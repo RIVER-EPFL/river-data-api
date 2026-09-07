@@ -14,7 +14,7 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use sea_orm::{ConnectionTrait, DbErr, Statement};
+use sea_orm::{ConnectionTrait, DbErr, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use super::job::Job;
@@ -58,17 +58,29 @@ pub async fn family_pairs<C: ConnectionTrait>(
         ))
         .await?;
     rows.iter()
+        .map(|r| PairRow::from_query_result(r, ""))
         .map(|r| {
-            Ok(FamilyPair {
-                new_id: r.try_get("", "new_id")?,
-                new_key: r.try_get("", "new_key")?,
-                new_paired: r.try_get("", "new_paired")?,
-                old_id: r.try_get("", "old_id")?,
-                old_key: r.try_get("", "old_key")?,
-                old_site_parameter_id: r.try_get("", "old_sp")?,
+            r.map(|p| FamilyPair {
+                new_id: p.new_id,
+                new_key: p.new_key,
+                new_paired: p.new_paired,
+                old_id: p.old_id,
+                old_key: p.old_key,
+                old_site_parameter_id: p.old_sp,
             })
         })
         .collect()
+}
+
+/// One retired family and the replicate family that replaces it, as the pairing query returns it.
+#[derive(FromQueryResult)]
+struct PairRow {
+    new_id: Uuid,
+    new_key: String,
+    new_paired: bool,
+    old_id: Uuid,
+    old_key: String,
+    old_sp: Option<Uuid>,
 }
 
 /// The tolerance bound between two value expressions, shared with the sync-time audit's
@@ -77,7 +89,7 @@ fn bound_sql(a: &str, b: &str, rel_bind: &str) -> String {
     crate::routes::private::sync::replicate_audit::bound_sql(a, b, rel_bind, DEFAULT_ABS_TOL)
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, FromQueryResult)]
 pub struct VerifyOutcome {
     pub compared: i64,
     pub mismatched: i64,
@@ -122,10 +134,7 @@ async fn verify_family<C: ConnectionTrait>(
         ))
         .await?
         .ok_or_else(|| DbErr::Custom("verification returned no row".to_string()))?;
-    Ok(VerifyOutcome {
-        compared: row.try_get("", "compared")?,
-        mismatched: row.try_get("", "mismatched")?,
-    })
+    VerifyOutcome::from_query_result(&row, "")
 }
 
 /// The first mismatching instants, for the job detail an operator reviews.
@@ -165,18 +174,26 @@ async fn mismatch_examples<C: ConnectionTrait>(
         ))
         .await?;
     rows.iter()
+        .map(|r| MismatchRow::from_query_result(r, ""))
         .map(|r| {
-            let time: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "time")?;
-            let old_value: Option<f64> = r.try_get("", "old_value")?;
-            let new_value: Option<f64> = r.try_get("", "new_value")?;
-            Ok(serde_json::json!({
-                "time": time.with_timezone(&Utc),
-                "old_value": old_value,
-                "new_value": new_value,
-                "delta": old_value.zip(new_value).map(|(a, b)| a - b),
-            }))
+            r.map(|m| {
+                serde_json::json!({
+                    "time": m.time.with_timezone(&Utc),
+                    "old_value": m.old_value,
+                    "new_value": m.new_value,
+                    "delta": m.old_value.zip(m.new_value).map(|(a, b)| a - b),
+                })
+            })
         })
         .collect()
+}
+
+/// One instant where the retired family and its replacement disagree.
+#[derive(FromQueryResult)]
+struct MismatchRow {
+    time: chrono::DateTime<chrono::FixedOffset>,
+    old_value: Option<f64>,
+    new_value: Option<f64>,
 }
 
 /// Old-stream instants the family stream has no readings for yet. Non-zero means the backfill has
@@ -228,8 +245,10 @@ async fn cutover_family(
             .ok_or_else(|| {
                 AppError::NotFound(format!("site_parameter {site_parameter_id} not found"))
             })?;
-        let site_id: Uuid = slot.try_get("", "site_id")?;
-        let parameter_id: Uuid = slot.try_get("", "parameter_id")?;
+        let SlotRow {
+            site_id,
+            parameter_id,
+        } = SlotRow::from_query_result(&slot, "")?;
 
         let claimed = txn
             .execute_raw(Statement::from_sql_and_values(
@@ -585,4 +604,11 @@ impl Job for ReplicateReconciliationDelete {
         }
         Ok(deleted_readings)
     }
+}
+
+/// The slot a retired family's readings belong to.
+#[derive(FromQueryResult)]
+struct SlotRow {
+    site_id: Uuid,
+    parameter_id: Uuid,
 }

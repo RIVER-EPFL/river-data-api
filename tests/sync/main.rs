@@ -7,6 +7,7 @@
 mod common;
 
 mod annotations_register;
+mod catalog_usage;
 mod change_proposals;
 mod control_plane;
 mod control_plane_client;

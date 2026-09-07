@@ -12,7 +12,9 @@
 //! align this file" before the operator confirms.
 
 use axum::{Json, extract::State};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Statement};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Statement,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -414,12 +416,15 @@ pub async fn import_csv(
     let mut site_param_ids: HashSet<Uuid> = HashSet::new();
 
     for row in &sp_rows {
-        let sp_name: String = row.try_get("", "sp_name").unwrap_or_default();
-        let Ok(pid) = row.try_get::<Uuid>("", "parameter_id") else {
+        let Ok(row) = SlotColumnRow::from_query_result(row, "") else {
             continue;
         };
-        let param_name: String = row.try_get("", "param_name").unwrap_or_default();
-        let aliases: Vec<String> = row.try_get("", "aliases").unwrap_or_default();
+        let (pid, sp_name, param_name, aliases) = (
+            row.parameter_id,
+            row.sp_name.unwrap_or_default(),
+            row.param_name.unwrap_or_default(),
+            row.aliases.unwrap_or_default(),
+        );
 
         site_param_map.insert(sp_name.to_lowercase(), (pid, sp_name.clone()));
         site_param_map.insert(param_name.to_lowercase(), (pid, sp_name.clone()));
@@ -456,11 +461,10 @@ pub async fn import_csv(
         .await?;
     let mut catalog: HashMap<String, Uuid> = HashMap::new();
     for row in &catalog_rows {
-        let Ok(pid) = row.try_get::<Uuid>("", "id") else {
+        let Ok(row) = CatalogColumnRow::from_query_result(row, "") else {
             continue;
         };
-        let name: String = row.try_get("", "code").unwrap_or_default();
-        let aliases: Vec<String> = row.try_get("", "aliases").unwrap_or_default();
+        let (pid, name, aliases) = (row.id, row.code.unwrap_or_default(), row.aliases.unwrap_or_default());
         catalog.insert(name.to_lowercase(), pid);
         for alias in &aliases {
             catalog.insert(alias.to_lowercase(), pid);
@@ -678,7 +682,8 @@ pub async fn import_csv(
                 ))
                 .await?
             {
-                family_keys.insert(row.try_get("", "id")?, row.try_get("", "source_key")?);
+                let row = FamilyKeyRow::from_query_result(&row, "")?;
+                family_keys.insert(row.id, row.source_key);
             }
         }
         if !family_keys.is_empty() {
@@ -751,7 +756,8 @@ pub async fn import_csv(
             ))
             .await?
         {
-            api_stream_of.insert(row.try_get("", "parameter_id")?, row.try_get("", "id")?);
+            let row = SlotStreamRow::from_query_result(&row, "")?;
+            api_stream_of.insert(row.parameter_id, row.id);
         }
 
         let mut stream_ids: Vec<Uuid> = overlap
@@ -773,7 +779,8 @@ pub async fn import_csv(
                 ))
                 .await?
             {
-                stream_default.insert(row.try_get("", "id")?, row.try_get("", "measurement_type")?);
+                let row = StreamDefaultRow::from_query_result(&row, "")?;
+                stream_default.insert(row.id, row.measurement_type);
             }
         }
 
@@ -944,7 +951,8 @@ pub async fn import_csv(
             ))
             .await?
         {
-            map.insert(row.try_get::<Uuid>("", "id")?, row.try_get::<Uuid>("", "sensor_id")?);
+            let row = StreamSensorRow::from_query_result(&row, "")?;
+            map.insert(row.id, row.sensor_id);
         }
         map
     };
@@ -1215,20 +1223,14 @@ async fn compute_overlaps(
     let mut existing: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), Vec<f64>> =
         HashMap::with_capacity(existing_rows.len());
     for row in &existing_rows {
-        let Ok(pid) = row.try_get::<Uuid>("", "parameter_id") else {
+        let Ok(row) = StoredValueRow::from_query_result(row, "") else {
             continue;
         };
-        let Ok(t) = row.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time") else {
-            continue;
-        };
-        let Ok(val) = row.try_get::<f64>("", "val") else {
-            continue;
-        };
-        let key = (pid, t.with_timezone(&chrono::Utc));
-        if let Ok(stream_id) = row.try_get::<Uuid>("", "stream_id") {
+        let key = (row.parameter_id, row.time.with_timezone(&chrono::Utc));
+        if let Some(stream_id) = row.stream_id {
             owning_stream.entry(key).or_insert(stream_id);
         }
-        existing.entry(key).or_default().push(val);
+        existing.entry(key).or_default().push(row.val);
     }
 
     let mut occurrence: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
@@ -1803,6 +1805,55 @@ async fn import_tool_csv(
         curves: curve_plan,
         check,
     })
+}
+
+/// The queries the importer's column resolution and overlap check make, each as the row its
+/// SELECT returns.
+#[derive(FromQueryResult)]
+struct SlotColumnRow {
+    parameter_id: Uuid,
+    sp_name: Option<String>,
+    param_name: Option<String>,
+    aliases: Option<Vec<String>>,
+}
+
+#[derive(FromQueryResult)]
+struct CatalogColumnRow {
+    id: Uuid,
+    code: Option<String>,
+    aliases: Option<Vec<String>>,
+}
+
+#[derive(FromQueryResult)]
+struct FamilyKeyRow {
+    id: Uuid,
+    source_key: String,
+}
+
+#[derive(FromQueryResult)]
+struct SlotStreamRow {
+    parameter_id: Uuid,
+    id: Uuid,
+}
+
+#[derive(FromQueryResult)]
+struct StreamDefaultRow {
+    id: Uuid,
+    measurement_type: Option<String>,
+}
+
+#[derive(FromQueryResult)]
+struct StreamSensorRow {
+    id: Uuid,
+    sensor_id: Uuid,
+}
+
+#[derive(FromQueryResult)]
+struct StoredValueRow {
+    parameter_id: Uuid,
+    time: sea_orm::prelude::DateTimeWithTimeZone,
+    val: f64,
+    stream_id: Option<Uuid>,
 }
 
 #[cfg(test)]

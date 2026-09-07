@@ -1,5 +1,7 @@
 # Build
 /target/
+# Each agent working the audit queue builds into its own CARGO_TARGET_DIR beside `target`.
+/target-*/
 debug/
 *.pdb
 

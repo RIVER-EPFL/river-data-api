@@ -5,7 +5,7 @@
 //! formulas present, and activates it. A run pins that version, so a recompute reproduces the
 //! value the audit compares against.
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
@@ -39,14 +39,27 @@ async fn load_calculation(
     else {
         return Ok(None);
     };
+    let row = StoredCalculation::from_query_result(&row, "")?;
     Ok(Some(CalculationRow {
-        name: row.try_get("", "name")?,
-        label: row.try_get("", "label")?,
-        description: row.try_get("", "description")?,
-        engine: Engine::parse(&row.try_get::<String>("", "engine")?).unwrap_or(Engine::Script),
-        parameter_group_id: row.try_get("", "parameter_group_id")?,
-        active_version_id: row.try_get("", "active_version_id")?,
+        name: row.name,
+        label: row.label,
+        description: row.description,
+        engine: Engine::parse(&row.engine).unwrap_or(Engine::Script),
+        parameter_group_id: row.parameter_group_id,
+        active_version_id: row.active_version_id,
     }))
+}
+
+/// A calculation as its row stands, with `engine` left as the stored word: an engine outside the
+/// vocabulary is a calculation this executor runs as a script, not a decode failure.
+#[derive(FromQueryResult)]
+struct StoredCalculation {
+    name: String,
+    label: String,
+    description: Option<String>,
+    engine: String,
+    parameter_group_id: Option<Uuid>,
+    active_version_id: Option<Uuid>,
 }
 
 /// Mint and activate a version for a formula calculation whose formula set has changed. A script
@@ -251,7 +264,8 @@ async fn ids_by_code(
         .await?;
     let mut by_code = std::collections::HashMap::new();
     for row in &rows {
-        by_code.insert(row.try_get("", "code")?, row.try_get("", "id")?);
+        let row = CodeRow::from_query_result(&row, "")?;
+        by_code.insert(row.code, row.id);
     }
     Ok(by_code)
 }
@@ -272,8 +286,7 @@ pub async fn calculations_of_group(
         .await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
-        let name: String = row.try_get("", "name")?;
-        let manifest: serde_json::Value = row.try_get("", "manifest")?;
+        let ActiveManifestRow { name, manifest } = ActiveManifestRow::from_query_result(row, "")?;
         let (input_codes, output_codes) = manifest_codes(&manifest);
         let mut all = input_codes.clone();
         all.extend(output_codes.clone());
@@ -333,13 +346,13 @@ pub async fn check_manifest_against_group(
         .await?;
     let mut members = Vec::with_capacity(member_rows.len());
     for row in &member_rows {
-        let role: String = row.try_get("", "role")?;
-        let Some(role) = Role::parse(&role) else {
+        let row = MemberRow::from_query_result(row, "")?;
+        let Some(role) = Role::parse(&row.role) else {
             continue;
         };
         members.push(Member {
-            group_id: row.try_get("", "group_id")?,
-            parameter_id: row.try_get("", "parameter_id")?,
+            group_id: row.group_id,
+            parameter_id: row.parameter_id,
             role,
         });
     }
@@ -375,4 +388,24 @@ fn codes_of_event_inputs(manifest: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The three list queries the calculation rules make, as their SELECTs return them.
+#[derive(FromQueryResult)]
+struct ActiveManifestRow {
+    name: String,
+    manifest: serde_json::Value,
+}
+
+#[derive(FromQueryResult)]
+struct MemberRow {
+    group_id: Uuid,
+    parameter_id: Uuid,
+    role: String,
+}
+
+#[derive(FromQueryResult)]
+struct CodeRow {
+    code: String,
+    id: Uuid,
 }

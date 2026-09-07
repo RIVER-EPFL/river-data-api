@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, Query, State},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -125,20 +125,21 @@ pub async fn get_site_sensor_identity(
 
     let mut bands: HashMap<Uuid, Vec<IdentityBand>> = HashMap::new();
     for row in &band_rows {
-        let parameter_id: Uuid = row.try_get("", "parameter_id")?;
-        let from: DateTime<chrono::FixedOffset> = row.try_get("", "deployed_from")?;
-        let until: Option<DateTime<chrono::FixedOffset>> = row.try_get("", "deployed_until").ok();
-        bands.entry(parameter_id).or_default().push(IdentityBand {
-            deployment_id: row.try_get("", "deployment_id")?,
-            sensor_id: row.try_get("", "sensor_id")?,
-            sensor_serial: row.try_get("", "sensor_serial").ok(),
-            sensor_name: row.try_get("", "sensor_name").ok(),
-            site_id: row.try_get("", "site_id")?,
-            site_name: Some(site.name.clone()),
-            parameter_id,
-            from: from.with_timezone(&Utc),
-            until: until.map(|u| u.with_timezone(&Utc)),
-        });
+        let row = BandRow::from_query_result(row, "")?;
+        bands
+            .entry(row.parameter_id)
+            .or_default()
+            .push(IdentityBand {
+                deployment_id: row.deployment_id,
+                sensor_id: row.sensor_id,
+                sensor_serial: row.sensor_serial,
+                sensor_name: row.sensor_name,
+                site_id: row.site_id,
+                site_name: Some(site.name.clone()),
+                parameter_id: row.parameter_id,
+                from: row.deployed_from.with_timezone(&Utc),
+                until: row.deployed_until.map(|u| u.with_timezone(&Utc)),
+            });
     }
 
     // Calibration markers: calibrations (overlapping the window) of the sensors deployed at this
@@ -180,20 +181,17 @@ pub async fn get_site_sensor_identity(
 
     let mut calibrations: HashMap<Uuid, Vec<CalibrationMarker>> = HashMap::new();
     for row in &cal_rows {
-        let parameter_id: Uuid = row.try_get("", "parameter_id")?;
-        let valid_from: DateTime<chrono::FixedOffset> = row.try_get("", "valid_from")?;
-        let valid_until: Option<DateTime<chrono::FixedOffset>> =
-            row.try_get("", "valid_until").ok();
+        let row = MarkerRow::from_query_result(row, "")?;
         calibrations
-            .entry(parameter_id)
+            .entry(row.parameter_id)
             .or_default()
             .push(CalibrationMarker {
-                calibration_id: row.try_get("", "calibration_id")?,
-                sensor_id: row.try_get("", "sensor_id")?,
-                slope: row.try_get("", "slope")?,
-                intercept: row.try_get("", "intercept")?,
-                valid_from: valid_from.with_timezone(&Utc),
-                valid_until: valid_until.map(|u| u.with_timezone(&Utc)),
+                calibration_id: row.calibration_id,
+                sensor_id: row.sensor_id,
+                slope: row.slope,
+                intercept: row.intercept,
+                valid_from: row.valid_from.with_timezone(&Utc),
+                valid_until: row.valid_until.map(|u| u.with_timezone(&Utc)),
             });
     }
 
@@ -202,4 +200,28 @@ pub async fn get_site_sensor_identity(
         bands,
         calibrations,
     }))
+}
+
+/// The two window queries this view makes, as their SELECTs return them.
+#[derive(FromQueryResult)]
+struct BandRow {
+    parameter_id: Uuid,
+    deployment_id: Uuid,
+    sensor_id: Uuid,
+    sensor_serial: Option<String>,
+    sensor_name: Option<String>,
+    site_id: Uuid,
+    deployed_from: DateTime<chrono::FixedOffset>,
+    deployed_until: Option<DateTime<chrono::FixedOffset>>,
+}
+
+#[derive(FromQueryResult)]
+struct MarkerRow {
+    parameter_id: Uuid,
+    calibration_id: Uuid,
+    sensor_id: Uuid,
+    slope: f64,
+    intercept: f64,
+    valid_from: DateTime<chrono::FixedOffset>,
+    valid_until: Option<DateTime<chrono::FixedOffset>>,
 }

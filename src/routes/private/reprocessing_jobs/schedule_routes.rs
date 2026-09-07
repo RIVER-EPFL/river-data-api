@@ -8,7 +8,7 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -98,22 +98,38 @@ fn view_with_schema(
     Ok(view)
 }
 
+/// The stored schedule row. `tunables` is nullable in the table and empty where a job declares
+/// none, which is what the view reads it as.
+#[derive(sea_orm::FromQueryResult)]
+struct ScheduleRow {
+    job_name: String,
+    enabled: bool,
+    interval_seconds: Option<i64>,
+    next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_enqueued_at: Option<chrono::DateTime<chrono::Utc>>,
+    overlap_policy: Option<String>,
+    catchup_policy: Option<String>,
+    tunables: Option<serde_json::Value>,
+    updated_by: Option<String>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    running: bool,
+}
+
 fn view_from_row(r: &sea_orm::QueryResult) -> Result<ScheduleView, sea_orm::DbErr> {
+    let r = ScheduleRow::from_query_result(r, "")?;
     Ok(ScheduleView {
-        job_name: r.try_get("", "job_name")?,
-        enabled: r.try_get("", "enabled")?,
-        interval_seconds: r.try_get("", "interval_seconds")?,
-        next_run_at: r.try_get("", "next_run_at")?,
-        last_enqueued_at: r.try_get("", "last_enqueued_at")?,
-        overlap_policy: r.try_get("", "overlap_policy")?,
-        catchup_policy: r.try_get("", "catchup_policy")?,
-        tunables: r
-            .try_get::<Option<serde_json::Value>>("", "tunables")?
-            .unwrap_or_else(|| serde_json::json!({})),
+        job_name: r.job_name,
+        enabled: r.enabled,
+        interval_seconds: r.interval_seconds,
+        next_run_at: r.next_run_at,
+        last_enqueued_at: r.last_enqueued_at,
+        overlap_policy: r.overlap_policy,
+        catchup_policy: r.catchup_policy,
+        tunables: r.tunables.unwrap_or_else(|| serde_json::json!({})),
         tunables_schema: Vec::new(),
-        updated_by: r.try_get("", "updated_by")?,
-        updated_at: r.try_get("", "updated_at")?,
-        running: r.try_get("", "running")?,
+        updated_by: r.updated_by,
+        updated_at: r.updated_at,
+        running: r.running,
     })
 }
 

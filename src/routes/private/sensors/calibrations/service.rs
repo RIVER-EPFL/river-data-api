@@ -348,6 +348,16 @@ pub fn corrected_rows(alias: &str) -> String {
     format!("({alias}.calibration_id IS NOT NULL OR {alias}.standard_curve_id IS NOT NULL)")
 }
 
+/// The sweep's own summary row. `moved` is a `count(*)`, so it is a non-null bigint; the span and
+/// the touched pairs are aggregates over a set that may be empty.
+#[derive(FromQueryResult)]
+struct DriftRow {
+    moved: i64,
+    lo: Option<DateTime<Utc>>,
+    hi: Option<DateTime<Utc>>,
+    touched: Option<serde_json::Value>,
+}
+
 /// What a curve-drift sweep moved: the row count and the span those rows cover.
 pub struct CurveDrift {
     pub moved: u64,
@@ -401,19 +411,11 @@ pub async fn sweep_curve_drift(db: &DatabaseConnection) -> crate::error::AppResu
             touched: Vec::new(),
         });
     };
-    let moved = u64::try_from(row.try_get::<i64>("", "moved").unwrap_or(0)).unwrap_or(0);
-    let lo = row
-        .try_get::<Option<DateTime<Utc>>>("", "lo")
-        .ok()
-        .flatten();
-    let hi = row
-        .try_get::<Option<DateTime<Utc>>>("", "hi")
-        .ok()
-        .flatten();
+    let row = DriftRow::from_query_result(&row, "")?;
+    let moved = u64::try_from(row.moved).unwrap_or(0);
+    let (lo, hi) = (row.lo, row.hi);
     let touched = row
-        .try_get::<Option<serde_json::Value>>("", "touched")
-        .ok()
-        .flatten()
+        .touched
         .and_then(|v| serde_json::from_value::<Vec<(Uuid, Uuid)>>(v).ok())
         .unwrap_or_default();
     Ok(CurveDrift {

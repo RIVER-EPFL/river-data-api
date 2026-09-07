@@ -1103,27 +1103,35 @@ async fn fetch_sample_stats(
         ))
         .await?;
     for row in rows {
-        let Ok(sid) = row.try_get::<Uuid>("", "sample_id") else {
-            continue;
-        };
-        if let Some(stat) = stats.get_mut(&sid) {
+        let row = ReplicateRow::from_query_result(&row, "")?;
+        if let Some(stat) = stats.get_mut(&row.sample_id) {
             stat.replicates.push(ReplicateOut {
-                replicate_index: row.try_get("", "replicate_index").unwrap_or(0),
-                raw_value: row.try_get("", "raw_value").unwrap_or(f64::NAN),
-                calibrated_value: row.try_get("", "calibrated_value").ok(),
-                calibration_id: row.try_get("", "calibration_id").ok(),
-                standard_curve_id: row.try_get("", "standard_curve_id").ok(),
-                flagged: row
-                    .try_get::<Option<bool>>("", "is_flagged")
-                    .ok()
-                    .flatten()
-                    .unwrap_or(false),
-                withdrawn: row.try_get::<bool>("", "withdrawn").unwrap_or(false),
+                replicate_index: row.replicate_index,
+                raw_value: row.raw_value,
+                calibrated_value: row.calibrated_value,
+                calibration_id: row.calibration_id,
+                standard_curve_id: row.standard_curve_id,
+                flagged: row.is_flagged.unwrap_or(false),
+                withdrawn: row.withdrawn,
             });
         }
     }
 
     Ok(stats)
+}
+
+/// One replicate of a spot group, as the statistics query returns it. `is_flagged` is the only
+/// nullable column: nothing has flagged the row yet, which reads as not flagged.
+#[derive(sea_orm::FromQueryResult)]
+struct ReplicateRow {
+    sample_id: Uuid,
+    replicate_index: i16,
+    raw_value: f64,
+    calibrated_value: Option<f64>,
+    calibration_id: Option<Uuid>,
+    standard_curve_id: Option<Uuid>,
+    is_flagged: Option<bool>,
+    withdrawn: bool,
 }
 
 /// Spot instants in the window with no live replicate left, per parameter.

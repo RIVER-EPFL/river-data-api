@@ -12,7 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -35,6 +35,25 @@ pub struct StatisticsQuery {
     /// `continuous` (default) or `spot`. A spot period is summarised over the served instant
     /// values, which are sample means, not over the individual replicates.
     pub measurement_type: Option<String>,
+}
+
+/// One parameter's row of the summary query. Derived rather than hand-decoded so a column added
+/// to the query and not to its reader is a compile error.
+#[derive(FromQueryResult)]
+struct StatisticsRow {
+    parameter_id: Uuid,
+    code: String,
+    name: String,
+    units: Option<String>,
+    decimal_places: Option<i16>,
+    time_points: i64,
+    n: i64,
+    median: Option<f64>,
+    mean: Option<f64>,
+    stdev_sample: Option<f64>,
+    stdev_population: Option<f64>,
+    min_value: Option<f64>,
+    max_value: Option<f64>,
 }
 
 /// The portal's eight rows for one parameter, with both standard deviations rather than one.
@@ -226,24 +245,23 @@ pub async fn get_site_statistics(
         .await?;
 
     let mut parameters = Vec::with_capacity(rows.len());
-    for r in &rows {
-        let time_points: i64 = r.try_get("", "time_points")?;
-        let n: i64 = r.try_get("", "n")?;
+    for row in &rows {
+        let r = StatisticsRow::from_query_result(row, "")?;
         parameters.push(ParameterStatistics {
-            parameter_id: r.try_get("", "parameter_id")?,
-            code: r.try_get("", "code")?,
-            name: r.try_get("", "name")?,
-            units: r.try_get("", "units")?,
-            decimal_places: r.try_get("", "decimal_places")?,
-            time_points,
-            n,
-            nulls: time_points - n,
-            median: r.try_get("", "median")?,
-            mean: r.try_get("", "mean")?,
-            stdev_sample: r.try_get("", "stdev_sample")?,
-            stdev_population: r.try_get("", "stdev_population")?,
-            min: r.try_get("", "min_value")?,
-            max: r.try_get("", "max_value")?,
+            parameter_id: r.parameter_id,
+            code: r.code,
+            name: r.name,
+            units: r.units,
+            decimal_places: r.decimal_places,
+            time_points: r.time_points,
+            n: r.n,
+            nulls: r.time_points - r.n,
+            median: r.median,
+            mean: r.mean,
+            stdev_sample: r.stdev_sample,
+            stdev_population: r.stdev_population,
+            min: r.min_value,
+            max: r.max_value,
         });
     }
 

@@ -247,7 +247,9 @@ async fn guard_stream_scope(
                 [sp_id.into()],
             ))
             .await?
-            .and_then(|r| r.try_get::<Uuid>("", "project_id").ok()),
+            .map(|r| r.try_get::<Option<Uuid>>("", "project_id"))
+            .transpose()?
+            .flatten(),
         None => None,
     };
     if !scope.allows_project_opt(stream_project) {
@@ -310,7 +312,9 @@ pub async fn stream_stats(
             [id.into()],
         ))
         .await?;
-    let latest_value: Option<f64> = latest_row.and_then(|r| r.try_get("", "raw_value").ok());
+    let latest_value: Option<f64> = latest_row
+        .map(|r| r.try_get("", "raw_value"))
+        .transpose()?;
 
     Ok(Json(StreamStatsResponse {
         stream_id: id,
@@ -425,7 +429,9 @@ pub async fn stream_receipts(
                     [sp_id.into()],
                 ))
                 .await?
-                .and_then(|r| r.try_get::<Uuid>("", "project_id").ok()),
+                .map(|r| r.try_get::<Option<Uuid>>("", "project_id"))
+                .transpose()?
+                .flatten(),
             None => None,
         };
         if !scope.allows_project_opt(stream_project) {
@@ -442,7 +448,8 @@ pub async fn stream_receipts(
             [id.into()],
         ))
         .await?
-        .map(|r| r.try_get("", "n").unwrap_or(0))
+        .map(|r| r.try_get("", "n"))
+        .transpose()?
         .unwrap_or(0);
     let rows = state
         .db
@@ -1607,6 +1614,6 @@ async fn referenced_ids<C: ConnectionTrait>(
         ))
         .await?
         .iter()
-        .filter_map(|row| row.try_get::<Uuid>("", "id").ok())
-        .collect())
+        .map(|row| row.try_get::<Uuid>("", "id"))
+        .collect::<Result<Vec<_>, _>>()?)
 }

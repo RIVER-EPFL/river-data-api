@@ -148,11 +148,37 @@ pub struct PlanStatusChanged {
 }
 
 /// How much of one source system is paired, the dashboard's "needs attention" count.
-#[derive(Serialize, ToSchema)]
+#[derive(Serialize, ToSchema, sea_orm::FromQueryResult)]
 pub struct UnpairedSummaryRow {
     pub source_system: String,
     pub unpaired: i64,
     pub paired: i64,
+}
+
+/// One site's metadata as the plan's streams carry it: every field is text in `metadata`, so the
+/// row reads them as text and the parses below turn them into what the response holds.
+#[derive(sea_orm::FromQueryResult)]
+struct PlanSiteMetadataRow {
+    site_name: Option<String>,
+    latitude: Option<String>,
+    longitude: Option<String>,
+    altitude_m: Option<String>,
+    glacier_name: Option<String>,
+    glacier_rgi: Option<String>,
+    location_type: Option<String>,
+    catchment: Option<String>,
+    full_name: Option<String>,
+    elevation: Option<String>,
+    channel_id: Option<String>,
+    sample_interval_sec: Option<String>,
+}
+
+#[derive(sea_orm::FromQueryResult)]
+struct PlanSiteDeviceRow {
+    site_name: Option<String>,
+    serial: Option<String>,
+    model: Option<String>,
+    streams: i64,
 }
 
 /// One logger a site's streams name, counted per site: a site instrumented with two loggers has
@@ -331,7 +357,7 @@ async fn uncovered_stream_count(
             [plan_id.into(), source_system.into()],
         ))
         .await?;
-    Ok(row.and_then(|r| r.try_get::<i64>("", "n").ok()))
+    Ok(row.map(|r| r.try_get::<i64>("", "n")).transpose()?)
 }
 
 /// Mark a draft superseded, which is what Start over does to the draft it replaces: the decisions
@@ -1094,7 +1120,7 @@ pub async fn revert_pairing_plan(
 pub async fn unpaired_summary(
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<UnpairedSummaryRow>>> {
-    use sea_orm::{ConnectionTrait, Statement};
+    use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
     let rows = state
         .db
         .query_all_raw(Statement::from_string(
@@ -1107,14 +1133,10 @@ pub async fn unpaired_summary(
         ))
         .await?;
 
-    let result: Vec<UnpairedSummaryRow> = rows
+    let result = rows
         .iter()
-        .map(|row| UnpairedSummaryRow {
-            source_system: row.try_get("", "source_system").unwrap_or_default(),
-            unpaired: row.try_get("", "unpaired").unwrap_or(0),
-            paired: row.try_get("", "paired").unwrap_or(0),
-        })
-        .collect();
+        .map(|row| UnpairedSummaryRow::from_query_result(row, ""))
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Json(result))
 }
@@ -1135,7 +1157,7 @@ pub async fn plan_site_metadata(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Vec<PlanSiteMetadata>>> {
-    use sea_orm::Statement;
+    use sea_orm::{FromQueryResult, Statement};
 
     let plan = crate::routes::private::data_streams::pairing_plans::Entity::find_by_id(id)
         .one(&state.db)
@@ -1182,33 +1204,37 @@ pub async fn plan_site_metadata(
         ))
         .await?;
 
+    // A JSON field that was never written reads as absent, and one written as the string "null"
+    // or as empty says the source had nothing there, which is the same thing.
+    fn present(value: Option<String>) -> Option<String> {
+        value.filter(|s| s != "null" && !s.is_empty())
+    }
+    fn number(value: Option<String>) -> Option<f64> {
+        present(value).and_then(|s| s.parse::<f64>().ok())
+    }
+
     let mut result: Vec<PlanSiteMetadata> = rows
         .iter()
         .map(|row| {
-            let get = |col: &str| -> Option<String> {
-                row.try_get::<Option<String>>("", col)
-                    .ok()
-                    .flatten()
-                    .filter(|s| s != "null" && !s.is_empty())
-            };
-            let number = |col: &str| get(col).and_then(|s| s.parse::<f64>().ok());
-            PlanSiteMetadata {
-                site_name: row.try_get("", "site_name").unwrap_or_default(),
-                latitude: number("latitude"),
-                longitude: number("longitude"),
-                altitude_m: number("altitude_m"),
-                glacier_name: get("glacier_name"),
-                glacier_rgi: get("glacier_rgi"),
-                location_type: get("location_type"),
-                catchment: get("catchment"),
-                full_name: get("full_name"),
-                elevation: number("elevation"),
-                channel_id: get("channel_id"),
-                sample_interval_sec: get("sample_interval_sec").and_then(|s| s.parse::<i64>().ok()),
+            let r = PlanSiteMetadataRow::from_query_result(row, "")?;
+            Ok(PlanSiteMetadata {
+                site_name: r.site_name.unwrap_or_default(),
+                latitude: number(r.latitude),
+                longitude: number(r.longitude),
+                altitude_m: number(r.altitude_m),
+                glacier_name: present(r.glacier_name),
+                glacier_rgi: present(r.glacier_rgi),
+                location_type: present(r.location_type),
+                catchment: present(r.catchment),
+                full_name: present(r.full_name),
+                elevation: number(r.elevation),
+                channel_id: present(r.channel_id),
+                sample_interval_sec: present(r.sample_interval_sec)
+                    .and_then(|s| s.parse::<i64>().ok()),
                 devices: Vec::new(),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
 
     // Devices are counted per site, not folded into the site row: a site instrumented with two
     // loggers has two, and reporting one of them names channels that belong to the other.
@@ -1237,18 +1263,17 @@ pub async fn plan_site_metadata(
     let mut devices_by_site: std::collections::HashMap<String, Vec<PlanSiteDevice>> =
         std::collections::HashMap::new();
     for row in &device_rows {
-        let site: String = row.try_get("", "site_name").unwrap_or_default();
-        let serial: String = row.try_get("", "serial").unwrap_or_default();
-        if serial.is_empty() {
+        let r = PlanSiteDeviceRow::from_query_result(row, "")?;
+        let Some(serial) = r.serial.filter(|s| !s.is_empty()) else {
             continue;
-        }
+        };
         devices_by_site
-            .entry(site)
+            .entry(r.site_name.unwrap_or_default())
             .or_default()
             .push(PlanSiteDevice {
                 serial,
-                model: row.try_get::<Option<String>>("", "model").ok().flatten(),
-                streams: row.try_get::<i64>("", "streams").unwrap_or_default(),
+                model: r.model,
+                streams: r.streams,
             });
     }
 

@@ -92,6 +92,8 @@ async fn read_health(db: &DatabaseConnection, config: &Config) -> NotificationHe
             .await
             .ok()
             .flatten();
+        // A health report degrades rather than fails: a row it cannot read is a channel whose
+        // state is unknown, which is what `None` says on every one of these three.
         let (healthy, detail, checked_at) = match row {
             Some(r) => (
                 r.try_get::<bool>("", "healthy").ok(),
@@ -129,6 +131,8 @@ async fn recent_failures(db: &DatabaseConnection) -> (i64, i64) {
                 .to_string(),
         ))
         .await;
+    // Both columns are cast to bigint in the query and a FILTER count is never NULL, so a default
+    // here is unreachable; it stands because this function reports health and must not fail.
     match row {
         Ok(Some(r)) => (
             r.try_get::<i64>("", "undeliverable").unwrap_or(0),

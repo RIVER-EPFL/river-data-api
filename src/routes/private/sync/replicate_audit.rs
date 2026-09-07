@@ -796,6 +796,33 @@ struct LatestHoldRow {
 }
 
 #[derive(FromQueryResult)]
+struct KindCountRow {
+    kind: String,
+    n: i64,
+}
+
+/// The payload the last audit recorded at one slot. Both columns are `NOT NULL`, so a row that
+/// does not decode is a corrupt hold rather than an absent one.
+#[derive(FromQueryResult)]
+struct PayloadRow {
+    expected: serde_json::Value,
+    computed: serde_json::Value,
+}
+
+#[derive(FromQueryResult)]
+struct ReplicateStateRow {
+    replicate_index: i16,
+    flagged: bool,
+}
+
+#[derive(FromQueryResult)]
+struct HoldSlotRow {
+    site_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
+    group_time: sea_orm::prelude::DateTimeWithTimeZone,
+}
+
+#[derive(FromQueryResult)]
 struct HoldCountsRow {
     total: i64,
     pending: i64,
@@ -1122,9 +1149,8 @@ pub async fn list_holds(
         .await?;
     let mut pending_by_kind = std::collections::BTreeMap::new();
     for row in &kind_rows {
-        let kind: String = row.try_get("", "kind")?;
-        let n: i64 = row.try_get("", "n")?;
-        pending_by_kind.insert(kind, u64::try_from(n).unwrap_or(0));
+        let row = KindCountRow::from_query_result(row, "")?;
+        pending_by_kind.insert(row.kind, u64::try_from(row.n).unwrap_or(0));
     }
 
     Ok(Json(ListHoldsResponse {
@@ -1236,17 +1262,11 @@ async fn hold_numbers<C: ConnectionTrait>(
         .await
         .ok()
         .flatten();
-    row.map_or_else(
-        || (serde_json::Value::Null, serde_json::Value::Null),
-        |row| {
-            (
-                row.try_get("", "expected")
-                    .unwrap_or(serde_json::Value::Null),
-                row.try_get("", "computed")
-                    .unwrap_or(serde_json::Value::Null),
-            )
-        },
-    )
+    row.and_then(|row| PayloadRow::from_query_result(&row, "").ok())
+        .map_or_else(
+            || (serde_json::Value::Null, serde_json::Value::Null),
+            |row| (row.expected, row.computed),
+        )
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1545,10 +1565,10 @@ pub async fn resolve_hold(
                 let mut existing: Vec<i16> = Vec::with_capacity(group_rows.len());
                 let mut already_flagged: Vec<i16> = Vec::new();
                 for row in &group_rows {
-                    let index: i16 = row.try_get("", "replicate_index")?;
-                    existing.push(index);
-                    if row.try_get::<bool>("", "flagged")? {
-                        already_flagged.push(index);
+                    let row = ReplicateStateRow::from_query_result(row, "")?;
+                    existing.push(row.replicate_index);
+                    if row.flagged {
+                        already_flagged.push(row.replicate_index);
                     }
                 }
                 let absent: Vec<String> = indexes
@@ -1692,10 +1712,9 @@ async fn rule_on_entry(
         ))
         .await?
         .ok_or_else(|| AppError::NotFound(format!("no pending unverified entry hold {id}")))?;
-    let site_id: Option<Uuid> = hold.try_get("", "site_id")?;
-    let parameter_id: Option<Uuid> = hold.try_get("", "parameter_id")?;
-    let group_time: sea_orm::prelude::DateTimeWithTimeZone = hold.try_get("", "group_time")?;
-    let (Some(site_id), Some(parameter_id)) = (site_id, parameter_id) else {
+    let hold = HoldSlotRow::from_query_result(&hold, "")?;
+    let group_time = hold.group_time;
+    let (Some(site_id), Some(parameter_id)) = (hold.site_id, hold.parameter_id) else {
         return Err(AppError::BadRequest(format!(
             "unverified entry hold {id} names no slot"
         )));

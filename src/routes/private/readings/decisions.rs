@@ -273,6 +273,27 @@ impl Origin {
 /// The rows this file's raw queries return that carry more than one column. Derived rather than
 /// hand-decoded so a column added to a query and not to its reader is a compile error rather than
 /// a field silently left behind.
+/// One `(site, parameter)` slot a selection covers.
+#[derive(FromQueryResult)]
+struct SlotKeyRow {
+    site_id: Uuid,
+    parameter_id: Uuid,
+}
+
+/// A stored decision set, as the rollback path reads it back.
+#[derive(FromQueryResult)]
+struct SetRow {
+    selection: serde_json::Value,
+    kind: String,
+}
+
+/// One ownership decision at a slot, newest first.
+#[derive(FromQueryResult)]
+struct OwnershipRow {
+    kind: String,
+    at: sea_orm::prelude::DateTimeWithTimeZone,
+}
+
 #[derive(FromQueryResult)]
 struct ForeignCurveRow {
     id: Uuid,
@@ -1837,7 +1858,10 @@ async fn slots_of<C: ConnectionTrait>(
         ))
         .await?;
     rows.iter()
-        .map(|r| Ok((r.try_get("", "site_id")?, r.try_get("", "parameter_id")?)))
+        .map(|r| {
+            let row = SlotKeyRow::from_query_result(r, "")?;
+            Ok((row.site_id, row.parameter_id))
+        })
         .collect()
 }
 
@@ -2023,10 +2047,11 @@ pub async fn enqueue_pin_reprocess_for_set(
     else {
         return Ok(Vec::new());
     };
-    let Some(kind) = Kind::parse(&row.try_get::<String>("", "kind")?) else {
+    let row = SetRow::from_query_result(&row, "")?;
+    let Some(kind) = Kind::parse(&row.kind) else {
         return Ok(Vec::new());
     };
-    let selection: Selection = serde_json::from_value(row.try_get("", "selection")?)
+    let selection: Selection = serde_json::from_value(row.selection)
         .map_err(|e| AppError::Internal(format!("stored selection unreadable: {e}")))?;
     let (predicate, binds) = selection.predicate()?;
     enqueue_attribution_pin(db, kind, None, set_id, &predicate, binds).await
@@ -2447,14 +2472,12 @@ pub async fn output_owner<C: ConnectionTrait>(
         .await?;
     let ownership: Vec<(Kind, chrono::DateTime<chrono::Utc>)> = ownership
         .iter()
-        .filter_map(|r| {
-            let kind = Kind::parse(&r.try_get::<String>("", "kind").ok()?)?;
-            let at = r
-                .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "at")
-                .ok()?
-                .with_timezone(&chrono::Utc);
-            Some((kind, at))
-        })
+        .map(|r| OwnershipRow::from_query_result(r, ""))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        // A kind outside the vocabulary is a corrupt row, not a decode failure, and the query
+        // already names the three this reads.
+        .filter_map(|r| Some((Kind::parse(&r.kind)?, r.at.with_timezone(&chrono::Utc))))
         .collect();
     let input = conn
         .query_one_raw(Statement::from_sql_and_values(

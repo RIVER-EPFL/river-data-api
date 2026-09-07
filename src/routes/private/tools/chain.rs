@@ -14,7 +14,9 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, Statement};
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, FromQueryResult, Statement,
+};
 use uuid::Uuid;
 
 use crate::common::AppState;
@@ -765,39 +767,51 @@ async fn pinned_tool(
     else {
         return Ok(None);
     };
-    let manifest_raw: serde_json::Value = row.try_get("", "manifest")?;
-    let Ok(manifest) = engine::parse_manifest(&manifest_raw) else {
+    let row = PinnedVersionRow::from_query_result(&row, "")?;
+    let Ok(manifest) = engine::parse_manifest(&row.manifest) else {
         return Ok(None);
     };
-    let engine_kind = engine::Engine::parse(&row.try_get::<String>("", "engine")?)
-        .unwrap_or(engine::Engine::Script);
-    let body: String = row.try_get("", "script")?;
-    let formulas = if engine_kind == engine::Engine::Formula {
-        match super::formula::parse_pinned(&body) {
+    let engine = engine::Engine::parse(&row.engine).unwrap_or(engine::Engine::Script);
+    let formulas = if engine == engine::Engine::Formula {
+        match super::formula::parse_pinned(&row.script) {
             Ok(formulas) => formulas,
             Err(_) => return Ok(None),
         }
     } else {
         Vec::new()
     };
-    let engine = engine_kind;
     Ok(Some(ActiveTool {
-        script_id: row.try_get("", "tool_script_id")?,
+        script_id: row.tool_script_id,
         name: tool_name.to_string(),
         label: manifest.label.clone(),
         description: manifest.description.clone(),
         version_id,
-        version_no: row.try_get("", "version_no")?,
-        script: row.try_get("", "script")?,
-        entry_function: row.try_get("", "entry_function")?,
-        content_hash: row.try_get("", "content_hash")?,
+        version_no: row.version_no,
+        script: row.script,
+        entry_function: row.entry_function,
+        content_hash: row.content_hash,
         manifest,
         engine,
-        parameter_group_id: row.try_get("", "parameter_group_id")?,
+        parameter_group_id: row.parameter_group_id,
         // The version body is the formula set, so a recompute under a pinned version runs the
         // formulas that version holds rather than the definitions as they stand today.
         formulas,
     }))
+}
+
+/// A pinned tool version as the chain reads it back. The manifest and the formula body are parsed
+/// from the derived row rather than decoded here: a stored version outside either vocabulary is a
+/// version this executor cannot run, not a decode failure.
+#[derive(FromQueryResult)]
+struct PinnedVersionRow {
+    tool_script_id: Uuid,
+    version_no: i32,
+    script: String,
+    entry_function: String,
+    content_hash: String,
+    manifest: serde_json::Value,
+    engine: String,
+    parameter_group_id: Option<Uuid>,
 }
 
 /// Whether every required param of a tool is answerable at the event without a person: a manifest

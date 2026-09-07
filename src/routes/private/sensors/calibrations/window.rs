@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, State},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::Serialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -87,11 +87,11 @@ pub async fn get_calibration_window(
             None => String::new(),
         }
     };
-    let parameter_id: Option<Uuid> = cal.try_get("", "parameter_id").ok();
+    let parameter_id: Option<Uuid> = cal.try_get("", "parameter_id")?;
     let slope: f64 = cal.try_get("", "slope")?;
     let intercept: f64 = cal.try_get("", "intercept")?;
     let valid_from: DateTime<chrono::FixedOffset> = cal.try_get("", "valid_from")?;
-    let valid_until: Option<DateTime<chrono::FixedOffset>> = cal.try_get("", "valid_until").ok();
+    let valid_until: Option<DateTime<chrono::FixedOffset>> = cal.try_get("", "valid_until")?;
 
     let vf: sea_orm::Value = valid_from.into();
     let vu: sea_orm::Value = match valid_until {
@@ -124,7 +124,9 @@ pub async fn get_calibration_window(
             count_vals,
         ))
         .await?;
-    let point_count: i64 = count_row.and_then(|r| r.try_get("", "c").ok()).unwrap_or(0);
+    // The count query is an aggregate over a subquery, so it always returns a row; no row means no
+    // calibration window, which is zero points rather than a number to guess at.
+    let point_count: i64 = count_row.map(|r| r.try_get("", "c")).transpose()?.unwrap_or(0);
 
     // Each arm carries its own LIMIT so the continuous arm keeps the index-backed early stop; the
     // outer sort then orders at most twice the cap. The spot arm collapses a replicate group to
@@ -174,12 +176,13 @@ pub async fn get_calibration_window(
     let mut points = rows
         .iter()
         .map(|row| -> AppResult<CalibrationWindowPoint> {
-            let t: DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
+            let row = WindowPointRow::from_query_result(row, "")?;
             Ok(CalibrationWindowPoint {
-                time: t.with_timezone(&Utc),
-                raw_value: row.try_get("", "raw_value")?,
-                calibrated_value: row.try_get::<f64>("", "calibrated_value").ok(),
-                is_flagged: row.try_get("", "is_flagged").unwrap_or(false),
+                time: row.time.with_timezone(&Utc),
+                raw_value: row.raw_value,
+                calibrated_value: row.calibrated_value,
+                // Nothing has flagged the row, which reads as not flagged.
+                is_flagged: row.is_flagged.unwrap_or(false),
             })
         })
         .collect::<AppResult<Vec<_>>>()?;
@@ -196,4 +199,13 @@ pub async fn get_calibration_window(
         point_count,
         points,
     }))
+}
+
+/// One point of a calibration's window, as the two-armed query returns it.
+#[derive(FromQueryResult)]
+struct WindowPointRow {
+    time: DateTime<chrono::FixedOffset>,
+    raw_value: f64,
+    calibrated_value: Option<f64>,
+    is_flagged: Option<bool>,
 }

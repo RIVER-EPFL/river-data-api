@@ -1,7 +1,7 @@
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter,
-    QueryOrder, Set, Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
+    QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -896,13 +896,8 @@ pub async fn create_plan(
         .await?
         .iter()
         .filter_map(|r| {
-            Some((
-                r.try_get::<Uuid>("", "stream_id").ok()?,
-                (
-                    r.try_get::<i64>("", "holds").ok()?,
-                    r.try_get::<i64>("", "population").ok()?,
-                ),
-            ))
+            let r = HoldCountRow::from_query_result(r, "").ok()?;
+            Some((r.stream_id, (r.holds, r.population)))
         })
         .collect();
 
@@ -917,13 +912,8 @@ pub async fn create_plan(
         .await?
         .iter()
         .filter_map(|r| {
-            Some((
-                (
-                    r.try_get::<Uuid>("", "site_id").ok()?,
-                    r.try_get::<Uuid>("", "parameter_id").ok()?,
-                ),
-                r.try_get::<String>("", "sd_estimator").ok()?,
-            ))
+            let r = DeclaredSlotRow::from_query_result(r, "").ok()?;
+            Some(((r.site_id, r.parameter_id), r.sd_estimator))
         })
         .collect();
 
@@ -1396,9 +1386,8 @@ pub async fn apply_plan(
     let slots: Vec<(Uuid, Uuid)> = slot_rows
         .into_iter()
         .filter_map(|r| {
-            let s: Uuid = r.try_get("", "site_id").ok()?;
-            let p: Uuid = r.try_get("", "parameter_id").ok()?;
-            Some((s, p))
+            let r = SlotRow::from_query_result(&r, "").ok()?;
+            Some((r.site_id, r.parameter_id))
         })
         .collect();
     // Re-derivation runs as tracked jobs so a failure is visible and rerunnable rather than a log
@@ -2180,7 +2169,7 @@ pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityC
             sea_orm::DatabaseBackend::Postgres,
             "SELECT sp.parameter_id AS parameter_id,
                     COUNT(*) AS slots,
-                    COALESCE(SUM(r.n), 0) AS readings
+                    COALESCE(SUM(r.n), 0)::bigint AS readings
              FROM site_parameters sp
              LEFT JOIN (
                  SELECT site_id, parameter_id, COUNT(*) AS n
@@ -2192,10 +2181,8 @@ pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityC
         ))
         .await?
     {
-        let id: Uuid = row.try_get("", "parameter_id")?;
-        let slots: i64 = row.try_get("", "slots").unwrap_or(0);
-        let readings: i64 = row.try_get("", "readings").unwrap_or(0);
-        usage.insert(id, (slots, readings));
+        let row = UsageRow::from_query_result(&row, "")?;
+        usage.insert(row.parameter_id, (row.slots, row.readings));
     }
 
     let params = parameters::Entity::find()
@@ -2944,4 +2931,35 @@ mod family_suggestion_tests {
             vec!["Flux", "Flux (mg/L)"]
         );
     }
+}
+
+/// The four aggregate queries this module makes that fill a shape of their own.
+#[derive(FromQueryResult)]
+struct HoldCountRow {
+    stream_id: Uuid,
+    holds: i64,
+    population: i64,
+}
+
+#[derive(FromQueryResult)]
+struct DeclaredSlotRow {
+    site_id: Uuid,
+    parameter_id: Uuid,
+    sd_estimator: String,
+}
+
+#[derive(FromQueryResult)]
+struct SlotRow {
+    site_id: Uuid,
+    parameter_id: Uuid,
+}
+
+/// A catalog parameter's usage. `SUM` over a bigint is NUMERIC in Postgres, so the sum is cast in
+/// the query: decoded as an integer it fails, which the hand mapping's `unwrap_or(0)` was
+/// swallowing, and every parameter reported no readings.
+#[derive(FromQueryResult)]
+struct UsageRow {
+    parameter_id: Uuid,
+    slots: i64,
+    readings: i64,
 }
