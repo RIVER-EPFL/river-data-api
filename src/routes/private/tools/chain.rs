@@ -113,32 +113,13 @@ pub fn dependency_order(tools: &[ActiveTool], catalog: &ParameterCatalog) -> App
         }
     }
 
-    let mut order = Vec::with_capacity(n);
-    let mut placed = vec![false; n];
-    loop {
-        let mut progressed = false;
-        // Stable by declaration order (list_active_tools orders by name).
-        for i in 0..n {
-            if !placed[i] && deps[i].iter().all(|&d| placed[d]) {
-                placed[i] = true;
-                order.push(i);
-                progressed = true;
-            }
-        }
-        if order.len() == n {
-            return Ok(order);
-        }
-        if !progressed {
-            let cycle: Vec<&str> = (0..n)
-                .filter(|&i| !placed[i])
-                .map(|i| tools[i].name.as_str())
-                .collect();
-            return Err(AppError::Conflict(format!(
-                "Tool event_inputs form a dependency cycle: {}",
-                cycle.join(", ")
-            )));
-        }
-    }
+    crate::common::dependency::order(&deps).map_err(|cycle| {
+        let members: Vec<&str> = cycle.iter().map(|&i| tools[i].name.as_str()).collect();
+        AppError::Conflict(format!(
+            "Tool event_inputs form a dependency cycle: {}",
+            members.join(", ")
+        ))
+    })
 }
 
 /// The served spot value at one (site, parameter, instant): the sample mean, else the lowest
@@ -238,6 +219,8 @@ pub struct RecomputeOutcome {
     /// the column, and here the stamp is reversible.
     pub readings_withdrawn: usize,
     pub skipped: Vec<(String, String)>,
+    /// `skipped_output` findings raised because a step did not run and its outputs are absent.
+    pub findings_raised: usize,
     /// Tools the site never declared: their output slots are not configured here, so they do not
     /// apply at this site at all (Q98). Distinct from `skipped`, which is an input that did not
     /// resolve on a tool that does apply.
@@ -326,6 +309,7 @@ pub async fn recompute_event(
         readings_written: 0,
         findings_closed: 0,
         skipped: Vec::new(),
+        findings_raised: 0,
         not_applicable: Vec::new(),
         unchanged: Vec::new(),
     };
@@ -369,6 +353,8 @@ pub async fn recompute_event(
             Ok(resolved) => resolved,
             Err(e) => match skip_reason(&e) {
                 Some(reason) => {
+                    outcome.findings_raised +=
+                        record_skip(&state.db, &event, &tool.name, &saved_outputs, &reason).await?;
                     outcome.skipped.push((tool.name.clone(), reason));
                     continue;
                 }
@@ -391,6 +377,9 @@ pub async fn recompute_event(
                 Ok(result) => result,
                 Err(e) => match skip_reason(&e) {
                     Some(reason) => {
+                        outcome.findings_raised +=
+                            record_skip(&state.db, &event, &tool.name, &saved_outputs, &reason)
+                                .await?;
                         outcome.skipped.push((tool.name.clone(), reason));
                         continue;
                     }
@@ -477,10 +466,10 @@ pub async fn recompute_event(
             })
             .collect();
         if readings.is_empty() {
-            outcome.skipped.push((
-                tool.name.clone(),
-                "run produced no savable output".to_string(),
-            ));
+            let reason = "run produced no savable output".to_string();
+            outcome.findings_raised +=
+                record_skip(&state.db, &event, &tool.name, &saved_outputs, &reason).await?;
+            outcome.skipped.push((tool.name.clone(), reason));
             continue;
         }
 
@@ -586,7 +575,7 @@ impl RecomputeScope {
             sql.push_str(
                 " AND EXISTS (SELECT 1 FROM replicate_audit_holds h \
                   WHERE h.stream_id IS NULL AND h.status = 'pending' \
-                    AND h.kind IN ('missing_output', 'stale_output') \
+                    AND h.kind IN ('missing_output', 'stale_output', 'skipped_output') \
                     AND h.site_id = ce.site_id AND h.group_time = ce.collected_at)",
             );
         }
@@ -650,6 +639,79 @@ async fn upsert_finding(
         },
     )
     .await
+}
+
+/// A step that did not run is a fact about the visit, not only about the run that skipped it: the
+/// outputs it would have produced are absent, and the reason belongs where it outlives the job
+/// row the counts are pruned with. An output some other path already filled is not reported.
+async fn record_skip(
+    db: &DatabaseConnection,
+    event: &EventContext,
+    tool: &str,
+    saved_outputs: &[(String, Uuid)],
+    reason: &str,
+) -> AppResult<usize> {
+    let mut raised = 0;
+    for (output, parameter_id) in saved_outputs {
+        if served_spot_value(db, event.site_id, *parameter_id, event.collected_at)
+            .await?
+            .is_some()
+        {
+            continue;
+        }
+        // The absence is now explained, so the audit's account of the same slot gives way to it.
+        db.execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE replicate_audit_holds SET status = 'superseded'
+             WHERE stream_id IS NULL AND status = 'pending'
+               AND kind IN ('missing_output', 'stale_output')
+               AND site_id = $1 AND parameter_id = $2 AND group_time = $3",
+            [
+                event.site_id.into(),
+                (*parameter_id).into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(event.collected_at).into(),
+            ],
+        ))
+        .await?;
+        upsert_finding(
+            db,
+            "skipped_output",
+            event,
+            *parameter_id,
+            tool,
+            FindingPayload {
+                expected: serde_json::json!({ "output": output, "reason": reason }),
+                computed: serde_json::json!({}),
+                delta: serde_json::json!({}),
+            },
+        )
+        .await?;
+        raised += 1;
+    }
+    Ok(raised)
+}
+
+/// Whether the executor already reported this slot as a step that did not run. The skip carries
+/// the reason, so the audit adds nothing by also calling the output absent.
+async fn has_pending_skip(
+    db: &DatabaseConnection,
+    event: &EventContext,
+    parameter_id: Uuid,
+) -> AppResult<bool> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT 1 AS found FROM replicate_audit_holds
+             WHERE stream_id IS NULL AND status = 'pending' AND kind = 'skipped_output'
+               AND site_id = $1 AND parameter_id = $2 AND group_time = $3",
+            [
+                event.site_id.into(),
+                parameter_id.into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(event.collected_at).into(),
+            ],
+        ))
+        .await?;
+    Ok(row.is_some())
 }
 
 /// Close open findings for slots the current audit found in agreement (or now populated).
@@ -922,6 +984,9 @@ pub async fn audit_event(
                         }
                     }
                     (None, Some(recomputed)) => {
+                        if has_pending_skip(&state.db, event, parameter_id).await? {
+                            continue;
+                        }
                         counts.missing += 1;
                         upsert_finding(
                             &state.db,
@@ -948,6 +1013,9 @@ pub async fn audit_event(
                     served_spot_value(&state.db, event.site_id, *parameter_id, event.collected_at)
                         .await?;
                 if stored.is_none() {
+                    if has_pending_skip(&state.db, event, *parameter_id).await? {
+                        continue;
+                    }
                     counts.missing += 1;
                     upsert_finding(
                         &state.db,
@@ -1033,6 +1101,7 @@ impl Job for EventRecompute {
                     .count("readings_written", outcome.readings_written)
                     .count("readings_withdrawn", outcome.readings_withdrawn)
                     .count("tools_skipped", outcome.skipped.len())
+                    .count("findings_raised", outcome.findings_raised)
                     .count("tools_unchanged", outcome.unchanged.len())
                     .count("findings_closed", outcome.findings_closed),
             )
@@ -1063,6 +1132,7 @@ impl Job for EventRecompute {
         let mut readings_withdrawn = 0usize;
         let mut tools_unchanged = 0usize;
         let mut tools_skipped = 0usize;
+        let mut findings_raised = 0usize;
         let mut findings_closed = 0usize;
         for event_id in &events {
             if ctx.is_cancelled() {
@@ -1077,6 +1147,7 @@ impl Job for EventRecompute {
             readings_withdrawn += outcome.readings_withdrawn;
             tools_unchanged += outcome.unchanged.len();
             tools_skipped += outcome.skipped.len();
+            findings_raised += outcome.findings_raised;
             findings_closed += outcome.findings_closed;
             for (tool, reason) in &outcome.skipped {
                 ctx.log(
@@ -1099,6 +1170,7 @@ impl Job for EventRecompute {
                 .count("readings_written", readings_written)
                 .count("readings_withdrawn", readings_withdrawn)
                 .count("tools_skipped", tools_skipped)
+                .count("findings_raised", findings_raised)
                 .count("tools_unchanged", tools_unchanged)
                 .count("findings_closed", findings_closed),
         )
@@ -1414,7 +1486,7 @@ mod scope_tests {
         assert!(sql.contains("ce.collected_at >= $2"));
         assert!(sql.contains("ce.collected_at <= $3"));
         assert_eq!(binds.len(), 3);
-        assert!(sql.contains("h.kind IN ('missing_output', 'stale_output')"));
+        assert!(sql.contains("h.kind IN ('missing_output', 'stale_output', 'skipped_output')"));
         assert!(sql.contains("h.status = 'pending'"));
         assert!(sql.trim_end().ends_with("ORDER BY ce.collected_at"));
     }

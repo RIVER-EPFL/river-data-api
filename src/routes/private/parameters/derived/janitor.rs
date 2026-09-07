@@ -51,7 +51,7 @@ fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> Statement {
                 ON sp.site_id = r.site_id
                AND sp.entry_mode = 'tool'
                AND COALESCE(sp.is_active, true) = true
-              JOIN derived_parameter_definitions d
+              JOIN calculation_formulas d
                 ON d.output_parameter_id = sp.parameter_id
               JOIN derived_parameter_sources dps
                 ON dps.derived_definition_id = d.id

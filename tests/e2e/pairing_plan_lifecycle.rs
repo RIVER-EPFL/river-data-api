@@ -1,6 +1,6 @@
-//! Pairing-plan workflow (USER_STORIES "Stream Pairing Workflow") over the HTTP surface: grouped
-//! discovery, then the draft → inspect → update → apply → revert lifecycle. A single
-//! full-permission API token drives every route. The apply-time entity-resolution rules are
+//! Pairing-plan workflow (USER_STORIES "Stream Pairing Workflow") over the HTTP surface: the
+//! draft → inspect → update → apply → revert lifecycle. A single full-permission API token
+//! drives every route. The apply-time entity-resolution rules are
 //! single-domain and live in `tests/sync/pairing_plan_resolution.rs`.
 //!
 //! Apply and revert run as tracked `plan_apply`/`plan_revert` jobs: the endpoint returns a `job_id`
@@ -17,88 +17,6 @@ use serial_test::serial;
 
 use crate::common::e2e::count;
 use crate::common::plans::{find_entry, run_plan_action};
-
-#[tokio::test]
-#[serial]
-async fn grouped_discovery_groups_unpaired_streams_by_site() {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_unpaired_stream_with_hierarchy(
-        &db,
-        &uuid::Uuid::new_v4().to_string(),
-        "metalp",
-        "k1",
-        "METALP",
-        "GL1_DN",
-        "Conductivity",
-        "uS/cm",
-        Some((46.5, 7.9, 2400.0)),
-        0,
-    )
-    .await;
-    crate::common::seed_unpaired_stream_with_hierarchy(
-        &db,
-        &uuid::Uuid::new_v4().to_string(),
-        "metalp",
-        "k2",
-        "METALP",
-        "GL1_DN",
-        "Temperature",
-        "degC",
-        None,
-        0,
-    )
-    .await;
-    crate::common::seed_unpaired_stream_with_hierarchy(
-        &db,
-        &uuid::Uuid::new_v4().to_string(),
-        "metalp",
-        "k3",
-        "METALP",
-        "GL2_UP",
-        "Conductivity",
-        "uS/cm",
-        None,
-        0,
-    )
-    .await;
-    let token = crate::common::seed_token_full(&db).await;
-    let app = crate::common::build_test_app(db.clone());
-
-    let (status, resp) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/sync/grouped-discovery",
-        &serde_json::json!({"source_system": "metalp"}),
-        &token,
-    )
-    .await;
-    assert_eq!(status, 200, "grouped-discovery ({status}): {resp}");
-    assert_eq!(resp["total_streams"], 3);
-
-    let sites = resp["sites"].as_array().expect("sites array");
-    assert_eq!(sites.len(), 2, "two distinct sites: {resp}");
-    let gl1 = sites
-        .iter()
-        .find(|s| s["name"] == "GL1_DN")
-        .expect("GL1_DN");
-    assert_eq!(gl1["stream_count"], 2, "GL1_DN has two streams");
-    assert!(gl1["existing_id"].is_null(), "GL1_DN does not pre-exist");
-    let gl2 = sites
-        .iter()
-        .find(|s| s["name"] == "GL2_UP")
-        .expect("GL2_UP");
-    assert_eq!(gl2["stream_count"], 1);
-
-    let params = resp["parameters"].as_array().expect("parameters array");
-    assert!(
-        params.iter().any(|p| p["name"] == "Conductivity"),
-        "Conductivity grouped: {resp}"
-    );
-    assert!(
-        params.iter().any(|p| p["name"] == "Temperature"),
-        "Temperature grouped: {resp}"
-    );
-}
 
 #[tokio::test]
 #[serial]

@@ -9,6 +9,9 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 
 use migration::m20260910_000007_site_parameter_entry_mode::{DOWN, UP};
+use migration::m20260910_000017_rename_calculation_formulas::{
+    DOWN as RENAME_DOWN, UP as RENAME_UP,
+};
 
 async fn entry_mode(db: &DatabaseConnection, name: &str) -> String {
     db.query_one_raw(Statement::from_string(
@@ -44,6 +47,9 @@ async fn the_declaration_survives_and_the_definition_reference_goes() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
+    // The migration names the formula table as it was named then, so its replay runs before the
+    // rename.
+    crate::common::exec_unprepared(&db, RENAME_DOWN).await;
     crate::common::exec_unprepared(&db, DOWN).await;
 
     seed_slot(&db, "computed here", "EntryModeComputed", true).await;
@@ -69,6 +75,8 @@ async fn the_declaration_survives_and_the_definition_reference_goes() {
         .expect("count");
     assert_eq!(columns, 0, "both columns are gone");
 
+    // Leave the schema as the rest of the suite reads it.
+    crate::common::exec_unprepared(&db, RENAME_UP).await;
     crate::common::cleanup_test_db(&db).await;
 }
 
@@ -84,7 +92,7 @@ async fn a_second_definition_cannot_claim_an_output() {
     for code in ["one", "two"] {
         let result = db
             .execute_unprepared(&format!(
-                "INSERT INTO derived_parameter_definitions (id, code, formula, output_parameter_id) \
+                "INSERT INTO calculation_formulas (id, code, formula, output_parameter_id) \
                  VALUES (gen_random_uuid(), '{code}', 'a * 2', '{param}')",
                 param = crate::common::GLOBAL_PARAM_DO_ID,
             ))

@@ -1032,9 +1032,9 @@ async fn author_chain_with_failing_b(app: &axum::Router, admin: &str) {
 
 /// Expected behaviour: a script error partway through a cascade is a skip, not a failure. The
 /// step that raised writes nothing, every step downstream of it skips for want of an input, and
-/// the run completes with both skips and their reasons on the job. Nowhere else says the script
-/// raised: the visit reads `current`, and the audit reports only that one output is absent while
-/// its inputs are present.
+/// the run completes with both skips and their reasons on the job. Each absent output is also a
+/// finding in the review queue carrying the reason, so the visit reads `stale` and the account
+/// outlives the job row.
 #[tokio::test]
 #[serial]
 async fn a_script_error_midway_skips_its_step_and_everything_downstream() {
@@ -1185,8 +1185,9 @@ async fn a_script_error_midway_skips_its_step_and_everything_downstream() {
         "chain_c skips for want of B's output: {job}"
     );
 
-    // The visit reads current: a completed run with two of its three steps missing is not a
-    // state the visit knows about.
+    assert_eq!(job["detail"]["counts"]["findings_raised"], 2, "{job}");
+
+    // The visit says so too: two of its three outputs are absent because a step did not run.
     let (status, detail) = crate::common::get_json_with_token(
         &app,
         &format!("/api/collection_events/{event_id}/detail"),
@@ -1194,11 +1195,40 @@ async fn a_script_error_midway_skips_its_step_and_everything_downstream() {
     )
     .await;
     assert_eq!(status, 200, "{detail}");
-    assert_eq!(detail["recompute"], "current", "{detail}");
+    assert_eq!(detail["recompute"], "stale", "{detail}");
 
-    // What the review queue holds is the audit's account, not the executor's: the step that
-    // raised is reported only as an output that is absent while its inputs are present, and the
-    // step below it is reported not at all, because its input never existed.
+    // The review queue carries each absent output with the reason its step did not run, and it
+    // is still there when the job row that counted them is gone.
+    crate::common::exec(
+        &db,
+        &format!("DELETE FROM reprocessing_jobs WHERE id = '{job_id}'"),
+    )
+    .await;
+    let findings =
+        serde_json::Value::Array(e2e::pending_event_findings(&app, &admin, &site_id).await);
+    let holds = findings.as_array().unwrap();
+    assert_eq!(holds.len(), 2, "one finding per absent output: {findings}");
+    let b_hold = holds
+        .iter()
+        .find(|h| h["tool"] == "chain_b")
+        .expect("the raising step is reported");
+    assert_eq!(b_hold["kind"], "skipped_output");
+    assert_eq!(b_hold["parameter_code"], "ChainPB");
+    assert!(
+        b_hold["expected"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("division by zero"),
+        "the script's message survives the job row: {b_hold}"
+    );
+    let c_hold = holds
+        .iter()
+        .find(|h| h["tool"] == "chain_c")
+        .expect("the step below it is reported");
+    assert_eq!(c_hold["kind"], "skipped_output");
+    assert_eq!(c_hold["parameter_code"], "ChainPC");
+
+    // The audit adds nothing over a slot the executor already explained.
     let (status, audit) = crate::common::post_json_parse_with_token(
         &app,
         "/api/actions/event_audit",
@@ -1209,15 +1239,11 @@ async fn a_script_error_midway_skips_its_step_and_everything_downstream() {
     assert_eq!(status, 200, "audit enqueue: {audit}");
     let audit_job = audit["job_id"].as_str().expect("job id").to_string();
     assert_eq!(e2e::poll_job(&app, &admin, &audit_job, 60).await, "completed");
-    let findings =
+    let after =
         serde_json::Value::Array(e2e::pending_event_findings(&app, &admin, &site_id).await);
-    let holds = findings.as_array().unwrap();
-    assert_eq!(holds.len(), 1, "one finding for the whole cascade: {findings}");
-    assert_eq!(holds[0]["kind"], "missing_output");
-    assert_eq!(holds[0]["tool"], "chain_b");
-    assert_eq!(holds[0]["parameter_code"], "ChainPB");
-    assert!(
-        !findings.to_string().contains("division by zero"),
-        "the script's message reaches the queue: {findings}"
+    assert_eq!(
+        after.as_array().unwrap().len(),
+        2,
+        "the audit duplicated the executor's findings: {after}"
     );
 }

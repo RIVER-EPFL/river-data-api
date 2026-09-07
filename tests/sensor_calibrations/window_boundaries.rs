@@ -16,6 +16,7 @@
 //! actions.
 
 use chrono::{DateTime, Utc};
+use sea_orm::ConnectionTrait;
 use serde_json::{Value, json};
 use serial_test::serial;
 use std::time::Duration;
@@ -146,6 +147,20 @@ async fn add_curve(
         "the calibration_create job settles without failing"
     );
     e2e::id_of(&body)
+}
+
+/// The stream the sensor's uploaded readings landed on, which is what a pin selection names.
+async fn stream_carrying(fx: &Fixture, sensor_id: &str) -> Uuid {
+    let row = fx
+        .db
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT stream_id FROM readings WHERE sensor_id = '{sensor_id}' LIMIT 1"),
+        ))
+        .await
+        .expect("query the uploaded reading's stream")
+        .expect("the upload landed a reading");
+    row.try_get("", "stream_id").expect("the reading names a stream")
 }
 
 /// Every calibration a sensor carries, oldest window first.
@@ -685,4 +700,64 @@ async fn rolling_back_into_a_refilled_slot_reports_a_conflict() {
     )
     .await;
     assert_eq!(status, 404, "the rolled-back deployment is gone: {body}");
+}
+
+/// Deleting a curve a reading is pinned to must report the pin, not fail on the raw foreign key:
+/// the repoint that clears the way for the delete holds pinned rows back on purpose, so the
+/// reference the constraint protects is still there when the delete runs.
+#[tokio::test]
+#[serial]
+async fn deleting_a_curve_a_reading_is_pinned_to_reports_the_pin() {
+    if !kc::require_keycloak_or_skip("delete_pinned_calibration").await {
+        return;
+    }
+    let fx = onboard().await;
+    let depth = fx.track.parameter_id(DEPTH).to_string();
+
+    let sensor = add_sensor(&fx, "WB-PINNED-0001").await;
+    let curve = add_curve(&fx, &sensor, &depth, 2.0, 5.0, "2025-01-01T00:00:00Z").await;
+    let at = "2025-06-02T09:00:00Z";
+    upload_history(&fx, &[(depth.as_str(), at, 10.0, sensor.as_str())]).await;
+
+    let stream = stream_carrying(&fx, &sensor).await;
+    let (status, body) = post_json_with_token(
+        &fx.app,
+        "/api/readings/pins",
+        &json!({
+            "kind": "calibration",
+            "target_id": curve,
+            "selection": { "keys": [{ "stream_id": stream, "time": at, "replicate_index": 0 }] },
+            "reason": "corrected against the curve entered that day",
+        }),
+        &fx.manager,
+    )
+    .await;
+    assert_eq!(status, 200, "the reading is pinned to the curve: {body}");
+
+    let (status, body) = delete_with_token(
+        &fx.app,
+        &format!("/api/sensor_calibrations/{curve}"),
+        &fx.admin,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a curve a reading is pinned to cannot be deleted: {body}"
+    );
+    assert!(
+        !body.contains("readings_calibration_id_fkey"),
+        "the operator is told which pin blocks the delete, not the constraint name: {body}"
+    );
+    assert!(
+        body.contains("pin"),
+        "the refusal names the pin as what has to be rolled back first: {body}"
+    );
+
+    let (status, body) = get_with_token(
+        &fx.app,
+        &format!("/api/sensor_calibrations/{curve}"),
+        &fx.admin,
+    )
+    .await;
+    assert_eq!(status, 200, "a refused delete leaves the curve standing: {body}");
 }

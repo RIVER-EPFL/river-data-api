@@ -578,10 +578,13 @@ async fn an_na_output_is_reported_as_cleared_and_recorded_as_an_explicit_null() 
         .expect("the run is stored")
         .try_get("", "outputs")
         .expect("outputs");
+    // The value, not its JSON spelling: the runner writes 8 where the assertion would write 8.0,
+    // and the contract is the explicit null beside it.
+    assert_eq!(outputs["doubled"].as_f64(), Some(8.0), "{outputs}");
     assert_eq!(
-        outputs,
-        json!({ "doubled": 8.0, "uncomputable": null }),
-        "the run records the clear as an explicit null, not an absence"
+        outputs.get("uncomputable"),
+        Some(&serde_json::Value::Null),
+        "the run records the clear as an explicit null, not an absence: {outputs}"
     );
     remove_probe_tool(&db).await;
 }

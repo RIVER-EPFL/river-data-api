@@ -184,7 +184,7 @@ async fn derived_edges(db: &DatabaseConnection) -> AppResult<Vec<DerivedEdge>> {
                          JOIN parameters p ON p.id = src.parameter_id
                         WHERE src.derived_definition_id = d.id),
                       '[]'::jsonb) AS reads
-               FROM derived_parameter_definitions d
+               FROM calculation_formulas d
                LEFT JOIN parameters out ON out.id = d.output_parameter_id
               WHERE d.tool_script_id IS NULL
               ORDER BY d.code"

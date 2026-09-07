@@ -23,7 +23,7 @@ use crate::common::AppState;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::decisions::{self, Kind, Origin, Selection};
-use crate::routes::private::tools::scripts::actor_label;
+use crate::common::actor::label;
 
 /// What one row's record says, reduced to what the routing turns on.
 #[derive(Debug, Clone, Default, Serialize, ToSchema)]
@@ -557,7 +557,7 @@ pub async fn preview(
     axum::Extension(auth): axum::Extension<AuthContext>,
     Json(req): Json<EditRequest>,
 ) -> AppResult<Json<PreviewResponse>> {
-    let actor = actor_label(&auth);
+    let actor = label(&auth);
     let kind = req.decision.parsed()?;
     let (_, option) = req.decision.assertion_over(kind, &req.selection)?;
     authorise(&auth, option)?;
@@ -647,7 +647,7 @@ pub async fn commit(
     axum::Extension(auth): axum::Extension<AuthContext>,
     Json(req): Json<EditRequest>,
 ) -> AppResult<Json<EditResponse>> {
-    let actor = actor_label(&auth);
+    let actor = label(&auth);
     let kind = req.decision.parsed()?;
     let (_, option) = req.decision.assertion_over(kind, &req.selection)?;
     authorise(&auth, option)?;
@@ -777,7 +777,7 @@ pub async fn rollback(
     axum::Extension(auth): axum::Extension<AuthContext>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> AppResult<Json<RollbackResponse>> {
-    let actor = actor_label(&auth);
+    let actor = label(&auth);
     let (rollback_id, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         decisions::rollback(txn, id, &actor, Some("edit rolled back")).await
     })
@@ -813,7 +813,7 @@ pub async fn rollback_edit_set(
     axum::Extension(auth): axum::Extension<AuthContext>,
     axum::extract::Path(set_id): axum::extract::Path<Uuid>,
 ) -> AppResult<Json<RollbackSetResponse>> {
-    let actor = actor_label(&auth);
+    let actor = label(&auth);
     let (rolled_back, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         decisions::rollback_set(txn, set_id, &actor, Some("edit set rolled back")).await
     })

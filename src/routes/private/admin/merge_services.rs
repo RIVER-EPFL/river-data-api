@@ -255,6 +255,73 @@ pub struct MergeParametersResponse {
 /// Merge two catalog parameters: absorb source into target at every site, then delete the source
 /// row. Same guarantees as [`merge_site_parameters`]: one guarded transaction, rollups refreshed
 /// after the commit.
+/// Refuse a merge that would make a derived definition read what it produces.
+///
+/// The merge re-points `derived_parameter_sources.parameter_id` from the source onto the target
+/// and leaves `output_parameter_id` where it is, so a definition producing the target and reading
+/// the source comes out reading itself. An edge is created by a write that never passes through
+/// the authoring validator, which is what Q96's decision names; the check is the same one, asked of
+/// the graph the merge would leave.
+async fn refuse_derived_cycle<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    source_id: Uuid,
+    target_id: Uuid,
+) -> AppResult<()> {
+    let rows = conn
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT d.id, d.code, d.output_parameter_id, src.parameter_id
+               FROM calculation_formulas d
+               LEFT JOIN derived_parameter_sources src ON src.derived_definition_id = d.id
+              WHERE d.output_parameter_id IS NOT NULL",
+            [],
+        ))
+        .await?;
+
+    // Parameters as indices, with the merge applied: everything the source named is the target.
+    let resolve = |id: Uuid| if id == source_id { target_id } else { id };
+    let mut index: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
+    let mut order_of: Vec<Uuid> = Vec::new();
+    let mut slot = |id: Uuid,
+                    index: &mut std::collections::HashMap<Uuid, usize>,
+                    order_of: &mut Vec<Uuid>| {
+        *index.entry(id).or_insert_with(|| {
+            order_of.push(id);
+            order_of.len() - 1
+        })
+    };
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    let mut definition_of: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
+    for row in &rows {
+        let output: Uuid = resolve(row.try_get("", "output_parameter_id")?);
+        let to = slot(output, &mut index, &mut order_of);
+        definition_of.insert(to, row.try_get("", "code")?);
+        let Some(source) = row.try_get::<Option<Uuid>>("", "parameter_id")? else {
+            continue;
+        };
+        let from = slot(resolve(source), &mut index, &mut order_of);
+        edges.push((to, from));
+    }
+    let mut deps: Vec<Vec<usize>> = vec![Vec::new(); order_of.len()];
+    for (to, from) in edges {
+        deps[to].push(from);
+    }
+    let Some(cycle) = crate::common::dependency::cycle(&deps) else {
+        return Ok(());
+    };
+    let mut named: Vec<&str> = cycle
+        .iter()
+        .filter_map(|i| definition_of.get(i).map(String::as_str))
+        .collect();
+    named.sort_unstable();
+    named.dedup();
+    Err(AppError::BadRequest(format!(
+        "Merging these parameters would make a derived calculation read what it produces: {}",
+        named.join(", ")
+    )))
+}
+
 pub async fn merge_parameters(
     db: &DatabaseConnection,
     req: &MergeParametersRequest,
@@ -272,6 +339,7 @@ pub async fn merge_parameters(
     let (response, touched) = bulk_write::guarded(db, async |txn| {
         validate_both_parameters_exist(txn, source_id, target_id).await?;
         refuse_on_collision(txn, MoveScope::EverySite, source_id, target_id).await?;
+        refuse_derived_cycle(txn, source_id, target_id).await?;
 
         let (sites_merged, sites_reassigned, moved) =
             merge_site_parameters_per_site(txn, source_id, target_id, actor).await?;
@@ -438,6 +506,17 @@ async fn reassign_parameter_references(
     txn.execute_raw(Statement::from_sql_and_values(
         pg,
         "UPDATE derived_parameter_sources SET parameter_id = $1 WHERE parameter_id = $2",
+        vec![target_id.into(), source_id.into()],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+
+    // What a formula produces moves with what it reads. Without this the delete below raises the
+    // output foreign key, and the merge fails on a constraint name rather than doing its job; a
+    // formula whose output would close a loop is already refused before any of this runs.
+    txn.execute_raw(Statement::from_sql_and_values(
+        pg,
+        "UPDATE calculation_formulas SET output_parameter_id = $1 WHERE output_parameter_id = $2",
         vec![target_id.into(), source_id.into()],
     ))
     .await

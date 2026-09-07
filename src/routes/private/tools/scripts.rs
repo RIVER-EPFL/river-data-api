@@ -35,13 +35,6 @@ use crate::error::{AppError, AppResult};
 /// Who the audit columns record. Taken from the authenticated caller, never from the request:
 /// a self-asserted author or activator is not a trail. These routes are Administrator-only, so
 /// the token arm exists for exhaustiveness rather than for a caller that can arrive here.
-pub(crate) fn actor_label(auth: &AuthContext) -> String {
-    match auth {
-        AuthContext::Keycloak { email: Some(e), .. } => e.clone(),
-        AuthContext::Keycloak { sub, .. } => sub.clone(),
-        AuthContext::ApiToken { token_id, .. } => format!("token:{token_id}"),
-    }
-}
 
 /// Packages a script may load or reach into with `::`. Mirrors the runner image's installed set
 /// plus the runner's own package; anything else fails at run time anyway, the lint just says so
@@ -408,7 +401,7 @@ pub async fn create_script(
         label: Set(payload.label),
         description: Set(payload.description),
         // Never from the request: a self-asserted author is not a trail.
-        created_by: Set(Some(actor_label(&auth))),
+        created_by: Set(Some(crate::common::actor::label(&auth))),
         engine: Set(payload.engine.unwrap_or_else(|| "script".to_string())),
         parameter_group_id: Set(payload.parameter_group_id),
         ..Default::default()
@@ -586,7 +579,7 @@ pub async fn create_version(
                 stored.test_cases.into(),
                 stored.content_hash.into(),
                 payload.note.into(),
-                actor_label(&auth).into(),
+                crate::common::actor::label(&auth).into(),
             ],
         ))
         .await
@@ -1205,7 +1198,7 @@ pub async fn activate_version(
         r"INSERT INTO tool_script_activations
               (tool_script_id, from_version_id, to_version_id, activated_by)
           SELECT id, active_version_id, $2, $3 FROM tool_scripts WHERE id = $1",
-        [id.into(), vid.into(), actor_label(&auth).into()],
+        [id.into(), vid.into(), crate::common::actor::label(&auth).into()],
     ))
     .await?;
     txn.execute_raw(Statement::from_sql_and_values(

@@ -85,6 +85,7 @@ where
 {
     let txn = db.begin().await?;
     lift_decompression_cap(&txn).await?;
+    crate::common::actor::declare(&txn).await?;
     match work(&txn).await {
         Ok(value) => {
             txn.commit().await?;
@@ -109,6 +110,7 @@ where
 {
     let txn = db.begin().await?;
     lift_decompression_cap(&txn).await?;
+    crate::common::actor::declare(&txn).await?;
     let outcome = work(&txn).await;
     if let Err(rollback) = txn.rollback().await {
         tracing::warn!(error = %rollback, "Rollback after a preview failed");

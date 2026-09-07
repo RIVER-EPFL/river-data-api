@@ -1,7 +1,7 @@
 //! The formula engine: a calculation whose versions carry formulas rather than an R script.
 //!
 //! A calculation is one entity with one of two engines (Q43). The script engine runs R in the
-//! sandbox; this one evaluates `derived_parameter_definitions` rows attached to the calculation,
+//! sandbox; this one evaluates `calculation_formulas` rows attached to the calculation,
 //! in `ordinal` order, over the same resolved inputs. Everything downstream, the manifest, the
 //! dependency order, the stored run, the provenance blob, the audit, sees one shape, because a
 //! formula calculation is assembled into the same manifest and the same run outcome.
@@ -245,17 +245,19 @@ pub fn in_order(formulas: &[PinnedFormula]) -> Result<Vec<&PinnedFormula>, Strin
 /// Parameter codes a calculation produces before the formula at `index` runs. Those are satisfied
 /// from inside the calculation, so they are not declared as event inputs and are not resolved from
 /// stored readings.
-/// The parameters an earlier formula hands to a later one inside the run.
 ///
-/// A per-replicate formula is not one of them. Its value exists once per index, and what a second
-/// stage reads is the family's mean, which the `samples` trigger derives after the repeats are
-/// stored and never a formula (Q95, D21). So its output stays an event input, resolved from the
-/// stored value the way any other parameter is, and the second stage converges on the pass after
-/// the repeats land rather than taking one of them.
-fn produced_before(ordered: &[&PinnedFormula], index: usize) -> Vec<String> {
+/// A per-replicate output is one of them only for another per-replicate formula, which reads it at
+/// its own index. A scalar consumer reads the family's mean, which the `samples` trigger derives
+/// after the repeats are stored and never a formula (Q95, D21), so for that one the output stays an
+/// event input and the second stage converges on the pass after the repeats land.
+fn produced_before(
+    ordered: &[&PinnedFormula],
+    index: usize,
+    consumer_is_per_replicate: bool,
+) -> Vec<String> {
     ordered[..index]
         .iter()
-        .filter(|f| f.per_replicate.is_none())
+        .filter(|f| f.per_replicate.is_none() || consumer_is_per_replicate)
         .filter_map(|f| f.output_parameter_code.as_ref())
         .map(|c| c.to_lowercase())
         .collect()
@@ -282,7 +284,7 @@ pub fn manifest_json(
     let mut event_inputs = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for (index, formula) in ordered.iter().enumerate() {
-        let internal = produced_before(&ordered, index);
+        let internal = produced_before(&ordered, index, formula.per_replicate.is_some());
         for (variable, parameter_code) in &formula.sources {
             if internal.contains(&parameter_code.to_lowercase()) || seen.contains(variable) {
                 continue;
@@ -376,15 +378,35 @@ pub fn evaluate(
     constants: &HashMap<String, f64>,
     curves: &HashMap<String, Curve>,
 ) -> Result<Vec<Evaluated>, String> {
+    evaluate_set(formulas, inputs, constants, curves, false)
+}
+
+/// One pass over the formula set. `chain_replicates` is the per-index pass of
+/// [`evaluate_over_replicates`]: a per-replicate result is handed to a later per-replicate formula
+/// at the same index, and to nothing else.
+fn evaluate_set(
+    formulas: &[PinnedFormula],
+    inputs: &HashMap<String, f64>,
+    constants: &HashMap<String, f64>,
+    curves: &HashMap<String, Curve>,
+    chain_replicates: bool,
+) -> Result<Vec<Evaluated>, String> {
     let ordered = in_order(formulas)?;
     let mut produced: HashMap<String, f64> = HashMap::new();
+    let mut at_index: HashMap<String, f64> = HashMap::new();
     let mut results = Vec::with_capacity(ordered.len());
     for formula in &ordered {
         let mut variables: HashMap<String, f64> = constants.clone();
         let mut skipped = None;
         for (variable, parameter_code) in &formula.sources {
-            let value = produced
-                .get(&parameter_code.to_lowercase())
+            let code = parameter_code.to_lowercase();
+            let chained = formula
+                .per_replicate
+                .is_some()
+                .then(|| at_index.get(&code))
+                .flatten();
+            let value = chained
+                .or_else(|| produced.get(&code))
                 .or_else(|| inputs.get(variable))
                 .copied();
             match value {
@@ -421,13 +443,16 @@ pub fn evaluate(
             .map_err(|e| format!("formula {}: {e}", formula.code))?;
         // NaN is the portal's NA: computed, and not a number. It clears the stored value rather
         // than feeding the next formula, which would turn one NA into a whole calculation of them.
-        // A per-replicate value is one repeat, not the calculation's answer for that parameter, so
-        // it is not handed to a later formula; that one reads the stored mean instead.
+        // A per-replicate value is one repeat, so it travels only to a later per-replicate formula
+        // at this index; a scalar formula reading that parameter takes the stored mean instead.
         if !value.is_nan()
-            && formula.per_replicate.is_none()
             && let Some(code) = &formula.output_parameter_code
         {
-            produced.insert(code.to_lowercase(), value);
+            if formula.per_replicate.is_none() {
+                produced.insert(code.to_lowercase(), value);
+            } else if chain_replicates {
+                at_index.insert(code.to_lowercase(), value);
+            }
         }
         results.push(Evaluated {
             code: formula.code.clone(),
@@ -448,12 +473,36 @@ fn replicate_width(
 ) -> usize {
     formulas
         .iter()
-        .filter_map(|f| f.per_replicate.as_ref())
-        .filter_map(|variable| replicates.get(variable))
-        .map(Vec::len)
+        .filter_map(|f| family_width(f, formulas, replicates))
         .max()
         .unwrap_or(1)
         .max(1)
+}
+
+/// How many indexes one per-replicate formula runs over: the length of the entered family it names,
+/// or, where it names an earlier formula's per-replicate output, that producer's width.
+fn family_width(
+    formula: &PinnedFormula,
+    formulas: &[&PinnedFormula],
+    replicates: &HashMap<String, Vec<Option<f64>>>,
+) -> Option<usize> {
+    let variable = formula.per_replicate.as_ref()?;
+    if let Some(values) = replicates.get(variable) {
+        return Some(values.len());
+    }
+    let code = formula
+        .sources
+        .iter()
+        .find(|(name, _)| name == variable)
+        .map(|(_, code)| code.to_lowercase())?;
+    // The set is topologically ordered by `in_order`, so a producer is always earlier and the walk
+    // terminates.
+    let producer = formulas.iter().find(|f| {
+        f.output_parameter_code
+            .as_ref()
+            .is_some_and(|produced| produced.to_lowercase() == code)
+    })?;
+    family_width(producer, formulas, replicates)
 }
 
 /// Evaluate a calculation whose formulas may be per-replicate, running the whole set once per
@@ -491,7 +540,7 @@ pub fn evaluate_over_replicates(
                 }
             }
         }
-        per_index.push(evaluate(formulas, &at_index, constants, curves)?);
+        per_index.push(evaluate_set(formulas, &at_index, constants, curves, true)?);
     }
 
     let mut produced = Vec::with_capacity(ordered.len());
@@ -1273,6 +1322,42 @@ mod tests {
         match &produced[1] {
             Produced::Scalar(evaluated) => assert_eq!(evaluated.value, Some(5.0)),
             other => panic!("the second stage is one number: {other:?}"),
+        }
+    }
+
+    /// A per-replicate formula reading another per-replicate output takes it at its own index,
+    /// which is Chl a's two-stage chain: the second stage runs over a family nobody entered, so its
+    /// width is the producer's and an index the first stage skipped stays a gap.
+    #[test]
+    fn test_a_per_replicate_formula_reads_an_earlier_one_at_its_own_index() {
+        let formulas = [
+            per_replicate("stage1", 1, "peak * 2", Some("S1"), &[("peak", "Peak")], "peak"),
+            per_replicate("stage2", 2, "s1 + 1", Some("S2"), &[("s1", "S1")], "s1"),
+        ];
+        let manifest = manifest_json("Two stage", None, &formulas).expect("manifest");
+        assert!(
+            !manifest["event_inputs"]
+                .as_array()
+                .expect("event_inputs")
+                .iter()
+                .any(|e| e["param"] == "s1"),
+            "the chained stage resolves inside the run, not from the store: {manifest:?}"
+        );
+
+        let produced = evaluate_over_replicates(
+            &formulas,
+            &HashMap::new(),
+            &replicates(&[("peak", &[Some(1.0), None, Some(3.0)])]),
+            &HashMap::new(),
+            &HashMap::new(),
+        )
+        .expect("evaluates");
+        match &produced[1] {
+            // 1*2+1, the unmeasured repeat, 3*2+1
+            Produced::PerReplicate { values, .. } => {
+                assert_eq!(values, &[Some(3.0), None, Some(7.0)]);
+            }
+            other => panic!("the second stage is one value per index: {other:?}"),
         }
     }
 }

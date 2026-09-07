@@ -78,9 +78,24 @@ async fn a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findin
     let other_site = e2e::create_site(&app, &admin, &project_id, "Other Site", "others").await;
     let pa = e2e::create_parameter(&app, &admin, "ScopeA", "Scope A", "ppb").await;
     let pb = e2e::create_parameter(&app, &admin, "ScopeB", "Scope B", "ppb").await;
-    for site in [&site_id, &other_site] {
-        e2e::assign_site_parameter_minimal(&app, &admin, site, &pa).await;
-    }
+    // A parameter belongs to one group, so both sites carry the same one.
+    let group_id = e2e::declare_site_slots(
+        &db,
+        &app,
+        &admin,
+        &site_id,
+        "scope_group",
+        &[(pa.as_str(), "measured"), (pb.as_str(), "output")],
+    )
+    .await;
+    let (status, applied) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sites/{other_site}/parameter_groups"),
+        &json!({ "group_id": group_id }),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "apply the group at the other site: {applied}");
     e2e::author_tool(
         &app,
         &admin,
@@ -293,4 +308,216 @@ async fn a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findin
     );
     // Reporting is all it does: no value is rewritten until somebody applies the repair.
     assert_eq!(served_b(site_id.clone(), VISITS[0]).await, Some(25.0));
+}
+
+/// Q108 end to end: an input is corrected, the calculation over it is recomputed without anyone
+/// asking, the value's record names the correction that moved it, and rolling the correction back
+/// puts both the value and its record where they started.
+#[tokio::test]
+#[serial]
+async fn a_correction_cascades_is_recorded_and_is_reversible() {
+    const AT: &str = "2025-07-08T09:00:00Z";
+    if !kc::require_keycloak_or_skip("a_correction_cascades_is_recorded_and_is_reversible").await {
+        return;
+    }
+    if !crate::common::tools_runner::require_runner_or_skip(
+        "a_correction_cascades_is_recorded_and_is_reversible",
+    )
+    .await
+    {
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    for sql in [
+        "UPDATE tool_scripts SET active_version_id = NULL WHERE name LIKE 'edit_%'",
+        "DELETE FROM tool_script_activations WHERE tool_script_id IN \
+         (SELECT id FROM tool_scripts WHERE name LIKE 'edit_%')",
+        "DELETE FROM tool_script_versions WHERE tool_script_id IN \
+         (SELECT id FROM tool_scripts WHERE name LIKE 'edit_%')",
+        "DELETE FROM tool_scripts WHERE name LIKE 'edit_%'",
+    ] {
+        crate::common::exec(&db, sql).await;
+    }
+    let app = kc::build_test_app_with_keycloak(db.clone()).await;
+    let admin = kc::get_keycloak_jwt("admin", "admin").await;
+
+    let project_id = e2e::create_project(&app, &admin, "Edit Project", "editp", false).await;
+    let site_id = e2e::create_site(&app, &admin, &project_id, "Edit Site", "edits").await;
+    let pa = e2e::create_parameter(&app, &admin, "EditA", "Edit A", "ppb").await;
+    let pb = e2e::create_parameter(&app, &admin, "EditB", "Edit B", "ppb").await;
+    e2e::declare_site_slots(
+        &db,
+        &app,
+        &admin,
+        &site_id,
+        "edit_group",
+        &[(pa.as_str(), "measured"), (pb.as_str(), "output")],
+    )
+    .await;
+    e2e::author_tool(
+        &app,
+        &admin,
+        "edit_b",
+        "tool <- function(inputs, constants, curves) list(out_b = inputs$a + 5)",
+        json!({
+            "label": "Edit B",
+            "params": [{ "name": "a", "label": "A", "kind": "number", "required": true }],
+            "event_inputs": [{ "param": "a", "parameter_code": "EditA" }],
+            "outputs": [{ "key": "out_b", "label": "B", "suggested_parameter_code": "EditB" }],
+        }),
+        json!({ "name": "adds", "inputs": { "a": 1.0 }, "expected": { "out_b": 6.0 } }),
+    )
+    .await;
+
+    kc::ensure_realm_user("river2", "river2", &["riverdata-river"]).await;
+    kc::grant_project(&db, &kc::keycloak_user_id("river2").await, &project_id).await;
+    let river = kc::get_keycloak_jwt("river2", "river2").await;
+
+    let served = |parameter: String| {
+        let db = db.clone();
+        let site = site_id.clone();
+        async move {
+            use sea_orm::ConnectionTrait;
+            db.query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT COALESCE(r.calibrated_value, r.raw_value) AS value FROM readings r \
+                     WHERE r.site_id = '{site}' AND r.parameter_id = '{parameter}' \
+                       AND r.time = '{AT}' AND r.withdrawn_at IS NULL \
+                     ORDER BY r.replicate_index LIMIT 1"
+                ),
+            ))
+            .await
+            .unwrap()
+            .and_then(|r| r.try_get::<Option<f64>>("", "value").ok().flatten())
+        }
+    };
+
+    let (status, saved) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": site_id,
+            "readings": [{ "parameter_id": pa, "value": 10.0, "time": AT }],
+        }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "save EditA: {saved}");
+    assert!(e2e::wait_for_jobs_by_trigger(&db, "event_recompute", 60).await);
+    assert_eq!(served(pb.clone()).await, Some(15.0), "the chain computed B");
+
+    // The input is corrected through the edit primitive, previewed first as every edit is.
+    let selection = json!({ "site_id": site_id, "parameter_id": pa, "from": AT, "to": AT });
+    let decision = json!({ "kind": "value_correction", "value": 20.0 });
+    let (status, preview) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/edits/preview",
+        &json!({ "selection": selection, "decision": decision }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "preview: {preview}");
+    let (status, committed) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/edits",
+        &json!({
+            "selection": selection,
+            "decision": decision,
+            "preview_id": preview["preview_id"].as_str().expect("preview id"),
+        }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "commit: {committed}");
+    assert_eq!(committed["rows_decided"], 1);
+
+    // The cascade is what B188 found missing on the inverse: nobody asked for this recompute.
+    assert!(e2e::wait_for_jobs_by_trigger(&db, "event_recompute", 60).await);
+    assert_eq!(served(pa.clone()).await, Some(20.0));
+    assert_eq!(
+        served(pb.clone()).await,
+        Some(25.0),
+        "the calculation over the corrected input ran again"
+    );
+
+    // The value's own record names the correction that moved it, and B's names the run.
+    let (status, record) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/readings/provenance?site_id={site_id}&parameter_id={pa}&time={AT}"),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "provenance: {record}");
+    let stream_id = record["records"][0]["origin"]["stream_id"]
+        .as_str()
+        .expect("the record names the stream")
+        .to_string();
+    let (status, decisions) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/readings/decisions?stream_id={stream_id}&time={AT}"),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "decisions: {decisions}");
+    assert_eq!(
+        decisions[0]["kind"], "value_correction",
+        "the newest decision is the correction: {decisions}"
+    );
+    assert_eq!(decisions[0]["new"]["raw_value"].as_f64(), Some(20.0));
+    assert_eq!(decisions[0]["old"]["raw_value"].as_f64(), Some(10.0));
+
+    let (status, record_b) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/readings/provenance?site_id={site_id}&parameter_id={pb}&time={AT}"),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "provenance B: {record_b}");
+    assert_eq!(
+        record_b["records"][0]["computation"]["run_source"], "chain",
+        "B's record says the chain made it: {record_b}"
+    );
+
+    // Rolling the correction back restores the input, and the cascade follows it back.
+    let decision_id = committed["decision_ids"][0]
+        .as_str()
+        .expect("decision id")
+        .to_string();
+    let (status, rolled) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/readings/edits/{decision_id}/rollback"),
+        &json!({}),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "rollback: {rolled}");
+    assert!(e2e::wait_for_jobs_by_trigger(&db, "event_recompute", 60).await);
+    assert_eq!(served(pa.clone()).await, Some(10.0), "the input is back");
+    assert_eq!(
+        served(pb.clone()).await,
+        Some(15.0),
+        "and so is everything computed from it"
+    );
+
+    let (status, decisions) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/readings/decisions?stream_id={stream_id}&time={AT}"),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "decisions after rollback: {decisions}");
+    assert_eq!(
+        decisions[0]["kind"], "rollback",
+        "the record keeps both the correction and its undo: {decisions}"
+    );
+    assert_eq!(
+        decisions[1]["kind"], "value_correction",
+        "{decisions}"
+    );
+    assert!(
+        decisions[1]["rolled_back_by"].is_string(),
+        "the correction is stamped with what undid it: {decisions}"
+    );
 }

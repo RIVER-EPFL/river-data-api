@@ -425,7 +425,7 @@ async fn recalled_inputs_take_their_derived_output_out_of_the_site() {
     exec(
         &db,
         &format!(
-            "INSERT INTO derived_parameter_definitions (id, code, name, units, formula, output_parameter_id) \
+            "INSERT INTO calculation_formulas (id, code, name, units, formula, output_parameter_id) \
              VALUES ('{derived_def}', 'TempDoubled', 'Temperature doubled', '°C', 'temp * 2', '{derived_param}')"
         ),
     )

@@ -169,8 +169,8 @@ pub fn visit_status(latest_job_status: Option<&str>, has_stale_finding: bool) ->
 }
 
 /// The recompute state of each visit: `queued` | `running` | `failed` from its latest
-/// `event_recompute` job, else `stale` when an open stale-output finding names it, else
-/// `current`.
+/// `event_recompute` job, else `stale` when an open stale-output or skipped-step finding names
+/// it, else `current`.
 pub async fn status_for(
     db: &DatabaseConnection,
     event_ids: &[Uuid],
@@ -206,7 +206,8 @@ pub async fn status_for(
              FROM replicate_audit_holds h
              JOIN collection_events ce
                ON ce.site_id = h.site_id AND ce.collected_at = h.group_time
-             WHERE h.kind = 'stale_output' AND h.status = 'pending' AND h.stream_id IS NULL
+             WHERE h.kind IN ('stale_output', 'skipped_output')
+               AND h.status = 'pending' AND h.stream_id IS NULL
                AND ce.id = ANY($1)",
             [event_ids.to_vec().into()],
         ))

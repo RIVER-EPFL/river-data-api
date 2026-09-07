@@ -785,3 +785,107 @@ async fn attribution_is_stored_on_create_and_the_fit_quality_freezes_with_the_co
         "notes stay editable on an applied curve: {body}"
     );
 }
+
+/// Scenario: a split copies a portal curve onto the instrument the readings are moved to.
+/// Expected behaviour: the copy names the curve it was made from and holds no source provenance of
+/// its own, so the portal keeps re-registering the original alone, and the original cannot be
+/// deleted while a copy points at it.
+#[tokio::test]
+#[serial]
+async fn a_copied_curve_names_its_origin_and_leaves_the_portal_identity_on_the_original() {
+    let fx = setup().await;
+
+    let (status, registered) = post_json_parse_with_token(
+        &fx.app,
+        "/api/standard_curves/register",
+        &json!({
+            "source_system": "cnet",
+            "source_key": "standard_curves:41",
+            "instrument_label": "DOC corr",
+            "slope": 2.0,
+            "intercept": 1.0,
+        }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "register the portal curve: {registered}");
+    let original: Uuid = registered["id"].as_str().unwrap().parse().unwrap();
+
+    // The copy the split writes: the original's coefficients on the receiving instrument, naming
+    // where it came from and claiming none of the source's identity.
+    let analyser = create_sensor(&fx.db, "Analyser-copy-01", GLOBAL_PARAM_TEMP_ID).await;
+    let copy = Uuid::new_v4();
+    fx.db
+        .execute_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "INSERT INTO standard_curves (id, sensor_id, name, slope, intercept, copied_from_id) \
+                 SELECT '{copy}', '{}', name, slope, intercept, id \
+                 FROM standard_curves WHERE id = '{original}'",
+                analyser.id
+            ),
+        ))
+        .await
+        .expect("the split's copy is storable");
+
+    let (status, body) =
+        get_json_with_token(&fx.app, &format!("/api/standard_curves/{copy}"), &fx.token).await;
+    assert_eq!(status, 200, "the copy is readable: {body}");
+    assert_eq!(
+        body["copied_from_id"].as_str(),
+        Some(original.to_string().as_str()),
+        "the copy names the curve it was made from: {body}"
+    );
+    assert!(
+        body["source_system"].is_null() && body["source_key"].is_null(),
+        "the copy claims none of the source's identity: {body}"
+    );
+
+    // The portal re-fits the curve it knows about. The copy is not a second holder of that
+    // identity, so the re-registration resolves to one row.
+    let (status, again) = post_json_parse_with_token(
+        &fx.app,
+        "/api/standard_curves/register",
+        &json!({
+            "source_system": "cnet",
+            "source_key": "standard_curves:41",
+            "instrument_label": "DOC corr",
+            "slope": 3.0,
+            "intercept": 1.0,
+        }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "re-register the portal curve: {again}");
+    assert_eq!(
+        again["id"].as_str(),
+        Some(original.to_string().as_str()),
+        "the unapplied original is re-fitted in place: {again}"
+    );
+
+    let holders = e2e::count(
+        &fx.db,
+        "SELECT count(*) AS c FROM standard_curves \
+         WHERE source_system = 'cnet' AND source_key = 'standard_curves:41'",
+    )
+    .await;
+    assert_eq!(holders, 1, "one row holds the source identity");
+
+    let copy_slope = e2e::count(
+        &fx.db,
+        &format!("SELECT count(*) AS c FROM standard_curves WHERE id = '{copy}' AND slope = 2.0"),
+    )
+    .await;
+    assert_eq!(copy_slope, 1, "the copy keeps the coefficients it was made with");
+
+    let (status, body) = delete_with_token(
+        &fx.app,
+        &format!("/api/standard_curves/{original}"),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "the original cannot be deleted while a copy names it: {body}"
+    );
+}

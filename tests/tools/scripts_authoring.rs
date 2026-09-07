@@ -824,9 +824,10 @@ async fn activation_runs_the_cases_rather_than_trusting_the_stamp() {
 /// Scenario: the lint reads the parse tree, so a rule written against one spelling now reaches
 /// every spelling of it.
 ///
-/// Expected behaviour: the thirteen shipped tools still pass. They are the corpus the policy has
-/// to stay compatible with, and a rule that refuses one of them is a rule that refuses the
-/// portal's own R.
+/// Expected behaviour: every shipped tool still passes. They are the corpus the policy has to stay
+/// compatible with, and a rule that refuses one of them is a rule that refuses the portal's own R.
+/// The corpus is the activated scripts; the subject this test authors against is not one of them,
+/// because a script with no active version is nothing the policy has to stay compatible with.
 #[tokio::test]
 #[serial]
 async fn every_shipped_tool_script_passes_the_lint() {
@@ -853,10 +854,13 @@ async fn every_shipped_tool_script_passes_the_lint() {
         ))
         .await
         .expect("active versions read");
+    let names: Vec<String> = rows
+        .iter()
+        .map(|r| r.try_get::<String>("", "name").unwrap())
+        .collect();
     assert!(
-        rows.len() >= 2,
-        "the seeded tool and the created subject are present: {}",
-        rows.len()
+        names.iter().any(|n| n == "doc"),
+        "the seeded corpus is present: {names:?}"
     );
 
     for row in &rows {

@@ -68,6 +68,7 @@ pub async fn declare_sd_estimator(
         .transaction::<_, (Option<String>, i64), sea_orm::DbErr>(|txn| {
             let estimator = estimator.clone();
             Box::pin(async move {
+                crate::common::actor::declare(txn).await?;
                 let row = txn
                     .query_one_raw(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,

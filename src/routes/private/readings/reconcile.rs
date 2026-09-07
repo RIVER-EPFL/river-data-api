@@ -2,19 +2,20 @@
 //! claim (`window {from, to, source_rows_read}`) from a sync service.
 //!
 //! With a window present the request is a diff, not an upsert: every stored key in the window is
-//! classified `unchanged` / `changed` / `withdrawn` / `retained`, and only new, changed and
-//! withdrawn rows are touched. Withdrawal is computed defensively — `stored − (admitted ∪
-//! rejected ∪ dropped)` — so a key the admission funnel refused, or a cell the backend could not
-//! decode, is never read as a source deletion. Retraction is a stamp (`withdrawn_at`), never a
-//! delete, and a later honest window that re-asserts a row clears it.
+//! classified `unchanged` / `changed` / `withdrawn` / `retained`. New rows are written and absent
+//! rows are withdrawn; a stored value the source has moved is proposed rather than written (Q84),
+//! and becomes the stored value when a person accepts the proposal. Withdrawal is computed
+//! defensively, `stored − (admitted ∪ rejected ∪ dropped)`, so a key the admission funnel refused,
+//! or a cell the backend could not decode, is never read as a source deletion. Retraction is a
+//! stamp (`withdrawn_at`), never a delete, and a later honest window that re-asserts a row clears
+//! it.
 //!
 //! Rows an operator has touched (flagged, hand-curved, or in a labelled sample) never change
 //! servedness without a person: a withdrawal leaves them served and raises a `source_modified`
-//! hold; a value change is applied (upstream owns the value) and raises the same hold. A pass
-//! that would change or withdraw more than `RECONCILE_BRAKE_FRACTION` of the window's stored
-//! rows, or lose one replicate index from most of its groups, applies only its new rows and
-//! raises a `brake_fired` hold. Every pass commits an `ingest_receipts` row whose arithmetic the
-//! database CHECKs.
+//! hold. A pass that would change or withdraw more than `RECONCILE_BRAKE_FRACTION` of the
+//! window's stored rows, or lose one replicate index from most of its groups, applies only its
+//! new rows and raises a `brake_fired` hold. Every pass commits an `ingest_receipts` row whose
+//! arithmetic the database CHECKs.
 
 use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, Statement};
@@ -77,8 +78,6 @@ pub struct DiffOutcome {
     pub retained: usize,
     pub reinstated: usize,
     pub braked: bool,
-    /// Whether classified-changed rows apply this pass; false under a brake.
-    pub apply_changed: bool,
     pub holds_raised: usize,
     pub changed_keys: Vec<(DateTime<Utc>, i16)>,
     /// The keys this pass stamped withdrawn, and the keys it cleared the stamp from. Neither is a
@@ -86,13 +85,21 @@ pub struct DiffOutcome {
     /// working from the request alone cannot see the instants whose served value moved.
     pub withdrawn_keys: Vec<Key>,
     pub reinstated_keys: Vec<Key>,
-    /// The keys the upsert should write: new rows, plus changed rows when they apply. An
-    /// unchanged row re-written with identical values is WAL churn the diff exists to avoid;
-    /// under a brake the changed keys are excluded so the upsert cannot correct them.
+    /// The keys the upsert should write: new rows only. A stored value the source has moved is
+    /// proposed, never written (Q84), and an unchanged row re-written with identical values is
+    /// WAL churn the diff exists to avoid.
     pub write_keys: HashSet<Key>,
+    /// Changed keys recorded as proposals this pass, and how many of those are awaiting a
+    /// decision. A pass leaving a proposal undecided is not clean, so the source keeps asserting
+    /// the window and the proposal keeps its evidence.
+    pub proposed: usize,
+    pub proposals_awaiting: usize,
 }
 
 pub type Key = (DateTime<Utc>, i16);
+/// One key the source has moved: what it now asserts, and what the store holds, each a value and
+/// the curve declared with it.
+type ProposedChange = (Key, (f64, Option<Uuid>), (f64, Option<Uuid>));
 /// One admitted payload row as the diff classifies it: key, raw value, declared curve.
 pub type AdmittedRow = (Key, f64, Option<Uuid>);
 
@@ -260,8 +267,7 @@ async fn upsert_brake_hold<C: ConnectionTrait>(
 }
 
 /// Classify the window and apply the withdrawal side. Runs inside the guarded transaction,
-/// before the insert/upsert of the admitted rows; returns what the upsert may do (`apply_changed`
-/// is false under a brake, in which case the caller inserts with `Replace::Nothing`).
+/// before the insert/upsert of the admitted rows.
 #[allow(clippy::too_many_lines)]
 pub async fn run_windowed_diff<C: ConnectionTrait>(
     conn: &C,
@@ -286,18 +292,19 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
         retained: 0,
         reinstated: 0,
         braked: false,
-        apply_changed: true,
         holds_raised: 0,
         changed_keys: Vec::new(),
         withdrawn_keys: Vec::new(),
         reinstated_keys: Vec::new(),
         write_keys: HashSet::new(),
+        proposed: 0,
+        proposals_awaiting: 0,
     };
 
     let mut admitted_keys: HashSet<Key> = HashSet::with_capacity(admitted.len());
-    let mut changed_touched: Vec<(Key, serde_json::Value)> = Vec::new();
     let mut reinstate: Vec<Key> = Vec::new();
-    let mut changed_all: Vec<Key> = Vec::new();
+    // Every key the source has moved, with what it now asserts and what the store holds.
+    let mut proposals: Vec<ProposedChange> = Vec::new();
     for (key, raw_value, standard_curve_id) in admitted {
         admitted_keys.insert(*key);
         // Keys outside the claimed window are plain appends and classify as new.
@@ -313,13 +320,14 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
                     outcome.unchanged += 1;
                 } else {
                     outcome.changed += 1;
-                    changed_all.push(*key);
                     if outcome.changed_keys.len() < 500 {
                         outcome.changed_keys.push(*key);
                     }
-                    if row.touched {
-                        changed_touched.push((*key, row.judgements.clone()));
-                    }
+                    proposals.push((
+                        *key,
+                        (*raw_value, *standard_curve_id),
+                        (row.raw_value, row.standard_curve_id),
+                    ));
                 }
                 // An honest window re-asserting a row clears its retraction, equal or corrected.
                 if row.withdrawn {
@@ -404,7 +412,6 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
             }
             None => {
                 outcome.braked = true;
-                outcome.apply_changed = false;
                 upsert_brake_hold(
                     conn,
                     stream_id,
@@ -421,12 +428,19 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
         }
     }
 
-    outcome.write_keys.extend(changed_all);
+    // A value the source has moved since river-data stored it is proposed, never written (Q84):
+    // the stored number changes when a person accepts the proposal, and the source re-asserting
+    // the same number every cycle re-proposes nothing.
+    for (key, proposed, stored_value) in &proposals {
+        if super::proposals::propose(conn, stream_id, *key, *proposed, *stored_value).await? {
+            outcome.proposals_awaiting += 1;
+        }
+        outcome.proposed += 1;
+    }
 
     // Curated rows never change servedness without a person: the withdrawal is not stamped and
-    // the disagreement lands in the review queue. A corrected value on a curated row IS applied
-    // (upstream owns the value; the flag still excludes it from serving), with the same hold so
-    // the operator re-rules on the new number.
+    // the disagreement lands in the review queue. A corrected value is a proposal for everyone,
+    // curated or not, so a curated row needs no hold of its own for it.
     for (key, judgements) in &withdraw_touched {
         upsert_source_modified_hold(
             conn,
@@ -441,20 +455,6 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
         .await?;
         outcome.holds_raised += 1;
     }
-    for (key, judgements) in &changed_touched {
-        upsert_source_modified_hold(
-            conn,
-            stream_id,
-            key.0,
-            serde_json::json!({ "claim": "value_changed", "replicate_index": key.1,
-                                "judgements": judgements }),
-            serde_json::json!({ "applied": true, "still_excluded_if_flagged": true }),
-            status,
-        )
-        .await?;
-        outcome.holds_raised += 1;
-    }
-
     // A withdrawal and a reinstatement are decisions of sync origin (ADR 0008): the source
     // retracted or re-asserted the row, and the record says so beside any operator's judgement.
     if !to_withdraw.is_empty() {
@@ -538,8 +538,8 @@ pub async fn write_receipt<C: ConnectionTrait>(
         "INSERT INTO ingest_receipts
              (stream_id, window_from, window_to, submitted, new_rows, changed, unchanged,
               retained, rejected_total, rejected, dropped, withdrawn, changed_keys, braked,
-              brake_threshold)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+              brake_threshold, proposed)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         [
             stream_id.into(),
             sea_orm::prelude::DateTimeWithTimeZone::from(window.from).into(),
@@ -558,6 +558,7 @@ pub async fn write_receipt<C: ConnectionTrait>(
             changed_keys.into(),
             outcome.braked.into(),
             (RECONCILE_BRAKE_FRACTION as f32).into(),
+            i32::try_from(outcome.proposed).unwrap_or(i32::MAX).into(),
         ],
     ))
     .await?;

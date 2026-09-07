@@ -423,3 +423,58 @@ async fn a_failed_job_is_announced_once_per_kind() {
         assert!(failed[0].subject.contains("measurement_retag"), "{}", failed[0].subject);
     }
 }
+
+/// Scenario: a cycle brings in a station's backlog and holds nothing for a decision.
+///
+/// Expected behaviour: the arrivals are the larger event and are announced (Q84), in the same
+/// message that carries what is waiting, and a service that synced nothing says nothing.
+#[tokio::test]
+#[serial]
+async fn a_cycle_that_added_readings_says_so_even_with_nothing_held() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    crate::common::exec(
+        &db,
+        "INSERT INTO sync_services (id, service_type, instance_id, status, created_at, updated_at) \
+         VALUES ('22222222-2222-2222-2222-222222222222', 'cnet', 'cnet-1', 'active', now(), now())",
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "INSERT INTO sync_events (service_id, event_type, status, readings_synced, started_at, completed_at) \
+         VALUES ('22222222-2222-2222-2222-222222222222', 'sync', 'completed', 4000, \
+                 NOW() - INTERVAL '5 minutes', NOW() - INTERVAL '4 minutes')",
+    )
+    .await;
+
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let channels: Vec<Box<dyn NotificationChannel>> =
+        vec![Box::new(MockChannel { sent: sent.clone() })];
+    triggers::run(&state, &channels).await;
+
+    {
+        let msgs = sent.lock().unwrap();
+        let changes = kinds(&msgs, "changes_pending");
+        assert_eq!(changes.len(), 1, "arrivals alone are announced: {msgs:?}");
+        assert!(
+            changes[0].body.contains("4,000") || changes[0].body.contains("4000"),
+            "the message names what arrived: {}",
+            changes[0].body
+        );
+        assert!(
+            changes[0].body.contains("cnet"),
+            "and which service brought it: {}",
+            changes[0].body
+        );
+    }
+
+    sent.lock().unwrap().clear();
+    triggers::run(&state, &channels).await;
+    assert!(
+        kinds(&sent.lock().unwrap(), "changes_pending").is_empty(),
+        "the same arrivals are not announced twice inside the window"
+    );
+}

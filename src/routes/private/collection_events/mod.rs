@@ -52,7 +52,7 @@ pub async fn recompute_collection_event(
         Some(event.site_id),
         &serde_json::json!({
             "collection_event_id": id,
-            "actor": crate::routes::private::tools::scripts::actor_label(&auth),
+            "actor": crate::common::actor::label(&auth),
         }),
         None,
     )
@@ -112,7 +112,7 @@ pub async fn stage_collection_event(
         )));
     }
 
-    let actor = crate::routes::private::tools::scripts::actor_label(&auth);
+    let actor = crate::common::actor::label(&auth);
     let collected_at = sea_orm::prelude::DateTimeWithTimeZone::from(req.collected_at);
     let row = state
         .db
@@ -223,7 +223,7 @@ pub async fn run_event_recompute(
             "start": req.start,
             "end": req.end,
             "only_findings": req.only_findings,
-            "actor": crate::routes::private::tools::scripts::actor_label(&auth),
+            "actor": crate::common::actor::label(&auth),
         }),
         None,
     )

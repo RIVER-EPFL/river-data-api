@@ -24,3 +24,4 @@ mod sync_full_reassert;
 mod scheduler;
 mod sync_maintenance;
 mod worker_pool;
+mod worker_timeline;

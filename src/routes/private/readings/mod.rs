@@ -9,6 +9,8 @@ pub mod import_job;
 pub mod ingest;
 pub mod measurement;
 pub mod model;
+pub mod ledger;
+pub mod proposals;
 pub mod provenance;
 pub mod reconcile;
 pub mod sample_groups;

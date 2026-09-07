@@ -25,16 +25,8 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::authz::AccessScope;
 use crate::common::middleware::{AuthContext, ProjectScope, enforce_project_scope_for_sites};
+use crate::common::paging::Window;
 use crate::error::{AppError, AppResult};
-
-/// Best-effort actor identity for the `acknowledged_by` audit field, as on alarm acknowledge.
-fn actor_label(auth: &AuthContext) -> String {
-    match auth {
-        AuthContext::Keycloak { email: Some(e), .. } => e.clone(),
-        AuthContext::Keycloak { .. } => "keycloak".to_string(),
-        AuthContext::ApiToken { token_id, .. } => format!("token:{token_id}"),
-    }
-}
 
 /// Confine a hold action to the caller's projects, resolved through the stream's paired site,
 /// as the readings flag handlers do. An unpaired stream's hold (deferred) belongs to no project,
@@ -853,7 +845,8 @@ pub struct HoldRow {
     pub id: Uuid,
     /// NULL on event-audit findings, which are keyed on (site, parameter, instant) instead.
     pub stream_id: Option<Uuid>,
-    /// `replicate_stats` | `source_modified` | `brake_fired` | `missing_output` | `stale_output`.
+    /// `replicate_stats` | `source_modified` | `brake_fired` | `missing_output` | `stale_output`
+    /// | `skipped_output`.
     pub kind: String,
     pub source_system: Option<String>,
     pub source_key: Option<String>,
@@ -1042,8 +1035,8 @@ pub async fn list_holds(
         }
     };
 
-    let page_size = query.page_size.unwrap_or(50).clamp(1, 500);
-    let offset = query.page.unwrap_or(1).max(1).saturating_sub(1) * page_size;
+    let window = Window::from_page(query.page, query.page_size, 50, 500);
+    let (limit, offset) = (window.limit, window.offset);
 
     let count_row = state
         .db
@@ -1097,7 +1090,7 @@ pub async fn list_holds(
              LEFT JOIN parameters ep ON ep.id = h.parameter_id
              WHERE {where_clause}
              ORDER BY {order_by}
-             LIMIT {page_size} OFFSET {offset}"
+             LIMIT {limit} OFFSET {offset}"
         ),
         binds.clone(),
     ))
@@ -1384,7 +1377,7 @@ pub async fn acknowledge_hold(
     axum::Extension(auth): axum::Extension<AuthContext>,
 ) -> AppResult<Json<AcknowledgeResponse>> {
     enforce_hold_scope(&state.db, &scope, id).await?;
-    accept_ours(&state, id, &actor_label(&auth)).await?;
+    accept_ours(&state, id, &crate::common::actor::label(&auth)).await?;
     Ok(Json(AcknowledgeResponse {
         acknowledged: 1,
         skipped_undeclared_estimator: 0,
@@ -1456,7 +1449,7 @@ pub async fn resolve_hold(
     Json(payload): Json<ResolveHoldRequest>,
 ) -> AppResult<Json<ResolveHoldResponse>> {
     enforce_hold_scope(&state.db, &scope, id).await?;
-    let by = actor_label(&auth);
+    let by = crate::common::actor::label(&auth);
     match payload.mode.as_str() {
         "ours" => {
             accept_ours(&state, id, &by).await?;
@@ -1969,7 +1962,7 @@ pub async fn reopen_hold(
     axum::Extension(auth): axum::Extension<AuthContext>,
 ) -> AppResult<Json<ResolveHoldResponse>> {
     enforce_hold_scope(&state.db, &scope, id).await?;
-    let by = actor_label(&auth);
+    let by = crate::common::actor::label(&auth);
     let reopened = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let hold = txn
             .query_one_raw(Statement::from_sql_and_values(
@@ -2198,7 +2191,7 @@ pub async fn acknowledge_holds_bulk(
     axum::Extension(auth): axum::Extension<AuthContext>,
     Json(payload): Json<BulkAcknowledgeRequest>,
 ) -> AppResult<Json<AcknowledgeResponse>> {
-    let by = actor_label(&auth);
+    let by = crate::common::actor::label(&auth);
     let mut binds: Vec<sea_orm::Value> = vec![by.clone().into()];
     let mut bounds = String::new();
     // A restricted caller acknowledges only holds whose stream is paired to a site in their

@@ -94,9 +94,13 @@ pub struct IngestResponse {
     /// Retained because the sync protocol (`river-data-core`) reports a held count per cycle.
     #[serde(default)]
     pub held: usize,
-    /// Windowed diff: stored rows whose source value changed, corrected in place.
+    /// Windowed diff: stored keys the source has moved since river-data stored them. Nothing is
+    /// written for them (Q84); `proposed` says how many are waiting for a person.
     #[serde(default)]
     pub changed: usize,
+    /// Windowed diff: changed keys recorded as proposals this pass, each awaiting a decision.
+    #[serde(default)]
+    pub proposed: usize,
     /// Windowed diff: stored rows absent from the claimed window, stamped withdrawn.
     #[serde(default)]
     pub withdrawn: usize,
@@ -211,6 +215,7 @@ pub async fn ingest_readings(
             skipped_reasons: Vec::new(),
             held: 0,
             changed: 0,
+            proposed: 0,
             withdrawn: 0,
             unchanged: 0,
             retained: 0,
@@ -676,7 +681,7 @@ pub async fn ingest_readings(
         || payload.window.is_some()
         || audited
     {
-        let actor = crate::routes::private::tools::scripts::actor_label(&auth);
+        let actor = crate::common::actor::label(&auth);
         let (n, diff, touched_events) = crate::common::bulk_write::guarded(db, async |txn| {
                 use crate::routes::private::readings::reconcile;
                 let diff = match &payload.window {
@@ -707,19 +712,17 @@ pub async fn ingest_readings(
                     }
                     None => None,
                 };
+                // A windowed pass writes only rows the store does not hold, so nothing it writes
+                // has a value to replace. An overwrite still replaces, which is what it is for.
                 let replace = if payload.overwrite {
-                    Replace::ValuesAndAttribution
-                } else if diff.as_ref().is_some_and(|d| d.apply_changed) {
-                    // The windowed path retires Replace::Nothing: a differing value is a correction
-                    // and it is applied, through the clause that never touches flags or sample links.
                     Replace::ValuesAndAttribution
                 } else {
                     Replace::Nothing
                 };
-                // Under a diff, only classified-new and applied-changed rows are written; an
-                // unchanged row re-written with identical values is a hypertable write, WAL and
-                // an upsert count that reads as effect, all for nothing. An overwrite is exempt:
-                // it exists to rewrite attribution, which the diff's value equality cannot see.
+                // Under a diff only classified-new rows are written: an unchanged row re-written
+                // with identical values is a hypertable write, WAL and an upsert count that reads
+                // as effect, all for nothing, and a changed one is a proposal (Q84). An overwrite
+                // is exempt: it exists to rewrite attribution, which value equality cannot see.
                 let filtered: Vec<readings::ActiveModel>;
                 let to_write: &[readings::ActiveModel] = match &diff {
                     Some(d) if !payload.overwrite => {
@@ -799,7 +802,7 @@ pub async fn ingest_readings(
                 // roll back with the writes. A braked pass withheld the corrections the claim
                 // describes, so the stored groups are not what the source asserted; the holds stand.
                 if let Some(audits) = payload.audit.as_deref().filter(|a| !a.is_empty())
-                    && diff.as_ref().is_none_or(|d| d.apply_changed)
+                    && diff.as_ref().is_none_or(|d| !d.braked)
                 {
                     run_replicate_audit(
                         txn,
@@ -854,13 +857,13 @@ pub async fn ingest_readings(
         insert_reading_chunks(db, &models, Replace::Nothing).await?
     };
 
-    let diff_changed = diff_outcome.as_ref().map_or(0, |d| d.changed);
     let diff_withdrawn = diff_outcome.as_ref().map_or(0, |d| d.withdrawn);
     let diff_reinstated = diff_outcome.as_ref().map_or(0, |d| d.reinstated);
     // What this pass did to served content, the gate every post-write side effect reads: a
-    // correction or a withdrawal with `inserted == 0` still rewrote history.
-    let moved = u64::try_from(inserted + diff_changed + diff_withdrawn + diff_reinstated)
-        .unwrap_or(u64::MAX);
+    // withdrawal with `inserted == 0` still rewrote history. A classified-changed key moved
+    // nothing here: it is a proposal until somebody accepts it, and the accept path does this
+    // work for the rows it writes.
+    let moved = u64::try_from(inserted + diff_withdrawn + diff_reinstated).unwrap_or(u64::MAX);
     let effect = moved > 0;
 
     let span = payload
@@ -874,7 +877,7 @@ pub async fn ingest_readings(
     // rollups have already materialised. The upsert leaves a hand-picked curve standing and this
     // correction resolved only a base, so the value is recomposed from whichever curves the row
     // ends up carrying, before the rollups read it back.
-    let corrected = (payload.overwrite && inserted > 0) || diff_changed > 0;
+    let corrected = payload.overwrite && inserted > 0;
     if corrected
         && let Some((lo, hi)) = span
         && let Err(e) = calibrations::service::recompose_from_own_curves_guarded(
@@ -933,7 +936,7 @@ pub async fn ingest_readings(
             recompute_derived: false,
             writer: crate::routes::private::collection_events::recompute::Writer::Person,
         },
-        &crate::routes::private::tools::scripts::actor_label(&auth),
+        &crate::common::actor::label(&auth),
     )
     .await?;
 
@@ -964,7 +967,7 @@ pub async fn ingest_readings(
                 && stripped_claims.is_empty()
                 && diff_outcome
                     .as_ref()
-                    .is_some_and(|d| !d.braked && d.holds_raised == 0)
+                    .is_some_and(|d| !d.braked && d.holds_raised == 0 && d.proposals_awaiting == 0)
         });
     let digest_changed = clean_digest.is_some() && stream.last_window_digest != clean_digest;
     if advance_cursor.is_some() || digest_changed {
@@ -1025,6 +1028,7 @@ pub async fn ingest_readings(
         // accurate account.
         outcome.inserted = d.new_rows;
         outcome.changed = d.changed;
+        outcome.proposed = d.proposed;
         outcome.withdrawn = d.withdrawn;
         outcome.unchanged = d.unchanged;
         outcome.retained = d.retained;
@@ -1121,6 +1125,7 @@ fn ingest_outcome(
         skipped_reasons,
         held: 0,
         changed: 0,
+        proposed: 0,
         withdrawn: 0,
         unchanged: 0,
         retained: 0,

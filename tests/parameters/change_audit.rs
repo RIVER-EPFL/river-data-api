@@ -108,3 +108,59 @@ async fn an_unknown_subject_is_an_empty_trail() {
             .is_empty()
     );
 }
+
+/// Scenario: a slot is declared by a route that owns its own transaction, not by CRUD.
+///
+/// Expected behaviour: the entry names who did it. The trigger reads `river.actor`, which only the
+/// request knows, so the write declares it on the transaction it runs in.
+#[tokio::test]
+#[serial]
+async fn a_route_that_owns_its_transaction_names_the_writer() {
+    use sea_orm::ConnectionTrait;
+    let (db, app, token) = setup().await;
+    let group_id = uuid::Uuid::new_v4();
+    let parameter_id = uuid::Uuid::new_v4();
+    for statement in [
+        format!(
+            "INSERT INTO parameters (id, code, name, category, created_at) \
+             VALUES ('{parameter_id}', 'ActorProbe', 'ActorProbe', 'measurement', NOW())"
+        ),
+        format!(
+            "INSERT INTO parameter_groups (id, code, label, ordinal, created_at) \
+             VALUES ('{group_id}', 'actor_grp', 'Actor group', 0, NOW())"
+        ),
+        format!(
+            "INSERT INTO parameter_group_members \
+                 (id, group_id, parameter_id, ordinal, role, created_at) \
+             VALUES (gen_random_uuid(), '{group_id}', '{parameter_id}', 0, 'output', NOW())"
+        ),
+    ] {
+        crate::common::exec(&db, &statement).await;
+    }
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sites/{}/parameter_groups", crate::common::SITE1_ID),
+        &json!({ "group_id": group_id }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let row = db
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT changed_by FROM change_audit \
+              WHERE change = 'site_parameter_insert' \
+              ORDER BY changed_at DESC LIMIT 1"
+                .to_string(),
+        ))
+        .await
+        .expect("the trail is readable")
+        .expect("the applied group left an entry");
+    let changed_by: Option<String> = row.try_get("", "changed_by").expect("changed_by");
+    assert!(
+        changed_by.as_deref().is_some_and(|a| a.starts_with("token:")),
+        "the entry names the caller, not nobody: {changed_by:?}"
+    );
+}

@@ -28,7 +28,7 @@ use crate::routes::private::{
     notes::Note,
     notifications::{NotificationLog, NotificationMute},
     parameters::Parameter,
-    parameters::derived::definition_model::DerivedParameterDefinition,
+    parameters::derived::definition_model::CalculationFormula,
     parameters::derived::source_model::DerivedParameterSource,
     parameters::groups::group_model::ParameterGroup,
     parameters::groups::member_model::ParameterGroupMember,
@@ -188,7 +188,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .nest("/standard_curves", field_crud(StandardCurve::router(db)))
         .nest(
             "/derived_parameters",
-            admin_write_crud(DerivedParameterDefinition::router(db)),
+            admin_write_crud(CalculationFormula::router(db)),
         )
         .nest(
             "/derived_parameter_sources",
@@ -489,6 +489,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .route(
             "/readings/provenance",
             get(crate::routes::private::readings::provenance::get_reading_provenance),
+        )
+        .route(
+            "/readings/ledger",
+            get(crate::routes::private::readings::ledger::get_reading_ledger),
         )
         .route(
             "/readings/decisions",

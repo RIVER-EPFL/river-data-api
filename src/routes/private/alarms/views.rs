@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::paging::Window;
 use crate::common::bulk;
 use crate::common::middleware::{AuthContext, ProjectScope};
 use crate::common::scope::{
@@ -693,15 +694,6 @@ async fn confine_alarm_event(
     require_row_in_scope(scope, &row, Unowned::Deny, "Alarm event")
 }
 
-/// Best-effort actor identity for the `acknowledged_by` audit field.
-fn actor_label(auth: &AuthContext) -> String {
-    match auth {
-        AuthContext::Keycloak { email: Some(e), .. } => e.clone(),
-        AuthContext::Keycloak { .. } => "keycloak".to_string(),
-        AuthContext::ApiToken { token_id, .. } => format!("token:{token_id}"),
-    }
-}
-
 /// Acknowledge an open alarm event
 ///
 /// Marks the open `alarm_event` as acknowledged by the calling user/token. Acknowledging does not
@@ -761,7 +753,7 @@ pub async fn acknowledge_alarm(
         }));
     }
 
-    let actor = actor_label(&auth);
+    let actor = crate::common::actor::label(&auth);
     let row = state
         .db
         .query_one_raw(Statement::from_sql_and_values(
@@ -1076,7 +1068,7 @@ pub async fn get_alarm_events(
     ProjectScope(scope): ProjectScope,
     Query(query): Query<AlarmEventsQuery>,
 ) -> AppResult<Json<AlarmEventsResponse>> {
-    let limit = query.limit.unwrap_or(200).min(1000);
+    let limit = Window::from_limit_offset(query.limit, None, 200, 1000).limit;
 
     let mut values: Vec<sea_orm::Value> = Vec::new();
     let mut conditions: Vec<String> = Vec::new();

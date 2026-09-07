@@ -49,9 +49,10 @@ pub struct Model {
     /// `/standard_curves/register` together with `source_system`.
     #[crudcrate(exclude(create, update), filterable)]
     pub source_key: Option<String>,
-    /// The curve this one was copied from, when readings were split onto another instrument and
-    /// took their correction with them (Q112). NULL on a curve that was fitted rather than copied.
-    #[crudcrate(exclude(create, update), filterable)]
+    /// The curve this one was copied from, stated by whoever made the copy: the split that moves
+    /// readings onto another instrument (Q112), or the copy dialog. NULL on a curve that was fitted
+    /// rather than copied, and frozen once stored.
+    #[crudcrate(exclude(update), filterable)]
     pub copied_from_id: Option<Uuid>,
 }
 
@@ -65,6 +66,12 @@ pub enum Relation {
     Sensor,
     #[sea_orm(has_many = "crate::routes::private::readings::Entity")]
     Readings,
+    #[sea_orm(
+        belongs_to = "Entity",
+        from = "Column::CopiedFromId",
+        to = "Column::Id"
+    )]
+    CopiedFrom,
 }
 
 impl Related<crate::routes::private::sensors::Entity> for Entity {

@@ -969,7 +969,7 @@ pub async fn insert_grab_samples(
         payload.tool_run_id,
         site.id,
         &payload.readings,
-        &crate::routes::private::tools::scripts::actor_label(&auth),
+        &crate::common::actor::label(&auth),
     )
     .await?;
 
@@ -1225,7 +1225,7 @@ pub async fn insert_grab_samples(
 
     // One guarded transaction: a replace on a compressed chunk must not fail on the cap, and the
     // delete, the sample rows and the insert land together or not at all.
-    let actor = crate::routes::private::tools::scripts::actor_label(&auth);
+    let actor = crate::common::actor::label(&auth);
     let (inserted, replaced, kept_curated, created_sample_ids, touched_events) =
         crate::common::bulk_write::guarded(&state.db, async |txn| {
             // A replace deletes the rows carrying the group's label, notes, authorship and blob,
@@ -1585,7 +1585,7 @@ pub async fn insert_grab_samples(
             recompute_derived: false,
             writer,
         },
-        &crate::routes::private::tools::scripts::actor_label(&auth),
+        &crate::common::actor::label(&auth),
     )
     .await?;
 

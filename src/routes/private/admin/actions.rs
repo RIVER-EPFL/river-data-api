@@ -1319,8 +1319,27 @@ pub struct OrphanedCorrection {
     pub last_time: chrono::DateTime<chrono::Utc>,
 }
 
+/// Readings corrected by a curve their own instrument does not own, grouped by the pair.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ForeignCurveUse {
+    /// The instrument the readings name.
+    pub sensor_id: Option<Uuid>,
+    /// The curve they are corrected by, which belongs to `curve_sensor_id`.
+    pub standard_curve_id: Uuid,
+    pub curve_sensor_id: Uuid,
+    pub curve_name: Option<String>,
+    pub site_id: Option<Uuid>,
+    pub parameter_id: Option<Uuid>,
+    pub count: i64,
+    pub first_time: chrono::DateTime<chrono::Utc>,
+    pub last_time: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CalibrationBackfillCandidatesResponse {
+    /// Readings corrected by a curve their own instrument does not own. Report-only.
+    pub foreign_curve_uses: Vec<ForeignCurveUse>,
+    pub total_foreign_curve_uses: i64,
     pub candidates: Vec<CalibrationBackfillCandidate>,
     pub total_candidates: usize,
     pub total_uncalibrated: i64,
@@ -1442,6 +1461,68 @@ async fn fetch_calibration_candidates(
 /// `since` bounds the read, and with it the counts. This half has no selective predicate at all,
 /// so it reads its whole window whether or not anything is wrong; the floor is the only thing
 /// keeping that off the rest of the history.
+/// Readings whose standard curve belongs to another instrument. Read-only: which side is wrong is
+/// a judgement (the reading was split, or the curve was), and the repair is the pin's own
+/// `curves` choice.
+async fn fetch_foreign_curve_uses(
+    db: &sea_orm::DatabaseConnection,
+    scope: &AccessScope,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> AppResult<Vec<ForeignCurveUse>> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let time_filter = scan_floor_sql(since, &mut values);
+    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
+        .map(|predicate| {
+            format!("AND EXISTS (SELECT 1 FROM sites s WHERE s.id = r.site_id AND {predicate})")
+        })
+        .unwrap_or_default();
+    let sql = format!(
+        r"SELECT r.sensor_id, sc.id AS standard_curve_id, sc.sensor_id AS curve_sensor_id,
+                 sc.name AS curve_name, r.site_id, r.parameter_id, COUNT(*) AS n,
+                 MIN(r.time) AS first_time, MAX(r.time) AS last_time
+          FROM readings r
+          JOIN standard_curves sc ON sc.id = r.standard_curve_id
+          WHERE {foreign}
+          {time_filter}
+          {project_filter}
+          GROUP BY r.sensor_id, sc.id, sc.sensor_id, sc.name, r.site_id, r.parameter_id
+          ORDER BY COUNT(*) DESC",
+        foreign =
+            crate::routes::private::sensors::calibrations::service::foreign_curve_rows("r", "sc"),
+    );
+
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+    rows.iter()
+        .map(|r| {
+            Ok(ForeignCurveUse {
+                sensor_id: r.try_get("", "sensor_id")?,
+                standard_curve_id: r.try_get("", "standard_curve_id")?,
+                curve_sensor_id: r.try_get("", "curve_sensor_id")?,
+                curve_name: r.try_get("", "curve_name")?,
+                site_id: r.try_get("", "site_id")?,
+                parameter_id: r.try_get("", "parameter_id")?,
+                count: r.try_get("", "n")?,
+                first_time: r
+                    .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "first_time")?
+                    .with_timezone(&chrono::Utc),
+                last_time: r
+                    .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "last_time")?
+                    .with_timezone(&chrono::Utc),
+            })
+        })
+        .collect()
+}
+
 async fn fetch_orphaned_corrections(
     db: &sea_orm::DatabaseConnection,
     scope: &AccessScope,
@@ -1522,14 +1603,18 @@ pub async fn calibration_candidates(
     let candidates = fetch_calibration_candidates(&app_state.db, &scope, scanned_from).await?;
     let orphaned_corrections =
         fetch_orphaned_corrections(&app_state.db, &scope, scanned_from).await?;
+    let foreign_curve_uses = fetch_foreign_curve_uses(&app_state.db, &scope, scanned_from).await?;
     let total_uncalibrated: i64 = candidates.iter().map(|c| c.uncalibrated_count).sum();
     let total_orphaned_corrections: i64 = orphaned_corrections.iter().map(|c| c.count).sum();
+    let total_foreign_curve_uses: i64 = foreign_curve_uses.iter().map(|c| c.count).sum();
     Ok(Json(CalibrationBackfillCandidatesResponse {
         total_candidates: candidates.len(),
         total_uncalibrated,
         candidates,
         total_orphaned_corrections,
         orphaned_corrections,
+        total_foreign_curve_uses,
+        foreign_curve_uses,
         scanned_from,
     }))
 }

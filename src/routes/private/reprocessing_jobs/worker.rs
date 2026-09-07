@@ -70,6 +70,8 @@ struct Claimed {
     trigger_type: String,
     lease_epoch: i64,
     params: serde_json::Value,
+    /// Attempts already spent on this row, so the timeline says which try it is watching.
+    retry_count: i32,
 }
 
 /// Claim one due `queued` row or one orphaned `running` row (the reaper arm), stamping this
@@ -101,7 +103,7 @@ async fn claim_one(
                  lease_expires_at = now() + (interval '1 second' * $2) \
              FROM claimable c \
              WHERE j.id = c.id \
-             RETURNING j.id, j.trigger_type, j.lease_epoch, j.params",
+             RETURNING j.id, j.trigger_type, j.lease_epoch, j.params, j.retry_count",
             [worker_id.into(), LEASE_SECONDS.into()],
         ))
         .await?;
@@ -112,6 +114,7 @@ async fn claim_one(
             trigger_type: r.try_get("", "trigger_type")?,
             lease_epoch: r.try_get("", "lease_epoch")?,
             params: r.try_get("", "params")?,
+            retry_count: r.try_get("", "retry_count").unwrap_or(0),
         })),
         None => Ok(None),
     }
@@ -262,6 +265,19 @@ async fn execute(
         events.clone(),
         claimed.params.clone(),
     );
+    // The two lines every run owes its timeline. A job body says what only it knows; that a run
+    // started and how it ended is the worker's to say, so a silent job is impossible.
+    let timeline = ctx.clone();
+    timeline
+        .log(
+            "info",
+            &format!("{} started", claimed.trigger_type),
+            serde_json::json!({
+                "trigger_type": claimed.trigger_type,
+                "attempt": claimed.retry_count + 1,
+            }),
+        )
+        .await;
     let hb = tokio::spawn(heartbeat(
         db.clone(),
         claimed.id,
@@ -301,6 +317,13 @@ async fn execute(
                 "completed"
             };
             let readings = i32::try_from(count).unwrap_or(i32::MAX);
+            timeline
+                .log(
+                    "info",
+                    &format!("{} {status}", claimed.trigger_type),
+                    serde_json::json!({ "status": status, "reported": count }),
+                )
+                .await;
             let owned =
                 commit_terminal(db, &claimed, worker_id, status, Some(readings), None).await?;
             if owned {
@@ -321,6 +344,18 @@ async fn execute(
         }
         Err(e) => {
             let message = e.to_string();
+            let outcome = if policy.max_retries > u32::try_from(claimed.retry_count).unwrap_or(0) {
+                "retrying"
+            } else {
+                "failed"
+            };
+            timeline
+                .log(
+                    if outcome == "failed" { "error" } else { "warn" },
+                    &format!("{} {outcome}", claimed.trigger_type),
+                    serde_json::json!({ "status": outcome, "error": message }),
+                )
+                .await;
             // Announce the failure the way the success arm announces completion: a watcher that only
             // sees `JobCompleted` learns nothing of a run that failed or is waiting out its backoff.
             match reschedule_or_fail(db, &claimed, worker_id, policy, &message)

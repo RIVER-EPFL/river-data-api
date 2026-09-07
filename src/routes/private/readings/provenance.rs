@@ -463,7 +463,7 @@ pub fn untold_rows_sql() -> String {
          OR r.provenance_kind = 'migration'
          OR (r.provenance_kind IN ('tool_run', 'chain', 'csv_import') AND r.provenance IS NULL)
          OR (r.provenance_kind = 'derived' AND NOT EXISTS (
-                SELECT 1 FROM derived_parameter_definitions d
+                SELECT 1 FROM calculation_formulas d
                  WHERE d.output_parameter_id = r.parameter_id))"
         .to_string()
 }
@@ -490,10 +490,10 @@ pub async fn untold_count<C: sea_orm::ConnectionTrait>(conn: &C) -> crate::error
 
 #[derive(Debug, FromQueryResult)]
 pub struct RawRow {
-    stream_id: Uuid,
+    pub stream_id: Uuid,
     replicate_index: i16,
-    site_id: Option<Uuid>,
-    parameter_id: Option<Uuid>,
+    pub site_id: Option<Uuid>,
+    pub parameter_id: Option<Uuid>,
     raw_value: f64,
     calibrated_value: Option<f64>,
     sensor_id: Option<Uuid>,
@@ -503,14 +503,14 @@ pub struct RawRow {
     measurement_type: Option<String>,
     is_flagged: Option<bool>,
     flag_reason: Option<String>,
-    sample_id: Option<Uuid>,
-    collection_event_id: Option<Uuid>,
+    pub sample_id: Option<Uuid>,
+    pub collection_event_id: Option<Uuid>,
     withdrawn_at: Option<DateTime<Utc>>,
     unverified: Option<bool>,
     withdrawn_reason: Option<String>,
     ingested_at: Option<DateTime<Utc>>,
     provenance_kind: Option<String>,
-    provenance: Option<serde_json::Value>,
+    pub provenance: Option<serde_json::Value>,
     derived_version_id: Option<Uuid>,
     label: Option<String>,
     notes: Option<String>,
@@ -542,66 +542,7 @@ pub async fn get_reading_provenance(
     ProjectScope(scope): ProjectScope,
     Query(q): Query<ProvenanceQuery>,
 ) -> AppResult<Json<ProvenanceResponse>> {
-    let rows: Vec<RawRow> = match (q.stream_id, q.site_id, q.parameter_id) {
-        (Some(stream_id), _, _) => {
-            let stmt = Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    "SELECT {ROW_COLUMNS} FROM readings WHERE stream_id = $1 AND time = $2 \
-                     ORDER BY replicate_index"
-                ),
-                [stream_id.into(), q.time.into()],
-            );
-            state.db.query_all_raw(stmt).await?
-        }
-        (None, Some(site_id), Some(parameter_id)) => {
-            let cadence = match q.measurement_type.as_deref() {
-                None => String::new(),
-                // The same word the readings query serves under: everything that is not a grab.
-                // A derived row plots on the continuous line, so a chart that drew it must be able
-                // to resolve the point it drew.
-                Some("continuous") => " AND (measurement_type IS DISTINCT FROM 'spot')".into(),
-                Some(other) => format!(" AND measurement_type = '{}'", sanitize_cadence(other)?),
-            };
-            let stmt = Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    "SELECT {ROW_COLUMNS} FROM readings \
-                     WHERE site_id = $1 AND parameter_id = $2 AND time = $3{cadence} \
-                     ORDER BY stream_id, replicate_index"
-                ),
-                [site_id.into(), parameter_id.into(), q.time.into()],
-            );
-            state.db.query_all_raw(stmt).await?
-        }
-        _ => {
-            return Err(AppError::BadRequest(
-                "Provide either stream_id or both site_id and parameter_id".to_string(),
-            ));
-        }
-    }
-    .iter()
-    .map(|row| RawRow::from_query_result(row, ""))
-    .collect::<Result<_, _>>()?;
-
-    if rows.is_empty() {
-        return Err(AppError::NotFound("No reading at that instant".to_string()));
-    }
-
-    // A project-scoped key sees another project's data (or unattributed rows) as not-found.
-    if scope.is_restricted() {
-        let project = match rows.iter().find_map(|r| r.site_id) {
-            Some(site_id) => sites::Entity::find_by_id(site_id)
-                .one(&state.db)
-                .await?
-                .and_then(|s| s.project_id),
-            None => None,
-        };
-        if !scope.allows_project_opt(project) {
-            return Err(AppError::NotFound("No reading at that instant".to_string()));
-        }
-    }
-
+    let rows = rows_at(&state.db, &q, &scope).await?;
     let records = assemble_records(&state.db, &rows, q.time).await?;
 
     let site_id = rows.iter().find_map(|r| r.site_id).or(q.site_id);
@@ -624,6 +565,76 @@ pub async fn get_reading_provenance(
         duplicate_slot: records.len() > 1,
         records,
     }))
+}
+
+/// The replicate group at the instant, by either key form, refused to a scoped caller who may not
+/// see it. Both the record and the ledger start from these rows, so they can never disagree about
+/// which reading was asked for.
+pub async fn rows_at(
+    db: &sea_orm::DatabaseConnection,
+    q: &ProvenanceQuery,
+    scope: &crate::common::authz::AccessScope,
+) -> AppResult<Vec<RawRow>> {
+    let rows: Vec<RawRow> = match (q.stream_id, q.site_id, q.parameter_id) {
+        (Some(stream_id), _, _) => {
+            let stmt = Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT {ROW_COLUMNS} FROM readings WHERE stream_id = $1 AND time = $2 \
+                     ORDER BY replicate_index"
+                ),
+                [stream_id.into(), q.time.into()],
+            );
+            db.query_all_raw(stmt).await?
+        }
+        (None, Some(site_id), Some(parameter_id)) => {
+            let cadence = match q.measurement_type.as_deref() {
+                None => String::new(),
+                // The same word the readings query serves under: everything that is not a grab.
+                // A derived row plots on the continuous line, so a chart that drew it must be able
+                // to resolve the point it drew.
+                Some("continuous") => " AND (measurement_type IS DISTINCT FROM 'spot')".into(),
+                Some(other) => format!(" AND measurement_type = '{}'", sanitize_cadence(other)?),
+            };
+            let stmt = Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT {ROW_COLUMNS} FROM readings \
+                     WHERE site_id = $1 AND parameter_id = $2 AND time = $3{cadence} \
+                     ORDER BY stream_id, replicate_index"
+                ),
+                [site_id.into(), parameter_id.into(), q.time.into()],
+            );
+            db.query_all_raw(stmt).await?
+        }
+        _ => {
+            return Err(AppError::BadRequest(
+                "Provide either stream_id or both site_id and parameter_id".to_string(),
+            ));
+        }
+    }
+    .iter()
+    .map(|row| RawRow::from_query_result(row, ""))
+    .collect::<Result<_, _>>()?;
+
+    if rows.is_empty() {
+        return Err(AppError::NotFound("No reading at that instant".to_string()));
+    }
+
+    // A project-scoped key sees another project's data (or unattributed rows) as not-found.
+    if scope.is_restricted() {
+        let project = match rows.iter().find_map(|r| r.site_id) {
+            Some(site_id) => sites::Entity::find_by_id(site_id)
+                .one(db)
+                .await?
+                .and_then(|s| s.project_id),
+            None => None,
+        };
+        if !scope.allows_project_opt(project) {
+            return Err(AppError::NotFound("No reading at that instant".to_string()));
+        }
+    }
+    Ok(rows)
 }
 
 /// The readings of one instant, grouped by stream into assembled records. Every lookup is batched
@@ -923,7 +934,7 @@ pub async fn records_for_event(
         .collect())
 }
 
-fn run_id_of(blob: Option<&serde_json::Value>) -> Option<Uuid> {
+pub fn run_id_of(blob: Option<&serde_json::Value>) -> Option<Uuid> {
     blob?
         .get("run_id")
         .and_then(|v| v.as_str())
@@ -1114,7 +1125,7 @@ async fn fetch_calculations(
             "SELECT d.id, d.code, d.name, d.output_parameter_id, \
                     (SELECT max(v.version_no) FROM derived_parameter_definition_versions v \
                       WHERE v.definition_id = d.id) AS active_version_no \
-               FROM derived_parameter_definitions d \
+               FROM calculation_formulas d \
               WHERE d.output_parameter_id = ANY($1)",
             [parameter_ids.into()],
         ))

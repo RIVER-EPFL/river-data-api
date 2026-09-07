@@ -24,7 +24,7 @@ fn manifest() -> serde_json::Value {
     json!({
         "label": "NA probe",
         "params": [{ "name": "t", "label": "T", "kind": "number", "required": true }],
-        "event_inputs": [{ "param": "t", "parameter_id": GLOBAL_PARAM_TEMP_ID }],
+        "event_inputs": [{ "param": "t", "parameter_code": "DO_Temperature" }],
         "outputs": [{ "key": "out", "label": "Out", "parameter_id": GLOBAL_PARAM_DO_ID }],
     })
 }

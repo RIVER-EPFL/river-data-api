@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Generate docs/schema.md and docs/schema.mmd from a migrated database.
+"""Generate the schema documents under docs/ from a migrated database.
 
-Reads DATABASE_URL, introspects the public schema, and writes one Mermaid entity
-relationship diagram per subject area plus a column reference for every table.
-Tables absent from AREAS land in the trailing catch-all, so a new migration always
-shows up somewhere.
+Reads DATABASE_URL, introspects the public schema, and writes schema.md (one Mermaid
+entity relationship diagram per subject area plus a column reference for every table),
+schema.dot and schema-core.dot, and the SVG each DOT renders to. Tables absent from
+AREAS land in the trailing catch-all, so a new migration always shows up somewhere.
 """
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 from collections import defaultdict
@@ -31,7 +32,7 @@ AREAS = [
         "reading_decision_sets",
     ]),
     ("Derived parameters and tools", [
-        "derived_parameter_definitions", "derived_parameter_sources", "tool_scripts",
+        "calculation_formulas", "derived_parameter_sources", "tool_scripts",
         "tool_script_versions", "tool_script_activations", "tool_runs",
     ]),
     ("Alarms and notifications", [
@@ -69,7 +70,7 @@ TIERS = [
         "data_streams", "readings", "status_events", "samples", "collection_events",
     ]),
     ("catalog", "Catalog", "definitions the core points at", "#dfeee2", "#2f6b45", [
-        "constants", "derived_parameter_definitions", "derived_parameter_sources",
+        "constants", "calculation_formulas", "derived_parameter_sources",
         "alarm_thresholds", "tool_scripts", "tool_script_versions", "tool_script_activations",
     ]),
     ("record", "Record", "evidence about readings: provenance and curation", "#f6e8d5", "#c77700", [
@@ -101,18 +102,29 @@ TYPE_SHORT = {
 ROOT = Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
 
+FIELD_SEPARATOR = "\x1f"
+RECORD_SEPARATOR = "\x1e"
+
 
 def query(sql):
+    """Rows as lists of fields, delimited by bytes no SQL value can contain.
+
+    A generated column's expression prints over several lines, so a newline cannot be the
+    record separator.
+    """
     url = os.environ.get("DATABASE_URL")
     if not url:
         sys.exit("DATABASE_URL is not set")
     out = subprocess.run(
-        ["psql", url, "-tAF\x1f", "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-c", sql],
+        ["psql", url, "-tA", "-F", FIELD_SEPARATOR, "-R", RECORD_SEPARATOR,
+         "--no-psqlrc", "-v", "ON_ERROR_STOP=1", "-c", sql],
         capture_output=True, text=True,
     )
     if out.returncode != 0:
         sys.exit(out.stderr.strip())
-    return [line.split("\x1f") for line in out.stdout.splitlines() if line]
+    # psql separates records rather than terminating them, and ends the output with a newline.
+    return [record.split(FIELD_SEPARATOR)
+            for record in out.stdout.rstrip("\n").split(RECORD_SEPARATOR) if record]
 
 
 def short_type(name):
@@ -208,7 +220,34 @@ def collect():
 
     head = query("SELECT max(version) FROM seaql_migrations")[0][0]
 
+    verify(tables, columns)
     return tables, columns, primary, foreign, hypertables, aggregates, head
+
+
+def verify(tables, columns):
+    """Refuse to write documents that disagree with `information_schema`.
+
+    The introspection above reads `pg_catalog` for the defaults and the generated expressions
+    `information_schema` does not carry, so the two are compared once per run.
+    """
+    declared = defaultdict(set)
+    for table, column in query(
+        "SELECT c.table_name, c.column_name FROM information_schema.columns c "
+        "JOIN information_schema.tables t ON t.table_schema = c.table_schema "
+        "AND t.table_name = c.table_name "
+        "WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE'"
+    ):
+        if table not in SKIP:
+            declared[table].add(column)
+    drawn = {t: {c["name"] for c in columns[t]} for t in tables}
+    if declared.keys() - drawn.keys():
+        sys.exit(f"tables missing from the diagram: {sorted(declared.keys() - drawn.keys())}")
+    for table in sorted(drawn):
+        if drawn[table] != declared[table]:
+            sys.exit(
+                f"{table} columns disagree with information_schema: "
+                f"{sorted(drawn[table] ^ declared[table])}"
+            )
 
 
 def diagram(members, columns, primary, foreign, scoped, isolate=False):
@@ -343,6 +382,20 @@ def dot_diagram(tables, columns, primary, foreign, clustered=True):
     return "\n".join(lines)
 
 
+def render(name):
+    """The SVG a reader opens, from the DOT just written. Skipped where Graphviz is absent."""
+    if not shutil.which("dot"):
+        print(f"graphviz is not installed, {name}.svg not rendered", file=sys.stderr)
+        return None
+    out = subprocess.run(
+        ["dot", "-Tsvg", "-o", str(DOCS / f"{name}.svg"), str(DOCS / f"{name}.dot")],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0:
+        sys.exit(out.stderr.strip())
+    return f"{name}.svg"
+
+
 def main():
     tables, columns, primary, foreign, hypertables, aggregates, head = collect()
 
@@ -403,7 +456,7 @@ def main():
             out.append("|--------|------|------|---------|------------|")
             for column in columns[table]:
                 key = "PK " if column["name"] in primary[table] else ""
-                default = column["default"].replace("|", "\\|")
+                default = " ".join(column["default"].split()).replace("|", "\\|")
                 default = f"`{default}`" if default else ""
                 refs = ", ".join(f"`{r}`" for r in fk_index[(table, column["name"])])
                 out.append(
@@ -421,7 +474,9 @@ def main():
     (DOCS / "schema-core.dot").write_text(
         dot_diagram(core, columns, primary, foreign, clustered=False) + "\n"
     )
-    print(f"wrote schema.md, schema.dot and schema-core.dot ({len(tables)} tables)")
+    rendered = [render(name) for name in ("schema", "schema-core")]
+    written = ["schema.md", "schema.dot", "schema-core.dot"] + [r for r in rendered if r]
+    print(f"wrote {', '.join(written)} ({len(tables)} tables)")
 
 
 if __name__ == "__main__":

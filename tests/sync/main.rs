@@ -7,18 +7,21 @@
 mod common;
 
 mod annotations_register;
+mod change_proposals;
 mod control_plane;
+mod control_plane_client;
 mod credential_listing_gate;
 mod credentials;
 mod duplicate_slots;
+mod fake_portal_cycle;
 mod hold_kinds;
 mod notes_register;
 mod pagination;
 mod pagination_bounds;
 mod pairing_backfill_parity;
 mod pairing_plan_apply;
-mod pairing_plan_resolution;
 mod pairing_plan_hardening;
+mod pairing_plan_resolution;
 mod plan_instrument_decisions;
 mod plan_review_progress;
 mod replicate_audit;

@@ -906,7 +906,7 @@ pub async fn insert_batch_readings(
     // hypertable older than the compression policy means decompressing them, and the per-statement
     // cap refuses that outside a transaction that lifts it. Chunking stays, so the statement size
     // is bounded; the transaction is what makes a part-written correction impossible.
-    let actor = crate::routes::private::tools::scripts::actor_label(&auth);
+    let actor = crate::common::actor::label(&auth);
     let touched_events;
     (inserted, overwritten, touched_events) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let mut inserted = 0usize;
@@ -1125,7 +1125,7 @@ pub async fn insert_batch_readings(
             recompute_derived: false,
             writer: crate::routes::private::collection_events::recompute::Writer::Person,
         },
-        &crate::routes::private::tools::scripts::actor_label(&auth),
+        &crate::common::actor::label(&auth),
     )
     .await?;
 

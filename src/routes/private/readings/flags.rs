@@ -12,7 +12,7 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::collection_events::recompute;
 use crate::routes::private::readings::decisions::{self, Kind, Origin};
 use crate::routes::private::readings::tail;
-use crate::routes::private::tools::scripts::actor_label;
+use crate::common::actor::label;
 
 /// Keys per statement. A statement is one OR-chain, and each term carries `time = $n` equality, so
 /// chunk exclusion prunes; the bound is on statement size, not on correctness.
@@ -333,7 +333,7 @@ pub async fn flag_readings(
     let updated = apply_flags(
         &state,
         &scope,
-        &actor_label(&auth),
+        &label(&auth),
         &payload.readings,
         FlagWrite::Set(payload.reason.clone()),
     )
@@ -366,7 +366,7 @@ pub async fn unflag_readings(
     let updated = apply_flags(
         &state,
         &scope,
-        &actor_label(&auth),
+        &label(&auth),
         &payload.readings,
         FlagWrite::Clear,
     )
@@ -448,7 +448,7 @@ pub async fn flag_range(
     let updated = apply_flags_over_range(
         &state,
         &scope,
-        &actor_label(&auth),
+        &label(&auth),
         range,
         &FlagWrite::Set(payload.reason.clone()),
     )
@@ -507,7 +507,7 @@ pub async fn unflag_range(
     let updated = apply_flags_over_range(
         &state,
         &scope,
-        &actor_label(&auth),
+        &label(&auth),
         range,
         &FlagWrite::Clear,
     )

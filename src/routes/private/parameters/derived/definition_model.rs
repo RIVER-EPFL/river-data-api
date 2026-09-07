@@ -1,18 +1,18 @@
 use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
 
-use super::operations::DerivedParameterDefinitionOperations;
+use super::operations::CalculationFormulaOperations;
 
 #[derive(
     Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
 )]
-#[sea_orm(table_name = "derived_parameter_definitions")]
+#[sea_orm(table_name = "calculation_formulas")]
 #[crudcrate(
-    api_struct = "DerivedParameterDefinition",
-    name_singular = "derived_parameter_definition",
-    name_plural = "derived_parameter_definitions",
+    api_struct = "CalculationFormula",
+    name_singular = "calculation_formula",
+    name_plural = "calculation_formulas",
     generate_router,
-    operations = DerivedParameterDefinitionOperations,
+    operations = CalculationFormulaOperations,
     derive_partial_eq
 )]
 pub struct Model {

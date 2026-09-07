@@ -90,6 +90,32 @@ async fn reprocess_after_calibration_write(
     Ok(())
 }
 
+/// How many readings hold a live `calibration_pin` naming this curve, or `None` when there are
+/// none. The repoint that clears the way for the delete excludes pinned rows, so each one still
+/// names the curve when the DELETE runs and the foreign key refuses the statement.
+async fn pinned_readings(db: &DatabaseConnection, id: Uuid) -> Result<Option<i64>, ApiError> {
+    let sql = format!(
+        "SELECT count(*) AS n FROM readings r
+         WHERE r.calibration_id = $1 AND NOT ({not_pinned})",
+        not_pinned = crate::routes::private::readings::decisions::not_pinned_sql(
+            "r",
+            crate::routes::private::readings::decisions::Kind::CalibrationPin
+        ),
+    );
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            [id.into()],
+        ))
+        .await
+        .map_err(ApiError::database)?;
+    let n = row
+        .and_then(|r| r.try_get::<i64>("", "n").ok())
+        .unwrap_or_default();
+    Ok((n > 0).then_some(n))
+}
+
 #[async_trait]
 impl CRUDOperations for SensorCalibrationOperations {
     type Resource = SensorCalibration;
@@ -222,6 +248,15 @@ impl CRUDOperations for SensorCalibrationOperations {
             ));
         };
         let sensor_id = row.sensor_id;
+
+        if let Some(pinned) = pinned_readings(db, id).await? {
+            return Err(ApiError::bad_request(format!(
+                "Calibration {id} is pinned to {pinned} reading{plural}, so it cannot be deleted: \
+                 a pin is attribution a person decided and the repoint leaves it alone. Roll the \
+                 pin back first, then delete the curve.",
+                plural = if pinned == 1 { "" } else { "s" }
+            )));
+        }
 
         // The readings this curve corrected move onto whichever of the sensor's remaining curves
         // covers their time, value recomputed in the same statement, before the row goes. A

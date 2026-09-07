@@ -118,17 +118,10 @@ async fn distinct_peers_get_distinct_buckets() {
     )
     .await;
 
-    let app = crate::common::build_test_app_with_rate_limiting(db);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(listener, river_db::routes::connected_service(app))
-            .await
-            .unwrap();
-    });
+    let base = crate::common::serve(crate::common::build_test_app_with_rate_limiting(db)).await;
 
     let url = format!(
-        "http://127.0.0.1:{port}/api/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z"
+        "{base}/api/public/test-river/sites/upstream/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T12:00:00Z"
     );
     let from = |ip: std::net::Ipv4Addr| {
         reqwest::Client::builder()

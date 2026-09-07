@@ -17,30 +17,10 @@ use super::{
     tokens_model as sync_service_tokens,
 };
 use crate::common::AppState;
+use crate::common::paging::{Window, content_range};
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sync::control::tokens::generate_token;
-
-/// `Content-Range: items {start}-{end}/{total}` with an inclusive end, per RFC 7233, plus the
-/// CORS expose header a browser needs to read it. Both list endpoints share this so their
-/// pagination cannot drift apart.
-fn content_range_headers(page: u64, per_page: u64, returned: usize, total: u64) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    let range_value = if returned == 0 {
-        format!("items */{total}")
-    } else {
-        let start = page * per_page;
-        let end = start + returned as u64 - 1;
-        format!("items {start}-{end}/{total}")
-    };
-    if let Ok(value) = range_value.parse() {
-        headers.insert("Content-Range", value);
-    }
-    if let Ok(value) = "Content-Range".parse() {
-        headers.insert("Access-Control-Expose-Headers", value);
-    }
-    headers
-}
 
 // ============================================================================
 // Response Types
@@ -250,25 +230,33 @@ fn default_page() -> u64 {
     1
 }
 fn default_per_page() -> u64 {
-    25
+    DEFAULT_PER_PAGE
 }
+
+/// Page size a caller naming none is served.
+const DEFAULT_PER_PAGE: u64 = 25;
 
 /// Largest page either listing will serve.
 const MAX_PER_PAGE: u64 = 100;
 
 impl PaginationQuery {
-    /// The zero-based page index and page size to query with.
+    /// The window to query with.
     ///
     /// An oversized page is clamped, but a page size of zero is refused: `Paginator::paginate`
     /// asserts a non-zero size, so a silent clamp would turn a caller's mistake into a page they
     /// did not ask for while a panic would take the request down with no answer.
-    fn resolve(&self) -> AppResult<(u64, u64)> {
+    fn resolve(&self) -> AppResult<Window> {
         if self.per_page == 0 {
             return Err(AppError::BadRequest(
                 "per_page must be at least 1".to_string(),
             ));
         }
-        Ok((self.page.max(1) - 1, self.per_page.min(MAX_PER_PAGE)))
+        Ok(Window::from_page(
+            Some(self.page),
+            Some(self.per_page),
+            DEFAULT_PER_PAGE,
+            MAX_PER_PAGE,
+        ))
     }
 }
 
@@ -541,21 +529,21 @@ pub async fn list_commands(
 ) -> AppResult<(StatusCode, HeaderMap, Json<Vec<SyncCommandResponse>>)> {
     use sea_orm::PaginatorTrait;
 
-    let (page, per_page) = params.resolve()?;
+    let window = params.resolve()?;
 
     let paginator = sync_commands::Entity::find()
         .order_by_desc(sync_commands::Column::CreatedAt)
-        .paginate(&state.db, per_page);
+        .paginate(&state.db, window.limit);
 
     let total = paginator.num_items().await?;
     let commands: Vec<SyncCommandResponse> = paginator
-        .fetch_page(page)
+        .fetch_page(window.page() - 1)
         .await?
         .into_iter()
         .map(command_to_response)
         .collect();
 
-    let headers = content_range_headers(page, per_page, commands.len(), total);
+    let headers = content_range(window.offset, commands.len(), total, "items");
 
     Ok((StatusCode::OK, headers, Json(commands)))
 }
@@ -718,18 +706,18 @@ pub async fn list_sync_events(
 ) -> AppResult<(StatusCode, HeaderMap, Json<Vec<SyncEventResponse>>)> {
     use sea_orm::PaginatorTrait;
 
-    let (page, per_page) = params.resolve()?;
+    let window = params.resolve()?;
 
     let paginator = sync_events::Entity::find()
         .order_by_desc(sync_events::Column::StartedAt)
-        .paginate(&state.db, per_page);
+        .paginate(&state.db, window.limit);
 
     let total = paginator.num_items().await?;
-    let events = paginator.fetch_page(page).await?;
+    let events = paginator.fetch_page(window.page() - 1).await?;
 
     let response: Vec<SyncEventResponse> = events.into_iter().map(sync_event_to_response).collect();
 
-    let headers = content_range_headers(page, per_page, response.len(), total);
+    let headers = content_range(window.offset, response.len(), total, "items");
 
     Ok((StatusCode::OK, headers, Json(response)))
 }

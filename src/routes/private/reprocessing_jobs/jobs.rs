@@ -382,7 +382,7 @@ fn derived_recompute_instants(params: &serde_json::Value) -> Result<Statement, D
             sea_orm::DatabaseBackend::Postgres,
             r"SELECT DISTINCT r.site_id, r.time
               FROM readings r
-              JOIN derived_parameter_definitions d ON d.id = $1
+              JOIN calculation_formulas d ON d.id = $1
               JOIN site_parameters sp
                 ON sp.site_id = r.site_id
                AND sp.entry_mode = 'tool'
@@ -421,7 +421,7 @@ fn derived_recompute_instants(params: &serde_json::Value) -> Result<Statement, D
         r"SELECT DISTINCT r.site_id, r.time
           FROM readings r
           JOIN derived_parameter_sources dps ON dps.parameter_id = r.parameter_id
-          JOIN derived_parameter_definitions d ON d.id = dps.derived_definition_id
+          JOIN calculation_formulas d ON d.id = dps.derived_definition_id
           JOIN site_parameters sp
             ON sp.site_id = r.site_id
            AND sp.entry_mode = 'tool'
@@ -629,12 +629,13 @@ pub struct JanitorRun {
 impl JanitorRun {
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
+        let retention = crate::common::retention::Retention::from_config(config);
         Self {
             interval_seconds: config.janitor_interval_seconds,
             full_refresh_seconds: config.janitor_full_refresh_seconds,
-            maintenance_retention_days: config.job_maintenance_retention_days,
-            operator_retention_days: config.janitor_retention_days,
-            maintenance_max_rows: config.job_maintenance_max_rows,
+            maintenance_retention_days: retention.job_maintenance.horizon_days().unwrap_or(0),
+            operator_retention_days: retention.job_operator.horizon_days().unwrap_or(0),
+            maintenance_max_rows: retention.job_maintenance_max_rows,
         }
     }
 }
@@ -1521,9 +1522,10 @@ pub struct SyncLedgerRetention {
 impl SyncLedgerRetention {
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
+        let retention = crate::common::retention::Retention::from_config(config);
         Self {
-            sync_event_retention_days: config.sync_event_retention_days,
-            ingest_receipt_retention_days: config.ingest_receipt_retention_days,
+            sync_event_retention_days: retention.sync_events.horizon_days().unwrap_or(0),
+            ingest_receipt_retention_days: retention.ingest_receipts.horizon_days().unwrap_or(0),
         }
     }
 }

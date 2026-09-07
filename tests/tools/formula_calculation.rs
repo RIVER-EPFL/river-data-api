@@ -1,4 +1,4 @@
-//! A calculation with the formula engine: its formulas are `derived_parameter_definitions` rows,
+//! A calculation with the formula engine: its formulas are `calculation_formulas` rows,
 //! its versions are minted from them, and it runs through the same calculate route a script
 //! calculation does.
 //!
@@ -429,7 +429,7 @@ async fn a_calculation_may_not_read_outside_its_group() {
 }
 
 /// The harness owns the rows a formula calculation leaves behind: a formula is a
-/// `derived_parameter_definitions` row with `derived_parameter_sources` under it, and neither FK
+/// `calculation_formulas` row with `derived_parameter_sources` under it, and neither FK
 /// cascades, so a cleanup that deletes the calculation first is refused and every later test in
 /// the binary fails at setup rather than in its body.
 #[tokio::test]
@@ -463,7 +463,7 @@ async fn cleanup_removes_a_formula_calculation_with_its_sources() {
         "the calculation is gone"
     );
     assert_eq!(
-        count(&db, "SELECT count(*) FROM derived_parameter_definitions").await,
+        count(&db, "SELECT count(*) FROM calculation_formulas").await,
         0,
         "its formulas went with it"
     );

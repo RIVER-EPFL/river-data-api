@@ -110,6 +110,9 @@ pub async fn run(state: &AppState, channels: &[Box<dyn NotificationChannel>]) {
     if let Err(e) = jobs_failed(state, channels).await {
         tracing::warn!(error = %e, "failed-job trigger failed");
     }
+    if let Err(e) = changes_pending(state, channels).await {
+        tracing::warn!(error = %e, "pending-change trigger failed");
+    }
 }
 
 async fn state_get(
@@ -652,6 +655,93 @@ async fn holds_open(
     };
     let _ = deliver(state, channels, &msg, None).await;
     Ok(())
+}
+
+/// Hours between repeat alerts while proposed corrections wait for a decision.
+const PROPOSALS_RENOTIFY_HOURS: i64 = 12;
+
+/// Values a source has changed since river-data stored them, waiting for a person (Q84). Nothing
+/// is written until one of them is accepted, so an unread queue is stored history diverging from
+/// the portal in silence.
+async fn changes_pending(
+    state: &AppState,
+    channels: &[Box<dyn NotificationChannel>],
+) -> Result<(), DbErr> {
+    let db = &state.db;
+    let counts = crate::routes::private::readings::proposals::pending_by_source(db)
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
+    // What arrived is the other half of the sentence Q84 asks for, and usually the larger number:
+    // a cycle that adds four thousand readings and holds nothing is an event nobody is told about
+    // if only the queue is counted. Read before the claim, which moves the watermark.
+    let since = state_get(db, "changes_pending", "all")
+        .await?
+        .map(|(_, at)| at)
+        .unwrap_or_else(|| Utc::now() - Duration::hours(PROPOSALS_RENOTIFY_HOURS));
+    let arrivals = arrivals_by_source(db, since).await?;
+    if counts.is_empty() && arrivals.is_empty() {
+        state_clear(db, "changes_pending", "all").await?;
+        return Ok(());
+    }
+    let total: i64 = counts.iter().map(|(_, n)| n).sum();
+    let arrived: i64 = arrivals.iter().map(|(_, n)| n).sum();
+    if !claim_renotify(db, "changes_pending", "all", PROPOSALS_RENOTIFY_HOURS).await? {
+        return Ok(());
+    }
+    let by_source = |rows: &[(String, i64)]| {
+        rows.iter()
+            .map(|(source, n)| format!("{n} from {source}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut body = String::new();
+    if arrived > 0 {
+        body.push_str(&format!(
+            "📥 {arrived} new value(s) synced ({}). ",
+            by_source(&arrivals)
+        ));
+    }
+    if total > 0 {
+        body.push_str(&format!(
+            "✏️ {total} stored value(s) have been changed at source and are awaiting a decision \
+             ({}). Accept or reject them under Data Streams, Audits.",
+            by_source(&counts)
+        ));
+    }
+    let msg = OutgoingMessage {
+        kind: "changes_pending",
+        subject: if total > 0 {
+            format!("RIVER Data: {total} stored value(s) changed at source")
+        } else {
+            format!("RIVER Data: {arrived} new value(s) synced")
+        },
+        body: body.trim_end().to_string(),
+        // The queue spans streams and sources alike, so it carries no single scope.
+        slot: None,
+    };
+    let _ = deliver(state, channels, &msg, None).await;
+    Ok(())
+}
+
+/// Readings each sync service reported bringing in since `since`, from the per-cycle count the
+/// services already write. Services that synced nothing are absent rather than zero.
+async fn arrivals_by_source(
+    db: &DatabaseConnection,
+    since: DateTime<Utc>,
+) -> Result<Vec<(String, i64)>, DbErr> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            PG,
+            "SELECT s.service_type AS source_system, SUM(e.readings_synced)::bigint AS n \
+               FROM sync_events e JOIN sync_services s ON s.id = e.service_id \
+              WHERE e.started_at > $1 AND e.readings_synced > 0 \
+              GROUP BY s.service_type ORDER BY s.service_type",
+            [sea_orm::prelude::DateTimeWithTimeZone::from(since).into()],
+        ))
+        .await?;
+    rows.iter()
+        .map(|r| Ok((r.try_get("", "source_system")?, r.try_get("", "n")?)))
+        .collect()
 }
 
 /// Hours between repeat alerts while jobs of one kind keep failing.

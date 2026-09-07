@@ -119,7 +119,7 @@ pub async fn calculate_tool(
         &state,
         &tool,
         &body,
-        &scripts::actor_label(&auth),
+        &crate::common::actor::label(&auth),
         "interactive",
     )
     .await?;

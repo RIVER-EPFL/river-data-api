@@ -294,6 +294,48 @@ pub async fn assign_site_parameter_minimal(
     .await
 }
 
+/// The slots a site carries, declared the way the portal declares them: a parameter group holding
+/// each parameter in its role, applied to the site. A grab save refuses a parameter the site does
+/// not carry (Q98), so a story that saves tool output declares the outputs here first.
+pub async fn declare_site_slots(
+    db: &sea_orm::DatabaseConnection,
+    app: &Router,
+    token: &str,
+    site_id: &str,
+    code: &str,
+    members: &[(&str, &str)],
+) -> String {
+    let group_id = uuid::Uuid::new_v4().to_string();
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO parameter_groups (id, code, label, ordinal) \
+             VALUES ('{group_id}', '{code}', '{code}', 1)"
+        ),
+    )
+    .await;
+    for (ordinal, (parameter, role)) in members.iter().enumerate() {
+        crate::common::exec(
+            db,
+            &format!(
+                "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
+                 VALUES (gen_random_uuid(), '{group_id}', '{parameter}', '{role}', {})",
+                ordinal + 1
+            ),
+        )
+        .await;
+    }
+    let (status, applied) = crate::common::post_json_with_token(
+        app,
+        &format!("/api/sites/{site_id}/parameter_groups"),
+        &json!({ "group_id": group_id }),
+        token,
+    )
+    .await;
+    assert_eq!(status, 200, "apply the group: {applied}");
+    group_id
+}
+
 pub async fn create_sensor(app: &Router, token: &str, _parameter_id: &str, serial: &str) -> String {
     // A sensor is parameter-free; the parameter is bound at deploy time (see `create_deployment`).
     create(

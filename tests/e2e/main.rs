@@ -20,6 +20,7 @@ mod onboarding_tracks;
 mod pairing_plan_lifecycle;
 mod portal_curve_instrument;
 mod portal_import_to_paired;
+mod portal_loop;
 mod portal_station_pairing;
 mod provision_to_public;
 mod reactive_recompute;

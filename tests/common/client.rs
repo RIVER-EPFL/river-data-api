@@ -335,3 +335,22 @@ pub async fn post_screened_import(
     }
     post_json_parse_with_token(app, "/api/readings/import_csv", &commit, token).await
 }
+
+/// Serve a router on a loopback port and return its base URL, for the tests that need a real
+/// HTTP client rather than `oneshot`: a mock upstream the app calls out to, and the sync driver,
+/// which reaches the API through `API_BASE_URL` and cannot be handed a `Router`.
+///
+/// The server lives as long as the test process; there is nothing to shut down, because a test
+/// binary that has finished takes its listeners with it.
+pub async fn serve(app: Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a free loopback port");
+    let addr = listener.local_addr().expect("the bound address");
+    tokio::spawn(async move {
+        axum::serve(listener, river_db::routes::connected_service(app))
+            .await
+            .expect("serve the router");
+    });
+    format!("http://{addr}")
+}

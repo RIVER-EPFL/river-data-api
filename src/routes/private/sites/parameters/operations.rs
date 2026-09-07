@@ -189,7 +189,7 @@ async fn definition_producing(
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id FROM derived_parameter_definitions WHERE output_parameter_id = $1 LIMIT 1",
+            r"SELECT id FROM calculation_formulas WHERE output_parameter_id = $1 LIMIT 1",
             [parameter_id.into()],
         ))
         .await

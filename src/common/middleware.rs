@@ -180,14 +180,18 @@ pub async fn service_auth_middleware(
                 } else {
                     crate::common::grants::load_grants(&state.db, &state.grants_cache, &sub).await
                 };
-                request.extensions_mut().insert(AuthContext::Keycloak {
+                let auth = AuthContext::Keycloak {
                     roles,
                     sub,
                     email,
                     email_verified,
                     grants,
-                });
-                return next.run(request).await;
+                };
+                // The change-audit triggers read the writer from a transaction setting, which only
+                // the request knows; every write this request makes runs inside this scope.
+                let actor = crate::common::actor::label(&auth);
+                request.extensions_mut().insert(auth);
+                return crate::common::actor::scoped(actor, next.run(request)).await;
             }
             axum_keycloak_auth::KeycloakAuthStatus::Failure(_) => {
                 // Keycloak auth failed, fall through to try API token
@@ -229,7 +233,8 @@ pub async fn service_auth_middleware(
         let audit = state.config.audit_api_token_use;
         let method = request.method().as_str().to_string();
         let path = request.uri().path().to_string();
-        let response = next.run(request).await;
+        let response =
+            crate::common::actor::scoped(format!("token:{token_id}"), next.run(request)).await;
         if audit {
             crate::routes::private::api_tokens::service::record_token_use(
                 &state.db,
@@ -274,7 +279,11 @@ pub async fn service_auth_middleware(
                 rate_limit_per_second: None,
             });
             request.extensions_mut().insert(SyncServiceMarker);
-            return next.run(request).await;
+            return crate::common::actor::scoped(
+                format!("token:{}", token.service_id),
+                next.run(request),
+            )
+            .await;
         }
     }
 

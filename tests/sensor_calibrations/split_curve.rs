@@ -204,3 +204,136 @@ async fn pinning_to_the_curve_s_own_instrument_needs_no_answer() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(curve_of(&db).await, Some(curve));
 }
+
+/// Scenario: the rows that predate the split's question still name a curve of the instrument they
+/// left, and nothing found them: the drift sweep judges a row against its own curves, so such a
+/// row is self-consistent and invisible to it.
+///
+/// Expected behaviour: `/actions/calibration_candidates` lists them, read-only.
+#[tokio::test]
+#[serial]
+async fn the_report_lists_a_reading_corrected_by_another_instrument_s_curve() {
+    let (db, app, token) = setup().await;
+    let from = lab_sensor(&db, "Analyser A", true).await;
+    let to = lab_sensor(&db, "Analyser B", false).await;
+    let curve = corrected_grab(&db, &app, &token, from).await;
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, "/api/actions/calibration_candidates", &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["total_foreign_curve_uses"], 0,
+        "a reading corrected by its own instrument's curve is not listed: {body}"
+    );
+
+    // The state a pre-B181 split left: the reading names the new instrument and the old curve.
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE readings SET sensor_id = '{to}' \
+             WHERE site_id = '{SITE1_ID}' AND parameter_id = '{GLOBAL_PARAM_DO_ID}' \
+               AND time = '{AT}'"
+        ),
+    )
+    .await;
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, "/api/actions/calibration_candidates", &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total_foreign_curve_uses"], 1, "{body}");
+    let use_row = &body["foreign_curve_uses"][0];
+    assert_eq!(use_row["standard_curve_id"], curve.to_string());
+    assert_eq!(use_row["curve_sensor_id"], from.to_string());
+    assert_eq!(use_row["sensor_id"], to.to_string());
+    assert_eq!(use_row["count"], 1);
+}
+
+/// Scenario: the readings belong to an analyser the inventory does not hold yet.
+///
+/// Expected behaviour: one call mints the instrument and pins the readings onto it, and a call
+/// that decides nothing leaves no instrument behind (M133).
+#[tokio::test]
+#[serial]
+async fn a_split_onto_a_new_instrument_mints_it_and_pins_in_one_call() {
+    let (db, app, token) = setup().await;
+    let from = lab_sensor(&db, "Analyser A", true).await;
+    let original = corrected_grab(&db, &app, &token, from).await;
+    let stream = stream_of(&db).await;
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/pins",
+        &serde_json::json!({
+            "kind": "instrument",
+            "new_instrument": { "name": "Analyser B", "serial_number": "AB-9", "kind": "lab" },
+            "selection": { "keys": [{ "stream_id": stream, "time": AT, "replicate_index": 0 }] },
+            "reason": "measured on the analyser that was not in the inventory",
+            "curves": "copy",
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let minted = Uuid::parse_str(body["target_id"].as_str().expect("target_id")).unwrap();
+
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT serial_number, kind FROM sensors WHERE id = '{minted}'"),
+        ))
+        .await
+        .unwrap()
+        .expect("the instrument was minted");
+    assert_eq!(row.try_get::<String>("", "serial_number").unwrap(), "AB-9");
+    assert_eq!(row.try_get::<String>("", "kind").unwrap(), "lab");
+
+    let now = curve_of(&db).await.expect("the reading still names a curve");
+    assert_ne!(now, original, "the curve travelled as a copy onto the new instrument");
+    let owner: Uuid = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT sensor_id FROM standard_curves WHERE id = '{now}'"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "sensor_id")
+        .unwrap();
+    assert_eq!(owner, minted);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_split_onto_a_new_instrument_that_decides_nothing_leaves_no_instrument_behind() {
+    let (db, app, token) = setup().await;
+    let from = lab_sensor(&db, "Analyser A", true).await;
+    corrected_grab(&db, &app, &token, from).await;
+    let stream = stream_of(&db).await;
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/readings/pins",
+        &serde_json::json!({
+            "kind": "instrument",
+            "new_instrument": { "name": "Analyser C", "serial_number": "AC-1" },
+            // A window the selection's readings are not in: nothing to pin.
+            "selection": { "keys": [{ "stream_id": stream, "time": "2024-01-01T00:00:00Z", "replicate_index": 0 }] },
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    let left: i64 = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM sensors WHERE serial_number = 'AC-1'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(left, 0, "the mint is rolled back with the pin: {body}");
+}

@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::bulk_write::{self, TouchedRange};
 use crate::common::middleware::ProjectScope;
+use crate::common::paging::Window;
 use crate::common::scope;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::DataStream;
@@ -432,8 +433,7 @@ pub async fn stream_receipts(
         }
     }
 
-    let page = q.page.unwrap_or(1).max(1);
-    let page_size = q.page_size.unwrap_or(50).clamp(1, 200);
+    let window = Window::from_page(q.page, q.page_size, 50, 200);
     let total: i64 = state
         .db
         .query_one_raw(Statement::from_sql_and_values(
@@ -454,8 +454,8 @@ pub async fn stream_receipts(
              ORDER BY at DESC LIMIT $2 OFFSET $3",
             [
                 id.into(),
-                (page_size as i64).into(),
-                (((page - 1) * page_size) as i64).into(),
+                (window.limit as i64).into(),
+                (window.offset as i64).into(),
             ],
         ))
         .await?;
@@ -961,7 +961,7 @@ pub async fn pair_stream(
     crate::routes::private::collection_events::recompute::enqueue_for(
         db,
         &touched_events,
-        &crate::routes::private::tools::scripts::actor_label(&auth),
+        &crate::common::actor::label(&auth),
         crate::routes::private::collection_events::recompute::Writer::Person,
     )
     .await?;

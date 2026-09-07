@@ -249,7 +249,7 @@ async fn test_derived_sources_reassigned() {
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO derived_parameter_definitions (id, code, name, units, formula)
+            "INSERT INTO calculation_formulas (id, code, name, units, formula)
              VALUES (gen_random_uuid(), 'test_derived', 'Test', 'mg/L', 'dissolved_oxygen * 0.032')
              ON CONFLICT DO NOTHING"
         ),
@@ -260,7 +260,7 @@ async fn test_derived_sources_reassigned() {
         &format!(
             "INSERT INTO derived_parameter_sources (derived_definition_id, parameter_id, variable_name)
              SELECT id, '{}', 'dissolved_oxygen'
-             FROM derived_parameter_definitions WHERE code = 'test_derived'",
+             FROM calculation_formulas WHERE code = 'test_derived'",
             crate::common::GLOBAL_PARAM_DO_ID
         ),
     )
@@ -498,4 +498,150 @@ async fn test_needs_review_clears_through_update() {
 
     assert_eq!(status, 200, "update needs_review: {body}");
     assert!(!needs_review(&db, crate::common::GLOBAL_PARAM_TEMP_ID).await);
+}
+
+/// Scenario: a derived definition produces one parameter and reads another, and the merge points
+/// what it reads at what it produces. The merge re-points `derived_parameter_sources` and leaves
+/// `output_parameter_id` alone, so the definition comes out reading itself.
+///
+/// Expected behaviour: refused before anything is written, naming the calculation (Q96: a cycle is
+/// refused wherever the edge is made, not only at authoring).
+#[tokio::test]
+#[serial]
+async fn a_merge_that_would_make_a_calculation_read_its_own_output_is_refused() {
+    let (db, _app, _token) = setup().await;
+    let definition = uuid::Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO calculation_formulas (id, code, formula, output_parameter_id) \
+             VALUES ('{definition}', 'loop_check', 'a * 2', '{}')",
+            crate::common::GLOBAL_PARAM_TEMP_ID
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO derived_parameter_sources (id, derived_definition_id, parameter_id, variable_name) \
+             VALUES ('{}', '{definition}', '{}', 'a')",
+            uuid::Uuid::new_v4(),
+            crate::common::GLOBAL_PARAM_DO_ID
+        ),
+    )
+    .await;
+
+    let err = merge_parameters(
+        &db,
+        &merge_req(
+            crate::common::GLOBAL_PARAM_DO_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+        ),
+        "tester",
+    )
+    .await
+    .expect_err("the merge closes a loop and is refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("read what it produces"),
+        "the refusal says what it is: {message}"
+    );
+    assert!(message.contains("loop_check"), "and names it: {message}");
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM parameters WHERE id = '{}'",
+                crate::common::GLOBAL_PARAM_DO_ID
+            ),
+        )
+        .await,
+        1,
+        "a refused merge deletes nothing"
+    );
+}
+
+/// The guard is about the loop, not about merges near a calculation: a definition that produces
+/// the target and reads neither side of the merge still merges.
+#[tokio::test]
+#[serial]
+async fn a_merge_that_closes_no_loop_still_merges() {
+    let (db, _app, _token) = setup().await;
+    let definition = uuid::Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO calculation_formulas (id, code, formula, output_parameter_id) \
+             VALUES ('{definition}', 'no_loop', 'a * 2', '{}')",
+            crate::common::GLOBAL_PARAM_TEMP_ID
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO derived_parameter_sources (id, derived_definition_id, parameter_id, variable_name) \
+             VALUES ('{}', '{definition}', '{}', 'a')",
+            uuid::Uuid::new_v4(),
+            crate::common::GLOBAL_PARAM_COND_ID
+        ),
+    )
+    .await;
+
+    merge_parameters(
+        &db,
+        &merge_req(
+            crate::common::GLOBAL_PARAM_DO_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+        ),
+        "tester",
+    )
+    .await
+    .expect("no loop, so nothing to refuse");
+}
+
+/// Scenario: the merged-away parameter is what a calculation writes. The sweep moved what a formula
+/// reads and not what it produces, so the delete raised the output foreign key.
+///
+/// Expected behaviour: the formula produces the survivor, and the merge does its job.
+#[tokio::test]
+#[serial]
+async fn a_formula_producing_the_merged_away_parameter_produces_the_survivor() {
+    let (db, _app, _token) = setup().await;
+    let definition = uuid::Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO calculation_formulas (id, code, formula, output_parameter_id) \
+             VALUES ('{definition}', 'produces_source', 'a * 2', '{}')",
+            crate::common::GLOBAL_PARAM_DO_ID
+        ),
+    )
+    .await;
+
+    merge_parameters(
+        &db,
+        &merge_req(
+            crate::common::GLOBAL_PARAM_DO_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+        ),
+        "tester",
+    )
+    .await
+    .expect("the formula's output moves with everything else the merge moves");
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM calculation_formulas \
+                 WHERE id = '{definition}' AND output_parameter_id = '{}'",
+                crate::common::GLOBAL_PARAM_TEMP_ID
+            ),
+        )
+        .await,
+        1,
+        "the formula produces the survivor"
+    );
 }

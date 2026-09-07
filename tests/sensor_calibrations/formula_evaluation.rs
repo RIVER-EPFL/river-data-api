@@ -93,7 +93,7 @@ async fn test_derived_parameter_skips_infinity() {
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO derived_parameter_definitions (id, code, name, units, formula) \
+            "INSERT INTO calculation_formulas (id, code, name, units, formula) \
              VALUES ('{derived_def_id}', 'TempOverDO', 'Temp / DO', 'ratio', 'temp / do_val')"
         ),
     )

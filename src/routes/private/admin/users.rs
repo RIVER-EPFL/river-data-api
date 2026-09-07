@@ -1,7 +1,6 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue},
     response::IntoResponse,
     routing::get,
 };
@@ -11,9 +10,14 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 
 use crate::common::AppState;
+use crate::common::paging::{Window, content_range};
 use crate::common::authz::{RIVER_ROLE_NAMES, Role};
 use crate::common::state::KeycloakAdmin;
 use crate::error::{AppError, AppResult};
+
+/// The page a caller naming no range is served, and the largest one it may ask for.
+const DEFAULT_PAGE_SIZE: u64 = 25;
+const MAX_PAGE_SIZE: u64 = 1000;
 
 /// Anti-backdoor hook: a user's cached access must not outlive their real access. On any change to
 /// a user's roles, enabled flag or existence, drop their cached role and their cached project
@@ -171,15 +175,9 @@ pub async fn list_users(
     let client = admin_client(&state)?;
     let base = admin_base_url(&state)?;
 
-    // Parse React Admin range: [start, end] (inclusive)
-    let (first, max) = if let Some(range) = &query.range {
-        let r: Vec<usize> = serde_json::from_str(range).unwrap_or_else(|_| vec![0, 24]);
-        let start = r.first().copied().unwrap_or(0);
-        let end = r.get(1).copied().unwrap_or(24);
-        (start, end.saturating_sub(start).saturating_add(1))
-    } else {
-        (0, 25)
-    };
+    let window = Window::from_range(query.range.as_deref(), DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
+    let first = usize::try_from(window.offset).unwrap_or(usize::MAX);
+    let max = usize::try_from(window.limit).unwrap_or(usize::MAX);
 
     // Parse filters
     let filter_json = query
@@ -258,14 +256,7 @@ pub async fn list_users(
 
     let total = users.len();
     let page: Vec<serde_json::Value> = users.into_iter().skip(first).take(max).collect();
-    let end = first + page.len().saturating_sub(1);
-    let content_range = format!("users {first}-{end}/{total}");
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "Content-Range",
-        HeaderValue::from_str(&content_range).unwrap(),
-    );
+    let headers = content_range(window.offset, page.len(), total as u64, "users");
 
     Ok((headers, Json(page)))
 }

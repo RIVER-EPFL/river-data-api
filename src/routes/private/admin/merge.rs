@@ -55,7 +55,7 @@ pub async fn merge_site_parameters_handler(
         &serde_json::json!({
             "source_site_parameter_id": payload.source_site_parameter_id,
             "target_site_parameter_id": payload.target_site_parameter_id,
-            "actor": crate::routes::private::tools::scripts::actor_label(&auth),
+            "actor": crate::common::actor::label(&auth),
         }),
         None,
     )
@@ -95,7 +95,7 @@ pub async fn merge_parameters_handler(
         &serde_json::json!({
             "source_parameter_id": payload.source_parameter_id,
             "target_parameter_id": payload.target_parameter_id,
-            "actor": crate::routes::private::tools::scripts::actor_label(&auth),
+            "actor": crate::common::actor::label(&auth),
         }),
         None,
     )

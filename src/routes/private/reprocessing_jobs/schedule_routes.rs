@@ -60,16 +60,6 @@ fn full_registry(state: &AppState) -> JobRegistry {
     registry
 }
 
-/// Best-effort actor identity stamped on edits (`updated_by`/`changed_by`). Keycloak email when
-/// present, else `keycloak`; an API token is `token:<id>`. Mirrors the alarm-ack audit label.
-fn actor_label(auth: &AuthContext) -> String {
-    match auth {
-        AuthContext::Keycloak { email: Some(e), .. } => e.clone(),
-        AuthContext::Keycloak { .. } => "keycloak".to_string(),
-        AuthContext::ApiToken { token_id, .. } => format!("token:{token_id}"),
-    }
-}
-
 /// Read one schedule row into a [`ScheduleView`], or `None` if the row doesn't exist. `running` is
 /// resolved in the same statement via an EXISTS subselect against the job queue.
 async fn load_view(
@@ -249,7 +239,7 @@ pub async fn update_schedule(
     // instead of waiting out the stale `next_run_at`. Otherwise leave the grid where it is.
     let reset_next_run = interval_changed || being_enabled;
 
-    let actor = actor_label(&auth);
+    let actor = crate::common::actor::label(&auth);
 
     // Single UPDATE; `next_run_at` is reset in SQL (`now() + interval`) only when needed.
     state

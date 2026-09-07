@@ -441,7 +441,7 @@ pub async fn seasonal_check(
         req.site_id,
         req.time,
         &req.values,
-        crate::routes::private::tools::scripts::actor_label(&auth),
+        crate::common::actor::label(&auth),
     )
     .await?;
 

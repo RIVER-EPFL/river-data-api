@@ -15,6 +15,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::paging::Window;
 use crate::error::{AppError, AppResult};
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
@@ -92,8 +93,8 @@ pub async fn list_deliveries(
     db: &DatabaseConnection,
     q: &DeliveryQuery,
 ) -> AppResult<DeliveryLogPage> {
-    let limit = q.limit.unwrap_or(50).clamp(1, MAX_LIMIT);
-    let offset = q.offset.unwrap_or(0);
+    let window = Window::from_limit_offset(q.limit, q.offset, 50, MAX_LIMIT);
+    let (limit, offset) = (window.limit, window.offset);
     if let Some(status) = &q.status {
         validate(status, "status")?;
     }

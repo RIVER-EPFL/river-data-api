@@ -52,7 +52,7 @@ async fn versions_of(db: &DatabaseConnection, code: &str) -> Vec<String> {
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT v.formula FROM derived_parameter_definition_versions v \
-               JOIN derived_parameter_definitions d ON d.id = v.definition_id \
+               JOIN calculation_formulas d ON d.id = v.definition_id \
               WHERE d.code = $1 ORDER BY v.version_no",
             [code.into()],
         ))

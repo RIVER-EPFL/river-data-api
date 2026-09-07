@@ -2,6 +2,7 @@ pub mod client;
 pub mod compression;
 pub mod db;
 pub mod e2e;
+pub mod fake_portal;
 pub mod fixtures;
 pub mod jobs;
 pub mod keycloak;

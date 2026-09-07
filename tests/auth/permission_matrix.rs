@@ -609,6 +609,7 @@ fn table() -> Table {
             ("POST", "/api/tools/{tool_name}/calculate"),
             ("POST", "/api/readings/seasonal_check"),
             ("GET", "/api/readings/provenance"),
+            ("GET", "/api/readings/ledger"),
             ("GET", "/api/readings/decisions"),
             ("POST", "/api/readings/edits/inspect"),
             ("GET", "/api/tool_runs/{id}/reload"),
@@ -627,6 +628,7 @@ fn table() -> Table {
             ("GET", "/api/version"),
             ("GET", "/api/actions/undeclared_sd_estimators"),
             ("GET", "/api/parameter_groups/{id}/definition"),
+            ("GET", "/api/change_audit"),
             ("GET", "/api/schedules"),
             ("GET", "/api/schedules/{job_name}"),
             ("GET", "/api/schedules/{job_name}/audit"),
@@ -662,6 +664,8 @@ fn table() -> Table {
             ("POST", "/api/schedules/{job_name}/run_now"),
             ("POST", "/api/site_parameters/{id}/declare_sd_estimator"),
             ("POST", "/api/actions/retag_sd_estimator"),
+            ("POST", "/api/parameter_groups/{id}/intermediates"),
+            ("POST", "/api/sites/{site_id}/parameter_groups"),
         ],
     );
 
@@ -685,7 +689,6 @@ fn table() -> Table {
             ("GET", "/api/sync/commands"),
             ("GET", "/api/sync/commands/{id}"),
             ("GET", "/api/sync/events"),
-            ("GET", "/api/sync/discovery"),
             ("GET", "/api/sync/pairing-plans"),
             ("GET", "/api/sync/pairing-plans/{id}"),
             ("GET", "/api/sync/pairing-plans/{id}/site-metadata"),
@@ -702,9 +705,6 @@ fn table() -> Table {
             ("PATCH", "/api/sync/services/{id}"),
             ("POST", "/api/sync/services/{id}/commands"),
             ("POST", "/api/sync/services/{id}/revoke"),
-            ("POST", "/api/sync/apply-discovery"),
-            ("POST", "/api/sync/grouped-discovery"),
-            ("POST", "/api/sync/bulk-pair"),
             ("POST", "/api/sync/pairing-plans"),
             ("PATCH", "/api/sync/pairing-plans/{id}"),
             ("POST", "/api/sync/pairing-plans/{id}/apply"),
@@ -1209,6 +1209,47 @@ fn every_nested_entity_has_a_row() {
 }
 
 /// The first string literal of every `.route(` call in a source file.
+/// The converse guarantee: a row for a route that no longer exists probes a 404 and says nothing,
+/// so the table drifts into claiming gates on surfaces that are gone. Rows under a nested entity
+/// router are not `.route` literals, so only the paths whose prefix one of the source files owns
+/// are checked here.
+#[test]
+fn every_row_names_a_route_that_still_exists() {
+    let sources: [(&str, &str); 5] = [
+        ("src/routes/service/mod.rs", "/api"),
+        ("src/routes/private/sync/views.rs", "/api/sync"),
+        ("src/routes/private/projects/router.rs", "/api/projects"),
+        ("src/routes/private/sites/router.rs", "/api/sites"),
+        ("src/routes/private/admin/users.rs", "/api/users"),
+    ];
+    let mut registered: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (file, prefix) in sources {
+        let text = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        for path in route_literals(&text) {
+            registered.insert(if path == "/" {
+                prefix.to_string()
+            } else {
+                format!("{prefix}{path}")
+            });
+        }
+    }
+    // Only the sync surface is checked: every other prefix is served by nested routers whose paths
+    // are not route literals in these files, so their absence here means nothing.
+    let gone: Vec<&str> = table()
+        .0
+        .iter()
+        .map(|r| r.declared)
+        .filter(|d| d.starts_with("/api/sync/"))
+        .filter(|d| !registered.contains(*d) && !registered.contains(d.trim_end_matches('/')))
+        .filter(|d| !["/api/sync/enroll", "/api/sync/heartbeat"].contains(d))
+        .collect();
+    assert!(
+        gone.is_empty(),
+        "rows in the permission matrix whose route is gone:\n  {}",
+        gone.join("\n  ")
+    );
+}
+
 fn route_literals(text: &str) -> Vec<String> {
     literals_after(text, ".route(")
 }

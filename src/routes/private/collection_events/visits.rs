@@ -14,6 +14,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::paging::Window;
 use crate::common::middleware::ProjectScope;
 use crate::error::{AppError, AppResult};
 use crate::routes::resolve_site;
@@ -140,23 +141,17 @@ const VISIT_COUNT_COLUMNS: &str = "\
       WHERE h.group_time = ce.collected_at AND h.status = 'pending' \
         AND COALESCE(h.site_id, sp.site_id) = ce.site_id) AS findings_open";
 
-struct Paging {
-    page: u64,
-    page_size: Option<u64>,
-}
-
 /// Paging is opt-in: a caller naming neither `page` nor `page_size` gets every row.
-fn paging(page: Option<u64>, page_size: Option<u64>) -> Paging {
+fn paging(page: Option<u64>, page_size: Option<u64>) -> Option<Window> {
     if page.is_none() && page_size.is_none() {
-        return Paging {
-            page: 1,
-            page_size: None,
-        };
+        return None;
     }
-    Paging {
-        page: page.unwrap_or(1).max(1),
-        page_size: Some(page_size.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE)),
-    }
+    Some(Window::from_page(
+        page,
+        page_size,
+        MAX_PAGE_SIZE,
+        MAX_PAGE_SIZE,
+    ))
 }
 
 fn range_clause(
@@ -176,13 +171,13 @@ fn range_clause(
     range
 }
 
-fn limit_clause(paging: &Paging, binds: &mut Vec<sea_orm::Value>) -> String {
-    let Some(page_size) = paging.page_size else {
+fn limit_clause(paging: Option<Window>, binds: &mut Vec<sea_orm::Value>) -> String {
+    let Some(window) = paging else {
         return String::new();
     };
-    binds.push((page_size as i64).into());
+    binds.push((window.limit as i64).into());
     let limit_ref = binds.len();
-    binds.push((((paging.page - 1) * page_size) as i64).into());
+    binds.push((window.offset as i64).into());
     format!(" LIMIT ${limit_ref} OFFSET ${}", binds.len())
 }
 
@@ -319,7 +314,7 @@ pub async fn list_site_visits(
     }
 
     let mut page_binds = binds;
-    let limit = limit_clause(&paging, &mut page_binds);
+    let limit = limit_clause(paging, &mut page_binds);
     let rows = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
@@ -513,8 +508,8 @@ pub async fn list_site_visits(
     Ok(Json(VisitsResponse {
         site_id: site.id,
         total,
-        page: paging.page,
-        page_size: paging.page_size.unwrap_or(total),
+        page: paging.map_or(1, Window::page),
+        page_size: paging.map_or(total, |w| w.limit),
         expected_parameters,
         visits,
     })
@@ -643,7 +638,7 @@ pub async fn list_visits(
         .map(|r| r.try_get("", "n").unwrap_or(0))
         .unwrap_or(0);
 
-    let limit = limit_clause(&paging, &mut binds);
+    let limit = limit_clause(paging, &mut binds);
     let rows = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
@@ -689,8 +684,8 @@ pub async fn list_visits(
     let total = u64::try_from(total).unwrap_or(0);
     Ok(Json(VisitListResponse {
         total,
-        page: paging.page,
-        page_size: paging.page_size.unwrap_or(total),
+        page: paging.map_or(1, Window::page),
+        page_size: paging.map_or(total, |w| w.limit),
         visits,
     }))
 }
@@ -811,7 +806,7 @@ pub struct CellReplicate {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CellFinding {
     pub id: Uuid,
-    /// `missing_output` or `stale_output`.
+    /// `missing_output`, `stale_output` or `skipped_output`.
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
@@ -1131,11 +1126,11 @@ mod tests {
 
     #[test]
     fn test_paging_is_opt_in() {
-        assert!(paging(None, None).page_size.is_none());
-        assert_eq!(paging(Some(3), None).page_size, Some(MAX_PAGE_SIZE));
-        assert_eq!(paging(None, Some(10)).page_size, Some(10));
-        assert_eq!(paging(Some(0), Some(500)).page, 1);
-        assert_eq!(paging(Some(0), Some(500)).page_size, Some(MAX_PAGE_SIZE));
+        assert!(paging(None, None).is_none());
+        assert_eq!(paging(Some(3), None).unwrap().limit, MAX_PAGE_SIZE);
+        assert_eq!(paging(None, Some(10)).unwrap().limit, 10);
+        assert_eq!(paging(Some(0), Some(500)).unwrap().page(), 1);
+        assert_eq!(paging(Some(0), Some(500)).unwrap().limit, MAX_PAGE_SIZE);
     }
 
     #[test]

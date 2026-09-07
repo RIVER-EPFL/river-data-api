@@ -82,6 +82,14 @@ pub fn manage_routes() -> Router<AppState> {
             post(super::replicate_audit::acknowledge_holds_bulk),
         )
         .route(
+            "/change_proposals",
+            get(crate::routes::private::readings::proposals::list_proposals),
+        )
+        .route(
+            "/change_proposals/decide",
+            post(crate::routes::private::readings::proposals::decide_proposals),
+        )
+        .route(
             "/replicate_reconciliation/duplicate_slots",
             get(super::replicate_reconciliation::duplicate_slots),
         )

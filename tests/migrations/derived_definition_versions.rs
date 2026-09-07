@@ -9,6 +9,9 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 
 use migration::m20260910_000014_derived_definition_versions::{DOWN, UP, formula_hash};
+use migration::m20260910_000017_rename_calculation_formulas::{
+    DOWN as RENAME_DOWN, UP as RENAME_UP,
+};
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
     db.query_one_raw(Statement::from_string(
@@ -23,13 +26,13 @@ async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
 }
 
 /// A definition writing a catalog parameter of its own, and one stored derived reading of it.
-async fn seed_definition(db: &DatabaseConnection, code: &str, formula: &str) {
+async fn seed_definition(db: &DatabaseConnection, table: &str, code: &str, formula: &str) {
     crate::common::exec_unprepared(
         db,
         &format!(
             "INSERT INTO parameters (id, code, name, default_units, category) \
              VALUES (gen_random_uuid(), '{code}', '{code}', 'mg/L', 'measurement'); \
-             INSERT INTO derived_parameter_definitions (id, code, name, units, formula, output_parameter_id) \
+             INSERT INTO {table} (id, code, name, units, formula, output_parameter_id) \
              SELECT gen_random_uuid(), '{code}_def', '{code}', 'mg/L', '{formula}', id \
                FROM parameters WHERE code = '{code}'"
         ),
@@ -43,9 +46,11 @@ async fn the_current_text_becomes_version_one_and_stored_readings_name_none() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
+    // Migration 14 names the table as it was named then, so its replay runs before the rename.
+    crate::common::exec_unprepared(&db, RENAME_DOWN).await;
     crate::common::exec_unprepared(&db, DOWN).await;
 
-    seed_definition(&db, "DerivedVersioned", "a + b").await;
+    seed_definition(&db, "derived_parameter_definitions", "DerivedVersioned", "a + b").await;
     crate::common::exec_unprepared(
         &db,
         &format!(
@@ -82,6 +87,9 @@ async fn the_current_text_becomes_version_one_and_stored_readings_name_none() {
         0,
         "a reading stored before versioning names no version rather than today's formula"
     );
+
+    // Leave the schema as the rest of the suite reads it.
+    crate::common::exec_unprepared(&db, RENAME_UP).await;
 }
 
 /// Expected behaviour: the resolver's single answer is already guaranteed, by the unique index
@@ -93,12 +101,12 @@ async fn one_definition_per_output_parameter_is_already_enforced() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
 
-    seed_definition(&db, "DerivedClash", "a + b").await;
+    seed_definition(&db, "calculation_formulas", "DerivedClash", "a + b").await;
     let refused = db
         .execute_unprepared(
-            "INSERT INTO derived_parameter_definitions (id, code, name, units, formula, output_parameter_id) \
+            "INSERT INTO calculation_formulas (id, code, name, units, formula, output_parameter_id) \
              SELECT gen_random_uuid(), 'DerivedClash_other', 'other', 'mg/L', 'a * b', output_parameter_id \
-               FROM derived_parameter_definitions WHERE code = 'DerivedClash_def'",
+               FROM calculation_formulas WHERE code = 'DerivedClash_def'",
         )
         .await;
     assert!(

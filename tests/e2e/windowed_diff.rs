@@ -1,11 +1,12 @@
 //! S8, windowed reconciliation (story catalog: ../archived-documentation/PLAN.md).
 //!
 //! Scenario: a sync service re-reads its mutable source in full and asserts a completeness
-//! window. The store converges — a removed replicate is withdrawn (a stamp, never a delete), a
-//! corrected value is applied in place, an unchanged re-send is a recorded no-op — and a reading
-//! an operator has flagged never changes servedness without a person: the withdrawal is held in
-//! the review queue instead. Dishonest windows are refused outright, and a pass reshaping the
-//! window at scale is braked.
+//! window. The store converges: a removed replicate is withdrawn (a stamp, never a delete), an
+//! unchanged re-send is a recorded no-op, and a value the source has changed since river-data
+//! stored it is proposed rather than written, applied only when a person accepts it (Q84). A
+//! reading an operator has flagged never changes servedness without a person, so its withdrawal
+//! is held in the review queue instead. Dishonest windows are refused outright, and a pass
+//! reshaping the window at scale is braked.
 
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serde_json::json;
@@ -157,6 +158,32 @@ async fn withdrawn_index(db: &DatabaseConnection, stream_id: &str, index: i16) -
     .unwrap()
 }
 
+/// The proposal queue as the review surface reads it.
+async fn proposals(fx: &Fixture, status: &str) -> serde_json::Value {
+    let (code, body) = crate::common::get_json_with_token(
+        &fx.app,
+        &format!("/api/sync/change_proposals?status={status}"),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    body
+}
+
+async fn decide(fx: &Fixture, ids: &[&str], decision: &str) -> (u16, serde_json::Value) {
+    let (code, body) = crate::common::post_json_with_token(
+        &fx.app,
+        "/api/sync/change_proposals/decide",
+        &serde_json::json!({ "ids": ids, "decision": decision }),
+        &fx.token,
+    )
+    .await;
+    (
+        code,
+        serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body)),
+    )
+}
+
 #[tokio::test]
 #[serial]
 async fn a_windowed_resend_converges_on_the_source() {
@@ -193,10 +220,34 @@ async fn a_windowed_resend_converges_on_the_source() {
         "served statistics exclude the retraction"
     );
 
-    // The source corrected replicate 0: applied in place, flags and sample links untouched.
+    // The source corrected replicate 0. The change is classified and proposed, not written: the
+    // stored value and the statistics stand until a person accepts it (Q84).
     let (status, resp) = windowed_ingest(&fx, replicates(T1, &[(0, 12.0), (2, 36.0)]), 1).await;
     assert_eq!(status, 200, "{resp}");
     assert_eq!(resp["changed"], 1, "{resp}");
+    assert_eq!(
+        resp["proposed"], 1,
+        "the response says how many of the changes wait for a person: {resp}"
+    );
+    assert_eq!(
+        sample_stats(&fx.db).await,
+        (23.0, 2),
+        "a proposed correction has not moved the served value"
+    );
+
+    // Re-asserting the same number every cycle re-proposes nothing.
+    let (_, _) = windowed_ingest(&fx, replicates(T1, &[(0, 12.0), (2, 36.0)]), 1).await;
+    let pending = proposals(&fx, "pending").await;
+    assert_eq!(
+        pending.as_array().map(Vec::len),
+        Some(1),
+        "one proposal, however many times the source asserts it: {pending}"
+    );
+
+    // Accepted, the correction is written, and the statistics follow.
+    let (status, resp) = decide(&fx, &[pending[0]["id"].as_str().unwrap()], "accept").await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(resp["accepted"], 1, "{resp}");
     assert_eq!(sample_stats(&fx.db).await, (24.0, 2));
 
     // The source restored replicate 1: an honest window re-asserting the row clears the stamp.
@@ -218,7 +269,7 @@ async fn a_windowed_resend_converges_on_the_source() {
         ),
     )
     .await;
-    assert_eq!(receipts, 5);
+    assert_eq!(receipts, 6);
 }
 
 #[tokio::test]
@@ -273,7 +324,7 @@ async fn a_flagged_reading_is_held_not_withdrawn() {
 /// untouched beside it, and the hold names the ruling the re-send collided with.
 #[tokio::test]
 #[serial]
-async fn a_correction_on_a_judged_reading_names_the_judgement_it_collided_with() {
+async fn a_correction_on_a_judged_reading_waits_for_the_person_who_judged_it() {
     let fx = setup().await;
     let (status, resp) =
         windowed_ingest(&fx, replicates(T1, &[(0, 10.0), (1, 20.0), (2, 36.0)]), 1).await;
@@ -296,72 +347,81 @@ async fn a_correction_on_a_judged_reading_names_the_judgement_it_collided_with()
     .await;
     assert_eq!(status, 200, "{resp}");
 
-    let flag_id = fx
-        .db
-        .query_one_raw(Statement::from_string(
-            DatabaseBackend::Postgres,
-            format!(
-                "SELECT id FROM reading_decisions WHERE stream_id = '{}' AND time = '{T1}' \
-                   AND kind = 'flag' AND rolled_back_by IS NULL",
-                fx.stream_id
-            ),
-        ))
-        .await
-        .unwrap()
-        .expect("the flag is on the record")
-        .try_get::<uuid::Uuid>("", "id")
-        .unwrap();
-
-    // The source corrects the value the operator flagged. Upstream owns the measurement, so the
-    // correction applies; the flag is not touched, and the hold says which ruling it met.
+    // The source corrects the value the operator flagged. Nothing is written: the correction is a
+    // proposal like any other, and the operator's ruling is not overwritten behind their back.
     let (status, resp) =
         windowed_ingest(&fx, replicates(T1, &[(0, 11.5), (1, 20.0), (2, 36.0)]), 1).await;
     assert_eq!(status, 200, "{resp}");
 
-    let row = fx
-        .db
-        .query_one_raw(Statement::from_string(
-            DatabaseBackend::Postgres,
-            format!(
-                "SELECT r.raw_value, r.is_flagged, \
-                        (SELECT count(*) FROM reading_decisions d \
-                          WHERE d.stream_id = r.stream_id AND d.time = r.time \
-                            AND d.replicate_index = r.replicate_index \
-                            AND d.kind = 'value_correction' AND d.origin = 'sync') AS corrections, \
-                        (SELECT h.expected -> 'judgements' FROM replicate_audit_holds h \
-                          WHERE h.stream_id = r.stream_id AND h.group_time = r.time \
-                            AND h.kind = 'source_modified') AS judgements \
-                 FROM readings r \
-                 WHERE r.stream_id = '{}' AND r.time = '{T1}' AND r.replicate_index = 0",
-                fx.stream_id
-            ),
-        ))
-        .await
-        .unwrap()
-        .expect("the corrected reading");
-    assert!(
-        (row.try_get::<f64>("", "raw_value").unwrap() - 11.5).abs() < 1e-9,
-        "the source owns the value"
-    );
-    assert!(
-        row.try_get::<Option<bool>>("", "is_flagged").unwrap() == Some(true),
-        "the operator's ruling stands"
-    );
+    let stored = |db: &DatabaseConnection, stream_id: String| {
+        let q = format!(
+            "SELECT raw_value, is_flagged FROM readings \
+             WHERE stream_id = '{stream_id}' AND time = '{T1}' AND replicate_index = 0"
+        );
+        let db = db.clone();
+        async move {
+            let row = db
+                .query_one_raw(Statement::from_string(DatabaseBackend::Postgres, q))
+                .await
+                .unwrap()
+                .expect("the reading");
+            (
+                row.try_get::<f64>("", "raw_value").unwrap(),
+                row.try_get::<Option<bool>>("", "is_flagged").unwrap(),
+            )
+        }
+    };
     assert_eq!(
-        row.try_get::<i64>("", "corrections").unwrap(),
-        1,
-        "the correction is a sync decision beside the flag"
+        stored(&fx.db, fx.stream_id.clone()).await,
+        (10.0, Some(true)),
+        "the stored value stands until the correction is accepted"
     );
-    let judgements: serde_json::Value = row.try_get("", "judgements").unwrap();
+
+    let pending = proposals(&fx, "pending").await;
+    assert_eq!(pending.as_array().map(Vec::len), Some(1), "{pending}");
+    assert!(
+        (pending[0]["proposed_raw_value"].as_f64().unwrap() - 11.5).abs() < 1e-9,
+        "the proposal carries the source's number: {pending}"
+    );
+    assert!(
+        (pending[0]["stored_raw_value"].as_f64().unwrap() - 10.0).abs() < 1e-9,
+        "and the one it would replace: {pending}"
+    );
+
+    // Rejected, the number stays where it is and the source re-asserting it proposes nothing new.
+    let id = pending[0]["id"].as_str().unwrap().to_string();
+    let (status, resp) = decide(&fx, &[&id], "reject").await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(resp["rejected"], 1, "{resp}");
+    let (_, _) = windowed_ingest(&fx, replicates(T1, &[(0, 11.5), (1, 20.0), (2, 36.0)]), 1).await;
     assert_eq!(
-        judgements
-            .as_array()
-            .expect("the hold names the rulings")
-            .iter()
-            .filter_map(|j| Some((j["id"].as_str()?.to_string(), j["kind"].as_str()?.to_string())))
-            .collect::<Vec<_>>(),
-        vec![(flag_id.to_string(), "flag".to_string())],
-        "the hold names the flag the re-send collided with"
+        proposals(&fx, "pending").await.as_array().map(Vec::len),
+        Some(0),
+        "a decision taken on this exact number is not asked again"
+    );
+
+    // The same proposal is still listed, and accepting it later applies it: the ruling was on the
+    // value, not on the queue.
+    let (status, resp) = decide(&fx, &[&id], "accept").await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(
+        stored(&fx.db, fx.stream_id.clone()).await,
+        (11.5, Some(true)),
+        "accepted, the value moves and the operator's flag stands"
+    );
+    let corrections = crate::common::e2e::count(
+        &fx.db,
+        &format!(
+            "SELECT COUNT(*)::bigint FROM reading_decisions \
+             WHERE stream_id = '{}' AND time = '{T1}' AND replicate_index = 0 \
+               AND kind = 'value_correction' AND origin = 'sync'",
+            fx.stream_id
+        ),
+    )
+    .await;
+    assert_eq!(
+        corrections, 1,
+        "the accepted correction is on the curation record"
     );
 }
 
@@ -611,7 +671,10 @@ async fn a_dropped_replicate_index_is_braked_by_the_index_arm() {
     }
     let (status, resp) = windowed_ingest(&fx, reassert, 40).await;
     assert_eq!(status, 200, "{resp}");
-    assert_eq!(resp["withdrawn"], 0, "braked pass applies only new rows: {resp}");
+    assert_eq!(
+        resp["withdrawn"], 0,
+        "braked pass applies only new rows: {resp}"
+    );
 
     let intact = crate::common::e2e::count(
         &fx.db,
@@ -637,7 +700,10 @@ async fn a_dropped_replicate_index_is_braked_by_the_index_arm() {
         ),
     )
     .await;
-    assert_eq!(holds, 1, "the dropped index raises exactly one brake review item");
+    assert_eq!(
+        holds, 1,
+        "the dropped index raises exactly one brake review item"
+    );
 }
 
 #[tokio::test]

@@ -94,7 +94,7 @@ async fn tracked_job_records_category_detail_and_timeline() {
     let detail: serde_json::Value = row.try_get("", "detail").unwrap();
     assert_eq!(detail["counts"]["readings_updated"], serde_json::json!(7));
 
-    // Timeline: two ordered lines (info seq 0, warn seq 1) with structured context.
+    // Timeline: the worker's opening line, the body's two, and the worker's closing line.
     let lines = db
         .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -103,13 +103,17 @@ async fn tracked_job_records_category_detail_and_timeline() {
         ))
         .await
         .unwrap();
-    assert_eq!(lines.len(), 2);
+    assert_eq!(lines.len(), 4);
     assert_eq!(lines[0].try_get::<i64>("", "seq").unwrap(), 0);
     assert_eq!(lines[0].try_get::<String>("", "level").unwrap(), "info");
     assert_eq!(lines[1].try_get::<i64>("", "seq").unwrap(), 1);
-    assert_eq!(lines[1].try_get::<String>("", "level").unwrap(), "warn");
-    let ctx1: serde_json::Value = lines[1].try_get("", "context").unwrap();
+    assert_eq!(lines[1].try_get::<String>("", "level").unwrap(), "info");
+    assert_eq!(lines[2].try_get::<i64>("", "seq").unwrap(), 2);
+    assert_eq!(lines[2].try_get::<String>("", "level").unwrap(), "warn");
+    let ctx1: serde_json::Value = lines[2].try_get("", "context").unwrap();
     assert_eq!(ctx1["slot"], serde_json::json!(3));
+    let closing: serde_json::Value = lines[3].try_get("", "context").unwrap();
+    assert_eq!(closing["status"], "completed");
 }
 
 #[tokio::test]

@@ -222,7 +222,7 @@ async fn screen_import(
                 site_id,
                 anchor,
                 &pairs,
-                crate::routes::private::tools::scripts::actor_label(auth),
+                crate::common::actor::label(auth),
             )
             .await?,
         )
@@ -436,7 +436,7 @@ pub async fn import_csv(
         .db
         .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT output_parameter_id FROM derived_parameter_definitions \
+            "SELECT output_parameter_id FROM calculation_formulas \
              WHERE output_parameter_id IS NOT NULL"
                 .to_owned(),
         ))
@@ -1657,7 +1657,7 @@ async fn import_tool_csv(
     let mut inserted_total = 0usize;
     let mut tool_runs_created = 0usize;
     if !req.dry_run {
-        let actor = crate::routes::private::tools::scripts::actor_label(auth);
+        let actor = crate::common::actor::label(auth);
         for ToolRow {
             line,
             time,

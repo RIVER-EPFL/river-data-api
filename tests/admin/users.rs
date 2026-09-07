@@ -288,10 +288,7 @@ async fn spawn_mock_keycloak_forbidding_role_users() -> String {
                 )
             }),
         );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("http://{addr}")
+    crate::common::serve(app).await
 }
 
 /// Mock Keycloak: token grant and role listings succeed, removing role mappings fails.
@@ -324,10 +321,7 @@ async fn spawn_mock_keycloak_failing_role_delete() -> String {
             }),
         )
         .route("/admin/realms/{realm}/unused", delete(|| async { "" }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("http://{addr}")
+    crate::common::serve(app).await
 }
 
 #[tokio::test]

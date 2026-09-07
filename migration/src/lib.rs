@@ -37,6 +37,9 @@ mod m20260910_000013_ingested_at_is_first_arrival;
 pub mod m20260910_000014_derived_definition_versions;
 mod m20260910_000015_entity_change_audit;
 mod m20260910_000016_curve_copied_from;
+pub mod m20260910_000017_rename_calculation_formulas;
+mod m20260910_000018_reading_change_proposals;
+pub mod m20260910_000019_ledger_lookup_indexes;
 pub mod portal_seed;
 
 pub struct Migrator;
@@ -82,6 +85,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260910_000014_derived_definition_versions::Migration),
             Box::new(m20260910_000015_entity_change_audit::Migration),
             Box::new(m20260910_000016_curve_copied_from::Migration),
+            Box::new(m20260910_000017_rename_calculation_formulas::Migration),
+            Box::new(m20260910_000018_reading_change_proposals::Migration),
+            Box::new(m20260910_000019_ledger_lookup_indexes::Migration),
         ]
     }
 }

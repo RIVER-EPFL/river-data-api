@@ -32,7 +32,7 @@ pub enum Relation {
         from = "Column::DerivedDefinitionId",
         to = "crate::routes::private::parameters::derived::definition_model::Column::Id"
     )]
-    DerivedParameterDefinition,
+    CalculationFormula,
     #[sea_orm(
         belongs_to = "crate::routes::private::parameters::Entity",
         from = "Column::ParameterId",
@@ -43,7 +43,7 @@ pub enum Relation {
 
 impl Related<crate::routes::private::parameters::derived::definition_model::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::DerivedParameterDefinition.def()
+        Relation::CalculationFormula.def()
     }
 }
 

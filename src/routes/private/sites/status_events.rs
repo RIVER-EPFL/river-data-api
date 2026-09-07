@@ -11,6 +11,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::paging::Window;
 use crate::common::bulk;
 use crate::common::middleware::ProjectScope;
 use crate::error::{AppError, AppResult};
@@ -152,9 +153,8 @@ pub async fn get_site_status_events(
     // Pagination applies to JSON only; CSV/NDJSON remain full-range exports.
     let pagination = match (format.as_str(), query.limit) {
         ("json", Some(limit)) => {
-            let limit = limit.min(1000);
-            let offset = query.offset.unwrap_or(0);
-            format!(" LIMIT {limit} OFFSET {offset}")
+            let window = Window::from_limit_offset(Some(limit), query.offset, 1000, 1000);
+            format!(" LIMIT {} OFFSET {}", window.limit, window.offset)
         }
         _ => String::new(),
     };

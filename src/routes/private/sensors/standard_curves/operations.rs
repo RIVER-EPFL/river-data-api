@@ -30,6 +30,22 @@ async fn curve_is_used(db: &DatabaseConnection, id: Uuid) -> Result<bool, ApiErr
     Ok(found.is_some())
 }
 
+/// How many curves were copied from this one. A copy records where its coefficients came from, and
+/// the reference is the only statement that it is a copy at all, so the row it names stays.
+async fn copies_made_from(db: &DatabaseConnection, id: Uuid) -> Result<i64, ApiError> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM standard_curves WHERE copied_from_id = $1",
+            [id.into()],
+        ))
+        .await
+        .map_err(ApiError::database)?;
+    Ok(row
+        .and_then(|r| r.try_get::<i64>("", "n").ok())
+        .unwrap_or_default())
+}
+
 #[async_trait]
 impl CRUDOperations for StandardCurveOperations {
     type Resource = StandardCurve;
@@ -90,6 +106,14 @@ impl CRUDOperations for StandardCurveOperations {
             return Err(ApiError::bad_request(format!(
                 "Standard curve {id} has been applied to readings and cannot be deleted: the \
                  readings would lose the curve that produced their values."
+            )));
+        }
+        let copies = copies_made_from(db, id).await?;
+        if copies > 0 {
+            return Err(ApiError::bad_request(format!(
+                "Standard curve {id} was copied onto {copies} other instrument{} and cannot be \
+                 deleted: each copy names it as where its coefficients came from.",
+                if copies == 1 { "" } else { "s" }
             )));
         }
         Ok(())

@@ -581,7 +581,10 @@ pub async fn rollback<C: ConnectionTrait>(
     // caller enqueues on, and a predicate over the state about to change matches nothing after.
     let recorded = Recorded {
         rows: 1,
-        span: Some((d.time.with_timezone(&chrono::Utc), d.time.with_timezone(&chrono::Utc))),
+        span: Some((
+            d.time.with_timezone(&chrono::Utc),
+            d.time.with_timezone(&chrono::Utc),
+        )),
         touched_events: if d.kind.fires_recompute() {
             crate::routes::private::collection_events::recompute::touched_events(
                 conn,
@@ -641,6 +644,18 @@ pub struct Recorded {
 }
 
 impl Recorded {
+    /// Fold another record in, so a caller writing per stream reports one span and one set of
+    /// visits rather than one per stream.
+    pub fn absorb(&mut self, other: Self) {
+        self.rows += other.rows;
+        self.span = match (self.span, other.span) {
+            (Some((a, b)), Some((c, d))) => Some((a.min(c), b.max(d))),
+            (x, None) => x,
+            (None, y) => y,
+        };
+        self.touched_events.extend(other.touched_events);
+    }
+
     #[must_use]
     pub fn touched(&self) -> crate::common::bulk_write::TouchedRange {
         crate::common::bulk_write::TouchedRange {
@@ -1952,8 +1967,15 @@ pub async fn enqueue_pin_reprocess_for_decision(
         ..Default::default()
     };
     let (predicate, binds) = selection.predicate()?;
-    enqueue_attribution_pin(db, d.kind, None, d.set_id.unwrap_or(decision_id), &predicate, binds)
-        .await
+    enqueue_attribution_pin(
+        db,
+        d.kind,
+        None,
+        d.set_id.unwrap_or(decision_id),
+        &predicate,
+        binds,
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
@@ -1968,7 +1990,14 @@ pub enum PinKind {
 pub struct PinRequest {
     pub kind: PinKind,
     /// The sensor (instrument pin) or calibration (calibration pin) the readings belong to.
-    pub target_id: Uuid,
+    /// Omitted only when `new_instrument` mints the one the readings move to.
+    #[serde(default)]
+    pub target_id: Option<Uuid>,
+    /// Mint the instrument the readings are pinned to, in the pin's own transaction. A split onto
+    /// an analyser the inventory does not hold yet is one act, so the instrument and the decisions
+    /// stand or fall together (M133).
+    #[serde(default)]
+    pub new_instrument: Option<NewInstrument>,
     pub selection: Selection,
     #[serde(default)]
     pub reason: Option<String>,
@@ -1977,6 +2006,25 @@ pub struct PinRequest {
     /// to exactly one instrument, so a split has to say whether the correction travels.
     #[serde(default)]
     pub curves: Option<CurveOnSplit>,
+}
+
+/// The instrument a split mints for itself. Only what identifies it: a curve, a deployment and a
+/// calibration are its own later decisions.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NewInstrument {
+    #[serde(default)]
+    pub serial_number: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub manufacturer: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// `device` (the default) or `lab`. A bookkeeping row is minted by the path that needs it and
+    /// never by a person, so nothing else is accepted here.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 /// The two answers Q112 admits for a corrected spot reading whose curve belongs to the instrument
@@ -1995,9 +2043,36 @@ pub enum CurveOnSplit {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PinResponse {
     pub set_id: Uuid,
+    /// The instrument or calibration the readings are pinned to, which is the minted one when the
+    /// request asked for a new instrument.
+    pub target_id: Uuid,
     pub rows_decided: u64,
     /// The slot reprocess jobs enqueued so the pinned rows' curves follow the pin.
     pub jobs: Vec<Uuid>,
+}
+
+/// The instrument a split creates for itself, in the split's transaction. Everything else about it
+/// is a later decision: no deployment, no calibration, no curve.
+async fn mint_instrument<C: ConnectionTrait>(conn: &C, spec: &NewInstrument) -> AppResult<Uuid> {
+    let id = Uuid::new_v4();
+    let kind = spec.kind.clone().unwrap_or_else(|| "device".to_string());
+    conn.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO sensors (id, serial_number, name, manufacturer, model, kind, \
+                              is_lab_instrument, is_active, data_frequency)
+         VALUES ($1, $2, $3, $4, $5, $6, $6 <> 'device', true,
+                 CASE WHEN $6 = 'device' THEN 'high' ELSE 'low' END)",
+        [
+            id.into(),
+            spec.serial_number.clone().into(),
+            spec.name.clone().into(),
+            spec.manufacturer.clone().into(),
+            spec.model.clone().into(),
+            kind.into(),
+        ],
+    ))
+    .await?;
+    Ok(id)
 }
 
 /// Pin a selection of readings to an instrument or a calibration (Q36 addendum): one decision
@@ -2019,43 +2094,66 @@ pub async fn pin_readings(
     axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(req): Json<PinRequest>,
 ) -> AppResult<Json<PinResponse>> {
-    let actor = crate::routes::private::tools::scripts::actor_label(&auth);
-    let (kind, new, exists_sql) = match req.kind {
-        PinKind::Instrument => (
-            Kind::InstrumentPin,
-            serde_json::json!({ "sensor_id": req.target_id }),
-            "SELECT 1 FROM sensors WHERE id = $1",
-        ),
-        PinKind::Calibration => (
-            Kind::CalibrationPin,
-            serde_json::json!({ "calibration_id": req.target_id }),
-            "SELECT 1 FROM sensor_calibrations WHERE id = $1",
-        ),
+    let actor = crate::common::actor::label(&auth);
+    let kind = match req.kind {
+        PinKind::Instrument => Kind::InstrumentPin,
+        PinKind::Calibration => Kind::CalibrationPin,
     };
-    if state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            exists_sql,
-            [req.target_id.into()],
-        ))
-        .await?
-        .is_none()
+    if req.new_instrument.is_some() && req.kind != PinKind::Instrument {
+        return Err(AppError::BadRequest(
+            "new_instrument belongs to an instrument pin; a calibration pin names an existing one"
+                .to_string(),
+        ));
+    }
+    if req.target_id.is_some() == req.new_instrument.is_some() {
+        return Err(AppError::BadRequest(
+            "name either target_id or new_instrument, not both and not neither".to_string(),
+        ));
+    }
+    if let Some(minted) = &req.new_instrument
+        && !matches!(minted.kind.as_deref(), None | Some("device") | Some("lab"))
     {
-        return Err(AppError::BadRequest(format!(
-            "No {} with id {}",
-            match req.kind {
-                PinKind::Instrument => "sensor",
-                PinKind::Calibration => "calibration",
-            },
-            req.target_id
-        )));
+        return Err(AppError::BadRequest(
+            "a minted instrument is 'device' or 'lab'".to_string(),
+        ));
+    }
+    if let Some(target_id) = req.target_id {
+        let exists_sql = match req.kind {
+            PinKind::Instrument => "SELECT 1 FROM sensors WHERE id = $1",
+            PinKind::Calibration => "SELECT 1 FROM sensor_calibrations WHERE id = $1",
+        };
+        if state
+            .db
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                exists_sql,
+                [target_id.into()],
+            ))
+            .await?
+            .is_none()
+        {
+            return Err(AppError::BadRequest(format!(
+                "No {} with id {}",
+                match req.kind {
+                    PinKind::Instrument => "sensor",
+                    PinKind::Calibration => "calibration",
+                },
+                target_id
+            )));
+        }
     }
     let (predicate, binds) = req.selection.predicate()?;
     // A curve belongs to one instrument, so an instrument pin has to say what happens to a
-    // correction the incoming instrument does not own (Q112). Asked before anything is written.
+    // correction the incoming instrument does not own (Q112). Asked before anything is written. A
+    // minted instrument owns none, so every curve in the selection is foreign to it.
     let foreign = if req.kind == PinKind::Instrument {
-        foreign_curves(&state.db, &predicate, binds.clone(), req.target_id).await?
+        foreign_curves(
+            &state.db,
+            &predicate,
+            binds.clone(),
+            req.target_id.unwrap_or_else(Uuid::nil),
+        )
+        .await?
     } else {
         Vec::new()
     };
@@ -2068,36 +2166,55 @@ pub async fn pin_readings(
             foreign.len()
         )));
     }
-    let (set_id, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
-        let set = record_set(
+    let (outcome, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
+        let target_id = match (&req.new_instrument, req.target_id) {
+            (Some(minted), _) => mint_instrument(txn, minted).await?,
+            (None, Some(id)) => id,
+            (None, None) => unreachable!("one of the two is present"),
+        };
+        let new = match req.kind {
+            PinKind::Instrument => serde_json::json!({ "sensor_id": target_id }),
+            PinKind::Calibration => serde_json::json!({ "calibration_id": target_id }),
+        };
+        let (set_id, recorded) = record_set(
             txn,
             kind,
             &req.selection,
-            new.clone(),
+            new,
             &actor,
             req.reason.as_deref(),
             Origin::Manual,
         )
         .await?;
+        // An instrument minted for a split that decides nothing is an instrument holding nothing,
+        // with no record that a split was attempted. The mint goes back with the pin.
+        if req.new_instrument.is_some() && recorded.rows == 0 {
+            return Err(AppError::BadRequest(
+                "the selection holds no readings, so there is nothing to split and no instrument \
+                 is created"
+                    .to_string(),
+            ));
+        }
         // In the same transaction as the pin: a reading is never left naming a curve of an
         // instrument it does not belong to.
         apply_curve_on_split(
             txn,
             req.curves,
             &foreign,
-            req.target_id,
+            target_id,
             &predicate,
             binds.clone(),
             &actor,
         )
         .await?;
-        Ok(set)
+        Ok(((set_id, target_id), recorded))
     })
     .await?;
+    let (set_id, target_id) = outcome;
     let jobs = enqueue_attribution_pin(
         &state.db,
         kind,
-        (req.kind == PinKind::Instrument).then_some(req.target_id),
+        (req.kind == PinKind::Instrument).then_some(target_id),
         set_id,
         &predicate,
         binds,
@@ -2105,6 +2222,7 @@ pub async fn pin_readings(
     .await?;
     Ok(Json(PinResponse {
         set_id,
+        target_id,
         rows_decided: recorded.rows,
         jobs,
     }))
@@ -2135,7 +2253,7 @@ pub async fn rollback_pin_set(
     axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     axum::extract::Path(set_id): axum::extract::Path<Uuid>,
 ) -> AppResult<Json<RollbackSetResponse>> {
-    let actor = crate::routes::private::tools::scripts::actor_label(&auth);
+    let actor = crate::common::actor::label(&auth);
     if state
         .db
         .query_one_raw(Statement::from_sql_and_values(
@@ -2312,7 +2430,7 @@ pub async fn detach_output(
     axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(req): Json<OutputSlotRequest>,
 ) -> AppResult<Json<OwnershipResponse>> {
-    let actor = crate::routes::private::tools::scripts::actor_label(&auth);
+    let actor = crate::common::actor::label(&auth);
     let rows = output_rows_at(&state.db, req.site_id, req.parameter_id, req.time).await?;
     if rows.is_empty() {
         return Err(AppError::NotFound(
@@ -2375,7 +2493,7 @@ pub async fn return_output(
     axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(req): Json<OutputSlotRequest>,
 ) -> AppResult<Json<OwnershipResponse>> {
-    let actor = crate::routes::private::tools::scripts::actor_label(&auth);
+    let actor = crate::common::actor::label(&auth);
     let rows = output_rows_at(&state.db, req.site_id, req.parameter_id, req.time).await?;
     if rows.is_empty() {
         return Err(AppError::NotFound(

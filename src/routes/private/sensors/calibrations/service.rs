@@ -131,6 +131,18 @@ pub fn attribution_derivable(alias: &str) -> String {
     )
 }
 
+/// A reading corrected by a standard curve that belongs to some other instrument.
+///
+/// A curve is bound to exactly one instrument (`standard_curves.sensor_id NOT NULL`), so this row
+/// says its value was corrected by something that did not measure it. Splitting readings onto
+/// another instrument is what produces them, and the split now asks instead (Q112, B181); these are
+/// the rows that predate the question. `readings` is the reading's alias, `curve` the joined
+/// `standard_curves`.
+#[must_use]
+pub fn foreign_curve_rows(readings: &str, curve: &str) -> String {
+    format!("{curve}.sensor_id IS DISTINCT FROM {readings}.sensor_id")
+}
+
 /// A reading holding a correction no curve accounts for: it names neither curve, yet carries a
 /// `calibrated_value` that is a different number from its raw value.
 ///
@@ -451,7 +463,7 @@ async fn fetch_derived_work_items(
             r"SELECT sp.id, d.id AS derived_definition_id, d.formula, sp.site_id, sp.parameter_id,
                      p.code AS parameter_code
               FROM site_parameters sp
-              JOIN derived_parameter_definitions d ON d.output_parameter_id = sp.parameter_id
+              JOIN calculation_formulas d ON d.output_parameter_id = sp.parameter_id
               JOIN parameters p ON p.id = sp.parameter_id
               WHERE sp.site_id = $1 AND sp.entry_mode = 'tool'",
             [site_id.into()],
@@ -496,7 +508,7 @@ async fn build_evaluation_order(
         deps.push(item_deps);
     }
 
-    evaluation_order(&deps).map_err(|cycle| {
+    crate::common::dependency::order(&deps).map_err(|cycle| {
         let members: Vec<&str> = cycle
             .iter()
             .map(|&idx| work_items[idx].derived_parameter_code.as_str())
@@ -508,32 +520,6 @@ async fn build_evaluation_order(
     })
 }
 
-/// The order the site's derived items evaluate in, each after every item it reads. Items whose
-/// dependencies never resolve are a cycle, and their positions come back as the error: computing
-/// the rest and dropping them would leave the values permanently absent with nothing said.
-fn evaluation_order(deps: &[Vec<usize>]) -> Result<Vec<usize>, Vec<usize>> {
-    let mut evaluated = vec![false; deps.len()];
-    let mut ordered: Vec<usize> = Vec::with_capacity(deps.len());
-    let mut remaining: Vec<usize> = (0..deps.len()).collect();
-
-    while !remaining.is_empty() {
-        let mut progress = false;
-        remaining.retain(|&idx| {
-            if deps[idx].iter().all(|&dep| evaluated[dep]) {
-                evaluated[idx] = true;
-                ordered.push(idx);
-                progress = true;
-                false
-            } else {
-                true
-            }
-        });
-        if !progress {
-            return Err(remaining);
-        }
-    }
-    Ok(ordered)
-}
 
 async fn get_or_create_derived_stream(
     db: &DatabaseConnection,
@@ -553,7 +539,7 @@ async fn get_or_create_derived_stream(
     let def_row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT name FROM derived_parameter_definitions WHERE id = $1",
+            r"SELECT name FROM calculation_formulas WHERE id = $1",
             [item.derived_definition_id.into()],
         ))
         .await?
@@ -1212,6 +1198,20 @@ async fn write_and_collect<C: ConnectionTrait>(
 mod tests {
     use super::*;
 
+    /// The report and the split ask the same question at different moments: a reading whose curve
+    /// belongs to another instrument. Keeping the predicate in one place is what stops the report
+    /// listing rows the split would not have asked about.
+    #[test]
+    fn a_foreign_curve_is_one_whose_owner_is_not_the_reading_s_instrument() {
+        assert_eq!(
+            foreign_curve_rows("r", "sc"),
+            "sc.sensor_id IS DISTINCT FROM r.sensor_id"
+        );
+        // NULL on either side is foreign, not skipped: a reading with no instrument corrected by
+        // somebody's curve is exactly the case worth listing.
+        assert!(foreign_curve_rows("r", "sc").contains("IS DISTINCT FROM"));
+    }
+
     #[test]
     fn the_drift_sweep_repairs_exactly_what_the_recompose_writes() {
         let drifted = format!(
@@ -1269,29 +1269,5 @@ mod tests {
             engine.contains("LEFT JOIN standard_curves sc"),
             "and the operator's standard curve is re-applied on top of the new base: {engine}"
         );
-    }
-
-    /// A site's derived items evaluate after everything they read.
-    #[test]
-    fn evaluation_order_puts_an_item_after_its_inputs() {
-        // item 0 reads item 2, item 2 reads item 1, item 1 reads nothing.
-        let order = evaluation_order(&[vec![2], vec![], vec![1]]).unwrap();
-        assert_eq!(order, vec![1, 2, 0]);
-    }
-
-    /// A cycle is named, not dropped: two definitions reading each other's output leave the run
-    /// with an error carrying both, rather than a warning and two values that never appear.
-    #[test]
-    fn evaluation_order_reports_a_cycle_rather_than_dropping_it() {
-        let cycle = evaluation_order(&[vec![1], vec![0]]).unwrap_err();
-        assert_eq!(cycle, vec![0, 1]);
-    }
-
-    /// The items outside the cycle are not what the error names.
-    #[test]
-    fn evaluation_order_names_only_the_cycle_members() {
-        // 0 stands alone; 1 and 2 read each other.
-        let cycle = evaluation_order(&[vec![], vec![2], vec![1]]).unwrap_err();
-        assert_eq!(cycle, vec![1, 2]);
     }
 }
