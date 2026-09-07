@@ -34,6 +34,7 @@ mod instrument_required;
 mod measurement_type_resolution;
 mod provenance;
 mod replicate_index_resync;
+mod rollback_propagation;
 mod sample_preview;
 mod sample_row_predicate;
 mod seasonal_check;

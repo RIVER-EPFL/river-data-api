@@ -417,3 +417,54 @@ async fn the_janitor_job_runs_the_sweep_and_the_sample_stats_follow() {
     );
     assert_eq!(n, 2);
 }
+
+/// Scenario: the sweep rewrites a spot value that a calculation at that visit reads as an input
+/// (Q108: everything rewrites, nothing is left stale).
+///
+/// Expected behaviour: the sweep reports the visits and parameters it moved, so the caller can
+/// recompute exactly them rather than sweeping the whole system or leaving them stale.
+#[tokio::test]
+#[serial]
+async fn the_sweep_reports_the_visits_whose_inputs_it_moved() {
+    let (db, app, token) = setup().await;
+    let (sensor, calibration) = deployed_lab_sensor(&db, 2.0, 1.0).await;
+    post_grab(&app, &token, sensor, None, 10.0).await;
+
+    let event_id: Option<Uuid> = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT collection_event_id FROM readings \
+                 WHERE site_id = '{SITE1_ID}' AND parameter_id = '{GLOBAL_PARAM_DO_ID}' \
+                   AND time = '{GRAB_TIME}'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "collection_event_id")
+        .unwrap();
+    let event_id = event_id.expect("a grab lands on a visit");
+
+    crate::common::exec(
+        &db,
+        &format!("UPDATE sensor_calibrations SET slope = 5.0 WHERE id = '{calibration}'"),
+    )
+    .await;
+
+    let drift = sweep_curve_drift(&db).await.expect("sweep runs");
+    assert_eq!(drift.moved, 1);
+    assert_eq!(
+        drift.touched,
+        vec![(event_id, GLOBAL_PARAM_DO_ID.parse::<Uuid>().unwrap())],
+        "the visit and parameter whose input moved, so its calculations can be re-run"
+    );
+
+    let events =
+        river_db::routes::private::collection_events::recompute::events_from_pairs(&db, &drift.touched)
+            .await
+            .expect("the visits resolve");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, event_id);
+    assert_eq!(events[0].source, "manual");
+}

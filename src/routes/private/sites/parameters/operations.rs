@@ -14,35 +14,6 @@ pub struct SiteParameterOperations;
 impl CRUDOperations for SiteParameterOperations {
     type Resource = SiteParameter;
 
-    /// One row at a time, through the single-row path: the crudcrate default delegates to the
-    /// resource, which delegates back here, and the single-row hooks are what a batch needs too.
-    async fn update_many(
-        &self,
-        db: &DatabaseConnection,
-        updates: Vec<(Uuid, <SiteParameter as CRUDResource>::UpdateModel)>,
-    ) -> Result<Vec<SiteParameter>, ApiError> {
-        let mut updated = Vec::with_capacity(updates.len());
-        for (id, data) in updates {
-            updated.push(self.update(db, id, data).await?);
-        }
-        Ok(updated)
-    }
-
-    /// One row at a time, through the single-row path: the crudcrate default `create_many`
-    /// delegates to the resource, which delegates back here, so the default recurses; the loop
-    /// also runs the single-row hooks for every item.
-    async fn create_many(
-        &self,
-        db: &DatabaseConnection,
-        data: Vec<<SiteParameter as CRUDResource>::CreateModel>,
-    ) -> Result<Vec<SiteParameter>, ApiError> {
-        let mut created = Vec::with_capacity(data.len());
-        for item in data {
-            created.push(self.create(db, item).await?);
-        }
-        Ok(created)
-    }
-
     /// Retire everything the slot owns before it goes away: unattribute its readings and status
     /// events, delete the samples nothing references any more, release the streams that fed it,
     /// and rebuild the rollups. `retire_slot` also does the `data_streams` NULLing the foreign key
@@ -54,24 +25,6 @@ impl CRUDOperations for SiteParameterOperations {
         )
         .await
         .map_err(|e| ApiError::internal(e.to_string(), None))?;
-        Ok(())
-    }
-
-    /// The bulk delete takes the same teardown per slot; without it a multi-slot delete leaves
-    /// readings attributed to a slot that no longer exists and fails on the stream foreign key.
-    async fn before_delete_many(
-        &self,
-        db: &DatabaseConnection,
-        ids: &[Uuid],
-    ) -> Result<(), ApiError> {
-        for id in ids {
-            crate::routes::private::data_streams::views::retire_slot(
-                db,
-                crate::routes::private::data_streams::views::SlotScope::SiteParameter(*id),
-            )
-            .await
-            .map_err(|e| ApiError::internal(e.to_string(), None))?;
-        }
         Ok(())
     }
 
@@ -221,15 +174,6 @@ impl CRUDOperations for SiteParameterOperations {
     }
 
     async fn after_delete(&self, db: &DatabaseConnection, _id: Uuid) -> Result<(), ApiError> {
-        crate::routes::private::alarms::sweeper::reconcile_all_from_hook(db).await;
-        Ok(())
-    }
-
-    async fn after_delete_many(
-        &self,
-        db: &DatabaseConnection,
-        _ids: &[Uuid],
-    ) -> Result<(), ApiError> {
         crate::routes::private::alarms::sweeper::reconcile_all_from_hook(db).await;
         Ok(())
     }

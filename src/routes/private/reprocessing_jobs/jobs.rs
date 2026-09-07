@@ -1281,6 +1281,31 @@ impl Job for JanitorRun {
                 {
                     tracing::warn!(error = %e, "Janitor: refresh after curve drift failed");
                 }
+                // A rewritten spot value is an input somebody's calculation read, so the visits it
+                // moved recompute in dependency order rather than being left stale (Q108).
+                match crate::routes::private::collection_events::recompute::events_from_pairs(
+                    db,
+                    &drift.touched,
+                )
+                .await
+                {
+                    Ok(events) => {
+                        if let Err(e) =
+                            crate::routes::private::collection_events::recompute::enqueue_for(
+                                db,
+                                &events,
+                                "janitor",
+                                crate::routes::private::collection_events::recompute::Writer::Person,
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "Janitor: recompute after curve drift failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Janitor: resolving drifted visits failed");
+                    }
+                }
             }
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "Janitor: curve drift sweep failed"),

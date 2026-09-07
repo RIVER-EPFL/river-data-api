@@ -60,6 +60,14 @@ struct SyncService {
 }
 
 #[derive(FromQueryResult)]
+struct FailedJobs {
+    trigger_type: String,
+    n: i64,
+    sample_error: Option<String>,
+    scope: Option<serde_json::Value>,
+}
+
+#[derive(FromQueryResult)]
 struct FailureCounts {
     n_failed: i64,
     n_partial: i64,
@@ -98,6 +106,9 @@ pub async fn run(state: &AppState, channels: &[Box<dyn NotificationChannel>]) {
     }
     if let Err(e) = holds_open(state, channels).await {
         tracing::warn!(error = %e, "open-holds trigger failed");
+    }
+    if let Err(e) = jobs_failed(state, channels).await {
+        tracing::warn!(error = %e, "failed-job trigger failed");
     }
 }
 
@@ -640,6 +651,66 @@ async fn holds_open(
         slot: None,
     };
     let _ = deliver(state, channels, &msg, None).await;
+    Ok(())
+}
+
+/// Hours between repeat alerts while jobs of one kind keep failing.
+const JOB_FAILED_RENOTIFY_HOURS: i64 = 6;
+
+/// A background job that has spent its retries and ended `failed`. Everything the operator
+/// triggers runs as one of these, so a plan apply that violated a constraint or a reprocess that
+/// died leaves an `error_message` on a row and nothing else; the digest is per trigger type so a
+/// broken kind failing on every run is one alert rather than one per job.
+async fn jobs_failed(
+    state: &AppState,
+    channels: &[Box<dyn NotificationChannel>],
+) -> Result<(), DbErr> {
+    let db = &state.db;
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            PG,
+            "SELECT trigger_type, COUNT(*)::bigint AS n, \
+                    (ARRAY_AGG(error_message ORDER BY completed_at DESC) \
+                        FILTER (WHERE error_message IS NOT NULL))[1] AS sample_error, \
+                    (ARRAY_AGG(detail -> 'scope' ORDER BY completed_at DESC) \
+                        FILTER (WHERE detail -> 'scope' IS NOT NULL))[1] AS scope \
+               FROM reprocessing_jobs \
+              WHERE status = 'failed' AND completed_at > NOW() - INTERVAL '24 hours' \
+              GROUP BY trigger_type ORDER BY trigger_type"
+                .to_string(),
+        ))
+        .await?;
+
+    for row in &rows {
+        let FailedJobs {
+            trigger_type,
+            n,
+            sample_error,
+            scope,
+        } = FailedJobs::from_query_result(row, "")?;
+        if !claim_renotify(db, "job_failed", &trigger_type, JOB_FAILED_RENOTIFY_HOURS).await? {
+            continue;
+        }
+        let mut body = format!(
+            "🛠 {n} {trigger_type} job(s) failed in the last 24 hours and will not be retried again."
+        );
+        if let Some(scope) = scope.filter(|s| !s.is_null()) {
+            body.push_str(&format!("\nScope: {scope}"));
+        }
+        if let Some(err) = sample_error {
+            let err: String = err.chars().take(300).collect();
+            body.push_str(&format!("\nLatest error: {err}"));
+        }
+        body.push_str("\nOpen it under System, Jobs.");
+        let msg = OutgoingMessage {
+            kind: "job_failed",
+            subject: format!("RIVER Data: {trigger_type} job failed"),
+            body,
+            // A job kind spans whatever it was run over, so the digest carries no single slot.
+            slot: None,
+        };
+        let _ = deliver(state, channels, &msg, None).await;
+    }
     Ok(())
 }
 

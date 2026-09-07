@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::sd_estimator;
+use crate::routes::private::sync::replicate_audit;
 
 mod manifest;
 mod runner;
@@ -1453,20 +1454,15 @@ async fn apply_manifest_aggregates(
             .collect();
 
         let computed = match kind {
-            "mean" if !values.is_empty() => Some(values.iter().sum::<f64>() / values.len() as f64),
-            "sd" if values.len() >= 2 => {
-                let n = values.len() as f64;
-                let mean = values.iter().sum::<f64>() / n;
-                let ss: f64 = values.iter().map(|v| (v - mean).powi(2)).sum();
-                let divisor = match output.fixed_sd_estimator() {
-                    Some("population") => n,
-                    Some(_) => n - 1.0,
-                    None => match displayed_sd_estimator(db, site_id, collected_at, param).await? {
-                        Some(sd_estimator::POPULATION) => n,
-                        _ => n - 1.0,
-                    },
+            "mean" => replicate_audit::group_stats(&values).mean,
+            "sd" => {
+                let estimator = match output.fixed_sd_estimator() {
+                    Some(fixed) => fixed,
+                    None => displayed_sd_estimator(db, site_id, collected_at, param)
+                        .await?
+                        .unwrap_or(sd_estimator::SAMPLE),
                 };
-                Some((ss / divisor).sqrt())
+                replicate_audit::group_stats(&values).under(estimator).sd
             }
             _ => None,
         };

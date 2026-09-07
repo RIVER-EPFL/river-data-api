@@ -68,7 +68,10 @@ async fn apply_and_wait(
         (200..300).contains(&status),
         "apply should be 2xx, got {status}: {text}"
     );
-    assert_eq!(crate::common::jobs::wait_for_job(db, &job_id_of(&text)).await, "completed");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(db, &job_id_of(&text)).await,
+        "completed"
+    );
 }
 
 fn entry_for(plan: &serde_json::Value, stream_id: Uuid) -> serde_json::Value {
@@ -1309,4 +1312,111 @@ async fn a_draft_reports_the_streams_registered_after_it() {
     register(&db, "loc-legacy").await;
     register(&db, "loc-legacy:reps").await;
     assert_eq!(uncovered(&app, &token).await, Some(2));
+}
+
+/// Two new slots at one site whose parameters carry the same display name and the same units, over
+/// a site that already holds that name. The apply must distinguish them rather than compute one
+/// suffixed name twice and violate `uq_site_param_name`.
+#[tokio::test]
+#[serial]
+async fn two_new_slots_sharing_a_name_and_units_both_apply() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    // Two catalog parameters that differ by code and share the label an operator reads.
+    let flux_a = Uuid::new_v4();
+    let flux_b = Uuid::new_v4();
+    let holder = Uuid::new_v4();
+    for (id, code) in [(flux_a, "FluxA"), (flux_b, "FluxB"), (holder, "FluxHeld")] {
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO parameters (id, code, name, default_units, category) \
+                 VALUES ('{id}', '{code}', 'Flux', 'mg/L', 'measurement')"
+            ),
+        )
+        .await;
+    }
+    // The site already holds the bare name, so both new slots need a suffix.
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, display_units, units_name, is_active) \
+             VALUES ('{}', '{}', '{holder}', 'Flux', '', 'mg/L', 'mg/L', true)",
+            Uuid::new_v4(),
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+
+    let stream_a = Uuid::new_v4();
+    let stream_b = Uuid::new_v4();
+    for (stream, key, code) in [(stream_a, "flux-a", "FluxA"), (stream_b, "flux-b", "FluxB")] {
+        crate::common::seed_unpaired_stream_with_hierarchy(
+            &db,
+            &stream.to_string(),
+            "hardening",
+            key,
+            "Test River Project",
+            "Upstream Station",
+            code,
+            "mg/L",
+            None,
+            1,
+        )
+        .await;
+    }
+
+    let plan_id = Uuid::new_v4();
+    let entry = |stream: Uuid, key: &str, param: Uuid, code: &str| {
+        serde_json::json!({
+            "stream_id": stream,
+            "source_key": key,
+            "source_name": null,
+            "action": "pair",
+            "project": { "id": crate::common::PROJECT_ID, "name": "Test River Project", "create": false },
+            "site": { "id": crate::common::SITE1_ID, "name": "Upstream Station", "create": false, "latitude": null, "longitude": null, "altitude_m": null },
+            "parameter": { "id": param, "name": code, "create": false, "units": "mg/L", "group_key": null, "original_names": [] },
+            "confidence": "high",
+            "warnings": [],
+            "original_parameter_name": code
+        })
+    };
+    insert_plan(
+        &db,
+        plan_id,
+        &serde_json::json!([
+            entry(stream_a, "flux-a", flux_a, "FluxA"),
+            entry(stream_b, "flux-b", flux_b, "FluxB"),
+        ]),
+    )
+    .await;
+
+    apply_and_wait(&app, &db, &token, plan_id).await;
+
+    let paired = scalar_i64(
+        &db,
+        &format!(
+            "SELECT count(*) AS v FROM data_streams \
+             WHERE id IN ('{stream_a}', '{stream_b}') AND site_parameter_id IS NOT NULL"
+        ),
+    )
+    .await;
+    assert_eq!(paired, 2, "both streams should be paired to their own slot");
+
+    let names = scalar_i64(
+        &db,
+        &format!(
+            "SELECT count(DISTINCT name) AS v FROM site_parameters \
+             WHERE site_id = '{}' AND parameter_id IN ('{flux_a}', '{flux_b}', '{holder}')",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    assert_eq!(names, 3, "each slot at the site should carry its own name");
+
+    crate::common::cleanup_test_db(&db).await;
 }

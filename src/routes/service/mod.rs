@@ -548,6 +548,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/schedules/{job_name}/audit",
             get(crate::routes::private::reprocessing_jobs::schedule_routes::get_schedule_audit),
         )
+        .route(
+            "/change_audit",
+            get(crate::routes::private::change_audit::list_change_audit),
+        )
         .layer(middleware::from_fn(require_read_metadata))
         .with_state(state.clone());
 

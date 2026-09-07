@@ -11,6 +11,7 @@ mod meteoswiss_provisioning;
 mod nomis_pairing_refused;
 mod pair_opens_at_history;
 mod pair_replicate_samples;
+mod preview_sd_estimator;
 mod register_declares_instrument;
 mod register_pair_stats;
 mod replicate_retag_guard;

@@ -90,53 +90,11 @@ async fn codes_for_statistics_rule(
 impl CRUDOperations for ParameterGroupOperations {
     type Resource = ParameterGroup;
 
-    /// One row at a time, through the single-row path: the crudcrate default delegates to the
-    /// resource, which delegates back here, and the single-row hooks are what a batch needs too.
-    async fn update_many(
-        &self,
-        db: &DatabaseConnection,
-        updates: Vec<(Uuid, <ParameterGroup as CRUDResource>::UpdateModel)>,
-    ) -> Result<Vec<ParameterGroup>, ApiError> {
-        let mut updated = Vec::with_capacity(updates.len());
-        for (id, data) in updates {
-            updated.push(self.update(db, id, data).await?);
-        }
-        Ok(updated)
-    }
-
-    /// One row at a time, through the single-row path: the crudcrate default `create_many`
-    /// delegates to the resource, which delegates back here, so the default recurses; the loop
-    /// also runs the single-row hooks for every item.
-    async fn create_many(
-        &self,
-        db: &DatabaseConnection,
-        data: Vec<<ParameterGroup as CRUDResource>::CreateModel>,
-    ) -> Result<Vec<ParameterGroup>, ApiError> {
-        let mut created = Vec::with_capacity(data.len());
-        for item in data {
-            created.push(self.create(db, item).await?);
-        }
-        Ok(created)
-    }
-
     /// The FK is `ON DELETE RESTRICT`, which would surface as a raw 500; the rule says what to do
     /// about it instead.
     async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
         rules::may_delete(id, &all_members(db).await?)
             .map_err(|refusal| ApiError::bad_request(refusal.to_string()))
-    }
-
-    async fn before_delete_many(
-        &self,
-        db: &DatabaseConnection,
-        ids: &[Uuid],
-    ) -> Result<(), ApiError> {
-        let members = all_members(db).await?;
-        for id in ids {
-            rules::may_delete(*id, &members)
-                .map_err(|refusal| ApiError::bad_request(refusal.to_string()))?;
-        }
-        Ok(())
     }
 }
 
@@ -145,32 +103,6 @@ pub struct ParameterGroupMemberOperations;
 #[async_trait]
 impl CRUDOperations for ParameterGroupMemberOperations {
     type Resource = ParameterGroupMember;
-
-    /// One row at a time, through the single-row path: the crudcrate default delegates to the
-    /// resource, which delegates back here, and the single-row hooks are what a batch needs too.
-    async fn update_many(
-        &self,
-        db: &DatabaseConnection,
-        updates: Vec<(Uuid, <ParameterGroupMember as CRUDResource>::UpdateModel)>,
-    ) -> Result<Vec<ParameterGroupMember>, ApiError> {
-        let mut updated = Vec::with_capacity(updates.len());
-        for (id, data) in updates {
-            updated.push(self.update(db, id, data).await?);
-        }
-        Ok(updated)
-    }
-
-    async fn create_many(
-        &self,
-        db: &DatabaseConnection,
-        data: Vec<<ParameterGroupMember as CRUDResource>::CreateModel>,
-    ) -> Result<Vec<ParameterGroupMember>, ApiError> {
-        let mut created = Vec::with_capacity(data.len());
-        for item in data {
-            created.push(self.create(db, item).await?);
-        }
-        Ok(created)
-    }
 
     /// A parameter belongs to at most one group. The UNIQUE index is the backstop; this names the
     /// group that already holds it. A group's replicated members carry their own mean and sd, so

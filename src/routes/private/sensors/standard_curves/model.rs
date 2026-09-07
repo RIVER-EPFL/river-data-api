@@ -49,6 +49,10 @@ pub struct Model {
     /// `/standard_curves/register` together with `source_system`.
     #[crudcrate(exclude(create, update), filterable)]
     pub source_key: Option<String>,
+    /// The curve this one was copied from, when readings were split onto another instrument and
+    /// took their correction with them (Q112). NULL on a curve that was fitted rather than copied.
+    #[crudcrate(exclude(create, update), filterable)]
+    pub copied_from_id: Option<Uuid>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

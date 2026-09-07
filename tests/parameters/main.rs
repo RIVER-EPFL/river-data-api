@@ -6,5 +6,6 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod change_audit;
 mod groups;
 mod portal_group_seed;

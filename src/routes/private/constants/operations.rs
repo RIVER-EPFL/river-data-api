@@ -33,33 +33,6 @@ pub fn audit_dedupe_key(name: &str) -> String {
 impl CRUDOperations for ConstantOperations {
     type Resource = Constant;
 
-    /// One row at a time, through the single-row path: the crudcrate default `update_many`
-    /// delegates to the resource, which delegates back here, so the default recurses and a bulk
-    /// edit would run none of the hooks below.
-    async fn update_many(
-        &self,
-        db: &DatabaseConnection,
-        updates: Vec<(Uuid, <Constant as CRUDResource>::UpdateModel)>,
-    ) -> Result<Vec<Constant>, ApiError> {
-        let mut updated = Vec::with_capacity(updates.len());
-        for (id, data) in updates {
-            updated.push(self.update(db, id, data).await?);
-        }
-        Ok(updated)
-    }
-
-    async fn create_many(
-        &self,
-        db: &DatabaseConnection,
-        data: Vec<<Constant as CRUDResource>::CreateModel>,
-    ) -> Result<Vec<Constant>, ApiError> {
-        let mut created = Vec::with_capacity(data.len());
-        for item in data {
-            created.push(self.create(db, item).await?);
-        }
-        Ok(created)
-    }
-
     /// The lifecycle with the previous value read first: a units or description edit changes no
     /// calculation and audits nothing.
     async fn update(

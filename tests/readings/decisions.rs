@@ -192,7 +192,7 @@ async fn a_flag_projects_in_the_same_transaction_and_an_unflag_supersedes_it() {
     assert_eq!(unflag.old["flag_reason"], "vial cracked");
 
     // Rolling the unflag back restores the flag from what the unflag recorded, and stamps it.
-    let rollback_id = bulk_write::guarded(&f.db, async |txn| {
+    let (rollback_id, _) = bulk_write::guarded(&f.db, async |txn| {
         decisions::rollback(txn, unflag_id, "tester", Some("wrong vial")).await
     })
     .await

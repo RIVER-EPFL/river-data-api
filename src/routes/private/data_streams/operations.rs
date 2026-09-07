@@ -27,20 +27,6 @@ async fn family_key(db: &DatabaseConnection, id: Uuid) -> Result<Option<String>,
 impl CRUDOperations for DataStreamOperations {
     type Resource = DataStream;
 
-    /// One row at a time, through the single-row path: the crudcrate default delegates to the
-    /// resource, which delegates back here, and the single-row hooks are what a batch needs too.
-    async fn create_many(
-        &self,
-        db: &DatabaseConnection,
-        data: Vec<<DataStream as crudcrate::CRUDResource>::CreateModel>,
-    ) -> Result<Vec<DataStream>, ApiError> {
-        let mut created = Vec::with_capacity(data.len());
-        for item in data {
-            created.push(self.create(db, item).await?);
-        }
-        Ok(created)
-    }
-
     /// A replicate family stays classified 'spot' through entity CRUD as well: `/streams/register`
     /// and `/streams/retag` already refuse it, and a plain PATCH must not be the one route that
     /// can move the column. Clearing it (NULL) is refused too, the classification would then fall
@@ -64,19 +50,6 @@ impl CRUDOperations for DataStreamOperations {
             )));
         }
         Ok(())
-    }
-
-    /// One row at a time, through the single-row path, so a bulk edit meets the same guard.
-    async fn update_many(
-        &self,
-        db: &DatabaseConnection,
-        updates: Vec<(Uuid, <DataStream as crudcrate::CRUDResource>::UpdateModel)>,
-    ) -> Result<Vec<DataStream>, ApiError> {
-        let mut updated = Vec::with_capacity(updates.len());
-        for (id, data) in updates {
-            updated.push(self.update(db, id, data).await?);
-        }
-        Ok(updated)
     }
 
     /// The replicate assignments, read out of the metadata the stream already carries.

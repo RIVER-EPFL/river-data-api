@@ -1032,9 +1032,9 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crudcrate"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c0f0cd361f25b9026c83afa6a1989c2d80dc38be6377a404d48338a49b1d5f0"
+checksum = "4c1522727d6a5cac975918ccd24a1f927a0e7b023d1c6f2d74366dfb35bc2a91"
 dependencies = [
  "async-trait",
  "axum",
@@ -1052,9 +1052,9 @@ dependencies = [
 
 [[package]]
 name = "crudcrate-derive"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f7b0d49fc6b47b55da0f375f1467806a493f640d360f24cf95071833a3f3d78"
+checksum = "e693998c98bf602473a3010eff71d59991857772b5e9e1a3fbd66d847eabf1f2"
 dependencies = [
  "convert_case",
  "heck 0.5.0",

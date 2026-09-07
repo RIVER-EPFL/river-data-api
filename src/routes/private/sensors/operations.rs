@@ -39,21 +39,6 @@ impl CRUDOperations for SensorOperations {
         Ok(())
     }
 
-    /// One row at a time, through the single-row path: the crudcrate default `create_many`
-    /// delegates to the resource, which delegates back here, so the default recurses; the loop
-    /// also runs the single-row hooks for every item.
-    async fn create_many(
-        &self,
-        db: &DatabaseConnection,
-        data: Vec<<Sensor as CRUDResource>::CreateModel>,
-    ) -> Result<Vec<Sensor>, ApiError> {
-        let mut created = Vec::with_capacity(data.len());
-        for item in data {
-            created.push(self.create(db, item).await?);
-        }
-        Ok(created)
-    }
-
     /// The dependent tables all reference sensors without ON DELETE, so the constraint would
     /// refuse this anyway; the check turns that into a stated 400 instead of an internal error.
     async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
@@ -88,30 +73,6 @@ impl CRUDOperations for SensorOperations {
                     held.join(", ")
                 )));
             }
-        }
-        Ok(())
-    }
-
-    /// One row at a time, through the single-row path, so a bulk edit meets the same guard.
-    async fn update_many(
-        &self,
-        db: &DatabaseConnection,
-        updates: Vec<(Uuid, <Sensor as CRUDResource>::UpdateModel)>,
-    ) -> Result<Vec<Sensor>, crudcrate::ApiError> {
-        let mut updated = Vec::with_capacity(updates.len());
-        for (id, data) in updates {
-            updated.push(self.update(db, id, data).await?);
-        }
-        Ok(updated)
-    }
-
-    async fn before_delete_many(
-        &self,
-        db: &DatabaseConnection,
-        ids: &[Uuid],
-    ) -> Result<(), ApiError> {
-        for id in ids {
-            self.before_delete(db, *id).await?;
         }
         Ok(())
     }

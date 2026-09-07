@@ -68,6 +68,40 @@ pub async fn touched_events<C: ConnectionTrait>(
         .collect()
 }
 
+/// The same visits, from `(collection_event_id, parameter_id)` pairs a bulk write already knows.
+/// A sweep that rewrites values in one statement has the pairs and no predicate to hand back, so
+/// this is the other door into [`enqueue_for`].
+pub async fn events_from_pairs<C: ConnectionTrait>(
+    conn: &C,
+    pairs: &[(Uuid, Uuid)],
+) -> AppResult<Vec<TouchedEvent>> {
+    if pairs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut by_event: std::collections::HashMap<Uuid, Vec<Uuid>> = std::collections::HashMap::new();
+    for (event_id, parameter_id) in pairs {
+        by_event.entry(*event_id).or_default().push(*parameter_id);
+    }
+    let ids: Vec<Uuid> = by_event.keys().copied().collect();
+    let rows = conn
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id, source FROM collection_events WHERE id = ANY($1)",
+            [ids.into()],
+        ))
+        .await?;
+    rows.iter()
+        .map(|r| {
+            let id: Uuid = r.try_get("", "id")?;
+            Ok(TouchedEvent {
+                parameter_ids: by_event.remove(&id).unwrap_or_default(),
+                source: r.try_get("", "source")?,
+                id,
+            })
+        })
+        .collect()
+}
+
 /// Enqueue `event_recompute` for every touched visit an enabled calculation reads. Returns the
 /// ids of the jobs this call queued; a visit with a job already queued adds none.
 pub async fn enqueue_for(

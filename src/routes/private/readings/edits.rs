@@ -674,24 +674,20 @@ pub async fn commit(
     })
     .await?;
 
-    if let Some((lo, hi)) = recorded.span
-        && let Err(e) = crate::common::aggregates::refresh(
-            &state.db,
-            crate::common::aggregates::Window::Range(lo, hi),
-        )
-        .await
-    {
-        tracing::warn!(error = %e, "edit: aggregate refresh failed");
-    }
-    crate::routes::private::collection_events::recompute::enqueue_for(
-        &state.db,
-        &recorded.touched_events,
-        &actor,
-        crate::routes::private::collection_events::recompute::Writer::Person,
-    )
-    .await?;
+    propagate(&state, &recorded, &actor).await?;
 
     let (predicate, binds) = req.selection.predicate()?;
+    // A pin recorded here owes the same reprocess as one recorded through `/readings/pins`: the
+    // projection sets the column, and only the reprocess makes the correction follow it.
+    decisions::enqueue_attribution_pin(
+        &state.db,
+        kind,
+        (kind == Kind::InstrumentPin).then(|| req.decision.target_id).flatten(),
+        set_id,
+        &predicate,
+        binds.clone(),
+    )
+    .await?;
     let ids = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
@@ -733,6 +729,32 @@ fn authorise(auth: &AuthContext, option: EditOption) -> AppResult<()> {
     )))
 }
 
+/// What every edit owes after its transaction commits, forward or inverted: the rollups over the
+/// span it moved, and the calculations at the visits it touched.
+async fn propagate(
+    state: &AppState,
+    recorded: &decisions::Recorded,
+    actor: &str,
+) -> AppResult<()> {
+    if let Some((lo, hi)) = recorded.span
+        && let Err(e) = crate::common::aggregates::refresh(
+            &state.db,
+            crate::common::aggregates::Window::Range(lo, hi),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "edit: aggregate refresh failed");
+    }
+    crate::routes::private::collection_events::recompute::enqueue_for(
+        &state.db,
+        &recorded.touched_events,
+        actor,
+        crate::routes::private::collection_events::recompute::Writer::Person,
+    )
+    .await?;
+    Ok(())
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RollbackResponse {
     pub rollback_id: Uuid,
@@ -756,10 +778,14 @@ pub async fn rollback(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> AppResult<Json<RollbackResponse>> {
     let actor = actor_label(&auth);
-    let rollback_id = crate::common::bulk_write::guarded(&state.db, async |txn| {
+    let (rollback_id, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         decisions::rollback(txn, id, &actor, Some("edit rolled back")).await
     })
     .await?;
+    propagate(&state, &recorded, &actor).await?;
+    // Inverting a pin changes what the window resolves for that reading, and only the reprocess
+    // writes it. The forward path enqueues the same job.
+    decisions::enqueue_pin_reprocess_for_decision(&state.db, id).await?;
     Ok(Json(RollbackResponse { rollback_id }))
 }
 
@@ -788,10 +814,12 @@ pub async fn rollback_edit_set(
     axum::extract::Path(set_id): axum::extract::Path<Uuid>,
 ) -> AppResult<Json<RollbackSetResponse>> {
     let actor = actor_label(&auth);
-    let rolled_back = crate::common::bulk_write::guarded(&state.db, async |txn| {
+    let (rolled_back, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         decisions::rollback_set(txn, set_id, &actor, Some("edit set rolled back")).await
     })
     .await?;
+    propagate(&state, &recorded, &actor).await?;
+    decisions::enqueue_pin_reprocess_for_set(&state.db, set_id).await?;
     Ok(Json(RollbackSetResponse {
         set_id,
         rolled_back,

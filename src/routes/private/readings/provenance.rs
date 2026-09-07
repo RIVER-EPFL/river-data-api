@@ -63,6 +63,9 @@ pub struct ProvenanceRecord {
     pub event: Option<EventRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub computation: Option<ComputationInfo>,
+    /// The formula that produced a derived value, the counterpart of a tool run's record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calculation: Option<CalculationInfo>,
     pub holds: Vec<HoldRef>,
 }
 
@@ -295,6 +298,28 @@ pub struct EventRef {
     pub created_by: Option<String>,
 }
 
+/// The standalone formula behind a derived value: the definition it belongs to and the version it
+/// was made with. A row stored before versioning names no version, so `formula` is absent rather
+/// than filled from the definition's current text, which no longer describes it.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CalculationInfo {
+    pub definition_id: Uuid,
+    pub code: String,
+    pub name: String,
+    /// The version the stored value names, absent when the value predates versioning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_no: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formula: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// The definition's newest version, so a value made by an older one is visible as such.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_version_no: Option<i32>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ComputationInfo {
     /// The statistics row, when the instant carries two or more replicates.
@@ -350,13 +375,15 @@ pub struct HoldRef {
 
 /// The stream's origin class, from the writer-side source-system set in
 /// `collection_events::attach`.
-/// How a reading reached the store, from the stream it arrived on: `manual`, `csv`, `api` or
-/// `sync`. One definition, so every surface naming an origin names the same thing.
+/// How a reading reached the store, from the stream it arrived on: `manual`, `csv`, `api`,
+/// `derived` or `sync`. One definition, so every surface naming an origin names the same thing. A
+/// computed value was made here rather than sent, so it is not a sync.
 pub fn classify_source(source_system: &str) -> &'static str {
     match source_system {
         "grab_sample" => "manual",
         "csv" | "csv_import" => "csv",
         "api" => "api",
+        "derived" => "derived",
         _ => "sync",
     }
 }
@@ -484,6 +511,7 @@ pub struct RawRow {
     ingested_at: Option<DateTime<Utc>>,
     provenance_kind: Option<String>,
     provenance: Option<serde_json::Value>,
+    derived_version_id: Option<Uuid>,
     label: Option<String>,
     notes: Option<String>,
     created_by: Option<String>,
@@ -493,7 +521,7 @@ const ROW_COLUMNS: &str = "stream_id, replicate_index, site_id, parameter_id, ra
      calibrated_value, sensor_id, calibration_id, standard_curve_id, deployment_id, \
      measurement_type, is_flagged, flag_reason, sample_id, collection_event_id, \
      withdrawn_at, withdrawn_reason, unverified, ingested_at, provenance_kind, provenance, \
-     label, notes, created_by";
+     derived_version_id, label, notes, created_by";
 
 /// The assembled record of one measured instant: where it came from, when it arrived, what
 /// instrument and corrections produced the stored value, the visit it belongs to, the tool run
@@ -691,6 +719,7 @@ pub async fn assemble_records(
     let mut pins = load_pins(db, &stream_ids, time).await?;
     let value_arrivals = load_value_arrivals(db, &stream_ids, time).await?;
     let run_sources = fetch_run_sources(db, rows).await?;
+    let (calculations, formula_versions) = fetch_calculations(db, rows).await?;
 
     let mut records = Vec::with_capacity(groups.len());
     for (stream_id, group) in &groups {
@@ -811,6 +840,27 @@ pub async fn assemble_records(
             None
         };
 
+        // A derived value's calculation, with the version this group's rows name where they
+        // name one at all.
+        let calculation = group
+            .iter()
+            .filter(|r| r.measurement_type.as_deref() == Some("derived"))
+            .find_map(|r| r.parameter_id)
+            .and_then(|parameter_id| calculations.get(&parameter_id).cloned())
+            .map(|mut calc| {
+                if let Some((version_id, (version_no, formula, content_hash))) = group
+                    .iter()
+                    .find_map(|r| r.derived_version_id)
+                    .and_then(|id| formula_versions.get(&id).map(|v| (id, v)))
+                {
+                    calc.version_id = Some(version_id);
+                    calc.version_no = Some(*version_no);
+                    calc.formula = Some(formula.clone());
+                    calc.content_hash = Some(content_hash.clone());
+                }
+                calc
+            });
+
         records.push(ProvenanceRecord {
             origin: OriginInfo {
                 stream_id: *stream_id,
@@ -839,6 +889,7 @@ pub async fn assemble_records(
             },
             event,
             computation,
+            calculation,
             holds,
         });
     }
@@ -1038,6 +1089,87 @@ async fn fetch_run_sources(
     Ok(out)
 }
 
+/// The calculation behind every derived row, keyed by the output parameter it writes, and the
+/// versions the stored values name, keyed by their own ids. A row naming no version keeps the
+/// definition and reports no formula, because the text that produced it is not recoverable (M134).
+type FormulaVersion = (i32, String, String);
+
+async fn fetch_calculations(
+    db: &sea_orm::DatabaseConnection,
+    rows: &[RawRow],
+) -> AppResult<(HashMap<Uuid, CalculationInfo>, HashMap<Uuid, FormulaVersion>)> {
+    let parameter_ids: Vec<Uuid> = rows
+        .iter()
+        .filter(|r| r.measurement_type.as_deref() == Some("derived"))
+        .filter_map(|r| r.parameter_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    if parameter_ids.is_empty() {
+        return Ok((HashMap::new(), HashMap::new()));
+    }
+    let definitions = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT d.id, d.code, d.name, d.output_parameter_id, \
+                    (SELECT max(v.version_no) FROM derived_parameter_definition_versions v \
+                      WHERE v.definition_id = d.id) AS active_version_no \
+               FROM derived_parameter_definitions d \
+              WHERE d.output_parameter_id = ANY($1)",
+            [parameter_ids.into()],
+        ))
+        .await?;
+    let mut by_parameter: HashMap<Uuid, CalculationInfo> = HashMap::new();
+    for row in definitions {
+        let Some(output) = row.try_get::<Option<Uuid>>("", "output_parameter_id")? else {
+            continue;
+        };
+        by_parameter.insert(
+            output,
+            CalculationInfo {
+                definition_id: row.try_get("", "id")?,
+                code: row.try_get("", "code")?,
+                name: row.try_get("", "name")?,
+                version_id: None,
+                version_no: None,
+                formula: None,
+                content_hash: None,
+                active_version_no: row.try_get("", "active_version_no")?,
+            },
+        );
+    }
+
+    let version_ids: Vec<Uuid> = rows
+        .iter()
+        .filter_map(|r| r.derived_version_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    if version_ids.is_empty() {
+        return Ok((by_parameter, HashMap::new()));
+    }
+    let found = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id, version_no, formula, content_hash \
+               FROM derived_parameter_definition_versions WHERE id = ANY($1)",
+            [version_ids.into()],
+        ))
+        .await?;
+    let mut versions = HashMap::new();
+    for row in found {
+        versions.insert(
+            row.try_get::<Uuid>("", "id")?,
+            (
+                row.try_get::<i32>("", "version_no")?,
+                row.try_get::<String>("", "formula")?,
+                row.try_get::<String>("", "content_hash")?,
+            ),
+        );
+    }
+    Ok((by_parameter, versions))
+}
+
 /// The slot's code, name, unit and declared precision. The site's own configuration wins over the
 /// catalog default, which is what makes the number on screen readable in the unit it was served in.
 async fn slot_identity(
@@ -1067,7 +1199,16 @@ async fn slot_identity(
 
 #[cfg(test)]
 mod tests {
-    use super::{PROVENANCE_KINDS, provenance_kind_for_run, provenance_kind_for_stream};
+    use super::{
+        PROVENANCE_KINDS, classify_source, provenance_kind_for_run, provenance_kind_for_stream,
+    };
+
+    #[test]
+    fn test_a_computed_value_is_not_classified_as_a_sync() {
+        assert_eq!(classify_source("derived"), "derived");
+        assert_eq!(classify_source("cnet"), "sync");
+        assert_eq!(classify_source("grab_sample"), "manual");
+    }
 
     #[test]
     fn test_a_row_that_records_nothing_is_untold() {

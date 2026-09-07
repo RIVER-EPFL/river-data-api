@@ -35,6 +35,8 @@ mod m20260910_000011_prediction_kind_group;
 pub mod m20260910_000012_drop_subscriber_cache;
 mod m20260910_000013_ingested_at_is_first_arrival;
 pub mod m20260910_000014_derived_definition_versions;
+mod m20260910_000015_entity_change_audit;
+mod m20260910_000016_curve_copied_from;
 pub mod portal_seed;
 
 pub struct Migrator;
@@ -78,6 +80,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260910_000012_drop_subscriber_cache::Migration),
             Box::new(m20260910_000013_ingested_at_is_first_arrival::Migration),
             Box::new(m20260910_000014_derived_definition_versions::Migration),
+            Box::new(m20260910_000015_entity_change_audit::Migration),
+            Box::new(m20260910_000016_curve_copied_from::Migration),
         ]
     }
 }

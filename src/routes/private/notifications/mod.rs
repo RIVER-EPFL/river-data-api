@@ -79,9 +79,8 @@ impl KindGroup {
 pub fn kind_group(kind: &str) -> Option<KindGroup> {
     match kind {
         "alarm_opened" | "alarm_resolved" => Some(KindGroup::Alarms),
-        "stale_data" | "sync_stale" | "sync_failure" | "streams_unpaired" | "holds_open" => {
-            Some(KindGroup::Sync)
-        }
+        "stale_data" | "sync_stale" | "sync_failure" | "streams_unpaired" | "holds_open"
+        | "job_failed" => Some(KindGroup::Sync),
         "battery_forecast" => Some(KindGroup::Prediction),
         _ => None,
     }
@@ -89,7 +88,7 @@ pub fn kind_group(kind: &str) -> Option<KindGroup> {
 
 /// Every kind the triggers emit. A kind absent from [`kind_group`] is delivered to every enabled
 /// recipient with no way to decline, so the list is here and the test below holds it to the map.
-pub const EMITTED_KINDS: [&str; 8] = [
+pub const EMITTED_KINDS: [&str; 9] = [
     "alarm_opened",
     "alarm_resolved",
     "battery_forecast",
@@ -98,6 +97,7 @@ pub const EMITTED_KINDS: [&str; 8] = [
     "sync_failure",
     "streams_unpaired",
     "holds_open",
+    "job_failed",
 ];
 
 /// The kind a message may carry without belonging to a group: the test send is addressed to
@@ -151,6 +151,7 @@ mod tests {
         assert_eq!(kind_group("sync_failure"), Some(KindGroup::Sync));
         assert_eq!(kind_group("streams_unpaired"), Some(KindGroup::Sync));
         assert_eq!(kind_group("holds_open"), Some(KindGroup::Sync));
+        assert_eq!(kind_group("job_failed"), Some(KindGroup::Sync));
     }
 
     /// The list above is only as good as its completeness, so it is held to the sources: every

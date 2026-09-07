@@ -157,3 +157,49 @@ async fn a_deployment_batch_delete_reprocesses_every_slot_it_removed() {
         "the delete enqueued the slot reprocess its single-row path enqueues"
     );
 }
+
+/// Scenario: two deployments are deleted in one batch.
+/// Expected behaviour: the delete lifecycle runs exactly once per row, so the slot reprocess is
+/// enqueued twice and not three times. A batch method that repeats what the per-row hook already
+/// does shows up here as the extra job.
+#[tokio::test]
+#[serial]
+async fn a_batch_delete_runs_the_delete_lifecycle_once_per_row() {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let sensor = create_sensor(&db, "Batch-lifecycle-01", GLOBAL_PARAM_TEMP_ID).await;
+    let first = deploy_sensor(&db, sensor.id, SITE1_ID, dt("2025-01-01T00:00:00Z")).await;
+    end_deployment(&db, first, dt("2025-05-01T00:00:00Z")).await;
+    let second = deploy_sensor(&db, sensor.id, SITE1_ID, dt("2025-06-01T00:00:00Z")).await;
+
+    let app = build_test_app(db.clone());
+    let token = seed_api_token(&db, full_permissions(), None).await;
+
+    let before = e2e::count(
+        &db,
+        "SELECT count(*) AS c FROM reprocessing_jobs WHERE trigger_type = 'deployment_delete'",
+    )
+    .await;
+
+    let (status, body) = delete_json_with_token(
+        &app,
+        "/api/sensor_deployments/batch",
+        &serde_json::json!([first, second]),
+        &token,
+    )
+    .await;
+    assert!(status < 400, "the batch delete is served: {status} {body}");
+
+    let after = e2e::count(
+        &db,
+        "SELECT count(*) AS c FROM reprocessing_jobs WHERE trigger_type = 'deployment_delete'",
+    )
+    .await;
+    assert_eq!(
+        after - before,
+        2,
+        "one slot reprocess per deleted deployment, not one per row plus a batch one"
+    );
+}

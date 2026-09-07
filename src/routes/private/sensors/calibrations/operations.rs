@@ -107,51 +107,6 @@ impl CRUDOperations for SensorCalibrationOperations {
         Ok(())
     }
 
-    /// One row at a time, for the same cycle described on [`Self::update_many`]; the loop also
-    /// runs the single-row checks for every item.
-    async fn create_many(
-        &self,
-        db: &DatabaseConnection,
-        data: Vec<<SensorCalibration as CRUDResource>::CreateModel>,
-    ) -> Result<Vec<SensorCalibration>, ApiError> {
-        let mut created = Vec::with_capacity(data.len());
-        for item in data {
-            created.push(self.create(db, item).await?);
-        }
-        Ok(created)
-    }
-
-    /// One row at a time, through the single-row path.
-    ///
-    /// The generated bulk route reaches the resource, which delegates to these operations, whose
-    /// default delegates back to the resource. Beyond the cycle, the checks and the reprocess
-    /// enqueue live on the single-row hooks, and an edit of a coefficient has to reach the readings
-    /// it corrected whether it arrived one row at a time or many.
-    async fn update_many(
-        &self,
-        db: &DatabaseConnection,
-        updates: Vec<(Uuid, <SensorCalibration as CRUDResource>::UpdateModel)>,
-    ) -> Result<Vec<SensorCalibration>, ApiError> {
-        let mut updated = Vec::with_capacity(updates.len());
-        for (id, data) in updates {
-            updated.push(self.update(db, id, data).await?);
-        }
-        Ok(updated)
-    }
-
-    /// One row at a time, so each delete repoints the readings that named it. See [`Self::update_many`].
-    async fn delete_many(
-        &self,
-        db: &DatabaseConnection,
-        ids: Vec<Uuid>,
-    ) -> Result<Vec<Uuid>, ApiError> {
-        let mut deleted = Vec::with_capacity(ids.len());
-        for id in ids {
-            deleted.push(self.delete(db, id).await?);
-        }
-        Ok(deleted)
-    }
-
     async fn before_update(
         &self,
         db: &DatabaseConnection,

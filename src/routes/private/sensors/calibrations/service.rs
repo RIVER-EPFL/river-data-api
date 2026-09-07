@@ -304,6 +304,9 @@ pub fn corrected_rows(alias: &str) -> String {
 pub struct CurveDrift {
     pub moved: u64,
     pub span: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// The `(collection_event_id, parameter_id)` pairs the sweep moved, so the caller can recompute
+    /// the visits whose calculations read a value that just changed under them (Q108).
+    pub touched: Vec<(Uuid, Uuid)>,
 }
 
 /// Rewrite every corrected reading whose stored value is not what its own curves produce.
@@ -321,9 +324,13 @@ pub async fn sweep_curve_drift(db: &DatabaseConnection) -> crate::error::AppResu
     let sql = format!(
         "WITH drift AS (
             {update}
-            RETURNING tgt.time
+            RETURNING tgt.time, tgt.collection_event_id, tgt.parameter_id
           )
-          SELECT count(*) AS moved, min(time) AS lo, max(time) AS hi FROM drift",
+          SELECT count(*) AS moved, min(time) AS lo, max(time) AS hi,
+                 (SELECT jsonb_agg(DISTINCT jsonb_build_array(collection_event_id, parameter_id))
+                    FROM drift
+                   WHERE collection_event_id IS NOT NULL AND parameter_id IS NOT NULL) AS touched
+            FROM drift",
         update = recompose_statement(&drifted, "TRUE"),
     );
 
@@ -343,6 +350,7 @@ pub async fn sweep_curve_drift(db: &DatabaseConnection) -> crate::error::AppResu
         return Ok(CurveDrift {
             moved: 0,
             span: None,
+            touched: Vec::new(),
         });
     };
     let moved = u64::try_from(row.try_get::<i64>("", "moved").unwrap_or(0)).unwrap_or(0);
@@ -354,9 +362,16 @@ pub async fn sweep_curve_drift(db: &DatabaseConnection) -> crate::error::AppResu
         .try_get::<Option<DateTime<Utc>>>("", "hi")
         .ok()
         .flatten();
+    let touched = row
+        .try_get::<Option<serde_json::Value>>("", "touched")
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value::<Vec<(Uuid, Uuid)>>(v).ok())
+        .unwrap_or_default();
     Ok(CurveDrift {
         moved,
         span: lo.zip(hi),
+        touched,
     })
 }
 

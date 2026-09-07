@@ -342,3 +342,84 @@ async fn unpaired_streams_and_open_holds_are_announced() {
         "unpairing it again is a fresh discovery"
     );
 }
+
+/// Scenario: a plan apply spends its retries and ends failed, which is how B189's five rows sat on
+/// the dev database unseen.
+#[tokio::test]
+#[serial]
+async fn a_failed_job_is_announced_once_per_kind() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    crate::common::exec(
+        &db,
+        "INSERT INTO reprocessing_jobs (trigger_type, status, error_message, completed_at, detail) \
+         VALUES ('plan_apply', 'failed', \
+                 'duplicate key value violates unique constraint \"uq_site_param_name\"', \
+                 NOW(), '{\"scope\": {\"plan_id\": \"p1\"}}'::jsonb)",
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "INSERT INTO reprocessing_jobs (trigger_type, status, completed_at) \
+         VALUES ('plan_apply', 'cancelled', NOW())",
+    )
+    .await;
+
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let channels: Vec<Box<dyn NotificationChannel>> =
+        vec![Box::new(MockChannel { sent: sent.clone() })];
+    triggers::run(&state, &channels).await;
+    {
+        let msgs = sent.lock().unwrap();
+        let failed = kinds(&msgs, "job_failed");
+        assert_eq!(failed.len(), 1, "one digest for the one failing kind");
+        assert!(
+            failed[0].body.contains("1 plan_apply job(s) failed"),
+            "the cancelled job is not counted: {}",
+            failed[0].body
+        );
+        assert!(
+            failed[0].body.contains("uq_site_param_name"),
+            "the reason travels with it: {}",
+            failed[0].body
+        );
+        assert!(
+            failed[0].body.contains("plan_id"),
+            "the scope the run recorded travels with it: {}",
+            failed[0].body
+        );
+    }
+
+    // A second failure of the same kind inside the window is the same broken thing.
+    crate::common::exec(
+        &db,
+        "INSERT INTO reprocessing_jobs (trigger_type, status, error_message, completed_at) \
+         VALUES ('plan_apply', 'failed', 'and again', NOW())",
+    )
+    .await;
+    sent.lock().unwrap().clear();
+    triggers::run(&state, &channels).await;
+    assert!(
+        kinds(&sent.lock().unwrap(), "job_failed").is_empty(),
+        "within the suppression window"
+    );
+
+    // Another kind failing is another thing broken, and says so on the same tick.
+    crate::common::exec(
+        &db,
+        "INSERT INTO reprocessing_jobs (trigger_type, status, error_message, completed_at) \
+         VALUES ('measurement_retag', 'failed', 'deadlock detected', NOW())",
+    )
+    .await;
+    sent.lock().unwrap().clear();
+    triggers::run(&state, &channels).await;
+    {
+        let msgs = sent.lock().unwrap();
+        let failed = kinds(&msgs, "job_failed");
+        assert_eq!(failed.len(), 1, "the new kind alone");
+        assert!(failed[0].subject.contains("measurement_retag"), "{}", failed[0].subject);
+    }
+}

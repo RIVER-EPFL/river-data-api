@@ -60,6 +60,76 @@ async fn author_chain(app: &axum::Router, admin: &str) {
 }
 
 /// Switch a calculation in or out of the set that fires at visits and is audited.
+/// The site declares the slots the chain writes: a grab save refuses a parameter the site does not
+/// carry (Q98), so every story applies the group its three parameters belong to before saving.
+async fn declare_chain_slots(
+    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    admin: &str,
+    site_id: &str,
+    pa: &str,
+    pb: &str,
+    pc: &str,
+) -> String {
+    let group_id = uuid::Uuid::new_v4().to_string();
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO parameter_groups (id, code, label, ordinal) \
+             VALUES ('{group_id}', 'chain_group', 'Chain group', 1)"
+        ),
+    )
+    .await;
+    for (parameter, role, ordinal) in [(pa, "measured", 1), (pb, "output", 2), (pc, "output", 3)] {
+        crate::common::exec(
+            db,
+            &format!(
+                "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
+                 VALUES (gen_random_uuid(), '{group_id}', '{parameter}', '{role}', {ordinal})"
+            ),
+        )
+        .await;
+    }
+    let (status, applied) = crate::common::post_json_with_token(
+        app,
+        &format!("/api/sites/{site_id}/parameter_groups"),
+        &json!({ "group_id": group_id }),
+        admin,
+    )
+    .await;
+    assert_eq!(status, 200, "apply the group: {applied}");
+    group_id
+}
+
+/// A member added to a group the site already carries: the group is applied again, which adds only
+/// what is missing.
+async fn add_slot(
+    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    admin: &str,
+    site_id: &str,
+    group_id: &str,
+    parameter: &str,
+    ordinal: i32,
+) {
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
+             VALUES (gen_random_uuid(), '{group_id}', '{parameter}', 'output', {ordinal})"
+        ),
+    )
+    .await;
+    let (status, applied) = crate::common::post_json_with_token(
+        app,
+        &format!("/api/sites/{site_id}/parameter_groups"),
+        &json!({ "group_id": group_id }),
+        admin,
+    )
+    .await;
+    assert_eq!(status, 200, "apply the group again: {applied}");
+}
+
 async fn set_enabled(app: &axum::Router, admin: &str, name: &str, enabled: bool) {
     let (status, scripts) =
         crate::common::get_json_with_token(app, "/api/tool_scripts", admin).await;
@@ -133,6 +203,7 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
     let pc = e2e::create_parameter(&app, &admin, "ChainPC", "Chain PC", "ppb").await;
     author_chain(&app, &admin).await;
     set_enabled(&app, &admin, "chain_c", false).await;
+    let group_id = declare_chain_slots(&db, &app, &admin, &site_id, &pa, &pb, &pc).await;
 
     kc::ensure_realm_user("river1", "river1", &["riverdata-river"]).await;
     kc::grant_project(&db, &kc::keycloak_user_id("river1").await, &project_id).await;
@@ -342,25 +413,10 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
     // only if F was ordered before G.
     let pf = e2e::create_parameter(&app, &admin, "ChainPF", "Chain PF", "ppb").await;
     let pg = e2e::create_parameter(&app, &admin, "ChainPG", "Chain PG", "ppb").await;
-    let group_id = uuid::Uuid::new_v4().to_string();
-    crate::common::exec(
-        &db,
-        &format!(
-            "INSERT INTO parameter_groups (id, code, label, ordinal) \
-             VALUES ('{group_id}', 'chain_group', 'Chain group', 1)"
-        ),
-    )
-    .await;
-    for (parameter, role, ordinal) in [(&pa, "measured", 1), (&pf, "output", 2)] {
-        crate::common::exec(
-            &db,
-            &format!(
-                "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
-                 VALUES (gen_random_uuid(), '{group_id}', '{parameter}', '{role}', {ordinal})"
-            ),
-        )
-        .await;
-    }
+    // A parameter belongs to one group, so the formula's output joins the group the chain already
+    // holds rather than a second one naming ChainPA again.
+    add_slot(&db, &app, &admin, &site_id, &group_id, &pf, 4).await;
+    add_slot(&db, &app, &admin, &site_id, &group_id, &pg, 5).await;
     // A formula calculation is authored as a `tool_scripts` row bound to the group, then a formula
     // in it; the version is minted from the formula set rather than posted as a body.
     crate::common::exec(
@@ -513,6 +569,7 @@ async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
     let pb = e2e::create_parameter(&app, &admin, "ChainPB", "Chain PB", "ppb").await;
     let pc = e2e::create_parameter(&app, &admin, "ChainPC", "Chain PC", "ppb").await;
     author_chain(&app, &admin).await;
+    declare_chain_slots(&db, &app, &admin, &site_id, &pa, &pb, &pc).await;
 
     kc::ensure_realm_user("river1", "river1", &["riverdata-river"]).await;
     kc::grant_project(&db, &kc::keycloak_user_id("river1").await, &project_id).await;
@@ -751,6 +808,7 @@ async fn an_unchanged_visit_recomputes_nothing_and_a_changed_input_reruns_once()
     let pb = e2e::create_parameter(&app, &admin, "ChainPB", "Chain PB", "ppb").await;
     let pc = e2e::create_parameter(&app, &admin, "ChainPC", "Chain PC", "ppb").await;
     author_chain(&app, &admin).await;
+    declare_chain_slots(&db, &app, &admin, &site_id, &pa, &pb, &pc).await;
 
     kc::ensure_realm_user("river1", "river1", &["riverdata-river"]).await;
     kc::grant_project(&db, &kc::keycloak_user_id("river1").await, &project_id).await;
@@ -920,4 +978,246 @@ async fn an_unchanged_visit_recomputes_nothing_and_a_changed_input_reruns_once()
     assert_eq!(runs("chain_c").await, 2);
     assert_eq!(job_count(again.clone(), "tools_run").await, 0);
     assert_eq!(job_count(again, "tools_unchanged").await, 3);
+}
+
+/// The same three tools, with B raising on the value A produces at this visit. The golden case
+/// stays inside the guard so the version still validates: the failure is in the data, not the
+/// script.
+async fn author_chain_with_failing_b(app: &axum::Router, admin: &str) {
+    e2e::author_tool(
+        app,
+        admin,
+        "chain_a",
+        "tool <- function(inputs, constants, curves) list(out_a = inputs$a * 2)",
+        json!({
+            "label": "Chain A",
+            "params": [{ "name": "a", "label": "A", "kind": "number", "required": true }],
+            "outputs": [{ "key": "out_a", "label": "PA", "suggested_parameter_code": "ChainPA" }],
+        }),
+        json!({ "name": "doubles", "inputs": { "a": 2.0 }, "expected": { "out_a": 4.0 } }),
+    )
+    .await;
+    e2e::author_tool(
+        app,
+        admin,
+        "chain_b",
+        "tool <- function(inputs, constants, curves) {\n\
+         if (inputs$pa > 100) stop(\"division by zero\")\n\
+         list(out_b = inputs$pa + 5)\n\
+         }",
+        json!({
+            "label": "Chain B",
+            "params": [{ "name": "pa", "label": "PA", "kind": "number", "required": true }],
+            "event_inputs": [{ "param": "pa", "parameter_code": "ChainPA" }],
+            "outputs": [{ "key": "out_b", "label": "PB", "suggested_parameter_code": "ChainPB" }],
+        }),
+        json!({ "name": "adds", "inputs": { "pa": 1.0 }, "expected": { "out_b": 6.0 } }),
+    )
+    .await;
+    e2e::author_tool(
+        app,
+        admin,
+        "chain_c",
+        "tool <- function(inputs, constants, curves) list(out_c = inputs$pb * 10)",
+        json!({
+            "label": "Chain C",
+            "params": [{ "name": "pb", "label": "PB", "kind": "number", "required": true }],
+            "event_inputs": [{ "param": "pb", "parameter_code": "ChainPB" }],
+            "outputs": [{ "key": "out_c", "label": "PC", "suggested_parameter_code": "ChainPC" }],
+        }),
+        json!({ "name": "tens", "inputs": { "pb": 3.0 }, "expected": { "out_c": 30.0 } }),
+    )
+    .await;
+}
+
+/// Expected behaviour: a script error partway through a cascade is a skip, not a failure. The
+/// step that raised writes nothing, every step downstream of it skips for want of an input, and
+/// the run completes with both skips and their reasons on the job. Nowhere else says the script
+/// raised: the visit reads `current`, and the audit reports only that one output is absent while
+/// its inputs are present.
+#[tokio::test]
+#[serial]
+async fn a_script_error_midway_skips_its_step_and_everything_downstream() {
+    use sea_orm::ConnectionTrait;
+    if !kc::require_keycloak_or_skip("a_script_error_midway_skips_its_step_and_everything_downstream")
+        .await
+    {
+        return;
+    }
+    if !crate::common::tools_runner::require_runner_or_skip(
+        "a_script_error_midway_skips_its_step_and_everything_downstream",
+    )
+    .await
+    {
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::exec(
+        &db,
+        "UPDATE tool_scripts SET active_version_id = NULL WHERE name LIKE 'chain_%'",
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "DELETE FROM tool_script_activations WHERE tool_script_id IN \
+         (SELECT id FROM tool_scripts WHERE name LIKE 'chain_%')",
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "DELETE FROM tool_script_versions WHERE tool_script_id IN \
+         (SELECT id FROM tool_scripts WHERE name LIKE 'chain_%')",
+    )
+    .await;
+    crate::common::exec(&db, "DELETE FROM tool_scripts WHERE name LIKE 'chain_%'").await;
+    let app = kc::build_test_app_with_keycloak(db.clone()).await;
+    let admin = kc::get_keycloak_jwt("admin", "admin").await;
+
+    let project_id = e2e::create_project(&app, &admin, "Raise Project", "raisep", false).await;
+    let site_id = e2e::create_site(&app, &admin, &project_id, "Raise Site", "raises").await;
+    let pa = e2e::create_parameter(&app, &admin, "ChainPA", "Chain PA", "ppb").await;
+    let pb = e2e::create_parameter(&app, &admin, "ChainPB", "Chain PB", "ppb").await;
+    let pc = e2e::create_parameter(&app, &admin, "ChainPC", "Chain PC", "ppb").await;
+    author_chain_with_failing_b(&app, &admin).await;
+
+    declare_chain_slots(&db, &app, &admin, &site_id, &pa, &pb, &pc).await;
+
+    kc::ensure_realm_user("river1", "river1", &["riverdata-river"]).await;
+    kc::grant_project(&db, &kc::keycloak_user_id("river1").await, &project_id).await;
+    let river = kc::get_keycloak_jwt("river1", "river1").await;
+
+    let (status, event) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/collection_events",
+        &json!({ "site_id": site_id, "collected_at": EVENT_TIME }),
+        &river,
+    )
+    .await;
+    assert!((200..300).contains(&status), "stage ({status}): {event}");
+    let event_id = e2e::id_of(&event);
+
+    // A produces 120, which is what B raises on.
+    let (status, a) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/tools/chain_a/calculate",
+        &json!({ "a": 60.0, "site_id": site_id, "collected_at": EVENT_TIME }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "calculate A ({status}): {a}");
+    let (status, saved) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": site_id,
+            "tool_run_id": a["run_id"],
+            "readings": [{ "parameter_id": pa, "value": 120.0, "time": EVENT_TIME, "output": "out_a" }],
+        }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "save A: {saved}");
+    assert!(e2e::wait_for_jobs_by_trigger(&db, "event_recompute", 60).await);
+
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/collection_events/{event_id}/recompute"),
+        &json!({}),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "recompute enqueue: {resp}");
+    let job_id = resp["job_id"].as_str().expect("job id").to_string();
+    assert_eq!(
+        e2e::poll_job(&app, &admin, &job_id, 60).await,
+        "completed",
+        "a raising step does not fail the run"
+    );
+
+    // Stage 1 is written; stage 2 and stage 3 are not.
+    let served = |parameter: String| {
+        let db = db.clone();
+        let site_id = site_id.clone();
+        async move {
+            db.query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT COALESCE(calibrated_value, raw_value) AS value FROM readings \
+                     WHERE site_id = '{site_id}' AND parameter_id = '{parameter}' \
+                       AND withdrawn_at IS NULL ORDER BY replicate_index LIMIT 1"
+                ),
+            ))
+            .await
+            .unwrap()
+            .map(|r| r.try_get::<Option<f64>>("", "value").unwrap())
+        }
+    };
+    assert_eq!(served(pa).await, Some(Some(120.0)));
+    assert_eq!(served(pb).await, None, "the raising step wrote a value");
+    assert_eq!(served(pc).await, None, "a step downstream of the raise ran");
+
+    // What the job reports: both steps skipped, with the script's message on the one that raised.
+    let (status, job) =
+        crate::common::get_json_with_token(&app, &format!("/api/reprocessing_jobs/{job_id}"), &admin)
+            .await;
+    assert_eq!(status, 200, "{job}");
+    assert_eq!(job["detail"]["counts"]["tools_skipped"], 2, "{job}");
+    assert_eq!(job["detail"]["counts"]["readings_written"], 0, "{job}");
+    let skipped = job["detail"]["scope"]["skipped"]
+        .as_array()
+        .expect("the skips are reported");
+    let b_reason = skipped
+        .iter()
+        .find(|s| s["tool"] == "chain_b")
+        .and_then(|s| s["reason"].as_str())
+        .expect("chain_b is reported skipped");
+    assert!(
+        b_reason.starts_with("script error: "),
+        "the script's own message is carried: {b_reason}"
+    );
+    assert!(
+        b_reason.contains("division by zero"),
+        "the script's own message is carried: {b_reason}"
+    );
+    assert!(
+        skipped.iter().any(|s| s["tool"] == "chain_c"),
+        "chain_c skips for want of B's output: {job}"
+    );
+
+    // The visit reads current: a completed run with two of its three steps missing is not a
+    // state the visit knows about.
+    let (status, detail) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/collection_events/{event_id}/detail"),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(detail["recompute"], "current", "{detail}");
+
+    // What the review queue holds is the audit's account, not the executor's: the step that
+    // raised is reported only as an output that is absent while its inputs are present, and the
+    // step below it is reported not at all, because its input never existed.
+    let (status, audit) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/actions/event_audit",
+        &json!({ "site_id": site_id }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "audit enqueue: {audit}");
+    let audit_job = audit["job_id"].as_str().expect("job id").to_string();
+    assert_eq!(e2e::poll_job(&app, &admin, &audit_job, 60).await, "completed");
+    let findings =
+        serde_json::Value::Array(e2e::pending_event_findings(&app, &admin, &site_id).await);
+    let holds = findings.as_array().unwrap();
+    assert_eq!(holds.len(), 1, "one finding for the whole cascade: {findings}");
+    assert_eq!(holds[0]["kind"], "missing_output");
+    assert_eq!(holds[0]["tool"], "chain_b");
+    assert_eq!(holds[0]["parameter_code"], "ChainPB");
+    assert!(
+        !findings.to_string().contains("division by zero"),
+        "the script's message reaches the queue: {findings}"
+    );
 }

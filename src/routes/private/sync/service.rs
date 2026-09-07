@@ -1452,6 +1452,58 @@ async fn resolve_plan_entry<C: ConnectionTrait>(
     Ok((site_parameter_id, parameter_id))
 }
 
+/// The names a new slot may take, most preferred first: the parameter's label, then the label
+/// qualified by units, then by the parameter's code. Beyond those a counter is appended, because
+/// two parameters can share a label, its units and nothing else.
+fn slot_name_candidates(base: &str, units: &str, code: &str) -> Vec<String> {
+    let mut names = vec![base.to_string()];
+    let units = units.trim();
+    if !units.is_empty() {
+        names.push(format!("{base} ({units})"));
+    }
+    if !code.is_empty() && code != units {
+        names.push(format!("{base} ({code})"));
+    }
+    names
+}
+
+/// The first candidate the site does not already hold. `(site_id, name)` is unique and the apply is
+/// one transaction, so the query sees the slots this same pass has created.
+async fn free_slot_name<C: ConnectionTrait>(
+    txn: &C,
+    site_id: Uuid,
+    base: &str,
+    units: &str,
+    code: &str,
+) -> AppResult<String> {
+    let taken = async |name: &str| -> AppResult<bool> {
+        Ok(site_parameters::Entity::find()
+            .filter(
+                Condition::all()
+                    .add(site_parameters::Column::SiteId.eq(site_id))
+                    .add(site_parameters::Column::Name.eq(name.to_string())),
+            )
+            .one(txn)
+            .await?
+            .is_some())
+    };
+    for name in slot_name_candidates(base, units, code) {
+        if !taken(&name).await? {
+            return Ok(name);
+        }
+    }
+    let qualified = slot_name_candidates(base, units, code)
+        .pop()
+        .unwrap_or_else(|| base.to_string());
+    for n in 2.. {
+        let name = format!("{qualified} {n}");
+        if !taken(&name).await? {
+            return Ok(name);
+        }
+    }
+    unreachable!()
+}
+
 /// The slot an entry pairs into, created when the site has none. The entry's review choices (sd
 /// estimator, decimal places) reach an existing slot too, each under its own rule.
 async fn resolve_or_create_site_param<C: ConnectionTrait>(
@@ -1502,34 +1554,16 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
         existing.id
     } else {
         let id = Uuid::new_v4();
-        let mut param_name_val = caches
+        let base = caches
             .param_names
             .get(&parameter_id)
             .cloned()
             .unwrap_or_default();
-        // (site_id, name) is unique; a clash here means the name belongs to a different
-        // parameter's slot, so suffix with units (or the parameter code) to disambiguate.
-        let name_taken = site_parameters::Entity::find()
-            .filter(
-                Condition::all()
-                    .add(site_parameters::Column::SiteId.eq(site_id))
-                    .add(site_parameters::Column::Name.eq(param_name_val.clone())),
-            )
+        let code = parameters::Entity::find_by_id(parameter_id)
             .one(txn)
             .await?
-            .is_some();
-        if name_taken {
-            let suffix = if !units.trim().is_empty() {
-                units.trim().to_string()
-            } else {
-                parameters::Entity::find_by_id(parameter_id)
-                    .one(txn)
-                    .await?
-                    .map(|p| p.code)
-                    .unwrap_or_else(|| parameter_id.to_string())
-            };
-            param_name_val = format!("{param_name_val} ({suffix})");
-        }
+            .map_or_else(|| parameter_id.to_string(), |p| p.code);
+        let param_name_val = free_slot_name(txn, site_id, &base, units, &code).await?;
         let units_val = {
             let u = units.trim();
             (!u.is_empty()).then(|| u.to_string())
@@ -2782,5 +2816,23 @@ mod family_suggestion_tests {
         // reason to export a `DOC` header where the portal wrote `DOC_avg_ppb`.
         assert_eq!(family_parameter_suggestion("DOC_ppb"), "DOC_ppb");
         assert_eq!(family_parameter_suggestion("DOC"), "DOC");
+    }
+
+    #[test]
+    fn slot_name_candidates_qualify_by_units_then_code() {
+        assert_eq!(
+            super::slot_name_candidates("Flux", "mg/L", "FluxA"),
+            vec!["Flux", "Flux (mg/L)", "Flux (FluxA)"]
+        );
+        // A blank unit contributes no candidate of its own.
+        assert_eq!(
+            super::slot_name_candidates("Flux", "  ", "FluxA"),
+            vec!["Flux", "Flux (FluxA)"]
+        );
+        // A code equal to the units would repeat the same name.
+        assert_eq!(
+            super::slot_name_candidates("Flux", "mg/L", "mg/L"),
+            vec!["Flux", "Flux (mg/L)"]
+        );
     }
 }

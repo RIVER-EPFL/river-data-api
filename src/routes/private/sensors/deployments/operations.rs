@@ -54,48 +54,6 @@ async fn spawn_slot_reprocess(
 impl CRUDOperations for SensorDeploymentOperations {
     type Resource = SensorDeployment;
 
-    /// One row at a time, through the single-row path: the crudcrate default delegates to the
-    /// resource, which delegates back here, and the single-row hooks are what a batch needs too.
-    async fn update_many(
-        &self,
-        db: &DatabaseConnection,
-        updates: Vec<(Uuid, <SensorDeployment as CRUDResource>::UpdateModel)>,
-    ) -> Result<Vec<SensorDeployment>, ApiError> {
-        let mut updated = Vec::with_capacity(updates.len());
-        for (id, data) in updates {
-            updated.push(self.update(db, id, data).await?);
-        }
-        Ok(updated)
-    }
-
-    /// One row at a time, so each delete re-derives the slot the deployment covered.
-    async fn delete_many(
-        &self,
-        db: &DatabaseConnection,
-        ids: Vec<Uuid>,
-    ) -> Result<Vec<Uuid>, ApiError> {
-        let mut deleted = Vec::with_capacity(ids.len());
-        for id in ids {
-            deleted.push(self.delete(db, id).await?);
-        }
-        Ok(deleted)
-    }
-
-    /// One row at a time, through the single-row path: the crudcrate default `create_many`
-    /// delegates to the resource, which delegates back here, so the default recurses; the loop
-    /// also runs the single-row hooks for every item.
-    async fn create_many(
-        &self,
-        db: &DatabaseConnection,
-        data: Vec<<SensorDeployment as CRUDResource>::CreateModel>,
-    ) -> Result<Vec<SensorDeployment>, ApiError> {
-        let mut created = Vec::with_capacity(data.len());
-        for item in data {
-            created.push(self.create(db, item).await?);
-        }
-        Ok(created)
-    }
-
     async fn before_create(
         &self,
         db: &DatabaseConnection,

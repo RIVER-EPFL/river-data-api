@@ -2,6 +2,7 @@ pub mod admin;
 pub mod alarms;
 pub mod annotations;
 pub mod api_tokens;
+pub mod change_audit;
 pub mod collection_events;
 pub mod constants;
 pub mod data_streams;

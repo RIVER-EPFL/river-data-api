@@ -382,3 +382,59 @@ async fn a_block_mixing_valued_and_unvalued_keys_is_refused() {
     .await;
     assert_eq!(status, 400, "{body}");
 }
+
+/// Scenario: the same pin is recordable through `/readings/pins` and through the edit surface, and
+/// only the first enqueued the reprocess that makes the correction follow the pin.
+///
+/// Expected behaviour: a pin committed as an edit leaves the same `attribution_pin` job.
+#[tokio::test]
+#[serial]
+async fn a_pin_committed_as_an_edit_enqueues_the_reprocess_a_pin_owes() {
+    let f = setup(&[10.0, 12.0, 14.0]).await;
+    let sensor =
+        crate::common::sensor_lifecycle::create_sensor_without_curve(&f.db, "spare probe").await;
+    let selection = one_key(f.stream, 0);
+    let decision = json!({ "kind": "instrument_pin", "target_id": sensor });
+
+    let (status, preview) = post(
+        &f,
+        "/api/readings/edits/preview",
+        &json!({ "selection": selection, "decision": decision }),
+    )
+    .await;
+    assert_eq!(status, 200, "{preview}");
+
+    let (status, committed) = post(
+        &f,
+        "/api/readings/edits",
+        &json!({
+            "selection": selection,
+            "decision": decision,
+            "preview_id": preview["preview_id"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{committed}");
+    assert_eq!(committed["rows_decided"], 1);
+    assert!(
+        crate::common::e2e::wait_for_jobs_by_trigger(&f.db, "attribution_pin", 60).await,
+        "the pin's slot is reprocessed, as it is through /readings/pins"
+    );
+
+    // Inverting the pin owes the same reprocess: what the window resolves has changed back, and
+    // only the job writes it.
+    crate::common::exec(&f.db, "DELETE FROM reprocessing_jobs").await;
+    let set_id = committed["set_id"].as_str().unwrap().to_string();
+    let (status, rolled) = post(
+        &f,
+        &format!("/api/readings/edits/sets/{set_id}/rollback"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{rolled}");
+    assert_eq!(rolled["rolled_back"], 1);
+    assert!(
+        crate::common::e2e::wait_for_jobs_by_trigger(&f.db, "attribution_pin", 60).await,
+        "the inverted pin's slot is reprocessed too"
+    );
+}

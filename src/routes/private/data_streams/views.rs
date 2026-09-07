@@ -17,11 +17,13 @@ use crate::common::middleware::ProjectScope;
 use crate::common::scope;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::DataStream;
+use crate::routes::private::readings::sd_estimator;
 use crate::routes::private::sensors;
 use crate::routes::private::sensors::calibrations;
 use crate::routes::private::sensors::identity::{
     close_sensor_deployment, create_sensor_for_stream, extract_vaisala_device_serial,
 };
+use crate::routes::private::sync::replicate_audit;
 use crate::routes::private::{data_streams, sites::parameters as site_parameters};
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -61,6 +63,11 @@ pub struct PreviewInstant {
 pub struct StreamPreviewResponse {
     pub stream_id: Uuid,
     pub source_key: String,
+    /// The divisor the standard deviations below were computed under, resolved the way the write
+    /// path resolves it: the stream's spec, then the slot's declaration, else the fallback.
+    pub sd_estimator: &'static str,
+    /// What chose it: 'stream', 'slot', or 'default' for the undeclared fallback.
+    pub sd_estimator_source: &'static str,
     pub instants: Vec<PreviewInstant>,
 }
 
@@ -157,6 +164,8 @@ pub async fn stream_preview(
         }
     }
 
+    let estimator = preview_estimator(&state.db, &stream).await?;
+
     // Statistics over the replicates that would be served: flagged and withdrawn rows are excluded
     // from `samples`, so excluding them here is what makes the preview match the outcome.
     for instant in &mut instants {
@@ -166,24 +175,55 @@ pub async fn stream_preview(
             .filter(|r| !r.is_flagged && !r.withdrawn)
             .filter_map(|r| r.value)
             .collect();
-        instant.n = values.len();
-        if values.is_empty() {
-            continue;
-        }
-        let mean = values.iter().sum::<f64>() / values.len() as f64;
-        instant.mean = Some(mean);
-        if values.len() > 1 {
-            let variance =
-                values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (values.len() - 1) as f64;
-            instant.sd = Some(variance.sqrt());
-        }
+        let stats = replicate_audit::group_stats(&values).under(estimator.estimator);
+        instant.n = stats.n;
+        instant.mean = stats.mean;
+        instant.sd = stats.sd;
     }
 
     Ok(Json(StreamPreviewResponse {
         stream_id: id,
         source_key: stream.source_key,
+        sd_estimator: estimator.estimator,
+        sd_estimator_source: estimator.source.as_str(),
         instants,
     }))
+}
+
+/// The divisor the pairing will serve for this stream, resolved as the write path resolves it:
+/// the stream's registered spec, then the slot's declaration once it is paired, else the
+/// undeclared fallback. An unpaired stream has no slot to read, which is the usual case here.
+async fn preview_estimator(
+    db: &DatabaseConnection,
+    stream: &data_streams::Model,
+) -> AppResult<sd_estimator::Resolved> {
+    let spec = super::replicates::ReplicateSpec::from_metadata(&stream.metadata)
+        .and_then(|spec| spec.sd_estimator);
+    let spec = sd_estimator::parse_opt(spec.as_deref())?;
+    if let Some(estimator) = spec {
+        return Ok(sd_estimator::Resolved {
+            estimator,
+            source: sd_estimator::Source::Stream,
+        });
+    }
+    let Some(site_parameter_id) = stream.site_parameter_id else {
+        return Ok(sd_estimator::Resolved::undeclared());
+    };
+    let slot = site_parameters::Entity::find_by_id(site_parameter_id)
+        .one(db)
+        .await?;
+    let Some(slot) = slot else {
+        return Ok(sd_estimator::Resolved::undeclared());
+    };
+    Ok(
+        match sd_estimator::slot_declaration(db, slot.site_id, slot.parameter_id).await? {
+            Some(estimator) => sd_estimator::Resolved {
+                estimator,
+                source: sd_estimator::Source::Slot,
+            },
+            None => sd_estimator::Resolved::undeclared(),
+        },
+    )
 }
 
 /// A project-scoped key may only inspect a stream paired into its own project. An unpaired or

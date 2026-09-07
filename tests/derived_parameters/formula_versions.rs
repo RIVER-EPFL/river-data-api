@@ -154,3 +154,101 @@ async fn a_computed_value_names_the_formula_it_was_made_with_and_an_edit_mints_a
         "the edit mints a version and leaves the one the stored value names"
     );
 }
+
+/// Scenario: the record of a value computed by a standalone formula is opened in the inspector.
+///
+/// Expected behaviour: it resolves the calculation that made it, the same way a value produced by
+/// a script resolves its run (C94). A row stored before versioning names no version, and the
+/// record says the formula is not recoverable rather than naming today's.
+#[tokio::test]
+#[serial]
+async fn a_formula_value_resolves_the_calculation_that_produced_it() {
+    let (db, app, token) = setup().await;
+
+    let code = format!("fprov_{}", Uuid::new_v4().simple());
+    let (status, def) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/derived_parameters",
+        &serde_json::json!({
+            "code": code,
+            "name": "Formula provenance fixture",
+            "units": "mg/L",
+            "formula": "Dissolved_O2 * 0.032",
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create ({status}): {def}");
+    let output = def["output_parameter_id"].as_str().expect("output").to_string();
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/site_parameters",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "parameter_id": output,
+            "name": code,
+            "sensor_type": "derived",
+            "entry_mode": "tool",
+            "display_units": "mg/L",
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "assign ({status}): {body}");
+
+    let at: DateTime<Utc> = Utc::now() - Duration::hours(11);
+    let at = at - Duration::nanoseconds(i64::from(at.timestamp_subsec_nanos()));
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/readings/batch",
+        &serde_json::json!({
+            "readings": [{
+                "site_id": crate::common::SITE1_ID,
+                "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
+                "time": at.to_rfc3339(),
+                "raw_value": 250.0,
+            }]
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "ingest ({status}): {body}");
+
+    let parameter = Uuid::parse_str(&output).unwrap();
+    formula_of(&db, parameter, at)
+        .await
+        .expect("the derived value is computed");
+
+    let uri = format!(
+        "/api/readings/provenance?site_id={}&parameter_id={}&time={}",
+        crate::common::SITE1_ID,
+        output,
+        at.to_rfc3339().replace('+', "%2B")
+    );
+    let (status, body) = crate::common::get_json_with_token(&app, &uri, &token).await;
+    assert_eq!(status, 200, "{body}");
+    let calc = &body["records"][0]["calculation"];
+    assert_eq!(calc["code"], code, "the record names the calculation: {body}");
+    assert_eq!(calc["formula"], "Dissolved_O2 * 0.032");
+    assert_eq!(calc["version_no"], 1);
+    assert_eq!(calc["active_version_no"], 1);
+    assert!(calc["content_hash"].is_string());
+
+    // A value stored before versioning names none, and the record says so rather than naming
+    // today's formula.
+    db.execute_unprepared(&format!(
+        "UPDATE readings SET derived_version_id = NULL WHERE parameter_id = '{parameter}'"
+    ))
+    .await
+    .expect("unstamp");
+    let (status, body) = crate::common::get_json_with_token(&app, &uri, &token).await;
+    assert_eq!(status, 200, "{body}");
+    let calc = &body["records"][0]["calculation"];
+    assert_eq!(calc["code"], code);
+    assert!(
+        calc["formula"].is_null() && calc["version_no"].is_null(),
+        "an unversioned value names no formula: {body}"
+    );
+    assert_eq!(calc["active_version_no"], 1);
+}

@@ -5,10 +5,9 @@
 //! dropping that condition re-stamps every re-asserted row, destroying arrival provenance for the
 //! whole portal dataset with nothing else failing.
 //!
-//! The change side is the arrival of the current value: an overwrite that does change a value
-//! records a value-correction decision, and its projection trigger re-stamps `ingested_at` as it
-//! writes the new `raw_value`, so the correction reports when it arrived rather than when the value
-//! it replaced first landed.
+//! A correction does not move it either (Q86): `ingested_at` is the row's first arrival and
+//! nothing rewrites it. When the current value arrived is read from the value-correction decision
+//! instead, which `/readings/provenance` serves as `value_arrived_at`.
 //!
 //! Run: cargo test --test readings ingested_at_restamp -- --test-threads=1
 
@@ -95,7 +94,7 @@ async fn identical_reassert_keeps_the_original_arrival_stamp() {
 
 #[tokio::test]
 #[serial]
-async fn value_correction_moves_the_arrival_stamp() {
+async fn a_correction_leaves_the_first_arrival_where_it_was() {
     let (app, db, token) = setup().await;
 
     let first = ingest(&app, &token, 1.0, "skip").await;
@@ -107,8 +106,8 @@ async fn value_correction_moves_the_arrival_stamp() {
     assert_eq!(corrected["overwritten"], 1, "the correction changes the value: {corrected}");
 
     let after = ingested_at_epoch(&db).await;
-    assert!(
-        after > original,
-        "a correction that changes the stored value is a fresh arrival: {after} <= {original}"
+    assert_eq!(
+        after, original,
+        "the row arrived once; when its current value arrived is the correction's own record"
     );
 }

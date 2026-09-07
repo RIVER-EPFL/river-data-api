@@ -547,7 +547,7 @@ pub async fn rollback<C: ConnectionTrait>(
     decision_id: Uuid,
     actor: &str,
     reason: Option<&str>,
-) -> AppResult<Uuid> {
+) -> AppResult<(Uuid, Recorded)> {
     let d = load(conn, decision_id).await?;
     if d.rolled_back_by.is_some() {
         return Err(AppError::Conflict(format!(
@@ -576,6 +576,23 @@ pub async fn rollback<C: ConnectionTrait>(
             "No reading at stream {} / {} / replicate {:?}",
             key.stream_id, key.time, key.replicate_index
         )));
+    };
+    // Read before the projection, as the forward path does: the visit membership is what the
+    // caller enqueues on, and a predicate over the state about to change matches nothing after.
+    let recorded = Recorded {
+        rows: 1,
+        span: Some((d.time.with_timezone(&chrono::Utc), d.time.with_timezone(&chrono::Utc))),
+        touched_events: if d.kind.fires_recompute() {
+            crate::routes::private::collection_events::recompute::touched_events(
+                conn,
+                "r.stream_id = $1 AND r.time = $2 \
+                 AND ($3::smallint IS NULL OR r.replicate_index = $3)",
+                key_binds(&key),
+            )
+            .await?
+        } else {
+            Vec::new()
+        },
     };
     let mut binds = key_binds(&key);
     binds.extend([
@@ -611,7 +628,7 @@ pub async fn rollback<C: ConnectionTrait>(
         )
         .await?;
     }
-    Ok(rollback_id)
+    Ok((rollback_id, recorded))
 }
 
 /// What a bulk record did: rows decided, the time span they cover (for the aggregate refresh),
@@ -1662,7 +1679,7 @@ pub async fn rollback_set<C: ConnectionTrait>(
     set_id: Uuid,
     actor: &str,
     reason: Option<&str>,
-) -> AppResult<usize> {
+) -> AppResult<(usize, Recorded)> {
     let already = conn
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -1684,9 +1701,16 @@ pub async fn rollback_set<C: ConnectionTrait>(
         ))
         .await?;
     let mut n = 0usize;
+    let mut recorded = Recorded::default();
     for row in &rows {
         let id: Uuid = row.try_get("", "id")?;
-        rollback(conn, id, actor, reason).await?;
+        let (_, one) = rollback(conn, id, actor, reason).await?;
+        recorded.rows += one.rows;
+        recorded.span = match (recorded.span, one.span) {
+            (Some((lo, hi)), Some((a, b))) => Some((lo.min(a), hi.max(b))),
+            (existing, incoming) => existing.or(incoming),
+        };
+        recorded.touched_events.extend(one.touched_events);
         n += 1;
     }
     conn.execute_raw(Statement::from_sql_and_values(
@@ -1695,7 +1719,7 @@ pub async fn rollback_set<C: ConnectionTrait>(
         [set_id.into(), actor.into()],
     ))
     .await?;
-    Ok(n)
+    Ok((n, recorded))
 }
 
 /// The slots a predicate's readings belong to, for the reprocess a pin enqueues.
@@ -1719,6 +1743,219 @@ async fn slots_of<C: ConnectionTrait>(
         .collect()
 }
 
+/// The reprocess a pin owes: every slot the selection touches re-derives under the pinned
+/// attribution, which is what makes the pinned rows' corrections follow the pin rather than the
+/// window. Both surfaces that record a pin call this, so a pin cannot be recorded on one of them
+/// and left inert.
+pub async fn enqueue_attribution_pin(
+    db: &sea_orm::DatabaseConnection,
+    kind: Kind,
+    sensor_id: Option<Uuid>,
+    set_id: Uuid,
+    predicate: &str,
+    binds: Vec<sea_orm::Value>,
+) -> AppResult<Vec<Uuid>> {
+    if !matches!(kind, Kind::InstrumentPin | Kind::CalibrationPin) {
+        return Ok(Vec::new());
+    }
+    let mut jobs = Vec::new();
+    for (site_id, parameter_id) in slots_of(db, predicate, binds).await? {
+        if let Some(job) = crate::routes::private::reprocessing_jobs::worker::enqueue(
+            db,
+            "attribution_pin",
+            sensor_id,
+            Some(set_id),
+            &serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
+            None,
+        )
+        .await?
+        {
+            jobs.push(job);
+        }
+    }
+    Ok(jobs)
+}
+
+/// A standard curve the selection's corrected spot readings name that the incoming instrument does
+/// not own, with how many readings carry it.
+#[derive(Debug, Clone)]
+pub struct ForeignCurve {
+    pub id: Uuid,
+    pub rows: i64,
+}
+
+/// The curves an instrument pin would leave behind: named by a selected reading, owned by some
+/// instrument other than the one being pinned to.
+pub async fn foreign_curves<C: ConnectionTrait>(
+    conn: &C,
+    predicate: &str,
+    binds: Vec<sea_orm::Value>,
+    target_sensor: Uuid,
+) -> AppResult<Vec<ForeignCurve>> {
+    let mut binds = binds;
+    binds.push(target_sensor.into());
+    let n = binds.len();
+    let rows = conn
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT sc.id, count(*) AS rows FROM readings r
+                   JOIN data_streams ds ON ds.id = r.stream_id
+                   JOIN standard_curves sc ON sc.id = r.standard_curve_id
+                  WHERE {predicate} AND sc.sensor_id <> ${n}
+                  GROUP BY sc.id"
+            ),
+            binds,
+        ))
+        .await?;
+    rows.iter()
+        .map(|r| {
+            Ok(ForeignCurve {
+                id: r.try_get("", "id")?,
+                rows: r.try_get("", "rows")?,
+            })
+        })
+        .collect()
+}
+
+/// Q112, applied in the pin's own transaction: copy each foreign curve onto the incoming
+/// instrument and re-point the readings at the copy, or clear the reference and let the reprocess
+/// recompose each value from the curves it still names.
+pub async fn apply_curve_on_split<C: ConnectionTrait>(
+    conn: &C,
+    choice: Option<CurveOnSplit>,
+    foreign: &[ForeignCurve],
+    target_sensor: Uuid,
+    predicate: &str,
+    binds: Vec<sea_orm::Value>,
+    actor: &str,
+) -> AppResult<()> {
+    if foreign.is_empty() {
+        return Ok(());
+    }
+    match choice {
+        None => Ok(()),
+        Some(CurveOnSplit::Drop) => {
+            let mut b = binds;
+            b.push(target_sensor.into());
+            let n = b.len();
+            conn.execute_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                &format!(
+                    "UPDATE readings tgt SET standard_curve_id = NULL
+                       FROM readings r
+                       JOIN data_streams ds ON ds.id = r.stream_id
+                       JOIN standard_curves sc ON sc.id = r.standard_curve_id
+                      WHERE {predicate} AND sc.sensor_id <> ${n}
+                        AND tgt.stream_id = r.stream_id AND tgt.time = r.time
+                        AND tgt.replicate_index = r.replicate_index"
+                ),
+                b,
+            ))
+            .await?;
+            Ok(())
+        }
+        Some(CurveOnSplit::Copy) => {
+            for curve in foreign {
+                // One copy per original per instrument: pinning a second month onto the same
+                // instrument re-points at the copy the first one made.
+                let copy = conn
+                    .query_one_raw(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        "WITH existing AS (
+                             SELECT id FROM standard_curves
+                              WHERE sensor_id = $1 AND copied_from_id = $2 LIMIT 1
+                         ), made AS (
+                             INSERT INTO standard_curves
+                                 (sensor_id, name, fitted_on, slope, intercept, r_squared, notes,
+                                  created_by, copied_from_id)
+                             SELECT $1, sc.name, sc.fitted_on, sc.slope, sc.intercept, sc.r_squared,
+                                    sc.notes, $3, sc.id
+                               FROM standard_curves sc
+                              WHERE sc.id = $2 AND NOT EXISTS (SELECT 1 FROM existing)
+                             RETURNING id
+                         )
+                         SELECT id FROM existing UNION ALL SELECT id FROM made",
+                        [target_sensor.into(), curve.id.into(), actor.into()],
+                    ))
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::Internal(format!("curve {} could not be copied", curve.id))
+                    })?;
+                let copy_id: Uuid = copy.try_get("", "id")?;
+                let mut b = binds.clone();
+                b.push(curve.id.into());
+                b.push(copy_id.into());
+                let orig = b.len() - 1;
+                let new = b.len();
+                conn.execute_raw(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    &format!(
+                        "UPDATE readings tgt SET standard_curve_id = ${new}
+                           FROM readings r
+                           JOIN data_streams ds ON ds.id = r.stream_id
+                          WHERE {predicate} AND r.standard_curve_id = ${orig}
+                            AND tgt.stream_id = r.stream_id AND tgt.time = r.time
+                            AND tgt.replicate_index = r.replicate_index"
+                    ),
+                    b,
+                ))
+                .await?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The reprocess an inverted pin owes, for a whole set. Clearing a pin changes what the window
+/// resolves, so the slots have to be re-derived exactly as they were when it was recorded; a set
+/// that recorded no pin enqueues nothing.
+pub async fn enqueue_pin_reprocess_for_set(
+    db: &sea_orm::DatabaseConnection,
+    set_id: Uuid,
+) -> AppResult<Vec<Uuid>> {
+    let Some(row) = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT s.selection, s.kind FROM reading_decision_sets s WHERE s.id = $1",
+            [set_id.into()],
+        ))
+        .await?
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(kind) = Kind::parse(&row.try_get::<String>("", "kind")?) else {
+        return Ok(Vec::new());
+    };
+    let selection: Selection = serde_json::from_value(row.try_get("", "selection")?)
+        .map_err(|e| AppError::Internal(format!("stored selection unreadable: {e}")))?;
+    let (predicate, binds) = selection.predicate()?;
+    enqueue_attribution_pin(db, kind, None, set_id, &predicate, binds).await
+}
+
+/// The same, for one decision rolled back on its own: the slot it names re-derives.
+pub async fn enqueue_pin_reprocess_for_decision(
+    db: &sea_orm::DatabaseConnection,
+    decision_id: Uuid,
+) -> AppResult<Vec<Uuid>> {
+    let d = load(db, decision_id).await?;
+    if !matches!(d.kind, Kind::InstrumentPin | Kind::CalibrationPin) {
+        return Ok(Vec::new());
+    }
+    let selection = Selection {
+        keys: vec![SelectionKey {
+            stream_id: d.stream_id,
+            time: d.time,
+            replicate_index: d.replicate_index,
+            value: None,
+        }],
+        ..Default::default()
+    };
+    let (predicate, binds) = selection.predicate()?;
+    enqueue_attribution_pin(db, d.kind, None, d.set_id.unwrap_or(decision_id), &predicate, binds)
+        .await
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PinKind {
@@ -1735,6 +1972,24 @@ pub struct PinRequest {
     pub selection: Selection,
     #[serde(default)]
     pub reason: Option<String>,
+    /// What to do with a standard curve the incoming instrument does not own (Q112). Required when
+    /// the selection holds a corrected spot reading naming one, refused otherwise: a curve belongs
+    /// to exactly one instrument, so a split has to say whether the correction travels.
+    #[serde(default)]
+    pub curves: Option<CurveOnSplit>,
+}
+
+/// The two answers Q112 admits for a corrected spot reading whose curve belongs to the instrument
+/// it is leaving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CurveOnSplit {
+    /// Copy the curve onto the incoming instrument, naming the original, and point the readings at
+    /// the copy. The correction stands and the value does not move.
+    Copy,
+    /// Leave the readings on the incoming instrument with no standard curve. The reprocess then
+    /// recomposes each value from the curves it still names, which is the base calibration alone.
+    Drop,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1797,9 +2052,24 @@ pub async fn pin_readings(
         )));
     }
     let (predicate, binds) = req.selection.predicate()?;
-    let slots = slots_of(&state.db, &predicate, binds).await?;
+    // A curve belongs to one instrument, so an instrument pin has to say what happens to a
+    // correction the incoming instrument does not own (Q112). Asked before anything is written.
+    let foreign = if req.kind == PinKind::Instrument {
+        foreign_curves(&state.db, &predicate, binds.clone(), req.target_id).await?
+    } else {
+        Vec::new()
+    };
+    if !foreign.is_empty() && req.curves.is_none() {
+        return Err(AppError::BadRequest(format!(
+            "{} of the selected readings are corrected by {} standard curve(s) the incoming \
+             instrument does not own; say `curves`: \"copy\" to copy them onto it, or \"drop\" to \
+             leave those readings with no standard curve",
+            foreign.iter().map(|c| c.rows).sum::<i64>(),
+            foreign.len()
+        )));
+    }
     let (set_id, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
-        record_set(
+        let set = record_set(
             txn,
             kind,
             &req.selection,
@@ -1808,24 +2078,31 @@ pub async fn pin_readings(
             req.reason.as_deref(),
             Origin::Manual,
         )
-        .await
+        .await?;
+        // In the same transaction as the pin: a reading is never left naming a curve of an
+        // instrument it does not belong to.
+        apply_curve_on_split(
+            txn,
+            req.curves,
+            &foreign,
+            req.target_id,
+            &predicate,
+            binds.clone(),
+            &actor,
+        )
+        .await?;
+        Ok(set)
     })
     .await?;
-    let mut jobs = Vec::new();
-    for (site_id, parameter_id) in slots {
-        if let Some(job) = crate::routes::private::reprocessing_jobs::worker::enqueue(
-            &state.db,
-            "attribution_pin",
-            (req.kind == PinKind::Instrument).then_some(req.target_id),
-            Some(set_id),
-            &serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
-            None,
-        )
-        .await?
-        {
-            jobs.push(job);
-        }
-    }
+    let jobs = enqueue_attribution_pin(
+        &state.db,
+        kind,
+        (req.kind == PinKind::Instrument).then_some(req.target_id),
+        set_id,
+        &predicate,
+        binds,
+    )
+    .await?;
     Ok(Json(PinResponse {
         set_id,
         rows_decided: recorded.rows,
@@ -1859,38 +2136,25 @@ pub async fn rollback_pin_set(
     axum::extract::Path(set_id): axum::extract::Path<Uuid>,
 ) -> AppResult<Json<RollbackSetResponse>> {
     let actor = crate::routes::private::tools::scripts::actor_label(&auth);
-    let selection_row = state
+    if state
         .db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT selection FROM reading_decision_sets WHERE id = $1",
+            "SELECT 1 FROM reading_decision_sets WHERE id = $1",
             [set_id.into()],
         ))
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("Decision set {set_id} not found")))?;
-    let selection: Selection = serde_json::from_value(selection_row.try_get("", "selection")?)
-        .map_err(|e| AppError::Internal(format!("stored selection unreadable: {e}")))?;
-    let (predicate, binds) = selection.predicate()?;
-    let slots = slots_of(&state.db, &predicate, binds).await?;
-    let rolled_back = crate::common::bulk_write::guarded(&state.db, async |txn| {
+        .is_none()
+    {
+        return Err(AppError::NotFound(format!(
+            "Decision set {set_id} not found"
+        )));
+    }
+    let (rolled_back, _) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         rollback_set(txn, set_id, &actor, Some("set rolled back")).await
     })
     .await?;
-    let mut jobs = Vec::new();
-    for (site_id, parameter_id) in slots {
-        if let Some(job) = crate::routes::private::reprocessing_jobs::worker::enqueue(
-            &state.db,
-            "attribution_pin",
-            None,
-            Some(set_id),
-            &serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
-            None,
-        )
-        .await?
-        {
-            jobs.push(job);
-        }
-    }
+    let jobs = enqueue_pin_reprocess_for_set(&state.db, set_id).await?;
     Ok(Json(RollbackSetResponse {
         set_id,
         rolled_back,
