@@ -256,6 +256,8 @@ pub async fn adopt_sensor(
     }
 
     let txn = db.begin().await?;
+    // The change-audit trigger reads the writer from the transaction it fires in.
+    crate::common::actor::declare(&txn).await?;
     // The readings parameter_id backfill below reaches compressed chunks.
     crate::common::bulk_write::lift_decompression_cap(&txn).await?;
     let (site_parameter_id, site_parameter_created) = resolve_or_create_site_parameter(
@@ -491,6 +493,8 @@ pub async fn swap_sensors(
     let at = payload.at.unwrap_or_else(Utc::now);
 
     let txn = db.begin().await?;
+    // The change-audit trigger reads the writer from the transaction it fires in.
+    crate::common::actor::declare(&txn).await?;
     // The readings parameter_id backfill below reaches compressed chunks.
     crate::common::bulk_write::lift_decompression_cap(&txn).await?;
     let (site_parameter_id, _created) = resolve_or_create_site_parameter(

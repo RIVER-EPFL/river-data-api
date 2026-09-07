@@ -1153,10 +1153,10 @@ async fn calibration_time_windows_auto_bounded() {
 }
 
 // ============================================================================
-// Calibration deletion, fallback with distinct values
+// Calibration retirement, fallback with distinct values
 // ============================================================================
 
-/// Three calibrations: base → A → B. Delete A.
+/// Three calibrations: base → A → B. Retire A.
 /// Readings in A's window fall back to the base curve.
 /// Each reading has distinct raw_value, so exact outputs are verifiable.
 ///
@@ -1165,13 +1165,13 @@ async fn calibration_time_windows_auto_bounded() {
 ///   Jan 15 (raw=15) → cal_a     → 31.0    (2*15+1)
 ///   Jan 25 (raw=25) → cal_b     → 77.0    (3*25+2)
 ///
-/// After deleting cal_a:
+/// After retiring cal_a:
 ///   Jan 5  (raw=5)  → base      → 5.0     (unchanged)
 ///   Jan 15 (raw=15) → base      → 15.0    (CHANGED: was 31.0)
 ///   Jan 25 (raw=25) → cal_b     → 77.0    (unchanged)
 #[tokio::test]
 #[serial]
-async fn delete_intermediate_calibration_fallback() {
+async fn retire_intermediate_calibration_fallback() {
     let db = setup_test_db().await;
     cleanup_test_db(&db).await;
     seed_base_entities(&db).await;
@@ -1230,12 +1230,17 @@ async fn delete_intermediate_calibration_fallback() {
     assert_eq!(rows[1].calibrated_value, Some(31.0), "before: 2*15+1=31");
     assert_eq!(rows[2].calibrated_value, Some(77.0), "before: 3*25+2=77");
 
-    // Delete cal_a
+    // Retire cal_a: a curve that has corrected readings is never deleted (M146).
     let app = build_test_app(db.clone());
     let token = seed_api_token(&db, full_permissions(), None).await;
-    let (status, _) =
-        delete_with_token(&app, &format!("/api/sensor_calibrations/{cal_a}"), &token).await;
-    assert_eq!(status, 204);
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sensor_calibrations/{cal_a}/retire"),
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "retire: {body}");
     assert!(wait_for_reprocessing(&db, sensor.id, WAIT_TIMEOUT).await);
 
     // AFTER: Jan 15 reading falls back to the base curve

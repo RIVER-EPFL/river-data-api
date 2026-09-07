@@ -9,13 +9,13 @@
 use axum::Json;
 use axum::extract::{Query, State};
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::common::paging::Window;
+use crate::common::paging::{Page, Window};
 use crate::error::{AppError, AppResult};
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
@@ -47,6 +47,35 @@ pub struct DeliveryCounts {
     pub skipped: i64,
 }
 
+/// The rows this file's two queries return. Derived rather than hand-decoded so a column added to
+/// a query and not to its reader is a compile error rather than a field silently left behind.
+#[derive(FromQueryResult)]
+struct MessageRow {
+    alarm_event_id: Option<Uuid>,
+    kind: String,
+    at: DateTime<Utc>,
+    site_name: Option<String>,
+    parameter_name: Option<String>,
+    total: i64,
+    sent: i64,
+    failed: i64,
+    muted: i64,
+    undeliverable: i64,
+    skipped: i64,
+}
+
+#[derive(FromQueryResult)]
+struct RecipientRow {
+    alarm_event_id: Option<Uuid>,
+    kind: String,
+    at: DateTime<Utc>,
+    channel: String,
+    recipient: String,
+    status: String,
+    error: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DeliveryRecipient {
@@ -70,14 +99,6 @@ pub struct DeliveryMessage {
     pub recipients: Vec<DeliveryRecipient>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct DeliveryLogPage {
-    pub messages: Vec<DeliveryMessage>,
-    /// Messages matching the filter, not rows.
-    pub total: i64,
-}
-
 fn validate(value: &str, field: &str) -> AppResult<()> {
     if field == "status" && !STATUSES.contains(&value) {
         return Err(AppError::BadRequest(format!(
@@ -92,7 +113,7 @@ fn validate(value: &str, field: &str) -> AppResult<()> {
 pub async fn list_deliveries(
     db: &DatabaseConnection,
     q: &DeliveryQuery,
-) -> AppResult<DeliveryLogPage> {
+) -> AppResult<Page<DeliveryMessage>> {
     let window = Window::from_limit_offset(q.limit, q.offset, 50, MAX_LIMIT);
     let (limit, offset) = (window.limit, window.offset);
     if let Some(status) = &q.status {
@@ -146,19 +167,20 @@ pub async fn list_deliveries(
 
     let mut messages = Vec::with_capacity(rows.len());
     for r in rows {
+        let row = MessageRow::from_query_result(&r, "")?;
         messages.push(DeliveryMessage {
-            alarm_event_id: r.try_get("", "alarm_event_id")?,
-            kind: r.try_get("", "kind")?,
-            at: r.try_get("", "at")?,
-            site_name: r.try_get("", "site_name")?,
-            parameter_name: r.try_get("", "parameter_name")?,
+            alarm_event_id: row.alarm_event_id,
+            kind: row.kind,
+            at: row.at,
+            site_name: row.site_name,
+            parameter_name: row.parameter_name,
             counts: DeliveryCounts {
-                total: r.try_get("", "total")?,
-                sent: r.try_get("", "sent")?,
-                failed: r.try_get("", "failed")?,
-                muted: r.try_get("", "muted")?,
-                undeliverable: r.try_get("", "undeliverable")?,
-                skipped: r.try_get("", "skipped")?,
+                total: row.total,
+                sent: row.sent,
+                failed: row.failed,
+                muted: row.muted,
+                undeliverable: row.undeliverable,
+                skipped: row.skipped,
             },
             recipients: Vec::new(),
         });
@@ -180,7 +202,11 @@ pub async fn list_deliveries(
     if !messages.is_empty() {
         attach_recipients(db, &mut messages).await?;
     }
-    Ok(DeliveryLogPage { messages, total })
+    Ok(Page::new(
+        messages,
+        u64::try_from(total).unwrap_or(0),
+        Some(window),
+    ))
 }
 
 /// Fill each message on the page with its own rows. The page is contiguous in time, so one scan of
@@ -204,23 +230,19 @@ async fn attach_recipients(
         .await?;
 
     for r in rows {
-        let key: (Option<Uuid>, String, DateTime<Utc>) = (
-            r.try_get("", "alarm_event_id")?,
-            r.try_get("", "kind")?,
-            r.try_get("", "at")?,
-        );
-        let Some(msg) = messages
-            .iter_mut()
-            .find(|m| (m.alarm_event_id, m.kind.as_str(), m.at) == (key.0, key.1.as_str(), key.2))
-        else {
+        let row = RecipientRow::from_query_result(&r, "")?;
+        let Some(msg) = messages.iter_mut().find(|m| {
+            (m.alarm_event_id, m.kind.as_str(), m.at)
+                == (row.alarm_event_id, row.kind.as_str(), row.at)
+        }) else {
             continue;
         };
         msg.recipients.push(DeliveryRecipient {
-            channel: r.try_get("", "channel")?,
-            recipient: r.try_get("", "recipient")?,
-            status: r.try_get("", "status")?,
-            error: r.try_get("", "error")?,
-            created_at: r.try_get("", "created_at")?,
+            channel: row.channel,
+            recipient: row.recipient,
+            status: row.status,
+            error: row.error,
+            created_at: row.created_at,
         });
     }
     Ok(())
@@ -230,12 +252,12 @@ async fn attach_recipients(
 #[utoipa::path(
     get,
     path = "/api/notifications/deliveries",
-    responses((status = 200, description = "Delivery log by message", body = DeliveryLogPage)),
+    responses((status = 200, description = "Delivery log by message", body = Page<DeliveryMessage>)),
     tag = "notifications"
 )]
 pub async fn list_delivery_log(
     State(state): State<AppState>,
     Query(q): Query<DeliveryQuery>,
-) -> AppResult<Json<DeliveryLogPage>> {
+) -> AppResult<Json<Page<DeliveryMessage>>> {
     Ok(Json(list_deliveries(&state.db, &q).await?))
 }

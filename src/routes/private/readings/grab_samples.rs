@@ -1,7 +1,7 @@
 use axum::{Json, extract::State};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
+    FromQueryResult, QueryFilter, Set,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -160,12 +160,62 @@ pub struct GrabPreview {
     pub calibrated_value: Option<f64>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema, FromQueryResult)]
 pub struct ExistingReplicate {
     pub replicate_index: i16,
     pub raw_value: f64,
     pub calibrated_value: Option<f64>,
     pub standard_curve_id: Option<Uuid>,
+}
+
+/// A replicate a replace kept, and why curation kept it.
+#[derive(FromQueryResult)]
+struct KeptRow {
+    replicate_index: i16,
+    reason: String,
+}
+
+#[derive(FromQueryResult)]
+struct StreamSensorRow {
+    id: Uuid,
+    sensor_id: Uuid,
+}
+
+/// The curation facts a stored group already carries, which a replace keeps.
+#[derive(FromQueryResult)]
+struct PriorFactsRow {
+    label: Option<String>,
+    notes: Option<String>,
+    created_by: Option<String>,
+    provenance: Option<serde_json::Value>,
+    provenance_kind: Option<String>,
+}
+
+impl From<PriorFactsRow> for StoredFacts {
+    fn from(row: PriorFactsRow) -> Self {
+        Self {
+            label: row.label,
+            notes: row.notes,
+            created_by: row.created_by,
+            provenance: row.provenance,
+            kind: row.provenance_kind,
+        }
+    }
+}
+
+/// A stored tool run, as the save path reads it back to build the provenance blob.
+#[derive(FromQueryResult)]
+struct StoredRun {
+    tool_name: String,
+    source: String,
+    context: Option<serde_json::Value>,
+    tool_version: serde_json::Value,
+    inputs: serde_json::Value,
+    constants: serde_json::Value,
+    curves: serde_json::Value,
+    outputs: serde_json::Value,
+    created_by: String,
+    created_at: chrono::DateTime<chrono::FixedOffset>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -254,14 +304,7 @@ async fn fetch_existing_groups(
         }
         let replicates = rows
             .iter()
-            .map(|row| {
-                Ok(ExistingReplicate {
-                    replicate_index: row.try_get("", "replicate_index")?,
-                    raw_value: row.try_get("", "raw_value")?,
-                    calibrated_value: row.try_get("", "calibrated_value")?,
-                    standard_curve_id: row.try_get("", "standard_curve_id")?,
-                })
-            })
+            .map(|row| ExistingReplicate::from_query_result(row, ""))
             .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
         out.push(ExistingGroup {
             parameter_id: *parameter_id,
@@ -696,22 +739,20 @@ async fn resolve_tool_run_provenance(
         .await?
         .ok_or_else(|| AppError::BadRequest(format!("Tool run {run_id} does not exist")))?;
 
-    let tool_name: String = row.try_get("", "tool_name").map_err(AppError::Database)?;
-    let run_source: String = row.try_get("", "source").map_err(AppError::Database)?;
-    let run_context: Option<serde_json::Value> =
-        row.try_get("", "context").map_err(AppError::Database)?;
-    let tool_version: serde_json::Value = row
-        .try_get("", "tool_version")
-        .map_err(AppError::Database)?;
-    let inputs: serde_json::Value = row.try_get("", "inputs").map_err(AppError::Database)?;
-    let constants: serde_json::Value = row.try_get("", "constants").map_err(AppError::Database)?;
-    let curves: serde_json::Value = row.try_get("", "curves").map_err(AppError::Database)?;
-    let outputs: serde_json::Value = row.try_get("", "outputs").map_err(AppError::Database)?;
-    let calculated_by: String = row.try_get("", "created_by").map_err(AppError::Database)?;
-    let calculated_at: chrono::DateTime<chrono::Utc> = row
-        .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "created_at")
-        .map_err(AppError::Database)?
-        .with_timezone(&chrono::Utc);
+    let run = StoredRun::from_query_result(&row, "").map_err(AppError::Database)?;
+    let StoredRun {
+        tool_name,
+        source: run_source,
+        context: run_context,
+        tool_version,
+        inputs,
+        constants,
+        curves,
+        outputs,
+        created_by: calculated_by,
+        created_at,
+    } = run;
+    let calculated_at = created_at.with_timezone(&chrono::Utc);
 
     // The run resolved its station properties and same-event reads for one visit, and those
     // resolutions travel into the blob below. Saving it anywhere else would file a number computed
@@ -1165,7 +1206,8 @@ pub async fn insert_grab_samples(
             ))
             .await?
         {
-            map.insert(row.try_get::<Uuid>("", "id")?, row.try_get::<Uuid>("", "sensor_id")?);
+            let row = StreamSensorRow::from_query_result(&row, "")?;
+            map.insert(row.id, row.sensor_id);
         }
         map
     };
@@ -1315,13 +1357,9 @@ pub async fn insert_grab_samples(
                         {
                             prior_facts.insert(
                                 (*parameter_id, *time),
-                                StoredFacts {
-                                    label: row.try_get("", "label").unwrap_or(None),
-                                    notes: row.try_get("", "notes").unwrap_or(None),
-                                    created_by: row.try_get("", "created_by").unwrap_or(None),
-                                    provenance: row.try_get("", "provenance").unwrap_or(None),
-                                    kind: row.try_get("", "provenance_kind").unwrap_or(None),
-                                },
+                                PriorFactsRow::from_query_result(&row, "")
+                                    .map(Into::into)
+                                    .unwrap_or_default(),
                             );
                         }
                     }
@@ -1355,14 +1393,16 @@ pub async fn insert_grab_samples(
                             .await?;
                         if !kept.is_empty() {
                             let entries = kept
-                            .iter()
-                            .map(|row| {
-                                Ok(serde_json::json!({
-                                    "replicate_index": row.try_get::<i16>("", "replicate_index")?,
-                                    "reason": row.try_get::<String>("", "reason")?,
-                                }))
-                            })
-                            .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
+                                .iter()
+                                .map(|row| {
+                                    KeptRow::from_query_result(row, "").map(|r| {
+                                        serde_json::json!({
+                                            "replicate_index": r.replicate_index,
+                                            "reason": r.reason,
+                                        })
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
                             super::reconcile::upsert_source_modified_hold(
                                 txn,
                                 stream_id,

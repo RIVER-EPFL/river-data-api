@@ -258,46 +258,29 @@ impl CRUDOperations for SensorCalibrationOperations {
             )));
         }
 
-        // The readings this curve corrected move onto whichever of the sensor's remaining curves
-        // covers their time, value recomputed in the same statement, before the row goes. A
-        // windowed calibration is deletable and its history reprocesses; that is deliberately
-        // unlike a standard curve, which is frozen once a reading references it.
-        //
-        // Spot rows are repointed here even though a window resolution otherwise never claims one:
-        // the curve their `calibration_id` names is going away, so the reference has to move. The
-        // operator's standard curve is preserved and re-applied on top of the new base.
-        // A reading no remaining curve covers is left uncorrected, which is what ingest stores for a
-        // time outside every window and what a reprocess over the same windows would recompute. The
-        // lateral is an outer join for that reason: an inner one would skip those rows, and the
-        // foreign key would then refuse the delete. The value expression is the shared
-        // `recomposed_value_sql`, so a row left with neither curve reads NULL rather than its raw
-        // value.
-        let repoint_sql = super::service::repoint_statement(
-            &super::resolver::pick_calibration_lateral_excluding("$2", Some("$1")),
-            &format!(
-                "r.calibration_id = $1 AND {not_pinned}",
-                not_pinned = crate::routes::private::readings::decisions::not_pinned_sql(
-                    "r",
-                    crate::routes::private::readings::decisions::Kind::CalibrationPin
-                ),
-            ),
-            "",
-        );
-        crate::common::bulk_write::guarded_mutation(
-            db,
-            Statement::from_sql_and_values(
+        // A curve that has corrected a reading is retired, never removed (Q107, M146): the row is
+        // the provenance of every value it produced, and a delete would take that away and leave
+        // the readings pointing at nothing. A curve nothing names has no history to keep.
+        let used: i64 = db
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                &repoint_sql,
-                [id.into(), sensor_id.into()],
-            ),
-        )
-        .await
-        .map_err(|e| {
-            ApiError::internal(
-                "Failed to move the calibration's readings onto their covering curve",
-                Some(e.to_string()),
-            )
-        })?;
+                "SELECT count(*)::bigint AS n FROM readings WHERE calibration_id = $1",
+                [id.into()],
+            ))
+            .await
+            .map_err(ApiError::database)?
+            .map(|r| r.try_get::<i64>("", "n"))
+            .transpose()
+            .map_err(ApiError::database)?
+            .unwrap_or(0);
+        if used > 0 {
+            return Err(ApiError::bad_request(format!(
+                "This calibration has corrected {used} reading(s), so it is retired rather than \
+                 deleted: POST /api/sensor_calibrations/{id}/retire. Retiring moves those readings \
+                 onto whatever else covers them, keeps the row and its provenance, and is \
+                 reversible."
+            )));
+        }
 
         db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,

@@ -6,7 +6,7 @@ use axum::{
     Json,
     extract::{Query, State},
 };
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -70,8 +70,10 @@ pub async fn reconciliation_candidates(
             ))
             .await?
             .ok_or_else(|| AppError::Internal("candidate probe returned no row".to_string()))?;
-        let old_readings: i64 = row.try_get("", "old_readings")?;
-        let missing: i64 = row.try_get("", "missing")?;
+        let ProbeCounts {
+            old_readings,
+            missing,
+        } = ProbeCounts::from_query_result(&row, "")?;
         families.push(FamilyCandidate {
             family_stream_id: pair.new_id,
             family_source_key: pair.new_key.clone(),
@@ -192,6 +194,33 @@ pub async fn start_reconciliation_delete(
     enqueue_reconciliation(&state, "replicate_reconciliation_delete", &payload).await
 }
 
+/// The rows this file's raw queries return. Derived rather than hand-decoded so a column added to
+/// a query and not to its reader is a compile error rather than a field silently left behind.
+#[derive(FromQueryResult)]
+struct ProbeCounts {
+    old_readings: i64,
+    missing: i64,
+}
+
+#[derive(FromQueryResult)]
+struct SlotRow {
+    site_parameter_id: Uuid,
+    stream_id: Uuid,
+    source_system: String,
+    source_key: String,
+    site_id: Uuid,
+    site_name: String,
+    parameter_id: Uuid,
+    parameter_name: String,
+}
+
+#[derive(FromQueryResult)]
+struct StreamExtent {
+    readings: i64,
+    first: Option<chrono::DateTime<chrono::Utc>>,
+    last: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DuplicateSlotStream {
     pub stream_id: Uuid,
@@ -255,8 +284,8 @@ pub async fn duplicate_slots(State(state): State<AppState>) -> AppResult<Json<Du
 
     let mut slots: Vec<DuplicateSlot> = Vec::new();
     for r in rows {
-        let site_parameter_id: Uuid = r.try_get("", "site_parameter_id")?;
-        let stream_id: Uuid = r.try_get("", "stream_id")?;
+        let slot = SlotRow::from_query_result(&r, "")?;
+        let (site_parameter_id, stream_id) = (slot.site_parameter_id, slot.stream_id);
         let stats = state
             .db
             .query_one_raw(Statement::from_sql_and_values(
@@ -267,21 +296,22 @@ pub async fn duplicate_slots(State(state): State<AppState>) -> AppResult<Json<Du
             ))
             .await?
             .ok_or_else(|| AppError::Internal("stream probe returned no row".to_string()))?;
+        let extent = StreamExtent::from_query_result(&stats, "")?;
         let stream = DuplicateSlotStream {
             stream_id,
-            source_system: r.try_get("", "source_system")?,
-            source_key: r.try_get("", "source_key")?,
-            readings: stats.try_get("", "readings")?,
-            first_reading: stats.try_get("", "first")?,
-            last_reading: stats.try_get("", "last")?,
+            source_system: slot.source_system,
+            source_key: slot.source_key,
+            readings: extent.readings,
+            first_reading: extent.first,
+            last_reading: extent.last,
         };
         match slots.iter_mut().find(|s| s.site_parameter_id == site_parameter_id) {
             Some(slot) => slot.streams.push(stream),
             None => slots.push(DuplicateSlot {
-                site_id: r.try_get("", "site_id")?,
-                site_name: r.try_get("", "site_name")?,
-                parameter_id: r.try_get("", "parameter_id")?,
-                parameter_name: r.try_get("", "parameter_name")?,
+                site_id: slot.site_id,
+                site_name: slot.site_name,
+                parameter_id: slot.parameter_id,
+                parameter_name: slot.parameter_name,
                 site_parameter_id,
                 streams: vec![stream],
                 duplicated_instants: 0,

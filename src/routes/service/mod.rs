@@ -578,6 +578,22 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             post(crate::routes::private::readings::decisions::pin_readings),
         )
         .route(
+            "/sensor_calibrations/{id}/retire",
+            post(crate::routes::private::sensors::calibrations::retire::retire_calibration),
+        )
+        .route(
+            "/sensor_calibrations/{id}/unretire",
+            post(crate::routes::private::sensors::calibrations::retire::unretire_calibration),
+        )
+        .route(
+            "/standard_curves/{id}/retire",
+            post(crate::routes::private::sensors::standard_curves::retire::retire_standard_curve),
+        )
+        .route(
+            "/standard_curves/{id}/unretire",
+            post(crate::routes::private::sensors::standard_curves::retire::unretire_standard_curve),
+        )
+        .route(
             "/readings/pins/{set_id}/rollback",
             post(crate::routes::private::readings::decisions::rollback_pin_set),
         )
@@ -845,6 +861,13 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     if let Some(routes) = user_routes {
         router = router.merge(routes);
     }
+
+    // A CRUD batch runs the single-row hooks once per row, so the global alarm reconcile they ask
+    // for is owed once per request rather than once per row.
+    let router = router.layer(middleware::from_fn_with_state(
+        state.clone(),
+        crate::routes::private::alarms::sweeper::coalesce_reconcile,
+    ));
 
     (router, under_api(entity_api))
 }

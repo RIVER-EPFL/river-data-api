@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Query, State},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -12,6 +12,35 @@ use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, sensor_in_scope};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sites::aggregates::{bucket_interval, resolution_of};
+
+/// The rows this file's raw queries return. Derived rather than hand-decoded so a column added to
+/// a query and not to its reader is a compile error rather than a field silently left behind.
+/// The series has two shapes: every point carries [`SeriesPoint`], and a bucketed one carries
+/// [`BucketExtent`] as well, which is why they are two structs and not one with optional halves.
+#[derive(FromQueryResult)]
+struct SeriesPoint {
+    time: DateTime<chrono::FixedOffset>,
+    raw_value: Option<f64>,
+    calibrated_value: Option<f64>,
+    site_id: Option<Uuid>,
+}
+
+#[derive(FromQueryResult)]
+struct BucketExtent {
+    raw_min: Option<f64>,
+    raw_max: Option<f64>,
+    cal_min: Option<f64>,
+    cal_max: Option<f64>,
+}
+
+#[derive(FromQueryResult)]
+struct BandRow {
+    deployment_id: Uuid,
+    site_id: Uuid,
+    site_name: Option<String>,
+    deployed_from: DateTime<chrono::FixedOffset>,
+    deployed_until: Option<DateTime<chrono::FixedOffset>>,
+}
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct SensorReadingsQuery {
@@ -365,20 +394,17 @@ pub async fn get_sensor_readings(
     let mut calibrated_max = Vec::with_capacity(if aggregated { rows.len() } else { 0 });
     let mut site_ids = Vec::with_capacity(rows.len());
     for row in &rows {
-        let t: DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
-        times.push(t.with_timezone(&Utc));
-        raw.push(if include_raw {
-            row.try_get::<f64>("", "raw_value").ok()
-        } else {
-            None
-        });
-        calibrated.push(row.try_get::<f64>("", "calibrated_value").ok());
-        site_ids.push(row.try_get::<Uuid>("", "site_id").ok());
+        let point = SeriesPoint::from_query_result(row, "")?;
+        times.push(point.time.with_timezone(&Utc));
+        raw.push(if include_raw { point.raw_value } else { None });
+        calibrated.push(point.calibrated_value);
+        site_ids.push(point.site_id);
         if aggregated {
-            raw_min.push(row.try_get::<f64>("", "raw_min").ok());
-            raw_max.push(row.try_get::<f64>("", "raw_max").ok());
-            calibrated_min.push(row.try_get::<f64>("", "cal_min").ok());
-            calibrated_max.push(row.try_get::<f64>("", "cal_max").ok());
+            let extent = BucketExtent::from_query_result(row, "")?;
+            raw_min.push(extent.raw_min);
+            raw_max.push(extent.raw_max);
+            calibrated_min.push(extent.cal_min);
+            calibrated_max.push(extent.cal_max);
         }
     }
 
@@ -492,15 +518,13 @@ pub async fn get_sensor_deployment_bands(
     let bands = rows
         .iter()
         .map(|row| -> AppResult<SensorDeploymentBand> {
-            let from: DateTime<chrono::FixedOffset> = row.try_get("", "deployed_from")?;
-            let until: Option<DateTime<chrono::FixedOffset>> =
-                row.try_get("", "deployed_until").ok();
+            let band = BandRow::from_query_result(row, "")?;
             Ok(SensorDeploymentBand {
-                deployment_id: row.try_get("", "deployment_id")?,
-                site_id: row.try_get("", "site_id")?,
-                site_name: row.try_get("", "site_name").ok(),
-                from: from.with_timezone(&Utc),
-                until: until.map(|u| u.with_timezone(&Utc)),
+                deployment_id: band.deployment_id,
+                site_id: band.site_id,
+                site_name: band.site_name,
+                from: band.deployed_from.with_timezone(&Utc),
+                until: band.deployed_until.map(|u| u.with_timezone(&Utc)),
             })
         })
         .collect::<AppResult<Vec<_>>>()?;

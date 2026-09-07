@@ -478,6 +478,24 @@ fn row_to_active(row: &sea_orm::QueryResult) -> AppResult<ActiveTool> {
     })
 }
 
+/// A jsonb array of `[name, name]` pairs as the pairs themselves. Both source lists are built the
+/// same way in SQL, so both are read the same way here.
+fn name_pairs(raw: &serde_json::Value) -> Vec<(String, String)> {
+    raw.as_array()
+        .map(|pairs| {
+            pairs
+                .iter()
+                .filter_map(|pair| {
+                    Some((
+                        pair.get(0)?.as_str()?.to_string(),
+                        pair.get(1)?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The formulas attached to the given calculations, as `(script_id, formula)` pairs.
 pub async fn load_formulas(
     db: &DatabaseConnection,
@@ -498,7 +516,14 @@ pub async fn load_formulas(
                            FROM derived_parameter_sources src
                            JOIN parameters p ON p.id = src.parameter_id
                           WHERE src.derived_definition_id = d.id),
-                        '[]'::jsonb) AS sources
+                        '[]'::jsonb) AS sources,
+                    COALESCE(
+                        (SELECT jsonb_agg(jsonb_build_array(src.variable_name, src.site_property)
+                                            ORDER BY src.variable_name)
+                           FROM derived_parameter_sources src
+                          WHERE src.derived_definition_id = d.id
+                            AND src.site_property IS NOT NULL),
+                        '[]'::jsonb) AS site_sources
                FROM calculation_formulas d
                LEFT JOIN parameters out ON out.id = d.output_parameter_id
               WHERE d.tool_script_id = ANY($1)
@@ -509,20 +534,8 @@ pub async fn load_formulas(
     let mut formulas = Vec::with_capacity(rows.len());
     for row in &rows {
         let script_id: Uuid = row.try_get("", "tool_script_id")?;
-        let raw: serde_json::Value = row.try_get("", "sources")?;
-        let sources: Vec<(String, String)> = raw
-            .as_array()
-            .map(|pairs| {
-                pairs
-                    .iter()
-                    .filter_map(|pair| {
-                        let variable = pair.get(0)?.as_str()?.to_string();
-                        let code = pair.get(1)?.as_str()?.to_string();
-                        Some((variable, code))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let sources = name_pairs(&row.try_get("", "sources")?);
+        let site_sources = name_pairs(&row.try_get("", "site_sources")?);
         let stored = StoredFormula::from_query_result(row, "")?;
         formulas.push((
             script_id,
@@ -534,6 +547,7 @@ pub async fn load_formulas(
                 ordinal: stored.ordinal,
                 output_parameter_code: stored.output_parameter_code,
                 sources,
+                site_sources,
                 curve_slot: stored.curve_slot,
                 per_replicate: stored.per_replicate,
             },

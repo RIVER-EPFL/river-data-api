@@ -11,7 +11,7 @@ use axum::{
     extract::{Query, State},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -165,33 +165,41 @@ async fn decisions<C: ConnectionTrait>(
     if streams.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, kind, actor, at, reason, old, new FROM reading_decisions \
-              WHERE stream_id = ANY($1) AND time = $2 ORDER BY at DESC",
-            [streams.to_vec().into(), time.into()],
-        ))
-        .await?;
-    rows.iter()
-        .map(|r| {
-            let kind: String = r.try_get("", "kind")?;
-            let reason: Option<String> = r.try_get("", "reason")?;
-            Ok(LedgerEntry {
-                at: r.try_get("", "at")?,
-                source: "decision".to_string(),
-                severity: Severity::Info.as_str().to_string(),
-                actor: r.try_get("", "actor")?,
-                what: match reason {
-                    Some(why) if !why.trim().is_empty() => format!("{kind}: {why}"),
-                    _ => kind,
-                },
-                old: r.try_get("", "old")?,
-                new: r.try_get("", "new")?,
-                id: r.try_get("", "id")?,
-            })
+    let rows = DecisionRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT id, kind, actor, at, reason, old, new FROM reading_decisions \
+          WHERE stream_id = ANY($1) AND time = $2 ORDER BY at DESC",
+        [streams.to_vec().into(), time.into()],
+    ))
+    .all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| LedgerEntry {
+            at: r.at,
+            source: "decision".to_string(),
+            severity: Severity::Info.as_str().to_string(),
+            actor: r.actor,
+            what: match r.reason {
+                Some(why) if !why.trim().is_empty() => format!("{}: {why}", r.kind),
+                _ => r.kind,
+            },
+            old: r.old,
+            new: r.new,
+            id: r.id,
         })
-        .collect()
+        .collect())
+}
+
+#[derive(FromQueryResult)]
+struct DecisionRow {
+    id: Uuid,
+    kind: String,
+    actor: Option<String>,
+    at: DateTime<Utc>,
+    reason: Option<String>,
+    old: Option<serde_json::Value>,
+    new: Option<serde_json::Value>,
 }
 
 /// Every windowed ingest pass whose claimed window covers the instant, not only the latest: the
@@ -204,49 +212,57 @@ async fn ingest_passes<C: ConnectionTrait>(
     if streams.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, at, submitted, new_rows, changed, unchanged, withdrawn, rejected_total, \
-                    braked \
-               FROM ingest_receipts \
-              WHERE stream_id = ANY($1) AND window_from <= $2 AND window_to >= $2 \
-              ORDER BY at DESC",
-            [streams.to_vec().into(), time.into()],
-        ))
-        .await?;
-    rows.iter()
-        .map(|r| {
-            let rejected: i32 = r.try_get("", "rejected_total")?;
-            let braked: bool = r.try_get("", "braked")?;
-            let changed: i32 = r.try_get("", "changed")?;
-            let new_rows: i32 = r.try_get("", "new_rows")?;
-            Ok(LedgerEntry {
-                at: r.try_get("", "at")?,
-                source: "ingest".to_string(),
-                severity: Severity::ingest_receipt(i64::from(rejected), braked)
-                    .as_str()
-                    .to_string(),
-                actor: None,
-                what: if braked {
-                    "windowed ingest, braked".to_string()
-                } else {
-                    format!("windowed ingest: {new_rows} new, {changed} changed")
-                },
-                old: None,
-                new: Some(serde_json::json!({
-                    "submitted": r.try_get::<i32>("", "submitted")?,
-                    "new": new_rows,
-                    "changed": changed,
-                    "unchanged": r.try_get::<i32>("", "unchanged")?,
-                    "withdrawn": r.try_get::<i32>("", "withdrawn")?,
-                    "rejected": rejected,
-                    "braked": braked,
-                })),
-                id: r.try_get("", "id")?,
-            })
+    let rows = ReceiptRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT id, at, submitted, new_rows, changed, unchanged, withdrawn, rejected_total, \
+                braked \
+           FROM ingest_receipts \
+          WHERE stream_id = ANY($1) AND window_from <= $2 AND window_to >= $2 \
+          ORDER BY at DESC",
+        [streams.to_vec().into(), time.into()],
+    ))
+    .all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| LedgerEntry {
+            at: r.at,
+            source: "ingest".to_string(),
+            severity: Severity::ingest_receipt(i64::from(r.rejected_total), r.braked)
+                .as_str()
+                .to_string(),
+            actor: None,
+            what: if r.braked {
+                "windowed ingest, braked".to_string()
+            } else {
+                format!("windowed ingest: {} new, {} changed", r.new_rows, r.changed)
+            },
+            old: None,
+            new: Some(serde_json::json!({
+                "submitted": r.submitted,
+                "new": r.new_rows,
+                "changed": r.changed,
+                "unchanged": r.unchanged,
+                "withdrawn": r.withdrawn,
+                "rejected": r.rejected_total,
+                "braked": r.braked,
+            })),
+            id: r.id,
         })
-        .collect()
+        .collect())
+}
+
+#[derive(FromQueryResult)]
+struct ReceiptRow {
+    id: Uuid,
+    at: DateTime<Utc>,
+    submitted: i32,
+    new_rows: i32,
+    changed: i32,
+    unchanged: i32,
+    withdrawn: i32,
+    rejected_total: i32,
+    braked: bool,
 }
 
 /// The review queue, by both of its key shapes: a statistics hold is keyed by stream, an event
@@ -281,32 +297,38 @@ async fn hold_rows<C: ConnectionTrait>(
     predicate: &str,
     binds: Vec<sea_orm::Value>,
 ) -> AppResult<Vec<LedgerEntry>> {
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT id, kind, status, created_at, tool FROM replicate_audit_holds \
-                  WHERE {predicate} ORDER BY created_at DESC"
-            ),
-            binds,
-        ))
-        .await?;
-    rows.iter()
-        .map(|r| {
-            let kind: String = r.try_get("", "kind")?;
-            let status: String = r.try_get("", "status")?;
-            Ok(LedgerEntry {
-                at: r.try_get("", "created_at")?,
-                source: "hold".to_string(),
-                severity: Severity::audit_hold(&status).as_str().to_string(),
-                actor: None,
-                what: format!("{kind} ({status})"),
-                old: None,
-                new: r.try_get::<Option<String>>("", "tool")?.map(Into::into),
-                id: r.try_get("", "id")?,
-            })
+    let rows = HoldRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "SELECT id, kind, status, created_at, tool FROM replicate_audit_holds \
+              WHERE {predicate} ORDER BY created_at DESC"
+        ),
+        binds,
+    ))
+    .all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| LedgerEntry {
+            at: r.created_at,
+            source: "hold".to_string(),
+            severity: Severity::audit_hold(&r.status).as_str().to_string(),
+            actor: None,
+            what: format!("{} ({})", r.kind, r.status),
+            old: None,
+            new: r.tool.map(Into::into),
+            id: r.id,
         })
-        .collect()
+        .collect())
+}
+
+#[derive(FromQueryResult)]
+struct HoldRow {
+    id: Uuid,
+    kind: String,
+    status: String,
+    created_at: DateTime<Utc>,
+    tool: Option<String>,
 }
 
 /// The runs that produced the value, and the runs made at the visit it belongs to: a chain step
@@ -320,32 +342,39 @@ async fn tool_runs<C: ConnectionTrait>(
         return Ok(Vec::new());
     }
     let event_keys: Vec<String> = events.iter().map(ToString::to_string).collect();
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, tool_name, source, created_by, created_at, tool_version \
-               FROM tool_runs \
-              WHERE id = ANY($1) OR context->>'collection_event_id' = ANY($2) \
-              ORDER BY created_at DESC",
-            [runs.to_vec().into(), event_keys.into()],
-        ))
-        .await?;
-    rows.iter()
-        .map(|r| {
-            let tool: String = r.try_get("", "tool_name")?;
-            let source: String = r.try_get("", "source")?;
-            Ok(LedgerEntry {
-                at: r.try_get("", "created_at")?,
-                source: "tool_run".to_string(),
-                severity: Severity::Info.as_str().to_string(),
-                actor: r.try_get("", "created_by")?,
-                what: format!("{tool} ({source})"),
-                old: None,
-                new: r.try_get("", "tool_version")?,
-                id: r.try_get("", "id")?,
-            })
+    let rows = RunRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT id, tool_name, source, created_by, created_at, tool_version \
+           FROM tool_runs \
+          WHERE id = ANY($1) OR context->>'collection_event_id' = ANY($2) \
+          ORDER BY created_at DESC",
+        [runs.to_vec().into(), event_keys.into()],
+    ))
+    .all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| LedgerEntry {
+            at: r.created_at,
+            source: "tool_run".to_string(),
+            severity: Severity::Info.as_str().to_string(),
+            actor: Some(r.created_by),
+            what: format!("{} ({})", r.tool_name, r.source),
+            old: None,
+            new: Some(r.tool_version),
+            id: r.id,
         })
-        .collect()
+        .collect())
+}
+
+#[derive(FromQueryResult)]
+struct RunRow {
+    id: Uuid,
+    tool_name: String,
+    source: String,
+    created_by: String,
+    created_at: DateTime<Utc>,
+    tool_version: serde_json::Value,
 }
 
 /// The tracked jobs that touched this slot or the visit it belongs to. A job names its subject in
@@ -360,48 +389,55 @@ async fn job_entries<C: ConnectionTrait>(
         return Ok(Vec::new());
     };
     let event_keys: Vec<String> = events.iter().map(ToString::to_string).collect();
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, trigger_type, status, error_message, created_at, completed_at, \
-                    readings_updated \
-               FROM reprocessing_jobs \
-              WHERE (params->>'site_id' = $1 AND params->>'parameter_id' = $2) \
-                 OR params->>'collection_event_id' = ANY($3) \
-              ORDER BY created_at DESC",
-            [
-                site_id.to_string().into(),
-                parameter_id.to_string().into(),
-                event_keys.into(),
-            ],
-        ))
-        .await?;
-    rows.iter()
-        .map(|r| {
-            let trigger: String = r.try_get("", "trigger_type")?;
-            let status: String = r.try_get("", "status")?;
-            let error: Option<String> = r.try_get("", "error_message")?;
-            Ok(LedgerEntry {
-                at: r
-                    .try_get::<Option<DateTime<Utc>>>("", "completed_at")?
-                    .unwrap_or(r.try_get("", "created_at")?),
-                source: "job".to_string(),
-                severity: Severity::job(&status).as_str().to_string(),
-                actor: None,
-                what: match &error {
-                    Some(message) if status == "failed" => format!("{trigger} failed: {message}"),
-                    _ => format!("{trigger} {status}"),
-                },
-                old: None,
-                new: Some(serde_json::json!({
-                    "status": status,
-                    "readings_updated": r.try_get::<Option<i32>>("", "readings_updated")?,
-                    "error_message": error,
-                })),
-                id: r.try_get("", "id")?,
-            })
+    let rows = JobRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT id, trigger_type, status, error_message, created_at, completed_at, \
+                readings_updated \
+           FROM reprocessing_jobs \
+          WHERE (params->>'site_id' = $1 AND params->>'parameter_id' = $2) \
+             OR params->>'collection_event_id' = ANY($3) \
+          ORDER BY created_at DESC",
+        [
+            site_id.to_string().into(),
+            parameter_id.to_string().into(),
+            event_keys.into(),
+        ],
+    ))
+    .all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| LedgerEntry {
+            at: r.completed_at.unwrap_or(r.created_at),
+            source: "job".to_string(),
+            severity: Severity::job(&r.status).as_str().to_string(),
+            actor: None,
+            what: match &r.error_message {
+                Some(message) if r.status == "failed" => {
+                    format!("{} failed: {message}", r.trigger_type)
+                }
+                _ => format!("{} {}", r.trigger_type, r.status),
+            },
+            old: None,
+            new: Some(serde_json::json!({
+                "status": r.status,
+                "readings_updated": r.readings_updated,
+                "error_message": r.error_message,
+            })),
+            id: r.id,
         })
-        .collect()
+        .collect())
+}
+
+#[derive(FromQueryResult)]
+struct JobRow {
+    id: Uuid,
+    trigger_type: String,
+    status: String,
+    error_message: Option<String>,
+    created_at: DateTime<Utc>,
+    completed_at: Option<DateTime<Utc>>,
+    readings_updated: Option<i32>,
 }
 
 /// What those jobs said while they ran, minus the routine. A cascade step that was skipped is
@@ -410,31 +446,37 @@ async fn job_logs<C: ConnectionTrait>(conn: &C, jobs: &[Uuid]) -> AppResult<Vec<
     if jobs.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT job_id, level, message, ts FROM reprocessing_job_logs \
-              WHERE job_id = ANY($1) AND level <> 'info' ORDER BY ts DESC",
-            [jobs.to_vec().into()],
-        ))
-        .await?;
-    rows.iter()
-        .map(|r| {
-            let level: String = r.try_get("", "level")?;
-            Ok(LedgerEntry {
-                at: r.try_get("", "ts")?,
-                source: "job_log".to_string(),
-                severity: Severity::job_log(&level).as_str().to_string(),
-                actor: None,
-                what: r.try_get("", "message")?,
-                old: None,
-                new: None,
-                // A timeline entry is keyed by (job_id, seq) and has no id of its own; the job is
-                // where a reader opens it.
-                id: r.try_get("", "job_id")?,
-            })
+    let rows = JobLogRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT job_id, level, message, ts FROM reprocessing_job_logs \
+          WHERE job_id = ANY($1) AND level <> 'info' ORDER BY ts DESC",
+        [jobs.to_vec().into()],
+    ))
+    .all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| LedgerEntry {
+            at: r.ts,
+            source: "job_log".to_string(),
+            severity: Severity::job_log(&r.level).as_str().to_string(),
+            actor: None,
+            what: r.message,
+            old: None,
+            new: None,
+            // A timeline entry is keyed by (job_id, seq) and has no id of its own; the job is
+            // where a reader opens it.
+            id: r.job_id,
         })
-        .collect()
+        .collect())
+}
+
+#[derive(FromQueryResult)]
+struct JobLogRow {
+    job_id: Uuid,
+    level: String,
+    message: String,
+    ts: DateTime<Utc>,
 }
 
 /// The edits to the slot and to the catalog parameter behind it: not what the value is, but what
@@ -447,33 +489,41 @@ async fn slot_changes<C: ConnectionTrait>(
     let (Some(site_id), Some(parameter_id)) = (site_id, parameter_id) else {
         return Ok(Vec::new());
     };
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT c.id, c.subject, c.change, c.old_value, c.new_value, c.changed_by, \
-                    c.changed_at \
-               FROM change_audit c \
-              WHERE c.subject = 'parameter:' || $2::text \
-                 OR c.subject IN (SELECT 'site_parameter:' || sp.id::text FROM site_parameters sp \
-                                   WHERE sp.site_id = $1 AND sp.parameter_id = $2) \
-              ORDER BY c.changed_at DESC",
-            [site_id.into(), parameter_id.into()],
-        ))
-        .await?;
-    rows.iter()
-        .map(|r| {
-            Ok(LedgerEntry {
-                at: r.try_get("", "changed_at")?,
-                source: "change".to_string(),
-                severity: Severity::Info.as_str().to_string(),
-                actor: r.try_get("", "changed_by")?,
-                what: r.try_get("", "change")?,
-                old: r.try_get("", "old_value")?,
-                new: r.try_get("", "new_value")?,
-                id: r.try_get("", "id")?,
-            })
+    let rows = ChangeRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT c.id, c.change, c.old_value, c.new_value, c.changed_by, c.changed_at \
+           FROM change_audit c \
+          WHERE c.subject = 'parameter:' || $2::text \
+             OR c.subject IN (SELECT 'site_parameter:' || sp.id::text FROM site_parameters sp \
+                               WHERE sp.site_id = $1 AND sp.parameter_id = $2) \
+          ORDER BY c.changed_at DESC",
+        [site_id.into(), parameter_id.into()],
+    ))
+    .all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| LedgerEntry {
+            at: r.changed_at,
+            source: "change".to_string(),
+            severity: Severity::Info.as_str().to_string(),
+            actor: r.changed_by,
+            what: r.change,
+            old: r.old_value,
+            new: r.new_value,
+            id: r.id,
         })
-        .collect()
+        .collect())
+}
+
+#[derive(FromQueryResult)]
+struct ChangeRow {
+    id: Uuid,
+    change: String,
+    old_value: Option<serde_json::Value>,
+    new_value: Option<serde_json::Value>,
+    changed_by: Option<String>,
+    changed_at: DateTime<Utc>,
 }
 
 /// The alarm episodes this value fell inside, which is the half nothing else answers: what
@@ -487,39 +537,48 @@ async fn alarms<C: ConnectionTrait>(
     let (Some(site_id), Some(parameter_id)) = (site_id, parameter_id) else {
         return Ok(Vec::new());
     };
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, severity, max_severity, started_at, last_seen_at, resolved_at, \
-                    acknowledged_by, measurement_type \
-               FROM alarm_events \
-              WHERE site_id = $1 AND parameter_id = $2 \
-                AND started_at <= $3 AND COALESCE(resolved_at, last_seen_at) >= $3",
-            [site_id.into(), parameter_id.into(), time.into()],
-        ))
-        .await?;
-    rows.iter()
-        .map(|r| {
-            let max: i16 = r.try_get("", "max_severity")?;
-            let resolved: Option<DateTime<Utc>> = r.try_get("", "resolved_at")?;
-            let cadence: String = r.try_get("", "measurement_type")?;
-            Ok(LedgerEntry {
-                at: r.try_get("", "started_at")?,
-                source: "alarm".to_string(),
-                severity: Severity::alarm(max, resolved.is_some()).as_str().to_string(),
-                actor: r.try_get("", "acknowledged_by")?,
-                what: match resolved {
-                    Some(_) => format!("{cadence} alarm, resolved"),
-                    None => format!("{cadence} alarm, open"),
-                },
-                old: None,
-                new: Some(serde_json::json!({
-                    "severity": r.try_get::<i16>("", "severity")?,
-                    "max_severity": max,
-                    "resolved_at": resolved,
-                })),
-                id: r.try_get("", "id")?,
-            })
+    let rows = AlarmRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT id, severity, max_severity, started_at, resolved_at, acknowledged_by, \
+                measurement_type \
+           FROM alarm_events \
+          WHERE site_id = $1 AND parameter_id = $2 \
+            AND started_at <= $3 AND COALESCE(resolved_at, last_seen_at) >= $3",
+        [site_id.into(), parameter_id.into(), time.into()],
+    ))
+    .all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| LedgerEntry {
+            at: r.started_at,
+            source: "alarm".to_string(),
+            severity: Severity::alarm(r.max_severity, r.resolved_at.is_some())
+                .as_str()
+                .to_string(),
+            actor: r.acknowledged_by,
+            what: match r.resolved_at {
+                Some(_) => format!("{} alarm, resolved", r.measurement_type),
+                None => format!("{} alarm, open", r.measurement_type),
+            },
+            old: None,
+            new: Some(serde_json::json!({
+                "severity": r.severity,
+                "max_severity": r.max_severity,
+                "resolved_at": r.resolved_at,
+            })),
+            id: r.id,
         })
-        .collect()
+        .collect())
+}
+
+#[derive(FromQueryResult)]
+struct AlarmRow {
+    id: Uuid,
+    severity: i16,
+    max_severity: i16,
+    started_at: DateTime<Utc>,
+    resolved_at: Option<DateTime<Utc>>,
+    acknowledged_by: Option<String>,
+    measurement_type: String,
 }

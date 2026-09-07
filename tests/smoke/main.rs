@@ -7,5 +7,6 @@
 mod common;
 
 mod infra_seed_and_healthz;
+mod openapi_coverage;
 mod openapi_paths;
 mod request_id;

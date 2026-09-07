@@ -5,6 +5,7 @@ use axum::{
 };
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
@@ -130,6 +131,57 @@ pub struct CreatePairingPlanRequest {
     source_system: String,
 }
 
+/// A plan action that runs as a tracked job: the row to watch, and the state it starts in.
+#[derive(Serialize, ToSchema)]
+pub struct PlanJobQueued {
+    /// Absent when the same action was already queued: `enqueue` dedupes rather than raising a
+    /// second job for one plan.
+    pub job_id: Option<Uuid>,
+    pub status: String,
+}
+
+/// A plan whose status this request moved, with no job behind it.
+#[derive(Serialize, ToSchema)]
+pub struct PlanStatusChanged {
+    pub id: Uuid,
+    pub status: String,
+}
+
+/// How much of one source system is paired, the dashboard's "needs attention" count.
+#[derive(Serialize, ToSchema)]
+pub struct UnpairedSummaryRow {
+    pub source_system: String,
+    pub unpaired: i64,
+    pub paired: i64,
+}
+
+/// One logger a site's streams name, counted per site: a site instrumented with two loggers has
+/// two rows, and reporting one of them would name channels belonging to the other.
+#[derive(Serialize, ToSchema)]
+pub struct PlanSiteDevice {
+    pub serial: String,
+    pub model: Option<String>,
+    pub streams: i64,
+}
+
+/// What the source knows about one site, as the review renders it beside the pairing.
+#[derive(Serialize, ToSchema)]
+pub struct PlanSiteMetadata {
+    pub site_name: String,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub altitude_m: Option<f64>,
+    pub glacier_name: Option<String>,
+    pub glacier_rgi: Option<String>,
+    pub location_type: Option<String>,
+    pub catchment: Option<String>,
+    pub full_name: Option<String>,
+    pub elevation: Option<f64>,
+    pub channel_id: Option<String>,
+    pub sample_interval_sec: Option<i64>,
+    pub devices: Vec<PlanSiteDevice>,
+}
+
 /// Create a draft pairing plan describing a batch of intended stream-to-site_parameter
 /// pairings. The plan is reviewable and applied separately. Requires `write_metadata`.
 #[utoipa::path(
@@ -137,17 +189,17 @@ pub struct CreatePairingPlanRequest {
     path = "/api/sync/pairing-plans",
     request_body(content = Object),
     responses(
-        (status = 200, description = "Created pairing plan", body = Object),
+        (status = 200, description = "Created pairing plan", body = crate::routes::private::data_streams::pairing_plans::PairingPlan),
     ),
     tag = "sync"
 )]
 pub async fn create_pairing_plan(
     State(state): State<AppState>,
     Json(req): Json<CreatePairingPlanRequest>,
-) -> AppResult<Json<crate::routes::private::data_streams::pairing_plans::Model>> {
+) -> AppResult<Json<crate::routes::private::data_streams::pairing_plans::PairingPlan>> {
     let plan =
         crate::routes::private::sync::service::create_plan(&state.db, &req.source_system).await?;
-    Ok(Json(plan))
+    Ok(Json(plan.into()))
 }
 
 #[derive(Deserialize)]
@@ -160,7 +212,7 @@ pub struct ListPairingPlansQuery {
 
 /// A plan without its `entries` document. A CNET draft's entries are 185 kB and a NOMIS draft's
 /// 2.5 MB, and the listing is a way back into a review, not a way to read every draft at once.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct PairingPlanSummary {
     id: Uuid,
     source_system: String,
@@ -185,7 +237,7 @@ pub struct PairingPlanSummary {
         ("status" = Option<String>, Query, description = "Only this status"),
     ),
     responses(
-        (status = 200, description = "Array of pairing plans without their entries", body = Object),
+        (status = 200, description = "Array of pairing plans without their entries", body = Vec<PairingPlanSummary>),
     ),
     tag = "sync"
 )]
@@ -289,7 +341,7 @@ async fn uncovered_stream_count(
     path = "/api/sync/pairing-plans/{id}/supersede",
     params(("id" = Uuid, Path, description = "Pairing plan UUID")),
     responses(
-        (status = 200, description = "Plan superseded", body = Object),
+        (status = 200, description = "Plan superseded", body = PlanStatusChanged),
         (status = 404, description = "Plan not found"),
         (status = 409, description = "Plan not in draft status"),
     ),
@@ -298,7 +350,7 @@ async fn uncovered_stream_count(
 pub async fn supersede_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<PlanStatusChanged>> {
     let status = plan_status(&state.db, id).await?;
     if status != "draft" {
         return Err(AppError::Conflict(format!(
@@ -313,9 +365,10 @@ pub async fn supersede_pairing_plan(
             [id.into()],
         ))
         .await?;
-    Ok(Json(
-        serde_json::json!({ "id": id, "status": "superseded" }),
-    ))
+    Ok(Json(PlanStatusChanged {
+        id,
+        status: "superseded".to_string(),
+    }))
 }
 
 /// Get a single pairing plan with its full pairing list. Requires `read_metadata`.
@@ -324,7 +377,7 @@ pub async fn supersede_pairing_plan(
     path = "/api/sync/pairing-plans/{id}",
     params(("id" = Uuid, Path, description = "Pairing plan UUID")),
     responses(
-        (status = 200, description = "Pairing plan with intended pairings", body = Object),
+        (status = 200, description = "Pairing plan with intended pairings", body = crate::routes::private::data_streams::pairing_plans::PairingPlan),
         (status = 404, description = "Plan not found"),
     ),
     tag = "sync"
@@ -332,12 +385,12 @@ pub async fn supersede_pairing_plan(
 pub async fn get_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<crate::routes::private::data_streams::pairing_plans::Model>> {
+) -> AppResult<Json<crate::routes::private::data_streams::pairing_plans::PairingPlan>> {
     let plan = crate::routes::private::data_streams::pairing_plans::Entity::find_by_id(id)
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
-    Ok(Json(plan))
+    Ok(Json(plan.into()))
 }
 
 #[derive(Deserialize)]
@@ -751,7 +804,7 @@ async fn apply_instrument_updates(
     params(("id" = Uuid, Path, description = "Pairing plan UUID")),
     request_body(content = Object),
     responses(
-        (status = 200, description = "Updated plan", body = Object),
+        (status = 200, description = "Updated plan", body = crate::routes::private::data_streams::pairing_plans::PairingPlan),
         (status = 404, description = "Plan not found"),
         (status = 409, description = "Plan not in draft status, or edited since the client read it", body = Object),
     ),
@@ -761,7 +814,7 @@ pub async fn update_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdatePairingPlanRequest>,
-) -> AppResult<Json<crate::routes::private::data_streams::pairing_plans::Model>> {
+) -> AppResult<Json<crate::routes::private::data_streams::pairing_plans::PairingPlan>> {
     let plan = crate::routes::private::data_streams::pairing_plans::Entity::find_by_id(id)
         .one(&state.db)
         .await?
@@ -887,7 +940,7 @@ pub async fn update_pairing_plan(
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
-    Ok(Json(updated))
+    Ok(Json(updated.into()))
 }
 
 /// The refusal a writer gets when the draft has moved on: the version it should reload is in the
@@ -926,7 +979,7 @@ pub struct ApplyPairingPlanRequest {
     params(("id" = Uuid, Path, description = "Pairing plan UUID")),
     request_body(content = Object),
     responses(
-        (status = 200, description = "Plan applied with execution counts", body = Object),
+        (status = 200, description = "The apply job, to be watched for its counts", body = PlanJobQueued),
         (status = 404, description = "Plan not found"),
         (status = 409, description = "Plan already applied or reverted, or edited since the client read it", body = Object),
     ),
@@ -936,7 +989,7 @@ pub async fn apply_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(req): Json<ApplyPairingPlanRequest>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<PlanJobQueued>> {
     // Validate synchronously for immediate feedback, then background the heavy entity-resolution +
     // readings backfill as a tracked job so the request doesn't block. The job's `detail` carries
     // the execution counts the UI used to read from the response.
@@ -971,9 +1024,10 @@ pub async fn apply_pairing_plan(
         None,
     )
     .await?;
-    Ok(Json(
-        serde_json::json!({ "job_id": job_id, "status": "queued" }),
-    ))
+    Ok(Json(PlanJobQueued {
+        job_id,
+        status: "queued".to_string(),
+    }))
 }
 
 /// Fetch a pairing plan's status, or 404 if unknown.
@@ -996,7 +1050,7 @@ async fn plan_status(db: &sea_orm::DatabaseConnection, id: Uuid) -> AppResult<St
     path = "/api/sync/pairing-plans/{id}/revert",
     params(("id" = Uuid, Path, description = "Pairing plan UUID")),
     responses(
-        (status = 200, description = "Plan reverted with unpaired counts", body = Object),
+        (status = 200, description = "The revert job, to be watched for its counts", body = PlanJobQueued),
         (status = 404, description = "Plan not found"),
         (status = 409, description = "Plan not in applied status"),
     ),
@@ -1005,7 +1059,7 @@ async fn plan_status(db: &sea_orm::DatabaseConnection, id: Uuid) -> AppResult<St
 pub async fn revert_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<PlanJobQueued>> {
     let status = plan_status(&state.db, id).await?;
     if status != "applied" {
         return Err(AppError::Conflict(format!(
@@ -1021,9 +1075,10 @@ pub async fn revert_pairing_plan(
         None,
     )
     .await?;
-    Ok(Json(
-        serde_json::json!({ "job_id": job_id, "status": "queued" }),
-    ))
+    Ok(Json(PlanJobQueued {
+        job_id,
+        status: "queued".to_string(),
+    }))
 }
 
 /// Aggregate summary of unpaired streams grouped by source system. Used by the dashboard
@@ -1032,13 +1087,13 @@ pub async fn revert_pairing_plan(
     get,
     path = "/api/sync/unpaired-summary",
     responses(
-        (status = 200, description = "Counts of unpaired streams by source_system", body = Object),
+        (status = 200, description = "Counts of unpaired streams by source_system", body = Vec<UnpairedSummaryRow>),
     ),
     tag = "sync"
 )]
 pub async fn unpaired_summary(
     State(state): State<AppState>,
-) -> AppResult<Json<Vec<serde_json::Value>>> {
+) -> AppResult<Json<Vec<UnpairedSummaryRow>>> {
     use sea_orm::{ConnectionTrait, Statement};
     let rows = state
         .db
@@ -1052,12 +1107,14 @@ pub async fn unpaired_summary(
         ))
         .await?;
 
-    let result: Vec<serde_json::Value> = rows.iter().map(|row| {
-        let source_system: String = row.try_get("", "source_system").unwrap_or_default();
-        let unpaired: i64 = row.try_get("", "unpaired").unwrap_or(0);
-        let paired: i64 = row.try_get("", "paired").unwrap_or(0);
-        serde_json::json!({ "source_system": source_system, "unpaired": unpaired, "paired": paired })
-    }).collect();
+    let result: Vec<UnpairedSummaryRow> = rows
+        .iter()
+        .map(|row| UnpairedSummaryRow {
+            source_system: row.try_get("", "source_system").unwrap_or_default(),
+            unpaired: row.try_get("", "unpaired").unwrap_or(0),
+            paired: row.try_get("", "paired").unwrap_or(0),
+        })
+        .collect();
 
     Ok(Json(result))
 }
@@ -1069,7 +1126,7 @@ pub async fn unpaired_summary(
     path = "/api/sync/pairing-plans/{id}/site-metadata",
     params(("id" = Uuid, Path, description = "Pairing plan UUID")),
     responses(
-        (status = 200, description = "Site metadata map keyed by site name", body = Object),
+        (status = 200, description = "One row per site the plan covers", body = Vec<PlanSiteMetadata>),
         (status = 404, description = "Plan not found"),
     ),
     tag = "sync"
@@ -1077,7 +1134,7 @@ pub async fn unpaired_summary(
 pub async fn plan_site_metadata(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<Vec<serde_json::Value>>> {
+) -> AppResult<Json<Vec<PlanSiteMetadata>>> {
     use sea_orm::Statement;
 
     let plan = crate::routes::private::data_streams::pairing_plans::Entity::find_by_id(id)
@@ -1125,26 +1182,33 @@ pub async fn plan_site_metadata(
         ))
         .await?;
 
-    let result: Vec<serde_json::Value> = rows.iter().map(|row| {
-        let get = |col: &str| -> Option<String> {
-            row.try_get::<Option<String>>("", col).ok().flatten().filter(|s| s != "null" && !s.is_empty())
-        };
-        let site_name: String = row.try_get("", "site_name").unwrap_or_default();
-        serde_json::json!({
-            "site_name": site_name,
-            "latitude": get("latitude").and_then(|s| s.parse::<f64>().ok()),
-            "longitude": get("longitude").and_then(|s| s.parse::<f64>().ok()),
-            "altitude_m": get("altitude_m").and_then(|s| s.parse::<f64>().ok()),
-            "glacier_name": get("glacier_name"),
-            "glacier_rgi": get("glacier_rgi"),
-            "location_type": get("location_type"),
-            "catchment": get("catchment"),
-            "full_name": get("full_name"),
-            "elevation": get("elevation").and_then(|s| s.parse::<f64>().ok()),
-            "channel_id": get("channel_id"),
-            "sample_interval_sec": get("sample_interval_sec").and_then(|s| s.parse::<i64>().ok()),
+    let mut result: Vec<PlanSiteMetadata> = rows
+        .iter()
+        .map(|row| {
+            let get = |col: &str| -> Option<String> {
+                row.try_get::<Option<String>>("", col)
+                    .ok()
+                    .flatten()
+                    .filter(|s| s != "null" && !s.is_empty())
+            };
+            let number = |col: &str| get(col).and_then(|s| s.parse::<f64>().ok());
+            PlanSiteMetadata {
+                site_name: row.try_get("", "site_name").unwrap_or_default(),
+                latitude: number("latitude"),
+                longitude: number("longitude"),
+                altitude_m: number("altitude_m"),
+                glacier_name: get("glacier_name"),
+                glacier_rgi: get("glacier_rgi"),
+                location_type: get("location_type"),
+                catchment: get("catchment"),
+                full_name: get("full_name"),
+                elevation: number("elevation"),
+                channel_id: get("channel_id"),
+                sample_interval_sec: get("sample_interval_sec").and_then(|s| s.parse::<i64>().ok()),
+                devices: Vec::new(),
+            }
         })
-    }).collect();
+        .collect();
 
     // Devices are counted per site, not folded into the site row: a site instrumented with two
     // loggers has two, and reporting one of them names channels that belong to the other.
@@ -1170,7 +1234,7 @@ pub async fn plan_site_metadata(
             )],
         ))
         .await?;
-    let mut devices_by_site: std::collections::HashMap<String, Vec<serde_json::Value>> =
+    let mut devices_by_site: std::collections::HashMap<String, Vec<PlanSiteDevice>> =
         std::collections::HashMap::new();
     for row in &device_rows {
         let site: String = row.try_get("", "site_name").unwrap_or_default();
@@ -1181,26 +1245,16 @@ pub async fn plan_site_metadata(
         devices_by_site
             .entry(site)
             .or_default()
-            .push(serde_json::json!({
-                "serial": serial,
-                "model": row.try_get::<Option<String>>("", "model").ok().flatten(),
-                "streams": row.try_get::<i64>("", "streams").unwrap_or_default(),
-            }));
+            .push(PlanSiteDevice {
+                serial,
+                model: row.try_get::<Option<String>>("", "model").ok().flatten(),
+                streams: row.try_get::<i64>("", "streams").unwrap_or_default(),
+            });
     }
 
-    let result: Vec<serde_json::Value> = result
-        .into_iter()
-        .map(|mut site| {
-            let name = site
-                .get("site_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            site["devices"] =
-                serde_json::Value::Array(devices_by_site.get(&name).cloned().unwrap_or_default());
-            site
-        })
-        .collect();
+    for site in &mut result {
+        site.devices = devices_by_site.remove(&site.site_name).unwrap_or_default();
+    }
 
     Ok(Json(result))
 }
@@ -1208,7 +1262,7 @@ pub async fn plan_site_metadata(
 /// One instrument decision in a pairing plan: the instrument, what it covers, and the curves it
 /// owns. Only instruments the plan actually binds are listed; the rest of the inventory is
 /// reachable through the picker, so this stays a list of decisions rather than a catalog.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PlanInstrumentGroup {
     /// The decision's scope: `column:<curve column>` or `parameter:<source parameter>`, matching
     /// what an update to any member stream settles. Absent for an unbound instrument.
@@ -1240,7 +1294,7 @@ pub struct PlanInstrumentGroup {
 
 /// The source parameters this plan pairs that no instrument covers, so an operator can attach one
 /// where the portal corrected a value upstream without naming a curve per reading.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PlanUnassignedParameter {
     pub scope: String,
     pub parameter: String,
@@ -1260,7 +1314,7 @@ pub struct PlanUnassignedParameter {
 /// One standard curve the source has replicated, and the instrument it is currently fitted on.
 /// Re-homing is a curve-level decision, so the curves are listed in their own right rather than
 /// only inside the instrument that happens to own them.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PlanCurveAssignment {
     pub id: Uuid,
     pub name: Option<String>,
@@ -1287,7 +1341,7 @@ pub struct PlanCurveAssignment {
 /// rather than one group carrying them all; the serial it reports is displayed, never matched on.
 /// It is listed so an operator can see which instrument each feed will land on, and whether it is
 /// already in the inventory.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PlanDeviceGroup {
     pub site: String,
     pub serial: String,
@@ -1300,7 +1354,7 @@ pub struct PlanDeviceGroup {
     pub anchor_stream_id: Uuid,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct PlanInstrumentsResponse {
     pub groups: Vec<PlanInstrumentGroup>,
     pub unassigned: Vec<PlanUnassignedParameter>,
@@ -1315,7 +1369,7 @@ pub struct PlanInstrumentsResponse {
     path = "/api/sync/pairing-plans/{id}/instruments",
     params(("id" = Uuid, Path, description = "Pairing plan UUID")),
     responses(
-        (status = 200, description = "The plan's instruments and unassigned parameters", body = Object),
+        (status = 200, description = "The plan's instruments and unassigned parameters", body = PlanInstrumentsResponse),
         (status = 404, description = "Plan not found"),
     ),
     tag = "sync"

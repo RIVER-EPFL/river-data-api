@@ -12,14 +12,44 @@
 //! never under `build_test_app`).
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use axum::extract::{Request, State};
+use axum::middleware::Next;
+use axum::response::Response;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
-use crate::common::{AppEvent, EventSender};
+use crate::common::{AppEvent, AppState, EventSender};
 use crate::error::AppResult;
 
 use super::views::fetch_active_alarm_rows;
+
+tokio::task_local! {
+    /// Whether the request in flight has asked for a global reconcile. A CRUD batch runs the
+    /// single-row hooks once per row, so the hook records the debt here and the request pays it
+    /// once, instead of running the same global pass a hundred times.
+    static RECONCILE_OWED: Arc<AtomicBool>;
+}
+
+/// Record a global reconcile against the request in flight. False where there is no request, a
+/// background job or a test, which reconciles on the spot instead.
+fn record_owed() -> bool {
+    RECONCILE_OWED
+        .try_with(|owed| owed.store(true, Ordering::Relaxed))
+        .is_ok()
+}
+
+/// Run the reconcile every hook of this request asked for, once, after the handler returns.
+pub async fn coalesce_reconcile(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let owed = Arc::new(AtomicBool::new(false));
+    let response = RECONCILE_OWED.scope(owed.clone(), next.run(request)).await;
+    if owed.load(Ordering::Relaxed) {
+        reconcile_all_now(&state.db).await;
+    }
+    response
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SweepStats {
@@ -88,10 +118,18 @@ pub async fn reconcile_all_and_notify(db: &DatabaseConnection, events: &EventSen
 }
 
 /// [`reconcile_all_and_notify`] for contexts that only hold a `&DatabaseConnection` (CrudCrate
-/// operation hooks). Uses the process-global event sender; a missing sender (some unit tests) just
-/// skips the SSE. Never returns an error, a failed reconcile must not fail the CRUD operation
-/// that triggered it.
+/// operation hooks). Inside a request it records the debt and [`coalesce_reconcile`] pays it once;
+/// anywhere else it reconciles on the spot. Uses the process-global event sender; a missing sender
+/// (some unit tests) just skips the SSE. Never returns an error, a failed reconcile must not fail
+/// the CRUD operation that triggered it.
 pub async fn reconcile_all_from_hook(db: &DatabaseConnection) {
+    if record_owed() {
+        return;
+    }
+    reconcile_all_now(db).await;
+}
+
+async fn reconcile_all_now(db: &DatabaseConnection) {
     match crate::common::global_event_sender() {
         Some(events) => reconcile_all_and_notify(db, &events).await,
         None => {
@@ -277,4 +315,28 @@ async fn reconcile_cadence(
     stats.resolved = resolved;
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_a_hook_outside_a_request_reconciles_on_the_spot() {
+        assert!(!record_owed());
+    }
+
+    #[tokio::test]
+    async fn test_every_hook_of_one_request_owes_one_reconcile() {
+        let owed = Arc::new(AtomicBool::new(false));
+        RECONCILE_OWED
+            .scope(owed.clone(), async {
+                // One per deleted row of a batch, all of them asking for the same global pass.
+                for _ in 0..60 {
+                    assert!(record_owed());
+                }
+            })
+            .await;
+        assert!(owed.load(Ordering::Relaxed));
+    }
 }

@@ -13,13 +13,13 @@ use crate::common::authz::Role;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct GrantedProject {
     pub project_id: Uuid,
     pub name: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct Me {
     pub sub: String,
     pub email: Option<String>,
@@ -51,6 +51,17 @@ fn role_token(role: &Role) -> &'static str {
     }
 }
 
+/// `GET /api/me`, the caller's identity, access level and project visibility. Keycloak-only: an
+/// API token carries no user identity, so it is refused here rather than answered with an empty set.
+#[utoipa::path(
+    get,
+    path = "/api/me",
+    responses(
+        (status = 200, description = "The caller's identity and visibility", body = Me),
+        (status = 403, description = "The caller is an API token, which has no user identity"),
+    ),
+    tag = "me"
+)]
 pub async fn get_me(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
@@ -86,13 +97,13 @@ pub async fn get_me(
     }))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct NavigatorSite {
     pub id: Uuid,
     pub name: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct NavigatorSubproject {
     /// `None` for sites without a subproject (defensive, the sites trigger normally assigns the
     /// project's default subproject).
@@ -101,7 +112,7 @@ pub struct NavigatorSubproject {
     pub sites: Vec<NavigatorSite>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 pub struct NavigatorProject {
     pub project_id: Uuid,
     pub name: String,
@@ -112,6 +123,15 @@ pub struct NavigatorProject {
 /// sidebar site navigator. Same visibility rule the CRUD scope filter enforces on `/api/sites`:
 /// administrators see every project, other members see exactly their grant set. Keycloak-only,
 /// like `/api/me`. Projects and subprojects without sites are omitted.
+#[utoipa::path(
+    get,
+    path = "/api/me/sites",
+    responses(
+        (status = 200, description = "The caller's visible sites, as a project tree", body = Vec<NavigatorProject>),
+        (status = 403, description = "The caller is an API token, which has no user identity"),
+    ),
+    tag = "me"
+)]
 pub async fn get_my_sites(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,

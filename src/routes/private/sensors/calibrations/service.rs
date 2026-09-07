@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -285,6 +285,42 @@ pub async fn recompose_from_own_curves<C: ConnectionTrait>(
     Ok(result.rows_affected())
 }
 
+/// Rebuild `calibrated_value` from the curves each row names, for the readings one decision set
+/// moved.
+///
+/// Unlike [`recompose_from_own_curves`] this reaches a row that now names no curve at all: a
+/// retirement may leave a reading uncorrected, and [`orphaned_correction_rows`], which protects
+/// rows written before the two curve references existed, would otherwise leave the old number
+/// standing beside no curve.
+pub async fn recompose_decided_rows<C: ConnectionTrait>(
+    db: &C,
+    set_id: uuid::Uuid,
+) -> Result<u64, sea_orm::DbErr> {
+    let sql = format!(
+        r"UPDATE readings tgt
+          SET calibrated_value = {value}
+          FROM readings r
+          LEFT JOIN sensor_calibrations c ON c.id = r.calibration_id
+          LEFT JOIN standard_curves sc ON sc.id = r.standard_curve_id
+          WHERE tgt.stream_id = r.stream_id
+            AND tgt.time = r.time
+            AND tgt.replicate_index = r.replicate_index
+            AND EXISTS (SELECT 1 FROM reading_decisions d
+                         WHERE d.set_id = $1
+                           AND d.stream_id = r.stream_id AND d.time = r.time
+                           AND d.replicate_index IS NOT DISTINCT FROM r.replicate_index)",
+        value = recomposed_own_curve_value(),
+    );
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            [set_id.into()],
+        ))
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// [`recompose_from_own_curves`] in a lifted transaction of its own.
 ///
 /// The write paths that correct a stored value recompose after their own guarded block has
@@ -423,6 +459,36 @@ fn register_guards(ctx: &mut meval::Context) {
     ctx.var("na", f64::NAN);
 }
 
+/// The rows this file's raw queries return. Derived rather than hand-decoded so a column added to
+/// a query and not to its reader is a compile error rather than a field silently left behind.
+#[derive(FromQueryResult)]
+struct DerivedWorkRow {
+    id: Uuid,
+    derived_definition_id: Uuid,
+    formula: String,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    parameter_code: String,
+}
+
+#[derive(FromQueryResult)]
+struct MappingRow {
+    variable_name: String,
+    parameter_id: Uuid,
+}
+
+#[derive(FromQueryResult)]
+struct InputRow {
+    val: f64,
+    measurement_type: Option<String>,
+}
+
+#[derive(FromQueryResult)]
+struct SlotInstant {
+    site_id: Uuid,
+    time: chrono::DateTime<chrono::FixedOffset>,
+}
+
 struct DerivedWork {
     site_param_id: Uuid,
     derived_definition_id: Uuid,
@@ -472,13 +538,14 @@ async fn fetch_derived_work_items(
 
     let mut items = Vec::with_capacity(rows.len());
     for row in &rows {
+        let row = DerivedWorkRow::from_query_result(row, "")?;
         items.push(DerivedWork {
-            site_param_id: row.try_get("", "id")?,
-            derived_definition_id: row.try_get("", "derived_definition_id")?,
-            formula: row.try_get("", "formula")?,
-            derived_site_id: row.try_get("", "site_id")?,
-            derived_parameter_id: row.try_get("", "parameter_id")?,
-            derived_parameter_code: row.try_get("", "parameter_code")?,
+            site_param_id: row.id,
+            derived_definition_id: row.derived_definition_id,
+            formula: row.formula,
+            derived_site_id: row.site_id,
+            derived_parameter_id: row.parameter_id,
+            derived_parameter_code: row.parameter_code,
         });
     }
     Ok(items)
@@ -644,8 +711,10 @@ async fn resolve_variables_for_derived(
 
     let mut variables = HashMap::new();
     for row in &mapping_rows {
-        let var_name: String = row.try_get("", "variable_name")?;
-        let source_param_id: Uuid = row.try_get("", "parameter_id")?;
+        let MappingRow {
+            variable_name: var_name,
+            parameter_id: source_param_id,
+        } = MappingRow::from_query_result(row, "")?;
 
         // Deterministic input pick when a sensor point and a grab share the timestamp:
         // prefer the continuous reading, then tie-break by stream_id (stable across VACUUM).
@@ -674,8 +743,8 @@ async fn resolve_variables_for_derived(
 
         match value_row {
             Some(vr) => {
-                let mt: Option<String> = vr.try_get("", "measurement_type")?;
-                if mt.as_deref() == Some("spot") {
+                let input = InputRow::from_query_result(&vr, "")?;
+                if input.measurement_type.as_deref() == Some("spot") {
                     tracing::debug!(
                         variable = %var_name,
                         parameter_id = %source_param_id,
@@ -683,7 +752,7 @@ async fn resolve_variables_for_derived(
                         "Derived input resolved from a grab (spot) reading"
                     );
                 }
-                variables.insert(var_name, vr.try_get("", "val")?)
+                variables.insert(var_name, input.val)
             }
             None => return Ok(None),
         };
@@ -708,8 +777,7 @@ async fn recalled_instants<C: ConnectionTrait>(
         .await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let site_id: Uuid = row.try_get("", "site_id")?;
-        let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
+        let SlotInstant { site_id, time } = SlotInstant::from_query_result(&row, "")?;
         out.push((site_id, time.with_timezone(&Utc)));
     }
     Ok(out)
@@ -832,7 +900,7 @@ pub async fn recompute_valid_until<C: ConnectionTrait>(
             SELECT id, valid_from,
                    LEAD(valid_from) OVER (PARTITION BY parameter_id ORDER BY valid_from, id) AS next_from
             FROM sensor_calibrations
-            WHERE sensor_id = $1
+            WHERE sensor_id = $1 AND retired_at IS NULL
         )
         UPDATE sensor_calibrations sc
         SET valid_until = CASE
@@ -1234,6 +1302,21 @@ mod tests {
             sweep,
             "the two statements differ only in which rows qualify"
         );
+    }
+
+    /// A retired curve is out of circulation: no write path and no reprocess may resolve one, and
+    /// the one producer of the ranking is where that is said.
+    #[test]
+    fn a_retired_curve_is_never_a_candidate() {
+        for pick in [
+            super::super::resolver::pick_calibration_lateral("$1"),
+            super::super::resolver::pick_calibration_lateral_excluding("$2", Some("$1")),
+        ] {
+            assert!(
+                pick.contains("c.retired_at IS NULL"),
+                "the ranking excludes retired curves: {pick}"
+            );
+        }
     }
 
     /// The reprocess engine and the calibration-delete hook repoint readings by the same rule. They

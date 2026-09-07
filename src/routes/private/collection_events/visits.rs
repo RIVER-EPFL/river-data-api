@@ -14,7 +14,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::common::paging::Window;
+use crate::common::paging::{Page, Window};
 use crate::common::middleware::ProjectScope;
 use crate::error::{AppError, AppResult};
 use crate::routes::resolve_site;
@@ -304,12 +304,13 @@ pub async fn list_site_visits(
         .await?;
     let mut expected_parameters = Vec::with_capacity(expected_rows.len());
     for r in &expected_rows {
+        let r = ExpectedRow::from_query_result(r, "")?;
         expected_parameters.push(ExpectedParameter {
-            parameter_id: r.try_get("", "id")?,
-            code: r.try_get("", "code")?,
-            name: r.try_get("", "name")?,
-            units: r.try_get("", "units")?,
-            decimal_places: r.try_get("", "decimal_places")?,
+            parameter_id: r.id,
+            code: r.code,
+            name: r.name,
+            units: r.units,
+            decimal_places: r.decimal_places,
         });
     }
 
@@ -417,39 +418,31 @@ pub async fn list_site_visits(
         let mut findings: std::collections::HashMap<(DateTime<Utc>, Uuid), (String, i64)> =
             std::collections::HashMap::new();
         for f in &finding_rows {
-            let at = f
-                .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "group_time")?
-                .with_timezone(&Utc);
-            let parameter_id: Uuid = f.try_get("", "parameter_id")?;
-            let kind: String = f.try_get("", "kind")?;
+            let f = VisitFindingRow::from_query_result(f, "")?;
             findings
-                .entry((at, parameter_id))
+                .entry((f.group_time.with_timezone(&Utc), f.parameter_id))
                 .and_modify(|(_, n)| *n += 1)
-                .or_insert((kind, 1));
+                .or_insert((f.kind, 1));
         }
         let mut by_event: std::collections::HashMap<Uuid, Vec<VisitCell>> =
             std::collections::HashMap::new();
         for c in &cell_rows {
-            let event_id: Uuid = c.try_get("", "event_id")?;
-            by_event.entry(event_id).or_default().push(VisitCell {
-                parameter_id: c.try_get("", "parameter_id")?,
-                value: c.try_get("", "value")?,
-                flagged: c
-                    .try_get::<Option<bool>>("", "all_flagged")?
-                    .unwrap_or(false),
-                withdrawn: c
-                    .try_get::<Option<bool>>("", "all_withdrawn")?
-                    .unwrap_or(false),
-                n_total: c.try_get("", "n_total")?,
-                n_flagged: c.try_get("", "n_flagged")?,
-                n_withdrawn: c.try_get("", "n_withdrawn")?,
-                n: c.try_get("", "sample_n")?,
-                stdev: c.try_get("", "stdev")?,
-                median: c.try_get("", "median")?,
-                min: c.try_get("", "min_value")?,
-                max: c.try_get("", "max_value")?,
-                sd_estimator: c.try_get("", "sd_estimator")?,
-                sd_estimator_source: c.try_get("", "sd_estimator_source")?,
+            let c = CellRow::from_query_result(c, "")?;
+            by_event.entry(c.event_id).or_default().push(VisitCell {
+                parameter_id: c.parameter_id,
+                value: c.value,
+                flagged: c.all_flagged.unwrap_or(false),
+                withdrawn: c.all_withdrawn.unwrap_or(false),
+                n_total: c.n_total,
+                n_flagged: c.n_flagged,
+                n_withdrawn: c.n_withdrawn,
+                n: c.sample_n,
+                stdev: c.stdev,
+                median: c.median,
+                min: c.min_value,
+                max: c.max_value,
+                sd_estimator: c.sd_estimator,
+                sd_estimator_source: c.sd_estimator_source,
                 finding: None,
                 finding_count: None,
             });
@@ -559,14 +552,6 @@ pub struct VisitListRow {
     pub recompute: String,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
-pub struct VisitListResponse {
-    pub total: u64,
-    pub page: u64,
-    pub page_size: u64,
-    pub visits: Vec<VisitListRow>,
-}
-
 /// The `ORDER BY` a sort name resolves to; the secondary key keeps ties stable.
 fn visit_list_order(sort: Option<&str>, order: Option<&str>) -> AppResult<String> {
     let direction = match order.unwrap_or("desc") {
@@ -600,7 +585,7 @@ fn visit_list_order(sort: Option<&str>, order: Option<&str>) -> AppResult<String
     path = "/api/visits",
     params(VisitListQuery),
     responses(
-        (status = 200, description = "Visits", body = VisitListResponse),
+        (status = 200, description = "Visits", body = Page<VisitListRow>),
         (status = 400, description = "Unknown sort or order"),
     ),
     tag = "collection_events"
@@ -609,7 +594,7 @@ pub async fn list_visits(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
     Query(q): Query<VisitListQuery>,
-) -> AppResult<Json<VisitListResponse>> {
+) -> AppResult<Json<Page<VisitListRow>>> {
     let order_by = visit_list_order(q.sort.as_deref(), q.order.as_deref())?;
     let paging = paging(q.page, q.page_size.or(Some(100)));
     let mut binds: Vec<sea_orm::Value> = Vec::new();
@@ -682,12 +667,7 @@ pub async fn list_visits(
     }
 
     let total = u64::try_from(total).unwrap_or(0);
-    Ok(Json(VisitListResponse {
-        total,
-        page: paging.map_or(1, Window::page),
-        page_size: paging.map_or(total, |w| w.limit),
-        visits,
-    }))
+    Ok(Json(Page::new(visits, total, paging)))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -837,6 +817,42 @@ struct VisitHeader {
     notes: Option<String>,
     filled: i64,
     findings_open: i64,
+}
+
+/// The three list queries this module makes that fill a shape of their own.
+#[derive(FromQueryResult)]
+struct ExpectedRow {
+    id: Uuid,
+    code: String,
+    name: String,
+    units: Option<String>,
+    decimal_places: Option<i16>,
+}
+
+#[derive(FromQueryResult)]
+struct VisitFindingRow {
+    group_time: sea_orm::prelude::DateTimeWithTimeZone,
+    parameter_id: Uuid,
+    kind: String,
+}
+
+#[derive(FromQueryResult)]
+struct CellRow {
+    event_id: Uuid,
+    parameter_id: Uuid,
+    value: Option<f64>,
+    all_flagged: Option<bool>,
+    all_withdrawn: Option<bool>,
+    n_total: i64,
+    n_flagged: i64,
+    n_withdrawn: i64,
+    sample_n: Option<i32>,
+    stdev: Option<f64>,
+    median: Option<f64>,
+    min_value: Option<f64>,
+    max_value: Option<f64>,
+    sd_estimator: Option<String>,
+    sd_estimator_source: Option<String>,
 }
 
 /// One replicate row of a visit's grid, as the detail query selects it. The fold below groups

@@ -20,7 +20,7 @@ const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 /// cannot drift apart.
 const CHANNEL_HEALTH_KIND: &str = "channel_health";
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelHealth {
     pub name: String,
@@ -31,7 +31,7 @@ pub struct ChannelHealth {
     pub checked_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationHealth {
     pub channels: Vec<ChannelHealth>,
@@ -143,11 +143,23 @@ async fn recent_failures(db: &DatabaseConnection) -> (i64, i64) {
 }
 
 /// `GET /api/notifications/health`, latest persisted health per channel (admin-only).
+#[utoipa::path(
+    get,
+    path = "/api/notifications/health",
+    responses((status = 200, description = "Latest persisted health per channel", body = NotificationHealth)),
+    tag = "notifications"
+)]
 pub async fn get_health(State(state): State<AppState>) -> AppResult<Json<NotificationHealth>> {
     Ok(Json(read_health(&state.db, &state.config).await))
 }
 
 /// `POST /api/notifications/health/refresh`, probe now, then return the fresh state (admin-only).
+#[utoipa::path(
+    post,
+    path = "/api/notifications/health/refresh",
+    responses((status = 200, description = "Health after probing every configured channel", body = NotificationHealth)),
+    tag = "notifications"
+)]
 pub async fn refresh_health(State(state): State<AppState>) -> AppResult<Json<NotificationHealth>> {
     let _ = probe_once(&state.db, &state.config).await;
     Ok(Json(read_health(&state.db, &state.config).await))

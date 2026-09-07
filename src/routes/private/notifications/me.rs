@@ -4,7 +4,7 @@
 
 use axum::{Extension, Json, extract::State, http::StatusCode};
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -41,6 +41,17 @@ pub struct SubscriptionScope {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub parameter_id: Option<Uuid>,
     pub enabled: bool,
+}
+
+/// A stored subscription row. The two columns that carry a default are read as nullable, so a row
+/// written before either existed takes the default rather than failing the whole read.
+#[derive(FromQueryResult)]
+struct StoredSubscription {
+    kind_group: Option<String>,
+    project_id: Option<Uuid>,
+    site_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -103,18 +114,17 @@ async fn load(state: &AppState, sub: &str) -> AppResult<MyNotifications> {
             [sub.into()],
         ))
         .await?;
-    let subscriptions = sub_rows
-        .iter()
-        .map(|r| SubscriptionScope {
-            kind_group: r
-                .try_get("", "kind_group")
-                .unwrap_or_else(|_| default_kind_group()),
-            project_id: r.try_get("", "project_id").ok().flatten(),
-            site_id: r.try_get("", "site_id").ok().flatten(),
-            parameter_id: r.try_get("", "parameter_id").ok().flatten(),
-            enabled: r.try_get("", "enabled").unwrap_or(true),
-        })
-        .collect();
+    let mut subscriptions = Vec::with_capacity(sub_rows.len());
+    for r in &sub_rows {
+        let row = StoredSubscription::from_query_result(r, "")?;
+        subscriptions.push(SubscriptionScope {
+            kind_group: row.kind_group.unwrap_or_else(default_kind_group),
+            project_id: row.project_id,
+            site_id: row.site_id,
+            parameter_id: row.parameter_id,
+            enabled: row.enabled.unwrap_or(true),
+        });
+    }
 
     Ok(MyNotifications {
         web_push_enabled,
@@ -253,7 +263,9 @@ pub struct RegisterPushRequest {
     pub user_agent: Option<String>,
 }
 
-#[derive(Serialize, ToSchema)]
+/// The row the push-subscription queries select, which is also what they answer with, so it
+/// decodes itself rather than being filled field by field.
+#[derive(Serialize, ToSchema, FromQueryResult)]
 pub struct PushSubscriptionRow {
     pub id: Uuid,
     pub endpoint: String,
@@ -292,13 +304,7 @@ pub async fn register_push_subscription(
         .await?
         .ok_or_else(|| AppError::NotFound("subscription".to_string()))?;
 
-    Ok(Json(PushSubscriptionRow {
-        id: row.try_get("", "id")?,
-        endpoint: row.try_get("", "endpoint")?,
-        user_agent: row.try_get("", "user_agent")?,
-        created_at: row.try_get("", "created_at")?,
-        last_success_at: row.try_get("", "last_success_at")?,
-    }))
+    Ok(Json(PushSubscriptionRow::from_query_result(&row, "")?))
 }
 
 #[utoipa::path(get, path = "/api/notifications/me/push", tag = "notifications")]
@@ -319,13 +325,7 @@ pub async fn list_push_subscriptions(
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        out.push(PushSubscriptionRow {
-            id: row.try_get("", "id")?,
-            endpoint: row.try_get("", "endpoint")?,
-            user_agent: row.try_get("", "user_agent")?,
-            created_at: row.try_get("", "created_at")?,
-            last_success_at: row.try_get("", "last_success_at")?,
-        });
+        out.push(PushSubscriptionRow::from_query_result(&row, "")?);
     }
     Ok(Json(out))
 }

@@ -88,6 +88,16 @@ impl FakePortal {
         }
     }
 
+    /// A second view of the same content, for the stories that hand one to the driver and keep
+    /// one to edit the source through.
+    #[must_use]
+    pub fn handle(&self) -> Self {
+        Self {
+            visits: Arc::clone(&self.visits),
+            assignments: Arc::clone(&self.assignments),
+        }
+    }
+
     /// Edit the source the way a portal user does: replace one visit's cells, in place. The next
     /// cycle re-reads the whole window, so the change travels as a correction rather than an
     /// append.
@@ -104,6 +114,28 @@ impl FakePortal {
             .find(|v| v.at == at)
             .unwrap_or_else(|| panic!("{station} has no visit at {at}"));
         edit(row);
+    }
+
+    /// A visit added at a station the store already holds, at any instant, including one inside a
+    /// window already reconciled. Kept in time order, as the source reads.
+    ///
+    /// # Panics
+    /// If the station is not in the content.
+    pub fn add_visit(&self, station: &str, visit: Visit) {
+        let mut visits = self.visits.lock().expect("visits lock");
+        let rows = visits
+            .get_mut(station)
+            .unwrap_or_else(|| panic!("{station} is a station of this portal"));
+        rows.push(visit);
+        rows.sort_by_key(|v| v.at);
+    }
+
+    /// A station that did not exist at enrolment, with the visits it arrives carrying.
+    pub fn add_station(&self, station: &str, rows: Vec<Visit>) {
+        self.visits
+            .lock()
+            .expect("visits lock")
+            .insert(station.to_string(), rows);
     }
 
     /// The replicate index the server pinned for one source column, or `None` before the
@@ -147,9 +179,24 @@ impl SourceBackend for FakePortal {
         true
     }
 
+    /// New stations and columns appear at the source without operator action, as the portals'
+    /// own backend declares.
+    fn rediscover_every_cycle(&self) -> bool {
+        true
+    }
+
     async fn discover_streams(&self) -> Result<Vec<StreamDescriptor>, BackendError> {
+        let mut stations: Vec<String> = self
+            .visits
+            .lock()
+            .map_err(|_| "visits lock poisoned")?
+            .keys()
+            .cloned()
+            .collect();
+        stations.sort();
         let mut out = Vec::new();
-        for station in STATIONS {
+        for station in &stations {
+            let station = station.as_str();
             out.push(StreamDescriptor {
                 source_key: format!("{station}:{SINGLE_COLUMN}"),
                 source_name: format!("{station} - {SINGLE_COLUMN}"),
@@ -299,6 +346,22 @@ pub async fn enrolled_driver(
     state: &river_db::common::AppState,
     portal: FakePortal,
 ) -> river_data_core::client::SyncDriver {
+    enrolled_service(app, state, portal).await.0
+}
+
+/// The same enrolment, with the control-plane client and the service id the server assigned.
+///
+/// A story that drives an operator command needs all three: the command is issued against the
+/// service id, collected on a heartbeat through the client, and run through the driver.
+pub async fn enrolled_service(
+    app: axum::Router,
+    state: &river_db::common::AppState,
+    portal: FakePortal,
+) -> (
+    river_data_core::client::SyncDriver,
+    river_data_core::client::ControlPlaneClient,
+    uuid::Uuid,
+) {
     use axum::Json;
     use axum::extract::State;
     use river_data_core::client::{ControlPlaneClient, RiverDataClient, SyncDriver};
@@ -322,7 +385,7 @@ pub async fn enrolled_driver(
         .expect("enroll the fake portal");
 
     let api = RiverDataClient::new(&base, &enrolled.session_token).expect("build the API client");
-    SyncDriver::new(
+    let driver = SyncDriver::new(
         Box::new(portal),
         api,
         &RunnerConfig {
@@ -336,5 +399,6 @@ pub async fn enrolled_driver(
             retry_max: 1,
             retry_delay_secs: 0,
         },
-    )
+    );
+    (driver, control, enrolled.service_id)
 }

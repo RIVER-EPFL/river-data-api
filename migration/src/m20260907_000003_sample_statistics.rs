@@ -80,7 +80,7 @@ $$;
 ";
 
 /// Fill the three columns on the rows that predate them, by the same arithmetic.
-const BACKFILL: &str = r"
+pub const BACKFILL: &str = r"
 UPDATE samples s
    SET stdev_sample     = a.stdev_samp,
        stdev_population = a.stdev_pop,

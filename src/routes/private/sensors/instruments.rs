@@ -8,7 +8,7 @@ use axum::{
     extract::{Path, State},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, EntityTrait, Statement};
+use sea_orm::{ConnectionTrait, EntityTrait, FromQueryResult, Statement};
 use serde::Serialize;
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -19,6 +19,46 @@ use crate::common::middleware::{ProjectScope, sensor_in_scope};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::identity::InstrumentKind;
 use crate::routes::private::sensors::{self, standard_curves};
+
+/// The rows this file's raw queries return. Derived rather than hand-decoded so a column added to
+/// a query and not to its reader is a compile error rather than a field silently left behind.
+#[derive(FromQueryResult)]
+struct CurveUsageRow {
+    id: Uuid,
+    n: i64,
+    first: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+    last: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+}
+
+#[derive(FromQueryResult)]
+struct StreamRefRow {
+    sensor_id: Uuid,
+    id: Uuid,
+    source_system: String,
+    source_key: String,
+    measurement_type: Option<String>,
+    site_name: Option<String>,
+    parameter_code: Option<String>,
+}
+
+#[derive(FromQueryResult)]
+struct CurvePointRow {
+    time: sea_orm::prelude::DateTimeWithTimeZone,
+    replicate_index: i16,
+    raw_value: f64,
+    calibrated_value: Option<f64>,
+    is_flagged: bool,
+    site_name: Option<String>,
+    parameter_code: Option<String>,
+}
+
+#[derive(FromQueryResult)]
+struct SensorCurveUsageRow {
+    curve_id: Uuid,
+    n: i64,
+    first: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+    last: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+}
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CurveOverview {
@@ -109,16 +149,13 @@ pub async fn get_instruments_overview(
         ))
         .await?
     {
+        let row = CurveUsageRow::from_query_result(&row, "")?;
         usage.insert(
-            row.try_get::<Uuid>("", "id")?,
+            row.id,
             Usage {
-                count: row.try_get::<i64>("", "n")?,
-                first: row
-                    .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "first")?
-                    .map(|t| t.with_timezone(&Utc)),
-                last: row
-                    .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "last")?
-                    .map(|t| t.with_timezone(&Utc)),
+                count: row.n,
+                first: row.first.map(|t| t.with_timezone(&Utc)),
+                last: row.last.map(|t| t.with_timezone(&Utc)),
             },
         );
     }
@@ -164,16 +201,17 @@ pub async fn get_instruments_overview(
         ))
         .await?
     {
+        let row = StreamRefRow::from_query_result(&row, "")?;
         streams_by_sensor
-            .entry(row.try_get::<Uuid>("", "sensor_id")?)
+            .entry(row.sensor_id)
             .or_default()
             .push(InstrumentStreamRef {
-                id: row.try_get::<Uuid>("", "id")?,
-                source_system: row.try_get::<String>("", "source_system")?,
-                source_key: row.try_get::<String>("", "source_key")?,
-                measurement_type: row.try_get::<Option<String>>("", "measurement_type")?,
-                site_name: row.try_get::<Option<String>>("", "site_name")?,
-                parameter_code: row.try_get::<Option<String>>("", "parameter_code")?,
+                id: row.id,
+                source_system: row.source_system,
+                source_key: row.source_key,
+                measurement_type: row.measurement_type,
+                site_name: row.site_name,
+                parameter_code: row.parameter_code,
             });
     }
 
@@ -292,16 +330,15 @@ pub async fn get_curve_usage(
         .await?
         .into_iter()
         .map(|row| {
+            let row = CurvePointRow::from_query_result(&row, "")?;
             Ok(CurveUsagePoint {
-                time: row
-                    .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time")?
-                    .with_timezone(&Utc),
-                replicate_index: row.try_get::<i16>("", "replicate_index")?,
-                raw_value: row.try_get::<f64>("", "raw_value")?,
-                calibrated_value: row.try_get::<Option<f64>>("", "calibrated_value")?,
-                is_flagged: row.try_get::<bool>("", "is_flagged")?,
-                site_name: row.try_get::<Option<String>>("", "site_name")?,
-                parameter_code: row.try_get::<Option<String>>("", "parameter_code")?,
+                time: row.time.with_timezone(&Utc),
+                replicate_index: row.replicate_index,
+                raw_value: row.raw_value,
+                calibrated_value: row.calibrated_value,
+                is_flagged: row.is_flagged,
+                site_name: row.site_name,
+                parameter_code: row.parameter_code,
             })
         })
         .collect::<AppResult<Vec<_>>>()?;
@@ -373,15 +410,12 @@ pub async fn get_sensor_curve_usage(
         .await?
         .into_iter()
         .map(|row| {
+            let row = SensorCurveUsageRow::from_query_result(&row, "")?;
             Ok(SensorCurveUsage {
-                curve_id: row.try_get::<Uuid>("", "curve_id")?,
-                reading_count: row.try_get::<i64>("", "n")?,
-                first_used: row
-                    .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "first")?
-                    .map(|t| t.with_timezone(&Utc)),
-                last_used: row
-                    .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "last")?
-                    .map(|t| t.with_timezone(&Utc)),
+                curve_id: row.curve_id,
+                reading_count: row.n,
+                first_used: row.first.map(|t| t.with_timezone(&Utc)),
+                last_used: row.last.map(|t| t.with_timezone(&Utc)),
             })
         })
         .collect::<AppResult<Vec<_>>>()?;

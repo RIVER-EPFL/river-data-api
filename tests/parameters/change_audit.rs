@@ -164,3 +164,38 @@ async fn a_route_that_owns_its_transaction_names_the_writer() {
         "the entry names the caller, not nobody: {changed_by:?}"
     );
 }
+
+/// Scenario: a slot created through CRUD is written inside `perform_create`'s own transaction,
+/// which is where the change-audit trigger fires. Without the actor declared there the row records
+/// what changed and not who.
+///
+/// Expected behaviour: the create's entry names the caller.
+#[tokio::test]
+#[serial]
+async fn a_slot_created_through_crud_names_its_caller() {
+    let (_db, app, token) = setup().await;
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/site_parameters",
+        &json!({
+            "site_id": crate::common::SITE2_ID,
+            "parameter_id": crate::common::GLOBAL_PARAM_DEPTH_ID,
+            "name": "Depth",
+            "sensor_type": "sensor",
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = created["id"].as_str().unwrap();
+
+    let entries = trail(&app, &token, &format!("site_parameter:{id}")).await;
+    assert_eq!(entries.len(), 1, "the create is one entry: {entries:?}");
+    assert_eq!(entries[0]["change"], "site_parameter_insert");
+    let changed_by = entries[0]["changed_by"].as_str();
+    assert!(
+        changed_by.is_some_and(|a| a.starts_with("token:")),
+        "the entry names the caller, not nobody: {changed_by:?}"
+    );
+}

@@ -21,7 +21,7 @@ use crate::error::{AppError, AppResult};
 
 /// One schedule row as the API exposes it. `running` is computed per-request from the live job
 /// queue, not stored. Field names/types are the UI contract.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ScheduleView {
     pub job_name: String,
     pub enabled: bool,
@@ -119,6 +119,12 @@ fn view_from_row(r: &sea_orm::QueryResult) -> Result<ScheduleView, sea_orm::DbEr
 
 /// `GET /api/schedules`, every recurring-Service schedule, ordered by `job_name`. Requires
 /// `read_metadata`.
+#[utoipa::path(
+    get,
+    path = "/api/schedules",
+    responses((status = 200, description = "Every recurring job's schedule", body = Vec<ScheduleView>)),
+    tag = "schedules"
+)]
 pub async fn list_schedules(State(state): State<AppState>) -> AppResult<Json<Vec<ScheduleView>>> {
     let rows = state
         .db
@@ -146,6 +152,16 @@ pub async fn list_schedules(State(state): State<AppState>) -> AppResult<Json<Vec
 }
 
 /// `GET /api/schedules/{job_name}`, one schedule. 404 if unknown. Requires `read_metadata`.
+#[utoipa::path(
+    get,
+    path = "/api/schedules/{job_name}",
+    params(("job_name" = String, Path, description = "Registered job name")),
+    responses(
+        (status = 200, description = "The schedule", body = ScheduleView),
+        (status = 404, description = "No schedule of that name"),
+    ),
+    tag = "schedules"
+)]
 pub async fn get_schedule(
     State(state): State<AppState>,
     Path(job_name): Path<String>,
@@ -157,7 +173,7 @@ pub async fn get_schedule(
 }
 
 /// PATCH body, every field optional; absent fields are left unchanged.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
 pub struct UpdateScheduleRequest {
     pub enabled: Option<bool>,
     pub interval_seconds: Option<i64>,
@@ -181,6 +197,18 @@ fn known_catchup(s: &str) -> bool {
 /// `next_run_at` when the interval changes or a disabled schedule is enabled, stamps the actor, and
 /// writes a `change_audit` row. Requires `write_metadata` (+ non-scoped token). Returns the
 /// updated [`ScheduleView`].
+#[utoipa::path(
+    patch,
+    path = "/api/schedules/{job_name}",
+    params(("job_name" = String, Path, description = "Registered job name")),
+    request_body = UpdateScheduleRequest,
+    responses(
+        (status = 200, description = "The updated schedule", body = ScheduleView),
+        (status = 400, description = "Bad interval, unknown policy, or rejected tunables"),
+        (status = 404, description = "No schedule of that name"),
+    ),
+    tag = "schedules"
+)]
 pub async fn update_schedule(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<AuthContext>,
@@ -314,7 +342,7 @@ pub async fn update_schedule(
 
 /// `POST /api/schedules/{job_name}/run_now` response: the enqueued job id (None on a dedupe
 /// collision, an identical run_now in the same second) and whether one was created.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RunNowResponse {
     pub job_id: Option<Uuid>,
     pub enqueued: bool,
@@ -323,6 +351,16 @@ pub struct RunNowResponse {
 /// `POST /api/schedules/{job_name}/run_now`, fire one off-cadence run with the schedule's current
 /// tunables snapshot. 404 if `job_name` is not a known job. Requires `write_metadata` (+ non-scoped
 /// token).
+#[utoipa::path(
+    post,
+    path = "/api/schedules/{job_name}/run_now",
+    params(("job_name" = String, Path, description = "Registered job name")),
+    responses(
+        (status = 200, description = "The enqueued run", body = RunNowResponse),
+        (status = 404, description = "No job of that name is registered"),
+    ),
+    tag = "schedules"
+)]
 pub async fn run_now(
     State(state): State<AppState>,
     Path(job_name): Path<String>,
@@ -373,6 +411,13 @@ pub async fn run_now(
 ///
 /// A schedule's trail is one subject in `change_audit`, so this is the general reader keyed for
 /// this caller rather than a second query over the same table.
+#[utoipa::path(
+    get,
+    path = "/api/schedules/{job_name}/audit",
+    params(("job_name" = String, Path, description = "Registered job name")),
+    responses((status = 200, description = "The schedule's edit trail, newest first", body = Vec<crate::routes::private::change_audit::ChangeEntry>)),
+    tag = "schedules"
+)]
 pub async fn get_schedule_audit(
     State(state): State<AppState>,
     Path(job_name): Path<String>,

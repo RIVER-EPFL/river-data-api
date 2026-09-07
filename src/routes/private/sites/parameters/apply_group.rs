@@ -172,6 +172,8 @@ pub async fn apply_group(
     // One transaction: a half-applied group is a site whose calculations partly apply, which is
     // the state this whole flow exists to prevent.
     let txn = state.db.begin().await?;
+    // The change-audit trigger reads the writer from the transaction it fires in.
+    crate::common::actor::declare(&txn).await?;
     crate::common::actor::declare(&txn).await?;
     let mut created = Vec::with_capacity(to_create.len());
     for member in &to_create {

@@ -6,12 +6,12 @@ use axum::{
 };
 use chrono::Utc;
 use sea_orm::{ConnectionTrait, Statement};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::common::AppState;
-use crate::common::paging::{Window, content_range};
 use crate::common::authz::{RIVER_ROLE_NAMES, Role};
+use crate::common::paging::{Window, content_range};
 use crate::common::state::KeycloakAdmin;
 use crate::error::{AppError, AppResult};
 
@@ -141,17 +141,48 @@ pub(crate) fn admin_client(state: &AppState) -> AppResult<&KeycloakAdmin> {
         .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))
 }
 
+/// A realm user as this API reports one: the fields the dashboard renders, plus the realm roles
+/// that decide what they may do. The names are Keycloak's own, so a caller reading the directory
+/// and a caller reading this see one shape.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct KeycloakUser {
+    pub id: Option<String>,
+    pub username: Option<String>,
+    pub email: Option<String>,
+    #[serde(rename = "firstName")]
+    pub first_name: Option<String>,
+    #[serde(rename = "lastName")]
+    pub last_name: Option<String>,
+    pub enabled: Option<bool>,
+    #[serde(rename = "createdTimestamp")]
+    pub created_timestamp: Option<i64>,
+    pub roles: Vec<String>,
+}
+
+/// The id of a user this request removed.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct DeletedUser {
+    pub id: String,
+}
+
+/// A role assignment that took effect. The roles themselves are read back through the user.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct RolesAssigned {
+    pub success: bool,
+}
+
 /// Transform a Keycloak user JSON into our simplified format.
-fn simplify_user(u: &serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "id": u["id"],
-        "username": u["username"],
-        "email": u["email"],
-        "firstName": u["firstName"],
-        "lastName": u["lastName"],
-        "enabled": u["enabled"],
-        "createdTimestamp": u["createdTimestamp"],
-    })
+fn simplify_user(u: &serde_json::Value, roles: Vec<String>) -> KeycloakUser {
+    KeycloakUser {
+        id: u["id"].as_str().map(str::to_string),
+        username: u["username"].as_str().map(str::to_string),
+        email: u["email"].as_str().map(str::to_string),
+        first_name: u["firstName"].as_str().map(str::to_string),
+        last_name: u["lastName"].as_str().map(str::to_string),
+        enabled: u["enabled"].as_bool(),
+        created_timestamp: u["createdTimestamp"].as_i64(),
+        roles,
+    }
 }
 
 /// List Keycloak users holding any riverdata access role, with optional filtering by
@@ -162,7 +193,7 @@ fn simplify_user(u: &serde_json::Value) -> serde_json::Value {
     path = "/api/users",
     params(ListQuery),
     responses(
-        (status = 200, description = "User list with Content-Range header", body = Object),
+        (status = 200, description = "User list with Content-Range header", body = Vec<KeycloakUser>),
         (status = 503, description = "Keycloak admin client not configured"),
     ),
     tag = "admin"
@@ -220,42 +251,35 @@ pub async fn list_users(
             }
         }
     }
-    let mut users: Vec<serde_json::Value> = order
+    let mut users: Vec<KeycloakUser> = order
         .into_iter()
         .map(|id| {
             let (u, mut roles) = by_id.remove(&id).expect("id came from order");
             roles.sort_by_key(|r| RIVER_ROLE_NAMES.iter().position(|n| n == r));
-            let mut user = simplify_user(&u);
-            user["roles"] = serde_json::json!(roles);
-            user
+            simplify_user(&u, roles)
         })
         .collect();
 
     // Apply admin filter
     if let Some(want_admin) = admin_filter {
-        users.retain(|u| {
-            let is_admin = u["roles"]
-                .as_array()
-                .is_some_and(|r| r.iter().any(|v| v.as_str() == Some(&admin_role)));
-            is_admin == want_admin
-        });
+        users.retain(|u| u.roles.iter().any(|r| r == &admin_role) == want_admin);
     }
 
     // Apply search filter (case-insensitive on username, email, firstName, lastName)
     if let Some(ref q) = search {
         users.retain(|u| {
-            ["username", "email", "firstName", "lastName"]
+            [&u.username, &u.email, &u.first_name, &u.last_name]
                 .iter()
                 .any(|field| {
-                    u[*field]
-                        .as_str()
+                    field
+                        .as_deref()
                         .is_some_and(|v| v.to_lowercase().contains(q))
                 })
         });
     }
 
     let total = users.len();
-    let page: Vec<serde_json::Value> = users.into_iter().skip(first).take(max).collect();
+    let page: Vec<KeycloakUser> = users.into_iter().skip(first).take(max).collect();
     let headers = content_range(window.offset, page.len(), total as u64, "users");
 
     Ok((headers, Json(page)))
@@ -275,7 +299,7 @@ pub struct SearchQuery {
     path = "/api/users/search",
     params(SearchQuery),
     responses(
-        (status = 200, description = "Matching users with their realm roles", body = Object),
+        (status = 200, description = "Matching users with their realm roles", body = Vec<KeycloakUser>),
         (status = 503, description = "Keycloak admin client not configured"),
     ),
     tag = "admin"
@@ -283,7 +307,7 @@ pub struct SearchQuery {
 pub async fn search_users(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
-) -> AppResult<Json<Vec<serde_json::Value>>> {
+) -> AppResult<Json<Vec<KeycloakUser>>> {
     let token = get_admin_token(&state).await?;
     let client = admin_client(&state)?;
     let base = admin_base_url(&state)?;
@@ -325,11 +349,9 @@ pub async fn search_users(
         .collect();
     let all_roles = futures::future::join_all(role_futures).await;
 
-    let mut users: Vec<serde_json::Value> = Vec::with_capacity(kc_users.len());
+    let mut users: Vec<KeycloakUser> = Vec::with_capacity(kc_users.len());
     for (u, roles) in kc_users.iter().zip(all_roles) {
-        let mut user = simplify_user(u);
-        user["roles"] = serde_json::json!(roles?);
-        users.push(user);
+        users.push(simplify_user(u, roles?));
     }
 
     Ok(Json(users))
@@ -341,7 +363,7 @@ pub async fn search_users(
     path = "/api/users/{id}",
     params(("id" = String, Path, description = "Keycloak user UUID")),
     responses(
-        (status = 200, description = "User detail", body = Object),
+        (status = 200, description = "User detail", body = KeycloakUser),
         (status = 404, description = "User not found"),
     ),
     tag = "admin"
@@ -349,7 +371,7 @@ pub async fn search_users(
 pub async fn get_user(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<KeycloakUser>> {
     let token = get_admin_token(&state).await?;
     let client = admin_client(&state)?;
     let base = admin_base_url(&state)?;
@@ -381,9 +403,7 @@ pub async fn get_user(
     // Fetch realm role mappings
     let roles = fetch_user_roles(client, &token, &base, &id).await?;
 
-    let mut result = simplify_user(&user);
-    result["roles"] = serde_json::json!(roles);
-    Ok(Json(result))
+    Ok(Json(simplify_user(&user, roles)))
 }
 
 /// Update a Keycloak user (partial JSON merge). Requires `require_admin`.
@@ -393,7 +413,7 @@ pub async fn get_user(
     params(("id" = String, Path, description = "Keycloak user UUID")),
     request_body(content = Object, description = "Partial user fields to update"),
     responses(
-        (status = 200, description = "User updated"),
+        (status = 200, description = "User updated", body = KeycloakUser),
         (status = 404, description = "User not found"),
     ),
     tag = "admin"
@@ -402,7 +422,7 @@ pub async fn update_user(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<serde_json::Value>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<KeycloakUser>> {
     let token = get_admin_token(&state).await?;
     let client = admin_client(&state)?;
     let base = admin_base_url(&state)?;
@@ -463,9 +483,7 @@ pub async fn update_user(
 
     invalidate_cached_access(&state, &id).await;
 
-    let mut result = simplify_user(&current);
-    result["roles"] = serde_json::json!(roles);
-    Ok(Json(result))
+    Ok(Json(simplify_user(&current, roles)))
 }
 
 /// Delete a Keycloak user. Requires `require_admin`.
@@ -474,7 +492,7 @@ pub async fn update_user(
     path = "/api/users/{id}",
     params(("id" = String, Path, description = "Keycloak user UUID")),
     responses(
-        (status = 200, description = "User deleted"),
+        (status = 200, description = "User deleted", body = DeletedUser),
         (status = 404, description = "User not found"),
     ),
     tag = "admin"
@@ -482,7 +500,7 @@ pub async fn update_user(
 pub async fn delete_user(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<DeletedUser>> {
     let token = get_admin_token(&state).await?;
     let client = admin_client(&state)?;
     let base = admin_base_url(&state)?;
@@ -508,7 +526,7 @@ pub async fn delete_user(
 
     invalidate_cached_access(&state, &id).await;
 
-    Ok(Json(serde_json::json!({ "id": id })))
+    Ok(Json(DeletedUser { id }))
 }
 
 /// Set the realm roles for a user (overwrites; not additive). Requires `require_admin`.
@@ -518,7 +536,7 @@ pub async fn delete_user(
     params(("id" = String, Path, description = "Keycloak user UUID")),
     request_body = AssignRolesRequest,
     responses(
-        (status = 200, description = "Roles updated"),
+        (status = 200, description = "Roles updated", body = RolesAssigned),
         (status = 404, description = "User not found"),
     ),
     tag = "admin"
@@ -527,7 +545,7 @@ pub async fn assign_roles(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<AssignRolesRequest>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<RolesAssigned>> {
     let token = get_admin_token(&state).await?;
     let client = admin_client(&state)?;
     let base = admin_base_url(&state)?;
@@ -536,7 +554,7 @@ pub async fn assign_roles(
 
     invalidate_cached_access(&state, &id).await;
 
-    Ok(Json(serde_json::json!({ "success": true })))
+    Ok(Json(RolesAssigned { success: true }))
 }
 
 /// Outcome of the startup realm check. `Missing` is authoritative (Keycloak answered, and the
@@ -1002,6 +1020,13 @@ pub struct SetGrantsRequest {
 
 /// List the projects a user is granted, with names. Administrators are unrestricted (they are never
 /// granted rows); this reflects only the stored grant set. Requires `require_admin`.
+#[utoipa::path(
+    get,
+    path = "/api/users/{id}/grants",
+    params(("id" = String, Path, description = "Keycloak user id (sub)")),
+    responses((status = 200, description = "The projects the user is granted", body = Vec<crate::routes::private::me::GrantedProject>)),
+    tag = "users"
+)]
 pub async fn list_user_grants(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1030,13 +1055,28 @@ pub async fn list_user_grants(
 }
 
 /// Replace a user's project grants transactionally and bust their grants cache so the change takes
+/// What a grant write left behind: the number of projects the user may now see.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SetGrantsResponse {
+    pub success: bool,
+    pub count: usize,
+}
+
 /// effect within one request. Requires `require_admin`.
+#[utoipa::path(
+    put,
+    path = "/api/users/{id}/grants",
+    params(("id" = String, Path, description = "Keycloak user id (sub)")),
+    request_body = SetGrantsRequest,
+    responses((status = 200, description = "The grant set after the write", body = SetGrantsResponse)),
+    tag = "users"
+)]
 pub async fn set_user_grants(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Path(id): Path<String>,
     Json(req): Json<SetGrantsRequest>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<SetGrantsResponse>> {
     use sea_orm::TransactionTrait;
     let granted_by = auth.keycloak_sub().unwrap_or("").to_string();
     let txn = state
@@ -1068,7 +1108,10 @@ pub async fn set_user_grants(
     state.grants_cache.invalidate(&id).await;
 
     Ok(Json(
-        serde_json::json!({ "success": true, "count": req.project_ids.len() }),
+        SetGrantsResponse {
+            success: true,
+            count: req.project_ids.len(),
+        },
     ))
 }
 

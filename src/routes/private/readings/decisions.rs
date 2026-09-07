@@ -34,6 +34,9 @@ pub enum Kind {
     Chain,
     Detach,
     Return,
+    /// A curve that corrected readings was taken out of circulation, and they moved onto
+    /// whatever else covers them (M146).
+    CurveRetire,
     Rollback,
 }
 
@@ -56,6 +59,7 @@ impl Kind {
             Self::Chain => "chain",
             Self::Detach => "detach",
             Self::Return => "return",
+            Self::CurveRetire => "curve_retire",
             Self::Rollback => "rollback",
         }
     }
@@ -77,6 +81,7 @@ impl Kind {
             Self::Chain,
             Self::Detach,
             Self::Return,
+            Self::CurveRetire,
             Self::Rollback,
         ]
         .into_iter()
@@ -98,7 +103,7 @@ impl Kind {
             Self::Withdraw | Self::Reassert => &["withdrawn_at", "withdrawn_reason"],
             Self::Reject => &["withdrawn_at", "withdrawn_reason", "unverified"],
             Self::Curve => &["standard_curve_id"],
-            Self::CalibrationPin => &["calibration_id"],
+            Self::CalibrationPin | Self::CurveRetire => &["calibration_id"],
             Self::InstrumentPin => &["sensor_id"],
             Self::ValueCorrection => &["raw_value"],
             Self::UnverifiedEntry | Self::Verify => &["unverified"],
@@ -125,6 +130,9 @@ impl Kind {
             Self::Curve => Some("curve"),
             Self::CalibrationPin => Some("calibration"),
             Self::InstrumentPin => Some("instrument"),
+            // Its own family: a retirement must not supersede a pin, which is honoured against
+            // every later reprocess, and a repoint is a derivation a reprocess is meant to redo.
+            Self::CurveRetire => Some("retire"),
             Self::SlotMove => Some("slot"),
             Self::ValueCorrection => Some("value"),
             Self::UnverifiedEntry | Self::Verify => Some("verified"),
@@ -163,6 +171,7 @@ impl Kind {
                 | Self::Reassert
                 | Self::Reject
                 | Self::ValueCorrection
+                | Self::CurveRetire
                 | Self::Rollback
         )
     }
@@ -196,6 +205,7 @@ pub enum Writer {
     JanitorRecompose,
     MeasurementRetag,
     SdEstimatorRetag,
+    CurveRetirement,
 }
 
 impl Writer {
@@ -218,6 +228,7 @@ impl Writer {
             Self::BatchOverwrite => Some((Kind::ValueCorrection, Origin::Manual)),
             Self::ChainSave => Some((Kind::Chain, Origin::Chain)),
             Self::MergeMove => Some((Kind::SlotMove, Origin::Manual)),
+            Self::CurveRetirement => Some((Kind::CurveRetire, Origin::Manual)),
             Self::ReprocessSensor
             | Self::ReprocessSlot
             | Self::CalibrationResolver
@@ -257,6 +268,27 @@ impl Origin {
             Self::System => "system",
         }
     }
+}
+
+/// The rows this file's raw queries return that carry more than one column. Derived rather than
+/// hand-decoded so a column added to a query and not to its reader is a compile error rather than
+/// a field silently left behind.
+#[derive(FromQueryResult)]
+struct ForeignCurveRow {
+    id: Uuid,
+    rows: i64,
+}
+
+#[derive(FromQueryResult)]
+struct ReplicateKeyRow {
+    stream_id: Uuid,
+    replicate_index: i16,
+}
+
+#[derive(FromQueryResult)]
+struct RestoreRow {
+    replicate_index: i16,
+    old: serde_json::Value,
 }
 
 /// The reading, or the whole replicate group, a decision is about.
@@ -458,6 +490,7 @@ async fn latest_live<C: ConnectionTrait>(
         Kind::Chain,
         Kind::Detach,
         Kind::Return,
+        Kind::CurveRetire,
     ]
     .into_iter()
     .filter(|k| k.family() == Some(family))
@@ -674,6 +707,10 @@ pub enum NewValue {
     /// The row's own projected state of the kind's columns, for a decision recorded over rows
     /// born with the state already in place (an insert-time curve claim): `old` is then null.
     Born,
+    /// A jsonb expression evaluated once per row against `r` (`readings`), for a decision whose
+    /// assertion differs per reading: a curve retirement moves each of its readings onto whichever
+    /// curve covers that reading, which is a different answer per row.
+    Sql(String),
 }
 
 const STATE_SQL: &str = "jsonb_build_object(
@@ -706,7 +743,7 @@ pub enum Keyed {
 }
 
 /// Every kind, in declaration order. The enumerations below filter this rather than repeat it.
-const ALL_KINDS: [Kind; 16] = [
+const ALL_KINDS: [Kind; 17] = [
     Kind::Flag,
     Kind::Unflag,
     Kind::Withdraw,
@@ -722,6 +759,7 @@ const ALL_KINDS: [Kind; 16] = [
     Kind::Chain,
     Kind::Detach,
     Kind::Return,
+    Kind::CurveRetire,
     Kind::Rollback,
 ];
 
@@ -802,6 +840,17 @@ pub async fn record_many<C: ConnectionTrait>(
                 ),
             )
         }
+        NewValue::Sql(_) => {
+            binds.push(serde_json::Value::Null.into());
+            (
+                format!(
+                    "(SELECT COALESCE(jsonb_object_agg(k, t.state -> k), '{{}}'::jsonb) \
+                      FROM unnest(${cols_b}::text[]) AS k)",
+                    cols_b = base + 6
+                ),
+                "t.resolved".to_string(),
+            )
+        }
     };
     binds.push(kind.as_str().into());
     binds.push(actor.into());
@@ -810,9 +859,14 @@ pub async fn record_many<C: ConnectionTrait>(
     binds.push(cols.into());
     binds.push(family_kinds(kind).into());
     binds.push(set_id.into());
+    let resolved = match &new {
+        NewValue::Sql(expr) => expr.clone(),
+        _ => "NULL::jsonb".to_string(),
+    };
     let sql = format!(
         "WITH target AS (
-             SELECT r.stream_id, r.time, r.replicate_index, {STATE_SQL} AS state
+             SELECT r.stream_id, r.time, r.replicate_index, {STATE_SQL} AS state,
+                    {resolved} AS resolved
              FROM readings r
              JOIN data_streams ds ON ds.id = r.stream_id
              WHERE {row_predicate}
@@ -1463,6 +1517,9 @@ pub struct Selection {
     pub site_id: Option<Uuid>,
     #[serde(default)]
     pub parameter_id: Option<Uuid>,
+    /// The readings a calibration corrected, which is what a retirement decides over.
+    #[serde(default)]
+    pub calibration_id: Option<Uuid>,
     #[serde(default)]
     pub from: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
@@ -1498,6 +1555,10 @@ impl Selection {
                     "A slot selection names both site_id and parameter_id".to_string(),
                 ));
             }
+        }
+        if let Some(calibration_id) = self.calibration_id {
+            binds.push(calibration_id.into());
+            clauses.push(format!("r.calibration_id = ${}", binds.len()));
         }
         if let Some(from) = self.from {
             binds.push(sea_orm::prelude::DateTimeWithTimeZone::from(from).into());
@@ -1592,16 +1653,17 @@ pub fn keyed_corrections(selection: &Selection) -> AppResult<Option<HashMapByStr
     Ok(Some(by_stream))
 }
 
-pub async fn record_set<C: ConnectionTrait>(
+/// Open a decision set: the row a set of decisions belongs to, and what a rollback names. A writer
+/// whose rows are chosen by something no [`Selection`] expresses records its decisions with
+/// [`record_many`] between this and [`close_set`]; everything else goes through [`record_set`].
+pub async fn open_set<C: ConnectionTrait>(
     conn: &C,
     kind: Kind,
     selection: &Selection,
     new: serde_json::Value,
     actor: &str,
     reason: Option<&str>,
-    origin: Origin,
-) -> AppResult<(Uuid, Recorded)> {
-    let (predicate, binds) = selection.predicate()?;
+) -> AppResult<Uuid> {
     let set_id = Uuid::new_v4();
     conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
@@ -1613,12 +1675,41 @@ pub async fn record_set<C: ConnectionTrait>(
             serde_json::to_value(selection)
                 .map_err(|e| AppError::Internal(e.to_string()))?
                 .into(),
-            new.clone().into(),
+            new.into(),
             actor.into(),
             reason.into(),
         ],
     ))
     .await?;
+    Ok(set_id)
+}
+
+/// Record how many rows the set decided, which is what the surfaces report.
+pub async fn close_set<C: ConnectionTrait>(
+    conn: &C,
+    set_id: Uuid,
+    rows: u64,
+) -> AppResult<()> {
+    conn.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "UPDATE reading_decision_sets SET rows_decided = $2 WHERE id = $1",
+        [set_id.into(), i64::try_from(rows).unwrap_or(i64::MAX).into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+pub async fn record_set<C: ConnectionTrait>(
+    conn: &C,
+    kind: Kind,
+    selection: &Selection,
+    new: serde_json::Value,
+    actor: &str,
+    reason: Option<&str>,
+    origin: Origin,
+) -> AppResult<(Uuid, Recorded)> {
+    let (predicate, binds) = selection.predicate()?;
+    let set_id = open_set(conn, kind, selection, new.clone(), actor, reason).await?;
     let recorded = match keyed_corrections(selection)? {
         Some(by_stream) if kind == Kind::ValueCorrection => {
             let mut all = Recorded::default();
@@ -1666,15 +1757,7 @@ pub async fn record_set<C: ConnectionTrait>(
             .await?
         }
     };
-    conn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "UPDATE reading_decision_sets SET rows_decided = $2 WHERE id = $1",
-        [
-            set_id.into(),
-            i64::try_from(recorded.rows).unwrap_or(i64::MAX).into(),
-        ],
-    ))
-    .await?;
+    close_set(conn, set_id, recorded.rows).await?;
     if kind == Kind::ValueCorrection && recorded.rows > 0 {
         recompose_corrected(
             conn,
@@ -1825,9 +1908,10 @@ pub async fn foreign_curves<C: ConnectionTrait>(
         .await?;
     rows.iter()
         .map(|r| {
+            let row = ForeignCurveRow::from_query_result(r, "")?;
             Ok(ForeignCurve {
-                id: r.try_get("", "id")?,
-                rows: r.try_get("", "rows")?,
+                id: row.id,
+                rows: row.rows,
             })
         })
         .collect()
@@ -2329,10 +2413,8 @@ async fn output_rows_at<C: ConnectionTrait>(
         .await?;
     rows.iter()
         .map(|r| {
-            Ok((
-                r.try_get("", "stream_id")?,
-                r.try_get("", "replicate_index")?,
-            ))
+            let row = ReplicateKeyRow::from_query_result(r, "")?;
+            Ok((row.stream_id, row.replicate_index))
         })
         .collect()
 }
@@ -2529,10 +2611,13 @@ pub async fn return_output(
             let rows: Vec<(chrono::DateTime<chrono::Utc>, i16, serde_json::Value)> = restore
                 .iter()
                 .filter_map(|r| {
-                    let index: i16 = r.try_get("", "replicate_index").ok()?;
-                    let old: serde_json::Value = r.try_get("", "old").ok()?;
-                    let raw = old.get("raw_value")?.as_f64()?;
-                    Some((req.time, index, serde_json::json!({ "raw_value": raw })))
+                    let row = RestoreRow::from_query_result(r, "").ok()?;
+                    let raw = row.old.get("raw_value")?.as_f64()?;
+                    Some((
+                        req.time,
+                        row.replicate_index,
+                        serde_json::json!({ "raw_value": raw }),
+                    ))
                 })
                 .collect();
             record_keyed(

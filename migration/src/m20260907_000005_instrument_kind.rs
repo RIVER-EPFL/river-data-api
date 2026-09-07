@@ -14,7 +14,7 @@ use sea_orm_migration::prelude::*;
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
-const UP: &str = "
+pub const UP: &str = "
     ALTER TABLE public.sensors ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'device';
 
     UPDATE public.sensors SET kind = 'entry_channel'

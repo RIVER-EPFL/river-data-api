@@ -175,13 +175,26 @@ async fn used_curve_edit_mints_successor() {
             &fx.db,
             &format!(
                 "SELECT COUNT(*) FROM standard_curves WHERE id = '{old_id}' \
-                 AND source_system IS NULL AND source_key IS NULL \
+                 AND source_system = 'cnet' AND source_key IS NULL \
                  AND slope = 2.0 AND intercept = 1.0"
             ),
         )
         .await,
         1,
-        "the old row keeps its coefficients and loses only its provenance"
+        "the old row keeps its coefficients and the system it came from, and frees only the key"
+    );
+    assert_eq!(
+        count(
+            &fx.db,
+            &format!(
+                "SELECT COUNT(*) FROM standard_curves WHERE id = '{old_id}' \
+                 AND retired_at IS NOT NULL AND retired_by = 'cnet' \
+                 AND retired_reason LIKE 'Superseded by {new_id}:%'"
+            ),
+        )
+        .await,
+        1,
+        "the row the portal replaced is retired at the same moment, naming its successor"
     );
     assert_eq!(
         count(

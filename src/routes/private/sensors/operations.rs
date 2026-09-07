@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -56,13 +56,14 @@ impl CRUDOperations for SensorOperations {
             .map_err(ApiError::database)?;
         if let Some(row) = blocking {
             let mut held: Vec<&str> = Vec::new();
-            for (col, label) in [
-                ("readings", "readings"),
-                ("curves", "standard curves"),
-                ("calibrations", "calibrations"),
-                ("deployments", "deployments"),
+            let blocking = BlockingRow::from_query_result(&row, "").map_err(ApiError::database)?;
+            for (present, label) in [
+                (blocking.readings, "readings"),
+                (blocking.curves, "standard curves"),
+                (blocking.calibrations, "calibrations"),
+                (blocking.deployments, "deployments"),
             ] {
-                if row.try_get::<bool>("", col).unwrap_or(false) {
+                if present {
                     held.push(label);
                 }
             }
@@ -226,14 +227,10 @@ async fn enrich(
         .await
         .map_err(ApiError::database)?;
     for row in &dep_rows {
-        if let (Ok(sensor_id), Ok(site_id), Ok(site_name)) = (
-            row.try_get::<Uuid>("", "sensor_id"),
-            row.try_get::<Uuid>("", "site_id"),
-            row.try_get::<String>("", "site_name"),
-        ) {
-            let entry = out.entry(sensor_id).or_default();
+        if let Ok(row) = OpenDeploymentRow::from_query_result(row, "") {
+            let entry = out.entry(row.sensor_id).or_default();
             if entry.current_site.is_none() {
-                entry.current_site = Some((site_id, site_name));
+                entry.current_site = Some((row.site_id, row.site_name));
             }
         }
     }
@@ -251,12 +248,9 @@ async fn enrich(
         .await
         .map_err(ApiError::database)?;
     for row in &cal_rows {
-        if let (Ok(sensor_id), Ok(valid_from)) = (
-            row.try_get::<Uuid>("", "sensor_id"),
-            row.try_get::<DateTime<chrono::FixedOffset>>("", "valid_from"),
-        ) {
-            out.entry(sensor_id).or_default().last_calibration_at =
-                Some(valid_from.with_timezone(&Utc));
+        if let Ok(row) = LastCalibrationRow::from_query_result(row, "") {
+            out.entry(row.sensor_id).or_default().last_calibration_at =
+                Some(row.valid_from.with_timezone(&Utc));
         }
     }
 
@@ -271,12 +265,9 @@ async fn enrich(
         .await
         .map_err(ApiError::database)?;
     for row in &count_rows {
-        if let (Ok(sensor_id), Ok(n)) = (
-            row.try_get::<Uuid>("", "sensor_id"),
-            row.try_get::<i64>("", "n"),
-        ) {
-            let entry = out.entry(sensor_id).or_default();
-            entry.reading_count = Some(entry.reading_count.unwrap_or(0) + n);
+        if let Ok(row) = CountRow::from_query_result(row, "") {
+            let entry = out.entry(row.sensor_id).or_default();
+            entry.reading_count = Some(entry.reading_count.unwrap_or(0) + row.n);
         }
     }
     let spot_rows = db
@@ -291,12 +282,9 @@ async fn enrich(
         .await
         .map_err(ApiError::database)?;
     for row in &spot_rows {
-        if let (Ok(sensor_id), Ok(n)) = (
-            row.try_get::<Uuid>("", "sensor_id"),
-            row.try_get::<i64>("", "n"),
-        ) {
-            let entry = out.entry(sensor_id).or_default();
-            entry.reading_count = Some(entry.reading_count.unwrap_or(0) + n);
+        if let Ok(row) = CountRow::from_query_result(row, "") {
+            let entry = out.entry(row.sensor_id).or_default();
+            entry.reading_count = Some(entry.reading_count.unwrap_or(0) + row.n);
         }
     }
     for id in ids {
@@ -336,24 +324,19 @@ async fn enrich(
             .or_insert(t);
     };
     for row in &cursor_rows {
-        if let (Ok(sensor_id), Ok(t)) = (
-            row.try_get::<Uuid>("", "sensor_id"),
-            row.try_get::<DateTime<chrono::FixedOffset>>("", "last_time"),
-        ) {
-            note(&mut newest, sensor_id, t.with_timezone(&Utc));
-            note(&mut window_end, sensor_id, t.with_timezone(&Utc));
+        if let Ok(row) = LastTimeRow::from_query_result(row, "") {
+            let t = row.last_time.with_timezone(&Utc);
+            note(&mut newest, row.sensor_id, t);
+            note(&mut window_end, row.sensor_id, t);
         }
     }
     for row in &bucket_rows {
-        if let (Ok(sensor_id), Ok(t)) = (
-            row.try_get::<Uuid>("", "sensor_id"),
-            row.try_get::<DateTime<chrono::FixedOffset>>("", "last_bucket"),
-        ) {
-            let bucket = t.with_timezone(&Utc);
-            note(&mut newest, sensor_id, bucket);
+        if let Ok(row) = LastBucketRow::from_query_result(row, "") {
+            let bucket = row.last_bucket.with_timezone(&Utc);
+            note(&mut newest, row.sensor_id, bucket);
             note(
                 &mut window_end,
-                sensor_id,
+                row.sensor_id,
                 bucket + chrono::Duration::hours(1),
             );
         }
@@ -437,32 +420,79 @@ async fn enrich(
         .await
         .map_err(ApiError::database)?;
     for row in &curve_rows {
-        let Ok(sensor_id) = row.try_get::<Uuid>("", "sensor_id") else {
+        let Ok(row) = CurveUseRow::from_query_result(row, "") else {
             continue;
         };
-        let entry = out.entry(sensor_id).or_default();
-        entry.curve_count = row.try_get::<i64>("", "curves").ok();
-        entry.last_curve_use = row
-            .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "last_use")
-            .ok()
-            .flatten()
-            .map(|t| t.with_timezone(&Utc));
+        let entry = out.entry(row.sensor_id).or_default();
+        entry.curve_count = Some(row.curves);
+        entry.last_curve_use = row.last_use.map(|t| t.with_timezone(&Utc));
     }
 
     Ok(out)
 }
 
+/// What still points at an instrument, which is what refuses its deletion.
+#[derive(FromQueryResult)]
+struct BlockingRow {
+    readings: bool,
+    curves: bool,
+    calibrations: bool,
+    deployments: bool,
+}
+
+#[derive(FromQueryResult)]
+struct OpenDeploymentRow {
+    sensor_id: Uuid,
+    site_id: Uuid,
+    site_name: String,
+}
+
+#[derive(FromQueryResult)]
+struct LastCalibrationRow {
+    sensor_id: Uuid,
+    valid_from: DateTime<chrono::FixedOffset>,
+}
+
+/// A per-instrument tally, from the rollup and from the spot rows alike.
+#[derive(FromQueryResult)]
+struct CountRow {
+    sensor_id: Uuid,
+    n: i64,
+}
+
+#[derive(FromQueryResult)]
+struct LastTimeRow {
+    sensor_id: Uuid,
+    last_time: DateTime<chrono::FixedOffset>,
+}
+
+#[derive(FromQueryResult)]
+struct LastBucketRow {
+    sensor_id: Uuid,
+    last_bucket: DateTime<chrono::FixedOffset>,
+}
+
+#[derive(FromQueryResult)]
+struct CurveUseRow {
+    sensor_id: Uuid,
+    curves: i64,
+    last_use: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+}
+
+#[derive(FromQueryResult)]
+struct ProbedRow {
+    sensor_id: Uuid,
+    time: DateTime<chrono::FixedOffset>,
+    value: f64,
+}
+
 /// The instant and value of each probed row, over whatever the enrichment already holds.
 fn record_values(rows: &[sea_orm::QueryResult], out: &mut HashMap<Uuid, Enrichment>) {
     for row in rows {
-        if let (Ok(sensor_id), Ok(time), Ok(value)) = (
-            row.try_get::<Uuid>("", "sensor_id"),
-            row.try_get::<DateTime<chrono::FixedOffset>>("", "time"),
-            row.try_get::<f64>("", "value"),
-        ) {
-            let entry = out.entry(sensor_id).or_default();
-            entry.last_reading_at = Some(time.with_timezone(&Utc));
-            entry.last_reading_value = Some(value);
+        if let Ok(row) = ProbedRow::from_query_result(row, "") {
+            let entry = out.entry(row.sensor_id).or_default();
+            entry.last_reading_at = Some(row.time.with_timezone(&Utc));
+            entry.last_reading_value = Some(row.value);
         }
     }
 }

@@ -18,8 +18,14 @@ pub struct Model {
     pub id: Uuid,
     #[crudcrate(filterable)]
     pub derived_definition_id: Uuid,
+    /// The catalog parameter read into the variable. NULL on a site source, which names a column
+    /// of the site's own row instead; a row carries exactly one of the two (DB CHECK).
     #[crudcrate(filterable)]
-    pub parameter_id: Uuid,
+    pub parameter_id: Option<Uuid>,
+    /// The column of `sites` read into the variable, for a property of the station rather than a
+    /// measurement taken at the visit. NULL on a parameter source.
+    #[crudcrate(filterable)]
+    pub site_property: Option<String>,
     pub variable_name: String,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,

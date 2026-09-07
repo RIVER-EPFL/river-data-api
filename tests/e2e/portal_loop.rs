@@ -230,3 +230,131 @@ async fn a_portal_source_reaches_a_served_value_and_changes_only_when_decided() 
         "the accepted value names the decision that wrote it"
     );
 }
+
+/// Expected behaviour: the source grows between cycles and the loop follows it without an
+/// operator. A visit added inside a window already reconciled classifies as new rather than being
+/// mistaken for a withdrawal, and a station that did not exist at enrolment registers as unpaired
+/// streams the pairing plan can propose.
+#[tokio::test]
+#[serial]
+async fn a_visit_added_inside_a_reconciled_window_lands_and_a_new_station_reaches_the_plan() {
+    use river_data_core::chrono::{TimeZone, Utc};
+
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let (app, state) = crate::common::build_test_app_with_state(db.clone());
+    let token = crate::common::seed_token_full(&db).await;
+
+    // The driver owns its backend, so the content is grown through a second view of it.
+    let portal = FakePortal::seeded();
+    let driver = enrolled_driver(app.clone(), &state, portal.handle()).await;
+
+    driver.sync(false).await.expect("the first cycle");
+    let plan = crate::common::plans::create_plan(&app, &token, SOURCE_SYSTEM).await;
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+    run_plan_action(&app, &token, &plan_id, "apply").await;
+
+    // A visit entered between two the store already holds: inside the window every pass
+    // re-asserts, which is where a diff could mistake it for something withdrawn.
+    let backdated = Utc
+        .with_ymd_and_hms(2026, 6, 4, 7, 0, 0)
+        .single()
+        .expect("a representable instant");
+    portal.add_visit(
+        "S01",
+        crate::common::fake_portal::Visit {
+            at: backdated,
+            single: Some(7.9),
+            replicates: [Some(330.0), Some(334.0), Some(332.0)],
+        },
+    );
+    // And a station nobody had seen at enrolment.
+    portal.add_station(
+        "S03",
+        vec![crate::common::fake_portal::Visit {
+            at: Utc
+                .with_ymd_and_hms(2026, 6, 15, 9, 0, 0)
+                .single()
+                .expect("a representable instant"),
+            single: Some(3.3),
+            replicates: [Some(90.0), Some(94.0), Some(92.0)],
+        }],
+    );
+
+    let grown = driver.sync(false).await.expect("the second cycle");
+    assert!(
+        grown.errors.is_empty(),
+        "the growing cycle reported errors: {:?}",
+        grown.errors
+    );
+
+    // The backdated visit is served at its own instant, and nothing at S01 was withdrawn for it.
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*)::bigint FROM readings r JOIN data_streams s ON s.id = r.stream_id \
+             WHERE s.source_key = 'S01:water_temp_degC' AND r.time = '2026-06-04T07:00:00Z' \
+               AND r.withdrawn_at IS NULL"
+        )
+        .await,
+        1,
+        "the visit added inside the window is stored"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*)::bigint FROM readings r JOIN data_streams s ON s.id = r.stream_id \
+                 WHERE s.source_system = '{SOURCE_SYSTEM}' AND r.withdrawn_at IS NOT NULL"
+            )
+        )
+        .await,
+        0,
+        "growing the source withdrew nothing"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*)::bigint FROM collection_events \
+             WHERE collected_at = '2026-06-04T07:00:00Z'"
+        )
+        .await,
+        1,
+        "the new visit is a collection event of its own"
+    );
+
+    // The new station registered by itself, unpaired, and the plan proposes it.
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*)::bigint FROM data_streams \
+                 WHERE source_system = '{SOURCE_SYSTEM}' AND source_key LIKE 'S03:%' \
+                   AND site_parameter_id IS NULL"
+            )
+        )
+        .await,
+        2,
+        "a station absent at enrolment discovers itself, and arrives unpaired"
+    );
+    let next = crate::common::plans::create_plan(&app, &token, SOURCE_SYSTEM).await;
+    let entries = next["entries"].as_array().expect("entries");
+    let s03: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| e["site"]["name"] == "S03")
+        .collect();
+    assert_eq!(
+        s03.len(),
+        2,
+        "the plan proposes the new station's two streams: {next}"
+    );
+    let family = s03
+        .iter()
+        .find(|e| e["source_key"] == format!("S03:{FAMILY_MEAN_COLUMN}:reps"))
+        .unwrap_or_else(|| panic!("the family is proposed as one entry: {next}"));
+    assert_eq!(
+        family["replicates"]["n"], 3,
+        "proposed as the family it is, not three columns: {family}"
+    );
+    assert_eq!(family["site"]["create"], true, "S03 is a site to create");
+}

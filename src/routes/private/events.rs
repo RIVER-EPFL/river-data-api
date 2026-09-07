@@ -106,6 +106,15 @@ fn event_type(event: &AppEvent) -> &'static str {
     }
 }
 
+/// `GET /api/events`, the live stream of job and alarm events as Server-Sent Events. The
+/// connection stays open and each event carries the kind in its `event` field; a project-scoped
+/// API token sees only its own project's events.
+#[utoipa::path(
+    get,
+    path = "/api/events",
+    responses((status = 200, description = "An open `text/event-stream` of job and alarm events", content_type = "text/event-stream")),
+    tag = "events"
+)]
 pub async fn event_stream(
     State(state): State<AppState>,
     auth: Option<axum::Extension<AuthContext>>,

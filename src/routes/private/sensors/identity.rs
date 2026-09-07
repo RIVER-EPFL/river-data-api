@@ -5,7 +5,7 @@
 use chrono::{DateTime, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
-    QueryFilter, Set, Statement,
+    FromQueryResult, QueryFilter, Set, Statement,
 };
 use uuid::Uuid;
 
@@ -722,18 +722,17 @@ pub async fn resolve_windows_for_times<C: ConnectionTrait>(
         .await?;
     let cals: Vec<(Uuid, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>)> = cal_rows
         .iter()
-        .map(|r| -> AppResult<_> {
-            let id: Uuid = r.try_get("", "id")?;
-            let from: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "valid_from")?;
-            let until: Option<chrono::DateTime<chrono::FixedOffset>> =
-                r.try_get("", "valid_until")?;
-            Ok((
-                id,
-                from.with_timezone(&Utc),
-                until.map(|u| u.with_timezone(&Utc)),
-            ))
+        .map(|r| CalWindow::from_query_result(r, ""))
+        .map(|r| {
+            r.map(|c| {
+                (
+                    c.id,
+                    c.valid_from.with_timezone(&Utc),
+                    c.valid_until.map(|u| u.with_timezone(&Utc)),
+                )
+            })
         })
-        .collect::<AppResult<_>>()?;
+        .collect::<Result<_, _>>()?;
 
     let dep_rows = db
         .query_all_raw(Statement::from_sql_and_values(
@@ -752,20 +751,18 @@ pub async fn resolve_windows_for_times<C: ConnectionTrait>(
         Option<chrono::DateTime<Utc>>,
     )> = dep_rows
         .iter()
-        .map(|r| -> AppResult<_> {
-            let id: Uuid = r.try_get("", "id")?;
-            let site_id: Uuid = r.try_get("", "site_id")?;
-            let from: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "deployed_from")?;
-            let until: Option<chrono::DateTime<chrono::FixedOffset>> =
-                r.try_get("", "deployed_until")?;
-            Ok((
-                id,
-                site_id,
-                from.with_timezone(&Utc),
-                until.map(|u| u.with_timezone(&Utc)),
-            ))
+        .map(|r| SiteWindow::from_query_result(r, ""))
+        .map(|r| {
+            r.map(|d| {
+                (
+                    d.id,
+                    d.site_id,
+                    d.deployed_from.with_timezone(&Utc),
+                    d.deployed_until.map(|u| u.with_timezone(&Utc)),
+                )
+            })
         })
-        .collect::<AppResult<_>>()?;
+        .collect::<Result<_, _>>()?;
 
     for &t in times {
         // A NULL upper bound is open-ended (covers everything from `from` onward).
@@ -833,20 +830,18 @@ pub async fn resolve_slot_owner_for_times<C: ConnectionTrait>(
         .await?;
     let deps: Vec<SlotWindowRow> = dep_rows
         .iter()
-        .map(|r| -> AppResult<_> {
-            let id: Uuid = r.try_get("", "id")?;
-            let sensor_id: Uuid = r.try_get("", "sensor_id")?;
-            let from: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "deployed_from")?;
-            let until: Option<chrono::DateTime<chrono::FixedOffset>> =
-                r.try_get("", "deployed_until")?;
-            Ok((
-                id,
-                sensor_id,
-                from.with_timezone(&Utc),
-                until.map(|u| u.with_timezone(&Utc)),
-            ))
+        .map(|r| SensorWindow::from_query_result(r, ""))
+        .map(|r| {
+            r.map(|d| {
+                (
+                    d.id,
+                    d.sensor_id,
+                    d.deployed_from.with_timezone(&Utc),
+                    d.deployed_until.map(|u| u.with_timezone(&Utc)),
+                )
+            })
         })
-        .collect::<AppResult<_>>()?;
+        .collect::<Result<_, _>>()?;
     if deps.is_empty() {
         for &t in times {
             out.insert(t, ResolvedOwner::default());
@@ -991,6 +986,30 @@ pub async fn raise_source_identity_hold<C: ConnectionTrait>(
     .await
 }
 
+/// The three window queries this module makes, each as the row its SELECT returns.
+#[derive(FromQueryResult)]
+struct CalWindow {
+    id: Uuid,
+    valid_from: DateTime<chrono::FixedOffset>,
+    valid_until: Option<DateTime<chrono::FixedOffset>>,
+}
+
+#[derive(FromQueryResult)]
+struct SiteWindow {
+    id: Uuid,
+    site_id: Uuid,
+    deployed_from: DateTime<chrono::FixedOffset>,
+    deployed_until: Option<DateTime<chrono::FixedOffset>>,
+}
+
+#[derive(FromQueryResult)]
+struct SensorWindow {
+    id: Uuid,
+    sensor_id: Uuid,
+    deployed_from: DateTime<chrono::FixedOffset>,
+    deployed_until: Option<DateTime<chrono::FixedOffset>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{InstrumentKind, source_instrument_name};
@@ -1029,3 +1048,4 @@ mod tests {
         assert_eq!(name, "Depth (api)");
     }
 }
+

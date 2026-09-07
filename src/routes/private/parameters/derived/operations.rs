@@ -75,18 +75,30 @@ fn validate_formula(formula: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Resolve each formula variable to a parameter UUID, with strict validation.
-/// Returns Vec<(`variable_name`, `parameter_id`)>.
+/// What a formula's identifiers resolve to.
+#[derive(Default)]
+struct ResolvedSources {
+    /// `(variable_name, parameter_id)`: read from the event's stored readings.
+    parameters: Vec<(String, Uuid)>,
+    /// `(variable_name, site_property)`: read from the site's own row.
+    site_properties: Vec<(String, String)>,
+}
+
+/// Resolve each formula variable, with strict validation.
 ///
-/// An identifier naming a row of `constants` is not a variable at all: it resolves to the same
-/// value at every site and instant, so it is left out of the sources and bound at evaluation from
-/// the constants table, exactly as the script engine binds a declared constant.
+/// Most specific first: a catalog parameter, then a `constants` row, then a column of `sites`.
+/// An identifier naming a constant is not a variable at all: it resolves to the same value at
+/// every site and instant, so it is left out of the sources and bound at evaluation from the
+/// constants table, exactly as the script engine binds a declared constant. A column of `sites`
+/// is a property of the station rather than a measurement, so it is recorded as a site source and
+/// resolved from the site row at calculate time, never asked for at the visit.
 async fn resolve_variables(
     db: &DatabaseConnection,
     formula: &str,
-) -> Result<Vec<(String, Uuid)>, ApiError> {
+) -> Result<ResolvedSources, ApiError> {
     let var_names = free_identifiers(formula);
-    let mut resolved = Vec::with_capacity(var_names.len());
+    let mut resolved = ResolvedSources::default();
+    let mut site_columns: Option<Vec<String>> = None;
 
     for var_name in &var_names {
         let row = db
@@ -102,15 +114,43 @@ async fn resolve_variables(
             let id: Uuid = row
                 .try_get("", "id")
                 .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-            resolved.push((var_name.clone(), id));
+            resolved.parameters.push((var_name.clone(), id));
         } else if !names_a_constant(db, var_name).await? {
-            return Err(ApiError::bad_request(format!(
-                "Formula variable '{var_name}' does not match any parameter or constant"
-            )));
+            let columns = match &site_columns {
+                Some(columns) => columns,
+                None => site_columns.insert(site_columns_of(db).await?),
+            };
+            if columns.contains(var_name) {
+                resolved
+                    .site_properties
+                    .push((var_name.clone(), var_name.clone()));
+            } else {
+                return Err(ApiError::bad_request(format!(
+                    "Formula variable '{var_name}' does not match any parameter, constant or site \
+                     property"
+                )));
+            }
         }
     }
 
     Ok(resolved)
+}
+
+/// The columns of the `sites` row, which is what a site source may name (D13: any column is
+/// resolvable, and the kind check at calculate time is what refuses a text one in a number input).
+async fn site_columns_of(db: &DatabaseConnection) -> Result<Vec<String>, ApiError> {
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = 'sites'",
+        ))
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| r.try_get::<String>("", "column_name").ok())
+        .collect())
 }
 
 /// Whether the constants table holds this name.
@@ -321,8 +361,9 @@ async fn stored_definition(
 async fn sync_sources(
     db: &DatabaseConnection,
     definition_id: Uuid,
-    resolved_params: &[(String, Uuid)],
+    resolved: &ResolvedSources,
 ) -> Result<(), ApiError> {
+    let resolved_params = &resolved.parameters;
     // Delete existing rows
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
@@ -343,6 +384,26 @@ async fn sync_sources(
         .await
         .map_err(|e| {
             ApiError::internal(format!("Failed to insert source '{var_name}': {e}"), None)
+        })?;
+    }
+
+    for (var_name, property) in &resolved.site_properties {
+        db.execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"INSERT INTO derived_parameter_sources (derived_definition_id, site_property, variable_name)
+              VALUES ($1, $2, $3)",
+            [
+                definition_id.into(),
+                property.clone().into(),
+                var_name.clone().into(),
+            ],
+        ))
+        .await
+        .map_err(|e| {
+            ApiError::internal(
+                format!("Failed to insert site source '{var_name}': {e}"),
+                None,
+            )
         })?;
     }
 
@@ -470,7 +531,7 @@ impl CRUDOperations for CalculationFormulaOperations {
         // A definition being created may already have its output parameter in the catalog, and
         // anything reading that parameter is a chain this formula would close.
         let output = existing_parameter_id(db, &data.code).await?;
-        validate_against_stored_graph(db, output, &resolved).await?;
+        validate_against_stored_graph(db, output, &resolved.parameters).await?;
         Ok(())
     }
 
@@ -496,12 +557,14 @@ impl CRUDOperations for CalculationFormulaOperations {
 
         // Populate the sources field on the response
         entity.sources = resolved
+            .parameters
             .into_iter()
             .map(|(var_name, param_id)| {
                 crate::routes::private::parameters::derived::source_model::DerivedParameterSource {
                     id: Uuid::nil(), // Will be fetched by CrudCrate on next read
                     derived_definition_id: entity.id,
-                    parameter_id: param_id,
+                    parameter_id: Some(param_id),
+                    site_property: None,
                     variable_name: var_name,
                     created_at: None,
                 }
@@ -523,7 +586,7 @@ impl CRUDOperations for CalculationFormulaOperations {
             // The stored row says what this definition produces, so the cycle and depth guards run
             // before the write rather than after it: a refused update must leave nothing behind.
             let (output, _) = stored_definition(db, id).await?;
-            validate_against_stored_graph(db, output, &resolved).await?;
+            validate_against_stored_graph(db, output, &resolved.parameters).await?;
         }
         Ok(())
     }
@@ -548,12 +611,14 @@ impl CRUDOperations for CalculationFormulaOperations {
 
         // Populate the sources field on the response
         entity.sources = resolved
+            .parameters
             .into_iter()
             .map(|(var_name, param_id)| {
                 crate::routes::private::parameters::derived::source_model::DerivedParameterSource {
                     id: Uuid::nil(),
                     derived_definition_id: entity.id,
-                    parameter_id: param_id,
+                    parameter_id: Some(param_id),
+                    site_property: None,
                     variable_name: var_name,
                     created_at: None,
                 }

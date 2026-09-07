@@ -135,15 +135,30 @@ constant_value <- function(name, v) {
 
 #' The `standard_curves` row shape the portal functions pull `a`/`b` from. The API sends
 #' `slope`/`intercept`; the portal columns are `a` (slope) and `b` (intercept).
+#'
+#' A coefficient that is not a number is refused by name, as a constant is: `as.numeric` on a
+#' string would make it `NA`, and a calculation carries `NA` into its output rather than refusing,
+#' so the wrong answer would be silent.
 curve_df <- function(curve) {
   if (is.null(curve) || length(curve) == 0L) {
     return(NULL)
   }
   data.frame(
-    a = as.numeric(curve$slope),
-    b = as.numeric(curve$intercept),
+    a = coefficient(curve$slope, "slope"),
+    b = coefficient(curve$intercept, "intercept"),
     stringsAsFactors = FALSE
   )
+}
+
+coefficient <- function(v, name) {
+  if (is.null(v) || length(v) != 1L) {
+    stop(sprintf("curve coefficient '%s' has no value", name), call. = FALSE)
+  }
+  n <- suppressWarnings(as.numeric(v))
+  if (is.na(n)) {
+    stop(sprintf("curve coefficient '%s' is not a number", name), call. = FALSE)
+  }
+  n
 }
 
 #' A one-row data frame with the portal's column names, the shape every calculation function

@@ -729,6 +729,8 @@ fn table() -> Table {
             ),
             ("GET", "/api/sync/replicate_reconciliation/candidates"),
             ("POST", "/api/sync/replicate_reconciliation"),
+            ("GET", "/api/sync/change_proposals"),
+            ("POST", "/api/sync/change_proposals/decide"),
         ],
     );
 

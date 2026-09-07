@@ -651,7 +651,7 @@ async fn the_cross_site_list_reports_fill_and_findings() {
     let (status, body) = crate::common::get_json_with_token(&app, "/api/visits", &token).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["total"], 3);
-    let visits = body["visits"].as_array().unwrap();
+    let visits = body["items"].as_array().unwrap();
     let first = visits
         .iter()
         .find(|v| v["collected_at"] == T1)
@@ -670,7 +670,7 @@ async fn the_cross_site_list_reports_fill_and_findings() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["total"], 2);
-    let visits = body["visits"].as_array().unwrap();
+    let visits = body["items"].as_array().unwrap();
     assert_eq!(visits[0]["collected_at"], T1, "most findings first: {body}");
     assert_eq!(visits[1]["findings_open"], 0);
 }

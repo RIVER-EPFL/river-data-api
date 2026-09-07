@@ -8,10 +8,13 @@ mod common;
 
 mod attribute_existing_readings;
 mod backdate_auto_deployments;
+mod change_audit;
 mod channel_health_into_state;
 mod derived_definition_versions;
+mod instrument_kind;
 mod one_doc_parameter;
 mod provenance_kind;
+mod sample_statistics;
 mod site_parameter_entry_mode;
 mod source_parameter_instrument_names;
 mod synthesise_curation_record;

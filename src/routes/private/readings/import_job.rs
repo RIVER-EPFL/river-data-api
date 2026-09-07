@@ -3,7 +3,7 @@
 //! imported window and enqueues the alarm backfill.
 
 use async_trait::async_trait;
-use sea_orm::{ConnectionTrait, DbErr, EntityTrait, Set, Statement};
+use sea_orm::{ConnectionTrait, DbErr, EntityTrait, FromQueryResult, Set, Statement};
 use uuid::Uuid;
 
 use super::batch::{ConflictMode, readings_on_conflict};
@@ -18,6 +18,45 @@ use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport
 use crate::routes::private::sensors::calibrations::service::{
     Curve, apply_curves, recalculate_derived_at_timestamp,
 };
+
+/// One staged row, as `csv_import_staging` holds it. The job reads the set four times, so the
+/// columns are named once here rather than in each pass.
+#[derive(Debug, Clone, Copy, FromQueryResult)]
+struct StagedRow {
+    stream_id: Uuid,
+    site_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
+    time: chrono::DateTime<chrono::FixedOffset>,
+    raw_value: f64,
+    sensor_id: Option<Uuid>,
+    calibration_id: Option<Uuid>,
+    deployment_id: Option<Uuid>,
+}
+
+/// A curated replicate an overwrite is about to displace, and what makes it curated.
+#[derive(FromQueryResult)]
+struct CuratedRow {
+    replicate_index: i16,
+    reason: String,
+}
+
+#[derive(FromQueryResult)]
+struct IdRow {
+    id: Uuid,
+}
+
+#[derive(FromQueryResult)]
+struct CurveRow {
+    id: Uuid,
+    slope: f64,
+    intercept: f64,
+}
+
+#[derive(FromQueryResult)]
+struct StreamDefaultRow {
+    id: Uuid,
+    measurement_type: Option<String>,
+}
 
 /// Take a spot group's replicates from `count` onwards out of what the group serves, ahead of an
 /// overwrite that carries only `count` columns.
@@ -54,9 +93,10 @@ async fn displace_spot_tail(
         let entries = curated
             .iter()
             .map(|row| {
+                let row = CuratedRow::from_query_result(row, "")?;
                 Ok(serde_json::json!({
-                    "replicate_index": row.try_get::<i16>("", "replicate_index")?,
-                    "reason": row.try_get::<String>("", "reason")?,
+                    "replicate_index": row.replicate_index,
+                    "reason": row.reason,
                 }))
             })
             .collect::<Result<Vec<_>, DbErr>>()?;
@@ -168,6 +208,8 @@ impl CsvImport {
         ctx.set_site(site_id).await;
 
         // Read the staged rows back and rebuild the readings, re-applying the constant fields.
+        // Decoded once here: the rows are read four times below, and a column named in one place
+        // and not another is exactly the drift the derive removes.
         let mut staged = ctx
             .db()
             .query_all_raw(Statement::from_sql_and_values(
@@ -177,16 +219,16 @@ impl CsvImport {
                  FROM csv_import_staging WHERE import_token = $1 ORDER BY seq",
                 [import_token.into()],
             ))
-            .await?;
+            .await?
+            .iter()
+            .map(|row| StagedRow::from_query_result(row, ""))
+            .collect::<Result<Vec<_>, _>>()?;
 
         // The import handler refuses rows targeting a replicate-family stream before staging, and
         // the same rule holds here so no staging row, however it got there, mints replicate
         // indexes onto a family (a reading's index is the source's column position).
         {
-            let mut staged_streams: Vec<Uuid> = staged
-                .iter()
-                .filter_map(|row| row.try_get::<Uuid>("", "stream_id").ok())
-                .collect();
+            let mut staged_streams: Vec<Uuid> = staged.iter().map(|row| row.stream_id).collect();
             staged_streams.sort_unstable();
             staged_streams.dedup();
             let family_ids: std::collections::HashSet<Uuid> = ctx
@@ -199,14 +241,11 @@ impl CsvImport {
                 ))
                 .await?
                 .iter()
-                .filter_map(|row| row.try_get::<Uuid>("", "id").ok())
+                .filter_map(|row| IdRow::from_query_result(row, "").ok().map(|r| r.id))
                 .collect();
             if !family_ids.is_empty() {
                 let before = staged.len();
-                staged.retain(|row| {
-                    row.try_get::<Uuid>("", "stream_id")
-                        .is_ok_and(|id| !family_ids.contains(&id))
-                });
+                staged.retain(|row| !family_ids.contains(&row.stream_id));
                 ctx.log(
                     "warn",
                     "Staged rows targeting replicate-family streams were dropped; family \
@@ -221,14 +260,7 @@ impl CsvImport {
         // read back here so the stored value is the one that calibration produces: a row that names
         // a curve and carries the uncorrected number claims a correction it never had.
         let staged_curves = {
-            let mut ids: Vec<Uuid> = staged
-                .iter()
-                .filter_map(|row| {
-                    row.try_get::<Option<Uuid>>("", "calibration_id")
-                        .ok()
-                        .flatten()
-                })
-                .collect();
+            let mut ids: Vec<Uuid> = staged.iter().filter_map(|row| row.calibration_id).collect();
             ids.sort_unstable();
             ids.dedup();
             let mut curves: std::collections::HashMap<Uuid, Curve> =
@@ -243,13 +275,13 @@ impl CsvImport {
                     ))
                     .await?
                 {
-                    let id: Uuid = row.try_get("", "id")?;
+                    let curve = CurveRow::from_query_result(&row, "")?;
                     curves.insert(
-                        id,
+                        curve.id,
                         Curve {
-                            id,
-                            slope: row.try_get("", "slope")?,
-                            intercept: row.try_get("", "intercept")?,
+                            id: curve.id,
+                            slope: curve.slope,
+                            intercept: curve.intercept,
                         },
                     );
                 }
@@ -261,8 +293,8 @@ impl CsvImport {
             let mut stream_ids: Vec<Uuid> = Vec::new();
             let mut sensor_ids: Vec<Uuid> = Vec::new();
             for row in &staged {
-                stream_ids.push(row.try_get("", "stream_id")?);
-                if let Some(sid) = row.try_get::<Option<Uuid>>("", "sensor_id")? {
+                stream_ids.push(row.stream_id);
+                if let Some(sid) = row.sensor_id {
                     sensor_ids.push(sid);
                 }
             }
@@ -282,8 +314,8 @@ impl CsvImport {
                 ))
                 .await?
             {
-                let id: Uuid = row.try_get("", "id")?;
-                defaults.insert(id, row.try_get("", "measurement_type")?);
+                let stream = StreamDefaultRow::from_query_result(&row, "")?;
+                defaults.insert(stream.id, stream.measurement_type);
             }
             let types =
                 crate::routes::private::readings::measurement::measurement_types_for_sensors(
@@ -302,14 +334,16 @@ impl CsvImport {
         let mut models: Vec<readings::ActiveModel> = Vec::with_capacity(staged.len());
         let mut distinct_ts: Vec<chrono::DateTime<chrono::Utc>> = Vec::new();
         for row in &staged {
-            let stream_id: Uuid = row.try_get("", "stream_id")?;
-            let row_site_id: Option<Uuid> = row.try_get("", "site_id")?;
-            let parameter_id: Option<Uuid> = row.try_get("", "parameter_id")?;
-            let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
-            let raw_value: f64 = row.try_get("", "raw_value")?;
-            let sensor_id: Option<Uuid> = row.try_get("", "sensor_id")?;
-            let calibration_id: Option<Uuid> = row.try_get("", "calibration_id")?;
-            let deployment_id: Option<Uuid> = row.try_get("", "deployment_id")?;
+            let &StagedRow {
+                stream_id,
+                site_id: row_site_id,
+                parameter_id,
+                time,
+                raw_value,
+                sensor_id,
+                calibration_id,
+                deployment_id,
+            } = row;
             distinct_ts.push(time.with_timezone(&chrono::Utc));
             let measurement_type =
                 crate::routes::private::readings::measurement::resolve_measurement_type(

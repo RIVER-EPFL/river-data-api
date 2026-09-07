@@ -307,7 +307,7 @@ impl PlanWarning {
 
 /// One of an instrument's standard curves, carried so the review can show what a save would
 /// correct with.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanCurveRef {
     pub id: Uuid,
     pub name: Option<String>,
@@ -355,7 +355,7 @@ pub struct PlanInstrumentRef {
 }
 
 /// The instrument a proposed name collides with, enough of it to choose by.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct InstrumentNameConflict {
     pub id: Uuid,
     pub name: String,
@@ -377,6 +377,7 @@ pub struct PlanReplicates {
 
 /// The instruments a source has registered, with their curves, plus any instrument the plan's
 /// streams already name (which may belong to no source, e.g. a device registered by serial).
+#[derive(Clone)]
 pub struct InstrumentCatalog {
     /// Instrument id -> (display name, source_key).
     by_id: HashMap<Uuid, (String, Option<String>)>,
@@ -391,6 +392,12 @@ pub struct InstrumentCatalog {
     /// lab's `DOC` may have arrived by hand or from another import.
     by_name: HashMap<String, InstrumentNameConflict>,
     curves: HashMap<Uuid, Vec<PlanCurveRef>>,
+    /// Instruments registration minted for a stream that named none, rather than ones a source or
+    /// an operator attributed. They carry `metadata.minted_from_stream`
+    /// (`sensors/identity.rs::resolve_or_mint_stream_instrument`). A default is what keeps a
+    /// reading from naming nothing; it is not evidence about which analyser produced a correction,
+    /// so it loses to a curve label that matches the stream's own curve column.
+    defaulted: std::collections::HashSet<Uuid>,
 }
 
 impl InstrumentCatalog {
@@ -504,12 +511,24 @@ pub async fn load_instrument_catalog(
         }
     }
 
+    let defaulted = rows
+        .iter()
+        .filter(|row| {
+            row.metadata
+                .as_ref()
+                .and_then(|m| m.get("minted_from_stream"))
+                .is_some()
+        })
+        .map(|row| row.id)
+        .collect();
+
     Ok(InstrumentCatalog {
         by_id,
         labels,
         by_source_key,
         by_name,
         curves,
+        defaulted,
     })
 }
 
@@ -521,6 +540,28 @@ pub async fn load_instrument_catalog(
 /// curve catalog is replicated independently of the readings, so the instrument is knowable even
 /// when no row has yet named a curve. It is a heuristic, so it is reported as one, and an
 /// ambiguous stem resolves to nothing rather than to a guess.
+/// The one instrument of this source whose label matches a curve column's stem. An ambiguous stem
+/// matches nothing rather than guessing between two.
+///
+/// A registration-minted default is not a candidate: its label is the parameter's own name, so
+/// `DOC` would tie with the analyser labelled `DOC corr` and make every stem ambiguous. The
+/// question a curve column asks is which instrument the source says produced the correction, and a
+/// default is the absence of that answer.
+fn label_match(curve_column: &str, catalog: &InstrumentCatalog) -> Option<Uuid> {
+    let stem = curve_column_stem(curve_column);
+    let matches: Vec<Uuid> = catalog
+        .labels
+        .iter()
+        .filter(|(_, id)| !catalog.defaulted.contains(id))
+        .filter(|(label, _)| *label == stem || label.starts_with(&format!("{stem} ")))
+        .map(|(_, id)| *id)
+        .collect();
+    match matches[..] {
+        [id] => Some(id),
+        _ => None,
+    }
+}
+
 pub fn resolve_instrument(
     stream_sensor_id: Option<Uuid>,
     curve_column: Option<&str>,
@@ -530,7 +571,15 @@ pub fn resolve_instrument(
     let stamps_readings = curve_column.is_some();
     let curve_column = curve_column.map(str::to_string);
 
-    if let Some(id) = stream_sensor_id {
+    // A registration-minted default is not an attribution: it is the row that kept the stream's
+    // readings from naming nothing. A stream whose source names a curve column is asking which
+    // instrument produced that correction, and a default is not an answer to it, so the resolution
+    // continues past this arm and ends in the source's own instrument or a proposal. A default on a
+    // stream with no curve column stands: there is no question to ask.
+    let defaulted = stream_sensor_id.is_some_and(|id| catalog.defaulted.contains(&id));
+    let asks_for_an_instrument = defaulted && curve_column.is_some();
+
+    if let Some(id) = stream_sensor_id.filter(|_| !asks_for_an_instrument) {
         let (name, source_key) = catalog
             .by_id
             .get(&id)
@@ -574,14 +623,7 @@ pub fn resolve_instrument(
         });
     }
 
-    let matches: Vec<Uuid> = catalog
-        .labels
-        .iter()
-        .filter(|(label, _)| *label == stem || label.starts_with(&format!("{stem} ")))
-        .map(|(_, id)| *id)
-        .collect();
-
-    if let [id] = matches[..] {
+    if let Some(id) = label_match(&column, catalog) {
         let (name, source_key) = catalog.by_id.get(&id).cloned().unwrap_or_default();
         return Some(PlanInstrumentRef {
             curve_column,
@@ -1636,6 +1678,17 @@ async fn mint_plan_instruments<C: ConnectionTrait>(
             None,
         )
         .await?;
+        // The key is already taken by the instrument registration minted for the stream, so the
+        // upsert resolved to that row rather than creating one. It is the default the review exists
+        // to answer, so it takes the name the operator gave and stops being a default; without this
+        // the name is silently discarded and the plan reports a creation that did not happen.
+        txn.execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE sensors SET name = $2, metadata = metadata - 'minted_from_stream' \
+             WHERE id = $1 AND metadata ? 'minted_from_stream'",
+            [id.into(), want.name.clone().into()],
+        ))
+        .await?;
         minted.insert(source_key.to_string(), id);
     }
     Ok(minted)
@@ -1649,14 +1702,13 @@ async fn pair_entry_stream<C: ConnectionTrait>(
     parameter_id: Uuid,
     instrument_id: Option<Uuid>,
 ) -> AppResult<()> {
-    // The plan's instrument, when the stream does not already name one. A lab instrument gets no
-    // deployment: it corrects a grab, it is not stationed at the site, and the "attributed but not
-    // deployed" state is the one `import_sensor_for_stream` documents.
-    let from_plan = stream
-        .sensor_id
-        .is_none()
-        .then_some(instrument_id)
-        .flatten();
+    // The plan's instrument wins over the one the stream carries. Since registration mints an
+    // instrument for every stream, a review that only filled the gaps would fill none: the entry's
+    // instrument is the operator's answer to the question the review asked, so the apply repoints
+    // the stream onto it. A lab instrument gets no deployment: it corrects a grab, it is not
+    // stationed at the site, and the "attributed but not deployed" state is the one
+    // `import_sensor_for_stream` documents.
+    let from_plan = instrument_id.filter(|id| stream.sensor_id != Some(*id));
     let needs_sensor = stream.sensor_id.is_none() && from_plan.is_none();
     let device =
         crate::routes::private::sensors::identity::extract_vaisala_device_serial(&stream.metadata)
@@ -2509,7 +2561,64 @@ mod tests {
                 .collect(),
             by_name: HashMap::new(),
             curves: HashMap::new(),
+            defaulted: std::collections::HashSet::new(),
         }
+    }
+
+    /// Scenario: a stream carries the per-parameter instrument registration mints for every feed,
+    /// and the source's own curve catalog holds an instrument whose label matches the stream's
+    /// curve column.
+    /// Expected behaviour: the curve label wins. A minted instrument is what the registration had
+    /// to write to keep a reading from naming nothing, not a statement about which analyser
+    /// produced the correction.
+    #[test]
+    fn test_a_defaulted_instrument_loses_to_a_matching_curve_label() {
+        let defaulted = Uuid::new_v4();
+        let analyser = Uuid::new_v4();
+        let mut c = catalog(&[]);
+        c.by_id
+            .insert(defaulted, ("cnet DOC_avg_ppb".to_string(), None));
+        c.by_id
+            .insert(analyser, ("DOC corr".to_string(), Some("DOC corr".to_string())));
+        c.labels.push(("doc".to_string(), analyser));
+        c.defaulted.insert(defaulted);
+
+        let resolved =
+            super::resolve_instrument(Some(defaulted), Some("doc_std_curve_id"), "cnet", &c)
+                .expect("a curve column resolves");
+        assert_eq!(resolved.resolved_by, "curve_label", "{resolved:?}");
+        assert_eq!(resolved.id, Some(analyser));
+
+        // An instrument that is a real attribution still wins: it is what measured the value.
+        let attributed =
+            super::resolve_instrument(Some(analyser), Some("doc_std_curve_id"), "cnet", &c)
+                .expect("a curve column resolves");
+        assert_eq!(attributed.resolved_by, "stream", "{attributed:?}");
+        assert_eq!(attributed.id, Some(analyser));
+
+        // The default's own label is the parameter name, so without excluding it every stem would
+        // tie with the analyser's and resolve to nothing. This is the case that bit.
+        let mut tied = c.clone();
+        tied.labels.push(("doc".to_string(), defaulted));
+        let still =
+            super::resolve_instrument(Some(defaulted), Some("doc_std_curve_id"), "cnet", &tied)
+                .expect("a curve column resolves");
+        assert_eq!(still.resolved_by, "curve_label", "{still:?}");
+        assert_eq!(still.id, Some(analyser));
+
+        // With nothing to match, the question stands unanswered and the plan proposes one rather
+        // than reporting the default as though it were the source's answer.
+        let alone = super::resolve_instrument(Some(defaulted), Some("tss_std_curve_id"), "cnet", &c)
+            .expect("a curve column resolves");
+        assert_eq!(alone.resolved_by, "placeholder", "{alone:?}");
+        assert_eq!(alone.create, true, "{alone:?}");
+
+        // A default on a stream whose source names no curve column is left alone: nothing is being
+        // asked, and the instrument it carries is the one its readings name.
+        let quiet = super::resolve_instrument(Some(defaulted), None, "cnet", &c)
+            .expect("a stream instrument resolves");
+        assert_eq!(quiet.resolved_by, "stream", "{quiet:?}");
+        assert_eq!(quiet.id, Some(defaulted));
     }
 
     /// A catalog holding one instrument by name and nothing else, for the collision cases.

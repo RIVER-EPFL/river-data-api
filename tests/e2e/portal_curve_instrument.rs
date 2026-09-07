@@ -166,7 +166,12 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let curve_id = register_curve(&app, &admin, "standard_curves:1", "DOC corr").await;
-    let sensors_after_curve = count(&db, "SELECT COUNT(*) FROM sensors").await;
+    // The harness seeds one instrument of its own, so the question is what the registration added.
+    let sensors_after_curve = count(
+        &db,
+        &format!("SELECT COUNT(*) FROM sensors WHERE id <> '{}'", crate::common::FIXTURE_SENSOR_ID),
+    )
+    .await;
     assert_eq!(
         sensors_after_curve, 1,
         "registering a curve creates exactly its lab instrument",
@@ -212,9 +217,18 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
         "a proposal is not an agreement: {xyz_instrument}",
     );
 
-    assert!(
-        entry_for(&plan, &plain)["instrument"].is_null(),
-        "a stream with no curve column needs no instrument: {plan}",
+    // Every stream carries an instrument from registration, so the entry reports one rather than
+    // nothing. What a stream with no curve column still says is that no curve is applied per
+    // reading and that nothing is being created for it.
+    let plain_instrument = &entry_for(&plan, &plain)["instrument"];
+    assert_eq!(
+        plain_instrument["resolved_by"], "stream",
+        "the instrument the stream already carries: {plain_instrument}",
+    );
+    assert_eq!(plain_instrument["create"], false, "{plain_instrument}");
+    assert_eq!(
+        plain_instrument["stamps_readings"], false,
+        "no curve column, so no curve is stored per reading: {plain_instrument}",
     );
     assert_eq!(
         plan["summary"]["instruments_to_create"], 1,
@@ -370,11 +384,12 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
     );
 }
 
-/// Scenario: a portal that corrects a value upstream names no curve per reading, so the plan
-/// resolves no instrument for those streams. The instrument is still known (its curves are
-/// replicated), it just cannot be inferred.
+/// Scenario: a portal that corrects a value upstream names no curve per reading, so nothing
+/// connects those streams to the fluorometer that measured them. Every stream still carries an
+/// instrument, because registration mints one per (source, parameter); it is just not the right
+/// one, and no inference can reach the right one.
 ///
-/// Expected behaviour: the plan reports the gap rather than hiding it, an operator attaches the
+/// Expected behaviour: the plan reports what it resolved and by what, an operator attaches the
 /// instrument by parameter (settling every station at once, which is how two chla columns reach one
 /// fluorometer), and the apply stores it on the streams without stamping a curve on any reading.
 #[tokio::test]
@@ -404,15 +419,21 @@ async fn an_instrument_is_attached_to_streams_whose_source_names_no_curve() {
     )
     .await;
     assert_eq!(status, 200, "instruments view ({status}): {view}");
-    let unassigned = view["unassigned"].as_array().expect("unassigned array");
+    let groups = view["groups"].as_array().expect("groups array");
     assert_eq!(
-        unassigned.len(),
+        groups.len(),
         3,
-        "every parameter with no instrument is reported: {view}",
+        "each stream's own registration instrument is reported, one per parameter: {view}",
     );
     assert!(
-        view["groups"].as_array().is_some_and(Vec::is_empty),
-        "the plan binds no instrument yet, and the inventory is not listed as if it did: {view}",
+        groups
+            .iter()
+            .all(|g| g["resolved_by"] == "stream" && g["instrument_id"] != instrument_id),
+        "none of them is the fluorometer, which is the gap the operator closes below: {view}",
+    );
+    assert!(
+        view["unassigned"].as_array().is_some_and(Vec::is_empty),
+        "no measurement without an instrument: nothing is left unattributed: {view}",
     );
 
     for stream in [&acid, &noacid] {

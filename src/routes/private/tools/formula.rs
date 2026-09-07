@@ -28,6 +28,11 @@ pub struct PinnedFormula {
     /// `(variable_name, parameter_code)`: the formula variable and the catalog parameter read
     /// into it.
     pub sources: Vec<(String, String)>,
+    /// `(variable_name, site_property)`: the formula variable and the column of the site's own row
+    /// read into it. A station's elevation is not a measurement anything took at a visit, so it is
+    /// resolved from the site rather than asked for per event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub site_sources: Vec<(String, String)>,
     /// The curve slot this formula corrects with, if any. Inside the formula the slot's
     /// coefficients are the variables `curve_slope` and `curve_intercept`, so a calculation whose
     /// outputs take different curves declares a slot per formula rather than one per calculation.
@@ -282,6 +287,7 @@ pub fn manifest_json(
         .collect();
     let mut params = Vec::new();
     let mut event_inputs = Vec::new();
+    let mut site_inputs = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for (index, formula) in ordered.iter().enumerate() {
         let internal = produced_before(&ordered, index, formula.per_replicate.is_some());
@@ -311,6 +317,26 @@ pub fn manifest_json(
                 "required": false,
             }));
             event_inputs.push(json!({ "param": variable, "parameter_code": parameter_code }));
+        }
+        for (variable, property) in &formula.site_sources {
+            if seen.contains(variable) {
+                continue;
+            }
+            seen.push(variable.clone());
+            params.push(json!({
+                "name": variable,
+                "label": variable,
+                "kind": "number",
+                "required": false,
+            }));
+            // Required: the formula reads it in every run, so a site that holds no value refuses
+            // the run naming the property rather than evaluating to nothing. The param itself
+            // stays optional, which is what lets a request override the stored value.
+            site_inputs.push(json!({
+                "property": property,
+                "param": variable,
+                "required": true,
+            }));
         }
     }
     let outputs: Vec<serde_json::Value> = ordered
@@ -342,6 +368,7 @@ pub fn manifest_json(
         "outputs": outputs,
         "constants": constants_of(formulas),
         "curves": curves,
+        "site_inputs": site_inputs,
         "event_inputs": event_inputs,
     }))
 }
@@ -583,6 +610,7 @@ mod tests {
                 .iter()
                 .map(|(v, p)| ((*v).to_string(), (*p).to_string()))
                 .collect(),
+            site_sources: Vec::new(),
             curve_slot: None,
             per_replicate: None,
         }
@@ -819,6 +847,45 @@ mod tests {
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0]["key"], "suva");
         assert_eq!(outputs[0]["suggested_parameter_code"], "suva");
+    }
+
+    /// Scenario: a formula reads the station's elevation, which is a column of the site row and
+    /// not a parameter anything measured.
+    /// Expected behaviour: the manifest declares it a site input, so the existing resolution fills
+    /// it from the `sites` row at calculate time, and it is not asked for at the event.
+    #[test]
+    fn test_a_site_source_is_a_site_input_and_not_an_event_input() {
+        let mut bp = formula(
+            "field_bp_altitude",
+            1,
+            "1013.25 * exp(-elevation / 8434.5)",
+            Some("field_bp_altitude"),
+            &[],
+        );
+        bp.site_sources = vec![("elevation".to_string(), "elevation".to_string())];
+        let manifest = manifest_json("Field Data", None, &[bp]).expect("the set has an order");
+
+        let site_inputs = manifest["site_inputs"].as_array().unwrap();
+        assert_eq!(site_inputs.len(), 1, "{site_inputs:?}");
+        assert_eq!(site_inputs[0]["property"], "elevation");
+        assert_eq!(site_inputs[0]["param"], "elevation");
+        assert_eq!(
+            site_inputs[0]["required"], true,
+            "a formula cannot evaluate without it, and a blank one would silently produce nothing"
+        );
+
+        assert!(
+            manifest["event_inputs"]
+                .as_array()
+                .is_none_or(|e| e.is_empty()),
+            "the site row holds it, so nothing reads it at the event: {:?}",
+            manifest["event_inputs"]
+        );
+
+        let params = manifest["params"].as_array().unwrap();
+        assert_eq!(params.len(), 1, "{params:?}");
+        assert_eq!(params[0]["name"], "elevation");
+        assert_eq!(params[0]["kind"], "number");
     }
 
     #[test]

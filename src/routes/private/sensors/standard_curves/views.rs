@@ -8,7 +8,7 @@ use axum::{Json, extract::State};
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
-    Statement,
+    Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -189,25 +189,40 @@ pub async fn register_standard_curve(
                 superseded: false,
             }));
         }
-        // Used curve edited upstream: mint a successor and move the provenance to it. The old row
-        // keeps the readings it produced; only its provenance columns are cleared so the partial
-        // unique index admits the successor. The clearing must come first: while the old row still
-        // holds the key, the successor insert conflicts, does nothing, and resolves back to the
-        // old row.
+        // Used curve edited upstream: mint a successor, move the provenance to it and retire the
+        // row it replaces, in one transaction. The old row keeps the readings it produced and the
+        // system it came from; only its `source_key` is cleared, which is what the partial unique
+        // index needs to admit the successor, and the clearing must come first, because while the
+        // old row still holds the key the successor insert conflicts, does nothing, and resolves
+        // back to the old row. Retiring it is what takes it out of the picker: without that, the
+        // lab is offered both rows on one instrument, the same name and fit date on each, and
+        // nothing saying which one the portal now holds.
         let old_id = current.id;
-        state
-            .db
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE standard_curves SET source_system = NULL, source_key = NULL WHERE id = $1",
-                [old_id.into()],
-            ))
-            .await?;
-        let minted = insert_curve(&state, &payload, sensor_id)
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!("minting successor for edited curve {old_id}: {e}"))
-            })?;
+        let txn = state.db.begin().await?;
+        txn.execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE standard_curves SET source_key = NULL WHERE id = $1",
+            [old_id.into()],
+        ))
+        .await?;
+        let minted = insert_curve(&txn, &payload, sensor_id).await.map_err(|e| {
+            AppError::Internal(format!("minting successor for edited curve {old_id}: {e}"))
+        })?;
+        txn.execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE standard_curves                 SET retired_at = NOW(), retired_by = $2, retired_reason = $3               WHERE id = $1 AND retired_at IS NULL",
+            [
+                old_id.into(),
+                payload.source_system.clone().into(),
+                format!(
+                    "Superseded by {minted}: {} re-registered {} with different coefficients",
+                    payload.source_system, payload.source_key
+                )
+                .into(),
+            ],
+        ))
+        .await?;
+        txn.commit().await?;
         tracing::warn!(
             source_system = %payload.source_system,
             source_key = %payload.source_key,
@@ -222,7 +237,7 @@ pub async fn register_standard_curve(
         }));
     }
 
-    let id = insert_curve(&state, &payload, sensor_id).await?;
+    let id = insert_curve(&state.db, &payload, sensor_id).await?;
     Ok(Json(RegisterStandardCurveResponse {
         id,
         sensor_id,
@@ -230,15 +245,13 @@ pub async fn register_standard_curve(
     }))
 }
 
-async fn insert_curve(
-    state: &AppState,
+async fn insert_curve<C: ConnectionTrait>(
+    conn: &C,
     payload: &RegisterStandardCurveRequest,
     sensor_id: Uuid,
 ) -> AppResult<Uuid> {
     let id = Uuid::new_v4();
-    state
-        .db
-        .execute_raw(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO standard_curves
                  (id, sensor_id, name, fitted_on, slope, intercept, r_squared, notes, created_at,
@@ -270,7 +283,7 @@ async fn insert_curve(
     let row = Entity::find()
         .filter(Column::SourceSystem.eq(payload.source_system.clone()))
         .filter(Column::SourceKey.eq(payload.source_key.clone()))
-        .one(&state.db)
+        .one(conn)
         .await?
         .ok_or_else(|| AppError::Internal("registered curve not found after upsert".to_string()))?;
     Ok(row.id)
@@ -308,8 +321,8 @@ const LAST_USED_METHOD: &str = "The newest spot reading at this site and paramet
 /// with, so the picker opens where the previous batch left off. `read_data`.
 #[utoipa::path(
     get,
-    path = "/api/sites/{id}/last_curve",
-    params(("id" = Uuid, Path, description = "Site UUID"), LastUsedCurveQuery),
+    path = "/api/sites/{site_id}/last_curve",
+    params(("site_id" = Uuid, Path, description = "Site UUID"), LastUsedCurveQuery),
     responses(
         (status = 200, body = LastUsedCurveResponse),
         (status = 400, description = "Neither parameter_id nor parameter_code given"),

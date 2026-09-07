@@ -6,6 +6,8 @@
 //! crudcrate's own function, which sanitises the resource name and clamps the end.
 
 use axum::http::HeaderMap;
+use serde::Serialize;
+use utoipa::ToSchema;
 
 /// The rows a request asked for: where the page starts and how many it takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +62,37 @@ impl Window {
     #[must_use]
     pub fn page(self) -> u64 {
         self.offset / self.limit + 1
+    }
+}
+
+/// One page of rows and nothing else: the shape every list answers in when it has no subject of
+/// its own.
+///
+/// A list that carries a subject beside its rows is a domain object, not a page, and keeps its own
+/// name for them: `GET /sites/{id}/visits` answers with the site and the grid's columns,
+/// `/streams/{id}/receipts` with the stream, the hold list with its per-kind counts, the search
+/// with results grouped by entity, and the alarm summary with its breakdowns. Those stay as they
+/// are; folding a subject into an envelope would only move it to a second key.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    /// Rows matching the filter, not rows on this page.
+    pub total: u64,
+    pub page: u64,
+    pub page_size: u64,
+}
+
+impl<T> Page<T> {
+    /// The page `window` asked for, with the total the count query answered. An absent window is a
+    /// caller that asked for everything, which is page 1 of one page.
+    #[must_use]
+    pub fn new(items: Vec<T>, total: u64, window: Option<Window>) -> Self {
+        Self {
+            items,
+            total,
+            page: window.map_or(1, Window::page),
+            page_size: window.map_or(total, |w| w.limit),
+        }
     }
 }
 
@@ -132,6 +165,18 @@ mod tests {
             Window { offset: 0, limit: 25 }
         );
         assert_eq!(Window::from_range(Some("nonsense"), 25, 100).offset, 0);
+    }
+
+    #[test]
+    fn a_page_reports_the_window_it_answered_and_the_total_it_counted() {
+        let page = Page::new(vec![1, 2, 3], 30, Some(Window::from_page(Some(2), Some(3), 50, 100)));
+        assert_eq!((page.page, page.page_size, page.total), (2, 3, 30));
+    }
+
+    #[test]
+    fn an_unpaged_list_is_one_page_holding_everything() {
+        let page = Page::new(vec![1, 2], 2, None);
+        assert_eq!((page.page, page.page_size), (1, 2));
     }
 
     #[test]

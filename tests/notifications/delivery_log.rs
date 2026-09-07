@@ -123,15 +123,15 @@ async fn rows_of_one_delivery_are_read_back_as_one_message_with_its_recipients()
         .expect("delivery log reads");
 
     assert_eq!(page.total, 2, "two messages, not three rows");
-    assert_eq!(page.messages.len(), 2);
+    assert_eq!(page.items.len(), 2);
 
-    let newest = &page.messages[0];
+    let newest = &page.items[0];
     assert_eq!(newest.kind, "sync_stale", "newest message first");
     assert_eq!(newest.counts.muted, 1);
     assert_eq!(newest.counts.total, 1);
     assert!(newest.alarm_event_id.is_none());
 
-    let alarm = &page.messages[1];
+    let alarm = &page.items[1];
     assert_eq!(alarm.alarm_event_id.map(|id| id.to_string()), Some(event));
     assert_eq!(alarm.counts.total, 2);
     assert_eq!(alarm.counts.sent, 1);
@@ -166,17 +166,17 @@ async fn a_status_filter_keeps_the_messages_carrying_that_status_whole() {
         .await
         .expect("filtered log reads");
     assert_eq!(page.total, 1, "only the alarm message carries a failure");
-    assert_eq!(page.messages.len(), 1);
+    assert_eq!(page.items.len(), 1);
     // The message is kept whole: the delivery that succeeded is still shown beside the one that
     // did not, which is the comparison the panel exists for.
-    assert_eq!(page.messages[0].recipients.len(), 2);
-    assert_eq!(page.messages[0].counts.sent, 1);
+    assert_eq!(page.items[0].recipients.len(), 2);
+    assert_eq!(page.items[0].counts.sent, 1);
 
     let none = list_deliveries(&db, &query(Some("skipped"), None, None, None))
         .await
         .expect("a status nothing carries is empty, not an error");
     assert_eq!(none.total, 0);
-    assert!(none.messages.is_empty());
+    assert!(none.items.is_empty());
 
     let bad = list_deliveries(&db, &query(Some("delivered"), None, None, None)).await;
     assert!(
@@ -193,17 +193,17 @@ async fn the_page_is_counted_in_messages_and_the_kind_filter_narrows_it() {
     let first = list_deliveries(&db, &query(None, None, Some(1), None))
         .await
         .expect("first page reads");
-    assert_eq!(first.messages.len(), 1);
+    assert_eq!(first.items.len(), 1);
     assert_eq!(first.total, 2, "total counts messages the filter matched");
-    assert_eq!(first.messages[0].kind, "sync_stale");
+    assert_eq!(first.items[0].kind, "sync_stale");
 
     let second = list_deliveries(&db, &query(None, None, Some(1), Some(1)))
         .await
         .expect("second page reads");
-    assert_eq!(second.messages.len(), 1);
-    assert_eq!(second.messages[0].kind, "alarm_opened");
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].kind, "alarm_opened");
     assert_eq!(
-        second.messages[0].recipients.len(),
+        second.items[0].recipients.len(),
         2,
         "the offset page carries its own rows"
     );
@@ -212,7 +212,7 @@ async fn the_page_is_counted_in_messages_and_the_kind_filter_narrows_it() {
         .await
         .expect("kind filter reads");
     assert_eq!(by_kind.total, 1);
-    assert_eq!(by_kind.messages[0].kind, "sync_stale");
+    assert_eq!(by_kind.items[0].kind, "sync_stale");
 }
 
 #[tokio::test]
@@ -225,5 +225,5 @@ async fn an_empty_log_is_an_empty_page() {
         .await
         .expect("an empty log reads");
     assert_eq!(page.total, 0);
-    assert!(page.messages.is_empty());
+    assert!(page.items.is_empty());
 }

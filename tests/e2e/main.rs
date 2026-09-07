@@ -19,6 +19,7 @@ mod instrument_grab_alongside_sensor;
 mod onboarding_tracks;
 mod pairing_plan_lifecycle;
 mod portal_curve_instrument;
+mod portal_full_sync_command;
 mod portal_import_to_paired;
 mod portal_loop;
 mod portal_station_pairing;

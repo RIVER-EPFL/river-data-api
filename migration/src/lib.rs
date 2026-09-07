@@ -7,9 +7,9 @@ mod m20260906_000002_instrument_required_untyped;
 mod m20260906_000003_note_provenance;
 mod m20260907_000001_full_reassert_per_service;
 pub mod m20260907_000002_backdate_auto_deployments;
-mod m20260907_000003_sample_statistics;
+pub mod m20260907_000003_sample_statistics;
 mod m20260907_000004_unverified_entries;
-mod m20260907_000005_instrument_kind;
+pub mod m20260907_000005_instrument_kind;
 pub mod m20260907_000006_synthesise_curation_record;
 mod m20260907_000007_meteoswiss_pressure;
 mod m20260908_000001_parameter_groups;
@@ -21,7 +21,7 @@ pub mod m20260908_000006_one_doc_parameter;
 pub mod m20260908_000007_seed_portal_parameter_groups;
 pub mod m20260908_000008_channel_health_into_state;
 mod m20260909_000001_seed_metalp_parameter_groups;
-mod m20260910_000001_change_audit;
+pub mod m20260910_000001_change_audit;
 mod m20260910_000002_parameter_default_thresholds;
 mod m20260910_000003_generated_sample_stdev;
 mod m20260910_000004_rollback_restores_ingested_at;
@@ -40,6 +40,8 @@ mod m20260910_000016_curve_copied_from;
 pub mod m20260910_000017_rename_calculation_formulas;
 mod m20260910_000018_reading_change_proposals;
 pub mod m20260910_000019_ledger_lookup_indexes;
+mod m20260910_000020_formula_site_source;
+pub mod m20260910_000021_curve_retirement;
 pub mod portal_seed;
 
 pub struct Migrator;
@@ -88,6 +90,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260910_000017_rename_calculation_formulas::Migration),
             Box::new(m20260910_000018_reading_change_proposals::Migration),
             Box::new(m20260910_000019_ledger_lookup_indexes::Migration),
+            Box::new(m20260910_000020_formula_site_source::Migration),
+            Box::new(m20260910_000021_curve_retirement::Migration),
         ]
     }
 }

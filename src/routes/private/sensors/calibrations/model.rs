@@ -45,6 +45,15 @@ pub struct Model {
     pub valid_until_explicit: bool,
     #[crudcrate(exclude(create, update))]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the curve was taken out of circulation (M146). A retired curve is never resolved for a
+    /// reading again and never bounds another curve's window; the row, its coefficients and the
+    /// readings it corrected stay. Written by the retire routes, never through CRUD.
+    #[crudcrate(exclude(create, update), filterable, sortable)]
+    pub retired_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[crudcrate(exclude(create, update))]
+    pub retired_by: Option<String>,
+    #[crudcrate(exclude(create, update))]
+    pub retired_reason: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

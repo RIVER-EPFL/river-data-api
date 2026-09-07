@@ -150,6 +150,10 @@ pub struct CalibrationRef {
     pub valid_from: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valid_until: Option<DateTime<Utc>>,
+    /// Set when the curve has been retired: the reading keeps the value it produced, and no new
+    /// measurement resolves it (M146).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -161,6 +165,9 @@ pub struct CurveRef {
     pub name: Option<String>,
     pub slope: f64,
     pub intercept: f64,
+    /// Set when the lab has taken the curve out of circulation (M147). The value stands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -199,14 +206,18 @@ async fn load_value_arrivals(
         ))
         .await?;
     let mut out = HashMap::new();
-    for r in &rows {
-        out.insert(
-            (r.try_get("", "stream_id")?, r.try_get("", "replicate_index")?),
-            r.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "at")?
-                .with_timezone(&Utc),
-        );
+    for r in rows.iter().map(|r| ArrivalRow::from_query_result(r, "")) {
+        let r = r?;
+        out.insert((r.stream_id, r.replicate_index), r.at.with_timezone(&Utc));
     }
     Ok(out)
+}
+
+#[derive(FromQueryResult)]
+struct ArrivalRow {
+    stream_id: Uuid,
+    replicate_index: i16,
+    at: DateTime<chrono::FixedOffset>,
 }
 
 /// Live instrument and calibration pins on the streams' instant (ADR 0008, M59), keyed by stream.
@@ -230,22 +241,33 @@ async fn load_pins(
         ))
         .await?;
     let mut out: HashMap<Uuid, Vec<PinRef>> = HashMap::new();
-    for r in &rows {
-        let stream_id: Uuid = r.try_get("", "stream_id")?;
-        out.entry(stream_id).or_default().push(PinRef {
-            decision_id: r.try_get("", "id")?,
-            kind: r.try_get("", "kind")?,
-            replicate_index: r.try_get("", "replicate_index")?,
-            target: r.try_get("", "new")?,
-            actor: r.try_get("", "actor")?,
-            at: r
-                .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "at")?
-                .with_timezone(&Utc),
-            reason: r.try_get("", "reason")?,
-            set_id: r.try_get("", "set_id")?,
+    for r in rows.iter().map(|r| PinRow::from_query_result(r, "")) {
+        let r = r?;
+        out.entry(r.stream_id).or_default().push(PinRef {
+            decision_id: r.id,
+            kind: r.kind,
+            replicate_index: r.replicate_index,
+            target: r.new,
+            actor: r.actor,
+            at: r.at.with_timezone(&Utc),
+            reason: r.reason,
+            set_id: r.set_id,
         });
     }
     Ok(out)
+}
+
+#[derive(FromQueryResult)]
+struct PinRow {
+    stream_id: Uuid,
+    id: Uuid,
+    kind: String,
+    replicate_index: Option<i16>,
+    new: serde_json::Value,
+    actor: String,
+    at: DateTime<chrono::FixedOffset>,
+    reason: Option<String>,
+    set_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -773,6 +795,7 @@ pub async fn assemble_records(
                         intercept: c.intercept,
                         valid_from: c.valid_from,
                         valid_until: c.valid_until,
+                        retired_at: c.retired_at,
                     })
                 }),
                 standard_curve: r.standard_curve_id.and_then(|id| {
@@ -782,6 +805,7 @@ pub async fn assemble_records(
                         name: c.name.clone(),
                         slope: c.slope,
                         intercept: c.intercept,
+                        retired_at: c.retired_at,
                     })
                 }),
             })
@@ -950,13 +974,6 @@ fn sanitize_cadence(value: &str) -> AppResult<&str> {
     }
 }
 
-fn fixed_at(row: &sea_orm::QueryResult, name: &str) -> Option<DateTime<Utc>> {
-    row.try_get::<Option<DateTime<chrono::FixedOffset>>>("", name)
-        .ok()
-        .flatten()
-        .map(|t| t.with_timezone(&Utc))
-}
-
 /// The latest windowed-ingest pass covering the instant, per stream.
 async fn fetch_covering_receipts(
     db: &sea_orm::DatabaseConnection,
@@ -975,36 +992,64 @@ async fn fetch_covering_receipts(
         ))
         .await?;
     let mut out = HashMap::new();
-    for row in rows {
-        let stream_id: Uuid = row.try_get("", "stream_id")?;
+    for row in rows.iter().map(|r| CoveringReceipt::from_query_result(r, "")) {
+        let row = row?;
         out.insert(
-            stream_id,
+            row.stream_id,
             ReceiptSummary {
-                id: row.try_get("", "id")?,
-                at: fixed_at(&row, "at").unwrap_or(time),
-                window_from: fixed_at(&row, "window_from"),
-                window_to: fixed_at(&row, "window_to"),
-                submitted: row.try_get("", "submitted")?,
-                new_rows: row.try_get("", "new_rows")?,
-                changed: row.try_get("", "changed")?,
-                unchanged: row.try_get("", "unchanged")?,
-                withdrawn: row.try_get("", "withdrawn")?,
-                rejected_total: row.try_get("", "rejected_total")?,
-                braked: row.try_get("", "braked")?,
+                id: row.id,
+                at: row.at.map_or(time, |t| t.with_timezone(&Utc)),
+                window_from: row.window_from.map(|t| t.with_timezone(&Utc)),
+                window_to: row.window_to.map(|t| t.with_timezone(&Utc)),
+                submitted: row.submitted,
+                new_rows: row.new_rows,
+                changed: row.changed,
+                unchanged: row.unchanged,
+                withdrawn: row.withdrawn,
+                rejected_total: row.rejected_total,
+                braked: row.braked,
             },
         );
     }
     Ok(out)
 }
 
-fn hold_ref(row: &sea_orm::QueryResult) -> Result<HoldRef, sea_orm::DbErr> {
-    let created: DateTime<chrono::FixedOffset> = row.try_get("", "created_at")?;
-    Ok(HoldRef {
-        id: row.try_get("", "id")?,
-        kind: row.try_get("", "kind")?,
-        status: row.try_get("", "status")?,
-        created_at: created.with_timezone(&Utc),
-    })
+#[derive(FromQueryResult)]
+struct CoveringReceipt {
+    stream_id: Uuid,
+    id: Uuid,
+    at: Option<DateTime<chrono::FixedOffset>>,
+    window_from: Option<DateTime<chrono::FixedOffset>>,
+    window_to: Option<DateTime<chrono::FixedOffset>>,
+    submitted: i32,
+    new_rows: i32,
+    changed: i32,
+    unchanged: i32,
+    withdrawn: i32,
+    rejected_total: i32,
+    braked: bool,
+}
+
+/// A hold as its queries select it, with the key column each of the two shapes carries.
+#[derive(FromQueryResult)]
+struct HoldRow {
+    stream_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
+    id: Uuid,
+    kind: String,
+    status: String,
+    created_at: DateTime<chrono::FixedOffset>,
+}
+
+impl From<&HoldRow> for HoldRef {
+    fn from(row: &HoldRow) -> Self {
+        Self {
+            id: row.id,
+            kind: row.kind.clone(),
+            status: row.status.clone(),
+            created_at: row.created_at.with_timezone(&Utc),
+        }
+    }
 }
 
 /// Replicate-statistics holds keyed by stream at the instant. Terminal holds are left out.
@@ -1016,7 +1061,8 @@ async fn fetch_stream_holds(
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT stream_id, id, kind, status, created_at FROM replicate_audit_holds \
+            "SELECT stream_id, NULL::uuid AS parameter_id, id, kind, status, created_at \
+             FROM replicate_audit_holds \
              WHERE stream_id = ANY($1) AND group_time = $2 \
                AND status IN ('pending', 'deferred', 'acknowledged') \
              ORDER BY created_at DESC",
@@ -1024,9 +1070,11 @@ async fn fetch_stream_holds(
         ))
         .await?;
     let mut out: HashMap<Uuid, Vec<HoldRef>> = HashMap::new();
-    for row in rows {
-        let stream_id: Uuid = row.try_get("", "stream_id")?;
-        out.entry(stream_id).or_default().push(hold_ref(&row)?);
+    for row in rows.iter().map(|r| HoldRow::from_query_result(r, "")) {
+        let row = row?;
+        if let Some(stream_id) = row.stream_id {
+            out.entry(stream_id).or_default().push((&row).into());
+        }
     }
     Ok(out)
 }
@@ -1048,7 +1096,8 @@ async fn fetch_slot_holds(
         let found = db
             .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT parameter_id, id, kind, status, created_at FROM replicate_audit_holds \
+                "SELECT NULL::uuid AS stream_id, parameter_id, id, kind, status, created_at \
+                 FROM replicate_audit_holds \
                  WHERE stream_id IS NULL AND site_id = $1 AND parameter_id = ANY($2) \
                    AND group_time = $3 AND status IN ('pending', 'deferred', 'acknowledged') \
                  ORDER BY created_at DESC",
@@ -1059,11 +1108,13 @@ async fn fetch_slot_holds(
                 ],
             ))
             .await?;
-        for row in found {
-            let parameter_id: Uuid = row.try_get("", "parameter_id")?;
-            out.entry((site_id, parameter_id))
-                .or_default()
-                .push(hold_ref(&row)?);
+        for row in found.iter().map(|r| HoldRow::from_query_result(r, "")) {
+            let row = row?;
+            if let Some(parameter_id) = row.parameter_id {
+                out.entry((site_id, parameter_id))
+                    .or_default()
+                    .push((&row).into());
+            }
         }
     }
     Ok(out)
@@ -1091,13 +1142,19 @@ async fn fetch_run_sources(
         ))
         .await?;
     let mut out = HashMap::new();
-    for row in found {
-        let id: Uuid = row.try_get("", "id")?;
-        if let Some(source) = row.try_get::<Option<String>>("", "source")? {
-            out.insert(id, source);
+    for row in found.iter().map(|r| RunSourceRow::from_query_result(r, "")) {
+        let row = row?;
+        if let Some(source) = row.source {
+            out.insert(row.id, source);
         }
     }
     Ok(out)
+}
+
+#[derive(FromQueryResult)]
+struct RunSourceRow {
+    id: Uuid,
+    source: Option<String>,
 }
 
 /// The calculation behind every derived row, keyed by the output parameter it writes, and the
@@ -1131,21 +1188,25 @@ async fn fetch_calculations(
         ))
         .await?;
     let mut by_parameter: HashMap<Uuid, CalculationInfo> = HashMap::new();
-    for row in definitions {
-        let Some(output) = row.try_get::<Option<Uuid>>("", "output_parameter_id")? else {
+    for row in definitions
+        .iter()
+        .map(|r| DefinitionRow::from_query_result(r, ""))
+    {
+        let row = row?;
+        let Some(output) = row.output_parameter_id else {
             continue;
         };
         by_parameter.insert(
             output,
             CalculationInfo {
-                definition_id: row.try_get("", "id")?,
-                code: row.try_get("", "code")?,
-                name: row.try_get("", "name")?,
+                definition_id: row.id,
+                code: row.code,
+                name: row.name,
                 version_id: None,
                 version_no: None,
                 formula: None,
                 content_hash: None,
-                active_version_no: row.try_get("", "active_version_no")?,
+                active_version_no: row.active_version_no,
             },
         );
     }
@@ -1168,17 +1229,28 @@ async fn fetch_calculations(
         ))
         .await?;
     let mut versions = HashMap::new();
-    for row in found {
-        versions.insert(
-            row.try_get::<Uuid>("", "id")?,
-            (
-                row.try_get::<i32>("", "version_no")?,
-                row.try_get::<String>("", "formula")?,
-                row.try_get::<String>("", "content_hash")?,
-            ),
-        );
+    for row in found.iter().map(|r| VersionRow::from_query_result(r, "")) {
+        let row = row?;
+        versions.insert(row.id, (row.version_no, row.formula, row.content_hash));
     }
     Ok((by_parameter, versions))
+}
+
+#[derive(FromQueryResult)]
+struct DefinitionRow {
+    id: Uuid,
+    code: String,
+    name: String,
+    output_parameter_id: Option<Uuid>,
+    active_version_no: Option<i32>,
+}
+
+#[derive(FromQueryResult)]
+struct VersionRow {
+    id: Uuid,
+    version_no: i32,
+    formula: String,
+    content_hash: String,
 }
 
 /// The slot's code, name, unit and declared precision. The site's own configuration wins over the
@@ -1200,12 +1272,16 @@ async fn slot_identity(
         ))
         .await?;
     let Some(row) = row else { return Ok(None) };
-    Ok(Some((
-        row.try_get("", "code")?,
-        row.try_get("", "name")?,
-        row.try_get("", "units")?,
-        row.try_get("", "decimal_places")?,
-    )))
+    let row = SlotRow::from_query_result(&row, "")?;
+    Ok(Some((row.code, row.name, row.units, row.decimal_places)))
+}
+
+#[derive(FromQueryResult)]
+struct SlotRow {
+    code: String,
+    name: String,
+    units: Option<String>,
+    decimal_places: Option<i16>,
 }
 
 #[cfg(test)]

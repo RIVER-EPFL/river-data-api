@@ -137,3 +137,80 @@ async fn the_spec_carries_the_generated_entity_routes() {
         "a generated create model is documented"
     );
 }
+
+/// The other direction: every route the service router mounts is in the document. `every_documented_path_resolves`
+/// only catches a `#[utoipa::path]` whose path drifted from where its handler is mounted; a
+/// handler with no annotation at all is invisible to it, which is how ten reachable endpoints
+/// came to be undescribed.
+///
+/// The exemption list is the same shape the permission matrix keeps: a route absent from the
+/// document on purpose says why here.
+#[test]
+fn every_registered_route_is_documented() {
+    let db = sea_orm::DatabaseConnection::default();
+    let mut config = crate::common::test_config();
+    config.keycloak_admin_client_id = Some("river-data-admin".into());
+    config.keycloak_admin_client_secret = Some("unused".into());
+    let state = river_db::common::AppState::new(db, config, None);
+    let spec = river_db::routes::openapi_spec(&state);
+
+    // Routes deliberately outside the document, with the reason.
+    let exempt = [
+        // The enrollment pair speaks the sync protocol, whose contract is river-data-core's wire
+        // types rather than an integrator-facing document.
+        "/api/sync/enroll",
+        "/api/sync/heartbeat",
+    ];
+
+    let sources: [(&str, &str); 5] = [
+        ("src/routes/service/mod.rs", "/api"),
+        ("src/routes/private/sync/views.rs", "/api/sync"),
+        ("src/routes/private/projects/router.rs", "/api/projects"),
+        ("src/routes/private/sites/router.rs", "/api/sites"),
+        ("src/routes/private/admin/users.rs", "/api/users"),
+    ];
+
+    let mut undocumented = Vec::new();
+    for (file, prefix) in sources {
+        let text = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        for path in route_literals(&text) {
+            let full = if path == "/" {
+                prefix.to_string()
+            } else {
+                format!("{prefix}{path}")
+            };
+            if exempt.contains(&full.as_str()) {
+                continue;
+            }
+            let normalised = full.trim_end_matches('/');
+            if !spec.paths.paths.contains_key(&full)
+                && !spec.paths.paths.contains_key(normalised)
+            {
+                undocumented.push(format!("{file}: {full}"));
+            }
+        }
+    }
+    assert!(
+        undocumented.is_empty(),
+        "{} routes are mounted and in no OpenAPI document:\n  {}",
+        undocumented.len(),
+        undocumented.join("\n  ")
+    );
+}
+
+fn route_literals(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(".route(") {
+        rest = &rest[at + ".route(".len()..];
+        let Some(open) = rest.find('"') else { break };
+        if rest[..open].chars().any(|c| !c.is_whitespace()) {
+            continue;
+        }
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('"') else { break };
+        out.push(after[..close].to_string());
+        rest = &after[close + 1..];
+    }
+    out
+}

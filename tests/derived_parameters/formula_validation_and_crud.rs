@@ -572,3 +572,65 @@ async fn test_preview_resolves_variables_by_code_not_name() {
         "the resolved slot's seeded readings should be in the window"
     );
 }
+
+/// Scenario: a formula reads the station's altitude, which is a column of the site row and not
+/// anything measured at a visit.
+/// Expected behaviour: the save stores it as a site source rather than refusing the identifier,
+/// and the parameter sources stay what the formula reads at the event.
+#[tokio::test]
+#[serial]
+async fn a_formula_naming_a_site_column_stores_it_as_a_site_source() {
+    let (db, app, token) = setup().await;
+    let name = format!("site_source_{}", uuid::Uuid::new_v4());
+
+    let (status, json) = create_derived_param(&app, &token, &name, "altitude_m * 2").await;
+    assert!(
+        (200..300).contains(&status),
+        "a site column is a source, not an unknown identifier: {status} {json}"
+    );
+    let id = json["id"].as_str().expect("response should have id");
+
+    let stored = crate::common::e2e::count(
+        &db,
+        &format!(
+            "SELECT count(*) AS c FROM derived_parameter_sources \
+             WHERE derived_definition_id = '{id}' \
+               AND site_property = 'altitude_m' AND variable_name = 'altitude_m' \
+               AND parameter_id IS NULL"
+        ),
+    )
+    .await;
+    assert_eq!(stored, 1, "the site property is stored as its own source");
+
+    assert_eq!(
+        crate::common::e2e::count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM derived_parameter_sources \
+                 WHERE derived_definition_id = '{id}' AND parameter_id IS NOT NULL"
+            ),
+        )
+        .await,
+        0,
+        "nothing is read at the event"
+    );
+
+    cleanup_derived_param(&app, &token, id).await;
+}
+
+/// An identifier that is neither a parameter, a constant nor a column of `sites` is still refused,
+/// and the refusal names all three.
+#[tokio::test]
+#[serial]
+async fn a_formula_naming_nothing_at_all_is_still_refused() {
+    let (_db, app, token) = setup().await;
+    let name = format!("unknown_source_{}", uuid::Uuid::new_v4());
+
+    let (status, json) = create_derived_param(&app, &token, &name, "not_a_thing * 2").await;
+    assert_eq!(status, 400, "{json}");
+    let message = json.to_string();
+    assert!(
+        message.contains("parameter, constant or site property"),
+        "the refusal says what it looked in: {message}"
+    );
+}

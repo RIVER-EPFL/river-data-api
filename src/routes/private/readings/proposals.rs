@@ -6,7 +6,7 @@
 //! nothing; a different number at source replaces the row with a fresh proposal.
 
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::error::{AppError, AppResult};
 
 /// One proposed correction, as the review surface reads it.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema, FromQueryResult)]
 pub struct Proposal {
     pub id: Uuid,
     pub stream_id: Uuid,
@@ -105,38 +105,6 @@ const SELECT: &str = r"SELECT p.id, p.stream_id, ds.source_system, ds.source_key
   LEFT JOIN sites s ON s.id = sp.site_id
   LEFT JOIN parameters par ON par.id = sp.parameter_id";
 
-fn read(row: &sea_orm::QueryResult) -> Result<Proposal, sea_orm::DbErr> {
-    Ok(Proposal {
-        id: row.try_get("", "id")?,
-        stream_id: row.try_get("", "stream_id")?,
-        source_system: row.try_get("", "source_system")?,
-        source_key: row.try_get("", "source_key")?,
-        site_id: row.try_get("", "site_id")?,
-        site_name: row.try_get("", "site_name")?,
-        parameter_id: row.try_get("", "parameter_id")?,
-        parameter_code: row.try_get("", "parameter_code")?,
-        time: row
-            .try_get::<DateTime<chrono::FixedOffset>>("", "time")?
-            .with_timezone(&Utc),
-        replicate_index: row.try_get("", "replicate_index")?,
-        stored_raw_value: row.try_get("", "stored_raw_value")?,
-        proposed_raw_value: row.try_get("", "proposed_raw_value")?,
-        stored_standard_curve_id: row.try_get("", "stored_standard_curve_id")?,
-        proposed_standard_curve_id: row.try_get("", "proposed_standard_curve_id")?,
-        status: row.try_get("", "status")?,
-        first_seen_at: row
-            .try_get::<DateTime<chrono::FixedOffset>>("", "first_seen_at")?
-            .with_timezone(&Utc),
-        last_seen_at: row
-            .try_get::<DateTime<chrono::FixedOffset>>("", "last_seen_at")?
-            .with_timezone(&Utc),
-        decided_by: row.try_get("", "decided_by")?,
-        decided_at: row
-            .try_get::<Option<DateTime<chrono::FixedOffset>>>("", "decided_at")?
-            .map(|t| t.with_timezone(&Utc)),
-    })
-}
-
 /// Every proposal matching the filter, newest source assertion first.
 pub async fn list(
     db: &DatabaseConnection,
@@ -173,7 +141,10 @@ pub async fn list(
             binds,
         ))
         .await?;
-    rows.iter().map(|r| Ok(read(r)?)).collect()
+    rows.iter()
+        .map(|r| Proposal::from_query_result(r, ""))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 /// What a decision did, per proposal.
@@ -195,6 +166,7 @@ pub struct DecideRequest {
     pub reason: Option<String>,
 }
 
+#[derive(FromQueryResult)]
 struct Pending {
     id: Uuid,
     stream_id: Uuid,
@@ -240,20 +212,8 @@ async fn load_undecided<C: ConnectionTrait>(
         ))
         .await?;
     rows.iter()
-        .map(|r| {
-            Ok(Pending {
-                id: r.try_get("", "id")?,
-                stream_id: r.try_get("", "stream_id")?,
-                time: r
-                    .try_get::<DateTime<chrono::FixedOffset>>("", "time")?
-                    .with_timezone(&Utc),
-                replicate_index: r.try_get("", "replicate_index")?,
-                proposed_raw_value: r.try_get("", "proposed_raw_value")?,
-                proposed_standard_curve_id: r.try_get("", "proposed_standard_curve_id")?,
-                stored_standard_curve_id: r.try_get("", "stored_standard_curve_id")?,
-            })
-        })
-        .collect::<Result<Vec<_>, sea_orm::DbErr>>()
+        .map(|r| Pending::from_query_result(r, ""))
+        .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
 
@@ -378,9 +338,15 @@ pub async fn pending_by_source(db: &DatabaseConnection) -> AppResult<Vec<(String
         ))
         .await?;
     rows.iter()
-        .map(|r| Ok((r.try_get("", "source_system")?, r.try_get("", "n")?)))
-        .collect::<Result<Vec<_>, sea_orm::DbErr>>()
+        .map(|r| SourceCount::from_query_result(r, "").map(|c| (c.source_system, c.n)))
+        .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+#[derive(FromQueryResult)]
+struct SourceCount {
+    source_system: String,
+    n: i64,
 }
 
 /// The decision vocabulary, refused rather than defaulted: an unrecognised word is a bug in the

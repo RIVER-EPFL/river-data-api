@@ -14,7 +14,7 @@
 //! - **rollback** inverts the decision, because nothing here deletes.
 
 use axum::{Json, extract::State};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -296,6 +296,23 @@ const ROW_SQL: &str = "SELECT r.stream_id, r.time, r.replicate_index, r.raw_valu
         ds.source_system
    FROM readings r JOIN data_streams ds ON ds.id = r.stream_id";
 
+/// One row of [`ROW_SQL`], decoded by the derive rather than column by column.
+#[derive(FromQueryResult)]
+struct StoredRow {
+    stream_id: Uuid,
+    time: sea_orm::prelude::DateTimeWithTimeZone,
+    replicate_index: i16,
+    raw_value: f64,
+    run_id: Option<String>,
+    has_curve: bool,
+    has_calibration: bool,
+    has_deployment: bool,
+    is_flagged: bool,
+    withdrawn: bool,
+    unverified: bool,
+    source_system: String,
+}
+
 fn classification(source_system: &str) -> String {
     match source_system {
         "grab_sample" => "manual",
@@ -320,26 +337,25 @@ async fn inspect_rows<C: ConnectionTrait>(
         .await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
-        let run_id: Option<String> = row.try_get("", "run_id")?;
-        let tool_run_id = run_id.as_deref().and_then(|s| s.parse::<Uuid>().ok());
-        let source_system: String = row.try_get("", "source_system")?;
+        let row = StoredRow::from_query_result(row, "")?;
+        // The run id is stored inside the provenance blob, so it arrives as text and is a run
+        // reference only if it parses as one.
+        let tool_run_id = row.run_id.as_deref().and_then(|s| s.parse::<Uuid>().ok());
         let provenance = RowProvenance {
             has_tool_run: tool_run_id.is_some(),
-            classification: classification(&source_system),
-            has_standard_curve: row.try_get("", "has_curve")?,
-            has_calibration: row.try_get("", "has_calibration")?,
-            has_deployment: row.try_get("", "has_deployment")?,
-            is_flagged: row.try_get("", "is_flagged")?,
-            withdrawn: row.try_get("", "withdrawn")?,
-            unverified: row.try_get("", "unverified")?,
+            classification: classification(&row.source_system),
+            has_standard_curve: row.has_curve,
+            has_calibration: row.has_calibration,
+            has_deployment: row.has_deployment,
+            is_flagged: row.is_flagged,
+            withdrawn: row.withdrawn,
+            unverified: row.unverified,
         };
         out.push(InspectedRow {
-            stream_id: row.try_get("", "stream_id")?,
-            time: row
-                .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time")?
-                .with_timezone(&chrono::Utc),
-            replicate_index: row.try_get("", "replicate_index")?,
-            raw_value: row.try_get("", "raw_value")?,
+            stream_id: row.stream_id,
+            time: row.time.with_timezone(&chrono::Utc),
+            replicate_index: row.replicate_index,
+            raw_value: row.raw_value,
             options: edit_options(&provenance),
             provenance,
             tool_run_id,
@@ -436,12 +452,12 @@ async fn row_states<C: ConnectionTrait>(
         .await?;
     rows.iter()
         .map(|row| {
+            let row = StateRow::from_query_result(row, "")?;
             Ok((
-                row.try_get("", "stream_id")?,
-                row.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time")?
-                    .with_timezone(&chrono::Utc),
-                row.try_get("", "replicate_index")?,
-                row.try_get("", "state")?,
+                row.stream_id,
+                row.time.with_timezone(&chrono::Utc),
+                row.replicate_index,
+                row.state,
             ))
         })
         .collect()
@@ -470,7 +486,10 @@ async fn sample_states<C: ConnectionTrait>(
         ))
         .await?;
     rows.iter()
-        .map(|row| Ok((row.try_get("", "id")?, row.try_get("", "stats")?)))
+        .map(|row| {
+            let row = SampleStatsRow::from_query_result(row, "")?;
+            Ok((row.id, row.stats))
+        })
         .collect()
 }
 
@@ -492,7 +511,7 @@ async fn touched_parameters<C: ConnectionTrait>(
         ))
         .await?;
     rows.iter()
-        .map(|row| Ok(row.try_get("", "parameter_id")?))
+        .map(|row| Ok(ParameterRow::from_query_result(row, "")?.parameter_id))
         .collect()
 }
 
@@ -826,6 +845,37 @@ pub async fn rollback_edit_set(
     }))
 }
 
+/// One reading's servedness, for the states a decision moves between.
+#[derive(FromQueryResult)]
+struct StateRow {
+    stream_id: Uuid,
+    time: sea_orm::prelude::DateTimeWithTimeZone,
+    replicate_index: i16,
+    state: serde_json::Value,
+}
+
+/// One sample's statistics, as the preview compares them before and after.
+#[derive(FromQueryResult)]
+struct SampleStatsRow {
+    id: Uuid,
+    stats: serde_json::Value,
+}
+
+#[derive(FromQueryResult)]
+struct ParameterRow {
+    parameter_id: Uuid,
+}
+
+/// The stored run a reopened calculation is rebuilt from.
+#[derive(FromQueryResult)]
+struct StoredRun {
+    tool_name: String,
+    inputs: serde_json::Value,
+    constants: serde_json::Value,
+    curves: serde_json::Value,
+    context: serde_json::Value,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ReloadResponse {
     pub tool: String,
@@ -863,27 +913,22 @@ pub async fn reload_run(
         ))
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Tool run {id} not found")))?;
-    let inputs: serde_json::Value = row.try_get("", "inputs")?;
-    let context: serde_json::Value = row.try_get("", "context")?;
-    let mut body = inputs.as_object().cloned().unwrap_or_default();
+    let run = StoredRun::from_query_result(&row, "")?;
+    let mut body = run.inputs.as_object().cloned().unwrap_or_default();
     // The reserved context fields the calculate body takes, so the reopened run resolves its
     // station and event inputs at the same visit rather than at whatever the browser last saw.
     for field in ["site_id", "collected_at"] {
-        if let Some(value) = context.get(field)
+        if let Some(value) = run.context.get(field)
             && !value.is_null()
         {
             body.insert(field.to_string(), value.clone());
         }
     }
     Ok(Json(ReloadResponse {
-        tool: row.try_get("", "tool_name")?,
+        tool: run.tool_name,
         body: serde_json::Value::Object(body),
-        constants: row.try_get("", "constants")?,
-        curves: row
-            .try_get::<serde_json::Value>("", "curves")?
-            .as_array()
-            .cloned()
-            .unwrap_or_default(),
+        constants: run.constants,
+        curves: run.curves.as_array().cloned().unwrap_or_default(),
     }))
 }
 

@@ -185,6 +185,24 @@ pub fn validate_optional_time_range(
         private::notifications::me::schedule_ping,
         private::notifications::views::test_send,
         private::notifications::views::list_subscribers,
+        private::notifications::health::get_health,
+        private::notifications::health::refresh_health,
+        private::events::event_stream,
+        private::change_audit::list_change_audit,
+        private::me::get_me,
+        private::me::get_my_sites,
+        private::admin::users::list_user_grants,
+        private::admin::users::set_user_grants,
+        private::readings::proposals::list_proposals,
+        private::readings::proposals::decide_proposals,
+        private::reprocessing_jobs::routes::get_job_logs,
+        private::reprocessing_jobs::routes::rerun_job,
+        private::reprocessing_jobs::routes::cancel_job,
+        private::reprocessing_jobs::schedule_routes::list_schedules,
+        private::reprocessing_jobs::schedule_routes::get_schedule,
+        private::reprocessing_jobs::schedule_routes::update_schedule,
+        private::reprocessing_jobs::schedule_routes::run_now,
+        private::reprocessing_jobs::schedule_routes::get_schedule_audit,
         private::notifications::deliveries::list_delivery_log,
         private::sync::replicate_reconciliation::duplicate_slots,
         private::sites::annotations::get_site_export_summary,
@@ -224,6 +242,10 @@ pub fn validate_optional_time_range(
         private::readings::decisions::list_decisions,
         private::readings::decisions::pin_readings,
         private::readings::decisions::rollback_pin_set,
+        private::sensors::calibrations::retire::retire_calibration,
+        private::sensors::calibrations::retire::unretire_calibration,
+        private::sensors::standard_curves::retire::retire_standard_curve,
+        private::sensors::standard_curves::retire::unretire_standard_curve,
         private::readings::decisions::detach_output,
         private::readings::decisions::return_output,
         private::readings::edits::inspect,
@@ -340,7 +362,6 @@ pub fn validate_optional_time_range(
     ),
     components(
         schemas(
-            private::notifications::deliveries::DeliveryLogPage,
             private::notifications::deliveries::DeliveryMessage,
             private::notifications::deliveries::DeliveryRecipient,
             private::notifications::deliveries::DeliveryCounts,
@@ -396,7 +417,7 @@ pub fn validate_optional_time_range(
             private::collection_events::EventRecomputeRequest,
             private::collection_events::EnqueuedJobResponse,
             private::collection_events::visits::VisitsResponse,
-            private::collection_events::visits::VisitListResponse,
+            private::collection_events::visits::VisitListRow,
             private::collection_events::visits::VisitListRow,
             private::collection_events::visits::VisitRow,
             private::collection_events::visits::VisitCell,
@@ -407,6 +428,11 @@ pub fn validate_optional_time_range(
             private::collection_events::visits::CellReplicate,
             private::collection_events::visits::CellFinding,
             private::readings::decisions::DecisionRow,
+            private::sensors::calibrations::retire::RetireRequest,
+            private::sensors::calibrations::retire::RetireResponse,
+            private::sensors::calibrations::retire::UnretireResponse,
+            private::sensors::standard_curves::retire::RetireCurveRequest,
+            private::sensors::standard_curves::retire::RetireCurveResponse,
             private::readings::decisions::PinRequest,
             private::readings::decisions::PinResponse,
             private::readings::decisions::PinKind,
@@ -636,6 +662,19 @@ impl utoipa::Modify for SecurityAddon {
 /// server root, so a key in it is a URL the router resolves.
 pub fn openapi_spec(state: &AppState) -> utoipa::openapi::OpenApi {
     merged_spec(service::api_router(state).1)
+}
+
+/// The document as the committed artefact holds it: pretty-printed, and with the crate version
+/// replaced by a fixed marker so a release bump is not a diff in every checked-in spec.
+///
+/// # Errors
+/// When the document cannot be serialised, which is a `ToSchema` derive producing invalid JSON.
+pub fn openapi_json(spec: &utoipa::openapi::OpenApi) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(spec)?;
+    if let Some(info) = value.get_mut("info").and_then(serde_json::Value::as_object_mut) {
+        info.insert("version".to_string(), serde_json::json!("{crate}"));
+    }
+    serde_json::to_string_pretty(&value)
 }
 
 /// [`openapi_spec`] over an entity document already built, for the caller that has one.

@@ -18,7 +18,7 @@ use sea_orm_migration::prelude::*;
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
-const UP: &str = r#"
+pub const UP: &str = r#"
     ALTER TABLE public.schedule_audit RENAME TO change_audit;
 
     ALTER TABLE public.change_audit ADD COLUMN IF NOT EXISTS subject text;
@@ -68,7 +68,7 @@ const UP: &str = r#"
         FOR EACH ROW EXECUTE FUNCTION public.record_parameter_group_change('member');
 "#;
 
-const DOWN: &str = r#"
+pub const DOWN: &str = r#"
     DROP TRIGGER IF EXISTS parameter_groups_history ON public.parameter_groups;
     DROP TRIGGER IF EXISTS parameter_group_members_history ON public.parameter_group_members;
 
@@ -119,6 +119,11 @@ const DOWN: &str = r#"
     CREATE TRIGGER parameter_group_members_history
         AFTER INSERT OR UPDATE OR DELETE ON public.parameter_group_members
         FOR EACH ROW EXECUTE FUNCTION public.record_parameter_group_change('member');
+
+    -- A trail this migration's up() never created is not a schedule row: later migrations write
+    -- `parameter:{id}` and `site_parameter:{id}` subjects into the same table, and backfilling
+    -- `job_name` over them would name a job that does not exist.
+    DELETE FROM public.change_audit WHERE subject NOT LIKE 'schedule:%';
 
     ALTER TABLE public.change_audit ADD COLUMN IF NOT EXISTS job_name text;
     UPDATE public.change_audit SET job_name = replace(subject, 'schedule:', '');

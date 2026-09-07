@@ -6,7 +6,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -47,6 +47,36 @@ fn member_statistics(
 pub struct DefinitionQuery {
     /// The site the group is rendered for; it is what declares the sd estimator.
     pub site_id: Option<Uuid>,
+}
+
+/// The rows this file's raw queries return. Derived rather than hand-decoded so a column added to
+/// a query and not to its reader is a compile error rather than a field silently left behind.
+#[derive(FromQueryResult)]
+struct MemberRow {
+    parameter_id: Uuid,
+    code: String,
+    label: String,
+    units: Option<String>,
+    description: Option<String>,
+    role: String,
+    ordinal: i32,
+    decimal_places: Option<i32>,
+    replicates: Option<serde_json::Value>,
+}
+
+#[derive(FromQueryResult)]
+struct GroupRow {
+    id: Uuid,
+    code: String,
+    label: String,
+    description: Option<String>,
+    ordinal: i32,
+}
+
+#[derive(FromQueryResult)]
+struct DeclaredEstimator {
+    parameter_id: Uuid,
+    sd_estimator: Option<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -135,42 +165,32 @@ pub async fn group_definition(
     let mut members = Vec::with_capacity(rows.len());
     let mut columns = Vec::with_capacity(rows.len());
     for row in rows {
-        let code: String = row.try_get("", "code").map_err(AppError::Database)?;
-        let role: String = row.try_get("", "role").map_err(AppError::Database)?;
-        let parameter_id: Uuid = row
-            .try_get("", "parameter_id")
-            .map_err(AppError::Database)?;
-        let ordinal: i32 = row.try_get("", "ordinal").map_err(AppError::Database)?;
-        let section = sections_by_code.get(&code.to_lowercase()).cloned();
+        let member = MemberRow::from_query_result(&row, "").map_err(AppError::Database)?;
+        let section = sections_by_code.get(&member.code.to_lowercase()).cloned();
         columns.push(Column {
-            parameter_id,
-            code: code.clone(),
-            ordinal,
-            role: Role::parse(&role).unwrap_or(Role::EntryOnly),
+            parameter_id: member.parameter_id,
+            code: member.code.clone(),
+            ordinal: member.ordinal,
+            role: Role::parse(&member.role).unwrap_or(Role::EntryOnly),
             section: section.clone(),
         });
-        let decimal_places: Option<i32> = row
-            .try_get("", "decimal_places")
-            .map_err(AppError::Database)?;
-        let replicates: Option<serde_json::Value> =
-            row.try_get("", "replicates").map_err(AppError::Database)?;
         let statistics = member_statistics(
-            &code,
-            replicates.as_ref(),
-            decimal_places,
-            estimators.get(&parameter_id).cloned().flatten(),
+            &member.code,
+            member.replicates.as_ref(),
+            member.decimal_places,
+            estimators.get(&member.parameter_id).cloned().flatten(),
         );
         members.push(DefinitionMember {
-            parameter_id,
-            code,
-            label: row.try_get("", "label").map_err(AppError::Database)?,
-            units: row.try_get("", "units").map_err(AppError::Database)?,
-            decimal_places,
-            description: row.try_get("", "description").map_err(AppError::Database)?,
-            role,
-            ordinal,
+            parameter_id: member.parameter_id,
+            code: member.code,
+            label: member.label,
+            units: member.units,
+            decimal_places: member.decimal_places,
+            description: member.description,
+            role: member.role,
+            ordinal: member.ordinal,
             section,
-            replicates,
+            replicates: member.replicates,
             statistics,
         });
     }
@@ -188,14 +208,13 @@ pub async fn group_definition(
     });
     let sections = ordering::section_order(&columns);
 
+    let header = GroupRow::from_query_result(&group, "").map_err(AppError::Database)?;
     Ok(Json(GroupDefinition {
-        id: group.try_get("", "id").map_err(AppError::Database)?,
-        code: group.try_get("", "code").map_err(AppError::Database)?,
-        label: group.try_get("", "label").map_err(AppError::Database)?,
-        description: group
-            .try_get("", "description")
-            .map_err(AppError::Database)?,
-        ordinal: group.try_get("", "ordinal").map_err(AppError::Database)?,
+        id: header.id,
+        code: header.code,
+        label: header.label,
+        description: header.description,
+        ordinal: header.ordinal,
         members,
         sections,
     }))
@@ -221,13 +240,8 @@ async fn declared_estimators(
         .map_err(AppError::Database)?;
     let mut declared = std::collections::HashMap::new();
     for row in rows {
-        let parameter_id: Uuid = row
-            .try_get("", "parameter_id")
-            .map_err(AppError::Database)?;
-        let estimator: Option<String> = row
-            .try_get("", "sd_estimator")
-            .map_err(AppError::Database)?;
-        declared.insert(parameter_id, estimator);
+        let row = DeclaredEstimator::from_query_result(&row, "").map_err(AppError::Database)?;
+        declared.insert(row.parameter_id, row.sd_estimator);
     }
     Ok(declared)
 }

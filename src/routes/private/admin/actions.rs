@@ -21,6 +21,41 @@ use crate::routes::private::sensors::calibrations::service::{
 };
 use crate::routes::private::sensors::deployments::slots;
 
+/// The rows this file's raw queries return. Derived rather than hand-decoded so a column added to
+/// a query and not to its reader is a compile error rather than a field silently left behind.
+#[derive(FromQueryResult)]
+struct SlotRow {
+    sp_id: Uuid,
+    parameter_id: Uuid,
+    units: String,
+}
+
+#[derive(FromQueryResult)]
+struct SeriesPoint {
+    time: chrono::DateTime<chrono::FixedOffset>,
+    val: f64,
+}
+
+#[derive(FromQueryResult)]
+struct CandidateRow {
+    sensor_id: Uuid,
+    uncalibrated_count: i64,
+    target_from: chrono::DateTime<chrono::FixedOffset>,
+}
+
+#[derive(FromQueryResult)]
+struct ForeignCurveRow {
+    sensor_id: Option<Uuid>,
+    standard_curve_id: Uuid,
+    curve_sensor_id: Uuid,
+    curve_name: Option<String>,
+    site_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
+    n: i64,
+    first_time: chrono::DateTime<chrono::FixedOffset>,
+    last_time: chrono::DateTime<chrono::FixedOffset>,
+}
+
 // ---------------------------------------------------------------------------
 // Project scope on the operator actions
 //
@@ -790,14 +825,11 @@ pub async fn preview_derived(
             .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
         if let Some(row) = row {
-            let sp_id: Uuid = row
-                .try_get("", "sp_id")
-                .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-            let parameter_id: Uuid = row
-                .try_get("", "parameter_id")
-                .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-            let units: String = row
-                .try_get("", "units")
+            let SlotRow {
+                sp_id,
+                parameter_id,
+                units,
+            } = SlotRow::from_query_result(&row, "")
                 .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
             param_info.push((var_name.clone(), sp_id, parameter_id, units));
         }
@@ -833,11 +865,7 @@ pub async fn preview_derived(
 
         let map = source_data.entry(var_name.clone()).or_default();
         for row in rows {
-            let time: chrono::DateTime<chrono::FixedOffset> = row
-                .try_get("", "time")
-                .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-            let val: f64 = row
-                .try_get("", "val")
+            let SeriesPoint { time, val } = SeriesPoint::from_query_result(&row, "")
                 .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
             let utc = time.with_timezone(&chrono::Utc);
             map.insert(utc.timestamp_millis(), val);
@@ -1414,9 +1442,11 @@ async fn fetch_calibration_candidates(
 
     let mut candidates = Vec::with_capacity(rows.len());
     for row in &rows {
-        let sensor_id: Uuid = row.try_get("", "sensor_id")?;
-        let uncalibrated_count: i64 = row.try_get("", "uncalibrated_count")?;
-        let target_from: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "target_from")?;
+        let CandidateRow {
+            sensor_id,
+            uncalibrated_count,
+            target_from,
+        } = CandidateRow::from_query_result(row, "")?;
 
         let cal_row = db
             .query_one_raw(Statement::from_sql_and_values(
@@ -1504,20 +1534,17 @@ async fn fetch_foreign_curve_uses(
 
     rows.iter()
         .map(|r| {
+            let row = ForeignCurveRow::from_query_result(r, "")?;
             Ok(ForeignCurveUse {
-                sensor_id: r.try_get("", "sensor_id")?,
-                standard_curve_id: r.try_get("", "standard_curve_id")?,
-                curve_sensor_id: r.try_get("", "curve_sensor_id")?,
-                curve_name: r.try_get("", "curve_name")?,
-                site_id: r.try_get("", "site_id")?,
-                parameter_id: r.try_get("", "parameter_id")?,
-                count: r.try_get("", "n")?,
-                first_time: r
-                    .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "first_time")?
-                    .with_timezone(&chrono::Utc),
-                last_time: r
-                    .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "last_time")?
-                    .with_timezone(&chrono::Utc),
+                sensor_id: row.sensor_id,
+                standard_curve_id: row.standard_curve_id,
+                curve_sensor_id: row.curve_sensor_id,
+                curve_name: row.curve_name,
+                site_id: row.site_id,
+                parameter_id: row.parameter_id,
+                count: row.n,
+                first_time: row.first_time.with_timezone(&chrono::Utc),
+                last_time: row.last_time.with_timezone(&chrono::Utc),
             })
         })
         .collect()

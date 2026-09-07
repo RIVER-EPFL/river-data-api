@@ -54,6 +54,15 @@ pub struct Model {
     /// rather than copied, and frozen once stored.
     #[crudcrate(exclude(update), filterable)]
     pub copied_from_id: Option<Uuid>,
+    /// When the lab took the curve out of circulation (M147). It is no longer offered for a new
+    /// measurement; the readings it corrected keep it and keep their values. Written by the retire
+    /// routes, never through CRUD.
+    #[crudcrate(exclude(create, update), filterable, sortable)]
+    pub retired_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[crudcrate(exclude(create, update))]
+    pub retired_by: Option<String>,
+    #[crudcrate(exclude(create, update))]
+    pub retired_reason: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

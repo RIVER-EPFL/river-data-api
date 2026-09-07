@@ -71,6 +71,11 @@ impl CRUDOperations for SiteParameterOperations {
         data: <SiteParameter as CRUDResource>::CreateModel,
     ) -> Result<SiteParameter, ApiError> {
         let txn = db.begin().await.map_err(ApiError::database)?;
+        // The change-audit trigger reads the writer from the transaction; this is the one that
+        // makes it a name rather than NULL.
+        crate::common::actor::declare(&txn)
+            .await
+            .map_err(ApiError::database)?;
         let active: <SiteParameter as CRUDResource>::ActiveModelType = data.into();
         let model = active.insert(&txn).await.map_err(ApiError::database)?;
         let mut entity = SiteParameter::from(model);

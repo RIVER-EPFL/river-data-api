@@ -28,7 +28,7 @@ async fn confine_job(state: &AppState, scope: &AccessScope, job_id: Uuid) -> App
     scope::require_row_in_scope(scope, &project, unowned, "Job")
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct JobLogsQuery {
     /// Only return lines with `seq` strictly greater than this (incremental polling/tailing).
     #[serde(default)]
@@ -38,7 +38,7 @@ pub struct JobLogsQuery {
     pub limit: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct JobLogLine {
     pub seq: i64,
     pub ts: chrono::DateTime<chrono::Utc>,
@@ -49,6 +49,16 @@ pub struct JobLogLine {
 
 /// `GET /api/reprocessing_jobs/{id}/logs`, the ordered timeline for one job. Paginated by `seq`
 /// so the UI can lazy-load the full record and tail new lines. Requires `read_data`.
+#[utoipa::path(
+    get,
+    path = "/api/reprocessing_jobs/{id}/logs",
+    params(("id" = Uuid, Path, description = "Job UUID"), JobLogsQuery),
+    responses(
+        (status = 200, description = "The job's timeline, oldest first", body = Vec<JobLogLine>),
+        (status = 404, description = "No job of that id"),
+    ),
+    tag = "jobs"
+)]
 pub async fn get_job_logs(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
@@ -85,7 +95,7 @@ pub async fn get_job_logs(
     Ok(Json(out))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct CancelResponse {
     pub status: String,
 }
@@ -95,6 +105,17 @@ pub struct CancelResponse {
 /// column, which the owning replica's heartbeat observes (possibly on a different replica) and the job
 /// honors at its next checkpoint. 409 if the type isn't cancellable or the job isn't in a cancellable
 /// state; 404 if the id is unknown. Requires MANAGER, or a token with `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/api/reprocessing_jobs/{id}/cancel",
+    params(("id" = Uuid, Path, description = "Job UUID")),
+    responses(
+        (status = 200, description = "The job's status after the request", body = CancelResponse),
+        (status = 404, description = "No job of that id"),
+        (status = 409, description = "This kind is not cancellable, or the job is not in a cancellable state"),
+    ),
+    tag = "jobs"
+)]
 pub async fn cancel_job(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
@@ -145,7 +166,7 @@ pub async fn cancel_job(
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RerunResponse {
     pub job_id: Uuid,
     pub status: String,
@@ -155,6 +176,17 @@ pub struct RerunResponse {
 /// row. Returns a NEW job (history is preserved). 409 if the type isn't rerunnable or an equivalent
 /// job is already in flight; 404 if the job id is unknown. Requires MANAGER, or a token with
 /// `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/api/reprocessing_jobs/{id}/rerun",
+    params(("id" = Uuid, Path, description = "Job UUID")),
+    responses(
+        (status = 200, description = "The new job the replay created", body = RerunResponse),
+        (status = 404, description = "No job of that id"),
+        (status = 409, description = "This kind is not rerunnable, or an equivalent job is in flight"),
+    ),
+    tag = "jobs"
+)]
 pub async fn rerun_job(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,

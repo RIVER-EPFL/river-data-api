@@ -32,6 +32,9 @@ use crate::error::AppResult;
 ///
 /// Join it `LEFT JOIN LATERAL (...) cw ON true` when rows outside every window must survive the
 /// join, `JOIN LATERAL` when they must not.
+///
+/// A retired curve is never a candidate (M146): retirement is what takes a curve out of
+/// circulation, and this is the one producer of the ranking, so the predicate has one home.
 #[must_use]
 pub fn pick_calibration_lateral(sensor_expr: &str) -> String {
     pick_calibration_lateral_excluding(sensor_expr, None)
@@ -47,6 +50,7 @@ pub fn pick_calibration_lateral_excluding(sensor_expr: &str, exclude_expr: Optio
         r"SELECT c.id, c.slope, c.intercept
           FROM sensor_calibrations c
           WHERE c.sensor_id = {sensor_expr}{exclude}
+            AND c.retired_at IS NULL
             AND (c.parameter_id = r.parameter_id OR c.parameter_id IS NULL OR r.parameter_id IS NULL)
             AND r.time >= c.valid_from
             AND r.time < COALESCE(c.valid_until, 'infinity'::timestamptz)

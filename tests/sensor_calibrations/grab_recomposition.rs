@@ -372,7 +372,7 @@ async fn a_grab_that_resolved_no_curve_keeps_a_null_value() {
 /// a null is there to distinguish.
 #[tokio::test]
 #[serial]
-async fn deleting_the_only_covering_curve_leaves_the_value_null() {
+async fn retiring_the_only_covering_curve_leaves_the_value_null() {
     let fx = setup().await;
     let sensor = create_sensor(&fx.db, "Plate-reader-04", GLOBAL_PARAM_TEMP_ID).await;
 
@@ -392,15 +392,19 @@ async fn deleting_the_only_covering_curve_leaves_the_value_null() {
         Some(sensor.base_calibration_id)
     );
 
-    let (status, body) = delete_with_token(
+    let (status, body) = crate::common::post_json_with_token(
         &fx.app,
-        &format!("/api/sensor_calibrations/{}", sensor.base_calibration_id),
+        &format!(
+            "/api/sensor_calibrations/{}/retire",
+            sensor.base_calibration_id
+        ),
+        &serde_json::json!({}),
         &fx.token,
     )
     .await;
-    assert!(
-        (200..300).contains(&status),
-        "a windowed calibration is deletable: {body}"
+    assert_eq!(
+        status, 200,
+        "a windowed calibration that corrected a reading is retired: {body}"
     );
 
     let after = grab_at(&fx.db, LATE_GRAB).await;
