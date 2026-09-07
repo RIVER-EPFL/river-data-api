@@ -18,3 +18,4 @@ mod me_sites;
 mod project_isolation;
 mod project_of_row;
 mod project_scope_gaps;
+mod scoped_batch_writes;

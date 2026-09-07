@@ -14,12 +14,8 @@ struct Fixture {
 }
 
 async fn setup() -> Fixture {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let token = crate::common::seed_token_full(&db).await;
-    let app = crate::common::build_test_app(db.clone());
-    Fixture { db, app, token }
+    let f = crate::common::seeded_app().await;
+    Fixture { db: f.db, app: f.app, token: f.token }
 }
 
 async fn create_sensor(fx: &Fixture, serial_number: &str) -> String {
@@ -39,7 +35,8 @@ async fn create_sensor(fx: &Fixture, serial_number: &str) -> String {
 
 async fn sensor_row(fx: &Fixture, id: &str) -> serde_json::Value {
     let (status, body) =
-        crate::common::get_json_with_token(&fx.app, "/api/sensors?page=1&per_page=100", &fx.token).await;
+        crate::common::get_json_with_token(&fx.app, "/api/sensors?page=1&per_page=100", &fx.token)
+            .await;
     assert_eq!(status, 200, "sensors list ({status}): {body}");
     body.as_array()
         .expect("array body")
@@ -108,4 +105,51 @@ async fn list_reads_latest_from_cursor_and_rollup() {
         "rollup fallback finds the batch-fed reading: {row}"
     );
     assert_eq!(row["last_reading_value"], 7.25, "{row}");
+}
+
+#[tokio::test]
+#[serial]
+async fn the_list_and_the_detail_report_one_sensor_alike() {
+    // Expected behaviour: both read paths resolve the same enrichment, so a sensor's count and
+    // latest reading do not depend on which endpoint asked.
+    let fx = setup().await;
+
+    let sensor = create_sensor(&fx, "SAME-1").await;
+    for (time, value) in [("2025-01-16T07:00:30Z", 3.5), ("2025-01-16T08:00:30Z", 4.5)] {
+        crate::common::exec(
+            &fx.db,
+            &format!(
+                "INSERT INTO readings (stream_id, site_id, parameter_id, sensor_id, time, raw_value) \
+                 SELECT id, '{}', '{}', '{sensor}', '{time}', {value} \
+                 FROM data_streams WHERE site_parameter_id = '{}'",
+                crate::common::SITE1_ID,
+                crate::common::GLOBAL_PARAM_TEMP_ID,
+                crate::common::PARAM_S1_TEMP_ID,
+            ),
+        )
+        .await;
+    }
+    crate::common::refresh_continuous_aggregates(&fx.db).await;
+
+    let listed = sensor_row(&fx, &sensor).await;
+    let (status, detail) =
+        crate::common::get_json_with_token(&fx.app, &format!("/api/sensors/{sensor}"), &fx.token)
+            .await;
+    assert_eq!(status, 200, "sensor detail ({status}): {detail}");
+
+    for field in [
+        "reading_count",
+        "last_reading_at",
+        "last_reading_value",
+        "last_calibration_at",
+        "current_site_id",
+        "current_site_name",
+    ] {
+        assert_eq!(
+            listed[field], detail[field],
+            "{field} differs between the list and the detail: {listed} / {detail}"
+        );
+    }
+    assert_eq!(detail["reading_count"], 2, "{detail}");
+    assert_eq!(detail["last_reading_value"], 4.5, "{detail}");
 }

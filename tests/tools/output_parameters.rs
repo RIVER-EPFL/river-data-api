@@ -45,8 +45,7 @@ async fn setup(script_name: &str) -> (axum::Router, String, String) {
     crate::common::seed_test_data(&db).await;
     remove_script(&db, script_name).await;
     let app = kc::build_test_app_with_keycloak(db).await;
-    kc::ensure_realm_user("scriptadmin", "scriptadmin", &["riverdata-admin"]).await;
-    let admin = kc::get_keycloak_jwt("scriptadmin", "scriptadmin").await;
+    let admin = kc::member_jwt("scriptadmin", "scriptadmin", "riverdata-admin").await;
 
     let (status, script) = crate::common::post_json_parse_with_token(
         &app,

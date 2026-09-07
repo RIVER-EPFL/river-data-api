@@ -97,12 +97,8 @@ async fn remove_probe_tool(db: &DatabaseConnection) {
 }
 
 async fn setup() -> (DatabaseConnection, axum::Router, String) {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let token = crate::common::seed_token_full(&db).await;
-    let app = crate::common::build_test_app(db.clone());
-    (db, app, token)
+    let f = crate::common::seeded_app().await;
+    (f.db, f.app, f.token)
 }
 
 async fn calculate(
@@ -433,8 +429,7 @@ async fn an_unknown_kind_is_refused_at_authoring() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     let app = kc::build_test_app_with_keycloak(db.clone()).await;
-    kc::ensure_realm_user("kindadmin", "kindadmin", &["riverdata-admin"]).await;
-    let admin = kc::get_keycloak_jwt("kindadmin", "kindadmin").await;
+    let admin = kc::member_jwt("kindadmin", "kindadmin", "riverdata-admin").await;
 
     let (status, script) = crate::common::post_json_parse_with_token(
         &app,

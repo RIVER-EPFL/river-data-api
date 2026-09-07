@@ -137,67 +137,17 @@ impl CRUDOperations for SensorOperations {
         db: &DatabaseConnection,
         entity: &mut Sensor,
     ) -> Result<(), ApiError> {
-        let id = entity.id;
-
-        // Summaries instead of an unbounded readings scan (whose planning cost grows with the
-        // hypertable's chunk count): the count is the hourly rollup's population plus recent spot
-        // rows, the newest instant is the stream ingest cursor with the rollup as fallback.
-        let reading_row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT (SELECT COALESCE(SUM(count), 0)::bigint FROM readings_hourly WHERE sensor_id = $1) \
-                      + (SELECT COUNT(*) FROM readings WHERE sensor_id = $1 \
-                           AND time > now() - INTERVAL '90 days' \
-                           AND measurement_type = 'spot' AND is_flagged IS NOT TRUE) AS count, \
-                        GREATEST((SELECT MAX(last_data_time) FROM data_streams WHERE sensor_id = $1), \
-                                 (SELECT MAX(bucket) FROM readings_hourly WHERE sensor_id = $1)) AS last_time",
-                [id.into()],
-            ))
-            .await
-            .map_err(ApiError::database)?;
-
-        if let Some(row) = reading_row {
-            entity.reading_count = Some(row.try_get("", "count").unwrap_or(0));
-            entity.last_reading_at = row
-                .try_get::<chrono::DateTime<chrono::FixedOffset>>("", "last_time")
-                .ok()
-                .map(|t| t.with_timezone(&Utc));
+        let mut enriched = enrich(db, &[entity.id]).await?;
+        if let Some(fields) = enriched.remove(&entity.id) {
+            fields.apply(
+                &mut entity.current_site_id,
+                &mut entity.current_site_name,
+                &mut entity.last_calibration_at,
+                &mut entity.last_reading_at,
+                &mut entity.last_reading_value,
+                &mut entity.reading_count,
+            );
         }
-
-        let cal_row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT MAX(valid_from) as last_cal FROM sensor_calibrations WHERE sensor_id = $1",
-                [id.into()],
-            ))
-            .await
-            .map_err(ApiError::database)?;
-
-        entity.last_calibration_at = cal_row
-            .and_then(|r| {
-                r.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "last_cal")
-                    .ok()
-            })
-            .map(|t| t.with_timezone(&Utc));
-
-        // Also populate current_site fields for detail view
-        let dep_row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"SELECT sd.site_id, s.name as site_name
-                  FROM sensor_deployments sd JOIN sites s ON s.id = sd.site_id
-                  WHERE sd.sensor_id = $1 AND sd.deployed_until IS NULL
-                  LIMIT 1",
-                [id.into()],
-            ))
-            .await
-            .map_err(ApiError::database)?;
-
-        if let Some(row) = dep_row {
-            entity.current_site_id = row.try_get("", "site_id").ok();
-            entity.current_site_name = row.try_get("", "site_name").ok();
-        }
-
         Ok(())
     }
 
@@ -209,220 +159,322 @@ impl CRUDOperations for SensorOperations {
         if entities.is_empty() {
             return Ok(());
         }
-
         let ids: Vec<Uuid> = entities.iter().map(|e| e.id).collect();
-        let placeholders = build_in_clause(ids.len());
-        let values = uuid_values(&ids);
-
-        // Query 1: Active deployments + site names
-        let dep_sql = format!(
-            r"SELECT sd.sensor_id, sd.site_id, s.name as site_name
-              FROM sensor_deployments sd JOIN sites s ON s.id = sd.site_id
-              WHERE sd.sensor_id IN ({placeholders}) AND sd.deployed_until IS NULL"
-        );
-        let dep_rows = db
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &dep_sql,
-                values.clone(),
-            ))
-            .await
-            .map_err(ApiError::database)?;
-
-        let mut site_by_sensor: HashMap<Uuid, (Uuid, String)> = HashMap::new();
-        for row in &dep_rows {
-            if let (Ok(sensor_id), Ok(site_id), Ok(site_name)) = (
-                row.try_get::<Uuid>("", "sensor_id"),
-                row.try_get::<Uuid>("", "site_id"),
-                row.try_get::<String>("", "site_name"),
-            ) {
-                site_by_sensor
-                    .entry(sensor_id)
-                    .or_insert((site_id, site_name));
-            }
-        }
-
-        // Query 2: Latest reading per sensor. An unbounded DISTINCT ON over the hypertable pays
-        // a planning cost proportional to the chunk count, so the newest instant comes from the
-        // stream ingest cursors, and only the value is read from readings, time-bounded so chunk
-        // exclusion applies. Sensors whose cursors sit close together share one query; a stale
-        // straggler gets its own window rather than widening everyone's.
-        let cursor_rows = db
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &format!(
-                    r"SELECT sensor_id, MAX(last_data_time) AS last_time
-                      FROM data_streams
-                      WHERE sensor_id IN ({placeholders}) AND last_data_time IS NOT NULL
-                      GROUP BY sensor_id"
-                ),
-                values.clone(),
-            ))
-            .await
-            .map_err(ApiError::database)?;
-        let mut cursors: Vec<(Uuid, chrono::DateTime<Utc>)> = Vec::new();
-        for row in &cursor_rows {
-            if let (Ok(sensor_id), Ok(t)) = (
-                row.try_get::<Uuid>("", "sensor_id"),
-                row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "last_time"),
-            ) {
-                cursors.push((sensor_id, t.with_timezone(&Utc)));
-            }
-        }
-        let mut reading_by_sensor: HashMap<Uuid, (chrono::DateTime<Utc>, f64)> = HashMap::new();
-        // Streams fed by `/ingest` carry the cursor; batch- and CSV-fed sensors fall back to
-        // the hourly rollup's newest bucket (plus its width, so the in-bucket rows are inside
-        // the lookup window). Spot-only sensors appear in neither and get one bounded probe.
-        let with_cursor: std::collections::HashSet<Uuid> =
-            cursors.iter().map(|(id, _)| *id).collect();
-        let missing: Vec<Uuid> = ids
-            .iter()
-            .filter(|id| !with_cursor.contains(id))
-            .copied()
-            .collect();
-        if !missing.is_empty() {
-            let ph = build_in_clause(missing.len());
-            let rows = db
-                .query_all_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    &format!(
-                        "SELECT sensor_id, MAX(bucket) AS last_bucket FROM readings_hourly \
-                         WHERE sensor_id IN ({ph}) GROUP BY sensor_id"
-                    ),
-                    uuid_values(&missing),
-                ))
-                .await
-                .map_err(ApiError::database)?;
-            for row in &rows {
-                if let (Ok(sensor_id), Ok(t)) = (
-                    row.try_get::<Uuid>("", "sensor_id"),
-                    row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "last_bucket"),
-                ) {
-                    cursors.push((
-                        sensor_id,
-                        t.with_timezone(&Utc) + chrono::Duration::hours(1),
-                    ));
-                }
-            }
-        }
-        let covered: std::collections::HashSet<Uuid> = cursors.iter().map(|(id, _)| *id).collect();
-        let uncovered: Vec<Uuid> = ids
-            .iter()
-            .filter(|id| !covered.contains(id))
-            .copied()
-            .collect();
-        if !uncovered.is_empty() {
-            let ph = build_in_clause(uncovered.len());
-            let rows = db
-                .query_all_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    &format!(
-                        r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) as value
-                          FROM readings
-                          WHERE sensor_id IN ({ph}) AND time > now() - INTERVAL '90 days'
-                          ORDER BY sensor_id, time DESC"
-                    ),
-                    uuid_values(&uncovered),
-                ))
-                .await
-                .map_err(ApiError::database)?;
-            for row in &rows {
-                if let (Ok(sensor_id), Ok(time), Ok(value)) = (
-                    row.try_get::<Uuid>("", "sensor_id"),
-                    row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "time"),
-                    row.try_get::<f64>("", "value"),
-                ) {
-                    reading_by_sensor.insert(sensor_id, (time.with_timezone(&Utc), value));
-                }
-            }
-        }
-        cursors.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
-
-        let mut i = 0;
-        while i < cursors.len() {
-            // One cluster: every sensor whose cursor lies within 30 days of the cluster's newest.
-            let hi = cursors[i].1;
-            let mut lo = cursors[i].1;
-            let mut ids: Vec<Uuid> = Vec::new();
-            while i < cursors.len() && hi - cursors[i].1 <= chrono::Duration::days(30) {
-                lo = cursors[i].1;
-                ids.push(cursors[i].0);
-                i += 1;
-            }
-            let cluster_ph = build_in_clause(ids.len());
-            let mut cluster_values = uuid_values(&ids);
-            cluster_values.push(
-                sea_orm::prelude::DateTimeWithTimeZone::from(lo - chrono::Duration::days(1)).into(),
-            );
-            let from_ref = cluster_values.len();
-            cluster_values.push(sea_orm::prelude::DateTimeWithTimeZone::from(hi).into());
-            let to_ref = cluster_values.len();
-            let rows = db
-                .query_all_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    &format!(
-                        r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) as value
-                          FROM readings
-                          WHERE sensor_id IN ({cluster_ph}) AND time >= ${from_ref} AND time <= ${to_ref}
-                          ORDER BY sensor_id, time DESC"
-                    ),
-                    cluster_values,
-                ))
-                .await
-                .map_err(ApiError::database)?;
-            for row in &rows {
-                if let (Ok(sensor_id), Ok(time), Ok(value)) = (
-                    row.try_get::<Uuid>("", "sensor_id"),
-                    row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "time"),
-                    row.try_get::<f64>("", "value"),
-                ) {
-                    reading_by_sensor.insert(sensor_id, (time.with_timezone(&Utc), value));
-                }
-            }
-        }
-
-        // Query 3: Latest calibration per sensor
-        let cal_sql = format!(
-            r"SELECT DISTINCT ON (sensor_id) sensor_id, valid_from
-              FROM sensor_calibrations
-              WHERE sensor_id IN ({placeholders})
-              ORDER BY sensor_id, valid_from DESC"
-        );
-        let cal_rows = db
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &cal_sql,
-                values,
-            ))
-            .await
-            .map_err(ApiError::database)?;
-
-        let mut cal_by_sensor: HashMap<Uuid, chrono::DateTime<Utc>> = HashMap::new();
-        for row in &cal_rows {
-            if let (Ok(sensor_id), Ok(valid_from)) = (
-                row.try_get::<Uuid>("", "sensor_id"),
-                row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "valid_from"),
-            ) {
-                cal_by_sensor.insert(sensor_id, valid_from.with_timezone(&Utc));
-            }
-        }
-
-        // Populate entities
+        let enriched = enrich(db, &ids).await?;
         for entity in entities.iter_mut() {
-            if let Some((site_id, site_name)) = site_by_sensor.get(&entity.id) {
-                entity.current_site_id = Some(*site_id);
-                entity.current_site_name = Some(site_name.clone());
-            }
-            if let Some((time, value)) = reading_by_sensor.get(&entity.id) {
-                entity.last_reading_at = Some(*time);
-                entity.last_reading_value = Some(*value);
-            }
-            if let Some(cal_time) = cal_by_sensor.get(&entity.id) {
-                entity.last_calibration_at = Some(*cal_time);
+            if let Some(fields) = enriched.get(&entity.id) {
+                fields.clone().apply(
+                    &mut entity.current_site_id,
+                    &mut entity.current_site_name,
+                    &mut entity.last_calibration_at,
+                    &mut entity.last_reading_at,
+                    &mut entity.last_reading_value,
+                    &mut entity.reading_count,
+                );
             }
         }
-
         Ok(())
+    }
+}
+
+/// What both sensor read paths report over the stored row: where the instrument is, when it was
+/// last calibrated, and what it last measured. One shape, so the detail and the list cannot
+/// disagree about a sensor.
+#[derive(Clone, Debug, Default)]
+struct Enrichment {
+    current_site: Option<(Uuid, String)>,
+    last_calibration_at: Option<DateTime<Utc>>,
+    last_reading_at: Option<DateTime<Utc>>,
+    last_reading_value: Option<f64>,
+    reading_count: Option<i64>,
+}
+
+impl Enrichment {
+    /// The detail and list models are separate types carrying the same six fields, so they are
+    /// written through by reference rather than by a trait neither of them implements.
+    fn apply(
+        self,
+        current_site_id: &mut Option<Uuid>,
+        current_site_name: &mut Option<String>,
+        last_calibration_at: &mut Option<DateTime<Utc>>,
+        last_reading_at: &mut Option<DateTime<Utc>>,
+        last_reading_value: &mut Option<f64>,
+        reading_count: &mut Option<i64>,
+    ) {
+        if let Some((site_id, site_name)) = self.current_site {
+            *current_site_id = Some(site_id);
+            *current_site_name = Some(site_name);
+        }
+        if self.last_calibration_at.is_some() {
+            *last_calibration_at = self.last_calibration_at;
+        }
+        if self.last_reading_at.is_some() {
+            *last_reading_at = self.last_reading_at;
+        }
+        if self.last_reading_value.is_some() {
+            *last_reading_value = self.last_reading_value;
+        }
+        if self.reading_count.is_some() {
+            *reading_count = self.reading_count;
+        }
+    }
+}
+
+/// Resolve [`Enrichment`] for a set of sensors in a fixed number of queries, whatever the set's
+/// size.
+///
+/// Summaries instead of an unbounded readings scan, whose planning cost grows with the
+/// hypertable's chunk count: the count is the hourly rollup's population plus recent spot rows,
+/// and the newest instant is the stream ingest cursor with the rollup's newest bucket as fallback.
+async fn enrich(
+    db: &DatabaseConnection,
+    ids: &[Uuid],
+) -> Result<HashMap<Uuid, Enrichment>, ApiError> {
+    let mut out: HashMap<Uuid, Enrichment> = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = build_in_clause(ids.len());
+    let values = uuid_values(ids);
+
+    // Where the instrument is now.
+    let dep_rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                r"SELECT sd.sensor_id, sd.site_id, s.name AS site_name
+                  FROM sensor_deployments sd JOIN sites s ON s.id = sd.site_id
+                  WHERE sd.sensor_id IN ({placeholders}) AND sd.deployed_until IS NULL"
+            ),
+            values.clone(),
+        ))
+        .await
+        .map_err(ApiError::database)?;
+    for row in &dep_rows {
+        if let (Ok(sensor_id), Ok(site_id), Ok(site_name)) = (
+            row.try_get::<Uuid>("", "sensor_id"),
+            row.try_get::<Uuid>("", "site_id"),
+            row.try_get::<String>("", "site_name"),
+        ) {
+            let entry = out.entry(sensor_id).or_default();
+            if entry.current_site.is_none() {
+                entry.current_site = Some((site_id, site_name));
+            }
+        }
+    }
+
+    // When it was last calibrated.
+    let cal_rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                r"SELECT DISTINCT ON (sensor_id) sensor_id, valid_from
+                  FROM sensor_calibrations
+                  WHERE sensor_id IN ({placeholders})
+                  ORDER BY sensor_id, valid_from DESC"
+            ),
+            values.clone(),
+        ))
+        .await
+        .map_err(ApiError::database)?;
+    for row in &cal_rows {
+        if let (Ok(sensor_id), Ok(valid_from)) = (
+            row.try_get::<Uuid>("", "sensor_id"),
+            row.try_get::<DateTime<chrono::FixedOffset>>("", "valid_from"),
+        ) {
+            out.entry(sensor_id).or_default().last_calibration_at =
+                Some(valid_from.with_timezone(&Utc));
+        }
+    }
+
+    // How much it has measured: the rollup's population plus the spot rows it does not carry.
+    let count_rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT sensor_id, COALESCE(SUM(count), 0)::bigint AS n FROM readings_hourly \
+                  WHERE sensor_id IN ({placeholders}) GROUP BY sensor_id"
+            ),
+            values.clone(),
+        ))
+        .await
+        .map_err(ApiError::database)?;
+    for row in &count_rows {
+        if let (Ok(sensor_id), Ok(n)) = (
+            row.try_get::<Uuid>("", "sensor_id"),
+            row.try_get::<i64>("", "n"),
+        ) {
+            let entry = out.entry(sensor_id).or_default();
+            entry.reading_count = Some(entry.reading_count.unwrap_or(0) + n);
+        }
+    }
+    let spot_rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT sensor_id, COUNT(*) AS n FROM readings \
+                  WHERE sensor_id IN ({placeholders}) AND time > now() - INTERVAL '90 days' \
+                    AND measurement_type = 'spot' AND is_flagged IS NOT TRUE \
+                  GROUP BY sensor_id"
+            ),
+            values.clone(),
+        ))
+        .await
+        .map_err(ApiError::database)?;
+    for row in &spot_rows {
+        if let (Ok(sensor_id), Ok(n)) = (
+            row.try_get::<Uuid>("", "sensor_id"),
+            row.try_get::<i64>("", "n"),
+        ) {
+            let entry = out.entry(sensor_id).or_default();
+            entry.reading_count = Some(entry.reading_count.unwrap_or(0) + n);
+        }
+    }
+    for id in ids {
+        out.entry(*id).or_default().reading_count.get_or_insert(0);
+    }
+
+    // What it last measured. The instant comes from the ingest cursors and the rollup; only the
+    // value is read from `readings`, over a window those two bound, so chunk exclusion applies.
+    let cursor_rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                r"SELECT sensor_id, MAX(last_data_time) AS last_time
+                  FROM data_streams
+                  WHERE sensor_id IN ({placeholders}) AND last_data_time IS NOT NULL
+                  GROUP BY sensor_id"
+            ),
+            values.clone(),
+        ))
+        .await
+        .map_err(ApiError::database)?;
+    let bucket_rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT sensor_id, MAX(bucket) AS last_bucket FROM readings_hourly \
+                  WHERE sensor_id IN ({placeholders}) GROUP BY sensor_id"
+            ),
+            values,
+        ))
+        .await
+        .map_err(ApiError::database)?;
+
+    // `newest` is the instant to report when no value is found; `window_end` bounds the lookup,
+    // and a bucket's own rows lie inside it, so it is the bucket's end.
+    let mut newest: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
+    let mut window_end: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
+    let note = |map: &mut HashMap<Uuid, DateTime<Utc>>, id: Uuid, t: DateTime<Utc>| {
+        map.entry(id)
+            .and_modify(|cur| *cur = (*cur).max(t))
+            .or_insert(t);
+    };
+    for row in &cursor_rows {
+        if let (Ok(sensor_id), Ok(t)) = (
+            row.try_get::<Uuid>("", "sensor_id"),
+            row.try_get::<DateTime<chrono::FixedOffset>>("", "last_time"),
+        ) {
+            note(&mut newest, sensor_id, t.with_timezone(&Utc));
+            note(&mut window_end, sensor_id, t.with_timezone(&Utc));
+        }
+    }
+    for row in &bucket_rows {
+        if let (Ok(sensor_id), Ok(t)) = (
+            row.try_get::<Uuid>("", "sensor_id"),
+            row.try_get::<DateTime<chrono::FixedOffset>>("", "last_bucket"),
+        ) {
+            let bucket = t.with_timezone(&Utc);
+            note(&mut newest, sensor_id, bucket);
+            note(
+                &mut window_end,
+                sensor_id,
+                bucket + chrono::Duration::hours(1),
+            );
+        }
+    }
+    for (id, t) in &newest {
+        out.entry(*id).or_default().last_reading_at = Some(*t);
+    }
+
+    // A sensor neither the cursors nor the rollup cover (spot-only, never ingested) gets one
+    // bounded probe of its own rather than widening everyone else's window.
+    let uncovered: Vec<Uuid> = ids
+        .iter()
+        .filter(|id| !window_end.contains_key(id))
+        .copied()
+        .collect();
+    if !uncovered.is_empty() {
+        let ph = build_in_clause(uncovered.len());
+        let rows = db
+            .query_all_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) AS value
+                      FROM readings
+                      WHERE sensor_id IN ({ph}) AND time > now() - INTERVAL '90 days'
+                      ORDER BY sensor_id, time DESC"
+                ),
+                uuid_values(&uncovered),
+            ))
+            .await
+            .map_err(ApiError::database)?;
+        record_values(&rows, &mut out);
+    }
+
+    // Sensors whose windows lie within 30 days of each other share one query; a stale straggler
+    // gets its own rather than widening the cluster's.
+    let mut windows: Vec<(Uuid, DateTime<Utc>)> = window_end.into_iter().collect();
+    windows.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
+    let mut i = 0;
+    while i < windows.len() {
+        let hi = windows[i].1;
+        let mut lo = windows[i].1;
+        let mut cluster: Vec<Uuid> = Vec::new();
+        while i < windows.len() && hi - windows[i].1 <= chrono::Duration::days(30) {
+            lo = windows[i].1;
+            cluster.push(windows[i].0);
+            i += 1;
+        }
+        let cluster_ph = build_in_clause(cluster.len());
+        let mut cluster_values = uuid_values(&cluster);
+        cluster_values.push(
+            sea_orm::prelude::DateTimeWithTimeZone::from(lo - chrono::Duration::days(1)).into(),
+        );
+        let from_ref = cluster_values.len();
+        cluster_values.push(sea_orm::prelude::DateTimeWithTimeZone::from(hi).into());
+        let to_ref = cluster_values.len();
+        let rows = db
+            .query_all_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) AS value
+                      FROM readings
+                      WHERE sensor_id IN ({cluster_ph}) AND time >= ${from_ref} AND time <= ${to_ref}
+                      ORDER BY sensor_id, time DESC"
+                ),
+                cluster_values,
+            ))
+            .await
+            .map_err(ApiError::database)?;
+        record_values(&rows, &mut out);
+    }
+
+    Ok(out)
+}
+
+/// The instant and value of each probed row, over whatever the enrichment already holds.
+fn record_values(rows: &[sea_orm::QueryResult], out: &mut HashMap<Uuid, Enrichment>) {
+    for row in rows {
+        if let (Ok(sensor_id), Ok(time), Ok(value)) = (
+            row.try_get::<Uuid>("", "sensor_id"),
+            row.try_get::<DateTime<chrono::FixedOffset>>("", "time"),
+            row.try_get::<f64>("", "value"),
+        ) {
+            let entry = out.entry(sensor_id).or_default();
+            entry.last_reading_at = Some(time.with_timezone(&Utc));
+            entry.last_reading_value = Some(value);
+        }
     }
 }
 
@@ -698,9 +750,13 @@ pub async fn create_sensor_for_stream<C: ConnectionTrait>(
     site_id: Uuid,
 ) -> AppResult<SensorContext> {
     let name = slot_instrument_name(db, site_id, parameter_id).await?;
-    let sensor_id =
-        resolve_or_mint_stream_instrument(db, stream, name.as_deref(), InstrumentKind::SourceParameter)
-            .await?;
+    let sensor_id = resolve_or_mint_stream_instrument(
+        db,
+        stream,
+        name.as_deref(),
+        InstrumentKind::SourceParameter,
+    )
+    .await?;
     let is_lab = sensors::Entity::find_by_id(sensor_id)
         .one(db)
         .await?
@@ -740,16 +796,15 @@ pub async fn ensure_channel_instrument<C: ConnectionTrait>(
     let name = slot_instrument_name(db, site_id, parameter_id)
         .await?
         .map(|slot| format!("{slot} ({kind})"));
-    resolve_or_mint_stream_instrument(db, stream, name.as_deref(), InstrumentKind::EntryChannel).await
+    resolve_or_mint_stream_instrument(db, stream, name.as_deref(), InstrumentKind::EntryChannel)
+        .await
 }
 
 /// A device feed is one whose stream metadata carries a `device` block. Broader than testing for a
 /// serial: viewLinc may report a channel with no `logger_serial`, and that is still a device.
 #[must_use]
 pub fn is_device_feed(stream_metadata: &serde_json::Value) -> bool {
-    stream_metadata
-        .get("device")
-        .is_some_and(|d| !d.is_null())
+    stream_metadata.get("device").is_some_and(|d| !d.is_null())
 }
 
 /// The name a source-registered field instrument takes: the slot it serves, "{site} {parameter}".

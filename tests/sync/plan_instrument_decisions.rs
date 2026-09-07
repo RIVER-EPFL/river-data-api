@@ -19,15 +19,14 @@ use crate::pairing_plan_apply::{job_id_of, wait_terminal};
 const SOURCE: &str = "instrdec";
 
 async fn setup() -> (axum::Router, String, sea_orm::DatabaseConnection) {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
-    let app = crate::common::build_test_app(db.clone());
-    (app, token, db)
+    let f = crate::common::seeded_app().await;
+    (f.app, f.token, f.db)
 }
 
 /// A feed carrying the hierarchy a plan reads plus the device identity the source reports.
+///
+/// `sensor_id` is set NULL against the suite's fixture default: what these tests are about is the
+/// instrument the feed itself resolves to, which a stream already naming one never reaches.
 async fn seed_device_stream(
     db: &sea_orm::DatabaseConnection,
     stream_id: Uuid,
@@ -44,9 +43,39 @@ async fn seed_device_stream(
     crate::common::exec(
         db,
         &format!(
-            "INSERT INTO data_streams (id, source_system, source_key, source_name, metadata, is_active) \
-             VALUES ('{stream_id}', '{SOURCE}', '{source_key}', '{source_key}', '{metadata}'::jsonb, true)"
+            "INSERT INTO data_streams \
+             (id, source_system, source_key, source_name, metadata, is_active, sensor_id) \
+             VALUES ('{stream_id}', '{SOURCE}', '{source_key}', '{source_key}', \
+                     '{metadata}'::jsonb, true, NULL)"
         ),
+    )
+    .await;
+}
+
+/// A lab-shaped feed carrying no instrument. The suite defaults `data_streams.sensor_id` to the
+/// fixture instrument, which would answer the question these tests put to the plan.
+async fn seed_lab_stream(
+    db: &sea_orm::DatabaseConnection,
+    stream_id: Uuid,
+    source_key: &str,
+    site: &str,
+) {
+    crate::common::seed_unpaired_stream_with_hierarchy(
+        db,
+        &stream_id.to_string(),
+        SOURCE,
+        source_key,
+        "Test River Project",
+        site,
+        "doc",
+        "ppb",
+        None,
+        0,
+    )
+    .await;
+    crate::common::exec(
+        db,
+        &format!("UPDATE data_streams SET sensor_id = NULL WHERE id = '{stream_id}'"),
     )
     .await;
 }
@@ -117,13 +146,8 @@ async fn apply_and_wait(
     token: &str,
     plan_id: &str,
 ) {
-    let (status, text) = crate::common::post_plan_action_with_token(
-        app,
-        &plan_id.to_string(),
-        "apply",
-        token,
-    )
-    .await;
+    let (status, text) =
+        crate::common::post_plan_action_with_token(app, &plan_id.to_string(), "apply", token).await;
     assert!((200..300).contains(&status), "apply ({status}): {text}");
     assert_eq!(wait_terminal(db, &job_id_of(&text)).await, "completed");
 }
@@ -313,29 +337,27 @@ async fn a_device_instrument_is_named_after_the_slot_it_serves() {
 async fn an_attached_instrument_returns_to_the_plan_s_own_proposal() {
     let (app, token, db) = setup().await;
     let stream = Uuid::new_v4();
-    crate::common::seed_unpaired_stream_with_hierarchy(
-        &db,
-        &stream.to_string(),
-        SOURCE,
-        "lab-doc",
-        "Test River Project",
-        "Upstream Station",
-        "doc",
-        "ppb",
-        None,
-        0,
-    )
-    .await;
+    seed_lab_stream(&db, stream, "lab-doc", "Upstream Station").await;
 
     let plan = create_plan(&app, &token).await;
     let plan_id = plan["id"].as_str().expect("plan id").to_string();
 
     let instruments = plan_instruments(&app, &token, &plan_id).await;
-    let unassigned = instruments["unassigned"].as_array().expect("unassigned");
-    assert_eq!(unassigned.len(), 1, "the lab feed is asked about");
     assert_eq!(
-        unassigned[0]["suggested_name"],
-        serde_json::json!("doc instrdec"),
+        instruments["unassigned"].as_array().map(Vec::len),
+        Some(0),
+        "a parameter with no instrument is proposed pre-agreed, not asked: {instruments}"
+    );
+    let proposed = entry_for(&plan, stream);
+    assert_eq!(
+        proposed["instrument"]["resolved_by"],
+        serde_json::json!("parameter")
+    );
+    assert_eq!(proposed["instrument"]["create"], serde_json::json!(true));
+    assert_eq!(proposed["instrument"]["confirmed"], serde_json::json!(true));
+    assert_eq!(
+        proposed["instrument"]["proposed_name"],
+        serde_json::json!("doc (instrdec)"),
         "the proposal reads as an identity, not as prose"
     );
 
@@ -416,19 +438,7 @@ async fn an_attached_instrument_returns_to_the_plan_s_own_proposal() {
 async fn a_later_plan_reports_the_instrument_an_earlier_one_created() {
     let (app, token, db) = setup().await;
     let first = Uuid::new_v4();
-    crate::common::seed_unpaired_stream_with_hierarchy(
-        &db,
-        &first.to_string(),
-        SOURCE,
-        "lab-doc-1",
-        "Test River Project",
-        "Upstream Station",
-        "doc",
-        "ppb",
-        None,
-        0,
-    )
-    .await;
+    seed_lab_stream(&db, first, "lab-doc-1", "Upstream Station").await;
 
     let plan = create_plan(&app, &token).await;
     let plan_id = plan["id"].as_str().expect("plan id").to_string();
@@ -447,19 +457,7 @@ async fn a_later_plan_reports_the_instrument_an_earlier_one_created() {
     apply_and_wait(&app, &db, &token, &plan_id).await;
 
     let second = Uuid::new_v4();
-    crate::common::seed_unpaired_stream_with_hierarchy(
-        &db,
-        &second.to_string(),
-        SOURCE,
-        "lab-doc-2",
-        "Test River Project",
-        "Downstream Station",
-        "doc",
-        "ppb",
-        None,
-        0,
-    )
-    .await;
+    seed_lab_stream(&db, second, "lab-doc-2", "Downstream Station").await;
 
     let plan = create_plan(&app, &token).await;
     let entry = entry_for(&plan, second);

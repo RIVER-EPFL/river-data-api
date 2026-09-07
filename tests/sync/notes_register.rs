@@ -17,12 +17,8 @@ struct Fixture {
 }
 
 async fn setup() -> Fixture {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let token = crate::common::seed_token_full(&db).await;
-    let app = crate::common::build_test_app(db.clone());
-    Fixture { db, app, token }
+    let f = crate::common::seeded_app().await;
+    Fixture { db: f.db, app: f.app, token: f.token }
 }
 
 async fn site_name(db: &DatabaseConnection) -> String {

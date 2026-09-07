@@ -32,12 +32,8 @@ const WINDOW: &str = "start=2025-06-01T00:00:00Z&end=2025-06-01T01:00:00Z";
 const TEMP_STREAM: &str = "00000000-0000-4000-d000-000000000001";
 
 async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
-    let app = crate::common::build_test_app(db.clone());
-    (db, app, token)
+    let f = crate::common::seeded_app().await;
+    (f.db, f.app, f.token)
 }
 
 /// Insert the three fixture values as continuous temperature readings at T0/T1/T2.

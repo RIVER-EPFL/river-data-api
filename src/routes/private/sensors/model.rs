@@ -55,7 +55,7 @@ pub struct Model {
     #[crudcrate(non_db_attr = true, exclude(create, update), join(one, depth = 1))]
     pub deployments: Vec<crate::routes::private::sensors::deployments::SensorDeployment>,
     #[sea_orm(ignore)]
-    #[crudcrate(non_db_attr = true, exclude(create, update, list))]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
     pub reading_count: Option<i64>,
     #[sea_orm(ignore)]
     #[crudcrate(non_db_attr = true, exclude(create, update))]

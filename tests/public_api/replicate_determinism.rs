@@ -4,18 +4,10 @@
 //!
 //! Run: cargo test --test public_api -- --test-threads=1
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::DatabaseConnection;
 use serial_test::serial;
 use uuid::Uuid;
 
-async fn exec(db: &DatabaseConnection, sql: &str) {
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_string(),
-    ))
-    .await
-    .unwrap_or_else(|e| panic!("SQL failed: {e}\nQuery: {sql}"));
-}
 
 /// Public project with an exposed parameter and a triplicate grab (replicates 0/1/2 behind one
 /// sample) at a timestamp off the seeded grid.
@@ -24,7 +16,7 @@ async fn setup_with_replicates() -> (DatabaseConnection, axum::Router) {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
 
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE projects SET is_public = true, public_code = 'test-river' WHERE id = '{}'",
@@ -32,7 +24,7 @@ async fn setup_with_replicates() -> (DatabaseConnection, axum::Router) {
         ),
     )
     .await;
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE sites SET public_code = 'upstream' WHERE id = '{}'",
@@ -40,7 +32,7 @@ async fn setup_with_replicates() -> (DatabaseConnection, axum::Router) {
         ),
     )
     .await;
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE site_parameters SET is_public = true WHERE id = '{}'",
@@ -50,7 +42,7 @@ async fn setup_with_replicates() -> (DatabaseConnection, axum::Router) {
     .await;
 
     let stream_id = Uuid::new_v4();
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO data_streams (id, source_system, source_key, is_active) \
@@ -60,7 +52,7 @@ async fn setup_with_replicates() -> (DatabaseConnection, axum::Router) {
     )
     .await;
     let sample_id = Uuid::new_v4();
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO samples (id, site_id, parameter_id, collected_at) \
@@ -71,7 +63,7 @@ async fn setup_with_replicates() -> (DatabaseConnection, axum::Router) {
     )
     .await;
     for (idx, value) in [(0, 10.0), (1, 20.0), (2, 30.0)] {
-        exec(
+        crate::common::exec(
             &db,
             &format!(
                 "INSERT INTO readings (stream_id, site_id, parameter_id, time, replicate_index, \

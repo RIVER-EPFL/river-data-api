@@ -67,8 +67,7 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
     let db = seeded_db().await;
     let app = kc::build_test_app_with_keycloak(db.clone()).await;
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
-    kc::ensure_realm_user("manager1", "manager1", &["riverdata-manager"]).await;
-    let manager = kc::get_keycloak_jwt("manager1", "manager1").await;
+    let manager = kc::member_jwt("manager1", "manager1", "riverdata-manager").await;
 
     // The payload the Tokens screen posts (river-data-ui/src/routes/tokens/new/+page.svelte).
     let payload = serde_json::json!({
@@ -338,8 +337,7 @@ async fn usage_view_and_audit_status_codes_over_http() {
     let kc_app = kc::build_test_app_with_keycloak(db.clone()).await;
     let audit_app = crate::common::build_test_app_with_audit(db.clone()).0;
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
-    kc::ensure_realm_user("manager1", "manager1", &["riverdata-manager"]).await;
-    let manager = kc::get_keycloak_jwt("manager1", "manager1").await;
+    let manager = kc::member_jwt("manager1", "manager1", "riverdata-manager").await;
 
     let read_only = serde_json::json!({
         "read_metadata": true,
@@ -521,8 +519,7 @@ async fn roles_endpoint_lists_only_river_access_levels() {
     crate::common::cleanup_test_db(&db).await;
     let app = kc::build_test_app_with_keycloak_admin(db.clone()).await;
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
-    kc::ensure_realm_user("manager1", "manager1", &["riverdata-manager"]).await;
-    let manager = kc::get_keycloak_jwt("manager1", "manager1").await;
+    let manager = kc::member_jwt("manager1", "manager1", "riverdata-manager").await;
 
     let (status, body) = crate::common::get_json_with_token(&app, "/api/roles", &admin).await;
     assert_eq!(

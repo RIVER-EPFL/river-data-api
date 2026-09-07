@@ -204,6 +204,13 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
     .await;
 }
 
+/// Run SQL through the simple protocol, for a script of several statements.
+pub async fn exec_unprepared(db: &DatabaseConnection, sql: &str) {
+    db.execute_unprepared(sql)
+        .await
+        .unwrap_or_else(|e| panic!("SQL failed: {e}\nQuery: {sql}"));
+}
+
 pub async fn exec(db: &DatabaseConnection, sql: &str) {
     db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,

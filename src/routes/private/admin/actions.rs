@@ -16,7 +16,7 @@ use crate::common::scope::{
 };
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors::calibrations::service::{
-    evaluate_formula, recompute_deployed_until, reprocess_sensor_readings,
+    evaluate_formula, recompute_deployed_until,
 };
 use crate::routes::private::sensors::deployments::slots;
 
@@ -471,6 +471,9 @@ pub struct RollbackDeploymentResponse {
     pub status: String,
     pub readings_reassigned: u64,
     pub previous_deployment_id: Option<Uuid>,
+    /// The reprocess this rollback queued: the re-derivation runs as a tracked job, like every
+    /// other caller's, rather than holding the request open for the whole cascade.
+    pub job_id: Uuid,
 }
 
 /// Undo the most recent sensor deployment, reassigning its readings back to the previous
@@ -645,9 +648,17 @@ pub async fn rollback_deployment(
     recompute_deployed_until(db, sensor_id)
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-    reprocess_sensor_readings(db, sensor_id)
-        .await
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
+        db,
+        "manual_reprocess",
+        Some(sensor_id),
+        None,
+        &serde_json::json!({ "sensor_id": sensor_id }),
+        None,
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .ok_or_else(|| AppError::Internal("failed to enqueue the rollback reprocess".to_string()))?;
 
     tracing::info!(
         deployment_id = %payload.deployment_id,
@@ -661,6 +672,7 @@ pub async fn rollback_deployment(
         status: "rolled_back".to_string(),
         readings_reassigned,
         previous_deployment_id,
+        job_id,
     }))
 }
 

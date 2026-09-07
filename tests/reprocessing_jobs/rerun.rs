@@ -11,12 +11,8 @@ use uuid::Uuid;
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
-    let app = crate::common::build_test_app(db.clone());
-    (db, app, token)
+    let f = crate::common::seeded_app().await;
+    (f.db, f.app, f.token)
 }
 
 fn job_id_of(text: &str) -> String {

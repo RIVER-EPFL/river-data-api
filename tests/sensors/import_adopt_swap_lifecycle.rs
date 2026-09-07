@@ -9,19 +9,11 @@ use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 use uuid::Uuid;
 
-async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_string(),
-    ))
-    .await
-    .unwrap_or_else(|e| panic!("SQL failed: {e}\n{sql}"));
-}
 
 /// Create an UNPAIRED stream (no site_parameter, no sensor) with site-less readings.
 async fn seed_unpaired_stream(db: &sea_orm::DatabaseConnection, source_key: &str) -> Uuid {
     let stream = Uuid::new_v4();
-    exec(
+    crate::common::exec(
         db,
         &format!(
             // Explicitly instrument-less: the harness defaults `sensor_id` to the fixture

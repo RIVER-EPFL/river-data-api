@@ -528,7 +528,7 @@ async fn resolve_variables_for_derived(
     db: &DatabaseConnection,
     item: &DerivedWork,
     time: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<HashMap<String, f64>>, sea_orm::DbErr> {
+) -> Result<Option<Option<HashMap<String, f64>>>, sea_orm::DbErr> {
     let mapping_rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -539,8 +539,10 @@ async fn resolve_variables_for_derived(
         ))
         .await?;
 
+    // A definition with no declared sources computes nothing at any instant. That is a definition
+    // that was never finished, not an input that went away, so it leaves whatever is stored alone.
     if mapping_rows.is_empty() {
-        return Ok(None);
+        return Ok(Some(None));
     }
 
     let mut variables = HashMap::new();
@@ -589,7 +591,56 @@ async fn resolve_variables_for_derived(
             None => return Ok(None),
         };
     }
-    Ok(Some(variables))
+    Ok(Some(Some(variables)))
+}
+
+/// The `(site, instant)` pairs a recall is about to clear, read before the UPDATE runs. A cleared
+/// instant is no longer selected by the cascade's own query, so it is carried across explicitly:
+/// the derived value computed from an input that has just left the site must go with it.
+async fn recalled_instants<C: ConnectionTrait>(
+    conn: &C,
+    predicate: &str,
+    values: Vec<sea_orm::Value>,
+) -> Result<Vec<(Uuid, chrono::DateTime<Utc>)>, sea_orm::DbErr> {
+    let rows = conn
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT DISTINCT r.site_id, r.time FROM readings r WHERE {predicate}"),
+            values,
+        ))
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let site_id: Uuid = row.try_get("", "site_id")?;
+        let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
+        out.push((site_id, time.with_timezone(&Utc)));
+    }
+    Ok(out)
+}
+
+/// Clear the site off a stored derived row, the unattributed state a recalled input leaves it in.
+async fn unattribute_derived_at(
+    db: &DatabaseConnection,
+    item: &DerivedWork,
+    time: chrono::DateTime<chrono::Utc>,
+) -> Result<(), sea_orm::DbErr> {
+    crate::common::bulk_write::guarded_mutation(
+        db,
+        Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"UPDATE readings SET site_id = NULL
+              WHERE site_id = $1 AND parameter_id = $2 AND time = $3
+                AND measurement_type = 'derived'",
+            [
+                item.derived_site_id.into(),
+                item.derived_parameter_id.into(),
+                time.into(),
+            ],
+        ),
+    )
+    .await
+    .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+    Ok(())
 }
 
 async fn evaluate_and_upsert_derived(
@@ -597,7 +648,14 @@ async fn evaluate_and_upsert_derived(
     item: &DerivedWork,
     time: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), sea_orm::DbErr> {
-    let Some(variables) = resolve_variables_for_derived(db, item, time).await? else {
+    let Some(resolved) = resolve_variables_for_derived(db, item, time).await? else {
+        // The inputs no longer resolve at this instant, so the stored derived value is the output
+        // of a measurement that is not served any more. It leaves the site the same way its input
+        // did rather than staying in the aggregates and the public arm.
+        unattribute_derived_at(db, item, time).await?;
+        return Ok(());
+    };
+    let Some(variables) = resolved else {
         return Ok(());
     };
 
@@ -716,47 +774,213 @@ pub async fn recompute_deployed_until<C: ConnectionTrait>(
     Ok(())
 }
 
+/// What a reprocess run covers.
+///
+/// The two scopes ask different questions of the same timelines. `Sensor` re-derives the columns of
+/// the readings one instrument already owns; `Slot` re-derives the owner too, which is what makes a
+/// swap (instrument B replaces A at one feed) hand A's post-swap readings to B. Everything after
+/// that choice, the curve resolution, the grab recomposition, the recall, the derived cascade and
+/// the rollup refresh, is one piece of code, so a fix cannot land on one arm and miss the other.
+#[derive(Clone, Copy, Debug)]
+pub enum Scope {
+    /// One instrument's own readings, wherever they sit.
+    Sensor(Uuid),
+    /// One (site, parameter) slot, whatever measured it.
+    Slot {
+        site_id: Uuid,
+        parameter_id: Uuid,
+    },
+}
+
+impl Scope {
+    fn values(self) -> Vec<sea_orm::Value> {
+        match self {
+            Self::Sensor(sensor_id) => vec![sensor_id.into()],
+            Self::Slot {
+                site_id,
+                parameter_id,
+            } => vec![site_id.into(), parameter_id.into()],
+        }
+    }
+
+    /// The readings this run may rewrite, as `r`.
+    fn readings_predicate(self) -> &'static str {
+        match self {
+            // A derived row carries the slot but no instrument, so no window resolves for it and
+            // the outer join below would erase the value the cascade wrote. The sensor arm needs no
+            // such guard: a derived row names no instrument to be in scope by.
+            Self::Sensor(_) => "r.sensor_id = $1",
+            Self::Slot { .. } => {
+                "r.site_id = $1 AND r.parameter_id = $2 \
+                 AND r.measurement_type IS DISTINCT FROM 'derived'"
+            }
+        }
+    }
+
+    /// Where the curve pick reads the instrument from: the scope's own on the sensor arm, the row's
+    /// (which step 1 has just re-owned) on the slot arm.
+    fn pick_sensor(self) -> &'static str {
+        match self {
+            Self::Sensor(_) => "$1",
+            Self::Slot { .. } => "r.sensor_id",
+        }
+    }
+
+    /// The deployments whose windows attribute this run's readings.
+    fn deployments_predicate(self) -> &'static str {
+        match self {
+            Self::Sensor(_) => "sensor_id = $1",
+            Self::Slot { .. } => "site_id = $1 AND parameter_id = $2",
+        }
+    }
+
+    /// The columns the attribution step writes. Only the slot arm re-owns.
+    fn attribution_set(self) -> &'static str {
+        match self {
+            Self::Sensor(_) => "deployment_id = dw.id, site_id = dw.site_id",
+            Self::Slot { .. } => "sensor_id = dw.sensor_id, deployment_id = dw.id, site_id = dw.site_id",
+        }
+    }
+
+    /// Which readings the attribution step considers, beyond the window overlap.
+    fn attribution_scope(self) -> &'static str {
+        match self {
+            // A deployment names one parameter, so it claims a row of that parameter or an
+            // unpaired one.
+            Self::Sensor(_) => {
+                "r.sensor_id = $1 AND (r.parameter_id IS NULL OR dw.parameter_id = r.parameter_id)"
+            }
+            // Either the row is at the slot, or it belongs to the instrument the slot's deployment
+            // names: that second half is what pulls a swapped instrument's readings back in.
+            Self::Slot { .. } => "r.parameter_id = $2 AND (r.site_id = $1 OR r.sensor_id = dw.sensor_id)",
+        }
+    }
+
+    /// A reading in a gap between deployments belongs to no site. Guarded to `time >= the scope's
+    /// first deployment` so readings that predate any deployment keep the site the stream pairing
+    /// gave them; an auto-created deployment opens at its stream's first reading, so the floor now
+    /// protects hand-dated deployments only.
+    fn recall_predicate(self) -> String {
+        let windowed = attribution_derivable("r");
+        match self {
+            Self::Sensor(_) => format!(
+                r"r.sensor_id = $1
+                    AND r.site_id IS NOT NULL
+                    AND {windowed}
+                    AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments d2
+                                   WHERE d2.sensor_id = $1
+                                     AND (r.parameter_id IS NULL OR d2.parameter_id = r.parameter_id))
+                    AND NOT EXISTS (
+                        SELECT 1 FROM sensor_deployments d
+                        WHERE d.sensor_id = $1
+                          AND (r.parameter_id IS NULL OR d.parameter_id = r.parameter_id)
+                          AND r.time >= d.deployed_from
+                          AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
+                    )"
+            ),
+            Self::Slot { .. } => format!(
+                r"r.site_id = $1 AND r.parameter_id = $2
+                    AND {windowed}
+                    AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments
+                                   WHERE site_id = $1 AND parameter_id = $2)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM sensor_deployments d
+                        WHERE d.site_id = $1 AND d.parameter_id = $2
+                          AND r.time >= d.deployed_from
+                          AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
+                    )"
+            ),
+        }
+    }
+
+    /// The rows whose span the rollup refresh covers.
+    fn refresh_predicate(self) -> &'static str {
+        match self {
+            Self::Sensor(_) => "sensor_id = $1",
+            Self::Slot { .. } => "site_id = $1 AND parameter_id = $2",
+        }
+    }
+}
+
 pub async fn reprocess_sensor_readings(
     db: &DatabaseConnection,
     sensor_id: Uuid,
 ) -> Result<usize, sea_orm::DbErr> {
-    // Nothing here manufactures coverage. A reading that predates the sensor's first curve, or falls
-    // in a gap between two, is uncorrected: the re-derivation below resolves no curve for it and
-    // clears both the reference and the value.
-    //
     // Repair a `valid_until` a bulk load left NULL, so the stored window agrees with the one the
     // resolver serves. `pick_calibration_lateral` is single-valued whether or not windows overlap,
-    // so the derivation below does not need this; what needs it is the curve editor, which reads
+    // so the derivation does not need this; what needs it is the curve editor, which reads
     // `valid_until` and would otherwise show a window open past the point a later curve takes over.
     recompute_valid_until(db, sensor_id).await?;
+    reprocess(db, Scope::Sensor(sensor_id)).await
+}
 
-    // The bulk re-derivation runs in one guarded transaction (`common::bulk_write`), which lifts
-    // TimescaleDB's per-statement decompression cap: a deep-historical reprocess rewrites rows in
-    // compressed (>30-day) chunks and would otherwise abort the job. The read-back, derived cascade
-    // and continuous-aggregate refresh run AFTER commit, a CAGG refresh cannot run inside a
-    // transaction.
-    //
-    // The calibration pick is `resolver::pick_calibration_lateral`, the same ranking the write paths
-    // resolve with, so reprocess recomputes the value ingest already stored rather than a different
-    // one.
-    //
-    // Which rows a window may claim is `window_resolved_rows`; the spot rows it holds back are
-    // rewritten from the curves they name by `recompose_spot_readings` below.
-    //
-    // The lateral is an outer join, so a reading no window covers is in scope rather than skipped:
-    // it is written `calibration_id = NULL` and, unless it names a standard curve, a NULL value. A
-    // gap in a calibration timeline is an ordinary state, and reprocess has to be able to CLEAR a
-    // correction as well as replace one, or a curve deleted or moved off a reading would leave that
-    // reading serving a corrected value nothing on the row accounts for. This is the same statement
-    // shape the delete path uses (`SensorCalibrationOperations::perform_delete`), including the
-    // standard curve it re-applies on top of whatever base resolves.
-    //
-    // `orphaned_correction_rows` is the one thing that clear does not reach. A row resolving no
-    // window, naming no curve, and holding a number that is not a copy of its raw value was written
-    // that way by a caller; recomputing it here would replace somebody's measurement with a NULL and
-    // leave no record it existed. Those rows are reported by `GET /actions/calibration_candidates`
-    // and left alone here.
-    let cal_sql = format!(
+/// Per-(site, parameter) reprocess. See [`Scope::Slot`].
+pub async fn reprocess_site_parameter_readings(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+) -> Result<usize, sea_orm::DbErr> {
+    reprocess(
+        db,
+        Scope::Slot {
+            site_id,
+            parameter_id,
+        },
+    )
+    .await
+}
+
+/// Re-derive a scope's readings from the deployment and calibration timelines, then follow the
+/// change out: derived values at the instants it moved, and the rollups over the span it covers.
+///
+/// Nothing here manufactures coverage. A reading that predates the instrument's first curve, or
+/// falls in a gap between two, is uncorrected: the resolution below resolves no curve for it and
+/// clears both the reference and the value. The lateral is an outer join for that reason, so a
+/// reading no window covers is in scope rather than skipped; a reprocess has to be able to CLEAR a
+/// correction as well as replace one, or a curve deleted or moved off a reading would leave that
+/// reading serving a number nothing on the row accounts for.
+///
+/// `orphaned_correction_rows` is the one thing that clear does not reach: a row resolving no window,
+/// naming no curve, and holding a number that is not a copy of its raw value was written that way by
+/// a caller, and recomputing it here would replace somebody's measurement with a NULL. Those are
+/// reported by `GET /actions/calibration_candidates` and left alone.
+///
+/// Steps 1 to 4 run in one guarded transaction (`common::bulk_write`), which lifts TimescaleDB's
+/// per-statement decompression cap: a deep-historical reprocess rewrites rows in compressed
+/// (>30-day) chunks and would otherwise abort the job. The cascade and the rollup refresh run after
+/// the commit, since a continuous-aggregate refresh cannot run inside a transaction.
+pub async fn reprocess(db: &DatabaseConnection, scope: Scope) -> Result<usize, sea_orm::DbErr> {
+    let values = scope.values();
+
+    // Step 1, attribution. On the slot arm this runs BEFORE the curve resolution and the order is
+    // the contract: step 2 resolves against `r.sensor_id`, so it picks the curves of the owner
+    // step 1 just wrote. Resolving first would stamp the outgoing instrument's curve on a reading
+    // the swap hands to the incoming one, and nothing repairs that afterwards.
+    let attribution_sql = format!(
+        r"UPDATE readings r
+            SET {set}
+            FROM (
+                SELECT id, sensor_id, site_id, parameter_id, deployed_from,
+                       COALESCE(deployed_until, 'infinity'::timestamptz) AS deployed_until
+                FROM sensor_deployments
+                WHERE {deployments}
+            ) dw
+            WHERE {scope_sql}
+              AND {windowed}
+              AND r.time >= dw.deployed_from
+              AND r.time < dw.deployed_until
+            RETURNING r.site_id, r.time",
+        set = scope.attribution_set(),
+        deployments = scope.deployments_predicate(),
+        scope_sql = scope.attribution_scope(),
+        windowed = attribution_derivable("r"),
+    );
+
+    // Step 2, the curve. The pick is `resolver::pick_calibration_lateral`, the same ranking the
+    // write paths resolve with, so a reprocess recomputes the value ingest already stored rather
+    // than a different one. Which rows a window may claim is `window_resolved_rows`; the spot rows
+    // it holds back are step 3's.
+    let calibration_sql = format!(
         r"UPDATE readings tgt
             SET calibration_id = picked.cal_id,
                 calibrated_value = {value}
@@ -767,14 +991,16 @@ pub async fn reprocess_sensor_readings(
                        cw.id AS cal_id, cw.slope, cw.intercept
                 FROM readings r
                 LEFT JOIN LATERAL ({pick}) cw ON true
-                WHERE r.sensor_id = $1
+                WHERE {scope_sql}
                   AND {windowed}
                   AND NOT (cw.id IS NULL AND ({orphaned}))
             ) picked
             LEFT JOIN standard_curves sc ON sc.id = picked.p_standard_curve_id
             WHERE tgt.stream_id = picked.p_stream_id
               AND tgt.time = picked.p_time
-              AND tgt.replicate_index = picked.p_replicate_index",
+              AND tgt.replicate_index = picked.p_replicate_index
+            RETURNING tgt.site_id, tgt.time",
+        scope_sql = scope.readings_predicate(),
         windowed = calibration_derivable("r"),
         orphaned = orphaned_correction_rows("r"),
         value = recomposed_value_sql(
@@ -790,94 +1016,48 @@ pub async fn reprocess_sensor_readings(
                 intercept: "sc.intercept",
             },
         ),
-        pick = super::resolver::pick_calibration_lateral("$1")
+        pick = super::resolver::pick_calibration_lateral(scope.pick_sensor()),
     );
 
-    let readings_updated = crate::common::bulk_write::guarded(db, async |txn| {
-        let cal_result = txn
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &cal_sql,
-                [sensor_id.into()],
-            ))
-            .await?;
-        let mut readings_updated = cal_result.rows_affected() as usize;
+    // Step 3, the grabs: they keep the curves they were entered against, and their value follows
+    // those curves' current coefficients.
+    let spot_sql = format!(
+        "{} RETURNING tgt.site_id, tgt.time",
+        recompose_statement("r.measurement_type = 'spot'", scope.readings_predicate())
+    );
 
-        readings_updated +=
-            recompose_spot_readings(txn, "r.sensor_id = $1", vec![sensor_id.into()]).await? as usize;
+    let recall_predicate = scope.recall_predicate();
+    let recall_sql =
+        format!("UPDATE readings r SET site_id = NULL, deployment_id = NULL WHERE {recall_predicate}");
 
+    let (readings_updated, cascade) = crate::common::bulk_write::guarded(db, async |txn| {
+        let mut touched: Vec<(Uuid, DateTime<Utc>)> = Vec::new();
+        let mut readings_updated = 0usize;
+        for sql in [&attribution_sql, &calibration_sql, &spot_sql] {
+            readings_updated += write_and_collect(txn, sql, values.clone(), &mut touched).await?;
+        }
+
+        // The instants the recall clears are read before it runs: afterwards they carry no site,
+        // and they are exactly the ones whose derived output has to follow its input out of it.
+        touched.extend(recalled_instants(txn, &recall_predicate, values.clone()).await?);
         txn.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                r"UPDATE readings r
-            SET deployment_id = dw.id,
-                site_id = dw.site_id
-            FROM (
-                SELECT id, site_id, parameter_id, deployed_from,
-                       COALESCE(deployed_until, 'infinity'::timestamptz) AS deployed_until
-                FROM sensor_deployments
-                WHERE sensor_id = $1
-            ) dw
-            WHERE r.sensor_id = $1
-              AND {windowed}
-              AND r.time >= dw.deployed_from
-              AND r.time < dw.deployed_until
-              AND (dw.parameter_id IS NULL OR r.parameter_id IS NULL OR dw.parameter_id = r.parameter_id)",
-                windowed = attribution_derivable("r")
-            ),
-            [sensor_id.into()],
+            &recall_sql,
+            values.clone(),
         ))
         .await?;
 
-        // Recall: a reading that falls in a gap between/after the sensor's deployments (the sensor
-        // was pulled out, e.g. sitting in the lab) belongs to no site. Clear its site/deployment so
-        // it drops out of the continuous aggregates. Guarded to `time >= the sensor's first
-        // deployment` so readings that predate any deployment keep the site_id the stream pairing
-        // gave them. An auto-created deployment opens at its stream's first reading, so the floor
-        // now protects hand-dated deployments only.
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                r"UPDATE readings r
-              SET site_id = NULL, deployment_id = NULL
-              WHERE r.sensor_id = $1
-                AND {windowed}
-                AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments d2
-                               WHERE d2.sensor_id = $1
-                                 AND (d2.parameter_id IS NULL OR r.parameter_id IS NULL
-                                      OR d2.parameter_id = r.parameter_id))
-                AND NOT EXISTS (
-                    SELECT 1 FROM sensor_deployments d
-                    WHERE d.sensor_id = $1
-                      AND (d.parameter_id IS NULL OR r.parameter_id IS NULL
-                           OR d.parameter_id = r.parameter_id)
-                      AND r.time >= d.deployed_from
-                      AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
-                )",
-                windowed = attribution_derivable("r")
-            ),
-            [sensor_id.into()],
-        ))
-        .await?;
-
-        Ok(readings_updated)
+        touched.sort_unstable();
+        touched.dedup();
+        Ok((readings_updated, touched))
     })
     .await
     .map_err(app_error_as_db_err)?;
 
-    let affected = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT DISTINCT site_id, time FROM readings
-              WHERE sensor_id = $1 AND site_id IS NOT NULL",
-            [sensor_id.into()],
-        ))
-        .await?;
-
-    for row in &affected {
-        let site_id: Uuid = row.try_get("", "site_id")?;
-        let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
-        let utc_time = time.with_timezone(&Utc);
+    // The cascade runs over what this run moved, not over every instant in the scope: a derived
+    // value at (site, time) is a function of the served values, and those changed only where a
+    // statement above wrote. Costing a query per instant, the difference is the whole run.
+    for (site_id, utc_time) in cascade {
         if let Err(e) = recalculate_derived_at_timestamp(db, site_id, utc_time).await {
             tracing::warn!(
                 error = %e,
@@ -888,206 +1068,52 @@ pub async fn reprocess_sensor_readings(
         }
     }
 
-    let time_range = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT MIN(time) AS min_time, MAX(time) AS max_time
-              FROM readings WHERE sensor_id = $1",
-            [sensor_id.into()],
-        ))
-        .await?;
-
-    if let Some(ref range) = time_range {
-        let min_time: Option<DateTime<Utc>> = range.try_get("", "min_time").ok();
-        if let Some(since) = min_time {
-            crate::common::aggregates::refresh(db, crate::common::aggregates::Window::Since(since))
-                .await
-                .map_err(app_error_as_db_err)?;
-        }
-    }
-
-    Ok(readings_updated)
-}
-
-/// Per-(site, parameter) twin of [`reprocess_sensor_readings`]. Where the per-sensor reprocess
-/// re-derives FK columns for rows it already owns (`r.sensor_id = $sensor`), this re-derives the
-/// OWNER too: for every reading at `(site_id, parameter_id)`, it sets `sensor_id`/`deployment_id`/
-/// `calibration_id`/`calibrated_value` from whichever deployment+calibration window covers the
-/// reading time. This is what makes a sensor SWAP (B replaces A at one feed) re-attribute A's
-/// post-swap readings to B. The `excl_deployment_site_param_slot` constraint guarantees at most one
-/// covering deployment per time, so the owner is unambiguous and the join is single-valued.
-///
-/// Like the per-sensor engine, the recall NULL-clear is guarded to `time >= the slot's first
-/// deployment` so pre-deployment history keeps its pairing site_id.
-pub async fn reprocess_site_parameter_readings(
-    db: &DatabaseConnection,
-    site_id: Uuid,
-    parameter_id: Uuid,
-) -> Result<usize, sea_orm::DbErr> {
-    // Steps 1-3 run in one guarded transaction (`common::bulk_write`), which lifts TimescaleDB's
-    // per-statement decompression cap; the derived cascade and aggregate refresh follow after commit.
-    // Step 2 resolves with `resolver::pick_calibration_lateral`, the ranking every other path uses.
-    //
-    // As in the per-sensor engine the lateral is an outer join, so a reading at this slot that no
-    // window covers is cleared (`calibration_id = NULL`, and a NULL value unless it names a standard
-    // curve) rather than left carrying a correction the timeline no longer accounts for, and as
-    // there `orphaned_correction_rows` is held out of that clear: a caller-supplied corrected value
-    // with no curve behind it is reported, never overwritten.
-    //
-    // Derived readings are held out. They carry the slot's site and parameter but no instrument, so
-    // no window can ever resolve for them; they are a computed quantity rather than an instrument
-    // reading plus a correction, and the outer join would otherwise erase every value the derived
-    // cascade wrote.
-    let cal_sql = format!(
-        r"UPDATE readings tgt
-          SET calibration_id = picked.cal_id,
-              calibrated_value = {value}
-          FROM (
-              SELECT r.stream_id AS p_stream_id, r.time AS p_time,
-                     r.replicate_index AS p_replicate_index,
-                     r.standard_curve_id AS p_standard_curve_id,
-                     cw.id AS cal_id, cw.slope, cw.intercept
-              FROM readings r
-              LEFT JOIN LATERAL ({pick}) cw ON true
-              WHERE r.site_id = $1 AND r.parameter_id = $2
-                AND {windowed}
-                AND r.measurement_type IS DISTINCT FROM 'derived'
-                AND NOT (cw.id IS NULL AND ({orphaned}))
-          ) picked
-          LEFT JOIN standard_curves sc ON sc.id = picked.p_standard_curve_id
-          WHERE tgt.stream_id = picked.p_stream_id
-            AND tgt.time = picked.p_time
-            AND tgt.replicate_index = picked.p_replicate_index",
-        windowed = calibration_derivable("r"),
-        orphaned = orphaned_correction_rows("r"),
-        value = recomposed_value_sql(
-            "tgt.raw_value",
-            &CurveColumns {
-                id: "picked.cal_id",
-                slope: "picked.slope",
-                intercept: "picked.intercept",
-            },
-            &CurveColumns {
-                id: "sc.id",
-                slope: "sc.slope",
-                intercept: "sc.intercept",
-            },
-        ),
-        pick = super::resolver::pick_calibration_lateral("r.sensor_id")
-    );
-
-    let updated = crate::common::bulk_write::guarded(db, async |txn| {
-        // 1. Re-own + re-stamp deployment/site from the (site, parameter) deployment timeline.
-        //    This runs before the curve resolution below, and the order is the contract: step 2
-        //    resolves against `r.sensor_id`, so it picks the curves of the owner step 1 just
-        //    wrote. Resolving first would stamp the outgoing sensor's curve on a reading the swap
-        //    hands to the incoming one, and nothing repairs that afterwards.
-        let dep_result = txn
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    r"UPDATE readings r
-                  SET sensor_id = dw.sensor_id,
-                      deployment_id = dw.id,
-                      site_id = dw.site_id
-                  FROM (
-                      SELECT id, sensor_id, site_id, deployed_from,
-                             COALESCE(deployed_until, 'infinity'::timestamptz) AS deployed_until
-                      FROM sensor_deployments
-                      WHERE site_id = $1 AND parameter_id = $2
-                  ) dw
-                  WHERE r.parameter_id = $2
-                    AND {windowed}
-                    AND (r.site_id = $1 OR r.sensor_id = dw.sensor_id)
-                    AND r.time >= dw.deployed_from
-                    AND r.time < dw.deployed_until",
-                    windowed = attribution_derivable("r")
-                ),
-                [site_id.into(), parameter_id.into()],
-            ))
-            .await?;
-        let updated = dep_result.rows_affected() as usize;
-
-        // 2. Re-derive calibrated_value/calibration_id for the (now correct) owner.
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &cal_sql,
-            [site_id.into(), parameter_id.into()],
-        ))
-        .await?;
-
-        // 3. Grabs at this slot keep the curves they were entered against, and their value follows
-        //    those curves' current coefficients.
-        recompose_spot_readings(
-            txn,
-            "r.site_id = $1 AND r.parameter_id = $2",
-            vec![site_id.into(), parameter_id.into()],
-        )
-        .await?;
-
-        // 4. Recall NULL-clear: a reading in a deployment gap drops out of the site (guarded to
-        //    time >= the slot's first deployment, which protects history under a hand-dated
-        //    deployment; an auto-created one opens at its stream's first reading).
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                r"UPDATE readings r
-              SET site_id = NULL, deployment_id = NULL
-              WHERE r.site_id = $1 AND r.parameter_id = $2
-                AND {windowed}
-                AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments
-                               WHERE site_id = $1 AND parameter_id = $2)
-                AND NOT EXISTS (
-                    SELECT 1 FROM sensor_deployments d
-                    WHERE d.site_id = $1 AND d.parameter_id = $2
-                      AND r.time >= d.deployed_from
-                      AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
-                )",
-                windowed = attribution_derivable("r")
-            ),
-            [site_id.into(), parameter_id.into()],
-        ))
-        .await?;
-
-        Ok(updated)
-    })
-    .await
-    .map_err(app_error_as_db_err)?;
-
-    // 4. Cascade derived + refresh aggregates over the affected range (same tail as per-sensor).
-    let affected = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT DISTINCT site_id, time FROM readings
-              WHERE site_id = $1 AND parameter_id = $2",
-            [site_id.into(), parameter_id.into()],
-        ))
-        .await?;
-    for row in &affected {
-        let sid: Uuid = row.try_get("", "site_id")?;
-        let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
-        let utc = time.with_timezone(&Utc);
-        if let Err(e) = recalculate_derived_at_timestamp(db, sid, utc).await {
-            tracing::warn!(error = %e, site_id = %sid, time = %utc,
-                "Failed to cascade (site,parameter) reprocess to derived parameter");
-        }
-    }
     let range = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT MIN(time) AS min_time FROM readings WHERE site_id = $1 AND parameter_id = $2",
-            [site_id.into(), parameter_id.into()],
+            format!(
+                "SELECT MIN(time) AS min_time FROM readings WHERE {}",
+                scope.refresh_predicate()
+            ),
+            values,
         ))
         .await?;
-    if let Some(r) = range
-        && let Ok(since) = r.try_get::<DateTime<Utc>>("", "min_time")
+    if let Some(row) = range
+        && let Ok(since) = row.try_get::<DateTime<Utc>>("", "min_time")
     {
         crate::common::aggregates::refresh(db, crate::common::aggregates::Window::Since(since))
             .await
             .map_err(app_error_as_db_err)?;
     }
-    Ok(updated)
+
+    Ok(readings_updated)
 }
+
+/// Run one of the engine's statements, collecting the attributed instants it wrote. Each ends in
+/// `RETURNING <target>.site_id, <target>.time`; an unattributed row returns a NULL site and is not
+/// an instant anything derives from.
+async fn write_and_collect<C: ConnectionTrait>(
+    conn: &C,
+    sql: &str,
+    values: Vec<sea_orm::Value>,
+    touched: &mut Vec<(Uuid, DateTime<Utc>)>,
+) -> Result<usize, sea_orm::DbErr> {
+    let rows = conn
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await?;
+    for row in &rows {
+        let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
+        if let Ok(site_id) = row.try_get::<Uuid>("", "site_id") {
+            touched.push((site_id, time.with_timezone(&Utc)));
+        }
+    }
+    Ok(rows.len())
+}
+
 
 #[cfg(test)]
 mod tests {

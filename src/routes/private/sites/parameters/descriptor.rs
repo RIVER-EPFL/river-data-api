@@ -148,7 +148,6 @@ mod tests {
             updated_at: None,
             discovered_at: None,
             parameter: Vec::new(),
-            derived_definition: None,
         }
     }
 

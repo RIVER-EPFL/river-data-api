@@ -521,12 +521,12 @@ pub async fn enforce_scope_on_crud(
     }
 
     let path = request.uri().path().to_string();
-    let Some((entity, id)) = parse_crud_target(&path) else {
+    let method = request.method().clone();
+    let Some((entity, target)) = parse_crud_target(&path) else {
         return AppError::Forbidden("You cannot perform this operation".to_string())
             .into_response();
     };
     let entity = entity.to_string();
-    let id = id.map(str::to_string);
 
     // Buffer the body so a create payload can be inspected and then forwarded intact.
     let (parts, body) = request.into_parts();
@@ -538,42 +538,71 @@ pub async fn enforce_scope_on_crud(
     };
     let json: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
 
-    let outside = || {
-        AppError::Forbidden("That resource is outside your project access".to_string())
-            .into_response()
+    // Every row the request touches must clear the check on its own; one element outside the
+    // caller's projects refuses the whole batch.
+    let elements: Vec<(Option<String>, Option<serde_json::Value>)> = match target {
+        CrudTarget::Collection => vec![(None, json.clone())],
+        CrudTarget::Row(id) => vec![(Some(id), json.clone())],
+        CrudTarget::Batch => match batch_elements(&method, json.as_ref()) {
+            Some(elements) if !elements.is_empty() => elements,
+            Some(_) => {
+                // Nothing to authorise, and nothing for the handler to do either.
+                let request = Request::from_parts(parts, axum::body::Body::from(bytes));
+                return next.run(request).await;
+            }
+            None => {
+                return AppError::Forbidden(
+                    "Could not resolve the rows this batch acts on".to_string(),
+                )
+                .into_response();
+            }
+        },
     };
-    match resolve_scope_project(&state.db, &entity, id.as_deref(), json.as_ref()).await {
-        // Every owning/target project must be in scope (a single owner, or owner + repoint target).
-        ScopeOutcome::RequireAll(projects) => {
-            if projects.is_empty() || !projects.iter().all(|p| scope.allows_project(*p)) {
-                return outside();
-            }
-        }
-        // At least one must be in scope, matches read confinement for a multi-project entity (a
-        // calibration is visible/writable if its sensor touches a granted project). Empty fails closed.
-        ScopeOutcome::RequireAny(projects) => {
-            if !projects.iter().any(|p| scope.allows_project(*p)) {
-                return outside();
-            }
-        }
-        // A project-scoped entity whose owning project couldn't be resolved (row missing/unbound, or a
-        // create that omits the owning FK to dodge the check): fail closed for any restricted principal.
-        // Administrators never reach here, the unrestricted early-return above skips this whole guard.
-        ScopeOutcome::Unresolved(msg) => {
-            return AppError::Forbidden(msg).into_response();
-        }
-        // An entity with no project dimension (global catalog: parameters, constants, sensors, …):
-        // a project-scoped token may not touch it; a member may (their role capability governs shared
-        // metadata writes).
-        ScopeOutcome::Global(msg) => {
-            if is_token {
-                return AppError::Forbidden(msg).into_response();
-            }
+
+    for (id, body) in &elements {
+        if let Some(refusal) = check_scope_outcome(
+            resolve_scope_project(&state.db, &entity, id.as_deref(), body.as_ref()).await,
+            &scope,
+            is_token,
+        ) {
+            return refusal;
         }
     }
 
     let request = Request::from_parts(parts, axum::body::Body::from(bytes));
     next.run(request).await
+}
+
+/// The refusal a resolved outcome earns, or `None` when the caller may proceed.
+fn check_scope_outcome(
+    outcome: ScopeOutcome,
+    scope: &crate::common::authz::AccessScope,
+    is_token: bool,
+) -> Option<Response> {
+    let outside = || {
+        AppError::Forbidden("That resource is outside your project access".to_string())
+            .into_response()
+    };
+    match outcome {
+        // Every owning/target project must be in scope (a single owner, or owner + repoint target).
+        ScopeOutcome::RequireAll(projects) => {
+            (projects.is_empty() || !projects.iter().all(|p| scope.allows_project(*p)))
+                .then(outside)
+        }
+        // At least one must be in scope, matches read confinement for a multi-project entity (a
+        // calibration is visible/writable if its sensor touches a granted project). Empty fails closed.
+        ScopeOutcome::RequireAny(projects) => {
+            (!projects.iter().any(|p| scope.allows_project(*p))).then(outside)
+        }
+        // A project-scoped entity whose owning project couldn't be resolved (row missing/unbound, or a
+        // create that omits the owning FK to dodge the check): fail closed for any restricted principal.
+        // Administrators never reach here, the unrestricted early-return above skips this whole guard.
+        ScopeOutcome::Unresolved(msg) => Some(AppError::Forbidden(msg).into_response()),
+        // An entity with no project dimension (global catalog: parameters, constants, sensors, …):
+        // a project-scoped token may not touch it; a member may (their role capability governs shared
+        // metadata writes).
+        ScopeOutcome::Global(msg) => is_token.then(|| AppError::Forbidden(msg).into_response()),
+    }
 }
 
 enum ScopeOutcome {
@@ -587,13 +616,59 @@ enum ScopeOutcome {
     Global(String),
 }
 
-/// Extract `(entity, optional id)` from a CRUD path like `/api/site_parameters/{id}`.
-fn parse_crud_target(path: &str) -> Option<(&str, Option<&str>)> {
+/// What a CRUD request acts on.
+#[derive(Debug, PartialEq, Eq)]
+enum CrudTarget {
+    /// `POST /{entity}`: the row is described by the body alone.
+    Collection,
+    /// `PATCH|DELETE /{entity}/{id}`: one row, named in the path.
+    Row(String),
+    /// `POST|PATCH|DELETE /{entity}/batch`: several rows, each named in the body. `batch` is a
+    /// sub-route, not an id, so parsing it as one fails closed on every batch write.
+    Batch,
+}
+
+/// Extract `(entity, target)` from a CRUD path like `/api/site_parameters/{id}`.
+fn parse_crud_target(path: &str) -> Option<(&str, CrudTarget)> {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let start = segs.iter().position(|s| *s == "api").map_or(0, |i| i + 1);
     let entity = segs.get(start)?;
-    let id = segs.get(start + 1).copied();
-    Some((entity, id))
+    let target = match segs.get(start + 1) {
+        None => CrudTarget::Collection,
+        Some(&"batch") => CrudTarget::Batch,
+        Some(id) => CrudTarget::Row((*id).to_string()),
+    };
+    Some((entity, target))
+}
+
+/// The (id, body) pairs a batch request acts on, one per element, by the shape crudcrate's batch
+/// handlers take: `POST` an array of create payloads, `PATCH` an array of `{id, data}`, `DELETE`
+/// an array of ids. `None` when the body is not the array the route requires, which fails closed.
+fn batch_elements(
+    method: &Method,
+    body: Option<&serde_json::Value>,
+) -> Option<Vec<(Option<String>, Option<serde_json::Value>)>> {
+    let items = body?.as_array()?;
+    match *method {
+        Method::POST => Some(
+            items
+                .iter()
+                .map(|item| (None, Some(item.clone())))
+                .collect(),
+        ),
+        Method::PATCH => items
+            .iter()
+            .map(|item| {
+                let id = item.get("id")?.as_str()?.to_string();
+                Some((Some(id), item.get("data").cloned()))
+            })
+            .collect(),
+        Method::DELETE => items
+            .iter()
+            .map(|item| Some((Some(item.as_str()?.to_string()), None)))
+            .collect(),
+        _ => None,
+    }
 }
 
 async fn resolve_scope_project(
@@ -1058,4 +1133,82 @@ pub async fn inject_read_scope(request: Request, next: Next) -> Response {
         return next.run(request).await;
     }
     next.run(request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{batch_elements, parse_crud_target, CrudTarget};
+    use axum::http::Method;
+    use serde_json::json;
+
+    #[test]
+    fn test_parse_crud_target_reads_batch_as_a_sub_route_not_an_id() {
+        assert_eq!(
+            parse_crud_target("/api/site_parameters/batch"),
+            Some(("site_parameters", CrudTarget::Batch)),
+            "parsed as an id, `batch` fails the UUID parse and refuses every scoped batch write"
+        );
+        assert_eq!(
+            parse_crud_target("/api/site_parameters"),
+            Some(("site_parameters", CrudTarget::Collection))
+        );
+        assert_eq!(
+            parse_crud_target("/api/site_parameters/0189d3f0-0000-4000-8000-000000000000"),
+            Some((
+                "site_parameters",
+                CrudTarget::Row("0189d3f0-0000-4000-8000-000000000000".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn test_batch_elements_follow_each_route_s_body_shape() {
+        let creates = json!([{ "site_id": "a" }, { "site_id": "b" }]);
+        assert_eq!(
+            batch_elements(&Method::POST, Some(&creates)),
+            Some(vec![
+                (None, Some(json!({ "site_id": "a" }))),
+                (None, Some(json!({ "site_id": "b" }))),
+            ])
+        );
+
+        let updates = json!([{ "id": "one", "data": { "name": "x" } }]);
+        assert_eq!(
+            batch_elements(&Method::PATCH, Some(&updates)),
+            Some(vec![(
+                Some("one".to_string()),
+                Some(json!({ "name": "x" }))
+            )])
+        );
+
+        let deletes = json!(["one", "two"]);
+        assert_eq!(
+            batch_elements(&Method::DELETE, Some(&deletes)),
+            Some(vec![
+                (Some("one".to_string()), None),
+                (Some("two".to_string()), None),
+            ])
+        );
+    }
+
+    /// A body that is not the array the route takes resolves no rows, so the caller is refused
+    /// rather than passed through unchecked.
+    #[test]
+    fn test_batch_elements_refuse_a_body_that_names_no_rows() {
+        assert_eq!(batch_elements(&Method::POST, None), None);
+        assert_eq!(
+            batch_elements(&Method::POST, Some(&json!({ "site_id": "a" }))),
+            None
+        );
+        assert_eq!(
+            batch_elements(&Method::PATCH, Some(&json!([{ "data": {} }]))),
+            None,
+            "an update element naming no id"
+        );
+        assert_eq!(
+            batch_elements(&Method::DELETE, Some(&json!([{ "id": "one" }]))),
+            None,
+            "a delete element that is not an id string"
+        );
+    }
 }

@@ -6,15 +6,6 @@
 
 use serial_test::serial;
 
-async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
-    use sea_orm::{ConnectionTrait, Statement};
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_string(),
-    ))
-    .await
-    .unwrap_or_else(|e| panic!("SQL failed: {e}\nQuery: {sql}"));
-}
 
 /// Scenario: the parameter carries a global threshold row and the site carries none.
 /// Expected behaviour: alarms fire against the global row.
@@ -29,9 +20,9 @@ async fn test_global_threshold_triggers_alarms_without_a_site_row() {
 
     let site_id = crate::common::SITE1_ID;
 
-    exec(&db, "DELETE FROM alarm_thresholds").await;
+    crate::common::exec(&db, "DELETE FROM alarm_thresholds").await;
 
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO alarm_thresholds (id, parameter_id, site_id, warning_min, warning_max, alarm_min, alarm_max, description) \
@@ -92,9 +83,9 @@ async fn test_site_threshold_overrides_the_global_row() {
 
     let site_id = crate::common::SITE1_ID;
 
-    exec(&db, "DELETE FROM alarm_thresholds").await;
+    crate::common::exec(&db, "DELETE FROM alarm_thresholds").await;
 
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO alarm_thresholds (id, parameter_id, site_id, warning_min, warning_max, alarm_min, alarm_max, description) \
@@ -105,7 +96,7 @@ async fn test_site_threshold_overrides_the_global_row() {
     .await;
 
     // Override with a very wide range that no reading will violate
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO alarm_thresholds (id, parameter_id, site_id, warning_min, warning_max, alarm_min, alarm_max, description) \
@@ -150,10 +141,10 @@ async fn test_active_alarms_includes_global_threshold_violations() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    exec(&db, "DELETE FROM alarm_events").await;
-    exec(&db, "DELETE FROM alarm_thresholds").await;
+    crate::common::exec(&db, "DELETE FROM alarm_events").await;
+    crate::common::exec(&db, "DELETE FROM alarm_thresholds").await;
 
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO alarm_thresholds (id, parameter_id, site_id, warning_min, warning_max, alarm_min, alarm_max, description) \

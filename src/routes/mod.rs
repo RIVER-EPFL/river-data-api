@@ -631,11 +631,19 @@ impl utoipa::Modify for SecurityAddon {
     }
 }
 
-/// The private API's OpenAPI document as `/docs` serves it. Every path is absolute from the
+/// The private API's OpenAPI document as `/docs` serves it: the hand-written half declared on
+/// [`ApiDoc`] plus the entity half the CrudCrate derive generates. Every path is absolute from the
 /// server root, so a key in it is a URL the router resolves.
-pub fn openapi_spec() -> utoipa::openapi::OpenApi {
+pub fn openapi_spec(state: &AppState) -> utoipa::openapi::OpenApi {
+    merged_spec(service::api_router(state).1)
+}
+
+/// [`openapi_spec`] over an entity document already built, for the caller that has one.
+fn merged_spec(entity: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
+    use utoipa::OpenApi as _;
     let mut openapi = ApiDoc::openapi();
     openapi.info.version = env!("CARGO_PKG_VERSION").to_string();
+    openapi.merge(entity);
     openapi
 }
 
@@ -652,7 +660,7 @@ pub fn build_router(state: AppState) -> Router {
         );
     }
 
-    let api_inner = service::api_router(&state);
+    let (api_inner, entity_api) = service::api_router(&state);
 
     // Public API routes
     let public_routes = public_api::public_router();
@@ -768,7 +776,7 @@ pub fn build_router(state: AppState) -> Router {
 </html>"#;
     // Report the crate's actual version in the served OpenAPI doc rather than a hand-maintained
     // literal (which had gone stale at 0.2.0 while the crate was 0.4.2).
-    let openapi = openapi_spec();
+    let openapi = merged_spec(entity_api);
     // `/docs` is unauthenticated and ingress-exposed on the same host as `/api`; only the
     // ingress whitelist-source-range (EPFL ranges, in every overlay) keeps the private spec off
     // the open internet. `/healthz` stays cluster-internal. The spec is the operator-facing
@@ -919,3 +927,4 @@ async fn request_id_middleware(
     }
     response
 }
+

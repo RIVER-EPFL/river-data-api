@@ -386,6 +386,118 @@ async fn reprocess_prefers_a_parameter_specific_curve_over_an_open_wildcard() {
     cleanup_test_db(&db).await;
 }
 
+/// Scenario: a derived slot computes from a temperature input; the instrument is recalled and the
+/// input rows after the recall lose their site.
+/// Expected behaviour: the derived rows at those instants lose theirs too, so no derived series is
+/// served for a period with no measured input.
+#[tokio::test]
+#[serial]
+async fn recalled_inputs_take_their_derived_output_out_of_the_site() {
+    use river_db::routes::private::sensors::calibrations::service::reprocess_sensor_readings;
+
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let sensor = create_sensor(&db, "Derived-Recall-01", GLOBAL_PARAM_TEMP_ID).await;
+    let deployment = deploy_sensor_for_parameter(
+        &db,
+        sensor.id,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        dt("2025-03-01T00:00:00Z"),
+    )
+    .await;
+    end_deployment(&db, deployment, dt("2025-06-01T00:00:00Z")).await;
+
+    // The derived slot: twice the temperature, mapped to the site's temperature slot.
+    let derived_param = uuid::Uuid::new_v4();
+    let derived_def = uuid::Uuid::new_v4();
+    let derived_sp = uuid::Uuid::new_v4();
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO parameters (id, code, name, default_units, category) \
+             VALUES ('{derived_param}', 'TempDoubled', 'Temperature doubled', '°C', 'measurement')"
+        ),
+    )
+    .await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO derived_parameter_definitions (id, code, name, units, formula, output_parameter_id) \
+             VALUES ('{derived_def}', 'TempDoubled', 'Temperature doubled', '°C', 'temp * 2', '{derived_param}')"
+        ),
+    )
+    .await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO derived_parameter_sources (id, derived_definition_id, parameter_id, variable_name) \
+             VALUES ('{}', '{derived_def}', '{GLOBAL_PARAM_TEMP_ID}', 'temp')",
+            uuid::Uuid::new_v4()
+        ),
+    )
+    .await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO site_parameters \
+             (id, site_id, parameter_id, name, sensor_type, is_active, is_derived, derived_definition_id, variable_mappings) \
+             VALUES ('{derived_sp}', '{SITE1_ID}', '{derived_param}', 'TempDoubled', 'TempDoubled', true, true, \
+                     '{derived_def}', '{{\"temp\": \"{PARAM_S1_TEMP_ID}\"}}'::jsonb)"
+        ),
+    )
+    .await;
+
+    // One input reading inside the deployment and one after it closed, each with the derived value
+    // that was computed from it.
+    let input_stream = create_paired_stream(&db, "derived-recall-input", PARAM_S1_TEMP_ID).await;
+    let derived_stream = create_paired_stream(&db, "derived-recall-output", &derived_sp.to_string()).await;
+    for (time, value) in [("2025-04-15T00:00:00Z", 4.0), ("2025-07-15T00:00:00Z", 7.0)] {
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO readings \
+                 (stream_id, site_id, parameter_id, time, raw_value, sensor_id, replicate_index) \
+                 VALUES ('{input_stream}', '{SITE1_ID}', '{GLOBAL_PARAM_TEMP_ID}', '{time}', {value}, '{}', 0)",
+                sensor.id
+            ),
+        )
+        .await;
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO readings \
+                 (stream_id, site_id, parameter_id, time, raw_value, measurement_type, replicate_index) \
+                 VALUES ('{derived_stream}', '{SITE1_ID}', '{derived_param}', '{time}', {}, 'derived', 0)",
+                value * 2.0
+            ),
+        )
+        .await;
+    }
+
+    reprocess_sensor_readings(&db, sensor.id)
+        .await
+        .expect("reprocess");
+
+    let inputs = get_readings(&db, input_stream).await;
+    let site: uuid::Uuid = SITE1_ID.parse().unwrap();
+    assert_eq!(inputs[0].site_id, Some(site), "April is covered");
+    assert_eq!(inputs[1].site_id, None, "July is recalled");
+
+    let derived = get_readings(&db, derived_stream).await;
+    assert_eq!(
+        derived[0].site_id,
+        Some(site),
+        "the derived value over a served input keeps its site"
+    );
+    assert_eq!(
+        derived[1].site_id, None,
+        "the derived value over a recalled input leaves the site with it"
+    );
+}
+
 /// Scenario: one hand-dated deployment covers March to June at a slot whose readings run January
 /// to July.
 /// Expected behaviour: the per-slot reprocess stamps the covered rows, leaves the rows before the

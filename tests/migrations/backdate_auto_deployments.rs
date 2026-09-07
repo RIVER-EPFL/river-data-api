@@ -16,18 +16,10 @@ use crate::common::{
 
 const AUTO_NOTE: &str = "Auto-created during stream pairing";
 
-async fn exec(db: &DatabaseConnection, sql: &str) {
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_string(),
-    ))
-    .await
-    .unwrap_or_else(|e| panic!("{sql}: {e}"));
-}
 
 async fn sensor(db: &DatabaseConnection, serial: &str) -> Uuid {
     let id = Uuid::new_v4();
-    exec(
+    crate::common::exec(
         db,
         &format!(
             "INSERT INTO sensors (id, serial_number, manufacturer, model, data_frequency) \
@@ -50,7 +42,7 @@ async fn deployment(
     let id = Uuid::new_v4();
     let until = until.map_or("NULL".to_string(), |u| format!("'{u}'"));
     let note = note.map_or("NULL".to_string(), |n| format!("'{n}'"));
-    exec(
+    crate::common::exec(
         db,
         &format!(
             "INSERT INTO sensor_deployments \
@@ -73,7 +65,7 @@ async fn attributed_readings(
     times: &[&str],
 ) {
     let stream = Uuid::new_v4();
-    exec(
+    crate::common::exec(
         db,
         &format!(
             "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active, sensor_id) \
@@ -82,7 +74,7 @@ async fn attributed_readings(
     )
     .await;
     for (i, t) in times.iter().enumerate() {
-        exec(
+        crate::common::exec(
             db,
             &format!(
                 "INSERT INTO readings \

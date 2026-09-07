@@ -13,12 +13,8 @@ use crate::common::sensor_lifecycle::create_unpaired_stream_with_device;
 use crate::common::{GLOBAL_PARAM_TEMP_ID, PARAM_S1_TEMP_ID, SITE1_ID};
 
 async fn setup() -> (axum::Router, String, sea_orm::DatabaseConnection) {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
-    let app = crate::common::build_test_app(db.clone());
-    (app, token, db)
+    let f = crate::common::seeded_app().await;
+    (f.app, f.token, f.db)
 }
 
 async fn seed_readings(db: &sea_orm::DatabaseConnection, stream_id: Uuid, times: &[&str]) {

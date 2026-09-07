@@ -9,9 +9,6 @@ use serial_test::serial;
 
 use migration::m20260908_000006_one_doc_parameter::UP;
 
-async fn exec(db: &DatabaseConnection, sql: &str) {
-    db.execute_unprepared(sql).await.expect("statement");
-}
 
 async fn codes(db: &DatabaseConnection) -> String {
     db.query_one_raw(Statement::from_string(
@@ -28,7 +25,7 @@ async fn codes(db: &DatabaseConnection) -> String {
 }
 
 async fn seed_parameter(db: &DatabaseConnection, code: &str) {
-    exec(
+    crate::common::exec_unprepared(
         db,
         &format!(
             "INSERT INTO parameters (id, code, name, default_units, category) \
@@ -45,7 +42,7 @@ async fn the_seeded_row_takes_the_portal_s_code() {
     crate::common::cleanup_test_db(&db).await;
     seed_parameter(&db, "DOC").await;
 
-    exec(&db, UP).await;
+    crate::common::exec_unprepared(&db, UP).await;
 
     assert_eq!(codes(&db).await, "DOC_ppb");
 
@@ -60,7 +57,7 @@ async fn a_database_holding_both_keeps_both() {
     seed_parameter(&db, "DOC").await;
     seed_parameter(&db, "DOC_ppb").await;
 
-    exec(&db, UP).await;
+    crate::common::exec_unprepared(&db, UP).await;
 
     // Renaming would collide, and deleting would take whatever readings the row carries with it.
     assert_eq!(codes(&db).await, "DOC,DOC_ppb");

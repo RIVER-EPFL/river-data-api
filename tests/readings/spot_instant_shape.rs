@@ -20,12 +20,8 @@ const AT: &str = "2025-05-06T07:00:00Z";
 const REPLICATES: [f64; 3] = [1.0, 2.0, 10.0];
 
 async fn setup() -> (DatabaseConnection, axum::Router, String) {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let token = crate::common::seed_token_full(&db).await;
-    let app = crate::common::build_test_app(db.clone());
-    (db, app, token)
+    let f = crate::common::seeded_app().await;
+    (f.db, f.app, f.token)
 }
 
 async fn save_group(app: &axum::Router, token: &str) {

@@ -16,6 +16,7 @@ use crate::routes::private::readings::batch::{
     CurveClaim, Replace, admission, admit_standard_curves, readings_upsert,
 };
 use crate::routes::private::readings::decisions;
+use crate::routes::private::readings::tail;
 use crate::routes::private::{
     data_streams, readings, readings::sample_groups, readings::samples, readings::sd_estimator,
     sensors::calibrations, sites, sites::parameters as site_parameters,
@@ -1598,51 +1599,36 @@ pub async fn insert_grab_samples(
         })
         .await?;
 
-    // The value has landed; the calculations that read it run without anyone asking (ADR 0007).
-    recompute::enqueue_for(
-        &state.db,
-        &touched_events,
+    // The value has landed: the calculations that read it run without anyone asking (ADR 0007),
+    // the sampled slots are reconciled and their episodes rebuilt inline (one `reprocessing_jobs`
+    // row per field campaign entry would be the noise), and the site's cached responses go. Grabs
+    // are excluded from the rollups, so there is nothing to refresh.
+    let written = tail::Written::new(u64::try_from(inserted + replaced).unwrap_or(u64::MAX))
+        .over(
+            alarm_windows
+                .values()
+                .copied()
+                .reduce(|(lo, hi), (a, b)| (lo.min(a), hi.max(b))),
+        )
+        .at(stream_cache
+            .keys()
+            .map(|pid| tail::Slot::paired(payload.site_id, *pid))
+            .collect())
+        .touching(touched_events);
+    tail::run(
+        &state,
+        &written,
+        &tail::Axes {
+            cache: tail::Cache::Sites,
+            refresh: tail::Refresh::Skip,
+            announce: false,
+            reconcile_alarms: true,
+            episodes: tail::Episodes::Inline,
+            writer,
+        },
         &crate::routes::private::tools::scripts::actor_label(&auth),
-        writer,
     )
     .await?;
-
-    // Event-driven open-alarm reconcile for the sampled slots (error-safe; backstop covers it),
-    // plus historical episode reconstruction per slot so back-dated grabs land in alarm_events
-    // like the batch/import paths. Inline rather than a tracked job to avoid one
-    // reprocessing_jobs row per field campaign entry.
-    if inserted > 0 || replaced > 0 {
-        let alarm_slots: Vec<(Uuid, Uuid)> = stream_cache
-            .keys()
-            .map(|pid| (payload.site_id, *pid))
-            .collect();
-        crate::routes::private::alarms::sweeper::reconcile_and_notify(
-            &state.db,
-            &state.events,
-            &alarm_slots,
-        )
-        .await;
-
-        for (pid, (lo, hi)) in alarm_windows {
-            if let Err(e) = crate::routes::private::alarms::episodes::evaluate_alarm_episodes(
-                &state.db,
-                payload.site_id,
-                pid,
-                lo,
-                hi,
-            )
-            .await
-            {
-                tracing::warn!(error = %e, site_id = %payload.site_id, parameter_id = %pid, "alarm episode reconstruction failed");
-            }
-        }
-    }
-
-    if inserted > 0 || replaced > 0 {
-        let site_id = payload.site_id;
-        crate::common::cache::invalidate_prefix(&state, &format!("readings:{site_id}")).await;
-        crate::common::cache::invalidate_prefix(&state, &format!("aggregates:{site_id}")).await;
-    }
 
     let samples_created = created_sample_ids.len();
     tracing::info!(total, inserted, replaced, kept_curated, samples_created, site = %site.name, "Grab samples inserted");

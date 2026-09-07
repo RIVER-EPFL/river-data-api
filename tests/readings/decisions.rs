@@ -8,6 +8,7 @@
 use river_db::common::bulk_write;
 use river_db::routes::private::readings::decisions::{self, Decision, DecisionKey, Kind, Origin};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use serde_json::json;
 use serial_test::serial;
 use uuid::Uuid;
 
@@ -64,6 +65,7 @@ struct Projected {
     raw_value: f64,
     calibrated_value: Option<f64>,
     unverified: bool,
+    ingested_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 async fn projected(f: &Fixture, replicate_index: i16) -> Projected {
@@ -73,7 +75,7 @@ async fn projected(f: &Fixture, replicate_index: i16) -> Projected {
             format!(
                 "SELECT COALESCE(is_flagged, false) AS is_flagged, flag_reason, \
                         withdrawn_at IS NOT NULL AS withdrawn, raw_value, calibrated_value, \
-                        unverified \
+                        unverified, ingested_at \
                  FROM readings WHERE stream_id = '{}' AND time = '{AT}' \
                    AND replicate_index = {replicate_index}",
                 f.stream
@@ -89,6 +91,7 @@ async fn projected(f: &Fixture, replicate_index: i16) -> Projected {
         raw_value: row.try_get("", "raw_value").unwrap(),
         calibrated_value: row.try_get("", "calibrated_value").unwrap(),
         unverified: row.try_get("", "unverified").unwrap(),
+        ingested_at: row.try_get("", "ingested_at").unwrap(),
     }
 }
 
@@ -247,6 +250,7 @@ async fn a_group_decision_projects_onto_every_replicate() {
 async fn a_value_correction_replaces_the_raw_value_and_leaves_the_correction_to_recompose() {
     let f = setup().await;
     seed_group(&f, &[10.0]).await;
+    let before = projected(&f, 0).await;
     let id = record(
         &f.db,
         decision(
@@ -270,7 +274,79 @@ async fn a_value_correction_replaces_the_raw_value_and_leaves_the_correction_to_
     })
     .await
     .unwrap();
-    assert_eq!(projected(&f, 0).await.raw_value, 10.0);
+    let restored = projected(&f, 0).await;
+    assert_eq!(restored.raw_value, 10.0);
+    assert_eq!(
+        restored.calibrated_value, None,
+        "the row names no curve, so there is no correction to recompose"
+    );
+    assert_eq!(
+        restored.ingested_at, before.ingested_at,
+        "the value that is served again is the value that arrived when it did"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn rolling_back_a_correction_recomposes_the_corrected_value_from_the_rows_own_curve() {
+    let f = setup().await;
+    seed_group(&f, &[10.0]).await;
+    let sensor =
+        crate::common::sensor_lifecycle::create_sensor_without_curve(&f.db, "analyser").await;
+    let curve = Uuid::new_v4();
+    crate::common::exec(
+        &f.db,
+        &format!(
+            "INSERT INTO standard_curves (id, sensor_id, slope, intercept, name) \
+             VALUES ('{curve}', '{sensor}', 3.0, 0.5, 'Plate A')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &f.db,
+        &format!(
+            "UPDATE readings SET standard_curve_id = '{curve}', calibrated_value = 30.5 \
+             WHERE stream_id = '{}' AND time = '{AT}' AND replicate_index = 0",
+            f.stream
+        ),
+    )
+    .await;
+    let before = projected(&f, 0).await;
+
+    let id = record(
+        &f.db,
+        decision(
+            &f,
+            Kind::ValueCorrection,
+            Some(0),
+            serde_json::json!({ "raw_value": 20.0 }),
+        ),
+    )
+    .await;
+    let corrected = projected(&f, 0).await;
+    assert_eq!(corrected.raw_value, 20.0);
+    assert_eq!(
+        corrected.calibrated_value,
+        Some(60.5),
+        "3 * 20 + 0.5: the corrected value follows the raw one through the row's own curve"
+    );
+
+    bulk_write::guarded(&f.db, async |txn| {
+        decisions::rollback(txn, id, "tester", None).await
+    })
+    .await
+    .unwrap();
+    let restored = projected(&f, 0).await;
+    assert_eq!(restored.raw_value, 10.0);
+    assert_eq!(
+        restored.calibrated_value,
+        Some(30.5),
+        "3 * 10 + 0.5: the rollback restores the value, not a NULL the sweep must repair"
+    );
+    assert_eq!(
+        restored.ingested_at, before.ingested_at,
+        "and the arrival stamp of the value it put back"
+    );
 }
 
 #[tokio::test]
@@ -1124,9 +1200,8 @@ async fn a_second_save_at_one_slot_instant_refreshes_the_hold_it_lost_to() {
         .expect("the first save files the hold");
 
     let db = f.db.clone();
-    let second = tokio::spawn(async move {
-        open_unverified_holds(&db, site, &groups, "intern-b").await
-    });
+    let second =
+        tokio::spawn(async move { open_unverified_holds(&db, site, &groups, "intern-b").await });
     // Long enough for the second insert to reach the index and block on the uncommitted row.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     first.commit().await.expect("commit");
@@ -1163,5 +1238,243 @@ async fn a_second_save_at_one_slot_instant_refreshes_the_hold_it_lost_to() {
         row.try_get::<String>("", "entered_by").expect("entered_by"),
         "intern-b",
         "the hold carries the entry that landed last"
+    );
+}
+
+/// Every column of a reading, as one object, for a before-and-after comparison.
+async fn snapshot(f: &Fixture, replicate_index: i16) -> serde_json::Map<String, serde_json::Value> {
+    let row =
+        f.db.query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT to_jsonb(r) AS row FROM readings r WHERE r.stream_id = '{}' \
+                   AND r.time = '{AT}' AND r.replicate_index = {replicate_index}",
+                f.stream
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the seeded reading");
+    match row.try_get::<serde_json::Value>("", "row").unwrap() {
+        serde_json::Value::Object(map) => map,
+        other => panic!("to_jsonb returned {other}"),
+    }
+}
+
+fn changed_columns(
+    before: &serde_json::Map<String, serde_json::Value>,
+    after: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    let mut cols: Vec<String> = after
+        .iter()
+        .filter(|(k, v)| before.get(*k) != Some(*v))
+        .map(|(k, _)| k.clone())
+        .collect();
+    cols.sort();
+    cols
+}
+
+/// Scenario: the projection trigger is written in SQL and `Kind::projected_columns` in Rust, and a
+/// rollback restores what the second one recorded from what the first one wrote.
+///
+/// Expected behaviour: for every kind, the columns the trigger moves are exactly the ones the Rust
+/// table names, so neither side can gain or lose a column without the other.
+#[tokio::test]
+#[serial]
+async fn every_kind_moves_exactly_the_columns_it_declares() {
+    let f = setup().await;
+    seed_group(&f, &[1.0]).await;
+    let sensor =
+        crate::common::sensor_lifecycle::create_sensor_without_curve(&f.db, "analyser").await;
+    let curve = Uuid::new_v4();
+    crate::common::exec(
+        &f.db,
+        &format!(
+            "INSERT INTO standard_curves (id, sensor_id, slope, intercept, name) \
+             VALUES ('{curve}', '{sensor}', 3.0, 0.5, 'Plate A')"
+        ),
+    )
+    .await;
+    let calibration = Uuid::new_v4();
+    crate::common::exec(
+        &f.db,
+        &format!(
+            "INSERT INTO sensor_calibrations (id, sensor_id, slope, intercept, valid_from) \
+             VALUES ('{calibration}', '{sensor}', 2.0, 1.0, '2025-01-01T00:00:00Z')"
+        ),
+    )
+    .await;
+
+    // (kind, what puts the row in a state the decision moves it out of, the decision's assertion)
+    let cases: Vec<(Kind, &str, serde_json::Value)> = vec![
+        (
+            Kind::Flag,
+            "is_flagged = FALSE, flag_reason = NULL",
+            json!({ "reason": "spike" }),
+        ),
+        (
+            Kind::Unflag,
+            "is_flagged = TRUE, flag_reason = 'spike'",
+            json!({}),
+        ),
+        (
+            Kind::Withdraw,
+            "withdrawn_at = NULL, withdrawn_reason = NULL",
+            json!({ "reason": "retracted" }),
+        ),
+        (
+            Kind::Reassert,
+            "withdrawn_at = '2025-06-16T10:00:00Z', withdrawn_reason = 'retracted'",
+            json!({}),
+        ),
+        (
+            Kind::Reject,
+            "withdrawn_at = NULL, withdrawn_reason = NULL, unverified = TRUE",
+            json!({ "reason": "not a measurement" }),
+        ),
+        (
+            Kind::Curve,
+            "standard_curve_id = NULL",
+            json!({ "standard_curve_id": curve }),
+        ),
+        (
+            Kind::CalibrationPin,
+            "calibration_id = NULL",
+            json!({ "calibration_id": calibration }),
+        ),
+        (
+            Kind::InstrumentPin,
+            "sensor_id = NULL",
+            json!({ "sensor_id": sensor }),
+        ),
+        // Uncorrected, so the corrected value the trigger clears is already NULL: what it is
+        // recomposed to is derived from the row's own curves, never recorded (B132).
+        (
+            Kind::ValueCorrection,
+            "raw_value = 1.0, calibrated_value = NULL, standard_curve_id = NULL, calibration_id = NULL",
+            json!({ "raw_value": 9.5 }),
+        ),
+        (Kind::UnverifiedEntry, "unverified = FALSE", json!({})),
+        (Kind::Verify, "unverified = TRUE", json!({})),
+        (Kind::SlotMove, "raw_value = 1.0", json!({})),
+        (
+            Kind::Chain,
+            "raw_value = 1.0",
+            json!({ "run_id": Uuid::new_v4() }),
+        ),
+        (Kind::Detach, "raw_value = 1.0", json!({})),
+        (Kind::Return, "raw_value = 1.0", json!({})),
+    ];
+
+    for (kind, arrange, new) in cases {
+        crate::common::exec(
+            &f.db,
+            &format!(
+                "UPDATE readings SET {arrange} WHERE stream_id = '{}' AND time = '{AT}' \
+                   AND replicate_index = 0",
+                f.stream
+            ),
+        )
+        .await;
+        let before = snapshot(&f, 0).await;
+        record(&f.db, decision(&f, kind, Some(0), new)).await;
+        let after = snapshot(&f, 0).await;
+        let mut declared: Vec<String> = kind
+            .projected_columns()
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect();
+        declared.sort();
+        assert_eq!(
+            changed_columns(&before, &after),
+            declared,
+            "a {} moves the columns it declares and no others",
+            kind.as_str()
+        );
+    }
+}
+
+/// Scenario: the drift report is a second spelling of the projection, and a column it does not fold
+/// is a column whose disagreement nobody is told about.
+///
+/// Expected behaviour: it folds every column a decision asserts, and the two it cannot predict are
+/// named for the reason they cannot be.
+#[tokio::test]
+#[serial]
+async fn the_drift_report_folds_every_column_a_decision_asserts() {
+    let derived: [&str; 2] = ["calibrated_value", "ingested_at"];
+    let sql = decisions::inconsistent_rows_sql();
+    for kind in [
+        Kind::Flag,
+        Kind::Unflag,
+        Kind::Withdraw,
+        Kind::Reassert,
+        Kind::Reject,
+        Kind::Curve,
+        Kind::CalibrationPin,
+        Kind::InstrumentPin,
+        Kind::ValueCorrection,
+        Kind::UnverifiedEntry,
+        Kind::Verify,
+    ] {
+        for col in kind.projected_columns() {
+            if derived.contains(col) {
+                continue;
+            }
+            assert!(
+                sql.contains(&format!("('{col}',")),
+                "the drift report folds {col}, which a {} asserts",
+                kind.as_str()
+            );
+        }
+    }
+
+    let f = setup().await;
+    seed_group(&f, &[1.0]).await;
+    let sensor =
+        crate::common::sensor_lifecycle::create_sensor_without_curve(&f.db, "analyser").await;
+    record(
+        &f.db,
+        decision(
+            &f,
+            Kind::Flag,
+            Some(0),
+            serde_json::json!({ "reason": "spike" }),
+        ),
+    )
+    .await;
+    assert!(
+        drift_keys(&f.db).await.is_empty(),
+        "an instrument nothing pinned is not a disagreement"
+    );
+
+    record(
+        &f.db,
+        decision(
+            &f,
+            Kind::InstrumentPin,
+            Some(0),
+            serde_json::json!({ "sensor_id": sensor }),
+        ),
+    )
+    .await;
+    assert!(
+        drift_keys(&f.db).await.is_empty(),
+        "the pin projected, so the record and the column agree"
+    );
+
+    crate::common::exec(
+        &f.db,
+        &format!(
+            "UPDATE readings SET sensor_id = NULL WHERE stream_id = '{}' AND time = '{AT}' \
+               AND replicate_index = 0",
+            f.stream
+        ),
+    )
+    .await;
+    assert_eq!(
+        drift_keys(&f.db).await.len(),
+        1,
+        "a pinned instrument taken off the row out of band is reported"
     );
 }

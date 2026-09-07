@@ -32,18 +32,18 @@ async fn revert_to_pre_rule_shape(db: &DatabaseConnection) {
 /// the next suite expects it. The migration under test adds the rule in its pre-tightening form,
 /// which admits a reading whose `measurement_type` is NULL.
 async fn restore_fixture_default(db: &DatabaseConnection) {
-    exec(
+    crate::common::exec(
         db,
         "ALTER TABLE readings DROP CONSTRAINT IF EXISTS readings_instrument_required",
     )
     .await;
-    exec(
+    crate::common::exec(
         db,
         "ALTER TABLE readings ADD CONSTRAINT readings_instrument_required \
          CHECK ((sensor_id IS NOT NULL) OR (measurement_type IS NOT DISTINCT FROM 'derived'))",
     )
     .await;
-    exec(
+    crate::common::exec(
         db,
         &format!(
             "ALTER TABLE data_streams ALTER COLUMN sensor_id SET DEFAULT '{FIXTURE_SENSOR_ID}'"
@@ -62,14 +62,6 @@ async fn run_migration(db: &DatabaseConnection) {
     .expect("the repair applies");
 }
 
-async fn exec(db: &DatabaseConnection, sql: &str) {
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_string(),
-    ))
-    .await
-    .unwrap_or_else(|e| panic!("{sql}: {e}"));
-}
 
 async fn scalar(db: &DatabaseConnection, sql: &str) -> Option<String> {
     let row = db
@@ -90,7 +82,7 @@ const SITE_PARAM: &str = "00000000-0000-4000-a000-000000000101";
 /// Build the two shapes the prod rehearsal holds: an `api` channel whose stream and readings name
 /// no instrument, and a `derived` stream whose readings predate `measurement_type` being stamped.
 async fn seed_unattributed_readings(db: &DatabaseConnection) {
-    exec(
+    crate::common::exec(
         db,
         &format!(
             "INSERT INTO data_streams (id, source_system, source_key, source_name, \
@@ -101,7 +93,7 @@ async fn seed_unattributed_readings(db: &DatabaseConnection) {
         ),
     )
     .await;
-    exec(
+    crate::common::exec(
         db,
         &format!(
             "INSERT INTO readings (stream_id, time, replicate_index, raw_value, site_id, \
@@ -194,7 +186,7 @@ async fn attributes_every_reading_before_adding_the_constraint() {
     );
 
     // The rule is now present and refuses what it exists to refuse.
-    exec(
+    crate::common::exec(
         &db,
         "INSERT INTO data_streams (id, source_system, source_key, is_active, sensor_id) \
          VALUES ('00000000-0000-4000-c000-0000000009f1', 'api', 'orphan', true, NULL)",

@@ -1323,8 +1323,7 @@ async fn listing_sync_credentials_is_administrator_only() {
     let db = fresh_db().await;
     let app = kc::build_test_app_with_keycloak(db.clone()).await;
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
-    kc::ensure_realm_user("intern1", "intern1", &["riverdata-intern"]).await;
-    let intern = kc::get_keycloak_jwt("intern1", "intern1").await;
+    let intern = kc::member_jwt("intern1", "intern1", "riverdata-intern").await;
     let read_token = mint_token(&app, &admin, "read-only-key", read_only_permissions(), None).await;
 
     let (status, created) = crate::common::post_json_parse_with_token(

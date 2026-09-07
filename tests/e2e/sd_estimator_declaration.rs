@@ -483,7 +483,15 @@ async fn an_instant_decision_leaves_the_parameter_undeclared_and_survives_a_reta
         status, 200,
         "declare sample for the slot ({status}): {body}"
     );
-    crate::common::e2e::wait_for_jobs_by_trigger(&fx.db, "sd_estimator_retag", 30).await;
+    assert_eq!(
+        body["samples_affected"], 0,
+        "the instant decision is not the declaration's to move, and T2 already reads sample: {body}"
+    );
+    assert_eq!(
+        body.get("job_id"),
+        None,
+        "a declaration that moves no sample enqueues no retag: {body}"
+    );
 
     let (stdev, estimator, source) = sample_row(&fx, T1).await;
     assert!(

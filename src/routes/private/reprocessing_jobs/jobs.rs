@@ -16,6 +16,7 @@ use crate::routes::private::readings;
 use crate::routes::private::readings::batch::{ConflictMode, readings_on_conflict};
 use crate::routes::private::readings::import::BATCH_SIZE as CSV_BATCH_SIZE;
 use crate::routes::private::readings::sample_groups;
+use crate::routes::private::readings::tail;
 use crate::routes::private::sensors::calibrations::service::{
     Curve, apply_curves, recalculate_derived_at_timestamp, reprocess_sensor_readings,
     reprocess_site_parameter_readings,
@@ -1358,6 +1359,9 @@ impl CsvImport {
             );
         }
 
+        let mut touched_visits: Vec<
+            crate::routes::private::collection_events::recompute::TouchedEvent,
+        > = Vec::new();
         // Samples are found-or-created and stamped after the insert, by the one materialiser, over
         // the streams and the time span this import touched. Scoping it that way rather than to the
         // rows this run inserted is deliberate: a reading already present at a group's slot is part
@@ -1395,18 +1399,10 @@ impl CsvImport {
             // The values have landed at their visits; the calculations that read them run without
             // anyone asking (ADR 0007). Read after the attach, which is what gives the rows the
             // events this looks them up by.
-            let touched = crate::routes::private::collection_events::recompute::touched_events(
+            touched_visits = crate::routes::private::collection_events::recompute::touched_events(
                 ctx.db(),
                 &row_predicate,
                 vec![stream_ids_for_events.into()],
-            )
-            .await
-            .map_err(as_db_err)?;
-            crate::routes::private::collection_events::recompute::enqueue_for(
-                ctx.db(),
-                &touched,
-                "csv_import",
-                crate::routes::private::collection_events::recompute::Writer::Person,
             )
             .await
             .map_err(as_db_err)?;
@@ -1421,15 +1417,6 @@ impl CsvImport {
         tracing::info!(site = %site_name, inserted_total, overwritten, "CSV import inserted readings");
 
         if inserted_total > 0 || overwritten > 0 {
-            for (parameter_id, stream_id) in &param_streams {
-                let _ = ctx.events().send(crate::common::AppEvent::DataIngested {
-                    site_id: Some(site_id),
-                    parameter_id: Some(*parameter_id),
-                    stream_id: Some(*stream_id),
-                    count: inserted_total + overwritten,
-                });
-            }
-
             // Phase 2: derived recompute over the imported timestamps.
             let derived_total = i32::try_from(models.len() + distinct_ts.len()).unwrap_or(i32::MAX);
             ctx.set_progress(
@@ -1448,39 +1435,40 @@ impl CsvImport {
                 }
             }
 
-            if let Some(s) = since {
-                sync_state::refresh_continuous_aggregates(ctx.db(), Some(s))
-                    .await
-                    .map_err(as_db_err)?;
-            }
-            if let Some(app) = crate::common::global_app_state() {
-                crate::common::cache::invalidate_prefix(&app, &format!("readings:{site_id}")).await;
-                crate::common::cache::invalidate_prefix(&app, &format!("aggregates:{site_id}"))
-                    .await;
-            }
-
-            // Rebuild persisted alarm events for the imported window so out-of-range CSV rows become
-            // breach episodes. Enqueued as a separate `alarm_backfill` job (not spawned inline) so it
-            // runs on the worker pool too.
-            if let (Some(alarm_start), Some(alarm_end)) = (since, latest) {
-                let slots: Vec<serde_json::Value> = param_streams
-                    .iter()
-                    .map(|(pid, _)| serde_json::json!([site_id, pid]))
-                    .collect();
-                crate::routes::private::reprocessing_jobs::worker::enqueue(
-                    ctx.db(),
-                    "alarm_backfill",
-                    None,
-                    None,
-                    &serde_json::json!({
-                        "slots": slots,
-                        "start": alarm_start.to_rfc3339(),
-                        "end": alarm_end.to_rfc3339(),
-                    }),
-                    None,
-                )
-                .await?;
-            }
+            // An import is a person entering visits after the fact, so the rollups are refreshed
+            // from the earliest instant it landed, and a failure there fails the job: a swallowed
+            // refresh reports an import as complete while the rollups still serve the old numbers.
+            // The window can be long, so episodes are rebuilt by the `alarm_backfill` job.
+            let app = crate::common::global_app_state();
+            let written =
+                tail::Written::new(u64::try_from(inserted_total + overwritten).unwrap_or(u64::MAX))
+                    .over(since.zip(latest))
+                    .at(param_streams
+                        .iter()
+                        .map(|(parameter_id, stream_id)| {
+                            tail::Slot::paired(site_id, *parameter_id).through(*stream_id)
+                        })
+                        .collect())
+                    .touching(touched_visits);
+            tail::run(
+                tail::Sink {
+                    db: ctx.db(),
+                    events: ctx.events(),
+                    cache: app.as_ref().map(|a| &a.response_cache),
+                },
+                &written,
+                &tail::Axes {
+                    cache: tail::Cache::Sites,
+                    refresh: tail::Refresh::Since { fatal: true },
+                    announce: true,
+                    reconcile_alarms: false,
+                    episodes: tail::Episodes::Job,
+                    writer: crate::routes::private::collection_events::recompute::Writer::Person,
+                },
+                "csv_import",
+            )
+            .await
+            .map_err(as_db_err)?;
         }
 
         // The staging source has served its purpose, drop it (makes this job non-rerunnable).

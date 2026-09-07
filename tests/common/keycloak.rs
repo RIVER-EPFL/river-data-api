@@ -382,6 +382,13 @@ pub async fn grant_project(db: &DatabaseConnection, sub: &str, project_id: &str)
 }
 
 /// Obtain a real JWT via the resource-owner password grant against the configured Keycloak.
+/// A realm member at one access level, and a token for them. Every test that drives a JWT-gated
+/// route opens on these two calls together.
+pub async fn member_jwt(username: &str, password: &str, river_role: &str) -> String {
+    ensure_realm_user(username, password, &[river_role]).await;
+    get_keycloak_jwt(username, password).await
+}
+
 pub async fn get_keycloak_jwt(username: &str, password: &str) -> String {
     let url = format!(
         "{}realms/{}/protocol/openid-connect/token",

@@ -8,31 +8,28 @@ use serial_test::serial;
 
 use migration::m20260908_000008_channel_health_into_state::UP;
 
-async fn exec(db: &DatabaseConnection, sql: &str) {
-    db.execute_unprepared(sql).await.expect("statement");
-}
 
 /// The shape the table had before the migration, with one probed row in it.
 async fn restore_pre_migration_shape(db: &DatabaseConnection) {
-    exec(
+    crate::common::exec_unprepared(
         db,
         "CREATE TABLE IF NOT EXISTS notification_channel_health ( \
              channel text PRIMARY KEY, healthy boolean NOT NULL, detail text, \
              checked_at timestamptz NOT NULL DEFAULT now())",
     )
     .await;
-    exec(
+    crate::common::exec_unprepared(
         db,
         "INSERT INTO notification_channel_health (channel, healthy, detail, checked_at) \
          VALUES ('web_push', false, 'endpoint refused', '2026-09-01T10:00:00Z')",
     )
     .await;
-    exec(
+    crate::common::exec_unprepared(
         db,
         "ALTER TABLE notification_state DROP COLUMN IF EXISTS detail",
     )
     .await;
-    exec(
+    crate::common::exec_unprepared(
         db,
         "DELETE FROM notification_state WHERE kind = 'channel_health'",
     )
@@ -46,7 +43,7 @@ async fn a_probed_channel_arrives_in_the_ledger() {
     crate::common::cleanup_test_db(&db).await;
     restore_pre_migration_shape(&db).await;
 
-    exec(&db, UP).await;
+    crate::common::exec_unprepared(&db, UP).await;
 
     let row = db
         .query_one_raw(Statement::from_string(

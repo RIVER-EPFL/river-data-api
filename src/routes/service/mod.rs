@@ -75,7 +75,10 @@ async fn invalidate_public_config_on_mutation(
 /// dual-auth (`service_auth_middleware`), Keycloak JWT pass-through, and optional
 /// rate limiting. Per-route authorization is enforced inside this function via
 /// the `require_*` middleware on grouped sub-routers.
-pub fn api_router(state: &AppState) -> Router<()> {
+/// Returns the router and the OpenAPI document the entity half of it generates: every CrudCrate
+/// route is described by the derive, and dropping the document is what left ~240 generated
+/// operations out of `/docs`.
+pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     let db = &state.db;
 
     // Per-entity CRUD gates: GET/HEAD need the read capability, mutations the write capability.
@@ -154,7 +157,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         ))
     };
 
-    let entity_router: Router<()> = OpenApiRouter::new()
+    let (entity_router, entity_api): (Router<()>, utoipa::openapi::OpenApi) = OpenApiRouter::new()
         .nest(
             "/projects",
             invalidate_public_config(crate::routes::private::projects::router::service_router(
@@ -258,7 +261,7 @@ pub fn api_router(state: &AppState) -> Router<()> {
         // scoped token's project (CrudCrate `ScopeCondition`). No-op for unscoped callers and for
         // global/operational entities. Disjoint from the write guard above (it handles mutations).
         .layer(middleware::from_fn(inject_read_scope))
-        .into();
+        .split_for_parts();
 
     use crate::routes::private::{
         admin::{actions, calibrations, derived, merge, public_config, users},
@@ -825,12 +828,20 @@ pub fn api_router(state: &AppState) -> Router<()> {
         router = router.merge(routes);
     }
 
-    router
+    (router, under_api(entity_api))
 }
 
-/// Legacy alias retained while routes/mod.rs is being updated to call api_router directly.
-pub fn service_router(state: &AppState) -> Router<()> {
-    api_router(state)
+/// The entity document's paths as the server serves them. The derive describes each route
+/// relative to the router it generated, and this whole router is mounted at `/api`, so a key in
+/// the merged document is only a URL once it carries that prefix.
+fn under_api(mut api: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
+    api.paths.paths = api
+        .paths
+        .paths
+        .into_iter()
+        .map(|(path, item)| (format!("/api{path}"), item))
+        .collect();
+    api
 }
 
 pub fn sync_control_router(state: &AppState) -> Router<AppState> {

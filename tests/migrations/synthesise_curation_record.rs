@@ -14,14 +14,6 @@ use crate::common::{GLOBAL_PARAM_TEMP_ID, SITE1_ID, cleanup_test_db, seed_test_d
 
 const AT: &str = "2025-06-15T10:00:00Z";
 
-async fn exec(db: &DatabaseConnection, sql: &str) {
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_string(),
-    ))
-    .await
-    .unwrap_or_else(|e| panic!("{sql}: {e}"));
-}
 
 /// The migration's own SQL, run the way the migrator runs it: several statements in one implicit
 /// transaction, which is what `SET LOCAL` needs.
@@ -66,7 +58,7 @@ async fn seed_curated_rows(db: &DatabaseConnection) -> Uuid {
         .unwrap()
         .try_get("", "id")
         .unwrap();
-    exec(
+    crate::common::exec(
         db,
         &format!(
             "INSERT INTO standard_curves (id, sensor_id, slope, intercept, name) \
@@ -75,7 +67,7 @@ async fn seed_curated_rows(db: &DatabaseConnection) -> Uuid {
     )
     .await;
     for i in 0..4 {
-        exec(
+        crate::common::exec(
             db,
             &format!(
                 "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, \
@@ -95,7 +87,7 @@ async fn seed_curated_rows(db: &DatabaseConnection) -> Uuid {
         "UPDATE readings SET standard_curve_id = '{c}' \
          WHERE stream_id = '{s}' AND time = '{AT}' AND replicate_index = 2",
     ] {
-        exec(
+        crate::common::exec(
             db,
             &sql.replace("{s}", &stream.to_string())
                 .replace("{AT}", AT)
@@ -213,7 +205,7 @@ async fn a_decision_someone_took_is_not_synthesised_over() {
     let stream = seed_curated_rows(&db).await;
 
     // The flag was taken by a person before the upgrade reached this row.
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO reading_decisions \

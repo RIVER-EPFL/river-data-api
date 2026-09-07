@@ -15,4 +15,5 @@ pub mod sample_preview;
 pub mod samples;
 pub mod sd_estimator;
 pub mod status_events;
+pub mod tail;
 pub use model::*;

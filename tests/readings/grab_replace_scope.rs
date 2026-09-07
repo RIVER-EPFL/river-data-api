@@ -18,12 +18,8 @@ struct Fixture {
 }
 
 async fn setup() -> Fixture {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let token = crate::common::seed_token_full(&db).await;
-    let app = crate::common::build_test_app(db.clone());
-    Fixture { db, app, token }
+    let f = crate::common::seeded_app().await;
+    Fixture { db: f.db, app: f.app, token: f.token }
 }
 
 async fn scalar_i64(db: &DatabaseConnection, sql: &str) -> i64 {
@@ -38,14 +34,6 @@ async fn scalar_i64(db: &DatabaseConnection, sql: &str) -> i64 {
     .unwrap()
 }
 
-async fn exec(db: &DatabaseConnection, sql: &str) {
-    db.execute_raw(Statement::from_string(
-        DatabaseBackend::Postgres,
-        sql.to_string(),
-    ))
-    .await
-    .unwrap();
-}
 
 fn grab(values: &[f64], mode: Option<&str>) -> serde_json::Value {
     let readings: Vec<serde_json::Value> = values
@@ -282,7 +270,7 @@ async fn replace_keeps_a_withdrawn_replicate() {
     let fx = setup().await;
     let (status, _) = save(&fx, &grab(&[10.0, 20.0, 30.0], None)).await;
     assert_eq!(status, 200);
-    exec(
+    crate::common::exec(
         &fx.db,
         &format!(
             "UPDATE readings r SET withdrawn_at = NOW(), withdrawn_reason = 'test' \
@@ -336,7 +324,7 @@ async fn replace_keeps_a_hand_curved_replicate_unless_the_request_supplies_a_cur
 
     let (status, _) = save(&fx, &grab(&[10.0, 20.0, 30.0], None)).await;
     assert_eq!(status, 200);
-    exec(
+    crate::common::exec(
         &fx.db,
         &format!(
             "UPDATE readings r SET standard_curve_id = '{curve_id}' \

@@ -6,15 +6,6 @@
 
 use serial_test::serial;
 
-async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
-    use sea_orm::{ConnectionTrait, Statement};
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_string(),
-    ))
-    .await
-    .unwrap_or_else(|e| panic!("SQL failed: {e}\nQuery: {sql}"));
-}
 
 const WARNING_SEEN_AT: &str = "2025-02-01T10:00:00Z";
 const ALARM_SEEN_AT: &str = "2025-02-02T11:30:00Z";
@@ -24,7 +15,7 @@ async fn seed_alarm_events(db: &sea_orm::DatabaseConnection) {
     let site_id = crate::common::SITE1_ID;
     let param_id = crate::common::GLOBAL_PARAM_TEMP_ID;
 
-    exec(
+    crate::common::exec(
         db,
         &format!(
             "INSERT INTO alarm_events \
@@ -37,7 +28,7 @@ async fn seed_alarm_events(db: &sea_orm::DatabaseConnection) {
     )
     .await;
 
-    exec(
+    crate::common::exec(
         db,
         &format!(
             "INSERT INTO alarm_events \
@@ -134,7 +125,7 @@ async fn test_alarm_events_severity_filter_binds_to_max_severity() {
 
     let site_id = crate::common::SITE1_ID;
     let param_id = crate::common::GLOBAL_PARAM_TEMP_ID;
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO alarm_events \

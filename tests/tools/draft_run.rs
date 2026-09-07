@@ -35,8 +35,7 @@ async fn setup() -> (DatabaseConnection, axum::Router, String) {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     let app = kc::build_test_app_with_keycloak(db.clone()).await;
-    kc::ensure_realm_user("scriptadmin", "scriptadmin", &["riverdata-admin"]).await;
-    let admin = kc::get_keycloak_jwt("scriptadmin", "scriptadmin").await;
+    let admin = kc::member_jwt("scriptadmin", "scriptadmin", "riverdata-admin").await;
     (db, app, admin)
 }
 
@@ -310,8 +309,7 @@ async fn a_draft_against_an_absent_runner_reports_it_with_the_findings() {
         Some(format!("http://127.0.0.1:{port}/ocpu")),
     )
     .await;
-    kc::ensure_realm_user("scriptadmin", "scriptadmin", &["riverdata-admin"]).await;
-    let admin = kc::get_keycloak_jwt("scriptadmin", "scriptadmin").await;
+    let admin = kc::member_jwt("scriptadmin", "scriptadmin", "riverdata-admin").await;
 
     let (status, out) = draft_run(
         &app,

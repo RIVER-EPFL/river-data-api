@@ -11,12 +11,8 @@ const T1: &str = "2025-06-01T10:00:00Z";
 const T2: &str = "2025-06-02T10:00:00Z";
 
 async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
-    let app = crate::common::build_test_app(db.clone());
-    (db, app, token)
+    let f = crate::common::seeded_app().await;
+    (f.db, f.app, f.token)
 }
 
 async fn save_group(app: &axum::Router, token: &str, time: &str, values: &[f64]) {
@@ -37,15 +33,6 @@ async fn save_group(app: &axum::Router, token: &str, time: &str, values: &[f64])
     assert_eq!(status, 200, "grab save: {body}");
 }
 
-async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
-    use sea_orm::{ConnectionTrait, Statement};
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_owned(),
-    ))
-    .await
-    .unwrap();
-}
 
 async fn sample_at(db: &sea_orm::DatabaseConnection, time: &str) -> (String, String, f64) {
     use sea_orm::{ConnectionTrait, Statement};
@@ -99,7 +86,7 @@ async fn override_instants_retags_an_instant_decision() {
     // 10, 20: sample sd 7.0711, population sd 5.0.
     save_group(&app, &token, T1, &[10.0, 20.0]).await;
     save_group(&app, &token, T2, &[10.0, 20.0]).await;
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE samples SET sd_estimator = 'sample', sd_estimator_source = 'sample' \
@@ -146,7 +133,7 @@ async fn a_window_confines_the_retag() {
     let (db, app, token) = setup().await;
     save_group(&app, &token, T1, &[10.0, 20.0]).await;
     save_group(&app, &token, T2, &[10.0, 20.0]).await;
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE samples SET sd_estimator = 'sample', sd_estimator_source = 'sample' \

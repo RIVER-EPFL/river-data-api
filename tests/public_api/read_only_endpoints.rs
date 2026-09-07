@@ -9,15 +9,6 @@ use serial_test::serial;
 // Helper
 // ============================================================================
 
-async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
-    use sea_orm::{ConnectionTrait, Statement};
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_string(),
-    ))
-    .await
-    .unwrap_or_else(|e| panic!("SQL failed: {e}\nQuery: {sql}"));
-}
 
 /// Set up a public project with one exposed parameter (DO_Temperature) for public API testing.
 async fn setup_public() -> (sea_orm::DatabaseConnection, axum::Router) {
@@ -25,7 +16,7 @@ async fn setup_public() -> (sea_orm::DatabaseConnection, axum::Router) {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
 
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE projects SET is_public = true, public_code = 'test-river' WHERE id = '{}'",
@@ -34,7 +25,7 @@ async fn setup_public() -> (sea_orm::DatabaseConnection, axum::Router) {
     )
     .await;
 
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE sites SET public_code = 'upstream' WHERE id = '{}'",
@@ -44,7 +35,7 @@ async fn setup_public() -> (sea_orm::DatabaseConnection, axum::Router) {
     .await;
 
     // Expose the DO_Temperature site_parameter publicly
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE site_parameters SET is_public = true WHERE id = '{}'",
@@ -62,7 +53,7 @@ async fn setup_two_params() -> (sea_orm::DatabaseConnection, axum::Router) {
     let (db, app) = setup_public().await;
 
     // Also expose Dissolved_O2 at site 1
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE site_parameters SET is_public = true WHERE id = '{}'",
@@ -97,7 +88,7 @@ async fn test_non_public_project_returns_404() {
     let (db, app) = setup_public().await;
 
     // Make the project non-public
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE projects SET is_public = false WHERE id = '{}'",
@@ -306,7 +297,7 @@ async fn test_public_readings_csv() {
 async fn test_public_docs_custom_title() {
     let (db, app) = setup_public().await;
 
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE projects SET public_api_title = 'Mount Resilience Data', \

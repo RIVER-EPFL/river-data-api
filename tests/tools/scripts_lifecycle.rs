@@ -58,8 +58,7 @@ async fn a_version_lives_through_lint_validate_activate_and_rollback() {
         crate::common::exec(&db, sql).await;
     }
     let app = kc::build_test_app_with_keycloak(db).await;
-    kc::ensure_realm_user("scriptadmin", "scriptadmin", &["riverdata-admin"]).await;
-    let admin = kc::get_keycloak_jwt("scriptadmin", "scriptadmin").await;
+    let admin = kc::member_jwt("scriptadmin", "scriptadmin", "riverdata-admin").await;
 
     let (status, script) = crate::common::post_json_parse_with_token(
         &app,

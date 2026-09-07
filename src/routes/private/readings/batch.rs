@@ -14,12 +14,12 @@ use std::collections::HashMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::common::aggregates::{self, Window};
+use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
-use crate::common::{AppEvent, AppState};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
 use crate::routes::private::readings;
+use crate::routes::private::readings::tail;
 use crate::routes::private::sensors::calibrations;
 use crate::routes::private::sensors::operations::{ResolvedOwner, resolve_slot_owner_for_times};
 use crate::routes::private::sensors::standard_curves;
@@ -1031,13 +1031,6 @@ pub async fn insert_batch_readings(
         touched.dedup();
         crate::routes::private::tools::closure::calculations_fed_by(&state.db, &touched).await?
     };
-    crate::routes::private::collection_events::recompute::enqueue_for(
-        &state.db,
-        &touched_events,
-        &crate::routes::private::tools::scripts::actor_label(&auth),
-        crate::routes::private::collection_events::recompute::Writer::Person,
-    )
-    .await?;
 
     // An overwrite replaces the measurement, not the correction: the write keeps the stored curve
     // references, so the value is recomputed from exactly those curves, the same as the CSV
@@ -1067,51 +1060,20 @@ pub async fn insert_batch_readings(
         "Batch readings insert complete"
     );
 
-    // Emit DataIngested events per unique (site_id, parameter_id) pair
+    let earliest = site_timestamps_for_derived
+        .values()
+        .flatten()
+        .min()
+        .copied();
+    let latest = site_timestamps_for_derived
+        .values()
+        .flatten()
+        .max()
+        .copied();
+
+    // Auto-compute derived values for affected sites, tracked as a job. Spawn-guard: keep only
+    // sites with an active derived parameter, others would compute nothing.
     if inserted > 0 || overwritten > 0 {
-        for ((site_id, parameter_id), &stream_id) in &stream_cache {
-            let _ = state.events.send(AppEvent::DataIngested {
-                site_id: Some(*site_id),
-                parameter_id: Some(*parameter_id),
-                stream_id: Some(stream_id),
-                count: inserted + overwritten,
-            });
-        }
-    }
-
-    // Invalidate response cache and auto-compute derived parameters for all affected sites.
-    // Cascade also runs when rows were overwritten, since their downstream values are now stale.
-    if inserted > 0 || overwritten > 0 {
-        let affected_site_ids: std::collections::HashSet<Uuid> =
-            stream_cache.keys().map(|(site_id, _)| *site_id).collect();
-        for site_id in &affected_site_ids {
-            crate::common::cache::invalidate_prefix(&state, &format!("readings:{site_id}")).await;
-            crate::common::cache::invalidate_prefix(&state, &format!("aggregates:{site_id}")).await;
-        }
-
-        let earliest = site_timestamps_for_derived
-            .values()
-            .flatten()
-            .min()
-            .copied();
-        let latest = site_timestamps_for_derived
-            .values()
-            .flatten()
-            .max()
-            .copied();
-
-        // An overwrite replaced values the rollups have already materialised. Best-effort: the
-        // rows are committed, so a refresh losing a lock to the janitor must not report a write
-        // that happened as one that did not. The rollups converge on the next scheduled refresh.
-        if overwritten > 0
-            && let (Some(lo), Some(hi)) = (earliest, latest)
-            && let Err(e) = aggregates::refresh(&state.db, Window::Range(lo, hi)).await
-        {
-            tracing::warn!(error = %e, %lo, %hi, "aggregate refresh after overwrite failed");
-        }
-
-        // Auto-compute derived values for affected sites, tracked as a job. Spawn-guard: keep only
-        // sites with an active derived parameter, others would compute nothing.
         let mut derived_sites: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
         for (site_id, timestamps) in &site_timestamps_for_derived {
             if crate::routes::private::parameters::derived::janitor::site_has_active_derived(
@@ -1140,42 +1102,39 @@ pub async fn insert_batch_readings(
             )
             .await?;
         }
-
-        // Rebuild persisted alarm events from the just-ingested readings: out-of-range historical
-        // values become breach episodes (the 60s sweeper only ever inspects the latest reading).
-        // Enqueued as an `alarm_backfill` worker job, scoped to exactly the ingested slots and window.
-        if let (Some(alarm_start), Some(alarm_end)) = (earliest, latest) {
-            let slots: Vec<serde_json::Value> = stream_cache
-                .keys()
-                .map(|(site_id, parameter_id)| serde_json::json!([site_id, parameter_id]))
-                .collect();
-            crate::routes::private::reprocessing_jobs::worker::enqueue(
-                &state.db,
-                "alarm_backfill",
-                None,
-                None,
-                &serde_json::json!({
-                    "slots": slots,
-                    "start": alarm_start.to_rfc3339(),
-                    "end": alarm_end.to_rfc3339(),
-                }),
-                None,
-            )
-            .await?;
-        }
-
-        // Live open-alarm reconcile for the just-ingested slots (event-driven freshness). The
-        // periodic backstop still reconciles everything; this just updates persisted alarms + SSE
-        // within ~1s of the write instead of waiting for the next sweep. Error-safe, the helper
-        // logs and swallows failures, so it can never break ingestion.
-        let alarm_slots: Vec<(Uuid, Uuid)> = stream_cache.keys().copied().collect();
-        crate::routes::private::alarms::sweeper::reconcile_and_notify(
-            &state.db,
-            &state.events,
-            &alarm_slots,
-        )
-        .await;
     }
+
+    // An overwrite replaced values the rollups have already materialised; an insert appended past
+    // them, which the next scheduled refresh covers. Best-effort: the rows are committed, so a
+    // refresh losing a lock to the janitor must not report a write that happened as one that did
+    // not. Episodes go to the `alarm_backfill` job because a batch can span a long window.
+    let written = tail::Written::new(u64::try_from(inserted + overwritten).unwrap_or(u64::MAX))
+        .over(earliest.zip(latest))
+        .at(stream_cache
+            .iter()
+            .map(|((site_id, parameter_id), stream_id)| {
+                tail::Slot::paired(*site_id, *parameter_id).through(*stream_id)
+            })
+            .collect())
+        .touching(touched_events);
+    tail::run(
+        &state,
+        &written,
+        &tail::Axes {
+            cache: tail::Cache::Sites,
+            refresh: if overwritten > 0 {
+                tail::Refresh::Range { fatal: false }
+            } else {
+                tail::Refresh::Skip
+            },
+            announce: true,
+            reconcile_alarms: true,
+            episodes: tail::Episodes::Job,
+            writer: crate::routes::private::collection_events::recompute::Writer::Person,
+        },
+        &crate::routes::private::tools::scripts::actor_label(&auth),
+    )
+    .await?;
 
     Ok(Json(BatchReadingsResponse {
         inserted,

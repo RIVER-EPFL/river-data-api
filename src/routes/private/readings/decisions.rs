@@ -85,6 +85,10 @@ impl Kind {
 
     /// The reading columns this kind projects to, which is also the state a decision records as
     /// `old` so a rollback can restore exactly it. Empty for kinds that project nothing.
+    ///
+    /// `calibrated_value` is not among them for a value correction: a corrected value is what the
+    /// curves the row names produce from its raw value, so it is recomposed after the projection
+    /// rather than recorded and restored (`calibrations::service::recompose_from_own_curves`).
     #[must_use]
     pub fn projected_columns(self) -> &'static [&'static str] {
         match self {
@@ -94,7 +98,7 @@ impl Kind {
             Self::Curve => &["standard_curve_id"],
             Self::CalibrationPin => &["calibration_id"],
             Self::InstrumentPin => &["sensor_id"],
-            Self::ValueCorrection => &["raw_value", "calibrated_value"],
+            Self::ValueCorrection => &["raw_value", "ingested_at"],
             Self::UnverifiedEntry | Self::Verify => &["unverified"],
             Self::SlotMove | Self::Chain | Self::Detach | Self::Return | Self::Rollback => &[],
         }
@@ -359,6 +363,7 @@ async fn current_state<C: ConnectionTrait>(
                  'raw_value', raw_value,
                  'calibrated_value', calibrated_value,
                  'unverified', unverified,
+                 'ingested_at', ingested_at,
                  'run_id', provenance ->> 'run_id',
                  'site_id', site_id,
                  'parameter_id', parameter_id) AS state
@@ -481,6 +486,15 @@ pub async fn record<C: ConnectionTrait>(conn: &C, d: &Decision) -> AppResult<Uui
         ))
         .await?
         .ok_or_else(|| AppError::Internal("recording a decision returned no row".to_string()))?;
+    if d.kind == Kind::ValueCorrection {
+        recompose_corrected(
+            conn,
+            "r.stream_id = $1 AND r.time = $2 \
+             AND ($3::smallint IS NULL OR r.replicate_index = $3)",
+            key_binds(&d.key),
+        )
+        .await?;
+    }
     Ok(row.try_get("", "id")?)
 }
 
@@ -547,6 +561,15 @@ pub async fn rollback<C: ConnectionTrait>(
         [rollback_id.into(), decision_id.into()],
     ))
     .await?;
+    if d.kind == Kind::ValueCorrection {
+        recompose_corrected(
+            conn,
+            "r.stream_id = $1 AND r.time = $2 \
+             AND ($3::smallint IS NULL OR r.replicate_index = $3)",
+            key_binds(&key),
+        )
+        .await?;
+    }
     Ok(rollback_id)
 }
 
@@ -591,6 +614,7 @@ const STATE_SQL: &str = "jsonb_build_object(
     'raw_value', r.raw_value,
     'calibrated_value', r.calibrated_value,
     'unverified', r.unverified,
+    'ingested_at', r.ingested_at,
     'run_id', r.provenance ->> 'run_id',
     'site_id', r.site_id,
     'parameter_id', r.parameter_id)";
@@ -1229,12 +1253,20 @@ pub fn projected_state(newest_first: &[FoldEntry]) -> ProjectedColumns {
 /// The same fold in SQL, anti-joined against the readings: every key whose folded columns are not
 /// what its live decisions say they should be. Report-only, because which side is wrong is a
 /// decision (a rollback, or a fresh decision), never something a sweep may pick.
+///
+/// It folds every column a decision's own assertion determines. The two it cannot are
+/// `calibrated_value`, which is recomposed from the row's own curves rather than asserted, and
+/// `ingested_at`, which a correction stamps with the clock; a decision records both as `old` for a
+/// rollback to restore, and neither can be predicted from `new`. The columns only some kinds
+/// assert are compared only where a decision asserted one, so a row carrying an instrument nothing
+/// pinned is not drift.
 #[must_use]
 pub fn inconsistent_rows_sql() -> String {
     "WITH candidate AS (
          SELECT r.stream_id, r.time, r.replicate_index,
                 COALESCE(r.is_flagged, false) AS is_flagged, r.flag_reason,
-                r.withdrawn_at, r.withdrawn_reason, COALESCE(r.unverified, false) AS unverified
+                r.withdrawn_at, r.withdrawn_reason, COALESCE(r.unverified, false) AS unverified,
+                r.standard_curve_id, r.calibration_id, r.sensor_id, r.raw_value
          FROM readings r
          WHERE r.is_flagged IS TRUE OR r.flag_reason IS NOT NULL
             OR r.withdrawn_at IS NOT NULL OR r.withdrawn_reason IS NOT NULL
@@ -1274,7 +1306,19 @@ pub fn inconsistent_rows_sql() -> String {
                  ('unverified', CASE
                       WHEN d.kind = 'unverified_entry' THEN 'true'::jsonb
                       WHEN d.kind IN ('verify', 'reject') THEN 'false'::jsonb
-                      WHEN d.kind = 'rollback' THEN d.new -> 'columns' -> 'unverified' END)
+                      WHEN d.kind = 'rollback' THEN d.new -> 'columns' -> 'unverified' END),
+                 ('standard_curve_id', CASE d.kind
+                      WHEN 'curve' THEN d.new -> 'standard_curve_id'
+                      WHEN 'rollback' THEN d.new -> 'columns' -> 'standard_curve_id' END),
+                 ('calibration_id', CASE d.kind
+                      WHEN 'calibration_pin' THEN d.new -> 'calibration_id'
+                      WHEN 'rollback' THEN d.new -> 'columns' -> 'calibration_id' END),
+                 ('sensor_id', CASE d.kind
+                      WHEN 'instrument_pin' THEN d.new -> 'sensor_id'
+                      WHEN 'rollback' THEN d.new -> 'columns' -> 'sensor_id' END),
+                 ('raw_value', CASE d.kind
+                      WHEN 'value_correction' THEN d.new -> 'raw_value'
+                      WHEN 'rollback' THEN d.new -> 'columns' -> 'raw_value' END)
              ) AS v(col, val)
              WHERE d.stream_id = c.stream_id AND d.time = c.time
                AND (d.replicate_index IS NULL OR d.replicate_index = c.replicate_index)
@@ -1286,7 +1330,14 @@ pub fn inconsistent_rows_sql() -> String {
         OR c.flag_reason IS DISTINCT FROM (e.m ->> 'flag_reason')
         OR c.withdrawn_at IS DISTINCT FROM (e.m ->> 'withdrawn_at')::timestamptz
         OR c.withdrawn_reason IS DISTINCT FROM (e.m ->> 'withdrawn_reason')
-        OR c.unverified IS DISTINCT FROM COALESCE((e.m ->> 'unverified')::boolean, false)"
+        OR c.unverified IS DISTINCT FROM COALESCE((e.m ->> 'unverified')::boolean, false)
+        OR (e.m ? 'standard_curve_id'
+            AND c.standard_curve_id IS DISTINCT FROM (e.m ->> 'standard_curve_id')::uuid)
+        OR (e.m ? 'calibration_id'
+            AND c.calibration_id IS DISTINCT FROM (e.m ->> 'calibration_id')::uuid)
+        OR (e.m ? 'sensor_id' AND c.sensor_id IS DISTINCT FROM (e.m ->> 'sensor_id')::uuid)
+        OR (e.m ? 'raw_value'
+            AND c.raw_value IS DISTINCT FROM (e.m ->> 'raw_value')::double precision)"
         .to_string()
 }
 
@@ -1404,6 +1455,26 @@ impl Selection {
 
 /// Record one decision per reading a selection covers, as one set. Returns the set id and what
 /// was recorded.
+/// Put the corrected value back under the rows a value correction touched.
+///
+/// The projection writes `raw_value` and leaves `calibrated_value` NULL, because a corrected value
+/// is a claim about the curves the row itself names rather than a number a decision may record.
+/// This recomposes it from exactly those curves, so value and provenance move together.
+async fn recompose_corrected<C: ConnectionTrait>(
+    conn: &C,
+    scope_sql: &str,
+    params: Vec<sea_orm::Value>,
+) -> AppResult<()> {
+    crate::routes::private::sensors::calibrations::service::recompose_from_own_curves(
+        conn,
+        &crate::routes::private::sensors::calibrations::service::corrected_rows("r"),
+        scope_sql,
+        params,
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn record_set<C: ConnectionTrait>(
     conn: &C,
     kind: Kind,
@@ -1452,6 +1523,16 @@ pub async fn record_set<C: ConnectionTrait>(
         ],
     ))
     .await?;
+    if kind == Kind::ValueCorrection && recorded.rows > 0 {
+        recompose_corrected(
+            conn,
+            "EXISTS (SELECT 1 FROM reading_decisions d WHERE d.set_id = $1 \
+                       AND d.stream_id = r.stream_id AND d.time = r.time \
+                       AND d.replicate_index = r.replicate_index)",
+            vec![set_id.into()],
+        )
+        .await?;
+    }
     Ok((set_id, recorded))
 }
 
@@ -2106,7 +2187,8 @@ mod tests {
         assert_eq!(Kind::CalibrationPin.projected_columns(), ["calibration_id"]);
         assert_eq!(
             Kind::ValueCorrection.projected_columns(),
-            ["raw_value", "calibrated_value"]
+            ["raw_value", "ingested_at"],
+            "the corrected value is recomposed from the row's own curves, never recorded"
         );
         assert_eq!(Kind::Verify.projected_columns(), ["unverified"]);
         for k in [
@@ -2135,7 +2217,8 @@ mod tests {
     fn old_state_keeps_only_the_columns_the_kind_touches() {
         let state = serde_json::json!({
             "is_flagged": true, "flag_reason": "x", "raw_value": 1.5,
-            "calibrated_value": 1.7, "unverified": false, "sensor_id": null
+            "calibrated_value": 1.7, "ingested_at": "2025-06-15T10:00:00Z",
+            "unverified": false, "sensor_id": null
         });
         assert_eq!(
             old_state_for(Kind::Flag, &state),
@@ -2143,7 +2226,7 @@ mod tests {
         );
         assert_eq!(
             old_state_for(Kind::ValueCorrection, &state),
-            serde_json::json!({ "raw_value": 1.5, "calibrated_value": 1.7 })
+            serde_json::json!({ "raw_value": 1.5, "ingested_at": "2025-06-15T10:00:00Z" })
         );
         // An ownership decision records the value and the run it supersedes, and projects nothing.
         assert_eq!(

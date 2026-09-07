@@ -9,15 +9,6 @@ use serial_test::serial;
 // Helper
 // ============================================================================
 
-async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
-    use sea_orm::{ConnectionTrait, Statement};
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_string(),
-    ))
-    .await
-    .unwrap_or_else(|e| panic!("SQL failed: {e}\nQuery: {sql}"));
-}
 
 // ============================================================================
 // Duplicate threshold: both global + site-specific for the same parameter
@@ -37,7 +28,7 @@ async fn test_global_plus_site_specific_threshold_no_duplicate_rows() {
     // The seed data already has a GLOBAL threshold (site_id IS NULL) for DO_Temperature.
     // Now add a SITE-SPECIFIC threshold for the same parameter at site 1.
     // This creates the conditions for the duplicate JOIN bug.
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO alarm_thresholds (id, parameter_id, site_id, warning_min, warning_max, alarm_min, alarm_max, description) \
@@ -119,8 +110,8 @@ async fn test_all_null_thresholds_no_violations() {
     let site_id = crate::common::SITE1_ID;
 
     // Remove all thresholds and replace with one that has all NULL bounds
-    exec(&db, "DELETE FROM alarm_thresholds").await;
-    exec(
+    crate::common::exec(&db, "DELETE FROM alarm_thresholds").await;
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO alarm_thresholds (id, parameter_id, description) \

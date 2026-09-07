@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::common::aggregates::{self, Window};
+use crate::common::AppState;
 use crate::common::middleware::{IsSyncService, ProjectScope, enforce_project_scope_for_sites};
-use crate::common::{AppEvent, AppState};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::batch::{Replace, admission, readings_upsert};
+use crate::routes::private::readings::tail;
 use crate::routes::private::sensors::calibrations::{
     self, resolver,
     service::{Curve, apply_curves},
@@ -674,6 +674,9 @@ pub async fn ingest_readings(
     // inside one transaction with the decompression cap lifted, like every other back-dated
     // write path. The diff, the writes and the receipt commit together or not at all.
     let mut diff_outcome: Option<crate::routes::private::readings::reconcile::DiffOutcome> = None;
+    let mut touched_visits: Vec<
+        crate::routes::private::collection_events::recompute::TouchedEvent,
+    > = Vec::new();
     let audited =
         payload.audit.as_deref().is_some_and(|a| !a.is_empty()) || !stripped_claims.is_empty();
     let inserted = if payload.overwrite
@@ -852,15 +855,7 @@ pub async fn ingest_readings(
             })
             .await?;
         diff_outcome = diff;
-        // A served value moved at a visit somebody entered here: its calculations run (ADR 0007).
-        // A portal_sync visit is left to its portal (Q41), which the hook enforces.
-        crate::routes::private::collection_events::recompute::enqueue_for(
-            db,
-            &touched_events,
-            &crate::routes::private::tools::scripts::actor_label(&auth),
-            crate::routes::private::collection_events::recompute::Writer::Person,
-        )
-        .await?;
+        touched_visits = touched_events;
         n
     } else {
         insert_reading_chunks(db, &models, Replace::Nothing).await?
@@ -871,81 +866,82 @@ pub async fn ingest_readings(
     let diff_reinstated = diff_outcome.as_ref().map_or(0, |d| d.reinstated);
     // What this pass did to served content, the gate every post-write side effect reads: a
     // correction or a withdrawal with `inserted == 0` still rewrote history.
-    let effect = inserted > 0 || diff_changed > 0 || diff_withdrawn > 0 || diff_reinstated > 0;
+    let moved = u64::try_from(inserted + diff_changed + diff_withdrawn + diff_reinstated)
+        .unwrap_or(u64::MAX);
+    let effect = moved > 0;
+
+    let span = payload
+        .readings
+        .iter()
+        .map(|r| r.time)
+        .min()
+        .zip(payload.readings.iter().map(|r| r.time).max());
+
+    // A correction rewrites history that bounded queries may have cached and replaces values the
+    // rollups have already materialised. The upsert leaves a hand-picked curve standing and this
+    // correction resolved only a base, so the value is recomposed from whichever curves the row
+    // ends up carrying, before the rollups read it back.
+    let corrected = (payload.overwrite && inserted > 0) || diff_changed > 0;
+    if corrected
+        && let Some((lo, hi)) = span
+        && let Err(e) = calibrations::service::recompose_from_own_curves_guarded(
+            &state.db,
+            "TRUE",
+            "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
+            vec![
+                payload.stream_id.into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
+            ],
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "recompose after overwrite failed");
+    }
 
     // Sample formation retroactively changes served historical points (the group's mean replaces
-    // the lone value), so bounded cached responses cannot be left to expire on TTL. Withdrawals
-    // and reinstatements rewrite served history the same way.
-    if effect && (sample_window.is_some() || payload.window.is_some()) {
-        state.response_cache.invalidate_all();
-    }
-
-    // Corrections rewrite history that bounded queries may have cached, and replace values the
-    // rollups have already materialised. A windowed pass that corrected values did exactly what
-    // an overwrite does, whatever `inserted` says.
-    if (payload.overwrite && inserted > 0) || diff_changed > 0 {
-        state.response_cache.invalidate_all();
-
-        // Best-effort, like the alarm reconstruction below it: the rows are committed and the
-        // cursor is about to advance past them, so a refresh that loses a lock to the janitor must
-        // not turn a successful write into a 500 that replays the same batch forever. The rollups
-        // converge on the next scheduled refresh.
-        let times = payload.readings.iter().map(|r| r.time);
-        if let (Some(lo), Some(hi)) = (times.clone().min(), times.max()) {
-            // The upsert leaves a hand-picked curve standing, and this correction resolved only a
-            // base, so the value is recomposed from whichever curves the row ends up carrying.
-            if let Err(e) = calibrations::service::recompose_from_own_curves_guarded(
-                &state.db,
-                "TRUE",
-                "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
-                vec![
-                    payload.stream_id.into(),
-                    sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
-                    sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
-                ],
-            )
-            .await
-            {
-                tracing::warn!(error = %e, "recompose after overwrite failed");
-            }
-            if let Err(e) = aggregates::refresh(&state.db, Window::Range(lo, hi)).await {
-                tracing::warn!(error = %e, %lo, %hi, "aggregate refresh after overwrite failed");
-            }
-        }
-    }
-
-    // Emit ingestion event
-    if effect {
-        let _ = state.events.send(AppEvent::DataIngested {
+    // the lone value), and a withdrawal, a reinstatement or a correction rewrites served history
+    // the same way, so those passes cannot be left to expire on TTL anywhere. A plain append is
+    // confined to its own site.
+    //
+    // The refresh is best-effort, like the alarm reconstruction: the rows are committed and the
+    // cursor is about to advance past them, so a refresh that loses a lock to the janitor must not
+    // turn a successful write into a 500 that replays the same batch forever. The rollups converge
+    // on the next scheduled refresh. Episodes are rebuilt inline rather than as a tracked job:
+    // single ingest fires every sync cycle per stream and would spam `reprocessing_jobs`.
+    let rewrote_history =
+        corrected || sample_window.is_some() || payload.window.is_some() || diff_withdrawn > 0;
+    let written = tail::Written::new(moved)
+        .announced(u64::try_from(inserted).unwrap_or(u64::MAX))
+        .over(span)
+        .at(vec![tail::Slot {
             site_id,
             parameter_id,
             stream_id: Some(payload.stream_id),
-            count: inserted,
-        });
-
-        // Event-driven open-alarm reconcile for this slot (error-safe; backstop still covers it),
-        // plus historical episode reconstruction over the ingested window so back-dated breaches
-        // land in alarm_events like the batch/import paths. Inline rather than a tracked job:
-        // single ingest fires every sync cycle per stream and would spam reprocessing_jobs.
-        if let (Some(s), Some(p)) = (site_id, parameter_id) {
-            crate::routes::private::alarms::sweeper::reconcile_and_notify(
-                &state.db,
-                &state.events,
-                &[(s, p)],
-            )
-            .await;
-
-            let times = payload.readings.iter().map(|r| r.time);
-            if let (Some(lo), Some(hi)) = (times.clone().min(), times.max())
-                && let Err(e) = crate::routes::private::alarms::episodes::evaluate_alarm_episodes(
-                    &state.db, s, p, lo, hi,
-                )
-                .await
-            {
-                tracing::warn!(error = %e, site_id = %s, parameter_id = %p, "alarm episode reconstruction failed");
-            }
-        }
-    }
+        }])
+        .touching(touched_visits);
+    tail::run(
+        &state,
+        &written,
+        &tail::Axes {
+            cache: if rewrote_history {
+                tail::Cache::All
+            } else {
+                tail::Cache::Sites
+            },
+            refresh: if corrected {
+                tail::Refresh::Range { fatal: false }
+            } else {
+                tail::Refresh::Skip
+            },
+            announce: true,
+            reconcile_alarms: true,
+            episodes: tail::Episodes::Inline,
+            writer: crate::routes::private::collection_events::recompute::Writer::Person,
+        },
+        &crate::routes::private::tools::scripts::actor_label(&auth),
+    )
+    .await?;
 
     // Update last_data_time on the stream. Every group is admitted (audit disagreements are
     // review records, not gates), so the cursor always advances to the batch's newest instant.

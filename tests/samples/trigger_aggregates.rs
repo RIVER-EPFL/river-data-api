@@ -37,21 +37,13 @@ async fn fetch_aggregate(db: &DatabaseConnection, sample_id: Uuid) -> SampleAggr
     }
 }
 
-async fn exec(db: &DatabaseConnection, sql: &str) {
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_string(),
-    ))
-    .await
-    .unwrap_or_else(|e| panic!("SQL failed: {e}\nQuery: {sql}"));
-}
 
 /// Ensure a "grab_sample" data stream exists and return its id for a
 /// (site, parameter) pair. Mirrors the helper used by the grab_samples handler.
 async fn ensure_stream(db: &DatabaseConnection, site_id: &str, parameter_id: &str) -> Uuid {
     let source_key = format!("{site_id}:{parameter_id}");
     let stream_id = Uuid::new_v4();
-    exec(
+    crate::common::exec(
         db,
         &format!(
             "INSERT INTO data_streams \
@@ -79,7 +71,7 @@ async fn ensure_stream(db: &DatabaseConnection, site_id: &str, parameter_id: &st
 
 async fn create_sample(db: &DatabaseConnection, site_id: &str, parameter_id: &str) -> Uuid {
     let id = Uuid::new_v4();
-    exec(
+    crate::common::exec(
         db,
         &format!(
             "INSERT INTO samples (id, site_id, parameter_id, collected_at) \
@@ -99,7 +91,7 @@ async fn insert_replicate(
     replicate_index: i16,
     value: f64,
 ) {
-    exec(
+    crate::common::exec(
         db,
         &format!(
             "INSERT INTO readings \
@@ -209,7 +201,7 @@ async fn samples_trigger_recomputes_on_flag() {
         .await;
     }
 
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE readings SET is_flagged = true \
@@ -258,7 +250,7 @@ async fn samples_trigger_deletes_unreferenced_sample() {
     let agg = fetch_aggregate(&db, sample_id).await;
     assert_eq!(agg.n, 1);
 
-    exec(
+    crate::common::exec(
         &db,
         &format!("DELETE FROM readings WHERE sample_id = '{sample_id}'"),
     )
@@ -309,7 +301,7 @@ async fn samples_trigger_keeps_row_when_only_flagged_readings_remain() {
     )
     .await;
 
-    exec(
+    crate::common::exec(
         &db,
         &format!("UPDATE readings SET is_flagged = true WHERE sample_id = '{sample_id}'"),
     )
@@ -346,7 +338,7 @@ async fn samples_trigger_handles_reassignment() {
     // Create sample B at a different timestamp so its readings don't collide
     // with sample A's (stream_id, time, replicate_index) PK.
     let sample_b_id = Uuid::new_v4();
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO samples (id, site_id, parameter_id, collected_at) \
@@ -380,7 +372,7 @@ async fn samples_trigger_handles_reassignment() {
     .await;
 
     // One replicate in B at time +1h
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO readings \
@@ -398,7 +390,7 @@ async fn samples_trigger_handles_reassignment() {
     assert_eq!(fetch_aggregate(&db, sample_b_id).await.n, 1);
 
     // Move replicate_index=2 from A to B (note: it stays at time 12:00, so PK is fine in B too)
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE readings SET sample_id = '{sample_b_id}' \
@@ -447,7 +439,7 @@ async fn samples_delete_sets_reading_sample_id_null() {
     )
     .await;
 
-    exec(
+    crate::common::exec(
         &db,
         &format!("DELETE FROM samples WHERE id = '{sample_id}'"),
     )
@@ -513,7 +505,7 @@ async fn samples_trigger_excludes_unverified_replicates_until_they_are_verified(
         .await;
     }
 
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE readings SET unverified = true \
@@ -526,7 +518,7 @@ async fn samples_trigger_excludes_unverified_replicates_until_they_are_verified(
     assert!((agg.mean.unwrap() - 11.0).abs() < 1e-9);
     assert!((agg.max_value.unwrap() - 12.0).abs() < 1e-9);
 
-    exec(
+    crate::common::exec(
         &db,
         &format!("UPDATE readings SET unverified = false WHERE sample_id = '{sample_id}'"),
     )

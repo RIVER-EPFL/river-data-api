@@ -80,7 +80,7 @@ async fn test_derived_parameter_skips_infinity() {
     let temp_stream_id = "00000000-0000-4000-d000-000000000001";
 
     // Create a global parameter for the derived value
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO parameters (id, code, name, default_units, category) \
@@ -90,7 +90,7 @@ async fn test_derived_parameter_skips_infinity() {
     .await;
 
     // Create a derived parameter definition with a division formula
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO derived_parameter_definitions (id, code, name, units, formula) \
@@ -100,7 +100,7 @@ async fn test_derived_parameter_skips_infinity() {
     .await;
 
     // Create a site_parameter for the derived value
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active, is_derived, derived_definition_id, variable_mappings) \
@@ -115,7 +115,7 @@ async fn test_derived_parameter_skips_infinity() {
     // Create a data stream for the derived readings
     crate::common::seed_data_stream(&db, derived_stream_id, "test", "derived_stream").await;
     // Pair it to the derived site_parameter
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE data_streams SET site_parameter_id = '{derived_sp_id}', paired_at = NOW() WHERE id = '{derived_stream_id}'"
@@ -126,7 +126,7 @@ async fn test_derived_parameter_skips_infinity() {
     // Insert a reading where DO = 0 (will cause division by zero in the formula)
     let time = "2025-01-15T00:00:00Z";
     // Overwrite the DO reading at this time with 0
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, replicate_index) \
@@ -138,7 +138,7 @@ async fn test_derived_parameter_skips_infinity() {
     .await;
 
     // Ensure temp reading exists at this time
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, replicate_index) \
@@ -180,15 +180,6 @@ async fn test_derived_parameter_skips_infinity() {
     crate::common::cleanup_test_db(&db).await;
 }
 
-async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
-    use sea_orm::{ConnectionTrait, Statement};
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_string(),
-    ))
-    .await
-    .unwrap_or_else(|e| panic!("SQL failed: {e}\nQuery: {sql}"));
-}
 
 // Calibration application formula (calibrated = slope * raw + intercept) and slope=0 rejection.
 

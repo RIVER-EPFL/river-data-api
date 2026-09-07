@@ -67,9 +67,9 @@ async fn every_documented_path_resolves() {
     config.keycloak_admin_client_id = Some("river-data-admin".into());
     config.keycloak_admin_client_secret = Some("unused".into());
     let state = river_db::common::AppState::new(db.clone(), config, None);
-    let app = river_db::routes::build_router(state);
+    let app = river_db::routes::build_router(state.clone());
 
-    let spec = river_db::routes::openapi_spec();
+    let spec = river_db::routes::openapi_spec(&state);
     assert!(
         spec.servers.is_none(),
         "paths are absolute, not relative to a server entry"
@@ -107,5 +107,33 @@ async fn every_documented_path_resolves() {
         "{} of {checked} documented operations do not resolve:\n{}",
         unresolved.len(),
         unresolved.join("\n")
+    );
+}
+
+/// Expected behaviour: the document carries the entity half the CrudCrate derive generates, not
+/// only the hand-declared paths. The derive mounts eight routes per entity and builds a document
+/// for them; the served spec is that document merged into the hand-written one.
+#[tokio::test]
+#[serial]
+async fn the_spec_carries_the_generated_entity_routes() {
+    let db = crate::common::setup_test_db().await;
+    let state = river_db::common::AppState::new(db.clone(), crate::common::test_config(), None);
+    let spec = river_db::routes::openapi_spec(&state);
+
+    assert!(
+        spec.paths.paths.contains_key("/api/site_parameters/{id}"),
+        "a generated entity path is documented"
+    );
+    assert!(
+        spec.paths.paths.contains_key("/api/sites/{site_id}/readings"),
+        "a hand-declared path is still documented"
+    );
+    let components = spec
+        .components
+        .as_ref()
+        .expect("the document declares components");
+    assert!(
+        components.schemas.contains_key("SiteParameterCreate"),
+        "a generated create model is documented"
     );
 }

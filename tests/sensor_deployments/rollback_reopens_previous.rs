@@ -121,7 +121,16 @@ async fn rollback_reopens_previous_deployment() {
         "deployment A reopened (deployed_until NULL)"
     );
 
-    // rollback_deployment reprocesses synchronously, so the readings are already re-attributed.
+    // The re-derivation is a tracked job, like every other reprocess caller's.
+    let job_id = resp["job_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the rollback names the reprocess it queued: {body}"));
+    assert_eq!(
+        crate::common::e2e::poll_job(&app, &token, job_id, 60).await,
+        "completed",
+        "the queued reprocess runs to completion"
+    );
+
     let rows = sl::get_readings_for_sensor(&db, sensor.id).await;
     assert_eq!(rows.len(), 6, "all six readings remain");
     for (i, r) in rows.iter().enumerate() {

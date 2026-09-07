@@ -150,15 +150,6 @@ struct CurveRow {
     valid_from: DateTime<Utc>,
 }
 
-/// Run a statement that shapes stored state directly, for the rows no endpoint can produce.
-async fn exec(db: &DatabaseConnection, sql: &str) {
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_string(),
-    ))
-    .await
-    .unwrap_or_else(|e| panic!("{sql}: {e}"));
-}
 
 /// The sensor's earliest calibration window.
 async fn earliest_curve(db: &DatabaseConnection, sensor_id: &str) -> CurveRow {
@@ -845,7 +836,7 @@ async fn calibration_candidates_then_backfill_calibrations() {
     // The anomaly the endpoint exists to find: rows a window covers whose stamp is missing. It is
     // made here by hand because no live path produces it any more; what is in the database from
     // before the stamp was reliable still looks exactly like this.
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "UPDATE readings SET calibration_id = NULL, calibrated_value = NULL \
@@ -858,7 +849,7 @@ async fn calibration_candidates_then_backfill_calibrations() {
     // And beside it, a correction nothing accounts for: no instrument, no curve of either kind, yet
     // a stored value that is not the raw one. It names no sensor, so no reprocess can reach it,
     // which is exactly why it has to be reported rather than repaired.
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO readings \

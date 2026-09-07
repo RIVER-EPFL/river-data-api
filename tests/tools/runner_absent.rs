@@ -143,8 +143,7 @@ async fn a_malformed_manifest_is_refused_without_the_runner() {
         Some(format!("http://127.0.0.1:{}/ocpu", closed_port())),
     )
     .await;
-    kc::ensure_realm_user("manifestadmin", "manifestadmin", &["riverdata-admin"]).await;
-    let admin = kc::get_keycloak_jwt("manifestadmin", "manifestadmin").await;
+    let admin = kc::member_jwt("manifestadmin", "manifestadmin", "riverdata-admin").await;
 
     let (status, script) = crate::common::post_json_parse_with_token(
         &app,

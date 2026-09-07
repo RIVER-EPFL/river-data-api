@@ -38,6 +38,24 @@ fn spawn_test_worker(state: &AppState) {
     });
 }
 
+/// A seeded application: the database, a router sharing it, and a full-permission API token.
+/// Nearly every theme opens on these five calls, so they live here and a test states only what it
+/// adds to them.
+pub struct Fixture {
+    pub db: DatabaseConnection,
+    pub app: axum::Router,
+    pub token: String,
+}
+
+pub async fn seeded_app() -> Fixture {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_test_data(&db).await;
+    let token = seed_token_full(&db).await;
+    let app = build_test_app(db.clone());
+    Fixture { db, app, token }
+}
+
 pub fn build_test_app(db: DatabaseConnection) -> axum::Router {
     let config = test_config();
     let state = AppState::new(db, config, None);

@@ -664,8 +664,7 @@ async fn a_backdated_reading_resolves_to_the_older_window_not_the_latest_calibra
     crate::common::cleanup_test_db(&db).await;
     let app = kc::build_test_app_with_keycloak(db.clone()).await;
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
-    kc::ensure_realm_user("manager1", "manager1", &["riverdata-manager"]).await;
-    let manager = kc::get_keycloak_jwt("manager1", "manager1").await;
+    let manager = kc::member_jwt("manager1", "manager1", "riverdata-manager").await;
 
     let fx = arrange(&db, &app, &admin).await;
     kc::grant_project(
@@ -804,8 +803,7 @@ async fn aggregates_report_the_new_curve_for_the_new_bucket_and_leave_the_old_bu
     crate::common::cleanup_test_db(&db).await;
     let app = kc::build_test_app_with_keycloak(db.clone()).await;
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
-    kc::ensure_realm_user("manager1", "manager1", &["riverdata-manager"]).await;
-    let manager = kc::get_keycloak_jwt("manager1", "manager1").await;
+    let manager = kc::member_jwt("manager1", "manager1", "riverdata-manager").await;
 
     let fx = arrange(&db, &app, &admin).await;
     kc::grant_project(

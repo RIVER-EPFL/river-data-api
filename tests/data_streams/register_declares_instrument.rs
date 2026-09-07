@@ -22,12 +22,8 @@ use river_db::error::AppError;
 use river_db::routes::private::data_streams::views::validate_declared_sensor;
 
 async fn setup() -> (axum::Router, String, sea_orm::DatabaseConnection) {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
-    let app = crate::common::build_test_app(db.clone());
-    (app, token, db)
+    let f = crate::common::seeded_app().await;
+    (f.app, f.token, f.db)
 }
 
 async fn create_sensor(app: &axum::Router, token: &str, serial: &str) -> String {

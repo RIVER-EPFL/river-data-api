@@ -540,3 +540,235 @@ async fn a_sensor_with_no_curves_reprocesses_and_stays_uncorrected() {
         );
     }
 }
+
+/// The per-slot engine resolves the same windows as the per-sensor one. The three that follow are
+/// the invariants the per-sensor arm already pins, asserted through
+/// `reprocess_site_parameter_readings`, which is what a pairing, a swap or a slot reprocess runs.
+#[tokio::test]
+#[serial]
+async fn slot_reprocess_clears_a_reading_in_a_curve_gap() {
+    use river_db::routes::private::sensors::calibrations::service::reprocess_site_parameter_readings;
+
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let sensor_id = create_sensor_without_curve(&db, "slot-window-gap").await;
+    let early = add_calibration_for_parameter(
+        &db,
+        sensor_id,
+        GLOBAL_PARAM_TEMP_ID,
+        2.0,
+        0.0,
+        dt("2025-01-01T00:00:00Z"),
+    )
+    .await;
+    let late = add_calibration_for_parameter(
+        &db,
+        sensor_id,
+        GLOBAL_PARAM_TEMP_ID,
+        3.0,
+        0.0,
+        dt("2025-03-01T00:00:00Z"),
+    )
+    .await;
+    exec_sql(
+        &db,
+        &format!(
+            "UPDATE sensor_calibrations \
+             SET valid_until = '2025-02-01T00:00:00Z', valid_until_explicit = true \
+             WHERE id = '{early}'"
+        ),
+    )
+    .await;
+
+    let deployment = deploy_sensor_for_parameter(
+        &db,
+        sensor_id,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        dt("2024-01-01T00:00:00Z"),
+    )
+    .await;
+    let stream = create_paired_stream(&db, "slot-window-gap", PARAM_S1_TEMP_ID).await;
+    insert_readings(
+        &db,
+        stream,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        sensor_id,
+        early,
+        deployment,
+        2.0,
+        0.0,
+        &[
+            (dt("2025-01-15T00:00:00Z"), 10.0),
+            (dt("2025-02-15T00:00:00Z"), 10.0),
+            (dt("2025-03-15T00:00:00Z"), 10.0),
+        ],
+    )
+    .await;
+
+    reprocess_site_parameter_readings(
+        &db,
+        SITE1_ID.parse().unwrap(),
+        GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
+    )
+    .await
+    .expect("slot reprocess");
+
+    let rows = get_readings(&db, stream).await;
+    let at = |time: &str| {
+        rows.iter()
+            .find(|r| r.time == dt(time))
+            .unwrap_or_else(|| panic!("no reading at {time}"))
+    };
+    assert_eq!(at("2025-01-15T00:00:00Z").calibration_id, Some(early));
+    assert_eq!(at("2025-01-15T00:00:00Z").calibrated_value, Some(20.0));
+    assert_eq!(
+        at("2025-02-15T00:00:00Z").calibration_id,
+        None,
+        "the gap resolves no curve, and the retired one's stamp is dropped"
+    );
+    assert_eq!(
+        at("2025-02-15T00:00:00Z").calibrated_value,
+        None,
+        "so the value it produced goes with it"
+    );
+    assert_eq!(at("2025-03-15T00:00:00Z").calibration_id, Some(late));
+    assert_eq!(at("2025-03-15T00:00:00Z").calibrated_value, Some(30.0));
+}
+
+#[tokio::test]
+#[serial]
+async fn slot_reprocess_leaves_a_reading_before_the_first_curve_uncorrected() {
+    use river_db::routes::private::sensors::calibrations::service::reprocess_site_parameter_readings;
+
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let sensor_id = create_sensor_without_curve(&db, "slot-window-leading").await;
+    let curve = add_calibration_for_parameter(
+        &db,
+        sensor_id,
+        GLOBAL_PARAM_TEMP_ID,
+        2.0,
+        0.0,
+        dt("2025-02-01T00:00:00Z"),
+    )
+    .await;
+    let deployment = deploy_sensor_for_parameter(
+        &db,
+        sensor_id,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        dt("2024-01-01T00:00:00Z"),
+    )
+    .await;
+    let stream = create_paired_stream(&db, "slot-window-leading", PARAM_S1_TEMP_ID).await;
+    insert_readings(
+        &db,
+        stream,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        sensor_id,
+        curve,
+        deployment,
+        2.0,
+        0.0,
+        &[
+            (dt("2025-01-15T00:00:00Z"), 10.0),
+            (dt("2025-03-15T00:00:00Z"), 10.0),
+        ],
+    )
+    .await;
+
+    reprocess_site_parameter_readings(
+        &db,
+        SITE1_ID.parse().unwrap(),
+        GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
+    )
+    .await
+    .expect("slot reprocess");
+
+    let rows = get_readings(&db, stream).await;
+    let leading = rows
+        .iter()
+        .find(|r| r.time == dt("2025-01-15T00:00:00Z"))
+        .expect("the reading before the curve");
+    let covered = rows
+        .iter()
+        .find(|r| r.time == dt("2025-03-15T00:00:00Z"))
+        .expect("the reading inside the curve");
+    assert_eq!(leading.calibration_id, None, "no curve covers it");
+    assert_eq!(
+        leading.calibrated_value, None,
+        "so the correction it carried is cleared, not kept"
+    );
+    assert_eq!(covered.calibration_id, Some(curve));
+    assert_eq!(covered.calibrated_value, Some(20.0), "2*10");
+}
+
+#[tokio::test]
+#[serial]
+async fn slot_reprocess_prefers_a_parameter_curve_over_an_open_wildcard() {
+    use river_db::routes::private::sensors::calibrations::service::reprocess_site_parameter_readings;
+
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let sensor_id = create_sensor_without_curve(&db, "slot-wildcard").await;
+    let wildcard = Uuid::new_v4();
+    let temp_curve = Uuid::new_v4();
+    exec_sql(
+        &db,
+        &format!(
+            "INSERT INTO sensor_calibrations \
+             (id, sensor_id, parameter_id, slope, intercept, valid_from, notes) VALUES \
+             ('{wildcard}', '{sensor_id}', NULL, 1.0, 0.0, '2000-01-01T00:00:00Z', 'wildcard'), \
+             ('{temp_curve}', '{sensor_id}', '{GLOBAL_PARAM_TEMP_ID}', 2.0, 0.0, \
+              '2000-01-01T00:00:00Z', 'temp')"
+        ),
+    )
+    .await;
+    let deployment = deploy_sensor_for_parameter(
+        &db,
+        sensor_id,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        dt("2000-01-01T00:00:00Z"),
+    )
+    .await;
+    let stream = create_paired_stream(&db, "slot-wildcard", PARAM_S1_TEMP_ID).await;
+    insert_readings(
+        &db,
+        stream,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        sensor_id,
+        wildcard,
+        deployment,
+        1.0,
+        0.0,
+        &[(dt("2025-01-01T10:00:00Z"), 3.0)],
+    )
+    .await;
+
+    reprocess_site_parameter_readings(
+        &db,
+        SITE1_ID.parse().unwrap(),
+        GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
+    )
+    .await
+    .expect("slot reprocess");
+
+    let row = &get_readings(&db, stream).await[0];
+    assert_eq!(
+        row.calibration_id,
+        Some(temp_curve),
+        "the parameter's own curve, not the wildcard"
+    );
+    assert_eq!(row.calibrated_value, Some(6.0), "2*3, never 1*3");
+}

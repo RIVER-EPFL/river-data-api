@@ -107,7 +107,7 @@ fn midnight(year: i32, month: u32, day: u32) -> DateTime<Utc> {
 }
 
 /// What a refresh should cover.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Window {
     /// The whole history of every view (`NULL, NULL`). The repair backstop; expensive.
     Full,

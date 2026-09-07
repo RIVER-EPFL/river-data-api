@@ -5,18 +5,37 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::common::aggregates::{self, Window};
 use crate::common::authz::AccessScope;
 use crate::common::bulk_write;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::collection_events::recompute;
 use crate::routes::private::readings::decisions::{self, Kind, Origin};
+use crate::routes::private::readings::tail;
 use crate::routes::private::tools::scripts::actor_label;
 
 /// Keys per statement. A statement is one OR-chain, and each term carries `time = $n` equality, so
 /// chunk exclusion prunes; the bound is on statement size, not on correctness.
 const KEYS_PER_STATEMENT: usize = 500;
+
+/// Curation moves values already served, at instants a bounded query may hold cached anywhere, and
+/// the rollups exclude what a flag hides, so the refresh is the write's own span and its failure is
+/// the caller's. Nothing arrives here, so no slot is announced and no alarm is re-evaluated.
+const CURATION_TAIL: tail::Axes = tail::Axes {
+    cache: tail::Cache::All,
+    refresh: tail::Refresh::Range { fatal: true },
+    announce: false,
+    reconcile_alarms: false,
+    episodes: tail::Episodes::None,
+    writer: recompute::Writer::Person,
+};
+
+/// What a recorded curation left behind, in the shape the shared tail reads.
+fn written(recorded: &decisions::Recorded) -> tail::Written {
+    tail::Written::new(recorded.rows)
+        .over(recorded.span)
+        .touching(recorded.touched_events.clone())
+}
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ReadingKey {
@@ -168,17 +187,7 @@ async fn apply_flags(
     })
     .await?;
 
-    if let Some(window) = Window::touched(&recorded.touched()) {
-        aggregates::refresh(&state.db, window).await?;
-        state.response_cache.invalidate_all();
-    }
-    recompute::enqueue_for(
-        &state.db,
-        &recorded.touched_events,
-        actor,
-        recompute::Writer::Person,
-    )
-    .await?;
+    tail::run(state, &written(&recorded), &CURATION_TAIL, actor).await?;
     Ok(recorded.rows)
 }
 
@@ -269,17 +278,7 @@ async fn apply_flags_over_range(
     })
     .await?;
 
-    if let Some(window) = Window::touched(&recorded.touched()) {
-        aggregates::refresh(&state.db, window).await?;
-        state.response_cache.invalidate_all();
-    }
-    recompute::enqueue_for(
-        &state.db,
-        &recorded.touched_events,
-        actor,
-        recompute::Writer::Person,
-    )
-    .await?;
+    tail::run(state, &written(&recorded), &CURATION_TAIL, actor).await?;
     Ok(recorded.rows)
 }
 

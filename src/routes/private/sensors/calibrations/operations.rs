@@ -63,6 +63,33 @@ fn valid_until_provenance(
     }
 }
 
+/// Chain the sensor's windows, then enqueue the reprocess that re-derives its readings. Every
+/// calibration write does exactly this and differs only in the trigger it records, so the three
+/// hooks call it rather than restating it.
+async fn reprocess_after_calibration_write(
+    db: &DatabaseConnection,
+    trigger: &str,
+    sensor_id: Uuid,
+    calibration_id: Uuid,
+) -> Result<(), ApiError> {
+    recompute_valid_until(db, sensor_id)
+        .await
+        .map_err(ApiError::database)?;
+
+    crate::routes::private::reprocessing_jobs::worker::enqueue(
+        db,
+        trigger,
+        Some(sensor_id),
+        Some(calibration_id),
+        &serde_json::json!({ "sensor_id": sensor_id }),
+        None,
+    )
+    .await
+    .map_err(ApiError::database)?;
+
+    Ok(())
+}
+
 #[async_trait]
 impl CRUDOperations for SensorCalibrationOperations {
     type Resource = SensorCalibration;
@@ -234,22 +261,7 @@ impl CRUDOperations for SensorCalibrationOperations {
         db: &DatabaseConnection,
         entity: &mut SensorCalibration,
     ) -> Result<(), ApiError> {
-        recompute_valid_until(db, entity.sensor_id)
-            .await
-            .map_err(ApiError::database)?;
-
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
-            db,
-            "calibration_create",
-            Some(entity.sensor_id),
-            Some(entity.id),
-            &serde_json::json!({ "sensor_id": entity.sensor_id }),
-            None,
-        )
-        .await
-        .map_err(ApiError::database)?;
-
-        Ok(())
+        reprocess_after_calibration_write(db, "calibration_create", entity.sensor_id, entity.id).await
     }
 
     async fn after_update(
@@ -257,22 +269,7 @@ impl CRUDOperations for SensorCalibrationOperations {
         db: &DatabaseConnection,
         entity: &mut SensorCalibration,
     ) -> Result<(), ApiError> {
-        recompute_valid_until(db, entity.sensor_id)
-            .await
-            .map_err(ApiError::database)?;
-
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
-            db,
-            "calibration_update",
-            Some(entity.sensor_id),
-            Some(entity.id),
-            &serde_json::json!({ "sensor_id": entity.sensor_id }),
-            None,
-        )
-        .await
-        .map_err(ApiError::database)?;
-
-        Ok(())
+        reprocess_after_calibration_write(db, "calibration_update", entity.sensor_id, entity.id).await
     }
 
     async fn perform_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<Uuid, ApiError> {
@@ -367,20 +364,7 @@ impl CRUDOperations for SensorCalibrationOperations {
         .await
         .map_err(ApiError::database)?;
 
-        recompute_valid_until(db, sensor_id)
-            .await
-            .map_err(ApiError::database)?;
-
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
-            db,
-            "calibration_delete",
-            Some(sensor_id),
-            Some(id),
-            &serde_json::json!({ "sensor_id": sensor_id }),
-            None,
-        )
-        .await
-        .map_err(ApiError::database)?;
+        reprocess_after_calibration_write(db, "calibration_delete", sensor_id, id).await?;
 
         Ok(id)
     }

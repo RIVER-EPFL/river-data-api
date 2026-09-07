@@ -17,14 +17,6 @@ fn events() -> river_db::common::EventSender {
     tokio::sync::broadcast::channel::<AppEvent>(16).0
 }
 
-async fn exec(db: &DatabaseConnection, sql: &str) {
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_owned(),
-    ))
-    .await
-    .unwrap();
-}
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
     db.query_one_raw(Statement::from_string(
@@ -79,7 +71,7 @@ async fn seed_service(
     paused: bool,
 ) -> Uuid {
     let id = Uuid::new_v4();
-    exec(
+    crate::common::exec(
         db,
         &format!(
             "INSERT INTO sync_services \
@@ -151,7 +143,7 @@ async fn ledger_retention_prunes_by_age_and_never_a_running_event() {
         ("recent", "1 day", "completed"),
         ("old_running", "120 days", "running"),
     ] {
-        exec(
+        crate::common::exec(
             &db,
             &format!(
                 "INSERT INTO sync_events (id, service_id, event_type, status, started_at) \
@@ -163,7 +155,7 @@ async fn ledger_retention_prunes_by_age_and_never_a_running_event() {
     }
 
     let stream = Uuid::new_v4();
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO data_streams (id, source_system, source_key, is_active) \
@@ -172,7 +164,7 @@ async fn ledger_retention_prunes_by_age_and_never_a_running_event() {
     )
     .await;
     for age in ["400 days", "10 days"] {
-        exec(
+        crate::common::exec(
             &db,
             &format!(
                 "INSERT INTO ingest_receipts \
@@ -237,7 +229,7 @@ async fn zero_retention_days_prunes_nothing() {
     crate::common::seed_test_data(&db).await;
 
     let service = seed_service(&db, "rshiny", "1 minute", false).await;
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO sync_events (id, service_id, event_type, status, started_at) \

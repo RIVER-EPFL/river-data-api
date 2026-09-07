@@ -9,23 +9,10 @@ use serial_test::serial;
 // Helper
 // ============================================================================
 
-async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
-    use sea_orm::{ConnectionTrait, Statement};
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_string(),
-    ))
-    .await
-    .unwrap_or_else(|e| panic!("SQL failed: {e}\nQuery: {sql}"));
-}
 
 async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
-    let app = crate::common::build_test_app(db.clone());
-    (db, app, token)
+    let f = crate::common::seeded_app().await;
+    (f.db, f.app, f.token)
 }
 
 // ============================================================================
@@ -41,7 +28,7 @@ async fn test_csv_value_with_comma_is_properly_quoted() {
     let param_id = crate::common::GLOBAL_PARAM_TEMP_ID;
     let stream_id = "00000000-0000-4000-d000-000000000001";
 
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO status_events (stream_id, site_id, parameter_id, time, value) \
@@ -145,7 +132,7 @@ async fn test_status_events_ndjson_format() {
     let param_id = crate::common::GLOBAL_PARAM_TEMP_ID;
     let stream_id = "00000000-0000-4000-d000-000000000001";
 
-    exec(
+    crate::common::exec(
         &db,
         &format!(
             "INSERT INTO status_events (stream_id, site_id, parameter_id, time, value) \
