@@ -779,3 +779,77 @@ async fn a_primed_cache_entry_is_not_served_outside_the_callers_project_scope() 
         reread.body
     );
 }
+
+/// Scenario: an operator pairs a stream that already holds history into a slot whose chart is open.
+///
+/// Expected behaviour: the pairing changes what the slot serves, so it announces the write like
+/// every other path that changes stored reading values, and the open chart's next request misses.
+#[tokio::test]
+#[serial]
+async fn pairing_a_stream_with_history_invalidates_the_slots_cached_readings() {
+    if !kc::require_keycloak_or_skip("pairing_invalidates_cached_readings").await {
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let app = kc::build_test_app_with_keycloak_and_cache(db.clone()).await;
+    let jwt = kc::get_keycloak_jwt("admin", "admin").await;
+
+    let slot = provision_slot(&app, &jwt, "paired").await;
+
+    let stream_id = uuid::Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
+             VALUES ('{stream_id}', 'vaisala', 'cache-pair-1', 'Cache Pair 1', true)"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO readings (stream_id, time, raw_value, replicate_index) \
+             VALUES ('{stream_id}', '2025-06-04T02:00:00Z', 303.0, 0)"
+        ),
+    )
+    .await;
+
+    let window = "start=2025-06-04T00:00:00Z&end=2025-06-04T06:00:00Z";
+    let uri = format!("/api/sites/{}/readings?{window}", slot.site_id);
+    let before = probe(&app, &uri, Some(&jwt)).await;
+    assert_eq!(before.status, 200, "slot readings: {}", before.body);
+    assert_eq!(before.cache, "MISS", "an empty cache cannot hit");
+    assert!(
+        e2e::values_for(&before.json, &slot.parameter_id).is_empty(),
+        "the unpaired stream's history is not the slot's yet: {}",
+        before.body
+    );
+    assert_eq!(
+        probe(&app, &uri, Some(&jwt)).await.cache,
+        "HIT",
+        "the entry is primed"
+    );
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/streams/{stream_id}/pair"),
+        &json!({ "site_parameter_id": slot.site_parameter_id }),
+        &jwt,
+    )
+    .await;
+    assert!((200..300).contains(&status), "pair ({status}): {body}");
+
+    let after = probe(&app, &uri, Some(&jwt)).await;
+    assert_eq!(
+        after.cache, "MISS",
+        "pairing changed what the slot serves, so the entry must be gone: {}",
+        after.body
+    );
+    assert_eq!(
+        e2e::values_for(&after.json, &slot.parameter_id),
+        vec![303.0],
+        "and the backfilled history is served: {}",
+        after.body
+    );
+}

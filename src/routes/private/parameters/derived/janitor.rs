@@ -23,6 +23,50 @@ pub async fn site_has_active_derived(
     Ok(row.is_some())
 }
 
+/// The gap scan, as the statement it emits.
+///
+/// `since` bounds the readings side by time. Unbounded, the anti-join hashes the whole hypertable:
+/// on the production shape that is a parallel hash whose 16MB doubling step does not fit the DB
+/// pod's 64MB `/dev/shm` when another parallel query holds shared memory, so the run aborts and no
+/// gap is filled that hour. Bounded, it is an index-range probe over the last few hours; the
+/// periodic unbounded run is what still covers drift older than the window.
+fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> Statement {
+    let (bound, params): (&str, Vec<sea_orm::Value>) = match since {
+        Some(from) => (
+            "AND r.time >= $2",
+            vec![
+                (MAX_GAPS_PER_RUN as i64).into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(from).into(),
+            ],
+        ),
+        None => ("", vec![(MAX_GAPS_PER_RUN as i64).into()]),
+    };
+    Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            r"SELECT DISTINCT r.site_id, r.time
+              FROM readings r
+              JOIN site_parameters sp
+                ON sp.site_id = r.site_id
+               AND sp.is_derived = true
+               AND COALESCE(sp.is_active, true) = true
+              JOIN derived_parameter_sources dps
+                ON dps.derived_definition_id = sp.derived_definition_id
+               AND dps.parameter_id = r.parameter_id
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM readings r2
+                  WHERE r2.site_id = r.site_id
+                    AND r2.parameter_id = sp.parameter_id
+                    AND r2.time = r.time
+              )
+              {bound}
+              ORDER BY r.site_id, r.time
+              LIMIT $1"
+        ),
+        params,
+    )
+}
+
 /// Find (site_id, time) pairs where a source reading exists but no corresponding
 /// derived reading was ever written. Recompute each.
 ///
@@ -39,32 +83,11 @@ pub async fn site_has_active_derived(
 pub async fn run_once(
     db: &DatabaseConnection,
     ctx: Option<&JobContext>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<usize, sea_orm::DbErr> {
     let started = std::time::Instant::now();
 
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT DISTINCT r.site_id, r.time
-              FROM readings r
-              JOIN site_parameters sp
-                ON sp.site_id = r.site_id
-               AND sp.is_derived = true
-               AND COALESCE(sp.is_active, true) = true
-              JOIN derived_parameter_sources dps
-                ON dps.derived_definition_id = sp.derived_definition_id
-               AND dps.parameter_id = r.parameter_id
-              WHERE NOT EXISTS (
-                  SELECT 1 FROM readings r2
-                  WHERE r2.site_id = r.site_id
-                    AND r2.parameter_id = sp.parameter_id
-                    AND r2.time = r.time
-              )
-              ORDER BY r.site_id, r.time
-              LIMIT $1",
-            [(MAX_GAPS_PER_RUN as i64).into()],
-        ))
-        .await?;
+    let rows = db.query_all_raw(gap_scan(since)).await?;
 
     let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
     if let Some(ctx) = ctx {
@@ -202,5 +225,25 @@ async fn run_delete(db: &DatabaseConnection, sql: String, label: &str) -> u64 {
             tracing::warn!(error = %e, label, "Tracked-job retention: prune layer failed");
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gap_scan;
+
+    #[test]
+    fn test_gap_scan_bounds_the_readings_side_when_given_a_window() {
+        let bounded = gap_scan(Some(chrono::Utc::now())).to_string();
+        assert!(
+            bounded.contains("r.time >= "),
+            "a bounded run must not hash the whole hypertable: {bounded}"
+        );
+
+        let full = gap_scan(None).to_string();
+        assert!(
+            !full.contains("r.time >= "),
+            "the periodic full run is the one that covers older drift: {full}"
+        );
     }
 }

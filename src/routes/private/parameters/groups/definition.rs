@@ -4,10 +4,10 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
 };
 use sea_orm::{ConnectionTrait, Statement};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::state::AppState;
@@ -15,6 +15,39 @@ use crate::error::{AppError, AppResult};
 
 use super::ordering::{self, Column};
 use super::rules::Role;
+
+/// The two columns a replicated member also shows: the mean and the sd the `samples` trigger
+/// computes over its replicates. Read-only wherever they render, since nothing writes them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+pub struct MemberStatistics {
+    pub mean_label: String,
+    pub sd_label: String,
+    /// The divisor the slot declares, NULL where it declares none. Never inferred.
+    pub sd_estimator: Option<String>,
+    pub decimal_places: Option<i32>,
+}
+
+/// The statistics a member shows, which is nothing at all unless it is entered several times.
+fn member_statistics(
+    code: &str,
+    replicates: Option<&serde_json::Value>,
+    decimal_places: Option<i32>,
+    sd_estimator: Option<String>,
+) -> Option<MemberStatistics> {
+    replicates?;
+    Some(MemberStatistics {
+        mean_label: format!("{code} mean"),
+        sd_label: format!("{code} sd"),
+        sd_estimator,
+        decimal_places,
+    })
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct DefinitionQuery {
+    /// The site the group is rendered for; it is what declares the sd estimator.
+    pub site_id: Option<Uuid>,
+}
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct DefinitionMember {
@@ -34,6 +67,9 @@ pub struct DefinitionMember {
     pub section: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replicates: Option<serde_json::Value>,
+    /// The mean and sd columns a replicated member also shows. Absent on a member entered once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statistics: Option<MemberStatistics>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -53,13 +89,14 @@ pub struct GroupDefinition {
 #[utoipa::path(
     get,
     path = "/api/parameter_groups/{id}/definition",
-    params(("id" = Uuid, Path, description = "Parameter group id")),
+    params(("id" = Uuid, Path, description = "Parameter group id"), DefinitionQuery),
     responses((status = 200, body = GroupDefinition)),
     tag = "parameter_groups"
 )]
 pub async fn group_definition(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<DefinitionQuery>,
 ) -> AppResult<Json<GroupDefinition>> {
     let group = state
         .db
@@ -90,6 +127,10 @@ pub async fn group_definition(
         .map_err(AppError::Database)?;
 
     let sections_by_code = manifest_sections(&state.db, id).await?;
+    let estimators = match query.site_id {
+        Some(site_id) => declared_estimators(&state.db, id, site_id).await?,
+        None => std::collections::HashMap::new(),
+    };
 
     let mut members = Vec::with_capacity(rows.len());
     let mut columns = Vec::with_capacity(rows.len());
@@ -108,19 +149,29 @@ pub async fn group_definition(
             role: Role::parse(&role).unwrap_or(Role::EntryOnly),
             section: section.clone(),
         });
+        let decimal_places: Option<i32> = row
+            .try_get("", "decimal_places")
+            .map_err(AppError::Database)?;
+        let replicates: Option<serde_json::Value> =
+            row.try_get("", "replicates").map_err(AppError::Database)?;
+        let statistics = member_statistics(
+            &code,
+            replicates.as_ref(),
+            decimal_places,
+            estimators.get(&parameter_id).cloned().flatten(),
+        );
         members.push(DefinitionMember {
             parameter_id,
             code,
             label: row.try_get("", "label").map_err(AppError::Database)?,
             units: row.try_get("", "units").map_err(AppError::Database)?,
-            decimal_places: row
-                .try_get("", "decimal_places")
-                .map_err(AppError::Database)?,
+            decimal_places,
             description: row.try_get("", "description").map_err(AppError::Database)?,
             role,
             ordinal,
             section,
-            replicates: row.try_get("", "replicates").map_err(AppError::Database)?,
+            replicates,
+            statistics,
         });
     }
 
@@ -148,6 +199,37 @@ pub async fn group_definition(
         members,
         sections,
     }))
+}
+
+/// What each of the group's parameters declares as its sd estimator at one site. A slot with no
+/// row, or a row declaring none, carries NULL: the divisor is a declaration and is never inferred.
+async fn declared_estimators(
+    db: &sea_orm::DatabaseConnection,
+    group_id: Uuid,
+    site_id: Uuid,
+) -> AppResult<std::collections::HashMap<Uuid, Option<String>>> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT sp.parameter_id, sp.sd_estimator \
+               FROM site_parameters sp \
+               JOIN parameter_group_members m ON m.parameter_id = sp.parameter_id \
+              WHERE m.group_id = $1 AND sp.site_id = $2",
+            [group_id.into(), site_id.into()],
+        ))
+        .await
+        .map_err(AppError::Database)?;
+    let mut declared = std::collections::HashMap::new();
+    for row in rows {
+        let parameter_id: Uuid = row
+            .try_get("", "parameter_id")
+            .map_err(AppError::Database)?;
+        let estimator: Option<String> = row
+            .try_get("", "sd_estimator")
+            .map_err(AppError::Database)?;
+        declared.insert(parameter_id, estimator);
+    }
+    Ok(declared)
 }
 
 /// The section each field renders under, by catalog code, taken from the active manifest of the
@@ -188,4 +270,66 @@ async fn manifest_sections(
         sections.insert(code.to_lowercase(), section.to_string());
     }
     Ok(sections)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routes::private::parameters::groups::ordering::{self, Column};
+    use crate::routes::private::parameters::groups::rules::Role;
+
+    fn spec() -> serde_json::Value {
+        serde_json::json!({ "positions": 3 })
+    }
+
+    #[test]
+    fn test_a_replicated_member_shows_a_mean_and_an_sd() {
+        let stats = member_statistics("doc", Some(&spec()), Some(2), Some("sample".into()))
+            .expect("a replicated member carries statistics");
+        assert_eq!(stats.mean_label, "doc mean");
+        assert_eq!(stats.sd_label, "doc sd");
+        assert_eq!(stats.sd_estimator.as_deref(), Some("sample"));
+        assert_eq!(stats.decimal_places, Some(2));
+    }
+
+    #[test]
+    fn test_a_member_entered_once_shows_none() {
+        assert_eq!(
+            member_statistics("ph", None, Some(2), Some("sample".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn test_an_undeclared_estimator_stays_undeclared() {
+        let stats = member_statistics("doc", Some(&spec()), None, None).expect("statistics");
+        assert_eq!(stats.sd_estimator, None);
+    }
+
+    // The statistics are the member's own columns, not members of the group, so the order the grid
+    // and the Toolbox share stays the members' own.
+    #[test]
+    fn test_statistics_are_not_columns_of_their_own() {
+        let columns = [
+            Column {
+                parameter_id: Uuid::new_v4(),
+                code: "doc".into(),
+                ordinal: 1,
+                role: Role::Measured,
+                section: None,
+            },
+            Column {
+                parameter_id: Uuid::new_v4(),
+                code: "ph".into(),
+                ordinal: 2,
+                role: Role::Measured,
+                section: None,
+            },
+        ];
+        let order: Vec<&str> = ordering::column_order(&columns)
+            .into_iter()
+            .map(|c| c.code.as_str())
+            .collect();
+        assert_eq!(order, vec!["doc", "ph"]);
+    }
 }

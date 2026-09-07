@@ -494,6 +494,7 @@ impl Job for DerivedRecompute {
 
             let mut filled: i32 = 0;
             let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
+            let mut filled_sites: std::collections::BTreeSet<Uuid> = std::collections::BTreeSet::new();
             for (i, row) in rows.iter().enumerate() {
                 if ctx.is_cancelled() {
                     break;
@@ -510,6 +511,7 @@ impl Job for DerivedRecompute {
                     Ok(()) => {
                         filled += 1;
                         min_filled = Some(min_filled.map_or(utc_time, |m| m.min(utc_time)));
+                        filled_sites.insert(site_id);
                     }
                     Err(e) => {
                         tracing::error!(error = %e, time = %time, "Failed to recompute derived value")
@@ -525,6 +527,9 @@ impl Job for DerivedRecompute {
                 sync_state::refresh_continuous_aggregates(ctx.db(), Some(since))
                     .await
                     .map_err(as_db_err)?;
+                for site_id in filled_sites {
+                    announce_derived_write(&ctx, site_id, filled);
+                }
             }
             ctx.set_progress(total, Some(total)).await;
             ctx.report(
@@ -599,6 +604,7 @@ impl Job for DerivedAssignment {
             sync_state::refresh_continuous_aggregates(ctx.db(), Some(since))
                 .await
                 .map_err(as_db_err)?;
+            announce_derived_write(&ctx, site_id, i32::try_from(filled).unwrap_or(i32::MAX));
         }
 
         ctx.report(
@@ -716,6 +722,13 @@ impl Job for SiteTimestampsDerived {
             sync_state::refresh_continuous_aggregates(ctx.db(), Some(since))
                 .await
                 .map_err(as_db_err)?;
+            for (site_id, timestamps) in &work {
+                announce_derived_write(
+                    &ctx,
+                    *site_id,
+                    i32::try_from(timestamps.len()).unwrap_or(i32::MAX),
+                );
+            }
         }
         ctx.set_progress(progress, Some(total)).await;
         ctx.report(
@@ -729,6 +742,17 @@ impl Job for SiteTimestampsDerived {
         tracing::info!(computed = progress, "Derived computation complete");
         Ok(i64::from(progress))
     }
+}
+
+/// A derived value is a served value, so a job that writes one announces it: `DataIngested` naming
+/// the site is what drops that site's cached responses (`common/cache.rs:17-18`).
+fn announce_derived_write(ctx: &JobContext, site_id: Uuid, count: i32) {
+    let _ = ctx.events().send(crate::common::AppEvent::DataIngested {
+        site_id: Some(site_id),
+        parameter_id: None,
+        stream_id: None,
+        count: usize::try_from(count).unwrap_or(0),
+    });
 }
 
 /// Auto-compute derived values for one site's newly ingested timestamps. Backs the `ingest_derived`
@@ -759,17 +783,27 @@ impl Job for IngestDerived {
         ctx.set_progress(0, Some(total)).await;
 
         let mut progress = 0i32;
+        let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
         for time in timestamps {
             if ctx.is_cancelled() {
                 break;
             }
             if let Err(e) = recalculate_derived_at_timestamp(ctx.db(), site_id, time).await {
                 tracing::warn!(error = %e, site_id = %site_id, time = %time, "Failed to auto-compute derived values after ingest");
+            } else {
+                earliest = Some(earliest.map_or(time, |e: chrono::DateTime<chrono::Utc>| e.min(time)));
             }
             progress += 1;
             if progress % 500 == 0 {
                 ctx.set_progress(progress, Some(total)).await;
             }
+        }
+
+        if let Some(since) = earliest {
+            sync_state::refresh_continuous_aggregates(ctx.db(), Some(since))
+                .await
+                .map_err(as_db_err)?;
+            announce_derived_write(&ctx, site_id, progress);
         }
         ctx.set_progress(progress, Some(total)).await;
         Ok(i64::from(progress))
@@ -1241,13 +1275,28 @@ impl CsvImport {
         // Phase 1: displace the tail and insert, in one transaction. A crash between the two
         // would otherwise leave the group short of both its old rows and its new ones.
         let mut inserted_so_far = 0usize;
-        let affected_total = crate::common::bulk_write::guarded(ctx.db(), async |txn| {
+        let (affected_total, corrected) = crate::common::bulk_write::guarded(ctx.db(), async |txn| {
             for ((stream_id, time), count) in &spot_group_sizes {
                 displace_spot_tail(txn, *stream_id, *time, *count).await?;
             }
 
             let mut affected_total = 0usize;
+            let mut corrected = 0usize;
             for chunk in models.chunks(CSV_BATCH_SIZE) {
+                // A correction corrects the measurement, so it is a decision: recorded before the
+                // write, against the values still stored, and only for the rows the write moves
+                // (ADR 0008). The count it returns is what the run reports as overwritten.
+                if conflict == ConflictMode::Overwrite {
+                    let corrections =
+                        crate::routes::private::readings::decisions::record_value_corrections(
+                            txn,
+                            chunk,
+                            "csv_import",
+                            crate::routes::private::readings::decisions::Origin::Csv,
+                        )
+                        .await?;
+                    corrected += usize::try_from(corrections.rows).unwrap_or(usize::MAX);
+                }
                 match readings::Entity::insert_many(chunk.to_vec())
                     .on_conflict(readings_on_conflict(conflict))
                     .exec_without_returning(txn)
@@ -1271,7 +1320,7 @@ impl CsvImport {
                     .await;
                 }
             }
-            Ok(affected_total)
+            Ok((affected_total, corrected))
         })
         .await
         .map_err(as_db_err)?;
@@ -1286,7 +1335,7 @@ impl CsvImport {
             stream_ids.sort_unstable();
             stream_ids.dedup();
             let recomposed =
-                crate::routes::private::sensors::calibrations::service::recompose_from_own_curves(
+                crate::routes::private::sensors::calibrations::service::recompose_from_own_curves_guarded(
                     ctx.db(),
                     "TRUE",
                     "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3",
@@ -1296,7 +1345,8 @@ impl CsvImport {
                         sea_orm::prelude::DateTimeWithTimeZone::from(*last).into(),
                     ],
                 )
-                .await?;
+                .await
+                .map_err(as_db_err)?;
             tracing::info!(
                 site = %site_name,
                 recomposed,
@@ -1319,6 +1369,7 @@ impl CsvImport {
                 first.to_rfc3339(),
                 last.to_rfc3339()
             );
+            let stream_ids_for_events = stream_ids.clone();
             sample_groups::materialise_samples(
                 ctx.db(),
                 &row_predicate,
@@ -1336,14 +1387,32 @@ impl CsvImport {
             )
             .await
             .map_err(as_db_err)?;
+
+            // The values have landed at their visits; the calculations that read them run without
+            // anyone asking (ADR 0007). Read after the attach, which is what gives the rows the
+            // events this looks them up by.
+            let touched = crate::routes::private::collection_events::recompute::touched_events(
+                ctx.db(),
+                &row_predicate,
+                vec![stream_ids_for_events.into()],
+            )
+            .await
+            .map_err(as_db_err)?;
+            crate::routes::private::collection_events::recompute::enqueue_for(
+                ctx.db(),
+                &touched,
+                "csv_import",
+                crate::routes::private::collection_events::recompute::Writer::Person,
+            )
+            .await
+            .map_err(as_db_err)?;
         }
 
         let (inserted_total, overwritten) = match conflict {
             ConflictMode::Skip => (affected_total, 0),
-            ConflictMode::Overwrite => (
-                affected_total.saturating_sub(overlapping),
-                overlap_differing,
-            ),
+            // The rows a correction was recorded for are the rows the write moved, so the run
+            // reports the same number the decision record holds rather than the staged estimate.
+            ConflictMode::Overwrite => (affected_total.saturating_sub(overlapping), corrected),
         };
         tracing::info!(site = %site_name, inserted_total, overwritten, "CSV import inserted readings");
 
@@ -1352,7 +1421,7 @@ impl CsvImport {
                 let _ = ctx.events().send(crate::common::AppEvent::DataIngested {
                     site_id: Some(site_id),
                     parameter_id: Some(*parameter_id),
-                    stream_id: *stream_id,
+                    stream_id: Some(*stream_id),
                     count: inserted_total + overwritten,
                 });
             }
@@ -1687,11 +1756,36 @@ impl Job for JanitorRun {
             .filter(|&n| n >= 1)
             .unwrap_or(self.operator_retention_days);
 
+        // The scheduled slot and the cadence it fired on, stamped by the scheduler; a `run_now`
+        // carries neither and falls back to the wall clock and the configured interval. Both the
+        // gap scan's window and the full-refresh period below are decided from them.
+        let scheduled_epoch = ctx
+            .params()
+            .get("scheduled_at")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map_or_else(|| chrono::Utc::now().timestamp(), |t| t.timestamp())
+            .max(0) as u64;
+        let cadence_seconds = ctx
+            .params()
+            .get("interval_seconds")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(self.interval_seconds)
+            .max(1);
+        let do_full = if self.full_refresh_seconds == 0 {
+            false
+        } else {
+            (scheduled_epoch % self.full_refresh_seconds) < cadence_seconds
+        };
+
         // 1. Fill derived gaps, reporting into this job and refreshing aggregates back to the
-        //    earliest filled timestamp.
-        if let Err(e) = janitor::run_once(db, Some(&ctx)).await {
-            tracing::warn!(error = %e, "Derived janitor: run failed");
-        }
+        //    earliest filled timestamp. Scoped to twice the cadence, so an hourly tick probes an
+        //    index range instead of hashing the whole hypertable; the full-refresh tick runs it
+        //    unbounded, which is what covers drift older than that window.
+        let since = (!do_full).then(|| {
+            chrono::Utc::now() - chrono::Duration::seconds((cadence_seconds * 2) as i64)
+        });
+        janitor::run_once(db, Some(&ctx), since).await?;
 
         // 2. Repair corrected readings whose stored value is no longer what their own curves
         //    produce, whichever route moved them apart. Hooks make that repair immediate; this makes
@@ -1737,24 +1831,6 @@ impl Job for JanitorRun {
         //    wall clock and the configured interval. A cadence longer than `full_refresh_seconds`
         //    makes every tick a full refresh, which is the safe direction but is a real cost on a
         //    large database.
-        let scheduled_epoch = ctx
-            .params()
-            .get("scheduled_at")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map_or_else(|| chrono::Utc::now().timestamp(), |t| t.timestamp())
-            .max(0) as u64;
-        let cadence_seconds = ctx
-            .params()
-            .get("interval_seconds")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(self.interval_seconds)
-            .max(1);
-        let do_full = if self.full_refresh_seconds == 0 {
-            false
-        } else {
-            (scheduled_epoch % self.full_refresh_seconds) < cadence_seconds
-        };
         if do_full {
             tracing::info!("Derived janitor: running scheduled full continuous aggregate refresh");
             sync_state::refresh_continuous_aggregates_full(db)

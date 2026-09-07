@@ -98,13 +98,15 @@ impl CRUDOperations for StandardCurveOperations {
             || data.intercept.is_some()
             || data.r_squared.is_some()
             || data.name.is_some()
+            || data.fitted_on.is_some()
             || data.sensor_id.is_some()
             || data.created_by.is_some();
         if frozen_field_change && curve_is_used(db, id).await? {
             return Err(ApiError::bad_request(
                 "This standard curve has already been applied to readings, so its coefficients, \
-                 fit quality, name, instrument and attribution are fixed. Create a new curve and \
-                 re-enter the affected measurements against it. Only its notes stay editable."
+                 fit quality, name, fit date, instrument and attribution are fixed. Create a new \
+                 curve and re-enter the affected measurements against it. Only its notes stay \
+                 editable."
                     .to_string(),
             ));
         }

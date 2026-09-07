@@ -9,6 +9,32 @@ use super::rules::{self, Member, Role};
 
 pub struct ParameterGroupOperations;
 
+/// One membership row by id, reduced to what the reshape rules read.
+async fn member_row(db: &DatabaseConnection, id: Uuid) -> Result<Option<Member>, ApiError> {
+    let Some(row) = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT group_id, parameter_id, role FROM parameter_group_members WHERE id = $1",
+            [id.into()],
+        ))
+        .await
+        .map_err(ApiError::database)?
+    else {
+        return Ok(None);
+    };
+    let role: String = row.try_get("", "role").map_err(ApiError::database)?;
+    let Some(role) = Role::parse(&role) else {
+        return Ok(None);
+    };
+    Ok(Some(Member {
+        group_id: row.try_get("", "group_id").map_err(ApiError::database)?,
+        parameter_id: row
+            .try_get("", "parameter_id")
+            .map_err(ApiError::database)?,
+        role,
+    }))
+}
+
 /// Every membership row, reduced to what the reshape rules read.
 async fn all_members(db: &DatabaseConnection) -> Result<Vec<Member>, ApiError> {
     let rows = db
@@ -110,13 +136,13 @@ impl CRUDOperations for ParameterGroupMemberOperations {
             .map_err(|refusal| ApiError::bad_request(refusal.to_string()))
     }
 
-    /// The role CHECK is the backstop; this names the value instead of raising a raw 500.
-    /// Moving a member between groups is checked against the group's calculations by
-    /// [`rules::may_move`], whose caller arrives with M67.
+    /// The role CHECK is the backstop; this names the value instead of raising a raw 500. A move
+    /// between groups is the reshape, so it is held to [`rules::may_move`]: an `output` does not
+    /// leave while a calculation in its group still writes it.
     async fn before_update(
         &self,
-        _db: &DatabaseConnection,
-        _id: Uuid,
+        db: &DatabaseConnection,
+        id: Uuid,
         data: &<ParameterGroupMember as CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
         if let Some(Some(role)) = data.role.as_ref()
@@ -126,6 +152,20 @@ impl CRUDOperations for ParameterGroupMemberOperations {
                 "role {role} is not measured, entry_only or output"
             )));
         }
-        Ok(())
+        let Some(Some(to_group)) = data.group_id else {
+            return Ok(());
+        };
+        let Some(member) = member_row(db, id).await? else {
+            return Ok(());
+        };
+        let calculations =
+            crate::routes::private::tools::calculation_versions::calculations_of_group(
+                db,
+                member.group_id,
+            )
+            .await
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        rules::may_move(member, to_group, &calculations)
+            .map_err(|refusal| ApiError::bad_request(refusal.to_string()))
     }
 }

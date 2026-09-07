@@ -59,7 +59,9 @@ pub enum AppEvent {
     DataIngested {
         site_id: Option<uuid::Uuid>,
         parameter_id: Option<uuid::Uuid>,
-        stream_id: uuid::Uuid,
+        /// The channel the values arrived on, absent for a derived value, which is computed from
+        /// a site's other readings and arrives on none.
+        stream_id: Option<uuid::Uuid>,
         count: usize,
     },
     AlarmStateChanged {

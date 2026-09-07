@@ -38,6 +38,9 @@ pub struct RegisterStandardCurveRequest {
     /// Human label for the curve, e.g. the portal's date + parameter. Falls back to source_key.
     #[serde(default)]
     pub name: Option<String>,
+    /// The date the source fitted the curve. Absent leaves the row on its creation date.
+    #[serde(default)]
+    pub fitted_on: Option<chrono::NaiveDate>,
     #[serde(default)]
     pub notes: Option<String>,
 }
@@ -176,6 +179,9 @@ pub async fn register_standard_curve(
             if let Some(name) = payload.name.clone() {
                 active.name = Set(Some(name));
             }
+            if let Some(fitted_on) = payload.fitted_on {
+                active.fitted_on = Set(Some(fitted_on));
+            }
             let updated = active.update(&state.db).await?;
             return Ok(Json(RegisterStandardCurveResponse {
                 id: updated.id,
@@ -235,9 +241,9 @@ async fn insert_curve(
         .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO standard_curves
-                 (id, sensor_id, name, slope, intercept, r_squared, notes, created_at,
+                 (id, sensor_id, name, fitted_on, slope, intercept, r_squared, notes, created_at,
                   source_system, source_key)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9)
+             VALUES ($1, $2, $3, COALESCE($4, CURRENT_DATE), $5, $6, $7, $8, NOW(), $9, $10)
              ON CONFLICT (source_system, source_key)
                  WHERE source_system IS NOT NULL AND source_key IS NOT NULL
                  DO NOTHING",
@@ -249,6 +255,7 @@ async fn insert_curve(
                     .clone()
                     .unwrap_or_else(|| payload.source_key.clone())
                     .into(),
+                payload.fitted_on.into(),
                 payload.slope.into(),
                 payload.intercept.into(),
                 payload.r_squared.into(),

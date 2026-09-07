@@ -16,6 +16,7 @@ use crate::common::authz::AccessScope;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
 
+use super::KindGroup;
 use super::access::project_allowed;
 use super::dispatcher::log_delivery;
 
@@ -29,6 +30,10 @@ fn require_sub(auth: &AuthContext) -> AppResult<String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SubscriptionScope {
+    /// Which notifications the row answers for: `alarms` or `sync`. Absent means `alarms`, the
+    /// only group anyone was subscribed to before groups existed.
+    #[serde(default = "default_kind_group")]
+    pub kind_group: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub project_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -44,6 +49,10 @@ pub struct MyNotifications {
     pub web_push_enabled: bool,
     pub push_subscription_count: i64,
     pub subscriptions: Vec<SubscriptionScope>,
+}
+
+fn default_kind_group() -> String {
+    KindGroup::Alarms.as_str().to_string()
 }
 
 async fn ensure_subscriber(state: &AppState, sub: &str) -> AppResult<()> {
@@ -89,14 +98,17 @@ async fn load(state: &AppState, sub: &str) -> AppResult<MyNotifications> {
         .db
         .query_all_raw(Statement::from_sql_and_values(
             PG,
-            "SELECT project_id, site_id, parameter_id, enabled FROM notification_subscriptions \
-             WHERE keycloak_sub = $1",
+            "SELECT kind_group, project_id, site_id, parameter_id, enabled \
+             FROM notification_subscriptions WHERE keycloak_sub = $1",
             [sub.into()],
         ))
         .await?;
     let subscriptions = sub_rows
         .iter()
         .map(|r| SubscriptionScope {
+            kind_group: r
+                .try_get("", "kind_group")
+                .unwrap_or_else(|_| default_kind_group()),
             project_id: r.try_get("", "project_id").ok().flatten(),
             site_id: r.try_get("", "site_id").ok().flatten(),
             parameter_id: r.try_get("", "parameter_id").ok().flatten(),
@@ -185,6 +197,12 @@ pub async fn set_my_subscriptions(
     };
 
     for s in &req.subscriptions {
+        if KindGroup::parse(&s.kind_group).is_none() {
+            return Err(AppError::BadRequest(format!(
+                "unknown notification group: {}",
+                s.kind_group
+            )));
+        }
         if let Some(pid) = s.project_id
             && !project_allowed(&accessible, pid)
         {
@@ -205,10 +223,11 @@ pub async fn set_my_subscriptions(
         txn.execute_raw(Statement::from_sql_and_values(
             PG,
             "INSERT INTO notification_subscriptions \
-                (keycloak_sub, project_id, site_id, parameter_id, enabled) \
-             VALUES ($1, $2, $3, $4, $5)",
+                (keycloak_sub, kind_group, project_id, site_id, parameter_id, enabled) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
             [
                 sub.clone().into(),
+                s.kind_group.clone().into(),
                 s.project_id.into(),
                 s.site_id.into(),
                 s.parameter_id.into(),

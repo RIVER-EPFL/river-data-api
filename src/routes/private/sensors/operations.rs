@@ -1237,7 +1237,7 @@ pub async fn reconcile_source_identity<C: ConnectionTrait>(
 
 /// Put a device-identity change in the review queue, updating the standing hold rather than adding
 /// one per sync cycle.
-async fn raise_source_identity_hold<C: ConnectionTrait>(
+pub async fn raise_source_identity_hold<C: ConnectionTrait>(
     db: &C,
     stream_id: Uuid,
     changed: &[&str],
@@ -1246,23 +1246,18 @@ async fn raise_source_identity_hold<C: ConnectionTrait>(
 ) -> AppResult<()> {
     let expected = serde_json::json!({ "was": stored, "fields": changed });
     let computed = serde_json::json!({ "now": reported });
-    let updated = db
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE replicate_audit_holds SET expected = $2, computed = $3, created_at = NOW() \
-             WHERE stream_id = $1 AND kind = 'source_identity_changed' \
-               AND status IN ('pending', 'deferred')",
-            [stream_id.into(), expected.clone().into(), computed.clone().into()],
-        ))
-        .await?;
-    if updated.rows_affected() > 0 {
-        return Ok(());
-    }
+    // One statement, because two overlapping registrations see neither each other's UPDATE nor
+    // each other's uncommitted row: `replicate_audit_holds_identity_live_uniq` is the conflict
+    // target, so the second pass waits and then updates the standing hold.
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO replicate_audit_holds \
              (stream_id, group_time, kind, expected, computed, delta, status) \
-         VALUES ($1, NOW(), 'source_identity_changed', $2, $3, '{}'::jsonb, 'pending')",
+         VALUES ($1, NOW(), 'source_identity_changed', $2, $3, '{}'::jsonb, 'pending') \
+         ON CONFLICT (stream_id) \
+             WHERE kind = 'source_identity_changed' AND status IN ('pending', 'deferred') \
+         DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed, \
+                       created_at = NOW()",
         [stream_id.into(), expected.into(), computed.into()],
     ))
     .await?;

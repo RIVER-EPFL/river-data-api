@@ -270,3 +270,65 @@ async fn a_curve_referenced_only_by_an_annotation_is_used() {
         "the curve the annotation names keeps the coefficients it recorded"
     );
 }
+
+async fn stored_fitted_on(db: &DatabaseConnection, curve_id: &str) -> Option<String> {
+    db.query_one_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!("SELECT fitted_on::text AS v FROM standard_curves WHERE id = '{curve_id}'"),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<Option<String>>("", "v")
+    .unwrap()
+}
+
+/// Expected behaviour: a curve is identified in the lab by the date it was fitted, so the source's
+/// own date is stored rather than folded into free text, and a source that reports none leaves the
+/// row on its creation date rather than on nothing.
+#[tokio::test]
+#[serial]
+async fn fitted_on_travels_from_the_source() {
+    let fx = setup().await;
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/standard_curves/register",
+        &json!({
+            "source_system": "cnet",
+            "source_key": "standard_curves:17",
+            "instrument_label": "DOC corr",
+            "slope": 2.0,
+            "intercept": 1.0,
+            "fitted_on": "2021-01-28",
+        }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "register ({status}): {body}");
+    let dated = body["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        stored_fitted_on(&fx.db, &dated).await.as_deref(),
+        Some("2021-01-28")
+    );
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/standard_curves/register",
+        &json!({
+            "source_system": "cnet",
+            "source_key": "standard_curves:18",
+            "instrument_label": "DOC corr",
+            "slope": 2.0,
+            "intercept": 1.0,
+        }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "register ({status}): {body}");
+    let undated = body["id"].as_str().unwrap().to_string();
+    assert!(
+        stored_fitted_on(&fx.db, &undated).await.is_some(),
+        "a source reporting no date leaves the curve on its creation date, never on NULL"
+    );
+}

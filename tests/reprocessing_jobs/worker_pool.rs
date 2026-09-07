@@ -138,6 +138,47 @@ async fn claims_and_runs_to_completion() {
     );
 }
 
+/// Scenario: a job left `running` by the pre-worker-pool `tokio::spawn` path, whose pod died. It
+/// carries no lease at all, because leases did not exist when it was written.
+///
+/// Expected behaviour: a claimed row always carries a lease, so a `running` row with none is
+/// exactly the orphan shape, and the reaper takes it.
+#[tokio::test]
+#[serial]
+async fn reaper_reclaims_a_running_row_with_no_lease() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let ev = events();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut reg = JobRegistry::new();
+    reg.register(Arc::new(CompletingJob {
+        name: "test_complete",
+        count: 1,
+        runs: runs.clone(),
+    }));
+    let wid = worker::worker_id();
+
+    let id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reprocessing_jobs \
+                (id, trigger_type, status, category, owner, lease_epoch, lease_expires_at) \
+             VALUES ('{id}', 'test_complete', 'running', 'operator', NULL, 0, NULL)"
+        ),
+    )
+    .await;
+
+    assert!(
+        worker::run_one(&db, &ev, &reg, &wid).await.unwrap(),
+        "a running row with no lease is unreachable by nothing else, so the reaper must take it"
+    );
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    let row = job_row(&db, id).await;
+    assert_eq!(row.status, "completed");
+    assert!(row.owner_is_null);
+}
+
 #[tokio::test]
 #[serial]
 async fn reaper_reclaims_expired_lease() {

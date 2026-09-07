@@ -14,6 +14,9 @@ pub mod m20260907_000006_synthesise_curation_record;
 mod m20260907_000007_meteoswiss_pressure;
 mod m20260908_000001_parameter_groups;
 mod m20260908_000002_calculation_engines;
+mod m20260908_000003_source_identity_hold_uniq;
+mod m20260908_000004_notification_kind_groups;
+mod m20260908_000005_curve_fitted_on;
 
 pub struct Migrator;
 
@@ -35,6 +38,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260907_000007_meteoswiss_pressure::Migration),
             Box::new(m20260908_000001_parameter_groups::Migration),
             Box::new(m20260908_000002_calculation_engines::Migration),
+            Box::new(m20260908_000003_source_identity_hold_uniq::Migration),
+            Box::new(m20260908_000004_notification_kind_groups::Migration),
+            Box::new(m20260908_000005_curve_fitted_on::Migration),
         ]
     }
 }

@@ -2,7 +2,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
 use super::access::{accessible_project_ids, project_allowed};
-use super::{DeliveryResult, NotificationChannel, OutgoingMessage, Slot};
+use super::{DeliveryResult, KindGroup, NotificationChannel, OutgoingMessage, Slot, kind_group};
 use crate::common::AppState;
 use crate::config::Config;
 
@@ -43,46 +43,82 @@ fn deep_link_url(base: Option<&str>, slot: &Option<Slot>) -> Option<String> {
     }
 }
 
+/// The push subscriptions a message reaches: subscribers who have the channel on, are in the
+/// message's group, and have not turned that group off for this slot.
+///
+/// A group with no row for a subscriber reads as its own default (`alarms` on, `sync` off), so the
+/// audience is right before anyone has visited the preferences page. `group` is `None` for a kind
+/// with no audience of its own, which is narrowed by the channel toggle alone.
 pub async fn slot_subscriptions(
     db: &DatabaseConnection,
     slot: &Option<Slot>,
+    group: Option<KindGroup>,
 ) -> Result<Vec<Subscription>, String> {
-    let rows = match slot {
-        Some(s) => {
-            db.query_all_raw(Statement::from_sql_and_values(
+    let Some(group) = group else {
+        return read_subscriptions(
+            db,
+            Statement::from_string(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT wps.id, wps.keycloak_sub AS sub, wps.endpoint, wps.p256dh, wps.auth \
-                 FROM web_push_subscriptions wps \
-                 LEFT JOIN notification_subscribers ns ON ns.keycloak_sub = wps.keycloak_sub \
-                 WHERE COALESCE(ns.is_active, true) AND COALESCE(ns.web_push_enabled, true) \
-                   AND COALESCE(( \
-                     SELECT subq.enabled FROM notification_subscriptions subq \
-                     WHERE subq.keycloak_sub = wps.keycloak_sub \
-                       AND ( (subq.site_id = $1 AND subq.parameter_id = $2) \
-                          OR (subq.site_id = $1 AND subq.parameter_id IS NULL) \
-                          OR ($3::uuid IS NOT NULL AND subq.project_id = $3 \
-                              AND subq.site_id IS NULL AND subq.parameter_id IS NULL) ) \
-                     ORDER BY (subq.parameter_id IS NOT NULL) DESC, (subq.site_id IS NOT NULL) DESC \
-                     LIMIT 1 \
-                   ), true)",
-                [s.site_id.into(), s.parameter_id.into(), s.project_id.into()],
-            ))
-            .await
-        }
-        None => {
-            db.query_all_raw(Statement::from_string(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT wps.id, wps.keycloak_sub AS sub, wps.endpoint, wps.p256dh, wps.auth \
-                 FROM web_push_subscriptions wps \
-                 LEFT JOIN notification_subscribers ns ON ns.keycloak_sub = wps.keycloak_sub \
-                 WHERE COALESCE(ns.is_active, true) AND COALESCE(ns.web_push_enabled, true)"
-                    .to_string(),
-            ))
-            .await
-        }
-    }
-    .map_err(|e| e.to_string())?;
+                SELECT_ENABLED_SUBSCRIPTIONS.to_string(),
+            ),
+        )
+        .await;
+    };
 
+    let (site_id, parameter_id, project_id) = match slot {
+        Some(s) => (Some(s.site_id), Some(s.parameter_id), s.project_id),
+        None => (None, None, None),
+    };
+
+    read_subscriptions(
+        db,
+        Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("{SELECT_ENABLED_SUBSCRIPTIONS} AND {GROUP_SUBSCRIBED}"),
+            [
+                site_id.into(),
+                parameter_id.into(),
+                project_id.into(),
+                group.as_str().into(),
+                group.subscribed_without_a_row().into(),
+            ],
+        ),
+    )
+    .await
+}
+
+const SELECT_ENABLED_SUBSCRIPTIONS: &str = "\
+    SELECT wps.id, wps.keycloak_sub AS sub, wps.endpoint, wps.p256dh, wps.auth \
+    FROM web_push_subscriptions wps \
+    LEFT JOIN notification_subscribers ns ON ns.keycloak_sub = wps.keycloak_sub \
+    WHERE COALESCE(ns.is_active, true) AND COALESCE(ns.web_push_enabled, true)";
+
+/// The most specific row the subscriber holds for this group wins: parameter, then site, then
+/// project, then the group-wide row. With none of them the group's own default stands.
+const GROUP_SUBSCRIBED: &str = "\
+    COALESCE(( \
+      SELECT subq.enabled FROM notification_subscriptions subq \
+      WHERE subq.keycloak_sub = wps.keycloak_sub \
+        AND subq.kind_group = $4 \
+        AND ( (subq.site_id = $1 AND subq.parameter_id = $2) \
+           OR (subq.site_id = $1 AND subq.parameter_id IS NULL) \
+           OR ($3::uuid IS NOT NULL AND subq.project_id = $3 \
+               AND subq.site_id IS NULL AND subq.parameter_id IS NULL) \
+           OR (subq.project_id IS NULL AND subq.site_id IS NULL \
+               AND subq.parameter_id IS NULL) ) \
+      ORDER BY (subq.parameter_id IS NOT NULL) DESC, (subq.site_id IS NOT NULL) DESC, \
+               (subq.project_id IS NOT NULL) DESC \
+      LIMIT 1 \
+    ), $5)";
+
+async fn read_subscriptions(
+    db: &DatabaseConnection,
+    statement: Statement,
+) -> Result<Vec<Subscription>, String> {
+    let rows = db
+        .query_all_raw(statement)
+        .await
+        .map_err(|e| e.to_string())?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         out.push(Subscription {
@@ -182,7 +218,7 @@ impl NotificationChannel for WebPushChannel {
 
     async fn deliver(&self, state: &AppState, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
         let db = &state.db;
-        let subscriptions = match slot_subscriptions(db, &msg.slot).await {
+        let subscriptions = match slot_subscriptions(db, &msg.slot, kind_group(msg.kind)).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "web_push: failed to load subscriptions");

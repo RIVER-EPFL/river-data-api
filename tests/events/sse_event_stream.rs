@@ -171,7 +171,7 @@ async fn sse_receives_data_ingested_event() {
     let _ = events.send(AppEvent::DataIngested {
         site_id: Some(site_id),
         parameter_id: Some(parameter_id),
-        stream_id,
+        stream_id: Some(stream_id),
         count: 42,
     });
 
@@ -242,7 +242,7 @@ async fn sse_receives_multiple_event_types() {
     let _ = events.send(AppEvent::DataIngested {
         site_id: None,
         parameter_id: None,
-        stream_id,
+        stream_id: Some(stream_id),
         count: 7,
     });
 

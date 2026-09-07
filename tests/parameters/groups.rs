@@ -361,3 +361,260 @@ async fn the_document_carries_the_calculation_s_sections_without_reordering() {
         "sections follow the columns, not the manifest's own order: {text}"
     );
 }
+
+/// The parameter ids each group's definition document lists, in its own order.
+async fn definition_members(app: &axum::Router, token: &str, group_id: &str) -> Vec<String> {
+    let (status, text) = crate::common::get_with_token(
+        app,
+        &format!("/api/parameter_groups/{group_id}/definition"),
+        token,
+    )
+    .await;
+    assert_eq!(status, 200, "definition ({status}): {text}");
+    let doc: serde_json::Value = serde_json::from_str(&text).expect("definition is JSON");
+    doc["members"]
+        .as_array()
+        .expect("members array")
+        .iter()
+        .map(|m| {
+            m["parameter_id"]
+                .as_str()
+                .expect("parameter_id")
+                .to_string()
+        })
+        .collect()
+}
+
+async fn member_id(db: &sea_orm::DatabaseConnection, group_id: &str, parameter_id: &str) -> String {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM parameter_group_members \
+               WHERE group_id = $1::uuid AND parameter_id = $2::uuid",
+            [group_id.into(), parameter_id.into()],
+        ))
+        .await
+        .expect("member query")
+        .expect("the member");
+    row.try_get::<uuid::Uuid>("", "id").expect("id").to_string()
+}
+
+async fn move_member(app: &axum::Router, token: &str, id: &str, to_group: &str) -> (u16, String) {
+    crate::common::put_json_with_token(
+        app,
+        &format!("/api/parameter_group_members/{id}"),
+        &json!({ "group_id": to_group }),
+        token,
+    )
+    .await
+}
+
+async fn reading_count(db: &sea_orm::DatabaseConnection) -> i64 {
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM readings".to_string(),
+        ))
+        .await
+        .expect("readings query")
+        .expect("one row");
+    row.try_get("", "n").expect("count")
+}
+
+// Scenario: a category is reshaped, which is the operation Evan expects once the portal is the
+// only place data is entered.
+// Expected behaviour: the member moves, both definition documents say so, both groups record it,
+// and not one reading is touched: a group says how a measurement is presented, never what it is.
+#[tokio::test]
+#[serial]
+async fn a_measured_member_moves_and_the_readings_do_not() {
+    let (db, app, token) = setup().await;
+    let dom = create_group(&app, &token, "dom").await;
+    let ions = create_group(&app, &token, "ions").await;
+    let dom_id = dom["id"].as_str().unwrap().to_string();
+    let ions_id = ions["id"].as_str().unwrap().to_string();
+
+    add_member(
+        &app,
+        &token,
+        &dom_id,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        "measured",
+        1,
+    )
+    .await;
+    let readings_before = reading_count(&db).await;
+    let dom_history_before = history_count(&db, &dom_id).await;
+    let ions_history_before = history_count(&db, &ions_id).await;
+
+    let id = member_id(&db, &dom_id, crate::common::GLOBAL_PARAM_TEMP_ID).await;
+    let (status, text) = move_member(&app, &token, &id, &ions_id).await;
+    assert!((200..300).contains(&status), "move ({status}): {text}");
+
+    assert!(
+        definition_members(&app, &token, &dom_id).await.is_empty(),
+        "the member left dom"
+    );
+    assert_eq!(
+        definition_members(&app, &token, &ions_id).await,
+        vec![crate::common::GLOBAL_PARAM_TEMP_ID.to_string()],
+        "and arrived in ions"
+    );
+    assert!(
+        history_count(&db, &ions_id).await > ions_history_before,
+        "the group it arrived in records the move"
+    );
+    assert!(
+        history_count(&db, &dom_id).await >= dom_history_before,
+        "the group it left is not rewritten backwards"
+    );
+    assert_eq!(
+        reading_count(&db).await,
+        readings_before,
+        "a reshape moves no data"
+    );
+}
+
+// Expected behaviour: a group is split by creating the second group and moving members across,
+// and at no point does a parameter belong to two groups.
+#[tokio::test]
+#[serial]
+async fn a_split_leaves_every_member_in_exactly_one_group() {
+    let (db, app, token) = setup().await;
+    let whole = create_group(&app, &token, "field_data").await;
+    let split = create_group(&app, &token, "gauge").await;
+    let whole_id = whole["id"].as_str().unwrap().to_string();
+    let split_id = split["id"].as_str().unwrap().to_string();
+
+    for (ordinal, parameter) in [
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        crate::common::GLOBAL_PARAM_DO_ID,
+        crate::common::GLOBAL_PARAM_DEPTH_ID,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (status, text) = add_member(
+            &app,
+            &token,
+            &whole_id,
+            parameter,
+            "measured",
+            i32::try_from(ordinal).expect("small"),
+        )
+        .await;
+        assert!((200..300).contains(&status), "add ({status}): {text}");
+    }
+
+    let id = member_id(&db, &whole_id, crate::common::GLOBAL_PARAM_DEPTH_ID).await;
+    let (status, text) = move_member(&app, &token, &id, &split_id).await;
+    assert!((200..300).contains(&status), "move ({status}): {text}");
+
+    let stayed = definition_members(&app, &token, &whole_id).await;
+    let moved = definition_members(&app, &token, &split_id).await;
+    assert_eq!(stayed.len(), 2, "two stayed: {stayed:?}");
+    assert_eq!(
+        moved,
+        vec![crate::common::GLOBAL_PARAM_DEPTH_ID.to_string()],
+        "one moved"
+    );
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM (SELECT parameter_id FROM parameter_group_members \
+               GROUP BY parameter_id HAVING count(*) > 1) d"
+                .to_string(),
+        ))
+        .await
+        .expect("duplicate query")
+        .expect("one row");
+    assert_eq!(
+        row.try_get::<i64>("", "n").expect("count"),
+        0,
+        "no parameter is in two groups after the split"
+    );
+}
+
+// Scenario: someone moves an output out of the group whose calculation writes it.
+// Expected behaviour: refused, naming the calculation, so the grid can never show a column no
+// group produces or two groups claim.
+#[tokio::test]
+#[serial]
+async fn an_output_member_cannot_leave_the_calculation_that_produces_it() {
+    let (db, app, token) = setup().await;
+    let dom = create_group(&app, &token, "dom").await;
+    let ions = create_group(&app, &token, "ions").await;
+    let dom_id = dom["id"].as_str().unwrap().to_string();
+    let ions_id = ions["id"].as_str().unwrap().to_string();
+
+    add_member(
+        &app,
+        &token,
+        &dom_id,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        "measured",
+        1,
+    )
+    .await;
+    add_member(
+        &app,
+        &token,
+        &dom_id,
+        crate::common::GLOBAL_PARAM_DO_ID,
+        "output",
+        2,
+    )
+    .await;
+    seed_group_calculation(&db, &dom_id, "suva").await;
+
+    let id = member_id(&db, &dom_id, crate::common::GLOBAL_PARAM_DO_ID).await;
+    let (status, text) = move_member(&app, &token, &id, &ions_id).await;
+    assert_eq!(status, 400, "the move should be refused: {text}");
+    assert!(
+        text.contains("suva"),
+        "the refusal names the calculation: {text}"
+    );
+
+    assert_eq!(
+        definition_members(&app, &token, &dom_id).await.len(),
+        2,
+        "and the member stayed"
+    );
+}
+
+/// A calculation bound to `group_id` reading the seeded temperature and producing dissolved
+/// oxygen. `tool_scripts` is authored through Administrator-only routes, so the rows are written
+/// directly, as the formula suite does.
+async fn seed_group_calculation(db: &sea_orm::DatabaseConnection, group_id: &str, name: &str) {
+    let manifest = json!({
+        "params": [{ "name": "temp", "kind": "number", "parameter_code": "DO_Temperature" }],
+        "outputs": [{ "name": "do", "suggested_parameter_code": "Dissolved_O2" }],
+    });
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO tool_scripts (id, name, label, engine, parameter_group_id, created_by) \
+             VALUES ('00000000-0000-4000-d000-0000000000a1', '{name}', '{name}', 'formula', \
+                     '{group_id}', 'test')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO tool_script_versions \
+               (id, tool_script_id, version_no, script, entry_function, manifest, test_cases, \
+                content_hash, created_by) \
+             VALUES ('00000000-0000-4000-d000-0000000000a2', \
+                     '00000000-0000-4000-d000-0000000000a1', 1, '', 'tool', \
+                     '{manifest}'::jsonb, '[]'::jsonb, 'seed-{name}', 'test')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        db,
+        "UPDATE tool_scripts SET active_version_id = '00000000-0000-4000-d000-0000000000a2' \
+           WHERE id = '00000000-0000-4000-d000-0000000000a1'",
+    )
+    .await;
+}

@@ -190,6 +190,12 @@ pub struct PlanEntry {
     pub sd_holds: i64,
     #[serde(default)]
     pub sd_population_holds: i64,
+    /// A person has looked at this entry and agreed with it. Set explicitly, never inferred from
+    /// an edit: an operator who toggles a parameter group to skip and back has decided nothing.
+    /// Only [`ReviewState::NeedsChecking`] entries wait on it; a fully matched entry with no
+    /// warning is self-validated and needs no tick.
+    #[serde(default)]
+    pub acknowledged: bool,
     /// Whether the source reports this feed as a device. That, not the presence of a serial, is
     /// what makes a feed field-shaped: its instrument is minted from the feed's own provenance
     /// when the stream is paired, so the plan proposes no lab instrument for it. A source may
@@ -633,6 +639,14 @@ pub struct PlanParamRef {
 pub struct PlanSummary {
     pub total_streams: usize,
     pub will_pair: usize,
+    /// The three review states over the entries the plan would pair, so the review can say what
+    /// share of the plan waits on a person and what share stands on its own evidence.
+    #[serde(default)]
+    pub needs_checking: usize,
+    #[serde(default)]
+    pub self_validated: usize,
+    #[serde(default)]
+    pub acknowledged: usize,
     pub will_skip: usize,
     pub projects_to_create: usize,
     pub sites_to_create: usize,
@@ -796,7 +810,7 @@ pub async fn create_plan(
         // statistic column. The incoming name survives as original_parameter_name.
         let replicates = plan_replicates(&stream.metadata);
         let parameter_name = if replicates.is_some() && !h.parameter.is_empty() {
-            family_parameter_suggestion(&h.parameter, &catalog.params)
+            family_parameter_suggestion(&h.parameter)
         } else {
             h.parameter.clone()
         };
@@ -856,6 +870,7 @@ pub async fn create_plan(
             ),
             sd_holds,
             sd_population_holds,
+            acknowledged: false,
             is_device: crate::routes::private::sensors::operations::is_device_feed(
                 &stream.metadata,
             ),
@@ -1608,6 +1623,16 @@ async fn backfill_plan_readings<C: ConnectionTrait>(txn: &C, plan_id: Uuid) -> A
     )
     .await?;
 
+    // Attribution arriving is what makes these spot readings addressable as visits: attach their
+    // collection events now, deriving the source from where each stream came from.
+    crate::routes::private::collection_events::attach::attach_collection_events(
+        txn,
+        "ds.pairing_plan_id = $1",
+        vec![plan_id.into()],
+        crate::routes::private::collection_events::attach::EventSource::ByStreamOrigin,
+    )
+    .await?;
+
     txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"UPDATE status_events se
@@ -1778,6 +1803,30 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
     Ok(reverted)
 }
 
+/// How much attention one entry still wants, the three states the review renders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewState {
+    /// Project, site and parameter all resolve and nothing warned, so the proposal stands on its
+    /// own evidence. Worth looking over, not waiting on anyone.
+    SelfValidated,
+    /// Something did not resolve, or the entry carries a warning. A person decides this one.
+    NeedsChecking,
+    /// A person looked and agreed.
+    Acknowledged,
+}
+
+/// The state of one entry, most decided first.
+#[must_use]
+pub fn review_state(entry: &PlanEntry) -> ReviewState {
+    if entry.acknowledged {
+        return ReviewState::Acknowledged;
+    }
+    if entry.confidence == "exact" && entry.warnings.is_empty() {
+        return ReviewState::SelfValidated;
+    }
+    ReviewState::NeedsChecking
+}
+
 pub fn compute_summary_pub(entries: &[PlanEntry]) -> PlanSummary {
     compute_summary(entries)
 }
@@ -1840,9 +1889,24 @@ fn compute_summary(entries: &[PlanEntry]) -> PlanSummary {
         .collect::<std::collections::HashSet<_>>()
         .len();
 
+    let pairing = entries.iter().filter(|e| e.action == "pair");
+    let mut needs_checking = 0usize;
+    let mut self_validated = 0usize;
+    let mut acknowledged = 0usize;
+    for entry in pairing {
+        match review_state(entry) {
+            ReviewState::NeedsChecking => needs_checking += 1,
+            ReviewState::SelfValidated => self_validated += 1,
+            ReviewState::Acknowledged => acknowledged += 1,
+        }
+    }
+
     PlanSummary {
         total_streams: entries.len(),
         will_pair,
+        needs_checking,
+        self_validated,
+        acknowledged,
         will_skip,
         projects_to_create,
         sites_to_create,
@@ -1894,7 +1958,15 @@ pub fn lookup_parameter_by_code_name_or_alias(
 /// column. Strips the `avg` marker (`DOC_avg_ppb` -> `DOC_ppb`), and when dropping a trailing
 /// token on top of that finds an existing catalog parameter (`DOC_ppb` -> `DOC`), prefers it, so
 /// a synced family and a tool save land on one slot instead of minting a sibling.
-fn family_parameter_suggestion(name: &str, params: &[CatalogParam]) -> String {
+/// The catalog code a replicate family's mean column suggests.
+///
+/// The incoming column header is the code, because that is how the data is already stored, so
+/// nothing is stripped from it except `avg`: an `_avg` column is by construction the mean of a
+/// replicate family, which makes that segment structural rather than a suffix, and the family is
+/// what is being paired. `DOC_avg_ppb` is `DOC_ppb`, units and all; a units-bearing column never
+/// resolves onto a shorter code, so a catalog that happens to hold `DOC` does not pull `DOC_ppb`
+/// onto it and give two portals different export headers for the same measurand.
+fn family_parameter_suggestion(name: &str) -> String {
     let stripped: String = name
         .split('_')
         .filter(|seg| !seg.eq_ignore_ascii_case("avg"))
@@ -1902,15 +1974,6 @@ fn family_parameter_suggestion(name: &str, params: &[CatalogParam]) -> String {
         .join("_");
     if stripped.is_empty() {
         return name.to_string();
-    }
-    if lookup_parameter_by_code_name_or_alias(&stripped, params).is_some() {
-        return stripped;
-    }
-    if let Some((head, _)) = stripped.rsplit_once('_')
-        && !head.is_empty()
-        && lookup_parameter_by_code_name_or_alias(head, params).is_some()
-    {
-        return head.to_string();
     }
     stripped
 }
@@ -2373,7 +2436,7 @@ mod tests {
         assert_eq!(proposed.proposed_name.as_deref(), Some("NO2_mgL (cnet)"));
     }
 
-    fn plan_entry(site: &str, parameter: &str, confidence: &str, warnings: usize) -> PlanEntry {
+    pub fn plan_entry(site: &str, parameter: &str, confidence: &str, warnings: usize) -> PlanEntry {
         let entry = serde_json::json!({
             "stream_id": Uuid::new_v4(),
             "source_key": format!("{site}:{parameter}"),
@@ -2457,5 +2520,74 @@ mod tests {
         let changed = apply_bulk_action(&mut entries, &BulkWhere::default(), "skip");
         assert_eq!(changed, 1, "and skipping is its inverse");
         assert!(entries.iter().all(|e| e.action == "skip"));
+    }
+}
+
+#[cfg(test)]
+mod review_state_tests {
+    use super::tests::plan_entry;
+    use super::{ReviewState, compute_summary, review_state};
+
+    #[test]
+    fn test_review_state_asks_only_where_the_evidence_is_short() {
+        let matched = plan_entry("FP1", "Depth", "exact", 0);
+        assert_eq!(review_state(&matched), ReviewState::SelfValidated);
+
+        let warned = plan_entry("FP1", "CDOM", "exact", 1);
+        assert_eq!(review_state(&warned), ReviewState::NeedsChecking);
+
+        let unmatched = plan_entry("FP2", "Depth", "none", 0);
+        assert_eq!(review_state(&unmatched), ReviewState::NeedsChecking);
+
+        // A tick settles the entry whatever its evidence said.
+        let mut acknowledged = plan_entry("FP2", "CDOM", "none", 2);
+        acknowledged.acknowledged = true;
+        assert_eq!(review_state(&acknowledged), ReviewState::Acknowledged);
+    }
+
+    #[test]
+    fn test_compute_summary_counts_the_three_states_over_pairing_entries_only() {
+        let mut skipped = plan_entry("FP3", "Depth", "none", 1);
+        skipped.action = "skip".to_string();
+        let mut acknowledged = plan_entry("FP2", "CDOM", "none", 1);
+        acknowledged.acknowledged = true;
+
+        let summary = compute_summary(&[
+            plan_entry("FP1", "Depth", "exact", 0),
+            plan_entry("FP1", "CDOM", "exact", 0),
+            plan_entry("FP2", "Depth", "none", 0),
+            acknowledged,
+            skipped,
+        ]);
+
+        assert_eq!(summary.will_pair, 4);
+        assert_eq!(summary.self_validated, 2);
+        assert_eq!(summary.needs_checking, 1);
+        assert_eq!(summary.acknowledged, 1);
+        assert_eq!(
+            summary.self_validated + summary.needs_checking + summary.acknowledged,
+            summary.will_pair,
+            "every pairing entry is in exactly one state"
+        );
+    }
+}
+
+#[cfg(test)]
+mod family_suggestion_tests {
+    use super::family_parameter_suggestion;
+
+    #[test]
+    fn test_family_suggestion_strips_only_the_structural_avg_segment() {
+        assert_eq!(family_parameter_suggestion("DOC_avg_ppb"), "DOC_ppb");
+        assert_eq!(family_parameter_suggestion("NO2_avg_mgL"), "NO2_mgL");
+        assert_eq!(family_parameter_suggestion("avg"), "avg");
+    }
+
+    #[test]
+    fn test_a_units_bearing_column_never_resolves_onto_a_shorter_code() {
+        // The suggestion no longer reads the catalog at all: a catalog holding `DOC` is not a
+        // reason to export a `DOC` header where the portal wrote `DOC_avg_ppb`.
+        assert_eq!(family_parameter_suggestion("DOC_ppb"), "DOC_ppb");
+        assert_eq!(family_parameter_suggestion("DOC"), "DOC");
     }
 }

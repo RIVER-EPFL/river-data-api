@@ -1033,6 +1033,42 @@ impl Job for EventRecompute {
 /// `event_audit`: the missing/stale report over one event, one site, or everything.
 pub struct EventAudit;
 
+/// The events one audit run covers, most specific scope first. A `constant` scope narrows to the
+/// visits whose stored provenance names it, so editing a constant audits what that edit could have
+/// changed rather than every visit ever recorded; a visit where the tool never ran carries no
+/// provenance and no stale output, which is the finding a constant edit cannot produce.
+fn audit_event_set(
+    event_id: Option<Uuid>,
+    site_id: Option<Uuid>,
+    constant: Option<&str>,
+) -> (String, Vec<sea_orm::Value>) {
+    let mut sql = String::from("SELECT id FROM collection_events");
+    let mut binds: Vec<sea_orm::Value> = Vec::new();
+    let mut clauses: Vec<String> = Vec::new();
+    if let Some(id) = event_id {
+        binds.push(id.into());
+        clauses.push(format!("id = ${}", binds.len()));
+    } else if let Some(site) = site_id {
+        binds.push(site.into());
+        clauses.push(format!("site_id = ${}", binds.len()));
+    }
+    if let Some(name) = constant {
+        binds.push(name.into());
+        clauses.push(format!(
+            "EXISTS (SELECT 1 FROM readings r \
+              WHERE r.collection_event_id = collection_events.id \
+                AND jsonb_exists(r.provenance -> 'constants', ${}))",
+            binds.len()
+        ));
+    }
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+    sql.push_str(" ORDER BY collected_at");
+    (sql, binds)
+}
+
 #[async_trait]
 impl Job for EventAudit {
     fn name(&self) -> &'static str {
@@ -1059,16 +1095,12 @@ impl Job for EventAudit {
             .map_err(as_db_err)?;
         let order = dependency_order(&tools, &catalog).map_err(as_db_err)?;
 
-        let mut sql = String::from("SELECT id FROM collection_events");
-        let mut binds: Vec<sea_orm::Value> = Vec::new();
-        if let Some(id) = event_id {
-            binds.push(id.into());
-            sql.push_str(" WHERE id = $1");
-        } else if let Some(site) = site_id {
-            binds.push(site.into());
-            sql.push_str(" WHERE site_id = $1");
-        }
-        sql.push_str(" ORDER BY collected_at");
+        let constant = params
+            .get("constant")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+
+        let (sql, binds) = audit_event_set(event_id, site_id, constant.as_deref());
         let event_rows = ctx
             .db()
             .query_all_raw(Statement::from_sql_and_values(
@@ -1099,6 +1131,7 @@ impl Job for EventAudit {
             JobReport::new()
                 .scope_opt("site_id", site_id.map(|id| id.to_string()))
                 .scope_opt("collection_event_id", event_id.map(|id| id.to_string()))
+                .scope_opt("constant", constant.clone())
                 .count("events_audited", counts.events_audited)
                 .count("missing_findings", counts.missing)
                 .count("stale_findings", counts.stale)
@@ -1106,6 +1139,42 @@ impl Job for EventAudit {
         )
         .await;
         Ok(i64::try_from(counts.missing + counts.stale).unwrap_or(i64::MAX))
+    }
+}
+
+#[cfg(test)]
+mod audit_scope_tests {
+    use super::audit_event_set;
+    use uuid::Uuid;
+
+    #[test]
+    fn an_unscoped_audit_covers_every_event_and_reads_no_provenance() {
+        let (sql, binds) = audit_event_set(None, None, None);
+        assert_eq!(sql, "SELECT id FROM collection_events ORDER BY collected_at");
+        assert!(binds.is_empty());
+    }
+
+    #[test]
+    fn a_constant_scope_narrows_to_the_events_whose_provenance_names_it() {
+        let (sql, binds) = audit_event_set(None, None, Some("xO2"));
+        assert!(sql.contains("jsonb_exists(r.provenance -> 'constants', $1)"), "{sql}");
+        assert_eq!(binds.len(), 1);
+    }
+
+    #[test]
+    fn a_site_scope_and_a_constant_scope_both_apply_and_bind_in_order() {
+        let site = Uuid::new_v4();
+        let (sql, binds) = audit_event_set(None, Some(site), Some("xO2"));
+        assert!(sql.contains("site_id = $1"), "{sql}");
+        assert!(sql.contains(", $2)"), "{sql}");
+        assert_eq!(binds.len(), 2);
+    }
+
+    #[test]
+    fn an_event_scope_outranks_a_site_scope() {
+        let (sql, _) = audit_event_set(Some(Uuid::new_v4()), Some(Uuid::new_v4()), None);
+        assert!(sql.contains("id = $1"), "{sql}");
+        assert!(!sql.contains("site_id"), "{sql}");
     }
 }
 
@@ -1194,5 +1263,138 @@ mod scope_tests {
         assert!(!sql.contains("replicate_audit_holds"));
         assert!(sql.contains(">= $1") && sql.contains("<= $2"));
         assert_eq!(binds.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::{ActiveTool, EventContext, body_for_run};
+    use crate::routes::private::tools::engine::{Engine, Manifest};
+    use uuid::Uuid;
+
+    fn tool(manifest: serde_json::Value) -> ActiveTool {
+        let manifest: Manifest = serde_json::from_value(manifest).expect("manifest parses");
+        ActiveTool {
+            script_id: Uuid::from_u128(1),
+            name: "pco2".to_string(),
+            label: "pCO2".to_string(),
+            description: None,
+            version_id: Uuid::from_u128(2),
+            version_no: 1,
+            script: String::new(),
+            entry_function: "tool".to_string(),
+            content_hash: "hash".to_string(),
+            manifest,
+            engine: Engine::Script,
+            parameter_group_id: None,
+            formulas: Vec::new(),
+        }
+    }
+
+    fn event() -> EventContext {
+        EventContext {
+            id: Uuid::from_u128(3),
+            site_id: Uuid::from_u128(4),
+            collected_at: chrono::DateTime::from_timestamp(1_772_259_000, 0)
+                .expect("representable"),
+        }
+    }
+
+    fn manifest_with(extra: serde_json::Value) -> serde_json::Value {
+        let mut base = serde_json::json!({
+            "label": "pCO2",
+            "params": [{ "name": "lab_temp_c", "label": "Lab temperature", "kind": "number" }],
+            "outputs": [],
+        });
+        for (k, v) in extra.as_object().expect("object") {
+            base[k] = v.clone();
+        }
+        base
+    }
+
+    #[test]
+    fn test_body_for_run_replays_the_prior_run_s_own_inputs() {
+        let blob = serde_json::json!({ "inputs": { "lab_temp_c": 21.5, "mode": "db" } });
+        let body = body_for_run(
+            &tool(manifest_with(serde_json::json!({}))),
+            &event(),
+            Some(&blob),
+        );
+        assert_eq!(body["lab_temp_c"], 21.5);
+        assert_eq!(body["mode"], "db");
+    }
+
+    // Scenario: a run made under an earlier shape is recomputed.
+    // Expected behaviour: what the context resolves is dropped from the replayed inputs, so an
+    // upstream value that has since changed propagates instead of the stored copy winning.
+    #[test]
+    fn test_body_for_run_drops_what_the_context_resolves() {
+        let manifest = manifest_with(serde_json::json!({
+            "params": [
+                { "name": "lab_temp_c", "label": "Lab temperature", "kind": "number" },
+                { "name": "water_temp_c", "label": "Water temperature", "kind": "number" },
+                { "name": "elevation_m", "label": "Elevation", "kind": "number" },
+            ],
+            "event_inputs": [{ "param": "water_temp_c", "parameter_code": "WTW_Temp_degC_1" }],
+            "site_inputs": [{ "property": "altitude_m", "param": "elevation_m" }],
+        }));
+        let blob = serde_json::json!({
+            "inputs": { "lab_temp_c": 21.5, "water_temp_c": 4.0, "elevation_m": 1500 }
+        });
+        let body = body_for_run(&tool(manifest), &event(), Some(&blob));
+        assert_eq!(body["lab_temp_c"], 21.5);
+        assert!(
+            !body.contains_key("water_temp_c"),
+            "the event input is re-resolved"
+        );
+        assert!(!body.contains_key("elevation_m"), "so is the site input");
+    }
+
+    // A site input with no `param` fills the property's own name, and that is what has to go.
+    #[test]
+    fn test_body_for_run_drops_a_site_input_that_names_no_param() {
+        let manifest = manifest_with(serde_json::json!({
+            "params": [{ "name": "altitude_m", "label": "Altitude", "kind": "number" }],
+            "site_inputs": [{ "property": "altitude_m" }],
+        }));
+        let blob = serde_json::json!({ "inputs": { "altitude_m": 1500 } });
+        let body = body_for_run(&tool(manifest), &event(), Some(&blob));
+        assert!(!body.contains_key("altitude_m"));
+    }
+
+    #[test]
+    fn test_body_for_run_states_the_context_over_a_stale_stored_copy() {
+        let blob = serde_json::json!({
+            "inputs": {
+                "site_id": "00000000-0000-0000-0000-0000000000ff",
+                "collected_at": "2020-01-01T00:00:00Z"
+            }
+        });
+        let body = body_for_run(
+            &tool(manifest_with(serde_json::json!({}))),
+            &event(),
+            Some(&blob),
+        );
+        assert_eq!(body["site_id"], serde_json::json!(Uuid::from_u128(4)));
+        assert_eq!(body["collected_at"], "2026-02-28T06:10:00Z");
+    }
+
+    #[test]
+    fn test_body_for_run_with_no_prior_run_carries_the_context_alone() {
+        let body = body_for_run(&tool(manifest_with(serde_json::json!({}))), &event(), None);
+        assert_eq!(body.len(), 2);
+        assert!(body.contains_key("site_id") && body.contains_key("collected_at"));
+    }
+
+    // A blob with no `inputs` object is not a replayable run: nothing is carried forward.
+    #[test]
+    fn test_body_for_run_ignores_a_blob_with_no_inputs() {
+        let blob = serde_json::json!({ "constants": { "xO2": 0.209446 } });
+        let body = body_for_run(
+            &tool(manifest_with(serde_json::json!({}))),
+            &event(),
+            Some(&blob),
+        );
+        assert_eq!(body.len(), 2);
     }
 }

@@ -27,6 +27,10 @@ pub struct Model {
     /// Human label the operator picks the curve by, for example the plate it was fitted from.
     #[crudcrate(filterable, fulltext, sortable)]
     pub name: Option<String>,
+    /// The date the curve was fitted, which is how the lab identifies one. Defaults to the row's
+    /// own creation date when nothing supplies it.
+    #[crudcrate(filterable, sortable, on_create = chrono::Utc::now().date_naive())]
+    pub fitted_on: Option<chrono::NaiveDate>,
     pub slope: f64,
     pub intercept: f64,
     /// Fit quality reported by whatever produced the curve; recorded, never used in arithmetic.

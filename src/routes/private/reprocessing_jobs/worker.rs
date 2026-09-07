@@ -72,8 +72,9 @@ struct Claimed {
     params: serde_json::Value,
 }
 
-/// Claim one due `queued` row or one expired-lease `running` row (the reaper arm), stamping this
-/// worker's ownership and a fresh lease. `SKIP LOCKED` keeps two workers from taking the same row.
+/// Claim one due `queued` row or one orphaned `running` row (the reaper arm), stamping this
+/// worker's ownership and a fresh lease. A claimed row always carries a lease, so a `running` row
+/// with none is an orphan too: rows stranded by the pre-worker-pool spawn path have no lease at all. `SKIP LOCKED` keeps two workers from taking the same row.
 /// The claim releases `dedupe_key`: the key coalesces enqueues while a job waits, and a change
 /// landing once the run has started needs a run of its own.
 async fn claim_one(
@@ -86,7 +87,8 @@ async fn claim_one(
             "WITH claimable AS ( \
                  SELECT id FROM reprocessing_jobs \
                  WHERE (status = 'queued' AND next_attempt_at <= now()) \
-                    OR (status = 'running' AND lease_expires_at < now()) \
+                    OR (status = 'running' \
+                        AND (lease_expires_at IS NULL OR lease_expires_at < now())) \
                  ORDER BY next_attempt_at \
                  FOR UPDATE SKIP LOCKED \
                  LIMIT 1 \

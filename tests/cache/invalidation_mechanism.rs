@@ -304,7 +304,7 @@ async fn the_write_bus_invalidates_the_site_it_names() {
     let _ = state.events.send(AppEvent::DataIngested {
         site_id: Some(site1()),
         parameter_id: None,
-        stream_id: Uuid::new_v4(),
+        stream_id: Some(Uuid::new_v4()),
         count: 1,
     });
 
@@ -338,7 +338,7 @@ async fn an_ingest_event_without_a_site_invalidates_nothing() {
     let _ = state.events.send(AppEvent::DataIngested {
         site_id: None,
         parameter_id: None,
-        stream_id: Uuid::new_v4(),
+        stream_id: Some(Uuid::new_v4()),
         count: 1,
     });
 
@@ -383,7 +383,7 @@ async fn a_job_completion_alone_invalidates_nothing() {
     let _ = state.events.send(AppEvent::DataIngested {
         site_id: Some(site1()),
         parameter_id: None,
-        stream_id: Uuid::new_v4(),
+        stream_id: Some(Uuid::new_v4()),
         count: 7,
     });
     assert!(
@@ -428,6 +428,40 @@ async fn the_cacheless_builder_stores_nothing() {
         cached(&state, &key).await,
         None,
         "with the cache off there is nothing to invalidate and nothing to serve"
+    );
+
+    cleanup_test_db(&db).await;
+}
+
+// A derived value is computed from a site's other readings and arrives on no stream, so its
+// announcement names the site and no channel. The invalidator keys on the site alone.
+#[tokio::test]
+#[serial]
+async fn a_derived_write_naming_no_stream_invalidates_its_site() {
+    let db = setup_test_db().await;
+    seed_public_sites(&db).await;
+    let (_app, state) = build_test_app_with_cache_and_state(db.clone());
+
+    let key = private_key(SITE1_ID);
+    let untouched = private_key(SITE2_ID);
+    store(&state, &key, "pre-derived").await;
+    store(&state, &untouched, "untouched").await;
+
+    let _ = state.events.send(AppEvent::DataIngested {
+        site_id: Some(site1()),
+        parameter_id: None,
+        stream_id: None,
+        count: 3,
+    });
+
+    assert!(
+        wait_until_dropped(&state, &key).await,
+        "the derived write drops the site's entry"
+    );
+    assert_eq!(
+        cached(&state, &untouched).await.as_deref(),
+        Some("untouched"),
+        "and only that site's"
     );
 
     cleanup_test_db(&db).await;

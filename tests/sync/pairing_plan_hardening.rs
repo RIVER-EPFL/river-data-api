@@ -624,19 +624,21 @@ async fn remap_to_existing_site_does_not_backfill_stream_coordinates() {
 /// Scenario: a replicate family arrives under its incoming statistic column (`DOC_avg_ppb`),
 /// with audit disagreements already recorded against the stream.
 ///
-/// Expected behaviour: the plan suggests the measurand (the catalog's `DOC`), keeps the incoming
-/// name as `original_parameter_name`, and quotes the divisor evidence: how many open
-/// disagreements there are and how many match the population signature. A family matching no
-/// catalog row still drops the `avg` marker.
+/// Expected behaviour: the plan suggests the family's own code, `DOC_ppb`, keeps the incoming name
+/// as `original_parameter_name`, and quotes the divisor evidence: how many open disagreements there
+/// are and how many match the population signature. Only the structural `avg` segment is dropped:
+/// a catalog holding the shorter `DOC` is a different parameter, not this family's, so the units in
+/// the column survive into the code every export writes.
 #[tokio::test]
 #[serial]
-async fn a_replicate_family_suggests_the_measurand_and_quotes_divisor_evidence() {
+async fn a_replicate_family_keeps_its_own_code_and_quotes_divisor_evidence() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
+    // A shorter neighbour in the catalog, which the family must not be pulled onto.
     crate::common::exec(
         &db,
         "INSERT INTO parameters (id, code, name, default_units, category) \
@@ -695,13 +697,13 @@ async fn a_replicate_family_suggests_the_measurand_and_quotes_divisor_evidence()
     let doc = entry_for(&plan, doc_stream);
     assert_eq!(
         doc["parameter"]["name"],
-        serde_json::json!("DOC"),
-        "the family lands on the catalog measurand: {doc}"
+        serde_json::json!("DOC_ppb"),
+        "the family keeps its own units-bearing code: {doc}"
     );
     assert_eq!(
         doc["parameter"]["create"],
-        serde_json::json!(false),
-        "no sibling parameter is minted: {doc}"
+        serde_json::json!(true),
+        "the catalog's shorter `DOC` is a different parameter, so this one is minted: {doc}"
     );
     assert_eq!(
         doc["original_parameter_name"],

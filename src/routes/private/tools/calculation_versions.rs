@@ -179,15 +179,8 @@ async fn activate(
     Ok(())
 }
 
-/// A calculation reads and writes only its group's members, in the roles they declare. The
-/// manifest names catalog codes; the group names parameter ids, so the codes are resolved first
-/// and an unknown code is itself a refusal.
-pub async fn check_manifest_against_group(
-    db: &DatabaseConnection,
-    group_id: Uuid,
-    name: &str,
-    manifest: &serde_json::Value,
-) -> AppResult<()> {
+/// The catalog codes a manifest reads and writes, lowercased and deduplicated.
+fn manifest_codes(manifest: &serde_json::Value) -> (Vec<String>, Vec<String>) {
     let codes = |key: &str, field: &str| -> Vec<String> {
         manifest
             .get(key)
@@ -201,14 +194,84 @@ pub async fn check_manifest_against_group(
             })
             .unwrap_or_default()
     };
-    let input_codes = {
-        let mut codes = codes("params", "parameter_code");
-        codes.extend(self::codes_of_event_inputs(manifest));
-        codes.sort();
-        codes.dedup();
-        codes
-    };
-    let output_codes = codes("outputs", "suggested_parameter_code");
+    let mut inputs = codes("params", "parameter_code");
+    inputs.extend(codes_of_event_inputs(manifest));
+    inputs.sort();
+    inputs.dedup();
+    (inputs, codes("outputs", "suggested_parameter_code"))
+}
+
+/// Catalog ids by lowercased code, for the codes asked for. A code the catalog does not hold is
+/// simply absent, which is what the caller has to decide about.
+async fn ids_by_code(
+    db: &DatabaseConnection,
+    codes: &[String],
+) -> AppResult<std::collections::HashMap<String, Uuid>> {
+    let mut wanted: Vec<String> = codes.to_vec();
+    wanted.sort();
+    wanted.dedup();
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id, LOWER(code) AS code FROM parameters WHERE LOWER(code) = ANY($1)",
+            [wanted.into()],
+        ))
+        .await?;
+    let mut by_code = std::collections::HashMap::new();
+    for row in &rows {
+        by_code.insert(row.try_get("", "code")?, row.try_get("", "id")?);
+    }
+    Ok(by_code)
+}
+
+/// The calculations bound to a group, as the reshape rules read them: name, inputs and outputs
+/// resolved from each calculation's *active* version. A calculation with no active version
+/// produces nothing yet and is not one.
+pub async fn calculations_of_group(
+    db: &DatabaseConnection,
+    group_id: Uuid,
+) -> AppResult<Vec<rules::Calculation>> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT s.name, v.manifest FROM tool_scripts s                JOIN tool_script_versions v ON v.id = s.active_version_id               WHERE s.parameter_group_id = $1",
+            [group_id.into()],
+        ))
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let name: String = row.try_get("", "name")?;
+        let manifest: serde_json::Value = row.try_get("", "manifest")?;
+        let (input_codes, output_codes) = manifest_codes(&manifest);
+        let mut all = input_codes.clone();
+        all.extend(output_codes.clone());
+        let by_code = ids_by_code(db, &all).await?;
+        out.push(rules::Calculation {
+            group_id,
+            name,
+            inputs: input_codes
+                .iter()
+                .filter_map(|c| by_code.get(c).copied())
+                .collect(),
+            outputs: output_codes
+                .iter()
+                .filter_map(|c| by_code.get(c).copied())
+                .collect(),
+        });
+    }
+    Ok(out)
+}
+
+/// A calculation reads and writes only its group's members, in the roles they declare. The
+/// manifest names catalog codes; the group names parameter ids, so the codes are resolved first
+/// and an unknown code is itself a refusal.
+pub async fn check_manifest_against_group(
+    db: &DatabaseConnection,
+    group_id: Uuid,
+    name: &str,
+    manifest: &serde_json::Value,
+) -> AppResult<()> {
+    let (input_codes, output_codes) = manifest_codes(manifest);
     if input_codes.is_empty() && output_codes.is_empty() {
         return Ok(());
     }
@@ -220,17 +283,7 @@ pub async fn check_manifest_against_group(
         .collect();
     wanted.sort();
     wanted.dedup();
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, LOWER(code) AS code FROM parameters WHERE LOWER(code) = ANY($1)",
-            [wanted.clone().into()],
-        ))
-        .await?;
-    let mut by_code: std::collections::HashMap<String, Uuid> = std::collections::HashMap::new();
-    for row in &rows {
-        by_code.insert(row.try_get("", "code")?, row.try_get("", "id")?);
-    }
+    let by_code = ids_by_code(db, &wanted).await?;
     for code in &wanted {
         if !by_code.contains_key(code) {
             return Err(AppError::BadRequest(format!(

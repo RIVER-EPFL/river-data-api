@@ -745,3 +745,90 @@ async fn a_visit_is_withdrawn_and_re_asserted_as_one_set() {
     .await;
     assert_eq!(status, 409, "a set is rolled back once: {again}");
 }
+
+async fn constant_id(db: &DatabaseConnection, name: &str) -> String {
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO constants (id, name, value, units, description) \
+             VALUES (gen_random_uuid(), '{name}', 0.209446, 'mol/mol', 'oxygen mole fraction') \
+             ON CONFLICT (name) DO NOTHING"
+        ),
+    )
+    .await;
+    db.query_one_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!("SELECT id FROM constants WHERE name = '{name}'"),
+    ))
+    .await
+    .unwrap()
+    .expect("the constant is there")
+    .try_get::<Uuid>("", "id")
+    .unwrap()
+    .to_string()
+}
+
+async fn queued_audits(db: &DatabaseConnection) -> Vec<serde_json::Value> {
+    db.query_all_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        "SELECT params FROM reprocessing_jobs WHERE trigger_type = 'event_audit' \
+         ORDER BY created_at"
+            .to_string(),
+    ))
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| r.try_get::<serde_json::Value>("", "params").unwrap())
+    .collect()
+}
+
+/// Editing a constant changes what every calculation declaring it would produce today, so the save
+/// files the report-only audit naming it. Nothing is rewritten by the save; repair stays a scoped
+/// recompute someone asks for. A units or description edit changes no calculation and audits
+/// nothing.
+#[tokio::test]
+#[serial]
+async fn a_constant_value_edit_queues_one_audit_naming_it() {
+    let (db, app, token) = setup().await;
+    let id = constant_id(&db, "xO2").await;
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/constants/{id}"),
+        &json!({ "description": "oxygen mole fraction in dry air" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        queued_audits(&db).await.is_empty(),
+        "a description edit changes no calculation"
+    );
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/constants/{id}"),
+        &json!({ "value": 0.2095 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let queued = queued_audits(&db).await;
+    assert_eq!(queued.len(), 1, "one audit for the change: {queued:?}");
+    assert_eq!(queued[0]["constant"], "xO2");
+
+    // The dedupe key coalesces a second edit of the same constant into the pending run.
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/constants/{id}"),
+        &json!({ "value": 0.2096 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        queued_audits(&db).await.len(),
+        1,
+        "the pending audit already covers this constant"
+    );
+}

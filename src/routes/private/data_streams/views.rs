@@ -999,6 +999,16 @@ pub async fn pair_stream(
         })
         .await?;
 
+    // Attribution changed what the slot serves, so the pairing announces it like every other
+    // path that changes stored reading values: `DataIngested` naming the site is what drops the
+    // site's cached responses (`common/cache.rs:17-18`).
+    let _ = state.events.send(crate::common::AppEvent::DataIngested {
+        site_id: Some(sp_site_id),
+        parameter_id: Some(sp_parameter_id),
+        stream_id: Some(stream_id),
+        count: usize::try_from(backfilled).unwrap_or(usize::MAX),
+    });
+
     // Attribution is what made these readings visit values; the calculations that read them at
     // each manual visit run now (ADR 0007).
     crate::routes::private::collection_events::recompute::enqueue_for(

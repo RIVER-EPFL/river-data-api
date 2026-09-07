@@ -1,6 +1,8 @@
 use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
 
+use super::operations::ConstantOperations;
+
 #[derive(
     Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
 )]
@@ -9,7 +11,8 @@ use sea_orm::entity::prelude::*;
     api_struct = "Constant",
     name_singular = "constant",
     name_plural = "constants",
-    generate_router
+    generate_router,
+    operations = ConstantOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]

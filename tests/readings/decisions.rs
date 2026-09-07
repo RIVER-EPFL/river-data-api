@@ -1025,3 +1025,80 @@ async fn a_reject_withdraws_an_intern_entry_and_a_reassert_restores_it() {
         "every ruling is on the record, so nothing drifts"
     );
 }
+
+/// Scenario: the same file imported twice with `conflict: overwrite`, the second time with a
+/// changed value.
+///
+/// Expected behaviour: the correction is a decision, the same as the one `/readings/batch` records
+/// for the same change, and a re-import of the unchanged values decides nothing.
+#[tokio::test]
+#[serial]
+async fn a_csv_overwrite_records_a_csv_value_correction_once() {
+    let f = setup().await;
+
+    let import = |value: f64| {
+        let app = f.app.clone();
+        let token = f.token.clone();
+        async move {
+            let (status, resp) = crate::common::post_json_parse_with_token(
+                &app,
+                "/api/readings/import_csv",
+                &serde_json::json!({
+                    "site": crate::common::SITE1_ID,
+                    "conflict": "overwrite",
+                    "csv": format!("DateTime,DO_Temperature\n2025-06-15 11:00:00,{value}\n"),
+                }),
+                &token,
+            )
+            .await;
+            assert_eq!(status, 200, "import ({status}): {resp}");
+        }
+    };
+
+    import(5.0).await;
+    wait_for_csv_value(&f.db, 5.0).await;
+    assert_eq!(decision_rows(&f.db, "value_correction", "csv").await, 0);
+
+    import(6.0).await;
+    wait_for_csv_value(&f.db, 6.0).await;
+    assert_eq!(decision_rows(&f.db, "value_correction", "csv").await, 1);
+
+    import(6.0).await;
+    wait_for_csv_value(&f.db, 6.0).await;
+    assert_eq!(
+        decision_rows(&f.db, "value_correction", "csv").await,
+        1,
+        "re-importing the same value corrects nothing"
+    );
+}
+
+/// The import runs in a tracked job, so the assertion waits for the value to land.
+async fn wait_for_csv_value(db: &DatabaseConnection, expected: f64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let row = db
+            .query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT raw_value FROM readings \
+                     WHERE site_id = '{}' AND parameter_id = '{}' \
+                       AND time = '2025-06-15T11:00:00Z'",
+                    crate::common::SITE1_ID,
+                    crate::common::GLOBAL_PARAM_TEMP_ID
+                ),
+            ))
+            .await
+            .unwrap();
+        if let Some(row) = row
+            && let Ok(Some(value)) = row.try_get::<Option<f64>>("", "raw_value")
+            && (value - expected).abs() < 1e-9
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the import worker never stored {expected}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}

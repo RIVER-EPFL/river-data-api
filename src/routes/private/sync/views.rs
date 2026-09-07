@@ -1839,6 +1839,10 @@ struct PlanEntryUpdate {
     /// Never inferred: absent leaves the slot undeclared and the audit gate asks later.
     #[serde(default)]
     sd_estimator: Option<String>,
+    /// Record that a person looked at this entry and agreed with it, or take that back. Separate
+    /// from `action`, so changing what an entry does is not the same as deciding it.
+    #[serde(default)]
+    acknowledged: Option<bool>,
 }
 
 /// What an instrument decision covers. A curve column is one instrument across the whole source,
@@ -2114,6 +2118,9 @@ pub async fn update_pairing_plan(
                             .to_string(),
                     )
                 };
+            }
+            if let Some(acknowledged) = update.acknowledged {
+                entry.acknowledged = acknowledged;
             }
             crate::routes::private::sync::service::reclassify_entry(entry, &catalog);
             // A renamed entry that resolves to an existing site must not carry the stream's

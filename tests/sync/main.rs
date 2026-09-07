@@ -19,6 +19,7 @@ mod pagination_bounds;
 mod pairing_plan_apply;
 mod pairing_plan_hardening;
 mod plan_instrument_decisions;
+mod plan_review_progress;
 mod replicate_audit;
 mod replicate_flag_indexes;
 mod routes_surface;

@@ -1050,14 +1050,13 @@ pub async fn insert_batch_readings(
         let times: Vec<chrono::DateTime<chrono::FixedOffset>> =
             models.iter().map(|m| *m.time.as_ref()).collect();
         if let (Some(first), Some(last)) = (times.iter().min(), times.iter().max()) {
-            calibrations::service::recompose_from_own_curves(
+            calibrations::service::recompose_from_own_curves_guarded(
                 &state.db,
                 "TRUE",
                 "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3",
                 vec![stream_ids.into(), (*first).into(), (*last).into()],
             )
-            .await
-            .map_err(AppError::Database)?;
+            .await?;
         }
     }
 
@@ -1074,7 +1073,7 @@ pub async fn insert_batch_readings(
             let _ = state.events.send(AppEvent::DataIngested {
                 site_id: Some(*site_id),
                 parameter_id: Some(*parameter_id),
-                stream_id,
+                stream_id: Some(stream_id),
                 count: inserted + overwritten,
             });
         }

@@ -184,6 +184,7 @@ pub async fn recompose_from_own_curves<C: ConnectionTrait>(
     scope_sql: &str,
     params: Vec<sea_orm::Value>,
 ) -> Result<u64, sea_orm::DbErr> {
+
     let value = recomposed_value_sql(
         "tgt.raw_value",
         &CurveColumns {
@@ -219,6 +220,26 @@ pub async fn recompose_from_own_curves<C: ConnectionTrait>(
         ))
         .await?;
     Ok(result.rows_affected())
+}
+
+/// [`recompose_from_own_curves`] in a lifted transaction of its own.
+///
+/// The write paths that correct a stored value recompose after their own guarded block has
+/// committed, over the whole corrected window, so this bulk `UPDATE readings` reaches compressed
+/// chunks with no lift in scope. Callers already inside a guarded transaction use the plain
+/// function and stay in one transaction.
+pub async fn recompose_from_own_curves_guarded<C: sea_orm::TransactionTrait>(
+    db: &C,
+    rows_sql: &str,
+    scope_sql: &str,
+    params: Vec<sea_orm::Value>,
+) -> crate::error::AppResult<u64> {
+    crate::common::bulk_write::guarded(db, async |txn| {
+        recompose_from_own_curves(txn, rows_sql, scope_sql, params)
+            .await
+            .map_err(crate::error::AppError::Database)
+    })
+    .await
 }
 
 /// Rows a curve-drift sweep can judge: the value is a claim about curves the row names, so a row
@@ -609,21 +630,25 @@ async fn evaluate_and_upsert_derived(
     // the value outright. Writing both columns also made the upsert lopsided: the previous
     // ON CONFLICT maintained only `calibrated_value`, so a recomputed row's `raw_value` stayed
     // frozen at whatever the very first evaluation produced.
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index, measurement_type)
+    crate::common::bulk_write::guarded_mutation(
+        db,
+        Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index, measurement_type)
           VALUES ($1, $2, $3, $4, $5, NULL, 0, 'derived')
           ON CONFLICT (stream_id, time, replicate_index) DO UPDATE
             SET raw_value = $5, calibrated_value = NULL, measurement_type = 'derived'",
-        [
-            stream_id.into(),
-            item.derived_site_id.into(),
-            item.derived_parameter_id.into(),
-            time.into(),
-            result.into(),
-        ],
-    ))
-    .await?;
+            [
+                stream_id.into(),
+                item.derived_site_id.into(),
+                item.derived_parameter_id.into(),
+                time.into(),
+                result.into(),
+            ],
+        ),
+    )
+    .await
+    .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
     Ok(())
 }
 

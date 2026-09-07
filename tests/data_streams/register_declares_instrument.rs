@@ -8,6 +8,7 @@
 //! already refuses project-scoped tokens outright, so the restricted principal the guard exists for
 //! cannot be produced by a request.
 
+use sea_orm::TransactionTrait;
 use serde_json::json;
 use serial_test::serial;
 use uuid::Uuid;
@@ -415,4 +416,80 @@ async fn scalar_text(db: &sea_orm::DatabaseConnection, sql: &str) -> Option<Stri
     .await
     .expect("query")
     .and_then(|row| row.try_get::<Option<String>>("", "v").ok().flatten())
+}
+
+/// Scenario: a discovery cycle and a triggered full sync re-register one channel at the same
+/// instant, both reporting the same identity change.
+///
+/// Expected behaviour: one standing hold. Neither pass sees the other's uncommitted row, so the
+/// second must converge on the first rather than adding a second open hold for the same stream.
+#[tokio::test]
+#[serial]
+async fn concurrent_identity_changes_converge_on_one_hold() {
+    let (_app, _token, db) = setup().await;
+
+    let stream_id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
+             VALUES ('{stream_id}', 'vaisala', 'race-1', 'Race 1', true)"
+        ),
+    )
+    .await;
+
+    let stored = json!({ "probe_serial": "PROBE-A" });
+    let first = db.begin().await.expect("begin");
+    river_db::routes::private::sensors::operations::raise_source_identity_hold(
+        &first,
+        stream_id,
+        &["probe_serial"],
+        &stored,
+        &json!({ "probe_serial": "PROBE-B" }),
+    )
+    .await
+    .expect("first raise");
+
+    // A plain second connection: `setup_test_db` would block on the harness advisory lock this
+    // process already holds.
+    let second = sea_orm::Database::connect(std::env::var("DATABASE_URL").expect("DATABASE_URL"))
+        .await
+        .expect("second connection");
+    let raise = tokio::spawn(async move {
+        river_db::routes::private::sensors::operations::raise_source_identity_hold(
+            &second,
+            stream_id,
+            &["probe_serial"],
+            &json!({ "probe_serial": "PROBE-A" }),
+            &json!({ "probe_serial": "PROBE-C" }),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    first.commit().await.expect("commit");
+    raise.await.expect("join").expect("the second raise waits for the first, then updates it");
+
+    let open = scalar_i64(
+        &db,
+        &format!(
+            "SELECT count(*) AS v FROM replicate_audit_holds \
+             WHERE stream_id = '{stream_id}' AND kind = 'source_identity_changed' \
+               AND status IN ('pending', 'deferred')"
+        ),
+    )
+    .await;
+    assert_eq!(open, 1, "one channel, one standing identity hold");
+}
+
+async fn scalar_i64(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
+    use sea_orm::{ConnectionTrait, Statement};
+    db.query_one_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_string(),
+    ))
+    .await
+    .expect("query")
+    .expect("row")
+    .try_get::<i64>("", "v")
+    .expect("value")
 }

@@ -191,3 +191,103 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
 
     crate::common::cleanup_test_db(&db).await;
 }
+
+/// Attribution arriving late is what makes a portal's spot readings addressable as visits, so the
+/// plan apply attaches their collection events exactly as the single-stream pairing does.
+#[tokio::test]
+#[serial]
+async fn apply_attaches_collection_events_for_spot_readings() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let stream_id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active, measurement_type) \
+             VALUES ('{stream_id}', 'cnet', 'FP1:DOC_avg_ppb:reps', 'FP1 DOC', true, 'spot')"
+        ),
+    )
+    .await;
+    for ts in ["2025-03-01T09:00:00Z", "2025-03-08T09:00:00Z"] {
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO readings (stream_id, time, raw_value, replicate_index) \
+                 VALUES ('{stream_id}', '{ts}', 2.5, 0)"
+            ),
+        )
+        .await;
+    }
+
+    let entries = serde_json::json!([{
+        "stream_id": stream_id,
+        "source_key": "FP1:DOC_avg_ppb:reps",
+        "source_name": "FP1 DOC",
+        "action": "pair",
+        "project": { "id": crate::common::PROJECT_ID, "name": "Test Project", "create": false },
+        "site": { "id": crate::common::SITE1_ID, "name": "Site 1", "create": false, "latitude": null, "longitude": null, "altitude_m": null },
+        "parameter": { "id": crate::common::GLOBAL_PARAM_TEMP_ID, "name": "Temperature", "create": false, "units": "C", "group_key": null, "original_names": [] },
+        "confidence": "exact",
+        "warnings": [],
+        "original_parameter_name": null
+    }]);
+    let plan_id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO pairing_plans (id, source_system, status, summary, entries) \
+             VALUES ('{plan_id}', 'cnet', 'draft', '{{}}'::jsonb, '{}'::jsonb)",
+            entries.to_string().replace('\'', "''")
+        ),
+    )
+    .await;
+
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
+            .await;
+    assert!(
+        (200..300).contains(&status),
+        "apply should be 2xx, got {status}: {text}"
+    );
+    assert_eq!(wait_terminal(&db, &job_id_of(&text)).await, "completed");
+
+    let events = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT source FROM collection_events WHERE site_id = '{}' ORDER BY collected_at",
+                crate::common::SITE1_ID
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2, "one event per visited instant");
+    for row in &events {
+        assert_eq!(
+            row.try_get::<String>("", "source").unwrap(),
+            "portal_sync",
+            "a sync-registered stream's visits are portal_sync"
+        );
+    }
+
+    let unstamped = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT count(*) AS v FROM readings \
+                 WHERE stream_id = '{stream_id}' AND collection_event_id IS NULL"
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "v")
+        .unwrap();
+    assert_eq!(unstamped, 0, "every paired spot reading names its visit");
+
+    crate::common::cleanup_test_db(&db).await;
+}

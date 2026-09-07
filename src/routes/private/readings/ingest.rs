@@ -894,7 +894,7 @@ pub async fn ingest_readings(
         if let (Some(lo), Some(hi)) = (times.clone().min(), times.max()) {
             // The upsert leaves a hand-picked curve standing, and this correction resolved only a
             // base, so the value is recomposed from whichever curves the row ends up carrying.
-            if let Err(e) = calibrations::service::recompose_from_own_curves(
+            if let Err(e) = calibrations::service::recompose_from_own_curves_guarded(
                 &state.db,
                 "TRUE",
                 "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
@@ -919,7 +919,7 @@ pub async fn ingest_readings(
         let _ = state.events.send(AppEvent::DataIngested {
             site_id,
             parameter_id,
-            stream_id: payload.stream_id,
+            stream_id: Some(payload.stream_id),
             count: inserted,
         });
 

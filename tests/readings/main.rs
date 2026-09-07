@@ -12,6 +12,7 @@ mod batch_overwrite_count;
 mod batch_standard_curve;
 mod collection_events;
 mod csv_import_column_resolution;
+mod csv_import_recompute;
 mod csv_import_family_guard;
 mod csv_import_overwrite_tail;
 mod csv_import_seasonal_gate;
