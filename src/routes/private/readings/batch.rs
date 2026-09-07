@@ -78,12 +78,6 @@ pub mod admission {
         ))
     }
 
-    /// Why this timestamp is not admissible, or `None` when it is. Callers that reject a whole
-    /// request raise it as a 400; the CSV importer reports it against the offending row.
-    pub fn time_rejection(time: DateTime<Utc>) -> Option<String> {
-        time_rejection_at(Utc::now(), time)
-    }
-
     /// Why this value is not admissible, or `None` when it is. `NaN` and the infinities have no
     /// meaning as a measurement and blank every aggregate bucket they reach.
     pub fn value_rejection(raw_value: f64) -> Option<String> {
@@ -119,10 +113,6 @@ pub mod admission {
     ) -> AppResult<()> {
         replicate_index_rejection(measurement_type, replicate_index)
             .map_or(Ok(()), |reason| Err(AppError::BadRequest(reason)))
-    }
-
-    pub fn admit_time(time: DateTime<Utc>) -> AppResult<()> {
-        time_rejection(time).map_or(Ok(()), |reason| Err(AppError::BadRequest(reason)))
     }
 
     pub fn admit_value(raw_value: f64) -> AppResult<()> {
@@ -323,11 +313,21 @@ pub mod admission {
         fn the_timestamp_window_holds_at_its_edges_and_refuses_beyond_them() {
             let now = Utc::now();
             let (min_time, max_time) = window(now);
-            assert!(admit_time(now).is_ok());
-            assert!(admit_time(min_time + Duration::minutes(1)).is_ok());
-            assert!(admit_time(max_time - Duration::minutes(1)).is_ok());
-            assert!(admit_time(min_time - Duration::days(1)).is_err());
-            assert!(admit_time(max_time + Duration::days(1)).is_err());
+            assert!(time_rejection_at(now, now).is_none());
+            assert!(time_rejection_at(now, min_time + Duration::minutes(1)).is_none());
+            assert!(time_rejection_at(now, max_time - Duration::minutes(1)).is_none());
+            assert!(time_rejection_at(now, min_time - Duration::days(1)).is_some());
+            assert!(time_rejection_at(now, max_time + Duration::days(1)).is_some());
+        }
+
+        /// Expected behaviour: the lead bound moves with the clock, so a file's rows are judged
+        /// against one reading of it. Judged a millisecond later, this timestamp changes answer.
+        #[test]
+        fn a_timestamp_just_past_the_lead_bound_turns_on_which_clock_read_judges_it() {
+            let now = Utc::now();
+            let just_past = now + Duration::days(MAX_LEAD_DAYS) + Duration::microseconds(500);
+            assert!(time_rejection_at(now, just_past).is_some());
+            assert!(time_rejection_at(now + Duration::milliseconds(1), just_past).is_none());
         }
 
         /// Expected behaviour: the floor is a fixed date, so a decade-old archive series stays
@@ -340,7 +340,7 @@ pub mod admission {
             assert_eq!(early, late);
 
             let archive = "2016-08-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-            assert!(admit_time(archive).is_ok());
+            assert!(time_rejection_at(Utc::now(), archive).is_none());
         }
 
         /// Expected behaviour: `rejection` and `admit` are one implementation, so the reason a

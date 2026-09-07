@@ -66,6 +66,8 @@ pub enum Refusal {
     OutputNotDeclared { parameter_id: Uuid },
     /// A calculation's input is not a `measured` or `entry_only` member of its group.
     InputNotDeclared { parameter_id: Uuid },
+    /// The parameter is the mean or sd of a replicated member of the same group.
+    StatisticOfMember { member_code: String },
 }
 
 impl fmt::Display for Refusal {
@@ -89,6 +91,10 @@ impl fmt::Display for Refusal {
                 f,
                 "parameter {parameter_id} is read by the calculation but is not a measured or entry_only member of its group"
             ),
+            Self::StatisticOfMember { member_code } => write!(
+                f,
+                "this is the mean or sd of member {member_code}, which the samples trigger computes; it renders beside that member and is not one"
+            ),
         }
     }
 }
@@ -101,6 +107,36 @@ pub fn may_add(parameter_id: Uuid, members: &[Member]) -> Result<(), Refusal> {
         }),
         None => Ok(()),
     }
+}
+
+/// The segments a portal statistics column is named with, between the analyte and its units:
+/// `DOC_avg_ppb` and `DOC_sd_ppb` are the mean and sd of `DOC_ppb`.
+const STATISTIC_SEGMENTS: [&str; 5] = ["avg", "mean", "sd", "stdev", "std"];
+
+/// A replicated member's statistics are computed by the `samples` trigger and shown beside it, so
+/// the group holds no member for them. The portals stored each as a parameter of its own, and one
+/// taken in as a member renders a second mean nothing maintains and an operator can type into.
+///
+/// `replicated` is the code of every member of the group that is entered several times.
+pub fn may_add_code(code: &str, replicated: &[&str]) -> Result<(), Refusal> {
+    let segments: Vec<&str> = code.split('_').collect();
+    for (index, segment) in segments.iter().enumerate() {
+        if !STATISTIC_SEGMENTS.contains(&segment.to_lowercase().as_str()) {
+            continue;
+        }
+        let mut rest = segments.clone();
+        rest.remove(index);
+        let stripped = rest.join("_");
+        if let Some(member) = replicated
+            .iter()
+            .find(|m| m.eq_ignore_ascii_case(&stripped))
+        {
+            return Err(Refusal::StatisticOfMember {
+                member_code: (*member).to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// A member leaves its group only when nothing in that group produces it. A move within the same
@@ -202,6 +238,30 @@ mod tests {
     #[test]
     fn test_may_add_accepts_into_an_empty_membership_table() {
         assert_eq!(may_add(id(10), &[]), Ok(()));
+    }
+
+    #[test]
+    fn test_may_add_code_refuses_the_mean_and_sd_of_a_replicated_member() {
+        for code in ["DOC_avg_ppb", "DOC_sd_ppb", "doc_mean_ppb"] {
+            assert_eq!(
+                may_add_code(code, &["DOC_ppb"]),
+                Err(Refusal::StatisticOfMember {
+                    member_code: "DOC_ppb".to_string()
+                }),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_may_add_code_accepts_an_analyte_whose_name_carries_no_statistic() {
+        assert_eq!(may_add_code("DOC_ppb", &["TSS_mgL"]), Ok(()));
+        assert_eq!(may_add_code("Std_Curve", &["DOC_ppb"]), Ok(()));
+    }
+
+    #[test]
+    fn test_may_add_code_accepts_a_statistic_of_a_member_no_group_replicates() {
+        assert_eq!(may_add_code("TSS_avg_mgL", &["DOC_ppb"]), Ok(()));
     }
 
     #[test]

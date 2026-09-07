@@ -1127,11 +1127,7 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
         ));
     }
 
-    txn.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
-    ))
-    .await?;
+    crate::common::bulk_write::lift_decompression_cap(&txn).await?;
 
     let param_names: HashMap<Uuid, String> = parameters::Entity::find()
         .all(&txn)
@@ -1708,11 +1704,7 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
         ));
     }
 
-    txn.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
-    ))
-    .await?;
+    crate::common::bulk_write::lift_decompression_cap(&txn).await?;
 
     // NULL out readings for streams from this plan; samples formed by the pairing backfill
     // lose their last reference and are removed below
@@ -2308,10 +2300,6 @@ async fn resolve_or_create_param(
         needs_review: Set(true),
         description: Set(None),
         aliases: Set(aliases),
-        default_warning_min: Set(None),
-        default_warning_max: Set(None),
-        default_alarm_min: Set(None),
-        default_alarm_max: Set(None),
         created_at: Set(Some(Utc::now())),
     }
     .insert(txn)

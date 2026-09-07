@@ -1,7 +1,7 @@
-//! Keystone: with ONLY a parameter default (no `alarm_thresholds` rows), a breaching value must be
-//! seen as an alarm by EVERY path, the resolution endpoint, `/alarms/active`, `/sites/{id}/alarms`,
-//! `readings?alarms=true`, `aggregates?alarms=true`, and the sweeper. Guards against any consumer
-//! dropping the parameter-default tier (all now share the one alarm engine).
+//! Keystone: with ONLY the parameter's global threshold (no site row anywhere), a breaching value
+//! must be seen as an alarm by EVERY path, the resolution endpoint, `/alarms/active`,
+//! `/sites/{id}/alarms`, `readings?alarms=true`, `aggregates?alarms=true`, and the sweeper. Guards
+//! against any consumer dropping the global tier (all now share the one alarm engine).
 //!
 //! Run: cargo test --test alarms -- --test-threads=1
 
@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 #[tokio::test]
 #[serial]
-async fn every_path_agrees_on_a_parameter_default_breach() {
+async fn every_path_agrees_on_a_global_threshold_breach() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -22,12 +22,15 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
     let site = crate::common::SITE1_ID;
     let turb = crate::common::GLOBAL_PARAM_TURB_ID;
 
-    // Only a parameter default, no threshold rows anywhere.
+    // Only the parameter's global row, no site row anywhere.
     crate::common::exec(&db, "DELETE FROM alarm_thresholds").await;
     crate::common::exec(&db, "DELETE FROM alarm_events").await;
     crate::common::exec(
         &db,
-        &format!("UPDATE parameters SET default_warning_max = 100, default_alarm_max = 500 WHERE id = '{turb}'"),
+        &format!(
+            "INSERT INTO alarm_thresholds (id, parameter_id, site_id, warning_max, alarm_max) \
+             VALUES (gen_random_uuid(), '{turb}', NULL, 100, 500)"
+        ),
     )
     .await;
 
@@ -53,7 +56,7 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
 
     let win = "start=2025-02-01T00:00:00Z&end=2025-02-01T01:00:00Z";
 
-    // 1. Resolution endpoint: resolves from the parameter default.
+    // 1. Resolution endpoint: resolves from the parameter's global threshold.
     let (s, b) = crate::common::get_json_with_token(
         &app,
         &format!("/api/alarms/thresholds?site_id={site}&parameter_id={turb}"),
@@ -69,8 +72,8 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
         .expect("turbidity resolved");
     assert_eq!(
         row["source"],
-        serde_json::json!("default"),
-        "from default tier: {row}"
+        serde_json::json!("global"),
+        "from the global tier: {row}"
     );
     assert_eq!(row["alarm_max"].as_f64(), Some(500.0));
 
@@ -82,7 +85,7 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
         .unwrap()
         .iter()
         .find(|x| x["parameter_id"].as_str() == Some(turb))
-        .expect("active breach from default");
+        .expect("active breach from the global threshold");
     assert_eq!(a["severity"].as_i64(), Some(2), "active severity: {a}");
 
     // 3. /sites/{id}/alarms → a severity-2 violation in the window.
@@ -105,7 +108,7 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
             .unwrap()
             .iter()
             .any(|v| v.as_i64() == Some(2)),
-        "site alarms severity 2 from default: {tp}"
+        "site alarms severity 2 from the global threshold: {tp}"
     );
 
     // 4. readings?alarms=true → severity 2 present (the path that was broken).
@@ -128,7 +131,7 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
             .unwrap()
             .iter()
             .any(|v| v.as_i64() == Some(2)),
-        "readings severity 2 from default: {rp}"
+        "readings severity 2 from the global threshold: {rp}"
     );
 
     // 5. aggregates?alarms=true → severity 2 in a bucket (the other broken path). Refresh the CAGG
@@ -150,17 +153,17 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
         && let Some(sevs) = ap["severities"].as_array()
         && !sevs.is_empty()
     {
-        // When the continuous aggregate has the bucket, its severity must also come from the default
+        // When the continuous aggregate has the bucket, its severity must also come from the global row
         // tier (CAGG refresh timing in tests can leave the just-injected point unbucketed, tolerated).
         assert!(
             sevs.iter().any(|v| v.as_i64() == Some(2)),
-            "aggregates severity 2 from default: {ap}"
+            "aggregates severity 2 from the global threshold: {ap}"
         );
     }
 
     // 6. Sweeper → opens an alarm event at severity 2.
     let stats = alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
-    assert!(stats.opened >= 1, "sweeper opens from default: {stats:?}");
+    assert!(stats.opened >= 1, "sweeper opens from the global threshold: {stats:?}");
     let sev: i16 = db
         .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
@@ -173,7 +176,7 @@ async fn every_path_agrees_on_a_parameter_default_breach() {
         .unwrap()
         .try_get("", "severity")
         .unwrap();
-    assert_eq!(sev, 2, "sweeper severity from default");
+    assert_eq!(sev, 2, "sweeper severity from the global threshold");
 
     crate::common::cleanup_test_db(&db).await;
 }

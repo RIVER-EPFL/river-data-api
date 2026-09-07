@@ -208,7 +208,7 @@ async fn job_rows(db: &DatabaseConnection, trigger: &str) -> i64 {
 async fn audit_rows(db: &DatabaseConnection, job: &str) -> i64 {
     count(
         db,
-        "SELECT count(*) AS n FROM schedule_audit WHERE job_name = $1",
+        "SELECT count(*) AS n FROM change_audit WHERE subject = 'schedule:' || $1",
         job,
     )
     .await
@@ -761,7 +761,7 @@ async fn run_now_dedupes_within_the_second_snapshots_empty_tunables_and_writes_n
         "the schedule audit trail records configuration edits, and a manual run is not one"
     );
     assert_eq!(
-        crate::common::e2e::count(&db, "SELECT count(*) AS n FROM schedule_audit").await,
+        crate::common::e2e::count(&db, "SELECT count(*) AS n FROM change_audit").await,
         0,
         "and no audit row was written against any schedule"
     );
@@ -844,7 +844,7 @@ async fn sse_streams_the_completion_of_an_operator_run_that_did_real_work() {
         .parse()
         .expect("the track's base day parses");
     assert!(
-        crate::common::e2e::hourly_bucket(&db, &track.site_id, &parameter_id, bucket_at)
+        crate::common::e2e::hourly_bucket(&app, &admin, &track.site_id, &parameter_id, bucket_at)
             .await
             .is_none(),
         "the hourly bucket holds nothing until something refreshes it"
@@ -933,7 +933,8 @@ async fn sse_streams_the_completion_of_an_operator_run_that_did_real_work() {
     // A completed status is not evidence a refresh happened: aggregate refresh failures are only
     // warn-logged (common/sync_state.rs). The bucket's values are.
     let bucket =
-        crate::common::e2e::hourly_bucket(&db, &track.site_id, &parameter_id, bucket_at).await;
+        crate::common::e2e::hourly_bucket(&app, &admin, &track.site_id, &parameter_id, bucket_at)
+            .await;
     assert!(
         bucket.is_some(),
         "the operator's run materialised the hourly bucket for the ingested cycle"

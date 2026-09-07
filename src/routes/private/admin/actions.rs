@@ -560,12 +560,7 @@ pub async fn rollback_deployment(
         .begin()
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-    txn.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
-    ))
-    .await
-    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    crate::common::bulk_write::lift_decompression_cap(&txn).await?;
 
     let cleared = txn
         .execute_raw(Statement::from_sql_and_values(

@@ -2,8 +2,9 @@ use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
 
 /// The statistics of two or more replicate readings of the same parameter sharing an instant at a
-/// site. Aggregate columns (mean/stdev/n/min_value/max_value) are maintained by a PostgreSQL
-/// trigger; application code never writes them and they are excluded from create/update payloads.
+/// site. Aggregate columns (mean/n/min_value/max_value and both divisors) are maintained by a
+/// PostgreSQL trigger and `stdev` is generated from the declared divisor; application code never
+/// writes them and they are excluded from create/update payloads.
 ///
 /// Statistics only: what a measurement is, who entered it and what produced it are properties of
 /// the reading and are stored there, so a single measurement needs no row here.
@@ -35,6 +36,8 @@ pub struct Model {
     // Aggregate columns, trigger-maintained, read-only to clients.
     #[crudcrate(exclude(create, update), sortable)]
     pub mean: Option<f64>,
+    // Generated from `sd_estimator` and the two divisors below, so a declaration change moves it
+    // without a trigger pass.
     #[crudcrate(exclude(create, update))]
     pub stdev: Option<f64>,
     #[crudcrate(exclude(create, update), sortable)]

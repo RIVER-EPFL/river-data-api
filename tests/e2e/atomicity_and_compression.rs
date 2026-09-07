@@ -196,8 +196,9 @@ async fn drain_jobs(db: &DatabaseConnection, max_secs: u64) {
 
 /// Poll the newest job of `trigger_type` until it is terminal, returning its status and a summary.
 ///
-/// A failing job returns to `queued` with an exponential retry delay rather than to `failed`, so a
-/// timeout reports the last observed state instead of waiting out the whole retry budget.
+/// A failing job returns to `queued` with an exponential retry delay rather than to `failed`, so
+/// the deadline elapsing means the retry budget outlived the test, not that the job holds the
+/// status last observed; it panics with the summary rather than reporting one.
 async fn await_job(db: &DatabaseConnection, trigger_type: &str, max_secs: u64) -> (String, String) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
     loop {
@@ -213,10 +214,14 @@ async fn await_job(db: &DatabaseConnection, trigger_type: &str, max_secs: u64) -
         let status: String = row
             .map(|r| r.try_get("", "status").unwrap_or_default())
             .unwrap_or_else(|| "missing".to_string());
-        let expired = std::time::Instant::now() >= deadline;
-        if status == "completed" || status == "failed" || expired {
+        if status == "completed" || status == "failed" {
             return (status, jobs_summary(db).await);
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{trigger_type} job still {status} after {max_secs}s: {}",
+            jobs_summary(db).await
+        );
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
 }
@@ -688,7 +693,7 @@ async fn flagging_readings_is_all_or_nothing_and_refreshes_the_rollups() {
 
     e2e::refresh_hourly(&db, day("2025-01-01")).await;
     assert_eq!(
-        e2e::hourly_bucket(&db, &site, &ranged, day("2025-04-07")).await,
+        e2e::hourly_bucket(&app, &admin, &site, &ranged, day("2025-04-07")).await,
         Some((10.0, 200)),
         "the bucket is materialised before flagging, so its disappearance afterwards is evidence"
     );
@@ -717,7 +722,7 @@ async fn flagging_readings_is_all_or_nothing_and_refreshes_the_rollups() {
         "every reading in the window is flagged: {flagged}"
     );
     assert_eq!(
-        e2e::hourly_bucket(&db, &site, &ranged, day("2025-04-07")).await,
+        e2e::hourly_bucket(&app, &admin, &site, &ranged, day("2025-04-07")).await,
         None,
         "the rollup is refreshed after flagging, so the flagged hour stops being served"
     );

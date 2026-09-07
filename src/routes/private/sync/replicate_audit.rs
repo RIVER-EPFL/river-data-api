@@ -1105,6 +1105,46 @@ async fn refuse_undeclared_estimator(
     )))
 }
 
+/// Accept the statistics recomputed from the stored replicates: the hold goes terminal, the
+/// decision is recorded on it, and the annotation that draws it on the chart is minted. Both the
+/// acknowledge route and `resolve {mode: "ours"}` are this and nothing else; only the response
+/// they build differs.
+async fn accept_ours(state: &AppState, id: Uuid, by: &str) -> AppResult<()> {
+    refuse_undeclared_estimator(&state.db, id).await?;
+    let resolution_sql = accept_ours_resolution_sql("$2");
+    let updated = state
+        .db
+        .execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "UPDATE replicate_audit_holds AS h
+                 SET status = 'acknowledged', resolution = {resolution_sql},
+                     acknowledged_by = $2, acknowledged_at = NOW()
+                 WHERE id = $1 AND status = 'pending'"
+            ),
+            [id.into(), by.into()],
+        ))
+        .await?
+        .rows_affected();
+    if updated == 0 {
+        return Err(AppError::NotFound(format!(
+            "no pending replicate audit hold {id}"
+        )));
+    }
+    let (expected, computed) = hold_numbers(&state.db, id).await;
+    mint_audit_annotation(
+        &state.db,
+        id,
+        &format!(
+            "Audit accepted: the statistics computed here stand ({}). Accepted by {by}.",
+            disagreement_phrase(&expected, &computed)
+        ),
+        by,
+    )
+    .await;
+    Ok(())
+}
+
 /// Acknowledge one pending hold: the operator confirms the statistics recomputed from the stored
 /// replicates. Terminal; re-detection of the same disagreement leaves the decision standing.
 /// The acting identity is taken from the caller's authentication, never from the request.
@@ -1124,39 +1164,7 @@ pub async fn acknowledge_hold(
     axum::Extension(auth): axum::Extension<AuthContext>,
 ) -> AppResult<Json<AcknowledgeResponse>> {
     enforce_hold_scope(&state.db, &scope, id).await?;
-    refuse_undeclared_estimator(&state.db, id).await?;
-    let by = actor_label(&auth);
-    let resolution_sql = accept_ours_resolution_sql("$2");
-    let updated = state
-        .db
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "UPDATE replicate_audit_holds AS h
-                 SET status = 'acknowledged', resolution = {resolution_sql},
-                     acknowledged_by = $2, acknowledged_at = NOW()
-                 WHERE id = $1 AND status = 'pending'"
-            ),
-            [id.into(), by.clone().into()],
-        ))
-        .await?
-        .rows_affected();
-    if updated == 0 {
-        return Err(AppError::NotFound(format!(
-            "no pending replicate audit hold {id}"
-        )));
-    }
-    let (expected, computed) = hold_numbers(&state.db, id).await;
-    mint_audit_annotation(
-        &state.db,
-        id,
-        &format!(
-            "Audit accepted: the statistics computed here stand ({}). Accepted by {by}.",
-            disagreement_phrase(&expected, &computed)
-        ),
-        &by,
-    )
-    .await;
+    accept_ours(&state, id, &actor_label(&auth)).await?;
     Ok(Json(AcknowledgeResponse {
         acknowledged: 1,
         skipped_undeclared_estimator: 0,
@@ -1231,38 +1239,7 @@ pub async fn resolve_hold(
     let by = actor_label(&auth);
     match payload.mode.as_str() {
         "ours" => {
-            refuse_undeclared_estimator(&state.db, id).await?;
-            let resolution_sql = accept_ours_resolution_sql("$2");
-            let updated = state
-                .db
-                .execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    format!(
-                        "UPDATE replicate_audit_holds AS h
-                         SET status = 'acknowledged', resolution = {resolution_sql},
-                             acknowledged_by = $2, acknowledged_at = NOW()
-                         WHERE id = $1 AND status = 'pending'"
-                    ),
-                    [id.into(), by.clone().into()],
-                ))
-                .await?
-                .rows_affected();
-            if updated == 0 {
-                return Err(AppError::NotFound(format!(
-                    "no pending replicate audit hold {id}"
-                )));
-            }
-            let (expected, computed) = hold_numbers(&state.db, id).await;
-            mint_audit_annotation(
-                &state.db,
-                id,
-                &format!(
-                    "Audit accepted: the statistics computed here stand ({}). Accepted by {by}.",
-                    disagreement_phrase(&expected, &computed)
-                ),
-                &by,
-            )
-            .await;
+            accept_ours(&state, id, &by).await?;
             Ok(Json(ResolveHoldResponse {
                 status: "acknowledged".to_string(),
                 job_id: None,

@@ -1,6 +1,7 @@
 //! The schedule control-plane REST surface (Stage D): list/inspect recurring-Service schedules,
 //! edit their cadence/policies/tunables, fire one now, and read the edit audit trail. Edits are
-//! validated against the owning [`Job`]'s `validate` and recorded in `schedule_audit`.
+//! validated against the owning [`Job`]'s `validate` and recorded in `change_audit` under
+//! the subject `schedule:{job_name}`.
 //!
 //! Raw `Statement` SQL + `AppResult<Json<…>>`, matching the sibling custom job handlers in
 //! [`super::routes`].
@@ -38,7 +39,7 @@ pub struct ScheduleView {
     pub running: bool,
 }
 
-/// Editable-field snapshot recorded in `schedule_audit.old_value` / `new_value`. The exact JSON
+/// Editable-field snapshot recorded in `change_audit.old_value` / `new_value`. The exact JSON
 /// shape of a before/after pair so an edit is auditable from the columns alone.
 #[derive(Debug, Serialize)]
 struct AuditSnapshot {
@@ -188,7 +189,7 @@ fn known_catchup(s: &str) -> bool {
 /// `PATCH /api/schedules/{job_name}`, edit cadence/policies/tunables. 404 unknown row; 400 on a
 /// bad interval, unknown policy, or rejected tunables. Applies only provided fields, recomputes
 /// `next_run_at` when the interval changes or a disabled schedule is enabled, stamps the actor, and
-/// writes a `schedule_audit` row. Requires `write_metadata` (+ non-scoped token). Returns the
+/// writes a `change_audit` row. Requires `write_metadata` (+ non-scoped token). Returns the
 /// updated [`ScheduleView`].
 pub async fn update_schedule(
     State(state): State<AppState>,
@@ -298,8 +299,8 @@ pub async fn update_schedule(
         .db
         .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO schedule_audit (job_name, changed_by, old_value, new_value) \
-             VALUES ($1, $2, $3::jsonb, $4::jsonb)",
+            "INSERT INTO change_audit (subject, change, changed_by, old_value, new_value) \
+             VALUES ('schedule:' || $1, 'schedule_update', $2, $3::jsonb, $4::jsonb)",
             [
                 job_name.clone().into(),
                 actor.into(),
@@ -397,8 +398,8 @@ pub async fn get_schedule_audit(
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT changed_at, changed_by, old_value, new_value \
-             FROM schedule_audit \
-             WHERE job_name = $1 \
+             FROM change_audit \
+             WHERE subject = 'schedule:' || $1 \
              ORDER BY changed_at DESC \
              LIMIT 100",
             [job_name.into()],

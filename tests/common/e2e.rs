@@ -32,38 +32,38 @@ pub async fn refresh_hourly(
 /// The hourly bucket a (site, parameter) resolves at `at`, as `(mean, count)`, or `None` when the
 /// bucket holds no rows.
 ///
-/// The aggregate is grouped by `(bucket, site_id, parameter_id, sensor_id)`, so a slot served by
-/// more than one sensor has one row per sensor. This collapses the sensor dimension the same way
-/// `sites/aggregates.rs` does, `SUM(sum_value) / SUM(count)`, rather than averaging the per-sensor
-/// averages, which would weight a sparse sensor equally with a dense one.
+/// Read through `/api/sites/{id}/aggregates/hourly`, so the sensor collapse a slot served by more
+/// than one instrument needs is whatever production serves rather than a second copy of the rule.
 pub async fn hourly_bucket(
-    db: &sea_orm::DatabaseConnection,
+    app: &Router,
+    token: &str,
     site_id: &str,
     parameter_id: &str,
     at: chrono::DateTime<chrono::Utc>,
 ) -> Option<(f64, i64)> {
-    use sea_orm::{ConnectionTrait, Statement};
-    let row = db
-        .query_one_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                // `count` is bigint, and SUM over bigint is NUMERIC in Postgres, which does not
-                // read back as i64. The cast is what makes `n` resolve at all.
-                "SELECT SUM(sum_value) AS total, SUM(count)::bigint AS n FROM readings_hourly \
-                 WHERE site_id = '{site_id}' AND parameter_id = '{parameter_id}' \
-                   AND bucket = time_bucket('1 hour', '{}'::timestamptz)",
-                at.to_rfc3339()
-            ),
-        ))
-        .await
-        .expect("query readings_hourly")?;
-
-    let total: Option<f64> = row.try_get("", "total").ok().flatten();
-    let n: Option<i64> = row.try_get("", "n").ok().flatten();
-    match (total, n) {
-        (Some(t), Some(c)) if c > 0 => Some((t / c as f64, c)),
-        _ => None,
-    }
+    use chrono::{Timelike, Utc};
+    let bucket: chrono::DateTime<Utc> = at
+        .with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .expect("truncate to the hour");
+    let stamp = bucket.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let (_s, resp) = super::get_json_with_token(
+        app,
+        &format!(
+            "/api/sites/{site_id}/aggregates/hourly\
+             ?start={stamp}&end={stamp}&parameter_ids={parameter_id}"
+        ),
+        token,
+    )
+    .await;
+    let entry = resp["parameters"]
+        .as_array()?
+        .iter()
+        .find(|p| p["parameter_id"] == parameter_id || p["code"] == parameter_id)?;
+    let mean = entry["avg"].as_array()?.first()?.as_f64()?;
+    let count = entry["count"].as_array()?.first()?.as_i64()?;
+    (count > 0).then_some((mean, count))
 }
 
 /// The first column of a single-row COUNT query.
@@ -119,7 +119,8 @@ pub fn id_of(json: &serde_json::Value) -> String {
         .to_string()
 }
 
-/// Poll a reprocessing job until completed/failed or the deadline elapses; returns the final status.
+/// Poll a reprocessing job to a terminal status and return it. A deadline elapsing is a failure of
+/// the test machine, not a status, so it panics rather than reporting whatever was last observed.
 pub async fn poll_job(app: &Router, token: &str, job_id: &str, max_secs: u64) -> String {
     let deadline = Instant::now() + Duration::from_secs(max_secs);
     loop {
@@ -127,16 +128,21 @@ pub async fn poll_job(app: &Router, token: &str, job_id: &str, max_secs: u64) ->
             super::get_json_with_token(app, &format!("/api/reprocessing_jobs/{job_id}"), token)
                 .await;
         let status = job["status"].as_str().unwrap_or("").to_string();
-        if status == "completed" || status == "failed" || Instant::now() >= deadline {
+        if status == "completed" || status == "failed" {
             return status;
         }
+        assert!(
+            Instant::now() < deadline,
+            "job {job_id} still {status} after {max_secs}s"
+        );
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
 
 /// Wait for all reprocessing jobs of a given `trigger_type` to reach a terminal state. Returns true
-/// if at least one job ran and none failed; false on failure or timeout. For background jobs whose
-/// id isn't returned by the triggering request (e.g. `derived_assignment`, which has a NULL sensor_id).
+/// if at least one job ran and none failed, false if one failed, and panics if the deadline elapses
+/// with jobs still running. For background jobs whose id isn't returned by the triggering request
+/// (e.g. `derived_assignment`, which has a NULL sensor_id).
 pub async fn wait_for_jobs_by_trigger(
     db: &sea_orm::DatabaseConnection,
     trigger_type: &str,
@@ -164,9 +170,10 @@ pub async fn wait_for_jobs_by_trigger(
         if total > 0 && active == 0 {
             return failed == 0;
         }
-        if start.elapsed().as_secs() > timeout_secs {
-            return false;
-        }
+        assert!(
+            start.elapsed().as_secs() <= timeout_secs,
+            "{trigger_type}: {active} of {total} jobs still running after {timeout_secs}s"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

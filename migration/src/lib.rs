@@ -17,6 +17,14 @@ mod m20260908_000002_calculation_engines;
 mod m20260908_000003_source_identity_hold_uniq;
 mod m20260908_000004_notification_kind_groups;
 mod m20260908_000005_curve_fitted_on;
+pub mod m20260908_000006_one_doc_parameter;
+pub mod m20260908_000007_seed_portal_parameter_groups;
+pub mod m20260908_000008_channel_health_into_state;
+mod m20260909_000001_seed_metalp_parameter_groups;
+mod m20260910_000001_change_audit;
+mod m20260910_000002_parameter_default_thresholds;
+mod m20260910_000003_generated_sample_stdev;
+pub mod portal_seed;
 
 pub struct Migrator;
 
@@ -41,6 +49,13 @@ impl MigratorTrait for Migrator {
             Box::new(m20260908_000003_source_identity_hold_uniq::Migration),
             Box::new(m20260908_000004_notification_kind_groups::Migration),
             Box::new(m20260908_000005_curve_fitted_on::Migration),
+            Box::new(m20260908_000006_one_doc_parameter::Migration),
+            Box::new(m20260908_000007_seed_portal_parameter_groups::Migration),
+            Box::new(m20260908_000008_channel_health_into_state::Migration),
+            Box::new(m20260909_000001_seed_metalp_parameter_groups::Migration),
+            Box::new(m20260910_000001_change_audit::Migration),
+            Box::new(m20260910_000002_parameter_default_thresholds::Migration),
+            Box::new(m20260910_000003_generated_sample_stdev::Migration),
         ]
     }
 }

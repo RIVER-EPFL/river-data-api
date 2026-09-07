@@ -436,7 +436,7 @@ async fn find_or_create_sample(
         collected_at: Set(time),
         created_at: Set(Some(chrono::Utc::now())),
         mean: Set(None),
-        stdev: Set(None),
+        stdev: sea_orm::ActiveValue::NotSet,
         stdev_sample: Set(None),
         stdev_population: Set(None),
         median: Set(None),
@@ -1464,11 +1464,9 @@ pub async fn insert_grab_samples(
                     replicate_index: Set(p.replicate_index),
                     raw_value: Set(r.value),
                     calibrated_value: Set(p.calibrated_value),
-                    sensor_id: Set(r.sensor_id.or_else(|| {
-                        stream_sensors
-                            .get(&stream_cache[&r.parameter_id])
-                            .copied()
-                    })),
+                    sensor_id: Set(r
+                        .sensor_id
+                        .or_else(|| stream_sensors.get(&stream_cache[&r.parameter_id]).copied())),
                     calibration_id: Set(p.base_calibration.as_ref().map(|c| c.id)),
                     deployment_id: Set(r.sensor_id.and_then(|sid| {
                         grab_slots
@@ -1664,7 +1662,7 @@ pub async fn insert_grab_samples(
 /// One review-queue row per slot instant an intern entered, so a manager sees the pending entry
 /// beside every other finding. Keyed on (site, parameter, instant): a re-entry at the same slot
 /// refreshes the open hold rather than filing a second one.
-async fn open_unverified_holds<C: sea_orm::ConnectionTrait>(
+pub async fn open_unverified_holds<C: sea_orm::ConnectionTrait>(
     conn: &C,
     site_id: Uuid,
     groups: &[(Uuid, chrono::DateTime<chrono::Utc>)],
@@ -1690,13 +1688,18 @@ async fn open_unverified_holds<C: sea_orm::ConnectionTrait>(
         if updated > 0 {
             continue;
         }
+        // Two saves at one slot instant see no row to update and both insert; the conflict
+        // clause makes the loser refresh the hold instead of failing its whole save.
         conn.execute_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO replicate_audit_holds \
                  (stream_id, site_id, parameter_id, group_time, kind, expected, computed, delta, \
                   status) \
              VALUES (NULL, $1, $2, $3, 'unverified_entry', '{\"state\": \"verified\"}'::jsonb, \
-                     $4, '{}'::jsonb, 'pending')",
+                     $4, '{}'::jsonb, 'pending') \
+             ON CONFLICT (kind, site_id, parameter_id, group_time) \
+                 WHERE stream_id IS NULL AND status = 'pending' \
+             DO UPDATE SET computed = EXCLUDED.computed, created_at = NOW()",
             binds,
         ))
         .await?;

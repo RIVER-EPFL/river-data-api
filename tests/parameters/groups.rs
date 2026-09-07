@@ -59,7 +59,7 @@ async fn history_count(db: &sea_orm::DatabaseConnection, group_id: &str) -> i64 
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT count(*) AS n FROM parameter_group_history WHERE group_id = $1::uuid",
+            "SELECT count(*) AS n FROM change_audit WHERE subject = 'parameter_group:' || $1",
             [group_id.into()],
         ))
         .await
@@ -185,9 +185,9 @@ async fn every_change_appends_a_history_row() {
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT change, old->>'role' AS old_role, new->>'role' AS new_role \
-               FROM parameter_group_history \
-              WHERE group_id = $1::uuid AND change = 'member_update'",
+            "SELECT change, old_value->>'role' AS old_role, new_value->>'role' AS new_role \
+               FROM change_audit \
+              WHERE subject = 'parameter_group:' || $1 AND change = 'member_update'",
             [group_id.as_str().into()],
         ))
         .await

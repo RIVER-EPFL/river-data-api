@@ -1,6 +1,7 @@
-//! Channel health heartbeat. A background probe checks each configured channel and upserts
-//! `notification_channel_health`; the admin endpoint reads the latest persisted state so the
-//! dashboard shows reachability and a last-checked time. Web Push is the one channel today.
+//! Channel health heartbeat. A background probe checks each configured channel and records the
+//! result as a `notification_state` row of kind `channel_health`; the admin endpoint reads the
+//! latest persisted state so the dashboard shows reachability and a last-checked time. Web Push
+//! is the one channel today.
 
 use axum::{Json, extract::State};
 use chrono::{DateTime, Utc};
@@ -14,6 +15,10 @@ use crate::error::AppResult;
 use super::dispatcher::build_channels;
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
+
+/// The `notification_state` kind a channel's health is recorded under, so the probe and the read
+/// cannot drift apart.
+const CHANNEL_HEALTH_KIND: &str = "channel_health";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,11 +57,17 @@ pub async fn probe_once(db: &DatabaseConnection, config: &Config) -> usize {
         let res = db
             .execute_raw(Statement::from_sql_and_values(
                 PG,
-                "INSERT INTO notification_channel_health (channel, healthy, detail, checked_at) \
-                 VALUES ($1, $2, $3, NOW()) \
-                 ON CONFLICT (channel) DO UPDATE SET healthy = EXCLUDED.healthy, \
-                     detail = EXCLUDED.detail, checked_at = EXCLUDED.checked_at",
-                [ch.name().into(), healthy.into(), detail.into()],
+                "INSERT INTO notification_state (kind, subject_key, state, last_notified_at, \
+                     detail) \
+                 VALUES ($1, $2, $3, NOW(), $4) \
+                 ON CONFLICT (kind, subject_key) DO UPDATE SET state = EXCLUDED.state, \
+                     detail = EXCLUDED.detail, last_notified_at = EXCLUDED.last_notified_at",
+                [
+                    CHANNEL_HEALTH_KIND.into(),
+                    ch.name().into(),
+                    if healthy { "healthy" } else { "unhealthy" }.into(),
+                    detail.into(),
+                ],
             ))
             .await;
         if let Err(e) = res {
@@ -73,9 +84,10 @@ async fn read_health(db: &DatabaseConnection, config: &Config) -> NotificationHe
         let row = db
             .query_one_raw(Statement::from_sql_and_values(
                 PG,
-                "SELECT healthy, detail, checked_at FROM notification_channel_health \
-                 WHERE channel = $1",
-                [name.into()],
+                "SELECT state = 'healthy' AS healthy, detail, last_notified_at AS checked_at \
+                   FROM notification_state \
+                  WHERE kind = $1 AND subject_key = $2",
+                [CHANNEL_HEALTH_KIND.into(), name.into()],
             ))
             .await
             .ok()

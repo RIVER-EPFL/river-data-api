@@ -126,6 +126,12 @@ fn stdev_sample(vs: &[f64]) -> f64 {
     variance.sqrt()
 }
 
+fn stdev_population(vs: &[f64]) -> f64 {
+    let m = mean(vs);
+    let variance = vs.iter().map(|v| (v - m).powi(2)).sum::<f64>() / (vs.len() as f64);
+    variance.sqrt()
+}
+
 /// Happy path: create a sample with 3 replicates → aggregate columns match reference.
 #[tokio::test]
 #[serial]
@@ -140,7 +146,11 @@ async fn samples_trigger_populates_aggregate_on_insert() {
         crate::common::GLOBAL_PARAM_TEMP_ID,
     )
     .await;
-    let sample_id = create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID)
+    let sample_id = create_sample(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
     .await;
 
     let values = [10.0_f64, 12.0, 14.0];
@@ -179,7 +189,11 @@ async fn samples_trigger_recomputes_on_flag() {
         crate::common::GLOBAL_PARAM_TEMP_ID,
     )
     .await;
-    let sample_id = create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID)
+    let sample_id = create_sample(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
     .await;
 
     for (i, v) in [10.0_f64, 12.0, 14.0].iter().enumerate() {
@@ -223,7 +237,11 @@ async fn samples_trigger_deletes_unreferenced_sample() {
         crate::common::GLOBAL_PARAM_TEMP_ID,
     )
     .await;
-    let sample_id = create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID)
+    let sample_id = create_sample(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
     .await;
 
     insert_replicate(
@@ -273,7 +291,11 @@ async fn samples_trigger_keeps_row_when_only_flagged_readings_remain() {
         crate::common::GLOBAL_PARAM_TEMP_ID,
     )
     .await;
-    let sample_id = create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID)
+    let sample_id = create_sample(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
     .await;
 
     insert_replicate(
@@ -315,7 +337,11 @@ async fn samples_trigger_handles_reassignment() {
         crate::common::GLOBAL_PARAM_TEMP_ID,
     )
     .await;
-    let sample_a = create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID)
+    let sample_a = create_sample(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
     .await;
     // Create sample B at a different timestamp so its readings don't collide
     // with sample A's (stream_id, time, replicate_index) PK.
@@ -403,7 +429,11 @@ async fn samples_delete_sets_reading_sample_id_null() {
         crate::common::GLOBAL_PARAM_TEMP_ID,
     )
     .await;
-    let sample_id = create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID)
+    let sample_id = create_sample(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
     .await;
 
     insert_replicate(
@@ -462,8 +492,12 @@ async fn samples_trigger_excludes_unverified_replicates_until_they_are_verified(
         crate::common::GLOBAL_PARAM_TEMP_ID,
     )
     .await;
-    let sample_id =
-        create_sample(&db, crate::common::SITE1_ID, crate::common::GLOBAL_PARAM_TEMP_ID).await;
+    let sample_id = create_sample(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
+    .await;
 
     let values = [10.0, 12.0, 14.0];
     for (i, v) in values.iter().enumerate() {
@@ -500,4 +534,54 @@ async fn samples_trigger_excludes_unverified_replicates_until_they_are_verified(
     let agg = fetch_aggregate(&db, sample_id).await;
     assert_eq!(agg.n, 3, "a verify recomputes the group");
     assert!((agg.mean.unwrap() - mean(&values)).abs() < 1e-9);
+}
+
+/// Scenario: a slot declares the population divisor after its statistics were computed.
+/// Expected behaviour: `stdev` is generated from the declaration, so it follows the UPDATE with no
+/// trigger pass over the readings.
+#[tokio::test]
+#[serial]
+async fn stdev_follows_the_declared_estimator_without_a_refresh() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+
+    let stream_id = ensure_stream(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
+    .await;
+    let sample_id = create_sample(
+        &db,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+    )
+    .await;
+
+    let values = [10.0_f64, 12.0, 14.0];
+    for (i, v) in values.iter().enumerate() {
+        insert_replicate(
+            &db,
+            stream_id,
+            crate::common::SITE1_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+            sample_id,
+            (i as i16) + 1,
+            *v,
+        )
+        .await;
+    }
+
+    let before = fetch_aggregate(&db, sample_id).await;
+    assert!((before.stdev.unwrap() - stdev_sample(&values)).abs() < 1e-9);
+
+    exec(
+        &db,
+        &format!("UPDATE samples SET sd_estimator = 'population' WHERE id = '{sample_id}'"),
+    )
+    .await;
+
+    let after = fetch_aggregate(&db, sample_id).await;
+    assert!((after.stdev.unwrap() - stdev_population(&values)).abs() < 1e-9);
 }

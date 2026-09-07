@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sea_orm::{ConnectionTrait, DbErr, EntityTrait, Set, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DbErr, EntityTrait, Set, Statement};
 use uuid::Uuid;
 
 use super::job::{Job, TunableKind, TunableSpec};
@@ -171,7 +171,9 @@ pub struct SlotOutcome {
 }
 
 impl SlotOutcome {
-    pub fn from(results: impl IntoIterator<Item = (serde_json::Value, Result<i64, DbErr>)>) -> Self {
+    pub fn from(
+        results: impl IntoIterator<Item = (serde_json::Value, Result<i64, DbErr>)>,
+    ) -> Self {
         let mut outcome = Self {
             succeeded: 0,
             failed: Vec::new(),
@@ -494,7 +496,8 @@ impl Job for DerivedRecompute {
 
             let mut filled: i32 = 0;
             let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
-            let mut filled_sites: std::collections::BTreeSet<Uuid> = std::collections::BTreeSet::new();
+            let mut filled_sites: std::collections::BTreeSet<Uuid> =
+                std::collections::BTreeSet::new();
             for (i, row) in rows.iter().enumerate() {
                 if ctx.is_cancelled() {
                     break;
@@ -791,7 +794,8 @@ impl Job for IngestDerived {
             if let Err(e) = recalculate_derived_at_timestamp(ctx.db(), site_id, time).await {
                 tracing::warn!(error = %e, site_id = %site_id, time = %time, "Failed to auto-compute derived values after ingest");
             } else {
-                earliest = Some(earliest.map_or(time, |e: chrono::DateTime<chrono::Utc>| e.min(time)));
+                earliest =
+                    Some(earliest.map_or(time, |e: chrono::DateTime<chrono::Utc>| e.min(time)));
             }
             progress += 1;
             if progress % 500 == 0 {
@@ -1782,9 +1786,8 @@ impl Job for JanitorRun {
         //    earliest filled timestamp. Scoped to twice the cadence, so an hourly tick probes an
         //    index range instead of hashing the whole hypertable; the full-refresh tick runs it
         //    unbounded, which is what covers drift older than that window.
-        let since = (!do_full).then(|| {
-            chrono::Utc::now() - chrono::Duration::seconds((cadence_seconds * 2) as i64)
-        });
+        let since = (!do_full)
+            .then(|| chrono::Utc::now() - chrono::Duration::seconds((cadence_seconds * 2) as i64));
         janitor::run_once(db, Some(&ctx), since).await?;
 
         // 2. Repair corrected readings whose stored value is no longer what their own curves
@@ -2195,7 +2198,7 @@ impl Job for PushSubscriptionReconcile {
 }
 
 /// Probe each configured notification channel and upsert
-/// `notification_channel_health`, the channel health heartbeat. Wraps [`health::probe_once`].
+/// The channel health heartbeat. Wraps [`health::probe_once`].
 pub struct NotifyHealth {
     interval_seconds: u64,
 }
@@ -2225,7 +2228,8 @@ impl Job for NotifyHealth {
             return Ok(0);
         };
         let probed =
-            crate::routes::private::notifications::health::probe_once(ctx.db(), &state.config).await;
+            crate::routes::private::notifications::health::probe_once(ctx.db(), &state.config)
+                .await;
         ctx.report(JobReport::new().count("channels_probed", probed))
             .await;
         Ok(0)
@@ -2330,17 +2334,16 @@ impl Job for MeasurementRetag {
             .map_err(|e| DbErr::Custom(e.to_string()))?;
         }
 
-        // 'declared' joins each reading to its stream in both the window probe and the rewrite and
-        // drops the target parameter; a fixed target compares against $1.
+        // 'declared' joins each reading to its stream in the rewrite and drops the target
+        // parameter; a fixed target compares against $1.
         // The sensor arm also matches by stream ownership: readings ingested before attribution
         // backfill carry sensor_id NULL but belong to the sensor's streams all the same.
-        let (scope, from_clause, mismatch, new_value, update_from) = if declared {
+        let (scope, mismatch, new_value, update_from) = if declared {
             (
                 "(r.sensor_id = ANY($1) OR r.stream_id = ANY($2) \
                   OR r.stream_id IN (SELECT id FROM data_streams WHERE sensor_id = ANY($1)) \
                   OR ($3::text IS NOT NULL AND r.stream_id IN \
                       (SELECT id FROM data_streams WHERE source_system = $3)))",
-                ", data_streams ds",
                 "r.stream_id = ds.id AND ds.measurement_type IS NOT NULL \
                  AND r.measurement_type IS DISTINCT FROM ds.measurement_type",
                 "ds.measurement_type",
@@ -2352,7 +2355,6 @@ impl Job for MeasurementRetag {
                   OR r.stream_id IN (SELECT id FROM data_streams WHERE sensor_id = ANY($2)) \
                   OR ($4::text IS NOT NULL AND r.stream_id IN \
                       (SELECT id FROM data_streams WHERE source_system = $4)))",
-                "",
                 "r.measurement_type IS DISTINCT FROM $1",
                 "$1",
                 "",
@@ -2365,31 +2367,6 @@ impl Job for MeasurementRetag {
         values.push(sensor_ids.clone().into());
         values.push(stream_ids.clone().into());
         values.push(source_system.clone().into());
-
-        // Affected window (for the aggregate refresh), read before the rewrite.
-        let window = ctx
-            .db()
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &format!(
-                    "SELECT min(r.time) AS lo, max(r.time) AS hi FROM readings r{from_clause} \
-                     WHERE {mismatch} AND {scope}"
-                ),
-                values.clone(),
-            ))
-            .await?;
-        let (lo, hi) = match &window {
-            Some(row) => (
-                row.try_get::<Option<chrono::DateTime<chrono::FixedOffset>>>("", "lo")?,
-                row.try_get::<Option<chrono::DateTime<chrono::FixedOffset>>>("", "hi")?,
-            ),
-            None => (None, None),
-        };
-        let (Some(lo), Some(hi)) = (lo, hi) else {
-            ctx.info("Nothing to retag, every reading in scope already matches")
-                .await;
-            return Ok(0);
-        };
 
         // A stream declaring a different classification will keep writing its own value on
         // ingest, so the retag would drift back; surface the conflict in the job timeline.
@@ -2426,56 +2403,35 @@ impl Job for MeasurementRetag {
 
         ctx.info(&format!("Retagging readings in scope to '{target}'"))
             .await;
-        let txn = ctx.db().begin().await?;
-        txn.execute_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
-        ))
-        .await?;
-        let retagged = txn
-            .execute_raw(Statement::from_sql_and_values(
+        let touched = crate::common::bulk_write::guarded_mutation(
+            ctx.db(),
+            Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 &format!(
                     "UPDATE readings r SET measurement_type = {new_value} \
                      {update_from} WHERE {mismatch} AND {scope}"
                 ),
                 values,
-            ))
-            .await?
-            .rows_affected();
-        txn.commit().await?;
+            ),
+        )
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
+        let retagged = touched.rows;
 
-        // Membership in the rollups changed (spot/derived are excluded), so refresh every
-        // aggregate over the affected window. Widened by one bucket so monthly boundaries are
-        // fully covered; CALL runs outside the txn (procedures can't run inside one).
-        let refresh_lo = lo - chrono::Duration::days(32);
-        let refresh_hi = hi + chrono::Duration::days(32);
-        for agg in [
-            "readings_hourly",
-            "readings_daily",
-            "readings_weekly",
-            "readings_monthly",
-        ] {
-            if let Err(e) = ctx
-                .db()
-                .execute_raw(Statement::from_string(
-                    sea_orm::DatabaseBackend::Postgres,
-                    format!(
-                        "CALL refresh_continuous_aggregate('{agg}', '{}'::timestamptz, '{}'::timestamptz)",
-                        refresh_lo.to_rfc3339(),
-                        refresh_hi.to_rfc3339()
-                    ),
-                ))
-                .await
-            {
-                ctx.log(
-                    "warn",
-                    &format!("Failed to refresh {agg} after retag"),
-                    serde_json::json!({ "error": e.to_string() }),
-                )
+        // Membership in the rollups changed (spot and derived are excluded), so every aggregate is
+        // refreshed over what the rewrite touched. A failure here leaves the rollups holding the
+        // old membership, so it fails the job rather than being logged.
+        let Some((lo, hi)) = touched.span() else {
+            ctx.info("Nothing to retag, every reading in scope already matches")
                 .await;
-            }
-        }
+            return Ok(0);
+        };
+        crate::common::aggregates::refresh(
+            ctx.db(),
+            crate::common::aggregates::Window::Range(lo, hi),
+        )
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
 
         // Reclassified rows change what bounded cached responses would serve.
         if retagged > 0
@@ -2653,7 +2609,10 @@ impl Job for SdEstimatorRetag {
                 )
                 .scope(
                     "stream_ids",
-                    stream_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    stream_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
                 )
                 .scope("override_instants", override_instants)
                 .scope("estimator", target)

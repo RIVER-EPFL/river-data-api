@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::{ActiveModelTrait, DatabaseConnection, Set};
+use uuid::Uuid;
 
 use super::model::{self, ApiToken};
 use super::service::mint_api_token;
@@ -10,6 +11,20 @@ pub struct ApiTokenOperations;
 #[async_trait]
 impl CRUDOperations for ApiTokenOperations {
     type Resource = ApiToken;
+
+    /// One row at a time, through the single-row path: the crudcrate default delegates to the
+    /// resource, which delegates back here, and the single-row hooks are what a batch needs too.
+    async fn update_many(
+        &self,
+        db: &DatabaseConnection,
+        updates: Vec<(Uuid, <ApiToken as CRUDResource>::UpdateModel)>,
+    ) -> Result<Vec<ApiToken>, ApiError> {
+        let mut updated = Vec::with_capacity(updates.len());
+        for (id, data) in updates {
+            updated.push(self.update(db, id, data).await?);
+        }
+        Ok(updated)
+    }
 
     /// One row at a time, through the single-row path: the crudcrate default `create_many`
     /// delegates to the resource, which delegates back here, so the default recurses; the loop

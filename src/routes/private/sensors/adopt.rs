@@ -247,13 +247,8 @@ pub async fn adopt_sensor(
     }
 
     let txn = db.begin().await?;
-    // Lift the decompression cap for the readings parameter_id backfill below (no-op on uncompressed
-    // data; resets on commit). Applies to the whole transaction.
-    txn.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
-    ))
-    .await?;
+    // The readings parameter_id backfill below reaches compressed chunks.
+    crate::common::bulk_write::lift_decompression_cap(&txn).await?;
     let (site_parameter_id, site_parameter_created) = resolve_or_create_site_parameter(
         &txn,
         payload.site_id,
@@ -481,12 +476,8 @@ pub async fn swap_sensors(
     let at = payload.at.unwrap_or_else(Utc::now);
 
     let txn = db.begin().await?;
-    // Lift the decompression cap for the readings parameter_id backfill below (resets on commit).
-    txn.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
-    ))
-    .await?;
+    // The readings parameter_id backfill below reaches compressed chunks.
+    crate::common::bulk_write::lift_decompression_cap(&txn).await?;
     let (site_parameter_id, _created) = resolve_or_create_site_parameter(
         &txn,
         payload.site_id,

@@ -7,3 +7,4 @@
 mod common;
 
 mod groups;
+mod portal_group_seed;

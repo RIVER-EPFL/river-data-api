@@ -32,6 +32,9 @@ async fn swap_reattributes_post_swap_readings() {
     )
     .await;
     let sensor_b = sl::create_sensor(&db, "feed-b", crate::common::GLOBAL_PARAM_TEMP_ID).await;
+    // B's own curve, open from the swap instant: what the handed-over readings must resolve.
+    let cal_b =
+        sl::add_calibration(&db, sensor_b.id, 2.0, 0.0, sl::dt("2025-06-01T00:30:00Z")).await;
 
     // One feed (paired stream) initially owned by A, with six readings.
     let stream = sl::create_paired_stream(&db, "feed", crate::common::PARAM_S1_TEMP_ID).await;
@@ -88,17 +91,39 @@ async fn swap_reattributes_post_swap_readings() {
     assert_eq!(rows.len(), 6);
     for (i, r) in rows.iter().enumerate() {
         assert_eq!(r.site_id, Some(site1), "reading[{i}] stays at site 1");
+        // The curve is asserted beside the owner: a reading says who measured it and which of that
+        // instrument's curves corrected it, and the two cannot come from different sensors.
         if i < 3 {
             assert_eq!(
                 r.sensor_id,
                 Some(sensor_a.id),
                 "reading[{i}] before swap stays sensor A"
             );
+            assert_eq!(
+                r.calibration_id,
+                Some(cal_a),
+                "reading[{i}] before swap keeps A's curve"
+            );
+            assert_eq!(
+                r.calibrated_value,
+                Some(10.0 + i as f64),
+                "reading[{i}] keeps A's 1.0x value"
+            );
         } else {
             assert_eq!(
                 r.sensor_id,
                 Some(sensor_b.id),
                 "reading[{i}] after swap re-attributes to sensor B"
+            );
+            assert_eq!(
+                r.calibration_id,
+                Some(cal_b),
+                "reading[{i}] after swap resolves B's curve, never the outgoing sensor's"
+            );
+            assert_eq!(
+                r.calibrated_value,
+                Some((10.0 + i as f64) * 2.0),
+                "reading[{i}] is recomputed by B's 2.0x curve"
             );
         }
     }

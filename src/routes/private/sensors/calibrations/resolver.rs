@@ -138,7 +138,7 @@ pub async fn resolve_many<C: ConnectionTrait>(
     Ok(out)
 }
 
-/// Attribute a stream's un-owned readings to `sensor_id`, by window.
+/// Attribute a stream's readings to `sensor_id`, by window, and report how many that moved.
 ///
 /// `POST /streams/{id}/import` adopts a stream's instrument into inventory; this is the readings
 /// half. Each reading takes the curve whose window covers its own time, not the sensor's newest
@@ -146,7 +146,10 @@ pub async fn resolve_many<C: ConnectionTrait>(
 /// adopted: an instrument with none, or with none covering this stretch of time, is an ordinary
 /// state, and those readings simply keep what they had until a reprocess resolves them.
 ///
-/// `sensor_id IS NULL` is the idempotence key, so a second import reports nothing attributed.
+/// Since registration attaches an instrument and the insert trigger stamps every row from its
+/// stream, an unowned reading is the exception rather than the rule, so the row set is the stream's
+/// own rows and the count is what actually changed: a row newly owned, or one whose curve the
+/// window resolved differently. A second import reports nothing.
 ///
 /// Spot rows take the owner and nothing else: a grab is corrected at entry (`/grab_samples`),
 /// against the base curve resolved then and the standard curve the operator picked, and re-stamping
@@ -159,34 +162,7 @@ pub async fn attribute_stream_by_window<C>(
 where
     C: ConnectionTrait + sea_orm::TransactionTrait,
 {
-    let sql = format!(
-        r"UPDATE readings tgt
-          SET sensor_id = $2,
-              calibration_id = CASE
-                  WHEN {windowed}
-                      THEN COALESCE(picked.cal_id, tgt.calibration_id)
-                  ELSE tgt.calibration_id
-              END,
-              calibrated_value = CASE
-                  WHEN picked.cal_id IS NOT NULL AND {windowed}
-                      THEN {value}
-                  ELSE tgt.calibrated_value
-              END
-          FROM (
-              SELECT r.stream_id AS p_stream_id, r.time AS p_time,
-                     r.replicate_index AS p_replicate_index,
-                     cw.id AS cal_id, cw.slope, cw.intercept
-              FROM readings r
-              LEFT JOIN LATERAL ({pick}) cw ON true
-              WHERE r.stream_id = $1 AND r.sensor_id IS NULL
-          ) picked
-          WHERE tgt.stream_id = picked.p_stream_id
-            AND tgt.time = picked.p_time
-            AND tgt.replicate_index = picked.p_replicate_index",
-        windowed = super::service::calibration_derivable("tgt"),
-        value = calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
-        pick = pick_calibration_lateral("$2")
-    );
+    let sql = attribute_by_window_sql();
 
     let touched = bulk_write::guarded_mutation(
         db,
@@ -200,9 +176,64 @@ where
     Ok(touched.rows)
 }
 
+/// The statement `attribute_stream_by_window` runs, as one expression so its row set and its
+/// change predicate can be read without a database.
+fn attribute_by_window_sql() -> String {
+    format!(
+        r"UPDATE readings tgt
+      SET sensor_id = $2,
+          calibration_id = CASE
+              WHEN {windowed}
+                  THEN COALESCE(picked.cal_id, tgt.calibration_id)
+              ELSE tgt.calibration_id
+          END,
+          calibrated_value = CASE
+              WHEN picked.cal_id IS NOT NULL AND {windowed}
+                  THEN {value}
+              ELSE tgt.calibrated_value
+          END
+      FROM (
+          SELECT r.stream_id AS p_stream_id, r.time AS p_time,
+                 r.replicate_index AS p_replicate_index,
+                 cw.id AS cal_id, cw.slope, cw.intercept
+          FROM readings r
+          LEFT JOIN LATERAL ({pick}) cw ON true
+          WHERE r.stream_id = $1 AND (r.sensor_id IS NULL OR r.sensor_id = $2)
+      ) picked
+      WHERE tgt.stream_id = picked.p_stream_id
+        AND tgt.time = picked.p_time
+        AND tgt.replicate_index = picked.p_replicate_index
+        AND (tgt.sensor_id IS DISTINCT FROM $2
+             OR (picked.cal_id IS NOT NULL
+                 AND {windowed}
+                 AND tgt.calibration_id IS DISTINCT FROM picked.cal_id))",
+        windowed = super::service::calibration_derivable("tgt"),
+        value = calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
+        pick = pick_calibration_lateral("$2")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_import_reads_the_streams_own_rows_and_writes_only_what_moves() {
+        let sql = attribute_by_window_sql();
+        assert!(
+            sql.contains("WHERE r.stream_id = $1 AND (r.sensor_id IS NULL OR r.sensor_id = $2)"),
+            "the row set is the stream's unowned rows and the ones this instrument already owns: \
+             {sql}"
+        );
+        assert!(
+            sql.contains("tgt.sensor_id IS DISTINCT FROM $2"),
+            "a row already owned is only rewritten for its curve: {sql}"
+        );
+        assert!(
+            sql.contains("tgt.calibration_id IS DISTINCT FROM picked.cal_id"),
+            "so the count reports rows that moved rather than rows that matched: {sql}"
+        );
+    }
 
     #[test]
     fn the_ranking_is_one_expression_parameterised_only_by_the_sensor() {

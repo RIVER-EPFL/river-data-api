@@ -155,8 +155,8 @@ async fn bucket_of(
 }
 
 /// A tracked job as the API reports it, polled until it settles. Settled means terminal or, for a
-/// job that failed and is waiting on a backoff, carrying an error. Parses leniently so a caller
-/// that must run teardown before asserting is never taken out by a panic mid-poll.
+/// job that failed and is waiting on a backoff, carrying an error. Parses leniently so a malformed
+/// body mid-poll is retried rather than fatal; a deadline elapsing is fatal and names the status.
 async fn poll_job_view(app: &Router, jwt: &str, job_id: &str, max_secs: u64) -> Value {
     let deadline = std::time::Instant::now() + Duration::from_secs(max_secs);
     loop {
@@ -166,12 +166,13 @@ async fn poll_job_view(app: &Router, jwt: &str, job_id: &str, max_secs: u64) -> 
         let job: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
         let status = job["status"].as_str().unwrap_or("").to_string();
         let errored = job["error_message"].as_str().is_some_and(|m| !m.is_empty());
-        if matches!(status.as_str(), "completed" | "failed" | "cancelled")
-            || errored
-            || std::time::Instant::now() >= deadline
-        {
+        if matches!(status.as_str(), "completed" | "failed" | "cancelled") || errored {
             return job;
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job {job_id} still {status} after {max_secs}s"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -340,7 +341,7 @@ async fn janitor_full_refresh_follows_the_operator_cadence() {
             "the batch's follow-on jobs settle before the tick"
         );
         assert!(
-            e2e::hourly_bucket(&db, &track.site_id, &parameter_id, instant(&at))
+            e2e::hourly_bucket(&app, &token, &track.site_id, &parameter_id, instant(&at))
                 .await
                 .is_none(),
             "the {at} bucket is unmaterialised before the {slot} janitor run"
@@ -368,7 +369,8 @@ async fn janitor_full_refresh_follows_the_operator_cadence() {
             "the janitor run for slot {slot} completes"
         );
 
-        let bucket = e2e::hourly_bucket(&db, &track.site_id, &parameter_id, instant(&at)).await;
+        let bucket =
+            e2e::hourly_bucket(&app, &token, &track.site_id, &parameter_id, instant(&at)).await;
         if let Some((mean, count)) = bucket {
             assert!(
                 (mean - value).abs() < 1e-9 && count == 1,
@@ -423,12 +425,12 @@ async fn merging_site_parameters_moves_the_rollups_with_the_readings() {
     e2e::refresh_hourly(&db, instant(&format!("{day}T00:00:00Z"))).await;
     let at = instant(&format!("{day}T10:00:00Z"));
     assert_eq!(
-        e2e::hourly_bucket(&db, &track.site_id, &source, at).await,
+        e2e::hourly_bucket(&app, &admin, &track.site_id, &source, at).await,
         Some((120.0, 2)),
         "the source slot's hourly bucket holds the mean of 110 and 130 before the merge"
     );
     assert_eq!(
-        e2e::hourly_bucket(&db, &track.site_id, &target, at).await,
+        e2e::hourly_bucket(&app, &admin, &track.site_id, &target, at).await,
         None,
         "the target slot has no data of its own before the merge"
     );
@@ -464,13 +466,13 @@ async fn merging_site_parameters_moves_the_rollups_with_the_readings() {
     );
 
     assert_eq!(
-        e2e::hourly_bucket(&db, &track.site_id, &target, at).await,
+        e2e::hourly_bucket(&app, &admin, &track.site_id, &target, at).await,
         Some((120.0, 2)),
         "the survivor's rollup must carry the moved readings, or the chart shows an empty series \
          while /readings shows the data"
     );
     assert_eq!(
-        e2e::hourly_bucket(&db, &track.site_id, &source, at).await,
+        e2e::hourly_bucket(&app, &admin, &track.site_id, &source, at).await,
         None,
         "and the absorbed parameter's rollup must be gone, not left standing on deleted readings"
     );
@@ -540,7 +542,7 @@ async fn a_refresh_that_cannot_run_fails_its_job() {
     );
     let at = instant(&format!("{day}T08:00:00Z"));
     assert_eq!(
-        e2e::hourly_bucket(&db, &track.site_id, &parameter_id, at).await,
+        e2e::hourly_bucket(&app, &admin, &track.site_id, &parameter_id, at).await,
         Some((140.0, 1)),
         "and that completed refresh really materialised the bucket"
     );
@@ -851,8 +853,8 @@ async fn an_incremental_refresh_covers_the_bucket_containing_its_start() {
     let first = instant(&format!("{day}T14:22:00Z"));
     let second = instant(&format!("{day}T16:10:00Z"));
     let site = track.site_id.clone();
-    let hourly_first = e2e::hourly_bucket(&db, &site, &parameter_id, first).await;
-    let hourly_second = e2e::hourly_bucket(&db, &site, &parameter_id, second).await;
+    let hourly_first = e2e::hourly_bucket(&app, &admin, &site, &parameter_id, first).await;
+    let hourly_second = e2e::hourly_bucket(&app, &admin, &site, &parameter_id, second).await;
     let daily = daily_bucket(&db, &site, &parameter_id, first).await;
     let weekly = weekly_bucket(&db, &site, &parameter_id, first).await;
 
@@ -861,7 +863,7 @@ async fn an_incremental_refresh_covers_the_bucket_containing_its_start() {
         full["status"], "completed",
         "the control full refresh completes: {full}"
     );
-    let hourly_first_full = e2e::hourly_bucket(&db, &site, &parameter_id, first).await;
+    let hourly_first_full = e2e::hourly_bucket(&app, &admin, &site, &parameter_id, first).await;
     let daily_full = daily_bucket(&db, &site, &parameter_id, first).await;
 
     assert_eq!(

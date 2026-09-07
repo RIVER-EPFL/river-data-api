@@ -7,6 +7,7 @@
 mod common;
 
 mod cache_builder;
+mod cleanup_coverage;
 mod compression;
 mod exclusive_database;
 mod statement_timeout;

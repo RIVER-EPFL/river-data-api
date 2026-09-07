@@ -754,12 +754,12 @@ async fn muted_slot_receives_no_stale_data_notification() {
     );
 }
 
-// the Telegram /thresholds command queries alarm_thresholds directly, so a site whose
-// thresholds resolve from the parameter-default tier reports none configured.
+// A parameter's own bounds are its global `alarm_thresholds` row, so the Telegram /thresholds
+// command, which queries that table directly, reports what the resolution reports.
 #[tokio::test]
 #[serial]
-async fn telegram_thresholds_reports_the_parameter_default_tier() {
-    if !kc::require_keycloak_or_skip("telegram_thresholds_reports_the_parameter_default_tier").await
+async fn telegram_thresholds_reports_the_global_tier() {
+    if !kc::require_keycloak_or_skip("telegram_thresholds_reports_the_global_tier").await
     {
         return;
     }
@@ -780,20 +780,34 @@ async fn telegram_thresholds_reports_the_parameter_default_tier() {
             "default_units": "mm",
             "category": "measurement",
             "aliases": [],
-            "default_warning_min": 5.0,
-            "default_warning_max": 20.0,
-            "default_alarm_min": 1.0,
-            "default_alarm_max": 30.0,
         }),
         &jwt,
     )
     .await;
     assert!(
         (200..300).contains(&status),
-        "create a parameter carrying default bounds ({status}): {default_param}"
+        "create the parameter whose bounds are global ({status}): {default_param}"
     );
     let default_param_id = e2e::id_of(&default_param);
     e2e::assign_site_parameter_minimal(&app, &jwt, &site_id, &default_param_id).await;
+
+    let (status, global) = post_json_parse_with_token(
+        &app,
+        "/api/alarm_thresholds",
+        &json!({
+            "parameter_id": default_param_id,
+            "warning_min": 5.0,
+            "warning_max": 20.0,
+            "alarm_min": 1.0,
+            "alarm_max": 30.0,
+        }),
+        &jwt,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "create the parameter's global threshold ({status}): {global}"
+    );
 
     let site_param = e2e::create_parameter(&app, &jwt, "Rd049Site", "RD049 Site Tier", "mm").await;
     e2e::assign_site_parameter_minimal(&app, &jwt, &site_id, &site_param).await;
@@ -826,8 +840,8 @@ async fn telegram_thresholds_reports_the_parameter_default_tier() {
     let default_row = entry_for(&resolved, &default_param_id);
     assert_eq!(
         default_row["source"],
-        json!("default"),
-        "the slot resolves from the parameter-default tier: {resolved}"
+        json!("global"),
+        "the slot resolves from the parameter's global threshold: {resolved}"
     );
 
     let site_row = entry_for(&resolved, &site_param);

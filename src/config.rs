@@ -145,7 +145,7 @@ pub struct Config {
     pub notify_poll_interval_seconds: u64,
     pub identity_reconcile_interval_seconds: u64,
     // How often the background health probe checks each configured channel (getMe / SMTP NOOP /
-    // Graph token) and upserts notification_channel_health.
+    // Graph token) and records each channel's health in notification_state.
     pub notify_health_interval_seconds: u64,
     // Battery depletion forecast: cutoff voltage and the days-to-cutoff threshold that raises an alert.
     pub battery_cutoff_volts: f64,

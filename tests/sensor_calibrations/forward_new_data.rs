@@ -112,9 +112,14 @@ async fn wait_for_job(
             status.as_deref(),
             Some("completed" | "failed" | "cancelled")
         );
-        if settled || Instant::now() >= deadline {
+        if settled {
             return status;
         }
+        assert!(
+            Instant::now() < deadline,
+            "{trigger_type} job for {trigger_id} still {status:?} after {}s",
+            timeout.as_secs()
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -812,7 +817,14 @@ async fn aggregates_report_the_new_curve_for_the_new_bucket_and_leave_the_old_bu
     let parameter_id = fx.parameter_id().to_string();
 
     refresh_hourly(&db, dt("2025-06-01T00:00:00Z")).await;
-    let history = hourly_bucket(&db, &fx.track.site_id, &parameter_id, dt(HISTORY_BUCKET)).await;
+    let history = hourly_bucket(
+        &app,
+        &admin,
+        &fx.track.site_id,
+        &parameter_id,
+        dt(HISTORY_BUCKET),
+    )
+    .await;
     assert!(
         history.is_some(),
         "the history bucket materialises once the aggregate is refreshed over its range"
@@ -854,7 +866,14 @@ async fn aggregates_report_the_new_curve_for_the_new_bucket_and_leave_the_old_bu
 
     // A completed job is not evidence of a refresh (refresh errors are swallowed by a warn), so the
     // bucket values are what the assertions read.
-    let forward = hourly_bucket(&db, &fx.track.site_id, &parameter_id, dt(FORWARD_BUCKET)).await;
+    let forward = hourly_bucket(
+        &app,
+        &admin,
+        &fx.track.site_id,
+        &parameter_id,
+        dt(FORWARD_BUCKET),
+    )
+    .await;
     assert!(
         forward.is_some(),
         "the reprocess refreshes the aggregate from the sensor's earliest reading, so the new bucket exists"
@@ -866,7 +885,14 @@ async fn aggregates_report_the_new_curve_for_the_new_bucket_and_leave_the_old_bu
     );
     assert_eq!(count, 2, "two readings roll up");
 
-    let history = hourly_bucket(&db, &fx.track.site_id, &parameter_id, dt(HISTORY_BUCKET)).await;
+    let history = hourly_bucket(
+        &app,
+        &admin,
+        &fx.track.site_id,
+        &parameter_id,
+        dt(HISTORY_BUCKET),
+    )
+    .await;
     assert!(history.is_some(), "the history bucket survives the refresh");
     let (mean, count) = history.unwrap();
     assert_eq!(mean, 45.0, "the older bucket still reports C1's mean");

@@ -786,8 +786,9 @@ async fn stream_import_attributes_each_reading_to_its_covering_curve() {
         "a stream with no instrument mints its own: {imported}"
     );
     assert_eq!(
-        imported["attributed"], 1,
-        "the fresh stream's reading is stamped: {imported}"
+        imported["attributed"], 0,
+        "registration attached the instrument the import adopts and the insert stamped the row \
+         from it, so the import moves nothing: {imported}"
     );
 
     let fresh_rows = sl::get_readings(&f.db, as_uuid(&fresh_stream)).await;

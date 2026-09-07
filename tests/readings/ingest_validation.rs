@@ -147,13 +147,14 @@ fn seconds_rfc3339(at: chrono::DateTime<chrono::Utc>) -> String {
 
 /// The hourly bucket a slot resolves at `at`, asserted present, as `(mean, count)`.
 async fn bucket(
-    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    token: &str,
     site_id: &str,
     parameter_id: &str,
     at: chrono::DateTime<chrono::Utc>,
     context: &str,
 ) -> (f64, i64) {
-    let materialised = e2e::hourly_bucket(db, site_id, parameter_id, at).await;
+    let materialised = e2e::hourly_bucket(app, token, site_id, parameter_id, at).await;
     assert!(
         materialised.is_some(),
         "{context}: the hour holding the imported rows must materialise a bucket"
@@ -412,7 +413,8 @@ async fn csv_overwrite_replaces_a_synced_reading_instead_of_duplicating_the_slot
 
     e2e::refresh_hourly(&db, instant("2025-06-11T00:00:00Z")).await;
     let (mean, count) = bucket(
-        &db,
+        &app,
+        &admin,
         &slot.site_id,
         &slot.parameter_id,
         instant(at),
@@ -630,7 +632,8 @@ async fn csv_import_refuses_a_non_finite_cell_and_leaves_the_bucket_computable()
 
     e2e::refresh_hourly(&db, instant("2025-06-12T00:00:00Z")).await;
     let (mean, count) = bucket(
-        &db,
+        &app,
+        &admin,
         &slot.site_id,
         &slot.parameter_id,
         instant("2025-06-12T09:00:00Z"),
@@ -704,7 +707,8 @@ async fn csv_import_treats_every_spelling_of_the_sentinel_as_missing() {
     let at = instant("2025-06-13T09:00:00Z");
 
     let (mean, count) = bucket(
-        &db,
+        &app,
+        &admin,
         &decimal_slot.site_id,
         &decimal_slot.parameter_id,
         at,
@@ -719,7 +723,8 @@ async fn csv_import_treats_every_spelling_of_the_sentinel_as_missing() {
     );
 
     let (mean, count) = bucket(
-        &db,
+        &app,
+        &admin,
         &decimal_slot.site_id,
         &bare_parameter_id,
         at,

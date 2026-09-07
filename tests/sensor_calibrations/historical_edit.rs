@@ -273,7 +273,7 @@ fn check(rows: &[ReadingRow], expected: &[(&str, f64, f64, Uuid)], phase: &str) 
 }
 
 async fn hourly(fx: &Fixture, site: &str, at: &str, why: &str) -> (f64, i64) {
-    let bucket = e2e::hourly_bucket(&fx.db, site, fx.parameter(), ts(at)).await;
+    let bucket = e2e::hourly_bucket(&fx.app, &fx.river, site, fx.parameter(), ts(at)).await;
     assert!(
         bucket.is_some(),
         "{why}: no hourly bucket materialised at {at} for site {site}"

@@ -93,6 +93,69 @@ pub async fn setup_test_db() -> DatabaseConnection {
 /// The instrument a hand-built fixture stream belongs to.
 pub const FIXTURE_SENSOR_ID: &str = "00000000-0000-4000-e000-000000000999";
 
+/// The tables the TRUNCATE empties. With [`CLEANUP_DELETED_TABLES`] this is the whole of what
+/// `cleanup_test_db` covers, and `tests/harness/cleanup_coverage.rs` holds the pair against the
+/// schema.
+///
+/// `constants` is migration-seeded reference data; truncating it cannot be undone by
+/// `seed_test_data`, so it is deliberately absent.
+pub const CLEANUP_TRUNCATED_TABLES: &[&str] = &[
+    "readings",
+    "reading_decisions",
+    "reading_decision_sets",
+    "status_events",
+    "samples",
+    "tool_runs",
+    "seasonal_checks",
+    "collection_events",
+    "sync_service_tokens",
+    "sync_events",
+    "sync_commands",
+    "sync_services",
+    "sync_service_credentials",
+    "pairing_plans",
+    "data_streams",
+    "reprocessing_jobs",
+    "schedules",
+    "change_audit",
+    "csv_import_staging",
+    "annotations",
+    "notes",
+    "alarm_thresholds",
+    "alarm_events",
+    "api_tokens",
+    "api_token_audit_log",
+    "web_push_subscriptions",
+    "notification_mutes",
+    "notification_log",
+    "notification_state",
+    "notification_subscribers",
+    "notification_subscriptions",
+    "sensor_calibrations",
+    "sensor_deployments",
+    "sensors",
+    "derived_parameter_sources",
+    "derived_parameter_definitions",
+    "user_project_grants",
+    "site_parameters",
+    "parameters",
+    "sites",
+    "subprojects",
+    "projects",
+];
+
+/// The tables emptied by statement instead, because their migration-seeded rows stay.
+pub const CLEANUP_DELETED_TABLES: &[&str] = &[
+    "parameter_group_members",
+    "parameter_groups",
+    "tool_script_activations",
+    "tool_script_versions",
+    "tool_scripts",
+];
+
+/// Reference data a test reads and never owns.
+pub const CLEANUP_EXEMPT_TABLES: &[&str] = &["constants", "seaql_migrations"];
+
 pub async fn cleanup_test_db(db: &DatabaseConnection) {
     let stmts = [
         "SELECT remove_continuous_aggregate_policy('readings_monthly', if_not_exists => true)",
@@ -116,47 +179,29 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
         // `parameter_groups`, so a TRUNCATE ... CASCADE over the groups would take the seeded
         // calculations with it.
         "DELETE FROM parameter_group_members",
-        "DELETE FROM parameter_group_history",
         "UPDATE tool_scripts SET parameter_group_id = NULL",
         "DELETE FROM parameter_groups",
-        // `constants` is migration-seeded reference data; truncating it cannot be undone by
-        // seed_test_data, so it is deliberately absent from this list.
-        "TRUNCATE readings, reading_decisions, status_events, samples, \
-         tool_runs, seasonal_checks, collection_events, \
-         sync_service_tokens, sync_events, sync_commands, sync_services, sync_service_credentials, \
-         pairing_plans, data_streams, \
-         reprocessing_jobs, schedules, schedule_audit, csv_import_staging, \
-         annotations, notes, \
-         alarm_thresholds, alarm_events, api_tokens, \
-         web_push_subscriptions, \
-         notification_mutes, notification_log, notification_state, \
-         notification_subscribers, notification_subscriptions, notification_channel_health, \
-         sensor_calibrations, sensor_deployments, sensors, \
-         derived_parameter_sources, derived_parameter_definitions, \
-         user_project_grants, \
-         site_parameters, parameters, sites, subprojects, projects CASCADE",
     ];
 
     for sql in &stmts {
-        let _ = db
-            .execute_raw(Statement::from_string(
-                sea_orm::DatabaseBackend::Postgres,
-                sql.to_string(),
-            ))
-            .await;
+        exec(db, sql).await;
     }
+    exec(
+        db,
+        &format!("TRUNCATE {} CASCADE", CLEANUP_TRUNCATED_TABLES.join(", ")),
+    )
+    .await;
 
     // Truncated with the rest, and restored here: the column default above points at it.
-    let _ = db
-        .execute_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "INSERT INTO sensors (id, name, is_active, source_system, source_key) \
-                 VALUES ('{FIXTURE_SENSOR_ID}', 'Fixture instrument', true, 'fixture', 'fixture') \
-                 ON CONFLICT DO NOTHING"
-            ),
-        ))
-        .await;
+    exec(
+        db,
+        &format!(
+            "INSERT INTO sensors (id, name, is_active, source_system, source_key) \
+             VALUES ('{FIXTURE_SENSOR_ID}', 'Fixture instrument', true, 'fixture', 'fixture') \
+             ON CONFLICT DO NOTHING"
+        ),
+    )
+    .await;
 }
 
 pub async fn exec(db: &DatabaseConnection, sql: &str) {

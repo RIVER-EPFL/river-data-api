@@ -1,5 +1,5 @@
-//! Tests that alarm evaluation falls back to parameter defaults when no explicit
-//! alarm_thresholds row exists, and that explicit thresholds override defaults.
+//! Tests that alarm evaluation falls back to the parameter's global `alarm_thresholds` row when
+//! the site has none of its own, and that a site row overrides it.
 //!
 //! Run with: cargo test --test alarm_thresholds
 //! Requires: DATABASE_URL pointing to a TimescaleDB instance.
@@ -16,11 +16,11 @@ async fn exec(db: &sea_orm::DatabaseConnection, sql: &str) {
     .unwrap_or_else(|e| panic!("SQL failed: {e}\nQuery: {sql}"));
 }
 
-/// Scenario: parameter has default thresholds, no alarm_thresholds rows exist.
-/// Expected behaviour: alarms still fire using the parameter defaults.
+/// Scenario: the parameter carries a global threshold row and the site carries none.
+/// Expected behaviour: alarms fire against the global row.
 #[tokio::test]
 #[serial]
-async fn test_parameter_defaults_trigger_alarms_without_explicit_thresholds() {
+async fn test_global_threshold_triggers_alarms_without_a_site_row() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -34,10 +34,8 @@ async fn test_parameter_defaults_trigger_alarms_without_explicit_thresholds() {
     exec(
         &db,
         &format!(
-            "UPDATE parameters SET \
-             default_warning_min = 0.5, default_warning_max = 20.0, \
-             default_alarm_min = 0.0, default_alarm_max = 25.0 \
-             WHERE id = '{}'",
+            "INSERT INTO alarm_thresholds (id, parameter_id, site_id, warning_min, warning_max, alarm_min, alarm_max, description) \
+             VALUES (gen_random_uuid(), '{}', NULL, 0.5, 20.0, 0.0, 25.0, 'Parameter default')",
             crate::common::GLOBAL_PARAM_TEMP_ID
         ),
     )
@@ -55,7 +53,7 @@ async fn test_parameter_defaults_trigger_alarms_without_explicit_thresholds() {
     let times = body["times"].as_array().unwrap();
     assert!(
         !times.is_empty(),
-        "parameter defaults should trigger alarm violations even without alarm_thresholds rows. response: {body}"
+        "the parameter's global threshold should trigger violations at a site with no row of its own. response: {body}"
     );
 
     let params = body["parameters"].as_array().unwrap();
@@ -81,11 +79,11 @@ async fn test_parameter_defaults_trigger_alarms_without_explicit_thresholds() {
     crate::common::cleanup_test_db(&db).await;
 }
 
-/// Scenario: parameter has defaults AND an explicit alarm_thresholds row with different values.
-/// Expected behaviour: the explicit threshold overrides the parameter default.
+/// Scenario: the parameter carries a global row and the site carries one with different values.
+/// Expected behaviour: the site row wins.
 #[tokio::test]
 #[serial]
-async fn test_explicit_threshold_overrides_parameter_default() {
+async fn test_site_threshold_overrides_the_global_row() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -99,10 +97,8 @@ async fn test_explicit_threshold_overrides_parameter_default() {
     exec(
         &db,
         &format!(
-            "UPDATE parameters SET \
-             default_warning_min = 0.5, default_warning_max = 20.0, \
-             default_alarm_min = 0.0, default_alarm_max = 25.0 \
-             WHERE id = '{}'",
+            "INSERT INTO alarm_thresholds (id, parameter_id, site_id, warning_min, warning_max, alarm_min, alarm_max, description) \
+             VALUES (gen_random_uuid(), '{}', NULL, 0.5, 20.0, 0.0, 25.0, 'Parameter default')",
             crate::common::GLOBAL_PARAM_TEMP_ID
         ),
     )
@@ -143,11 +139,11 @@ async fn test_explicit_threshold_overrides_parameter_default() {
     crate::common::cleanup_test_db(&db).await;
 }
 
-/// Scenario: parameter defaults set, no alarm_thresholds rows.
+/// Scenario: the parameter carries a global row and no site has one.
 /// Expected behaviour: GET /alarms/active returns the parameter in the breach list.
 #[tokio::test]
 #[serial]
-async fn test_active_alarms_includes_parameter_default_violations() {
+async fn test_active_alarms_includes_global_threshold_violations() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -160,10 +156,8 @@ async fn test_active_alarms_includes_parameter_default_violations() {
     exec(
         &db,
         &format!(
-            "UPDATE parameters SET \
-             default_warning_min = 0.5, default_warning_max = 20.0, \
-             default_alarm_min = 0.0, default_alarm_max = 25.0 \
-             WHERE id = '{}'",
+            "INSERT INTO alarm_thresholds (id, parameter_id, site_id, warning_min, warning_max, alarm_min, alarm_max, description) \
+             VALUES (gen_random_uuid(), '{}', NULL, 0.5, 20.0, 0.0, 25.0, 'Parameter default')",
             crate::common::GLOBAL_PARAM_TEMP_ID
         ),
     )
@@ -178,8 +172,8 @@ async fn test_active_alarms_includes_parameter_default_violations() {
 
     // fetch_active_alarm_rows checks the single latest reading per (site, parameter).
     // The seed data's last temperature reading may be within normal range, so we check
-    // whether ANY parameter from defaults appears rather than requiring temperature specifically.
-    // At minimum, the endpoint must not error when resolving thresholds from defaults.
+    // whether ANY parameter appears rather than requiring temperature specifically.
+    // At minimum, the endpoint must not error when resolving thresholds from the global row.
     if alarms.is_empty() {
         // Verify it's because the latest reading is in range, not because defaults were ignored.
         // Query site alarms over the full range, this MUST find violations.
@@ -196,7 +190,7 @@ async fn test_active_alarms_includes_parameter_default_violations() {
         let times = b2["times"].as_array().unwrap();
         assert!(
             !times.is_empty(),
-            "site alarms should find violations from parameter defaults even if latest reading is in range"
+            "site alarms should find violations from the global threshold even if latest reading is in range"
         );
     }
 

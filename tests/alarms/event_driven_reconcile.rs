@@ -341,11 +341,11 @@ async fn threshold_crud_reconciles_without_new_reading() {
     );
 }
 
-/// Editing a parameter's `default_*` columns re-checks breach state instantly when no
-/// `alarm_thresholds` row exists (the default tier is resolved live).
+/// Creating and widening the parameter's global threshold re-checks breach state instantly, with
+/// no site row anywhere and no new reading.
 #[tokio::test]
 #[serial]
-async fn parameter_default_change_reconciles_without_new_reading() {
+async fn global_threshold_change_reconciles_without_new_reading() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -362,32 +362,37 @@ async fn parameter_default_change_reconciles_without_new_reading() {
         "no thresholds, no trigger fired"
     );
 
-    let (status, body) = crate::common::put_json_with_token(
+    let (status, created) = crate::common::post_json_parse_with_token(
         &app,
-        &format!("/api/parameters/{}", crate::common::GLOBAL_PARAM_TURB_ID),
-        &serde_json::json!({ "default_warning_max": 100.0, "default_alarm_max": 500.0 }),
+        "/api/alarm_thresholds",
+        &serde_json::json!({
+            "parameter_id": crate::common::GLOBAL_PARAM_TURB_ID,
+            "warning_max": 100.0,
+            "alarm_max": 500.0,
+        }),
         &token,
     )
     .await;
-    assert_eq!(status, 200, "parameter update: {body}");
+    assert_eq!(status, 201, "create the global threshold: {created}");
     assert_eq!(
         open_turb_event_count(&db).await,
         1,
-        "tight defaults open without a sweep"
+        "a tight global threshold opens without a sweep"
     );
 
+    let global_id = created["id"].as_str().unwrap().to_string();
     let (status, body) = crate::common::put_json_with_token(
         &app,
-        &format!("/api/parameters/{}", crate::common::GLOBAL_PARAM_TURB_ID),
-        &serde_json::json!({ "default_warning_max": 99999.0, "default_alarm_max": 99999.0 }),
+        &format!("/api/alarm_thresholds/{global_id}"),
+        &serde_json::json!({ "warning_max": 99999.0, "alarm_max": 99999.0 }),
         &token,
     )
     .await;
-    assert_eq!(status, 200, "parameter update: {body}");
+    assert_eq!(status, 200, "widen the global threshold: {body}");
     assert_eq!(
         open_turb_event_count(&db).await,
         0,
-        "wide defaults resolve without a sweep"
+        "a wide global threshold resolves without a sweep"
     );
 }
 

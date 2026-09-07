@@ -27,7 +27,10 @@ async fn breaching_readings_count_without_an_alarm_event_row() {
     crate::common::exec(&db, "DELETE FROM alarm_events").await;
     crate::common::exec(
         &db,
-        &format!("UPDATE parameters SET default_alarm_max = 500 WHERE id = '{turb}'"),
+        &format!(
+            "INSERT INTO alarm_thresholds (id, parameter_id, site_id, alarm_max) \
+             VALUES (gen_random_uuid(), '{turb}', NULL, 500)"
+        ),
     )
     .await;
 

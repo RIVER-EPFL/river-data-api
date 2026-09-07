@@ -8,7 +8,6 @@
 //! Run with: cargo test --test e2e
 
 use serial_test::serial;
-use std::time::{Duration, Instant};
 
 /// Real, full-precision Verbier readings exported from the production database (2026-03-01,
 /// 10-minute interval). DOuM → dissolved_oxygen, WaterTempdegC → temperature; DOmgL is recomputed
@@ -83,24 +82,6 @@ fn id_of(json: &serde_json::Value) -> String {
         .as_str()
         .expect("created entity must have id")
         .to_string()
-}
-
-/// Poll a reprocessing job until it completes (or fails / times out).
-async fn poll_job(app: &axum::Router, token: &str, job_id: &str, max_secs: u64) {
-    let deadline = Instant::now() + Duration::from_secs(max_secs);
-    loop {
-        let (_s, job) = crate::common::get_json_with_token(
-            app,
-            &format!("/api/reprocessing_jobs/{job_id}"),
-            token,
-        )
-        .await;
-        let status = job["status"].as_str().unwrap_or("");
-        if status == "completed" || status == "failed" || Instant::now() >= deadline {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    }
 }
 
 #[tokio::test]
@@ -287,7 +268,7 @@ async fn test_full_public_data_workflow() {
     let job_id = imp["derived_job_id"]
         .as_str()
         .expect("expected a derived job id");
-    poll_job(&app, &token, job_id, 30).await;
+    crate::common::e2e::poll_job(&app, &token, job_id, 30).await;
 
     // 10. Public discovery + sites list reflect the new project/site.
     let (status, discovery) = crate::common::get_json(&app, "/api/public").await;

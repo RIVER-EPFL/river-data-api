@@ -18,3 +18,4 @@ mod runner_absent;
 mod scripts_authoring;
 mod scripts_lifecycle;
 mod seeded_cases;
+mod seeded_version_hashes;

@@ -68,6 +68,20 @@ pub struct SiteParameterOperations;
 impl CRUDOperations for SiteParameterOperations {
     type Resource = SiteParameter;
 
+    /// One row at a time, through the single-row path: the crudcrate default delegates to the
+    /// resource, which delegates back here, and the single-row hooks are what a batch needs too.
+    async fn update_many(
+        &self,
+        db: &DatabaseConnection,
+        updates: Vec<(Uuid, <SiteParameter as CRUDResource>::UpdateModel)>,
+    ) -> Result<Vec<SiteParameter>, ApiError> {
+        let mut updated = Vec::with_capacity(updates.len());
+        for (id, data) in updates {
+            updated.push(self.update(db, id, data).await?);
+        }
+        Ok(updated)
+    }
+
     /// One row at a time, through the single-row path: the crudcrate default `create_many`
     /// delegates to the resource, which delegates back here, so the default recurses; the loop
     /// also runs the single-row hooks for every item.

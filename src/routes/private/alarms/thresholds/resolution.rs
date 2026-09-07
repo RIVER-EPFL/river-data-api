@@ -1,12 +1,11 @@
 //! Shared alarm-threshold resolution and severity logic.
 //!
-//! The breach definition (which value counts as warning vs alarm) and the 3-priority threshold
+//! The breach definition (which value counts as warning vs alarm) and the two-tier threshold
 //! fallback live here so the live evaluation (`views.rs`, `sweeper.rs`) and the historical episode
 //! rebuild (`episodes.rs`) can't drift apart.
 
 use sea_orm::sea_query::{
-    Alias, Condition, Expr, JoinType, PostgresQueryBuilder, Query as SeaQuery, SelectStatement,
-    UnionType,
+    Alias, Expr, JoinType, PostgresQueryBuilder, Query as SeaQuery, SelectStatement,
 };
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, ExprTrait, FromQueryResult, Statement,
@@ -24,7 +23,7 @@ pub struct ResolvedThreshold {
 
 impl ResolvedThreshold {
     /// A threshold with every bound NULL never fires; this is the "Disabled" state written by the
-    /// UI (a null-valued row at priority 1 that blocks the parameter-default fallback).
+    /// UI (a null-valued site row that blocks the global fallback).
     pub fn is_disabled(&self) -> bool {
         self.warning_min.is_none()
             && self.warning_max.is_none()
@@ -102,7 +101,7 @@ pub struct ThresholdRow {
     pub warning_max: Option<f64>,
     pub alarm_min: Option<f64>,
     pub alarm_max: Option<f64>,
-    /// `"site"` | `"global"` | `"default"`, which tier supplied this threshold.
+    /// `"site"` | `"global"`, which tier supplied this threshold.
     pub source: String,
 }
 
@@ -110,7 +109,8 @@ fn col(table: &str, c: &str) -> Expr {
     Expr::col((Alias::new(table), Alias::new(c)))
 }
 
-/// THE single definition of the 3-tier resolution (site row → global row → parameter `default_*`).
+/// THE single definition of the two-tier resolution: the site's own `alarm_thresholds` row, else
+/// the parameter's global one. A parameter's own bounds are that global row and live nowhere else.
 ///
 /// Built with sea-query so it is composable and dialect-portable. Produces one row per active
 /// `(site_id, parameter_id)` slot with the winning bounds + `source`, picking the highest-priority
@@ -160,43 +160,12 @@ pub fn resolve_thresholds_query(
         )
         .and_where(col("sp", "is_active").eq(true));
 
-    // Tier 3: parameter defaults, for slots whose parameter carries any default bound.
-    let mut defaults = SeaQuery::select();
-    defaults
-        .expr_as(col("sp", "site_id"), Alias::new("site_id"))
-        .expr_as(col("sp", "parameter_id"), Alias::new("parameter_id"))
-        .expr_as(col("p", "default_warning_min"), Alias::new("warning_min"))
-        .expr_as(col("p", "default_warning_max"), Alias::new("warning_max"))
-        .expr_as(col("p", "default_alarm_min"), Alias::new("alarm_min"))
-        .expr_as(col("p", "default_alarm_max"), Alias::new("alarm_max"))
-        .expr_as(Expr::val(3), Alias::new("priority"))
-        .expr_as(Expr::val("default"), Alias::new("source"))
-        .from_as(Alias::new("site_parameters"), Alias::new("sp"))
-        .join_as(
-            JoinType::Join,
-            Alias::new("parameters"),
-            Alias::new("p"),
-            col("p", "id").equals((Alias::new("sp"), Alias::new("parameter_id"))),
-        )
-        .and_where(col("sp", "is_active").eq(true))
-        .cond_where(
-            Condition::any()
-                .add(col("p", "default_warning_min").is_not_null())
-                .add(col("p", "default_warning_max").is_not_null())
-                .add(col("p", "default_alarm_min").is_not_null())
-                .add(col("p", "default_alarm_max").is_not_null()),
-        );
-
     if let Some(s) = site_id {
         rows.and_where(col("sp", "site_id").eq(s));
-        defaults.and_where(col("sp", "site_id").eq(s));
     }
     if let Some(pids) = param_ids {
-        rows.and_where(col("sp", "parameter_id").is_in(pids.clone()));
-        defaults.and_where(col("sp", "parameter_id").is_in(pids));
+        rows.and_where(col("sp", "parameter_id").is_in(pids));
     }
-
-    rows.union(UnionType::All, defaults);
 
     // Rank tiers per slot and keep the winner.
     let mut ranked = SeaQuery::select();

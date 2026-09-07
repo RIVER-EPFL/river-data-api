@@ -8,4 +8,6 @@ mod common;
 
 mod attribute_existing_readings;
 mod backdate_auto_deployments;
+mod channel_health_into_state;
+mod one_doc_parameter;
 mod synthesise_curation_record;

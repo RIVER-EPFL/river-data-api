@@ -214,25 +214,25 @@ async fn two_site_fixture(db: &DatabaseConnection) -> TwoSites {
     let site2_id = uuid(&site2);
 
     assert_bucket(
-        e2e::hourly_bucket(db, &site1, &parameter_id, ts("08:00:00")).await,
+        e2e::hourly_bucket(&app, &river, &site1, &parameter_id, ts("08:00:00")).await,
         35.0,
         2,
         "baseline upstream 08:00 (the curve was applied to the logged history, not left at raw)",
     );
     assert_bucket(
-        e2e::hourly_bucket(db, &site1, &parameter_id, ts("09:00:00")).await,
+        e2e::hourly_bucket(&app, &river, &site1, &parameter_id, ts("09:00:00")).await,
         95.0,
         4,
         "baseline upstream 09:00, the bucket the move will straddle",
     );
     assert_bucket(
-        e2e::hourly_bucket(db, &site1, &parameter_id, ts("10:00:00")).await,
+        e2e::hourly_bucket(&app, &river, &site1, &parameter_id, ts("10:00:00")).await,
         155.0,
         2,
         "baseline upstream 10:00",
     );
     assert!(
-        e2e::hourly_bucket(db, &site2, &parameter_id, ts("09:00:00"))
+        e2e::hourly_bucket(&app, &river, &site2, &parameter_id, ts("09:00:00"))
             .await
             .is_none(),
         "the downstream site holds nothing yet, so a later downstream bucket cannot be satisfied \
@@ -303,35 +303,69 @@ impl TwoSites {
 
     /// The buckets a move at 09:30 produces, asserted before each later correction so the
     /// transition that correction causes is a real change and not an empty start.
-    async fn assert_post_move_buckets(&self, db: &DatabaseConnection) {
+    async fn assert_post_move_buckets(&self) {
         assert_bucket(
-            e2e::hourly_bucket(db, &self.site1, &self.parameter_id, ts("08:00:00")).await,
+            e2e::hourly_bucket(
+                &self.app,
+                &self.river,
+                &self.site1,
+                &self.parameter_id,
+                ts("08:00:00"),
+            )
+            .await,
             35.0,
             2,
             "upstream 08:00 sits entirely before the move",
         );
         assert_bucket(
-            e2e::hourly_bucket(db, &self.site1, &self.parameter_id, ts("09:00:00")).await,
+            e2e::hourly_bucket(
+                &self.app,
+                &self.river,
+                &self.site1,
+                &self.parameter_id,
+                ts("09:00:00"),
+            )
+            .await,
             75.0,
             2,
             "upstream 09:00 kept only the two readings before the move",
         );
         assert_bucket(
-            e2e::hourly_bucket(db, &self.site2, &self.parameter_id, ts("09:00:00")).await,
+            e2e::hourly_bucket(
+                &self.app,
+                &self.river,
+                &self.site2,
+                &self.parameter_id,
+                ts("09:00:00"),
+            )
+            .await,
             115.0,
             2,
             "downstream 09:00 gained exactly the two readings upstream lost",
         );
         assert_bucket(
-            e2e::hourly_bucket(db, &self.site2, &self.parameter_id, ts("10:00:00")).await,
+            e2e::hourly_bucket(
+                &self.app,
+                &self.river,
+                &self.site2,
+                &self.parameter_id,
+                ts("10:00:00"),
+            )
+            .await,
             155.0,
             2,
             "downstream 10:00 holds the whole post-move hour",
         );
         assert!(
-            e2e::hourly_bucket(db, &self.site1, &self.parameter_id, ts("10:00:00"))
-                .await
-                .is_none(),
+            e2e::hourly_bucket(
+                &self.app,
+                &self.river,
+                &self.site1,
+                &self.parameter_id,
+                ts("10:00:00")
+            )
+            .await
+            .is_none(),
             "upstream 10:00 is gone, not merely reduced"
         );
     }
@@ -520,7 +554,7 @@ async fn moving_a_sensor_moves_its_readings_and_both_sites_aggregates() {
     // No manual refresh happens after the move: a stale or missing bucket below is a real failure
     // of the propagation contract, not a test artefact. The one refresh the job issues is
     // time-scoped with no site predicate, which is what lets it correct both sites at once.
-    f.assert_post_move_buckets(&db).await;
+    f.assert_post_move_buckets().await;
 
     // Read back through the API surface the dashboard uses. `split_by_sensor=true` also pins which
     // instrument the relocated series belongs to. Each URL is issued exactly once in this test so
@@ -578,7 +612,7 @@ async fn backdating_the_move_pulls_the_earlier_reading_downstream() {
     let f = two_site_fixture(&db).await;
 
     let dep_b = f.move_downstream(&db, "09:30:00").await;
-    f.assert_post_move_buckets(&db).await;
+    f.assert_post_move_buckets().await;
 
     // The instrument actually travelled a quarter of an hour earlier.
     f.correct_start(&db, dep_b, "09:15:00").await;
@@ -618,31 +652,31 @@ async fn backdating_the_move_pulls_the_earlier_reading_downstream() {
     }
 
     assert_bucket(
-        e2e::hourly_bucket(&db, &f.site1, &f.parameter_id, ts("09:00:00")).await,
+        e2e::hourly_bucket(&f.app, &f.river, &f.site1, &f.parameter_id, ts("09:00:00")).await,
         65.0,
         1,
         "upstream 09:00 was 75.0 over 2 and gives up the 09:15 reading",
     );
     assert_bucket(
-        e2e::hourly_bucket(&db, &f.site2, &f.parameter_id, ts("09:00:00")).await,
+        e2e::hourly_bucket(&f.app, &f.river, &f.site2, &f.parameter_id, ts("09:00:00")).await,
         105.0,
         3,
         "downstream 09:00 was 115.0 over 2 and gains exactly that reading",
     );
     assert_bucket(
-        e2e::hourly_bucket(&db, &f.site1, &f.parameter_id, ts("08:00:00")).await,
+        e2e::hourly_bucket(&f.app, &f.river, &f.site1, &f.parameter_id, ts("08:00:00")).await,
         35.0,
         2,
         "upstream 08:00 is untouched by a correction two hours later",
     );
     assert_bucket(
-        e2e::hourly_bucket(&db, &f.site2, &f.parameter_id, ts("10:00:00")).await,
+        e2e::hourly_bucket(&f.app, &f.river, &f.site2, &f.parameter_id, ts("10:00:00")).await,
         155.0,
         2,
         "downstream 10:00 is untouched",
     );
     assert!(
-        e2e::hourly_bucket(&db, &f.site1, &f.parameter_id, ts("10:00:00"))
+        e2e::hourly_bucket(&f.app, &f.river, &f.site1, &f.parameter_id, ts("10:00:00"))
             .await
             .is_none(),
         "upstream 10:00 stays absent"
@@ -663,7 +697,7 @@ async fn moving_the_move_date_forward_returns_readings_to_the_previous_site() {
     let f = two_site_fixture(&db).await;
 
     let dep_b = f.move_downstream(&db, "09:30:00").await;
-    f.assert_post_move_buckets(&db).await;
+    f.assert_post_move_buckets().await;
 
     // The instrument actually travelled a quarter of an hour later.
     f.correct_start(&db, dep_b, "09:45:00").await;
@@ -708,25 +742,25 @@ async fn moving_the_move_date_forward_returns_readings_to_the_previous_site() {
     );
 
     assert_bucket(
-        e2e::hourly_bucket(&db, &f.site1, &f.parameter_id, ts("09:00:00")).await,
+        e2e::hourly_bucket(&f.app, &f.river, &f.site1, &f.parameter_id, ts("09:00:00")).await,
         85.0,
         3,
         "upstream 09:00 was 75.0 over 2 and takes the 09:30 reading back",
     );
     assert_bucket(
-        e2e::hourly_bucket(&db, &f.site2, &f.parameter_id, ts("09:00:00")).await,
+        e2e::hourly_bucket(&f.app, &f.river, &f.site2, &f.parameter_id, ts("09:00:00")).await,
         125.0,
         1,
         "downstream 09:00 keeps only the reading logged after the corrected move",
     );
     assert_bucket(
-        e2e::hourly_bucket(&db, &f.site1, &f.parameter_id, ts("08:00:00")).await,
+        e2e::hourly_bucket(&f.app, &f.river, &f.site1, &f.parameter_id, ts("08:00:00")).await,
         35.0,
         2,
         "upstream 08:00 is untouched by a correction an hour later",
     );
     assert_bucket(
-        e2e::hourly_bucket(&db, &f.site2, &f.parameter_id, ts("10:00:00")).await,
+        e2e::hourly_bucket(&f.app, &f.river, &f.site2, &f.parameter_id, ts("10:00:00")).await,
         155.0,
         2,
         "downstream 10:00 is untouched",
@@ -744,7 +778,7 @@ async fn deleting_the_downstream_deployment_unattributes_its_readings() {
     let f = two_site_fixture(&db).await;
 
     let dep_b = f.move_downstream(&db, "09:30:00").await;
-    f.assert_post_move_buckets(&db).await;
+    f.assert_post_move_buckets().await;
 
     let (status, body) = crate::common::delete_with_token(
         &f.app,
@@ -807,27 +841,27 @@ async fn deleting_the_downstream_deployment_unattributes_its_readings() {
     }
 
     assert_bucket(
-        e2e::hourly_bucket(&db, &f.site1, &f.parameter_id, ts("08:00:00")).await,
+        e2e::hourly_bucket(&f.app, &f.river, &f.site1, &f.parameter_id, ts("08:00:00")).await,
         35.0,
         2,
         "upstream 08:00 is bit-identical to the pre-delete baseline",
     );
     assert_bucket(
-        e2e::hourly_bucket(&db, &f.site1, &f.parameter_id, ts("09:00:00")).await,
+        e2e::hourly_bucket(&f.app, &f.river, &f.site1, &f.parameter_id, ts("09:00:00")).await,
         75.0,
         2,
         "upstream 09:00 is bit-identical to the pre-delete baseline: deleting the downstream \
          deployment must not touch a single upstream reading",
     );
     assert!(
-        e2e::hourly_bucket(&db, &f.site2, &f.parameter_id, ts("09:00:00"))
+        e2e::hourly_bucket(&f.app, &f.river, &f.site2, &f.parameter_id, ts("09:00:00"))
             .await
             .is_none(),
         "the un-attributed readings drop out of the downstream rollup entirely (the aggregate \
          filters on site_id IS NOT NULL), and this bucket was asserted present before the delete"
     );
     assert!(
-        e2e::hourly_bucket(&db, &f.site2, &f.parameter_id, ts("10:00:00"))
+        e2e::hourly_bucket(&f.app, &f.river, &f.site2, &f.parameter_id, ts("10:00:00"))
             .await
             .is_none(),
         "so does the whole downstream 10:00 bucket"

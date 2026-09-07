@@ -27,6 +27,34 @@ async fn attached_readings(db: &DatabaseConnection, id: Uuid) -> Result<i64, Api
 impl CRUDOperations for CollectionEventOperations {
     type Resource = CollectionEvent;
 
+    /// One row at a time, through the single-row path: the crudcrate default delegates to the
+    /// resource, which delegates back here, and the single-row hooks are what a batch needs too.
+    async fn create_many(
+        &self,
+        db: &DatabaseConnection,
+        data: Vec<<CollectionEvent as crudcrate::CRUDResource>::CreateModel>,
+    ) -> Result<Vec<CollectionEvent>, ApiError> {
+        let mut created = Vec::with_capacity(data.len());
+        for item in data {
+            created.push(self.create(db, item).await?);
+        }
+        Ok(created)
+    }
+
+    /// One row at a time, through the single-row path: the crudcrate default delegates to the
+    /// resource, which delegates back here, and the single-row hooks are what a batch needs too.
+    async fn update_many(
+        &self,
+        db: &DatabaseConnection,
+        updates: Vec<(Uuid, <CollectionEvent as crudcrate::CRUDResource>::UpdateModel)>,
+    ) -> Result<Vec<CollectionEvent>, ApiError> {
+        let mut updated = Vec::with_capacity(updates.len());
+        for (id, data) in updates {
+            updated.push(self.update(db, id, data).await?);
+        }
+        Ok(updated)
+    }
+
     async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
         let n = attached_readings(db, id).await?;
         if n > 0 {

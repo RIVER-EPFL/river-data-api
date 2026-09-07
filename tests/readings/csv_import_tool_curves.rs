@@ -25,11 +25,12 @@ async fn setup() -> Fixture {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
-    // The catalog parameter the doc tool's replicates are readings of.
+    // The catalog parameter the doc tool's replicates are readings of, under the code its manifest
+    // names.
     crate::common::exec(
         &db,
         "INSERT INTO parameters (id, code, name, category) \
-         VALUES ('00000000-0000-4000-b000-0000000000d0', 'DOC', 'DOC', 'measurement')",
+         VALUES ('00000000-0000-4000-b000-0000000000d0', 'DOC_ppb', 'DOC', 'measurement')",
     )
     .await;
     let token = crate::common::seed_token_full(&db).await;

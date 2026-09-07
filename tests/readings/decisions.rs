@@ -1102,3 +1102,66 @@ async fn wait_for_csv_value(db: &DatabaseConnection, expected: f64) {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
+
+/// Two interns saving the same visit at once, or one double-submitting: both writers find no hold
+/// to refresh and both insert, and the partial unique index makes the loser wait. The loser must
+/// refresh the hold the winner filed, not lose its whole save to a `unique_violation`.
+#[tokio::test]
+#[serial]
+async fn a_second_save_at_one_slot_instant_refreshes_the_hold_it_lost_to() {
+    use river_db::routes::private::readings::grab_samples::open_unverified_holds;
+    use sea_orm::TransactionTrait;
+
+    let f = setup().await;
+    let site = Uuid::parse_str(crate::common::SITE1_ID).expect("site id");
+    let parameter = Uuid::parse_str(crate::common::GLOBAL_PARAM_TEMP_ID).expect("parameter id");
+    let at: chrono::DateTime<chrono::Utc> = AT.parse().expect("instant");
+    let groups = vec![(parameter, at)];
+
+    let first = f.db.begin().await.expect("begin");
+    open_unverified_holds(&first, site, &groups, "intern-a")
+        .await
+        .expect("the first save files the hold");
+
+    let db = f.db.clone();
+    let second = tokio::spawn(async move {
+        open_unverified_holds(&db, site, &groups, "intern-b").await
+    });
+    // Long enough for the second insert to reach the index and block on the uncommitted row.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    first.commit().await.expect("commit");
+
+    assert!(
+        second.await.expect("join").is_ok(),
+        "the second save is served once the first commits"
+    );
+
+    let open = crate::common::e2e::count(
+        &f.db,
+        &format!(
+            "SELECT count(*) AS c FROM replicate_audit_holds \
+             WHERE kind = 'unverified_entry' AND status = 'pending' \
+               AND site_id = '{site}' AND parameter_id = '{parameter}'"
+        ),
+    )
+    .await;
+    assert_eq!(open, 1, "one open hold stands for the slot instant");
+
+    let row =
+        f.db.query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT computed ->> 'entered_by' AS entered_by FROM replicate_audit_holds \
+                 WHERE kind = 'unverified_entry' AND site_id = '{site}' \
+                   AND parameter_id = '{parameter}'"
+            ),
+        ))
+        .await
+        .expect("query")
+        .expect("the hold row");
+    assert_eq!(
+        row.try_get::<String>("", "entered_by").expect("entered_by"),
+        "intern-b",
+        "the hold carries the entry that landed last"
+    );
+}

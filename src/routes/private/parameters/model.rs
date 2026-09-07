@@ -37,10 +37,6 @@ pub struct Model {
     /// confirming or merging the parameter.
     #[crudcrate(filterable, on_create = false)]
     pub needs_review: bool,
-    pub default_warning_min: Option<f64>,
-    pub default_warning_max: Option<f64>,
-    pub default_alarm_min: Option<f64>,
-    pub default_alarm_max: Option<f64>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }

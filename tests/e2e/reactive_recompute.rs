@@ -20,23 +20,14 @@ async fn served(
     site_id: &str,
     parameter_id: &str,
 ) -> Option<f64> {
-    use sea_orm::ConnectionTrait;
-    db.query_one_raw(sea_orm::Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        format!(
-            "SELECT COALESCE(
-                (SELECT smp.mean FROM samples smp
-                  WHERE smp.site_id = '{site_id}' AND smp.parameter_id = '{parameter_id}'
-                    AND smp.collected_at = '{VISIT}'),
-                (SELECT COALESCE(r.calibrated_value, r.raw_value) FROM readings r
-                  WHERE r.site_id = '{site_id}' AND r.parameter_id = '{parameter_id}'
-                    AND r.time = '{VISIT}' AND r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL
-                  ORDER BY r.replicate_index LIMIT 1)) AS value"
-        ),
-    ))
+    river_db::routes::private::tools::chain::served_spot_value(
+        db,
+        site_id.parse().expect("site uuid"),
+        parameter_id.parse().expect("parameter uuid"),
+        VISIT.parse().expect("visit instant"),
+    )
     .await
-    .unwrap()
-    .and_then(|r| r.try_get::<Option<f64>>("", "value").ok().flatten())
+    .expect("read the served spot value")
 }
 
 #[tokio::test]
@@ -220,7 +211,6 @@ async fn a_value_landing_at_a_visit_runs_the_calculation_that_reads_it() {
         "a disabled calculation is not reported: {preview}"
     );
     save_a(vec![10.0, 40.0], VISIT, true, false).await;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert_eq!(
         recompute_jobs().await,
         2,
@@ -289,7 +279,6 @@ async fn a_value_landing_at_a_visit_runs_the_calculation_that_reads_it() {
     .await
     .unwrap();
     save_a(vec![10.0, 20.0], SYNCED_VISIT, false, false).await;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert_eq!(
         recompute_jobs().await,
         3,

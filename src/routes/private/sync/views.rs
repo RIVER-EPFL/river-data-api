@@ -537,11 +537,7 @@ pub async fn apply_discovery(
 ) -> AppResult<Json<ApplyDiscoveryResponse>> {
     let db = &state.db;
     let txn = db.begin().await?;
-    txn.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
-    ))
-    .await?;
+    crate::common::bulk_write::lift_decompression_cap(&txn).await?;
 
     let mut resp = ApplyDiscoveryResponse {
         projects_created: 0,
@@ -744,10 +740,6 @@ async fn resolve_or_create_parameter<C: ConnectionTrait>(
         needs_review: Set(true),
         description: Set(None),
         aliases: Set(vec![]),
-        default_warning_min: Set(None),
-        default_warning_max: Set(None),
-        default_alarm_min: Set(None),
-        default_alarm_max: Set(None),
         created_at: Set(Some(Utc::now())),
     };
     let inserted = p.insert(db).await.map_err(|e| e.to_string())?;
@@ -1331,10 +1323,6 @@ pub async fn bulk_pair(
             needs_review: Set(true),
             description: Set(None),
             aliases: Set(vec![]),
-            default_warning_min: Set(None),
-            default_warning_max: Set(None),
-            default_alarm_min: Set(None),
-            default_alarm_max: Set(None),
             created_at: Set(Some(Utc::now())),
         }
         .insert(&txn)
@@ -1452,12 +1440,8 @@ pub async fn bulk_pair(
         stream_to_sp.push((stream.id, site_parameter_id));
     }
 
-    // Raise the TimescaleDB decompression limit so backfills reach compressed history
-    txn.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0".to_owned(),
-    ))
-    .await?;
+    // The pairing backfills below reach compressed history.
+    crate::common::bulk_write::lift_decompression_cap(&txn).await?;
 
     // Second pass: pair each stream through the same helper the plan flow uses, so sensors,
     // deployment attribution, status events and samples all follow; the curves each reading is

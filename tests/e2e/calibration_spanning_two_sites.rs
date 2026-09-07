@@ -747,7 +747,14 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
     let morning = sl::dt(BUCKET_MORNING);
     let afternoon = sl::dt(BUCKET_AFTERNOON);
 
-    let before_up = e2e::hourly_bucket(&span.db, &span.site1, &span.parameter, morning).await;
+    let before_up = e2e::hourly_bucket(
+        &span.app,
+        &span.river,
+        &span.site1,
+        &span.parameter,
+        morning,
+    )
+    .await;
     assert!(
         before_up.is_some(),
         "the upstream morning bucket is materialised before the edit"
@@ -759,7 +766,14 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
         "upstream morning bucket holds three readings before the edit"
     );
 
-    let before_down = e2e::hourly_bucket(&span.db, &span.site2, &span.parameter, afternoon).await;
+    let before_down = e2e::hourly_bucket(
+        &span.app,
+        &span.river,
+        &span.site2,
+        &span.parameter,
+        afternoon,
+    )
+    .await;
     assert!(
         before_down.is_some(),
         "the downstream afternoon bucket is materialised before the edit"
@@ -771,8 +785,14 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
         "downstream afternoon bucket holds three readings before the edit"
     );
 
-    let before_ctrl =
-        e2e::hourly_bucket(&span.db, &span.site1, &span.control_parameter, morning).await;
+    let before_ctrl = e2e::hourly_bucket(
+        &span.app,
+        &span.river,
+        &span.site1,
+        &span.control_parameter,
+        morning,
+    )
+    .await;
     assert!(
         before_ctrl.is_some(),
         "the co-located control bucket is materialised before the edit"
@@ -786,7 +806,14 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
 
     edit_span_calibration(&span).await;
 
-    let after_up = e2e::hourly_bucket(&span.db, &span.site1, &span.parameter, morning).await;
+    let after_up = e2e::hourly_bucket(
+        &span.app,
+        &span.river,
+        &span.site1,
+        &span.parameter,
+        morning,
+    )
+    .await;
     assert!(
         after_up.is_some(),
         "the upstream morning bucket survives the refresh"
@@ -798,7 +825,14 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
         "upstream morning bucket still holds three readings"
     );
 
-    let after_down = e2e::hourly_bucket(&span.db, &span.site2, &span.parameter, afternoon).await;
+    let after_down = e2e::hourly_bucket(
+        &span.app,
+        &span.river,
+        &span.site2,
+        &span.parameter,
+        afternoon,
+    )
+    .await;
     assert!(
         after_down.is_some(),
         "the downstream afternoon bucket survives the refresh"
@@ -814,8 +848,14 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
         "downstream afternoon bucket still holds three readings"
     );
 
-    let after_ctrl =
-        e2e::hourly_bucket(&span.db, &span.site1, &span.control_parameter, morning).await;
+    let after_ctrl = e2e::hourly_bucket(
+        &span.app,
+        &span.river,
+        &span.site1,
+        &span.control_parameter,
+        morning,
+    )
+    .await;
     assert!(
         after_ctrl.is_some(),
         "the co-located control bucket survives the refresh"
@@ -913,7 +953,14 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
     let morning = sl::dt(BUCKET_MORNING);
     let afternoon = sl::dt(BUCKET_AFTERNOON);
 
-    let before_up = e2e::hourly_bucket(&span.db, &span.site1, &span.parameter, morning).await;
+    let before_up = e2e::hourly_bucket(
+        &span.app,
+        &span.river,
+        &span.site1,
+        &span.parameter,
+        morning,
+    )
+    .await;
     assert!(
         before_up.is_some(),
         "the upstream morning bucket is materialised before the move"
@@ -922,9 +969,15 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
     assert_close(mean, 45.0, "upstream morning mean before the move");
     assert_eq!(count, 3, "three upstream readings before the move");
     assert!(
-        e2e::hourly_bucket(&span.db, &span.site2, &span.parameter, morning)
-            .await
-            .is_none(),
+        e2e::hourly_bucket(
+            &span.app,
+            &span.river,
+            &span.site2,
+            &span.parameter,
+            morning
+        )
+        .await
+        .is_none(),
         "the downstream site holds no morning bucket before the move"
     );
 
@@ -1043,7 +1096,14 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
         );
     }
 
-    let after_up = e2e::hourly_bucket(&span.db, &span.site1, &span.parameter, morning).await;
+    let after_up = e2e::hourly_bucket(
+        &span.app,
+        &span.river,
+        &span.site1,
+        &span.parameter,
+        morning,
+    )
+    .await;
     assert!(
         after_up.is_some(),
         "the upstream morning bucket survives the move"
@@ -1059,7 +1119,14 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
         "two readings remain in the upstream morning bucket"
     );
 
-    let new_down = e2e::hourly_bucket(&span.db, &span.site2, &span.parameter, morning).await;
+    let new_down = e2e::hourly_bucket(
+        &span.app,
+        &span.river,
+        &span.site2,
+        &span.parameter,
+        morning,
+    )
+    .await;
     assert!(
         new_down.is_some(),
         "the crossing reading opens a morning bucket at the downstream site"
@@ -1072,7 +1139,14 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
     );
     assert_eq!(count, 1, "exactly one reading crossed");
 
-    let untouched = e2e::hourly_bucket(&span.db, &span.site2, &span.parameter, afternoon).await;
+    let untouched = e2e::hourly_bucket(
+        &span.app,
+        &span.river,
+        &span.site2,
+        &span.parameter,
+        afternoon,
+    )
+    .await;
     assert!(
         untouched.is_some(),
         "the downstream afternoon bucket survives the move"
@@ -1108,8 +1182,14 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
 
     span.assert_control_untouched("after the deployment move")
         .await;
-    let ctrl_bucket =
-        e2e::hourly_bucket(&span.db, &span.site1, &span.control_parameter, morning).await;
+    let ctrl_bucket = e2e::hourly_bucket(
+        &span.app,
+        &span.river,
+        &span.site1,
+        &span.control_parameter,
+        morning,
+    )
+    .await;
     assert!(
         ctrl_bucket.is_some(),
         "the control bucket survives the move"

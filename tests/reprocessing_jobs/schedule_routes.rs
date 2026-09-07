@@ -49,7 +49,7 @@ async fn next_run_at(db: &DatabaseConnection, job_name: &str) -> chrono::DateTim
 async fn audit_count(db: &DatabaseConnection, job_name: &str) -> i64 {
     db.query_one_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "SELECT count(*) AS n FROM schedule_audit WHERE job_name = $1",
+        "SELECT count(*) AS n FROM change_audit WHERE subject = 'schedule:' || $1",
         [job_name.into()],
     ))
     .await

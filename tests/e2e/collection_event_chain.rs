@@ -259,7 +259,10 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
         1,
         "chain_c's absent output is reported: {findings}"
     );
-    assert_eq!(missing[0]["parameter_code"], "ChainPC", "the output slot is {pc}");
+    assert_eq!(
+        missing[0]["parameter_code"], "ChainPC",
+        "the output slot is {pc}"
+    );
 
     // The executor recomputes the event on demand and fills the gap, in dependency order.
     let (status, recompute) = crate::common::post_json_parse_with_token(
@@ -455,7 +458,6 @@ async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
     .await;
     assert_eq!(status, 200, "{a2}");
     save(a2, pa.clone(), 50.0, "out_a", true).await;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert_eq!(
         crate::common::e2e::count(
             &db,

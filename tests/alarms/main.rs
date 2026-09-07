@@ -10,5 +10,5 @@ mod backfill_reconstruction;
 mod event_driven_reconcile;
 mod events_feed_and_summary;
 mod export_summary_counts;
-mod parameter_default_breach_consistency;
+mod global_threshold_breach_consistency;
 mod threshold_lifecycle_and_state;

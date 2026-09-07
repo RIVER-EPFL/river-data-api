@@ -428,19 +428,33 @@ pub async fn get_keycloak_jwt(username: &str, password: &str) -> String {
 /// (axum-keycloak-auth 0.8.3) if a request arrives before discovery has started, which a no-token
 /// request can otherwise race.
 pub async fn build_test_app_with_keycloak(db: DatabaseConnection) -> axum::Router {
+    build_test_app_with_keycloak_inner(db, false, super::test_config())
+        .await
+        .0
+}
+
+/// Like [`build_test_app_with_keycloak`], keeping the `AppState` the router shares, so a test can
+/// reach the caches a request reads (the grants cache, whose TTL a test would otherwise sleep out).
+pub async fn build_test_app_with_keycloak_and_state(
+    db: DatabaseConnection,
+) -> (axum::Router, AppState) {
     build_test_app_with_keycloak_inner(db, false, super::test_config()).await
 }
 
 /// Like [`build_test_app_with_keycloak`], additionally configuring the Keycloak **admin proxy**
 /// (service-account client credentials), so the conditional `/users` + `/roles` routes are mounted.
 pub async fn build_test_app_with_keycloak_admin(db: DatabaseConnection) -> axum::Router {
-    build_test_app_with_keycloak_inner(db, true, super::test_config()).await
+    build_test_app_with_keycloak_inner(db, true, super::test_config())
+        .await
+        .0
 }
 
 /// Like [`build_test_app_with_keycloak`] with the response cache enabled, for cache tests that
 /// assert on JWT-derived scope in the cache key.
 pub async fn build_test_app_with_keycloak_and_cache(db: DatabaseConnection) -> axum::Router {
-    build_test_app_with_keycloak_inner(db, false, super::cached_test_config()).await
+    build_test_app_with_keycloak_inner(db, false, super::cached_test_config())
+        .await
+        .0
 }
 
 /// Like [`build_test_app_with_keycloak`] with the tool runner pointed where the caller says, for
@@ -452,14 +466,16 @@ pub async fn build_test_app_with_keycloak_and_runner(
     let mut config = super::test_config();
     config.tools_runner_url = runner_url;
     config.tools_runner_timeout_seconds = 5;
-    build_test_app_with_keycloak_inner(db, false, config).await
+    build_test_app_with_keycloak_inner(db, false, config)
+        .await
+        .0
 }
 
 async fn build_test_app_with_keycloak_inner(
     db: DatabaseConnection,
     with_admin_proxy: bool,
     mut config: river_db::config::Config,
-) -> axum::Router {
+) -> (axum::Router, AppState) {
     let base = keycloak_base_url();
     let realm = keycloak_realm();
     config.keycloak_url = Some(base.clone());
@@ -490,7 +506,7 @@ async fn build_test_app_with_keycloak_inner(
     // The non-Keycloak builders all start the tracked-job worker; without it here any Keycloak
     // test that triggers a job would wait on one that is queued and never runs.
     super::spawn_test_worker(&state);
-    river_db::routes::build_router(state)
+    (river_db::routes::build_router(state.clone()), state)
 }
 
 /// Idempotently ensure a realm group exists whose realm role mappings include `role`. Returns the

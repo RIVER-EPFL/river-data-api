@@ -386,6 +386,87 @@ async fn reprocess_prefers_a_parameter_specific_curve_over_an_open_wildcard() {
     cleanup_test_db(&db).await;
 }
 
+/// Scenario: one hand-dated deployment covers March to June at a slot whose readings run January
+/// to July.
+/// Expected behaviour: the per-slot reprocess stamps the covered rows, leaves the rows before the
+/// slot's first deployment on their pairing, and clears the rows after it out of the site.
+#[tokio::test]
+#[serial]
+async fn slot_reprocess_recalls_only_after_the_first_deployment() {
+    use river_db::routes::private::sensors::calibrations::service::reprocess_site_parameter_readings;
+
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let sensor = create_sensor(&db, "Slot-Recall-01", GLOBAL_PARAM_TEMP_ID).await;
+    let deployment = deploy_sensor_for_parameter(
+        &db,
+        sensor.id,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        dt("2025-03-01T00:00:00Z"),
+    )
+    .await;
+    end_deployment(&db, deployment, dt("2025-06-01T00:00:00Z")).await;
+
+    let stream = create_paired_stream(&db, "slot-recall", PARAM_S1_TEMP_ID).await;
+    for month in 1..=7 {
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO readings \
+                 (stream_id, site_id, parameter_id, time, raw_value, replicate_index) \
+                 VALUES ('{stream}', '{SITE1_ID}', '{GLOBAL_PARAM_TEMP_ID}', \
+                         '2025-0{month}-15T00:00:00Z', 1.0, 0)"
+            ),
+        )
+        .await;
+    }
+
+    reprocess_site_parameter_readings(
+        &db,
+        SITE1_ID.parse().unwrap(),
+        GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
+    )
+    .await
+    .expect("reprocess");
+
+    let rows = get_readings(&db, stream).await;
+    assert_eq!(rows.len(), 7, "one reading a month, January to July");
+    let site: uuid::Uuid = SITE1_ID.parse().unwrap();
+
+    for (i, row) in rows.iter().take(2).enumerate() {
+        assert_eq!(
+            row.site_id,
+            Some(site),
+            "month {} predates the slot's first deployment and keeps its pairing",
+            i + 1
+        );
+        assert_eq!(row.deployment_id, None, "and names no deployment");
+    }
+
+    for (i, row) in rows.iter().skip(2).take(3).enumerate() {
+        assert_eq!(
+            row.deployment_id,
+            Some(deployment),
+            "month {} is covered by the deployment",
+            i + 3
+        );
+        assert_eq!(row.site_id, Some(site), "and is owned by its site");
+        assert_eq!(row.sensor_id, Some(sensor.id), "and by its instrument");
+    }
+
+    for (i, row) in rows.iter().skip(5).enumerate() {
+        assert_eq!(
+            row.site_id, None,
+            "month {} falls after the deployment closed and is recalled out of the site",
+            i + 6
+        );
+        assert_eq!(row.deployment_id, None, "and names no deployment");
+    }
+}
+
 /// A lab instrument's grab (measurement_type = 'spot', its own standard curve) that shares a
 /// (site, parameter) with a deployed field sensor survives that slot's reprocess untouched: its
 /// sensor_id, its standard curve reference and the value that curve produces are preserved, while
@@ -1188,6 +1269,88 @@ async fn full_cascade_calibration_to_aggregates() {
         (avg_after - 25.0).abs() < 0.01,
         "after: hourly avg = {avg_after}, expected 25.0"
     );
+
+    cleanup_test_db(&db).await;
+}
+
+/// Expected behaviour: the resolver, not `recompute_valid_until`, is what makes the window pick
+/// single-valued. The per-slot arm never chains, so two open same-parameter windows reach it as
+/// they were stored; `pick_calibration_lateral` still orders them and the later curve is the one
+/// stamped. Twin of `reprocess_prefers_a_parameter_specific_curve_over_an_open_wildcard` for the
+/// per-slot arm, and the guard on the reason the per-sensor arm's chaining call is there.
+#[tokio::test]
+#[serial]
+async fn slot_reprocess_picks_the_later_of_two_open_windows() {
+    use river_db::routes::private::sensors::calibrations::service::reprocess_site_parameter_readings;
+
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let sensor = uuid::Uuid::new_v4();
+    let earlier = uuid::Uuid::new_v4();
+    let later = uuid::Uuid::new_v4();
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, name, is_active) VALUES ('{sensor}', 'TwoOpenWindows-01', true)"
+        ),
+    )
+    .await;
+    // Both open, same parameter, both covering the reading: the shape a bulk load leaves behind.
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO sensor_calibrations \
+             (id, sensor_id, parameter_id, slope, intercept, valid_from) VALUES \
+             ('{earlier}', '{sensor}', '{GLOBAL_PARAM_TEMP_ID}', 2.0, 0.0, '2025-01-01T00:00:00Z'), \
+             ('{later}', '{sensor}', '{GLOBAL_PARAM_TEMP_ID}', 5.0, 0.0, '2025-03-01T00:00:00Z')"
+        ),
+    )
+    .await;
+    deploy_sensor(&db, sensor, SITE1_ID, dt("2000-01-01T00:00:00Z")).await;
+    let stream = create_paired_stream(&db, "two-open-windows-temp", PARAM_S1_TEMP_ID).await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO readings \
+             (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, sensor_id, replicate_index) VALUES \
+             ('{stream}', '{SITE1_ID}', '{GLOBAL_PARAM_TEMP_ID}', '2025-04-01T10:00:00Z', 3.0, 3.0, '{sensor}', 0)"
+        ),
+    )
+    .await;
+
+    reprocess_site_parameter_readings(
+        &db,
+        SITE1_ID.parse().unwrap(),
+        GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
+    )
+    .await
+    .expect("reprocess");
+
+    let rows = get_readings(&db, stream).await;
+    assert_eq!(
+        rows[0].calibration_id,
+        Some(later),
+        "the later window is stamped, with nothing having closed the earlier one"
+    );
+    assert_eq!(
+        rows[0].calibrated_value,
+        Some(15.0),
+        "the later curve's value (5*3), never the earlier one's (2*3)"
+    );
+
+    // What the per-sensor arm's `recompute_valid_until` call is actually for: the stored window is
+    // still open, so a reader of `valid_until` alone would show the earlier curve covering April.
+    let still_open = crate::common::e2e::count(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM sensor_calibrations \
+             WHERE id = '{earlier}' AND valid_until IS NULL"
+        ),
+    )
+    .await;
+    assert_eq!(still_open, 1, "the per-slot arm does not chain windows");
 
     cleanup_test_db(&db).await;
 }

@@ -34,13 +34,8 @@ async fn site_parameter_create_does_not_auto_create_or_shadow_threshold() {
     let depth = crate::common::GLOBAL_PARAM_DEPTH_ID;
     let site2 = crate::common::SITE2_ID; // seed does not give SITE2 a Depth site_parameter
 
-    // Give Depth parameter defaults, the exact condition the (now-removed) hook fired on. The seed
-    // already provides a global Depth threshold, so a correct create must leave that global in force.
-    crate::common::exec(
-        &db,
-        &format!("UPDATE parameters SET default_warning_max = 999, default_alarm_max = 1000 WHERE id = '{depth}'"),
-    )
-    .await;
+    // The seed already provides a global Depth threshold, so a correct create must leave that
+    // global in force rather than manufacture a site row that shadows it.
 
     // Creating a Depth site_parameter at SITE2 must NOT manufacture a site-specific row.
     let (status, body) = crate::common::post_json_with_token(

@@ -371,9 +371,19 @@ async fn moved_expectation_reaudits_a_group_already_stored() {
 
     let holds = list_holds(&fx, "&status=pending").await;
     let items = holds["holds"].as_array().expect("holds");
-    assert_eq!(items.len(), 1, "the moved expectation is held for review: {holds}");
-    assert_eq!(items[0]["expected"]["mean"], 25.0, "held against the moved claim, not the original");
-    assert_eq!(items[0]["computed"]["mean"], 20.0, "the stored replicates are what it recomputed");
+    assert_eq!(
+        items.len(),
+        1,
+        "the moved expectation is held for review: {holds}"
+    );
+    assert_eq!(
+        items[0]["expected"]["mean"], 25.0,
+        "held against the moved claim, not the original"
+    );
+    assert_eq!(
+        items[0]["computed"]["mean"], 20.0,
+        "the stored replicates are what it recomputed"
+    );
 }
 
 #[tokio::test]
@@ -1212,7 +1222,8 @@ async fn hold_review_is_confined_to_the_callers_projects() {
     crate::common::seed_test_data(&db).await;
     let token = crate::common::seed_token_full(&db).await;
     let (sync_token, _service_id) = crate::common::seed_sync_session_token(&db).await;
-    let app = crate::common::keycloak::build_test_app_with_keycloak(db.clone()).await;
+    let (app, state) =
+        crate::common::keycloak::build_test_app_with_keycloak_and_state(db.clone()).await;
 
     let other_project = "00000000-0000-4000-a000-0000000000c1";
     crate::common::exec(
@@ -1303,10 +1314,10 @@ async fn hold_review_is_confined_to_the_callers_projects() {
         "bulk acknowledge cannot reach the other project's holds: {body}"
     );
 
-    // Granted the hold's own project, the same manager sees and resolves it. The grants cache
-    // TTL is 1s in the test config; wait it out so the new grant is read.
+    // Granted the hold's own project, the same manager sees and resolves it. The grant is read
+    // through the grants cache, so drop what it holds rather than waiting out its TTL.
     crate::common::keycloak::grant_project(&db, &sub, crate::common::PROJECT_ID).await;
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    state.grants_cache.invalidate_all();
     let (status, body) =
         crate::common::get_json_with_token(&app, "/api/sync/replicate_audit_holds", &jwt).await;
     assert_eq!(status, 200, "list ({status}): {body}");
@@ -1497,7 +1508,10 @@ async fn a_hold_records_the_divisor_its_sd_was_computed_under() {
     let fx = setup("audit-divisor").await;
     let (status, declared) = crate::common::post_json_parse_with_token(
         &fx.app,
-        &format!("/api/site_parameters/{}/declare_sd_estimator", crate::common::PARAM_S1_TEMP_ID),
+        &format!(
+            "/api/site_parameters/{}/declare_sd_estimator",
+            crate::common::PARAM_S1_TEMP_ID
+        ),
         &json!({ "estimator": "population" }),
         &fx.token,
     )

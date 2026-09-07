@@ -174,18 +174,10 @@ pub async fn recompose_spot_readings<C: ConnectionTrait>(
     recompose_from_own_curves(db, "r.measurement_type = 'spot'", scope_sql, params).await
 }
 
-/// Rewrite `calibrated_value` from the curves each row itself names, for a corrected measurement.
-///
-/// `rows_sql` narrows which readings qualify and `scope_sql` selects them as `r` against `params`.
-/// Idempotent, so a scope wider than the rows that changed is safe.
-pub async fn recompose_from_own_curves<C: ConnectionTrait>(
-    db: &C,
-    rows_sql: &str,
-    scope_sql: &str,
-    params: Vec<sea_orm::Value>,
-) -> Result<u64, sea_orm::DbErr> {
-
-    let value = recomposed_value_sql(
+/// What the curves a row itself names produce from its raw value. Both the recompose and the drift
+/// sweep judge against this one expression, so what the sweep repairs is what the recompose writes.
+fn recomposed_own_curve_value() -> String {
+    recomposed_value_sql(
         "tgt.raw_value",
         &CurveColumns {
             id: "c.id",
@@ -197,8 +189,13 @@ pub async fn recompose_from_own_curves<C: ConnectionTrait>(
             slope: "sc.slope",
             intercept: "sc.intercept",
         },
-    );
-    let sql = format!(
+    )
+}
+
+/// The `UPDATE readings` both curve-recomposing statements are: `rows_sql` narrows which readings
+/// qualify, `scope_sql` selects them as `r`.
+fn recompose_statement(rows_sql: &str, scope_sql: &str) -> String {
+    format!(
         r"UPDATE readings tgt
           SET calibrated_value = {value}
           FROM readings r
@@ -210,12 +207,25 @@ pub async fn recompose_from_own_curves<C: ConnectionTrait>(
             AND ({rows_sql})
             AND NOT ({orphaned})
             AND ({scope_sql})",
+        value = recomposed_own_curve_value(),
         orphaned = orphaned_correction_rows("r"),
-    );
+    )
+}
+
+/// Rewrite `calibrated_value` from the curves each row itself names, for a corrected measurement.
+///
+/// `rows_sql` narrows which readings qualify and `scope_sql` selects them as `r` against `params`.
+/// Idempotent, so a scope wider than the rows that changed is safe.
+pub async fn recompose_from_own_curves<C: ConnectionTrait>(
+    db: &C,
+    rows_sql: &str,
+    scope_sql: &str,
+    params: Vec<sea_orm::Value>,
+) -> Result<u64, sea_orm::DbErr> {
     let result = db
         .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
+            &recompose_statement(rows_sql, scope_sql),
             params,
         ))
         .await?;
@@ -261,52 +271,32 @@ pub struct CurveDrift {
 /// attributed to the wrong curve for its timestamp is consistent by this measure and is the
 /// reprocess engines' subject, not this one's. The span is returned for the caller's aggregate
 /// refresh, since a rewritten value leaves the rollups holding the old one.
-pub async fn sweep_curve_drift(db: &DatabaseConnection) -> Result<CurveDrift, sea_orm::DbErr> {
-    let value = recomposed_value_sql(
-        "tgt.raw_value",
-        &CurveColumns {
-            id: "c.id",
-            slope: "c.slope",
-            intercept: "c.intercept",
-        },
-        &CurveColumns {
-            id: "sc.id",
-            slope: "sc.slope",
-            intercept: "sc.intercept",
-        },
+pub async fn sweep_curve_drift(db: &DatabaseConnection) -> crate::error::AppResult<CurveDrift> {
+    let drifted = format!(
+        "{corrected} AND tgt.calibrated_value IS DISTINCT FROM ({value})",
+        corrected = corrected_rows("r"),
+        value = recomposed_own_curve_value(),
     );
     let sql = format!(
-        r"WITH drift AS (
-            UPDATE readings tgt
-            SET calibrated_value = {value}
-            FROM readings r
-            LEFT JOIN sensor_calibrations c ON c.id = r.calibration_id
-            LEFT JOIN standard_curves sc ON sc.id = r.standard_curve_id
-            WHERE tgt.stream_id = r.stream_id
-              AND tgt.time = r.time
-              AND tgt.replicate_index = r.replicate_index
-              AND {corrected}
-              AND NOT ({orphaned})
-              AND tgt.calibrated_value IS DISTINCT FROM ({value})
+        "WITH drift AS (
+            {update}
             RETURNING tgt.time
           )
           SELECT count(*) AS moved, min(time) AS lo, max(time) AS hi FROM drift",
-        corrected = corrected_rows("r"),
-        orphaned = orphaned_correction_rows("r"),
+        update = recompose_statement(&drifted, "TRUE"),
     );
 
-    // Drift in a chunk past the compression policy has to decompress, and the per-statement cap
-    // refuses that outside a transaction lifting it.
-    let txn = <DatabaseConnection as sea_orm::TransactionTrait>::begin(db).await?;
-    txn.execute_unprepared("SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0")
-        .await?;
-    let row = txn
-        .query_one_raw(Statement::from_string(
+    // Drift in a chunk past the compression policy has to decompress, and the roll-up carries its
+    // own `RETURNING tgt.time`, so this is `guarded` rather than `guarded_mutation`.
+    let row = crate::common::bulk_write::guarded(db, async |txn| {
+        txn.query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             sql,
         ))
-        .await?;
-    txn.commit().await?;
+        .await
+        .map_err(crate::error::AppError::Database)
+    })
+    .await?;
 
     let Some(row) = row else {
         return Ok(CurveDrift {
@@ -734,10 +724,10 @@ pub async fn reprocess_sensor_readings(
     // in a gap between two, is uncorrected: the re-derivation below resolves no curve for it and
     // clears both the reference and the value.
     //
-    // Chain each parameter's calibration windows (valid_until = next valid_from) before deriving, so
-    // the window UPDATE below is single-valued. Calibrations inserted outside the CRUD hooks (bulk
-    // load, tests) may carry no valid_until; without this two open windows on the same parameter would
-    // both cover a reading and the UPDATE..FROM would pick one arbitrarily (nondeterministic).
+    // Repair a `valid_until` a bulk load left NULL, so the stored window agrees with the one the
+    // resolver serves. `pick_calibration_lateral` is single-valued whether or not windows overlap,
+    // so the derivation below does not need this; what needs it is the curve editor, which reads
+    // `valid_until` and would otherwise show a window open past the point a later curve takes over.
     recompute_valid_until(db, sensor_id).await?;
 
     // The bulk re-derivation runs in one guarded transaction (`common::bulk_write`), which lifts
@@ -988,6 +978,10 @@ pub async fn reprocess_site_parameter_readings(
 
     let updated = crate::common::bulk_write::guarded(db, async |txn| {
         // 1. Re-own + re-stamp deployment/site from the (site, parameter) deployment timeline.
+        //    This runs before the curve resolution below, and the order is the contract: step 2
+        //    resolves against `r.sensor_id`, so it picks the curves of the owner step 1 just
+        //    wrote. Resolving first would stamp the outgoing sensor's curve on a reading the swap
+        //    hands to the incoming one, and nothing repairs that afterwards.
         let dep_result = txn
             .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
@@ -1093,4 +1087,33 @@ pub async fn reprocess_site_parameter_readings(
             .map_err(app_error_as_db_err)?;
     }
     Ok(updated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_drift_sweep_repairs_exactly_what_the_recompose_writes() {
+        let drifted = format!(
+            "{corrected} AND tgt.calibrated_value IS DISTINCT FROM ({value})",
+            corrected = corrected_rows("r"),
+            value = recomposed_own_curve_value(),
+        );
+        let sweep = recompose_statement(&drifted, "TRUE");
+        assert!(
+            sweep.contains(&recomposed_own_curve_value()),
+            "the sweep writes the value the recompose computes: {sweep}"
+        );
+        assert!(
+            sweep.contains(&orphaned_correction_rows("r")),
+            "and leaves an orphaned correction alone, as the recompose does: {sweep}"
+        );
+        assert_eq!(
+            recompose_statement("r.measurement_type = 'spot'", "TRUE")
+                .replace("r.measurement_type = 'spot'", &drifted),
+            sweep,
+            "the two statements differ only in which rows qualify"
+        );
+    }
 }

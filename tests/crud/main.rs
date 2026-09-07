@@ -6,5 +6,6 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod batch_routes;
 mod config_fields_and_contract;
 mod delete_cascade_and_constraints;

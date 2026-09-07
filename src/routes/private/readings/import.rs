@@ -591,6 +591,9 @@ pub async fn import_csv(
     let mut errors: Vec<RowError> = Vec::new();
     let mut error_count = 0usize;
     let mut line = 1usize; // header is line 1
+    // One clock read for the file: every row is judged against the same lead bound, so two rows
+    // carrying one timestamp cannot land on opposite sides of it.
+    let now = chrono::Utc::now();
 
     let record_error =
         |row: usize, message: String, errors: &mut Vec<RowError>, count: &mut usize| {
@@ -626,7 +629,7 @@ pub async fn import_csv(
         };
         // The same bound /ingest and /readings/batch enforce, reported per row so the rest of the
         // file still imports.
-        if let Some(reason) = admission::time_rejection(time) {
+        if let Some(reason) = admission::time_rejection_at(now, time) {
             record_error(line, reason, &mut errors, &mut error_count);
             continue;
         }
@@ -1454,6 +1457,7 @@ async fn import_tool_csv(
     let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut latest: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut line = 1usize;
+    let now = chrono::Utc::now();
     for record in reader.records() {
         line += 1;
         let record = match record {
@@ -1478,7 +1482,7 @@ async fn import_tool_csv(
             );
             continue;
         };
-        if let Some(reason) = admission::time_rejection(time) {
+        if let Some(reason) = admission::time_rejection_at(now, time) {
             record_error(line, reason, &mut errors, &mut error_count);
             continue;
         }

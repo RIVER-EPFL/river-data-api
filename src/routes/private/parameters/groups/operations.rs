@@ -61,9 +61,60 @@ async fn all_members(db: &DatabaseConnection) -> Result<Vec<Member>, ApiError> {
     Ok(members)
 }
 
+/// The candidate's catalog code, and the codes of the group's members entered several times. The
+/// statistics rule reads both: what is being added, and what the group already computes.
+async fn codes_for_statistics_rule(
+    db: &DatabaseConnection,
+    group_id: Uuid,
+    parameter_id: Uuid,
+) -> Result<(String, Vec<String>), ApiError> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT code FROM parameters WHERE id = $1",
+            [parameter_id.into()],
+        ))
+        .await
+        .map_err(ApiError::database)?;
+    let code: String = match row {
+        Some(row) => row.try_get("", "code").map_err(ApiError::database)?,
+        None => return Ok((String::new(), Vec::new())),
+    };
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT p.code FROM parameter_group_members m \
+               JOIN parameters p ON p.id = m.parameter_id \
+              WHERE m.group_id = $1 AND m.replicates IS NOT NULL",
+            [group_id.into()],
+        ))
+        .await
+        .map_err(ApiError::database)?;
+    let mut replicated = Vec::with_capacity(rows.len());
+    for row in rows {
+        let code: String = row.try_get("", "code").map_err(ApiError::database)?;
+        replicated.push(code);
+    }
+    Ok((code, replicated))
+}
+
 #[async_trait]
 impl CRUDOperations for ParameterGroupOperations {
     type Resource = ParameterGroup;
+
+    /// One row at a time, through the single-row path: the crudcrate default delegates to the
+    /// resource, which delegates back here, and the single-row hooks are what a batch needs too.
+    async fn update_many(
+        &self,
+        db: &DatabaseConnection,
+        updates: Vec<(Uuid, <ParameterGroup as CRUDResource>::UpdateModel)>,
+    ) -> Result<Vec<ParameterGroup>, ApiError> {
+        let mut updated = Vec::with_capacity(updates.len());
+        for (id, data) in updates {
+            updated.push(self.update(db, id, data).await?);
+        }
+        Ok(updated)
+    }
 
     /// One row at a time, through the single-row path: the crudcrate default `create_many`
     /// delegates to the resource, which delegates back here, so the default recurses; the loop
@@ -107,6 +158,20 @@ pub struct ParameterGroupMemberOperations;
 impl CRUDOperations for ParameterGroupMemberOperations {
     type Resource = ParameterGroupMember;
 
+    /// One row at a time, through the single-row path: the crudcrate default delegates to the
+    /// resource, which delegates back here, and the single-row hooks are what a batch needs too.
+    async fn update_many(
+        &self,
+        db: &DatabaseConnection,
+        updates: Vec<(Uuid, <ParameterGroupMember as CRUDResource>::UpdateModel)>,
+    ) -> Result<Vec<ParameterGroupMember>, ApiError> {
+        let mut updated = Vec::with_capacity(updates.len());
+        for (id, data) in updates {
+            updated.push(self.update(db, id, data).await?);
+        }
+        Ok(updated)
+    }
+
     async fn create_many(
         &self,
         db: &DatabaseConnection,
@@ -120,7 +185,8 @@ impl CRUDOperations for ParameterGroupMemberOperations {
     }
 
     /// A parameter belongs to at most one group. The UNIQUE index is the backstop; this names the
-    /// group that already holds it.
+    /// group that already holds it. A group's replicated members carry their own mean and sd, so
+    /// the catalog parameters the portals stored those in are refused as members.
     async fn before_create(
         &self,
         db: &DatabaseConnection,
@@ -133,6 +199,11 @@ impl CRUDOperations for ParameterGroupMemberOperations {
             )));
         }
         rules::may_add(data.parameter_id, &all_members(db).await?)
+            .map_err(|refusal| ApiError::bad_request(refusal.to_string()))?;
+        let (code, replicated) =
+            codes_for_statistics_rule(db, data.group_id, data.parameter_id).await?;
+        let replicated: Vec<&str> = replicated.iter().map(String::as_str).collect();
+        rules::may_add_code(&code, &replicated)
             .map_err(|refusal| ApiError::bad_request(refusal.to_string()))
     }
 
