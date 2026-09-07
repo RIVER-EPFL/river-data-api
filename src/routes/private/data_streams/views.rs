@@ -990,12 +990,11 @@ pub async fn pair_stream(
 
             // Audit mismatches recorded while the stream was unpaired become reviewable now that the
             // data serves a slot.
-            txn.execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE replicate_audit_holds SET status = 'pending'
-             WHERE stream_id = $1 AND status = 'deferred'",
-                [stream_id.into()],
-            ))
+            crate::routes::private::sync::replicate_audit::repoint_holds(
+                txn,
+                crate::routes::private::sync::replicate_audit::HoldScope::Stream(stream_id),
+                true,
+            )
             .await?;
 
             Ok((sp.site_id, sp.parameter_id, backfilled, touched_events))
@@ -1123,12 +1122,11 @@ pub async fn unpair_stream(
 
     // Open reviews lose their reviewer along with the slot; they wait as deferred until the
     // stream is paired again.
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "UPDATE replicate_audit_holds SET status = 'deferred'
-         WHERE stream_id = $1 AND status = 'pending'",
-        [stream_id.into()],
-    ))
+    crate::routes::private::sync::replicate_audit::repoint_holds(
+        db,
+        crate::routes::private::sync::replicate_audit::HoldScope::Stream(stream_id),
+        false,
+    )
     .await?;
 
     let updated = data_streams::Entity::find_by_id(stream_id)

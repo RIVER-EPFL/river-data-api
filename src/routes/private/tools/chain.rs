@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement};
 use uuid::Uuid;
 
+use crate::routes::private::sync::replicate_audit as audit;
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::grab_samples::{
@@ -596,28 +597,23 @@ async fn upsert_finding(
     tool: &str,
     payload: FindingPayload,
 ) -> AppResult<()> {
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO replicate_audit_holds
-             (kind, site_id, parameter_id, group_time, tool, expected, computed, delta, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
-         ON CONFLICT (kind, site_id, parameter_id, group_time)
-             WHERE stream_id IS NULL AND status = 'pending'
-         DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed,
-                       delta = EXCLUDED.delta, tool = EXCLUDED.tool, created_at = NOW()",
-        [
-            kind.into(),
-            event.site_id.into(),
-            parameter_id.into(),
-            sea_orm::prelude::DateTimeWithTimeZone::from(event.collected_at).into(),
-            tool.into(),
-            payload.expected.into(),
-            payload.computed.into(),
-            payload.delta.into(),
-        ],
-    ))
-    .await?;
-    Ok(())
+    audit::upsert_hold(
+        db,
+        &audit::Hold {
+            key: audit::HoldKey::Slot {
+                site_id: event.site_id,
+                parameter_id,
+                group_time: event.collected_at,
+            },
+            kind,
+            expected: payload.expected,
+            computed: payload.computed,
+            delta: payload.delta,
+            status: "pending",
+            tool: Some(tool),
+        },
+    )
+    .await
 }
 
 /// Close open findings for slots the current audit found in agreement (or now populated).

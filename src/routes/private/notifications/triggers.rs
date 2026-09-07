@@ -36,6 +36,12 @@ pub async fn run(state: &AppState, channels: &[Box<dyn NotificationChannel>]) {
     if let Err(e) = sync_staleness(state, channels).await {
         tracing::warn!(error = %e, "sync-staleness trigger failed");
     }
+    if let Err(e) = streams_unpaired(state, channels).await {
+        tracing::warn!(error = %e, "unpaired-streams trigger failed");
+    }
+    if let Err(e) = holds_open(state, channels).await {
+        tracing::warn!(error = %e, "open-holds trigger failed");
+    }
 }
 
 async fn state_get(
@@ -386,6 +392,9 @@ async fn battery_forecast(
 /// Hours between repeat alerts while a sync service stays heartbeat-dead.
 const SYNC_STALE_RENOTIFY_HOURS: i64 = 12;
 
+/// Hours between repeat alerts while the review queue still holds an open decision.
+const HOLDS_RENOTIFY_HOURS: i64 = SYNC_STALE_RENOTIFY_HOURS;
+
 /// A sync service whose heartbeat has stopped. `sync_failures` cannot see this — it counts
 /// `sync_events` rows and a dead service writes none (the three portal services were once
 /// heartbeat-dead for two days with zero notifications) — so the expectation is judged from the
@@ -435,6 +444,137 @@ async fn sync_staleness(
         };
         let _ = deliver(state, channels, &msg, None).await;
     }
+    Ok(())
+}
+
+/// A stream a sync brought in that nobody has paired yet. Its readings are stored unattributed, so
+/// they reach no site view and no aggregate until an operator pairs it; nothing else points at the
+/// wizard, so the discovery has to arrive rather than be found.
+///
+/// A stream is a standing condition, keyed and claimed per stream so each one is announced once and
+/// stops being announced when it is paired, and the cycle's new ones are digested per source system
+/// rather than sent one message each. Pairing is the operator's own action, so it clears the state
+/// silently instead of sending a recovery notice.
+async fn streams_unpaired(
+    state: &AppState,
+    channels: &[Box<dyn NotificationChannel>],
+) -> Result<(), DbErr> {
+    let db = &state.db;
+
+    // A stream that was paired, deactivated or deleted is no longer waiting: drop its row so that
+    // an unpairing later reads as a fresh discovery.
+    db.execute_raw(Statement::from_string(
+        PG,
+        "DELETE FROM notification_state ns WHERE ns.kind = 'streams_unpaired' \
+         AND NOT EXISTS (SELECT 1 FROM data_streams ds WHERE ds.id::text = ns.subject_key \
+                         AND ds.site_parameter_id IS NULL AND ds.is_active)"
+            .to_string(),
+    ))
+    .await?;
+
+    // `last_data_time` is the stream's cursor, so it is set exactly when readings have landed.
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            PG,
+            "SELECT id, source_system, COALESCE(source_name, source_key) AS label \
+             FROM data_streams \
+             WHERE site_parameter_id IS NULL AND is_active AND last_data_time IS NOT NULL \
+             ORDER BY source_system, source_key"
+                .to_string(),
+        ))
+        .await?;
+
+    let mut by_system: std::collections::BTreeMap<String, Vec<(uuid::Uuid, String)>> =
+        std::collections::BTreeMap::new();
+    for r in &rows {
+        let id: uuid::Uuid = r.try_get("", "id")?;
+        let source_system: String = r.try_get("", "source_system")?;
+        let label: String = r.try_get("", "label")?;
+        // Claim the firing transition before sending so only one replica announces it.
+        if claim_insert(db, "streams_unpaired", &id.to_string()).await? {
+            by_system.entry(source_system).or_default().push((id, label));
+        }
+    }
+
+    for (source_system, claimed) in by_system {
+        let n = claimed.len();
+        let listed = claimed
+            .iter()
+            .take(5)
+            .map(|(_, label)| label.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = if n > 5 {
+            format!(" and {} more", n - 5)
+        } else {
+            String::new()
+        };
+        let msg = OutgoingMessage {
+            kind: "streams_unpaired",
+            subject: format!("RIVER Data: {n} unpaired stream(s) on {source_system}"),
+            body: format!(
+                "🔗 {n} {source_system} stream(s) are storing readings with no site parameter, so \
+                 nothing is attributed: {listed}{more}. Pair them from Data Streams."
+            ),
+            // Which slot they belong to is the question being asked, so there is none yet.
+            slot: None,
+        };
+        if !deliver(state, channels, &msg, None).await {
+            for (id, _) in &claimed {
+                state_clear(db, "streams_unpaired", &id.to_string()).await?; // retry next tick
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Open review-queue holds. A held source edit or a statistics disagreement waits for a person, and
+/// the audits panel is only found by people who already know it exists, so the backlog is announced
+/// on the same cadence a silent sync service is.
+async fn holds_open(
+    state: &AppState,
+    channels: &[Box<dyn NotificationChannel>],
+) -> Result<(), DbErr> {
+    let db = &state.db;
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            PG,
+            format!(
+                "SELECT kind, COUNT(*)::bigint AS n FROM replicate_audit_holds \
+                 WHERE status IN {open} GROUP BY kind ORDER BY kind",
+                open = crate::routes::private::sync::replicate_audit::OPEN
+            ),
+        ))
+        .await?;
+    if rows.is_empty() {
+        // Nothing is waiting, so a later backlog is a fresh transition rather than a repeat.
+        state_clear(db, "holds_open", "all").await?;
+        return Ok(());
+    }
+
+    let mut total = 0i64;
+    let mut parts = Vec::new();
+    for r in &rows {
+        let kind: String = r.try_get("", "kind")?;
+        let n: i64 = r.try_get("", "n")?;
+        total += n;
+        parts.push(format!("{n} {kind}"));
+    }
+    if !claim_renotify(db, "holds_open", "all", HOLDS_RENOTIFY_HOURS).await? {
+        return Ok(());
+    }
+    let msg = OutgoingMessage {
+        kind: "holds_open",
+        subject: format!("RIVER Data: {total} hold(s) awaiting review"),
+        body: format!(
+            "📋 {total} hold(s) are open in the review queue ({}). Review them under Data \
+             Streams, Audits.",
+            parts.join(", ")
+        ),
+        // The queue spans slots and unpaired streams alike, so it carries no single scope.
+        slot: None,
+    };
+    let _ = deliver(state, channels, &msg, None).await;
     Ok(())
 }
 

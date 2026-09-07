@@ -71,7 +71,10 @@ pub fn write_routes() -> Router<AppState> {
         .route("/pairing-plans", post(create_pairing_plan))
         .route("/pairing-plans/{id}", patch(update_pairing_plan))
         .route("/pairing-plans/{id}/apply", post(apply_pairing_plan))
-        .route("/pairing-plans/{id}/supersede", post(supersede_pairing_plan))
+        .route(
+            "/pairing-plans/{id}/supersede",
+            post(supersede_pairing_plan),
+        )
         .route("/pairing-plans/{id}/revert", post(revert_pairing_plan))
 }
 
@@ -1364,8 +1367,6 @@ pub async fn bulk_pair(
     }
 
     // 4. Fetch unpaired streams, build site_parameter mappings, then batch-pair
-    use sea_orm::Statement;
-
     let streams = data_streams::Entity::find()
         .filter(data_streams::Column::SourceSystem.eq(&req.source_system))
         .filter(data_streams::Column::SiteParameterId.is_null())
@@ -1829,10 +1830,10 @@ struct PlanEntryUpdate {
     acknowledged: Option<bool>,
 }
 
-/// What an instrument decision covers. A curve column is one instrument across the whole source,
-/// so settling it on any one entry settles every entry sharing the column; where no column names a
-/// curve, the source parameter plays that role, so choosing the fluorometer for `chla_acid` covers
-/// all 31 stations rather than one.
+/// What an instrument decision covers where the entry names no instrument yet. A curve column is
+/// one instrument across the whole source, so settling it on any one entry settles every entry
+/// sharing the column; where no column names a curve, the source parameter plays that role, so
+/// choosing the fluorometer for `chla_acid` covers all 31 stations rather than one.
 fn instrument_scope(entry: &crate::routes::private::sync::service::PlanEntry) -> String {
     match entry
         .instrument
@@ -1851,12 +1852,26 @@ fn instrument_scope(entry: &crate::routes::private::sync::service::PlanEntry) ->
     }
 }
 
+/// The identity an instrument decision belongs to. An entry that already names an instrument
+/// belongs to that instrument, however many source columns share it: the portal's `chla acid`
+/// curve corrects both `Chla_acid_ugL` and `Chla_acid_ugm2` from one lab instrument, and keying
+/// those by parameter would report one instrument as two rows and move only half of it when the
+/// operator repointed it. An entry with no instrument has only its scope to be keyed by.
+fn instrument_key(entry: &crate::routes::private::sync::service::PlanEntry) -> String {
+    match entry.instrument.as_ref() {
+        Some(instrument) if !instrument.source_key.is_empty() => {
+            format!("instrument:{}", instrument.source_key)
+        }
+        _ => instrument_scope(entry),
+    }
+}
+
 /// Apply the instrument half of a plan edit.
 ///
-/// Kept apart from the per-entry loop because an instrument decision is per curve column, not per
-/// stream: one column resolves to one instrument across the whole source, so confirming or
-/// repointing it on any one entry settles every entry that shares it. Doing it per entry would
-/// leave 30 of 31 DOC streams still asking.
+/// Kept apart from the per-entry loop because an instrument decision is per instrument, not per
+/// stream: one instrument serves the whole source, so confirming or repointing it on any one entry
+/// settles every entry that shares it. Doing it per entry would leave 30 of 31 DOC streams still
+/// asking.
 async fn apply_instrument_updates(
     state: &AppState,
     source_system: &str,
@@ -1874,7 +1889,17 @@ async fn apply_instrument_updates(
         let Some(target) = entries.iter().find(|e| e.stream_id == update.stream_id) else {
             continue;
         };
-        let scope = instrument_scope(target);
+        let key = instrument_key(target);
+        // One key in, one key out: the proposal a rename mints is derived from the entry the
+        // operator edited, so a row covering several source columns stays one row.
+        let proposed_source_key = match target
+            .instrument
+            .as_ref()
+            .and_then(|i| i.curve_column.as_deref())
+        {
+            Some(column) => format!("{source_system}:{column}"),
+            None => format!("{source_system}:{}", target.parameter.name),
+        };
 
         // A feed the source reports as a device has its instrument already: one minted for the
         // slot it serves when the stream is paired, with that slot's deployment opened. Minting a
@@ -1926,7 +1951,7 @@ async fn apply_instrument_updates(
             None => Vec::new(),
         };
 
-        for entry in entries.iter_mut().filter(|e| instrument_scope(e) == scope) {
+        for entry in entries.iter_mut().filter(|e| instrument_key(e) == key) {
             if update.instrument_clear == Some(true) {
                 entry.instrument = None;
                 continue;
@@ -1942,16 +1967,15 @@ async fn apply_instrument_updates(
                     .map(str::trim)
                     .filter(|n| !n.is_empty());
                 if repointed.is_some() || proposed.is_some() {
-                    let parameter = entry.parameter.name.clone();
                     let name = proposed
                         .map(str::to_string)
-                        .unwrap_or_else(|| parameter.clone());
+                        .unwrap_or_else(|| entry.parameter.name.clone());
                     entry.instrument =
                         Some(crate::routes::private::sync::service::PlanInstrumentRef {
                             curve_column: None,
                             id: None,
                             name: name.clone(),
-                            source_key: format!("{source_system}:{parameter}"),
+                            source_key: proposed_source_key.clone(),
                             resolved_by: if repointed.is_some() {
                                 "manual".to_string()
                             } else {
@@ -1965,7 +1989,6 @@ async fn apply_instrument_updates(
                         });
                 }
             }
-            let entry_parameter = entry.parameter.name.clone();
             let Some(instrument) = entry.instrument.as_mut() else {
                 continue;
             };
@@ -1995,14 +2018,10 @@ async fn apply_instrument_updates(
                     instrument.name = name.clone();
                     instrument.proposed_name = Some(name);
                 } else {
-                    let source_key = match &instrument.curve_column {
-                        Some(column) => format!("{source_system}:{column}"),
-                        None => format!("{source_system}:{entry_parameter}"),
-                    };
                     instrument.id = None;
                     instrument.name = name.clone();
                     instrument.proposed_name = Some(name);
-                    instrument.source_key = source_key;
+                    instrument.source_key = proposed_source_key.clone();
                     instrument.resolved_by = "placeholder".to_string();
                     instrument.create = true;
                     instrument.confirmed = false;
@@ -2608,7 +2627,7 @@ pub async fn plan_instruments(
         std::collections::BTreeMap::new();
 
     for entry in entries.iter().filter(|e| e.action == "pair") {
-        let scope = instrument_scope(entry);
+        let scope = instrument_key(entry);
         // A device-shaped feed is reported as its device, whether or not it already names one.
         // Listing it as a lab decision as well would put the same instrument in two places, one of
         // which offers to change it.
@@ -2832,4 +2851,61 @@ pub async fn plan_instruments(
         devices: device_acc.into_values().collect(),
         curves,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::instrument_key;
+    use serde_json::json;
+
+    fn entry(
+        parameter: &str,
+        instrument_source_key: Option<&str>,
+    ) -> crate::routes::private::sync::service::PlanEntry {
+        serde_json::from_value(json!({
+            "stream_id": uuid::Uuid::new_v4(),
+            "source_key": format!("FP1:{parameter}"),
+            "source_name": null,
+            "action": "pair",
+            "confidence": "none",
+            "project": { "id": null, "name": "METALP", "create": true },
+            "site": { "id": null, "name": "FP1", "create": true, "latitude": null, "longitude": null, "altitude_m": null },
+            "parameter": { "id": null, "name": parameter, "create": false, "units": "-" },
+            "instrument": instrument_source_key.map(|key| json!({
+                "id": null,
+                "name": "chla acid (metalp)",
+                "source_key": key,
+                "resolved_by": "stream",
+                "create": false,
+                "stamps_readings": false,
+            })),
+        }))
+        .expect("plan entry fixture deserializes")
+    }
+
+    /// One lab instrument corrects several source columns, so the review reports it once and an
+    /// edit on it moves every column it serves.
+    #[test]
+    fn columns_sharing_an_instrument_share_one_key() {
+        let ugl = entry("Chla_acid_ugL", Some("metalp:chla acid"));
+        let ugm2 = entry("Chla_acid_ugm2", Some("metalp:chla acid"));
+        assert_eq!(instrument_key(&ugl), instrument_key(&ugm2));
+    }
+
+    #[test]
+    fn different_instruments_stay_apart() {
+        let acid = entry("Chla_acid_ugL", Some("metalp:chla acid"));
+        let noacid = entry("Chla_noacid_ugL", Some("metalp:chla noacid"));
+        assert_ne!(instrument_key(&acid), instrument_key(&noacid));
+    }
+
+    /// With no instrument to key on, the parameter is what the decision covers, so every station
+    /// reporting it is still one row.
+    #[test]
+    fn an_entry_with_no_instrument_keys_on_its_parameter() {
+        let a = entry("DOC_ppb", None);
+        let b = entry("DOC_ppb", None);
+        assert_eq!(instrument_key(&a), instrument_key(&b));
+        assert_ne!(instrument_key(&a), instrument_key(&entry("NUT_P", None)));
+    }
 }

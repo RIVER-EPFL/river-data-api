@@ -75,6 +75,7 @@ async fn displace_spot_tail(
             time,
             serde_json::json!({ "claim": "displaced", "withdrawn": entries }),
             serde_json::json!({ "replicates": count }),
+            "pending",
         )
         .await?;
     }
@@ -1015,10 +1016,6 @@ impl CsvImport {
             .get("overlapping")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as usize;
-        let overlap_differing = params
-            .get("overlap_differing")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as usize;
         let param_streams = uuid_pair_array(params, "param_streams");
         // Explicit request-level classification, or None to resolve per row from the
         // stream declaration and the owning sensor's data_frequency.
@@ -1646,9 +1643,24 @@ impl Job for MergeParameters {
     }
 }
 
+/// The status a guarded plan job's work leaves behind, read before it runs.
+///
+/// A lease lost after the run committed is reclaimed by the reaper and the job runs again. The
+/// guard inside `apply_plan`/`revert_plan` then refuses the plan for being past its starting
+/// status, which the worker records as a failure over work that in fact succeeded, so the replay
+/// is recognised here and reported instead.
+async fn plan_status<C: ConnectionTrait>(db: &C, plan_id: Uuid) -> Result<Option<String>, DbErr> {
+    Ok(
+        crate::routes::private::data_streams::pairing_plans::Entity::find_by_id(plan_id)
+            .one(db)
+            .await?
+            .map(|p| p.status),
+    )
+}
+
 /// Apply a pairing plan: resolve entities, execute pairings, backfill readings, mark the plan
-/// `applied`. The status transition is guarded (only a `draft` plan applies), so a re-execution
-/// after a lost lease does nothing; not offered as a rerun. Backs the `apply_pairing_plan`
+/// `applied`. The status transition is guarded (only a `draft` plan applies), and a re-execution
+/// after a lost lease finds the plan already applied and reports a replay; not offered as a rerun. Backs the `apply_pairing_plan`
 /// operator action.
 pub struct PlanApply;
 
@@ -1660,6 +1672,13 @@ impl Job for PlanApply {
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let plan_id = required_uuid(ctx.params(), "plan_id")?;
+        if plan_status(ctx.db(), plan_id).await?.as_deref() == Some("applied") {
+            ctx.report(JobReport::new().scope("plan_id", plan_id.to_string()))
+                .await;
+            ctx.info("Plan is already applied; this run is a replay and changed nothing")
+                .await;
+            return Ok(0);
+        }
         let result = crate::routes::private::sync::service::apply_plan(ctx.db(), plan_id)
             .await
             .map_err(|e| DbErr::Custom(e.to_string()))?;
@@ -1680,8 +1699,9 @@ impl Job for PlanApply {
 }
 
 /// Revert an applied pairing plan: unpair every stream it touched, restoring the prior state, and
-/// mark the plan `reverted`. The status transition is guarded (only an `applied` plan reverts), so
-/// a re-execution after a lost lease does nothing; not offered as a rerun. Backs the
+/// mark the plan `reverted`. The status transition is guarded (only an `applied` plan reverts), and
+/// a re-execution after a lost lease finds the plan already reverted and reports a replay; not
+/// offered as a rerun. Backs the
 /// `revert_pairing_plan` operator action.
 pub struct PlanRevert;
 
@@ -1693,6 +1713,13 @@ impl Job for PlanRevert {
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let plan_id = required_uuid(ctx.params(), "plan_id")?;
+        if plan_status(ctx.db(), plan_id).await?.as_deref() == Some("reverted") {
+            ctx.report(JobReport::new().scope("plan_id", plan_id.to_string()))
+                .await;
+            ctx.info("Plan is already reverted; this run is a replay and changed nothing")
+                .await;
+            return Ok(0);
+        }
         let reverted = crate::routes::private::sync::service::revert_plan(ctx.db(), plan_id)
             .await
             .map_err(|e| DbErr::Custom(e.to_string()))?;

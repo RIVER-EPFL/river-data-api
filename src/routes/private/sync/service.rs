@@ -547,18 +547,36 @@ pub fn resolve_instrument(
     })
 }
 
+/// The provenance key a stream's instrument is held under: the source's instrument for the raw
+/// column the feed carries, or the feed's own key when it names no parameter.
+///
+/// The plan and the pairing both key through here, so the row one proposes is the row the other
+/// mints. A plan's suggested parameter is a display name (a family's `DOC_avg_ppb` reads as `DOC`)
+/// and the regrouping loop rewrites it again, so keying off it mints a second instrument for the
+/// same analyte.
+pub fn stream_instrument_key(stream: &data_streams::Model) -> String {
+    let parameter = extract_hierarchy(stream).parameter;
+    let key_part = if parameter.is_empty() {
+        stream.source_key.as_str()
+    } else {
+        parameter.as_str()
+    };
+    format!("{}:{key_part}", stream.source_system)
+}
+
 /// The instrument a source parameter resolves to, for the feeds that name no curve column.
 ///
-/// The source's own instrument under the key an apply mints (`{source}:{param}`) when it has one,
-/// and otherwise that same key proposed for creation, pre-agreed. Every stream is paired with an
-/// instrument, so the review's default is the suggestion rather than a question: an operator who
-/// wants another instrument attaches it, and one who wants none has nothing to pair.
+/// The source's own instrument under the key an apply mints ([`stream_instrument_key`]) when it has
+/// one, and otherwise that same key proposed for creation, pre-agreed. Every stream is paired with
+/// an instrument, so the review's default is the suggestion rather than a question: an operator who
+/// wants another instrument attaches it, and one who wants none has nothing to pair. `parameter`
+/// names the proposal, it does not key it.
 pub fn resolve_parameter_instrument(
     source_system: &str,
+    source_key: String,
     parameter: &str,
     catalog: &InstrumentCatalog,
 ) -> PlanInstrumentRef {
-    let source_key = format!("{source_system}:{parameter}");
     if let Some(id) = catalog.by_source_key.get(&source_key).copied() {
         let (name, key) = catalog.by_id.get(&id).cloned().unwrap_or_default();
         return PlanInstrumentRef {
@@ -893,6 +911,7 @@ pub async fn create_plan(
         if entry.instrument.is_none() && !entry.is_device {
             entry.instrument = Some(resolve_parameter_instrument(
                 source_system,
+                stream_instrument_key(stream),
                 &entry.parameter.name,
                 &instruments,
             ));
@@ -1212,13 +1231,11 @@ pub async fn apply_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppR
     let readings_backfilled = backfill_plan_readings(&txn, plan_id).await?;
     // Audit mismatches recorded while these streams were unpaired become reviewable with the
     // pairing they just gained.
-    txn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "UPDATE replicate_audit_holds h SET status = 'pending'
-         FROM data_streams ds
-         WHERE ds.id = h.stream_id AND ds.pairing_plan_id = $1 AND h.status = 'deferred'",
-        [plan_id.into()],
-    ))
+    crate::routes::private::sync::replicate_audit::repoint_holds(
+        &txn,
+        crate::routes::private::sync::replicate_audit::HoldScope::Plan(plan_id),
+        true,
+    )
     .await?;
     finalize_plan(&txn, plan_id, &counters, readings_backfilled).await?;
     txn.commit().await?;
@@ -1484,8 +1501,8 @@ async fn mint_plan_instruments<C: ConnectionTrait>(
             source_system,
             source_key,
             &want.name,
-            // The same identity `resolve_or_mint_stream_instrument` mints under, so a hand pairing
-            // and a plan converge on one row rather than on two that disagree about what it is.
+            // The key is `stream_instrument_key`'s on both sides, so a hand pairing and a plan
+            // converge on one row rather than on two that disagree about what it is.
             InstrumentKind::SourceParameter,
             "high",
             None,
@@ -1726,13 +1743,11 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
     .await?;
 
     // Reverting the pairing takes the reviewer away again; open reviews wait as deferred.
-    txn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "UPDATE replicate_audit_holds h SET status = 'deferred'
-         FROM data_streams ds
-         WHERE ds.id = h.stream_id AND ds.pairing_plan_id = $1 AND h.status = 'pending'",
-        [plan_id.into()],
-    ))
+    crate::routes::private::sync::replicate_audit::repoint_holds(
+        &txn,
+        crate::routes::private::sync::replicate_audit::HoldScope::Plan(plan_id),
+        false,
+    )
     .await?;
 
     if !sample_ids.is_empty() {
@@ -2383,8 +2398,8 @@ pub fn apply_bulk_action(entries: &mut [PlanEntry], filter: &BulkWhere, action: 
 #[cfg(test)]
 mod tests {
     use super::{
-        BulkWhere, InstrumentCatalog, PlanEntry, apply_bulk_action, resolve_parameter_instrument,
-        select_entries,
+        BulkWhere, InstrumentCatalog, PlanEntry, apply_bulk_action, family_parameter_suggestion,
+        resolve_parameter_instrument, select_entries, stream_instrument_key,
     };
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -2404,10 +2419,55 @@ mod tests {
         }
     }
 
+    fn family_stream() -> super::data_streams::Model {
+        let now = chrono::Utc::now().into();
+        super::data_streams::Model {
+            id: Uuid::new_v4(),
+            source_system: "cnet".to_string(),
+            source_key: "FP3:DOC_avg_ppb:reps".to_string(),
+            source_name: None,
+            source_path: None,
+            metadata: serde_json::json!({
+                "hierarchy": { "project": "CNET", "site": "FP3", "parameter": "DOC_avg_ppb" }
+            }),
+            site_parameter_id: None,
+            sensor_id: None,
+            measurement_type: None,
+            is_active: true,
+            discovered_at: now,
+            paired_at: None,
+            last_data_time: None,
+            last_window_digest: None,
+            pairing_plan_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// The plan proposes the instrument the pairing mints, for a replicate family too: the
+    /// suggested parameter is a label, and keying the proposal on it mints a second row for the
+    /// same analyte.
+    #[test]
+    fn test_the_plan_proposes_the_key_the_pairing_mints() {
+        let stream = family_stream();
+        let suggestion = family_parameter_suggestion("DOC_avg_ppb");
+        assert_ne!(suggestion, "DOC_avg_ppb", "the suggestion is a label");
+
+        let proposed =
+            resolve_parameter_instrument("cnet", stream_instrument_key(&stream), &suggestion, &catalog(&[]));
+
+        assert_eq!(proposed.source_key, "cnet:DOC_avg_ppb");
+    }
+
     #[test]
     fn test_resolve_parameter_instrument_takes_the_source_s_own() {
         let id = Uuid::new_v4();
-        let resolved = resolve_parameter_instrument("cnet", "NO2_mgL", &catalog(&[("cnet:NO2_mgL", id)]));
+        let resolved = resolve_parameter_instrument(
+            "cnet",
+            "cnet:NO2_mgL".to_string(),
+            "NO2_mgL",
+            &catalog(&[("cnet:NO2_mgL", id)]),
+        );
         assert_eq!(resolved.id, Some(id));
         assert!(!resolved.create, "an instrument that exists is not created again");
         assert!(resolved.confirmed);
@@ -2417,7 +2477,8 @@ mod tests {
     /// changes it by attaching another; leaving it alone creates the suggestion.
     #[test]
     fn test_resolve_parameter_instrument_proposes_one_already_agreed() {
-        let proposed = resolve_parameter_instrument("cnet", "NO2_mgL", &catalog(&[]));
+        let proposed =
+            resolve_parameter_instrument("cnet", "cnet:NO2_mgL".to_string(), "NO2_mgL", &catalog(&[]));
         assert_eq!(proposed.id, None);
         assert_eq!(proposed.source_key, "cnet:NO2_mgL");
         assert!(proposed.create && proposed.confirmed);

@@ -1,7 +1,8 @@
 //! Write-time attribution: when a deployment already covers a reading's (site, parameter, time), the
 //! ingest paths now stamp `sensor_id`/`deployment_id`/`calibration_id` at write time instead of
-//! leaving them NULL (the source of historical orphans). Readings before the deployment stay NULL
-//! (they need a backdate). Pairing a stream into a slot attributes the backfilled readings by the
+//! leaving them NULL (the source of historical orphans). A reading before the deployment takes no
+//! deployment and no calibration (it needs a backdate) and falls back to its channel's own
+//! instrument, which every stored measurement carries. Pairing a stream into a slot attributes the backfilled readings by the
 //! deployment window, not a single frozen sensor.
 //!
 //! Run: cargo test --test e2e -- --test-threads=1
@@ -37,6 +38,25 @@ async fn attr_at(
         row.try_get("", "deployment_id").ok(),
         row.try_get("", "calibration_id").ok(),
     )
+}
+
+/// The instrument on the stream the reading at `time` landed on.
+async fn channel_instrument(db: &sea_orm::DatabaseConnection, time: &str) -> Option<Uuid> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT ds.sensor_id FROM readings r JOIN data_streams ds ON ds.id = r.stream_id \
+             WHERE r.site_id = $1::uuid AND r.parameter_id = $2::uuid AND r.time = $3",
+            [
+                crate::common::SITE1_ID.into(),
+                crate::common::GLOBAL_PARAM_TEMP_ID.into(),
+                sl::dt(time).into(),
+            ],
+        ))
+        .await
+        .unwrap()
+        .expect("reading exists");
+    row.try_get("", "sensor_id").ok()
 }
 
 #[tokio::test]
@@ -85,9 +105,21 @@ async fn batch_attributes_rows_inside_the_deployment_window() {
         "in-window row gets calibration"
     );
 
-    // Pre-deployment row stays unattributed (needs a backdate).
-    let (sid_before, _, _) = attr_at(&db, "2025-05-01T00:00:00Z").await;
-    assert_eq!(sid_before, None, "pre-deployment row stays NULL");
+    // Pre-deployment row takes no deployment and no calibration, and names the channel that wrote
+    // it rather than the sensor deployed later.
+    let (sid_before, did_before, cid_before) = attr_at(&db, "2025-05-01T00:00:00Z").await;
+    assert_eq!(did_before, None, "pre-deployment row gets no deployment");
+    assert_eq!(cid_before, None, "pre-deployment row gets no calibration");
+    assert_ne!(
+        sid_before,
+        Some(sensor.id),
+        "pre-deployment row is not attributed to the deployed sensor"
+    );
+    assert_eq!(
+        sid_before,
+        channel_instrument(&db, "2025-05-01T00:00:00Z").await,
+        "pre-deployment row inherits its channel's instrument"
+    );
 }
 
 #[tokio::test]

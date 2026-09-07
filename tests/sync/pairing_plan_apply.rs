@@ -291,3 +291,91 @@ async fn apply_attaches_collection_events_for_spot_readings() {
 
     crate::common::cleanup_test_db(&db).await;
 }
+
+/// Scenario: a `plan_apply` run commits, loses its lease, and the reaper hands the row to another
+/// worker.
+///
+/// Expected behaviour: the replay finds the plan already applied and completes reporting nothing,
+/// rather than failing the operator's import over the draft guard that the first run satisfied.
+#[tokio::test]
+#[serial]
+async fn a_replayed_apply_reports_a_replay_instead_of_failing() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let stream_id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
+             VALUES ('{stream_id}', 'vaisala', 'loc-replay-1', 'Loc Replay 1', true)"
+        ),
+    )
+    .await;
+    let entries = serde_json::json!([{
+        "stream_id": stream_id,
+        "source_key": "loc-replay-1",
+        "source_name": "Loc Replay 1",
+        "action": "pair",
+        "project": { "id": crate::common::PROJECT_ID, "name": "Test Project", "create": false },
+        "site": { "id": crate::common::SITE1_ID, "name": "Site 1", "create": false, "latitude": null, "longitude": null, "altitude_m": null },
+        "parameter": { "id": crate::common::GLOBAL_PARAM_TEMP_ID, "name": "Temperature", "create": false, "units": "C", "group_key": null, "original_names": [] },
+        "confidence": "exact",
+        "warnings": [],
+        "original_parameter_name": null
+    }]);
+    let plan_id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO pairing_plans (id, source_system, status, summary, entries) \
+             VALUES ('{plan_id}', 'vaisala', 'draft', '{{}}'::jsonb, '{}'::jsonb)",
+            entries.to_string().replace('\'', "''")
+        ),
+    )
+    .await;
+
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
+            .await;
+    assert!((200..300).contains(&status), "apply ({status}): {text}");
+    assert_eq!(wait_terminal(&db, &job_id_of(&text)).await, "completed");
+
+    let replay = river_db::routes::private::reprocessing_jobs::worker::enqueue(
+        &db,
+        "plan_apply",
+        None,
+        None,
+        &serde_json::json!({ "plan_id": plan_id }),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("the replay is enqueued");
+
+    assert_eq!(
+        wait_terminal(&db, &replay.to_string()).await,
+        "completed",
+        "a run over an applied plan is a replay, not a failure"
+    );
+    let counts = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT detail->'counts' AS v FROM reprocessing_jobs WHERE id = '{replay}'"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<serde_json::Value>("", "v")
+        .unwrap();
+    assert_eq!(
+        counts,
+        serde_json::json!({}),
+        "the replay claims none of the first run's work"
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}

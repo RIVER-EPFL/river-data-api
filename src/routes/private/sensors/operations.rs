@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::model::Sensor;
+use crate::routes::private::sync::replicate_audit as audit;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::{data_streams, sensors, sensors::deployments};
 
@@ -691,6 +692,10 @@ pub async fn upsert_source_instrument<C: ConnectionTrait>(
 ///    one lab instrument per parameter across every station, which is the key the pairing plan
 ///    mints and resolves under, so a hand pairing and a plan converge on the same row.
 ///
+/// `name_hint` names a device channel or a hand-entry channel. A source-parameter or lab
+/// instrument is named for its parameter and source whatever the hint says, since it serves every
+/// station that reports the parameter.
+///
 /// Updates `data_streams.sensor_id` to link the stream.
 pub async fn resolve_or_mint_stream_instrument<C: ConnectionTrait>(
     db: &C,
@@ -707,17 +712,12 @@ pub async fn resolve_or_mint_stream_instrument<C: ConnectionTrait>(
             .sensor_id);
     }
 
-    let parameter = crate::routes::private::sync::service::extract_hierarchy(stream).parameter;
-    let key_part = if parameter.is_empty() {
-        stream.source_key.clone()
-    } else {
-        parameter.clone()
-    };
-    let source_key = format!("{}:{key_part}", stream.source_system);
-    let name = name_hint.map_or_else(
-        || format!("{key_part} ({})", stream.source_system),
-        ToString::to_string,
-    );
+    let source_key = crate::routes::private::sync::service::stream_instrument_key(stream);
+    let key_part = source_key
+        .strip_prefix(&format!("{}:", stream.source_system))
+        .unwrap_or(&source_key)
+        .to_string();
+    let name = source_instrument_name(kind, &key_part, &stream.source_system, name_hint);
     let sensor_id = upsert_source_instrument(
         db,
         &stream.source_system,
@@ -805,6 +805,29 @@ pub async fn ensure_channel_instrument<C: ConnectionTrait>(
 #[must_use]
 pub fn is_device_feed(stream_metadata: &serde_json::Value) -> bool {
     stream_metadata.get("device").is_some_and(|d| !d.is_null())
+}
+
+/// The name a non-device instrument takes when it is minted.
+///
+/// A source-parameter or lab instrument is one row for the parameter across every station that
+/// reports it, so it is named for the parameter and the source; a slot name would be true of
+/// whichever station registered first and of no other. A hand-entry channel is per slot and keeps
+/// the name its caller gives it.
+#[must_use]
+fn source_instrument_name(
+    kind: InstrumentKind,
+    key_part: &str,
+    source_system: &str,
+    name_hint: Option<&str>,
+) -> String {
+    match kind {
+        InstrumentKind::SourceParameter | InstrumentKind::Lab => None,
+        _ => name_hint,
+    }
+    .map_or_else(
+        || format!("{key_part} ({source_system})"),
+        ToString::to_string,
+    )
 }
 
 /// The name a source-registered field instrument takes: the slot it serves, "{site} {parameter}".
@@ -1299,22 +1322,61 @@ pub async fn raise_source_identity_hold<C: ConnectionTrait>(
     stored: &serde_json::Value,
     reported: &serde_json::Value,
 ) -> AppResult<()> {
-    let expected = serde_json::json!({ "was": stored, "fields": changed });
-    let computed = serde_json::json!({ "now": reported });
     // One statement, because two overlapping registrations see neither each other's UPDATE nor
     // each other's uncommitted row: `replicate_audit_holds_identity_live_uniq` is the conflict
     // target, so the second pass waits and then updates the standing hold.
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO replicate_audit_holds \
-             (stream_id, group_time, kind, expected, computed, delta, status) \
-         VALUES ($1, NOW(), 'source_identity_changed', $2, $3, '{}'::jsonb, 'pending') \
-         ON CONFLICT (stream_id) \
-             WHERE kind = 'source_identity_changed' AND status IN ('pending', 'deferred') \
-         DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed, \
-                       created_at = NOW()",
-        [stream_id.into(), expected.into(), computed.into()],
-    ))
-    .await?;
-    Ok(())
+    audit::upsert_hold(
+        db,
+        &audit::Hold {
+            key: audit::HoldKey::StreamStanding {
+                stream_id,
+            },
+            kind: "source_identity_changed",
+            expected: serde_json::json!({ "was": stored, "fields": changed }),
+            computed: serde_json::json!({ "now": reported }),
+            delta: serde_json::json!({}),
+            status: "pending",
+            tool: None,
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InstrumentKind, source_instrument_name};
+
+    #[test]
+    fn test_source_instrument_name_source_parameter_carries_no_site() {
+        let name = source_instrument_name(
+            InstrumentKind::SourceParameter,
+            "DOC_avg_ppb",
+            "cnet",
+            Some("FP1 DOC_avg_ppb"),
+        );
+        assert_eq!(name, "DOC_avg_ppb (cnet)");
+    }
+
+    #[test]
+    fn test_source_instrument_name_lab_carries_no_site() {
+        let name = source_instrument_name(InstrumentKind::Lab, "DOC", "cnet", Some("FP1 DOC"));
+        assert_eq!(name, "DOC (cnet)");
+    }
+
+    #[test]
+    fn test_source_instrument_name_entry_channel_keeps_slot_name() {
+        let name = source_instrument_name(
+            InstrumentKind::EntryChannel,
+            "Depth",
+            "grab_sample",
+            Some("Martigny Depth (grab_sample)"),
+        );
+        assert_eq!(name, "Martigny Depth (grab_sample)");
+    }
+
+    #[test]
+    fn test_source_instrument_name_falls_back_without_a_hint() {
+        let name = source_instrument_name(InstrumentKind::EntryChannel, "Depth", "api", None);
+        assert_eq!(name, "Depth (api)");
+    }
 }

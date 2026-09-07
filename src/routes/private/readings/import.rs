@@ -1016,7 +1016,6 @@ pub async fn import_csv(
             "since": earliest.map(|t| t.to_rfc3339()),
             "latest": latest.map(|t| t.to_rfc3339()),
             "overlapping": overlapping,
-            "overlap_differing": overlap_differing,
             "param_streams": param_streams,
             "measurement_type": req.measurement_type.as_deref(),
         });

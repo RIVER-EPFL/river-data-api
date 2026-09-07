@@ -24,6 +24,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+use crate::routes::private::sync::replicate_audit as audit;
 
 /// Fraction of a window's stored rows a single pass may change or withdraw before the brake
 /// holds the corrections and withdrawals (new rows always apply).
@@ -141,19 +142,6 @@ async fn stored_window<C: ConnectionTrait>(
     Ok(out)
 }
 
-/// Bind a set of keys as parallel arrays for an `unnest` join. Timestamps travel as RFC 3339
-/// text and are cast in SQL (`::text[]::timestamptz[]`) — the same convention as the calibration
-/// resolver, because the driver cannot bind a timestamptz array directly.
-fn key_arrays(keys: &[Key]) -> (sea_orm::Value, sea_orm::Value) {
-    use sea_orm::sea_query::ArrayType;
-    let times: Vec<sea_orm::Value> = keys.iter().map(|(t, _)| t.to_rfc3339().into()).collect();
-    let indices: Vec<sea_orm::Value> = keys.iter().map(|(_, i)| i32::from(*i).into()).collect();
-    (
-        sea_orm::Value::Array(ArrayType::String, Some(Box::new(times))),
-        sea_orm::Value::Array(ArrayType::Int, Some(Box::new(indices))),
-    )
-}
-
 /// The two shapes with no state in which acknowledging them is correct: refused, nothing applied.
 pub fn refuse_dishonest_window(
     window: &SourceWindow,
@@ -185,25 +173,24 @@ pub(crate) async fn upsert_source_modified_hold<C: ConnectionTrait>(
     group_time: DateTime<Utc>,
     expected: serde_json::Value,
     computed: serde_json::Value,
+    status: &str,
 ) -> AppResult<()> {
-    conn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO replicate_audit_holds
-             (stream_id, group_time, kind, expected, computed, delta, status)
-         VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, 'pending')
-         ON CONFLICT (stream_id, group_time, kind) WHERE status IN ('pending', 'deferred')
-         DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed,
-                       created_at = NOW()",
-        [
-            stream_id.into(),
-            sea_orm::prelude::DateTimeWithTimeZone::from(group_time).into(),
-            "source_modified".into(),
-            expected.into(),
-            computed.into(),
-        ],
-    ))
-    .await?;
-    Ok(())
+    audit::upsert_hold(
+        conn,
+        &audit::Hold {
+            key: audit::HoldKey::Stream {
+                stream_id,
+                group_time,
+            },
+            kind: "source_modified",
+            expected,
+            computed,
+            delta: serde_json::json!({}),
+            status,
+            tool: None,
+        },
+    )
+    .await
 }
 
 async fn upsert_brake_hold<C: ConnectionTrait>(
@@ -213,31 +200,30 @@ async fn upsert_brake_hold<C: ConnectionTrait>(
     changed: usize,
     withdrawn: usize,
     stored: usize,
+    status: &str,
 ) -> AppResult<()> {
-    conn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO replicate_audit_holds
-             (stream_id, group_time, kind, expected, computed, delta, status)
-         VALUES ($1, $2, 'brake_fired', $3, $4, '{}'::jsonb, 'pending')
-         ON CONFLICT (stream_id, group_time, kind) WHERE status IN ('pending', 'deferred')
-         DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed,
-                       created_at = NOW()",
-        [
-            stream_id.into(),
-            sea_orm::prelude::DateTimeWithTimeZone::from(window.from).into(),
-            serde_json::json!({
+    audit::upsert_hold(
+        conn,
+        &audit::Hold {
+            key: audit::HoldKey::Stream {
+                stream_id,
+                group_time: window.from,
+            },
+            kind: "brake_fired",
+            expected: serde_json::json!({
                 "window": { "from": window.from, "to": window.to },
                 "would_change": changed,
                 "would_withdraw": withdrawn,
                 "stored_in_window": stored,
                 "threshold": RECONCILE_BRAKE_FRACTION,
-            })
-            .into(),
-            serde_json::json!({ "held": "changed and withdrawn; new rows applied" }).into(),
-        ],
-    ))
-    .await?;
-    Ok(())
+            }),
+            computed: serde_json::json!({ "held": "changed and withdrawn; new rows applied" }),
+            delta: serde_json::json!({}),
+            status,
+            tool: None,
+        },
+    )
+    .await
 }
 
 /// Classify the window and apply the withdrawal side. Runs inside the guarded transaction,
@@ -251,7 +237,9 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
     admitted: &[AdmittedRow],
     rejected_keys: &HashSet<Key>,
     actor: &str,
+    paired: bool,
 ) -> AppResult<DiffOutcome> {
+    let status = audit::status_for(paired);
     let stored = stored_window(conn, stream_id, window).await?;
     refuse_dishonest_window(window, admitted.len(), stored.len())?;
 
@@ -400,6 +388,7 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
                     outcome.changed,
                     to_withdraw.len() + withdraw_touched.len(),
                     stored.len(),
+                    status,
                 )
                 .await?;
                 outcome.holds_raised += 1;
@@ -423,6 +412,7 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
                                 "judgements": judgements,
                                 "window": { "from": window.from, "to": window.to } }),
             serde_json::json!({ "kept_served": true }),
+            status,
         )
         .await?;
         outcome.holds_raised += 1;
@@ -435,6 +425,7 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
             serde_json::json!({ "claim": "value_changed", "replicate_index": key.1,
                                 "judgements": judgements }),
             serde_json::json!({ "applied": true, "still_excluded_if_flagged": true }),
+            status,
         )
         .await?;
         outcome.holds_raised += 1;

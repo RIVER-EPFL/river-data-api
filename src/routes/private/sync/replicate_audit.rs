@@ -261,7 +261,7 @@ pub struct GroupMismatch {
 /// partial index predicate in m20260821_000002 exactly, since the upsert names it as its
 /// conflict target. Everything else is a decision or an outcome and is never rewritten by the
 /// gate.
-const OPEN: &str = "('pending', 'deferred')";
+pub(crate) const OPEN: &str = "('pending', 'deferred')";
 
 /// Everything past review. `use_portal`, `use_manual` and `consumed` are legacy statuses kept
 /// for history; nothing produces them.
@@ -357,11 +357,184 @@ pub async fn latest_holds<C: ConnectionTrait>(
         .collect()
 }
 
-/// Record (or refresh) a hold for a mismatching group: `pending` on a paired stream (the review
-/// queue), `deferred` on an unpaired one (waiting for pairing). The open unique index makes the
-/// re-detection on every sync cycle an update of the same row, never a duplicate; a deferred row
-/// found by a paired-stream detection is promoted to pending.
-pub async fn upsert_hold<C: ConnectionTrait>(
+/// The status a detection asks for: `pending` on a paired stream (the review queue), `deferred` on
+/// an unpaired one, promoted to pending when the stream is paired.
+#[must_use]
+pub fn status_for(paired: bool) -> &'static str {
+    if paired { "pending" } else { "deferred" }
+}
+
+/// What a hold is keyed by, which is also which open-unique index the upsert conflicts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldKey {
+    /// A stream's replicate group at one instant.
+    Stream {
+        stream_id: Uuid,
+        group_time: DateTime<Utc>,
+    },
+    /// A slot's instant, for a finding no stream produced (the event audit, an unverified entry).
+    Slot {
+        site_id: Uuid,
+        parameter_id: Uuid,
+        group_time: DateTime<Utc>,
+    },
+    /// One standing hold per stream whatever the instant: the device behind the feed changed, and
+    /// a second detection updates the standing row rather than adding one per sync cycle.
+    StreamStanding { stream_id: Uuid },
+}
+
+/// A detection, in the shape every writer states it.
+pub struct Hold<'a> {
+    pub key: HoldKey,
+    pub kind: &'a str,
+    pub expected: serde_json::Value,
+    pub computed: serde_json::Value,
+    pub delta: serde_json::Value,
+    /// `pending` or `deferred`; see [`status_for`].
+    pub status: &'a str,
+    /// The calculation a finding is about, where one produced it.
+    pub tool: Option<&'a str>,
+}
+
+impl Hold<'_> {
+    /// The columns the key fills, and the conflict target that makes a re-detection an update of
+    /// the same row rather than a duplicate. Each target is an open-only partial index, so a
+    /// decision already taken is never rewritten: a detection beside a terminal hold inserts a
+    /// fresh open row.
+    fn target(&self) -> (&'static str, String, Vec<sea_orm::Value>) {
+        match self.key {
+            HoldKey::Stream {
+                stream_id,
+                group_time,
+            } => (
+                "stream_id, group_time",
+                format!("(stream_id, group_time, kind) WHERE status IN {OPEN}"),
+                vec![
+                    stream_id.into(),
+                    sea_orm::prelude::DateTimeWithTimeZone::from(group_time).into(),
+                ],
+            ),
+            HoldKey::Slot {
+                site_id,
+                parameter_id,
+                group_time,
+            } => (
+                "site_id, parameter_id, group_time",
+                "(kind, site_id, parameter_id, group_time) WHERE stream_id IS NULL AND status = 'pending'"
+                    .to_string(),
+                vec![
+                    site_id.into(),
+                    parameter_id.into(),
+                    sea_orm::prelude::DateTimeWithTimeZone::from(group_time).into(),
+                ],
+            ),
+            HoldKey::StreamStanding { stream_id } => (
+                "stream_id, group_time",
+                format!("(stream_id) WHERE kind = 'source_identity_changed' AND status IN {OPEN}"),
+                vec![stream_id.into(), "NOW()".into()],
+            ),
+        }
+    }
+}
+
+/// The one statement every hold is written by. Read it back in a test rather than a database.
+#[must_use]
+pub fn hold_statement(hold: &Hold) -> Statement {
+    let (key_columns, conflict, mut values) = hold.target();
+    let key_placeholders: String = match hold.key {
+        HoldKey::StreamStanding { .. } => {
+            values.pop();
+            "$1, NOW()".to_string()
+        }
+        _ => (1..=values.len())
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    let n = values.len();
+    values.push(hold.kind.into());
+    values.push(hold.expected.clone().into());
+    values.push(hold.computed.clone().into());
+    values.push(hold.delta.clone().into());
+    values.push(hold.status.into());
+    values.push(hold.tool.into());
+    Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO replicate_audit_holds
+                 ({key_columns}, kind, expected, computed, delta, status, tool)
+             VALUES ({key_placeholders}, ${kind}, ${expected}, ${computed}, ${delta}, ${status}, ${tool})
+             ON CONFLICT {conflict}
+             DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed,
+                           delta = EXCLUDED.delta, tool = EXCLUDED.tool, created_at = NOW(),
+                           status = CASE WHEN replicate_audit_holds.status = 'deferred'
+                                              AND EXCLUDED.status = 'pending'
+                                         THEN 'pending' ELSE replicate_audit_holds.status END",
+            kind = n + 1,
+            expected = n + 2,
+            computed = n + 3,
+            delta = n + 4,
+            status = n + 5,
+            tool = n + 6,
+        ),
+        values,
+    )
+}
+
+/// Which streams' holds a pairing change moves.
+#[derive(Debug, Clone, Copy)]
+pub enum HoldScope {
+    /// One stream.
+    Stream(Uuid),
+    /// Every stream a pairing plan owns.
+    Plan(Uuid),
+}
+
+/// Pairing promotes a stream's deferred holds into the review queue; unpairing defers them again.
+/// A slot-keyed hold names no stream and is never moved by either.
+pub async fn repoint_holds<C: ConnectionTrait>(
+    conn: &C,
+    scope: HoldScope,
+    paired: bool,
+) -> AppResult<()> {
+    let (to, from) = if paired {
+        ("pending", "deferred")
+    } else {
+        ("deferred", "pending")
+    };
+    let statement = match scope {
+        HoldScope::Stream(stream_id) => Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "UPDATE replicate_audit_holds SET status = '{to}'
+                 WHERE stream_id = $1 AND status = '{from}'"
+            ),
+            [stream_id.into()],
+        ),
+        HoldScope::Plan(plan_id) => Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "UPDATE replicate_audit_holds h SET status = '{to}'
+                 FROM data_streams ds
+                 WHERE ds.id = h.stream_id AND ds.pairing_plan_id = $1 AND h.status = '{from}'"
+            ),
+            [plan_id.into()],
+        ),
+    };
+    conn.execute_raw(statement).await?;
+    Ok(())
+}
+
+/// Record (or refresh) a hold. The open unique index makes a re-detection on every sync cycle an
+/// update of the same row, never a duplicate; a deferred row found by a paired-stream detection is
+/// promoted to pending.
+pub async fn upsert_hold<C: ConnectionTrait>(conn: &C, hold: &Hold<'_>) -> AppResult<()> {
+    conn.execute_raw(hold_statement(hold)).await?;
+    Ok(())
+}
+
+/// Record (or refresh) a hold for a group whose statistics disagree with the source's own.
+pub async fn upsert_stats_hold<C: ConnectionTrait>(
     conn: &C,
     stream_id: Uuid,
     mismatch: &GroupMismatch,
@@ -387,30 +560,22 @@ pub async fn upsert_hold<C: ConnectionTrait>(
         delta["n"] =
             i64::try_from(mismatch.n).map_or(serde_json::Value::Null, |n| (expected_n - n).into());
     }
-    conn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        format!(
-            "INSERT INTO replicate_audit_holds (stream_id, group_time, kind, expected, computed, delta, status)
-             VALUES ($1, $2, 'replicate_stats', $3, $4, $5, $6)
-             ON CONFLICT (stream_id, group_time, kind) WHERE status IN {OPEN}
-             DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed,
-                           delta = EXCLUDED.delta,
-                           status = CASE WHEN replicate_audit_holds.status = 'deferred'
-                                              AND EXCLUDED.status = 'pending'
-                                         THEN 'pending' ELSE replicate_audit_holds.status END
-             WHERE replicate_audit_holds.status IN {OPEN}"
-        ),
-        [
-            stream_id.into(),
-            sea_orm::prelude::DateTimeWithTimeZone::from(mismatch.time).into(),
-            expected.into(),
-            computed.into(),
-            delta.into(),
-            status.to_string().into(),
-        ],
-    ))
-    .await?;
-    Ok(())
+    upsert_hold(
+        conn,
+        &Hold {
+            key: HoldKey::Stream {
+                stream_id,
+                group_time: mismatch.time,
+            },
+            kind: "replicate_stats",
+            expected,
+            computed,
+            delta,
+            status,
+            tool: None,
+        },
+    )
+    .await
 }
 
 fn delta_of(expected: Option<f64>, computed: Option<f64>) -> Option<f64> {
@@ -2310,5 +2475,107 @@ mod tests {
         let sql = bound_sql("a.v", "b.v", "$3", DEFAULT_ABS_TOL);
         assert!(sql.contains(&QUANTUM_FLOOR.to_string()), "{sql}");
         assert!(sql.contains(&DEFAULT_ABS_TOL.to_string()), "{sql}");
+    }
+
+    fn hold(key: HoldKey, status: &str) -> Hold<'_> {
+        Hold {
+            key,
+            kind: "replicate_stats",
+            expected: serde_json::json!({ "mean": 1.0 }),
+            computed: serde_json::json!({ "mean": 2.0 }),
+            delta: serde_json::json!({ "mean": -1.0 }),
+            status,
+            tool: None,
+        }
+    }
+
+    fn at() -> DateTime<Utc> {
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 1, 1, 0, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn a_stream_hold_conflicts_on_the_open_stream_index() {
+        let sql = hold_statement(&hold(
+            HoldKey::Stream {
+                stream_id: Uuid::nil(),
+                group_time: at(),
+            },
+            "pending",
+        ))
+        .to_string();
+        assert!(
+            sql.contains(
+                "ON CONFLICT (stream_id, group_time, kind) WHERE status IN ('pending', 'deferred')"
+            ),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn a_slot_hold_conflicts_on_the_streamless_event_index() {
+        let sql = hold_statement(&hold(
+            HoldKey::Slot {
+                site_id: Uuid::nil(),
+                parameter_id: Uuid::nil(),
+                group_time: at(),
+            },
+            "pending",
+        ))
+        .to_string();
+        assert!(
+            sql.contains(
+                "ON CONFLICT (kind, site_id, parameter_id, group_time) WHERE stream_id IS NULL AND status = 'pending'"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("site_id, parameter_id, group_time, kind"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn a_standing_stream_hold_stamps_its_own_instant_and_conflicts_on_the_stream() {
+        let sql = hold_statement(&hold(
+            HoldKey::StreamStanding {
+                stream_id: Uuid::nil(),
+            },
+            "pending",
+        ))
+        .to_string();
+        assert!(
+            sql.contains("VALUES ('00000000-0000-0000-0000-000000000000', NOW(),"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("ON CONFLICT (stream_id) WHERE kind = 'source_identity_changed'"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn a_re_detection_refreshes_the_payload_and_promotes_a_deferred_hold_only() {
+        let sql = hold_statement(&hold(
+            HoldKey::Stream {
+                stream_id: Uuid::nil(),
+                group_time: at(),
+            },
+            "pending",
+        ))
+        .to_string();
+        assert!(sql.contains("expected = EXCLUDED.expected"), "{sql}");
+        assert!(sql.contains("created_at = NOW()"), "{sql}");
+        assert!(
+            sql.contains(
+                "status = CASE WHEN replicate_audit_holds.status = 'deferred'\n                                              AND EXCLUDED.status = 'pending'\n                                         THEN 'pending' ELSE replicate_audit_holds.status END"
+            ),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn an_unpaired_stream_defers_its_hold() {
+        assert_eq!(status_for(true), "pending");
+        assert_eq!(status_for(false), "deferred");
     }
 }

@@ -251,3 +251,94 @@ async fn sync_digest_covers_partial_cycles() {
         "a repeating partial is suppressed within the window"
     );
 }
+
+/// Scenario: a sync registers a station nobody has paired, and a portal edit lands on a curated
+/// reading. Both wait for a person on a screen nobody has a reason to open.
+/// Expected behaviour: each raises its own notification, once, and the unpaired one stops once the
+/// stream is paired.
+#[tokio::test]
+#[serial]
+async fn unpaired_streams_and_open_holds_are_announced() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    let stream = uuid::Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active, last_data_time) \
+             VALUES ('{stream}', 'cnet', 'S99:DOC_avg_ppb', 'S99 DOC', true, NOW())"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO replicate_audit_holds \
+                 (stream_id, site_id, parameter_id, group_time, kind, expected, computed, delta, status) \
+             VALUES ('{stream}', NULL, NULL, NOW(), 'source_modified', '{{}}'::jsonb, \
+                     '{{}}'::jsonb, '{{}}'::jsonb, 'deferred')"
+        ),
+    )
+    .await;
+
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let channels: Vec<Box<dyn NotificationChannel>> =
+        vec![Box::new(MockChannel { sent: sent.clone() })];
+    triggers::run(&state, &channels).await;
+
+    {
+        let msgs = sent.lock().unwrap();
+        let unpaired = kinds(&msgs, "streams_unpaired");
+        assert_eq!(unpaired.len(), 1, "one digest for the one source system");
+        assert!(unpaired[0].body.contains("S99 DOC"), "body: {}", unpaired[0].body);
+        let holds = kinds(&msgs, "holds_open");
+        assert_eq!(holds.len(), 1, "the review queue is announced");
+        assert!(
+            holds[0].body.contains("1 source_modified"),
+            "the digest says what is waiting: {}",
+            holds[0].body
+        );
+    }
+
+    // Both conditions still stand, so neither repeats.
+    sent.lock().unwrap().clear();
+    triggers::run(&state, &channels).await;
+    {
+        let msgs = sent.lock().unwrap();
+        assert!(kinds(&msgs, "streams_unpaired").is_empty(), "no re-announcement");
+        assert!(kinds(&msgs, "holds_open").is_empty(), "within the suppression window");
+    }
+
+    // Pairing is the operator's own action: it clears the state silently, and an unpairing later
+    // reads as a fresh discovery.
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE data_streams SET site_parameter_id = '{}', paired_at = NOW() WHERE id = '{stream}'",
+            crate::common::PARAM_S1_TURB_ID
+        ),
+    )
+    .await;
+    sent.lock().unwrap().clear();
+    triggers::run(&state, &channels).await;
+    assert!(
+        kinds(&sent.lock().unwrap(), "streams_unpaired").is_empty(),
+        "a paired stream sends nothing"
+    );
+
+    crate::common::exec(
+        &db,
+        &format!("UPDATE data_streams SET site_parameter_id = NULL WHERE id = '{stream}'"),
+    )
+    .await;
+    sent.lock().unwrap().clear();
+    triggers::run(&state, &channels).await;
+    assert_eq!(
+        kinds(&sent.lock().unwrap(), "streams_unpaired").len(),
+        1,
+        "unpairing it again is a fresh discovery"
+    );
+}

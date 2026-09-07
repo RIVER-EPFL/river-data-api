@@ -10,6 +10,40 @@ pub const HARNESS_LOCK_KEY: i64 = 0x5249_5645_52; // "RIVER"
 /// How long a second runner waits for the first to finish before giving up and saying so.
 const LOCK_WAIT: Duration = Duration::from_secs(1800);
 
+/// How many suites the server must hold at once. The advisory lock isolates a database, not the
+/// server: the audit's own rules give every agent its own database on this one instance, so
+/// several suites hold their pools at the same time.
+const CONCURRENT_SUITES: i64 = 4;
+
+/// Refuse a server that cannot hold the fleet's pools.
+///
+/// Postgres defaults to 100 connections. Four suites at [`test_config`]'s pool size exceed that,
+/// and what a run over the ceiling looks like is not a connection error but a wall of assertion
+/// failures in whichever tests happened to need a connection, each of which passes alone. Asked
+/// here, the answer is one line before the first test.
+///
+/// [`test_config`]: crate::common::test_config
+async fn require_connection_headroom(db: &DatabaseConnection, url: &str) {
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT current_setting('max_connections')::bigint \
+                  - current_setting('superuser_reserved_connections')::bigint AS ceiling"
+                .to_string(),
+        ))
+        .await
+        .expect("read max_connections")
+        .expect("max_connections row");
+    let ceiling: i64 = row.try_get("", "ceiling").expect("ceiling");
+    let pool = i64::from(crate::common::test_config().db_max_connections);
+    let needed = pool * CONCURRENT_SUITES;
+    assert!(
+        ceiling >= needed,
+        "{url} leaves {ceiling} connections, and {CONCURRENT_SUITES} suites at {pool} each need \
+         {needed}. Raise max_connections on the test database service."
+    );
+}
+
 /// The session holding [`HARNESS_LOCK_KEY`], kept for the life of the process. Every test builds
 /// its own runtime, so this connection outlives the one that opened it; it is never queried again,
 /// and Postgres releases the lock when the process exits.
@@ -62,6 +96,7 @@ pub async fn setup_test_db() -> DatabaseConnection {
     // The deployment serves handlers from a 25-connection pool and the job worker from its own.
     // The harness runs both plus the test's own queries on one pool, so it takes the wider ceiling:
     // sqlx defaults to ten, which a job holding connections across tool runs can exhaust.
+    let url_for_message = url.clone();
     let mut opts = ConnectOptions::new(url);
     opts.max_connections(crate::common::test_config().db_max_connections)
         .min_connections(1)
@@ -70,6 +105,8 @@ pub async fn setup_test_db() -> DatabaseConnection {
     let db = Database::connect(opts)
         .await
         .expect("Failed to connect to test database");
+
+    require_connection_headroom(&db, &url_for_message).await;
 
     migration::Migrator::up(&db, None)
         .await
@@ -174,6 +211,15 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
         "UPDATE tool_scripts SET active_version_id = NULL WHERE created_by IS DISTINCT FROM 'seed'",
         "DELETE FROM tool_script_versions v USING tool_scripts s \
           WHERE v.tool_script_id = s.id AND s.created_by IS DISTINCT FROM 'seed'",
+        // A formula calculation owns `derived_parameter_definitions` rows, which cascade with the
+        // calculation; what hangs off them does not, so the sources and the slots naming a
+        // definition go first or the delete below is refused by their foreign keys.
+        "DELETE FROM derived_parameter_sources src \
+           USING derived_parameter_definitions d JOIN tool_scripts s ON s.id = d.tool_script_id \
+           WHERE src.derived_definition_id = d.id AND s.created_by IS DISTINCT FROM 'seed'",
+        "UPDATE site_parameters sp SET derived_definition_id = NULL \
+           FROM derived_parameter_definitions d JOIN tool_scripts s ON s.id = d.tool_script_id \
+          WHERE sp.derived_definition_id = d.id AND s.created_by IS DISTINCT FROM 'seed'",
         "DELETE FROM tool_scripts WHERE created_by IS DISTINCT FROM 'seed'",
         // Deleted rather than truncated: `tool_scripts.parameter_group_id` references
         // `parameter_groups`, so a TRUNCATE ... CASCADE over the groups would take the seeded

@@ -297,3 +297,61 @@ async fn a_calculation_may_not_read_outside_its_group() {
         "nothing was minted for a refused formula set"
     );
 }
+
+/// The harness owns the rows a formula calculation leaves behind: a formula is a
+/// `derived_parameter_definitions` row with `derived_parameter_sources` under it, and neither FK
+/// cascades, so a cleanup that deletes the calculation first is refused and every later test in
+/// the binary fails at setup rather than in its body.
+#[tokio::test]
+#[serial]
+async fn cleanup_removes_a_formula_calculation_with_its_sources() {
+    let group_id = "00000000-0000-4000-c000-000000000105";
+    let (db, app, token) = setup().await;
+    seed_calculation(&db, group_id).await;
+    let script_id = calculation_id(&db).await;
+    declare_output(&db, group_id, "temp_ratio_out").await;
+    let (status, text) = add_formula(
+        &app,
+        &token,
+        &script_id,
+        "temp_ratio_out",
+        "DO_Temperature / Dissolved_O2",
+        1,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create ({status}): {text}");
+    assert!(
+        count(&db, "SELECT count(*) FROM derived_parameter_sources").await > 0,
+        "the formula recorded its sources"
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM tool_scripts WHERE created_by = 'test'").await,
+        0,
+        "the calculation is gone"
+    );
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM derived_parameter_definitions").await,
+        0,
+        "its formulas went with it"
+    );
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM derived_parameter_sources").await,
+        0,
+        "and so did their sources"
+    );
+}
+
+async fn count(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
+    db.query_one_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql.to_string(),
+    ))
+    .await
+    .expect("query")
+    .expect("a row")
+    .try_get::<i64>("", "count")
+    .expect("count")
+}

@@ -32,7 +32,9 @@ pub struct Model {
     pub altitude_m: Option<f64>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[crudcrate(exclude(create, update))]
+    /// Stamped by every sync path that mints a site, and by nothing else, so it is what says a
+    /// row arrived from a source rather than by hand.
+    #[crudcrate(exclude(create, update), filterable, sortable)]
     pub discovered_at: Option<chrono::DateTime<chrono::Utc>>,
     pub public_code: Option<String>,
     /// The MeteoSwiss SMN station abbreviation (`MOB`, `SIO`, ...) supplying this site's

@@ -50,7 +50,7 @@ pub struct Model {
     pub is_public: Option<bool>,
     /// Set when a verified tool save mints the slot (`provision_site_parameter`); cleared by a
     /// manager confirming the slot from the site's Parameters tab.
-    #[crudcrate(filterable, on_create = false)]
+    #[crudcrate(filterable, sortable, on_create = false)]
     pub needs_review: bool,
     /// How this slot's replicate standard deviation is defined: 'sample' (divisor n-1) or
     /// 'population' (divisor n). NULL is UNDECLARED, not a synonym for 'sample': the sources use
@@ -72,7 +72,9 @@ pub struct Model {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[crudcrate(exclude(create, update))]
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    #[crudcrate(exclude(create, update))]
+    /// Stamped by every sync path that mints a slot, and by nothing else, so it is what says a
+    /// row arrived from a source rather than by hand.
+    #[crudcrate(exclude(create, update), filterable, sortable)]
     pub discovered_at: Option<chrono::DateTime<chrono::Utc>>,
     #[sea_orm(ignore)]
     #[crudcrate(non_db_attr = true, exclude(create, update), join(one, all, depth = 1))]

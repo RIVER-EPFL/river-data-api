@@ -642,3 +642,48 @@ async fn a_curve_assigned_to_a_proposed_instrument_moves_when_the_plan_is_applie
         "the used curve stayed where it was"
     );
 }
+
+/// The plan proposes the instrument the pairing mints, for a replicate family too.
+///
+/// A family's suggested parameter is the measurand (`DOC_avg_ppb` reads as `DOC_ppb`), which is a
+/// label; keying the proposal on it would offer a second instrument for an analyte the pairing
+/// already holds one for.
+#[tokio::test]
+#[serial]
+async fn a_family_entry_proposes_the_instrument_key_the_pairing_mints() {
+    let (app, token, db) = setup().await;
+    let stream_id = Uuid::new_v4();
+    crate::common::seed_unpaired_stream_with_hierarchy(
+        &db,
+        &stream_id.to_string(),
+        SOURCE,
+        "FP3:DOC_avg_ppb:reps",
+        "Test River Project",
+        "Family Station",
+        "DOC_avg_ppb",
+        "ppb",
+        None,
+        0,
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE data_streams SET sensor_id = NULL,              metadata = metadata || '{{\"replicates\": {{\"source_columns\":              [\"DOC_rep_A\", \"DOC_rep_B\"]}}}}'::jsonb WHERE id = '{stream_id}'"
+        ),
+    )
+    .await;
+
+    let plan = create_plan(&app, &token).await;
+    let entry = entry_for(&plan, stream_id);
+
+    assert_ne!(
+        entry["parameter"]["name"], serde_json::json!("DOC_avg_ppb"),
+        "the family's suggested parameter is the measurand, not the statistic column: {entry}"
+    );
+    assert_eq!(
+        entry["instrument"]["source_key"],
+        serde_json::json!(format!("{SOURCE}:DOC_avg_ppb")),
+        "the proposal keys on the stream, not on the suggestion: {entry}"
+    );
+}

@@ -12,7 +12,11 @@ pub mod engine;
 pub mod formula;
 /// Content hashing for tool script versions, over the jsonb-normalised stored form.
 pub mod hash;
+pub mod activation_model;
+pub mod script_model;
+pub mod script_operations;
 pub mod scripts;
+pub mod version_model;
 
 use axum::{
     Extension, Json,

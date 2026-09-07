@@ -13,6 +13,7 @@ use crate::common::middleware::{IsSyncService, ProjectScope, enforce_project_sco
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::batch::{Replace, admission, readings_upsert};
 use crate::routes::private::readings::tail;
+use crate::routes::private::sync::replicate_audit as audit;
 use crate::routes::private::sensors::calibrations::{
     self, resolver,
     service::{Curve, apply_curves},
@@ -708,6 +709,7 @@ pub async fn ingest_readings(
                                 &admitted,
                                 &rejected_keys,
                                 &actor,
+                                paired,
                             )
                             .await?,
                         )
@@ -1057,22 +1059,21 @@ async fn upsert_curve_claim_hold<C: ConnectionTrait>(
     claims: &[serde_json::Value],
     status: &str,
 ) -> AppResult<()> {
-    conn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO replicate_audit_holds
-             (stream_id, group_time, kind, expected, computed, delta, status)
-         VALUES ($1, $2, 'curve_claim_stripped', $3, $4, '{}'::jsonb, $5)
-         ON CONFLICT (stream_id, group_time, kind) WHERE status IN ('pending', 'deferred')
-         DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed,
-                       created_at = NOW()",
-        [
-            stream_id.into(),
-            sea_orm::prelude::DateTimeWithTimeZone::from(group_time).into(),
-            serde_json::json!({ "claims": claims }).into(),
-            serde_json::json!({ "stored_without_curve": claims.len() }).into(),
-            status.into(),
-        ],
-    ))
+    audit::upsert_hold(
+        conn,
+        &audit::Hold {
+            key: audit::HoldKey::Stream {
+                stream_id,
+                group_time,
+            },
+            kind: "curve_claim_stripped",
+            expected: serde_json::json!({ "claims": claims }),
+            computed: serde_json::json!({ "stored_without_curve": claims.len() }),
+            delta: serde_json::json!({}),
+            status,
+            tool: None,
+        },
+    )
     .await?;
     conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
@@ -1475,11 +1476,11 @@ async fn run_replicate_audit(
                 if matches!(hold.status.as_str(), "acknowledged" | "remediated") =>
             {
                 if audit::expected_changed(&hold.expected, a) {
-                    audit::upsert_hold(txn, stream_id, &mismatch, hold_status).await?;
+                    audit::upsert_stats_hold(txn, stream_id, &mismatch, hold_status).await?;
                 }
             }
             (false, _) => {
-                audit::upsert_hold(txn, stream_id, &mismatch, hold_status).await?;
+                audit::upsert_stats_hold(txn, stream_id, &mismatch, hold_status).await?;
             }
         }
     }

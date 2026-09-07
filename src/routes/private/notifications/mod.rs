@@ -74,7 +74,9 @@ impl KindGroup {
 pub fn kind_group(kind: &str) -> Option<KindGroup> {
     match kind {
         "alarm_opened" | "alarm_resolved" | "battery_forecast" => Some(KindGroup::Alarms),
-        "stale_data" | "sync_stale" | "sync_failure" => Some(KindGroup::Sync),
+        "stale_data" | "sync_stale" | "sync_failure" | "streams_unpaired" | "holds_open" => {
+            Some(KindGroup::Sync)
+        }
         _ => None,
     }
 }
@@ -116,6 +118,8 @@ mod tests {
         assert_eq!(kind_group("stale_data"), Some(KindGroup::Sync));
         assert_eq!(kind_group("sync_stale"), Some(KindGroup::Sync));
         assert_eq!(kind_group("sync_failure"), Some(KindGroup::Sync));
+        assert_eq!(kind_group("streams_unpaired"), Some(KindGroup::Sync));
+        assert_eq!(kind_group("holds_open"), Some(KindGroup::Sync));
     }
 
     #[test]

@@ -24,10 +24,15 @@ in tests/fixtures/README.md.
 
 Usage:
   build-test-fixtures.py --viewlinc-dir DIR --portal-dump cnet.sql --portal-dump metalp.sql \
-                        [--nomis-dump nomis.sql] [--out tests/fixtures]
+                        [--nomis-dump nomis.sql] [--emit-portal-db] [--out tests/fixtures]
+
+Each source is optional, so one family of fixtures can be rebuilt without the others. With
+--emit-portal-db each portal dump also yields a loadable portal_db_<label>.sql: the DDL verbatim,
+pseudonymised rows for a few stations, and schema-only for users, data_requests and notes.
 """
 
 import argparse
+import collections
 import csv
 import re
 import sys
@@ -74,6 +79,19 @@ NOMIS_LOCATION_ROWS = 25
 NOMIS_REPLICATE_ROWS = 36
 BUDGET_BYTES = 100 * 1024
 
+# The portal database fixture. Sized to the scenarios rather than to the source: a few stations,
+# the replicate families and calculation chains they carry, every curve and constant the rows
+# reference, and an early and a late block per station, which leaves a real span with no rows.
+PORTAL_DB_TABLES = [
+    "constants", "grab_param_categories", "grab_params_plotting", "parameter_calculations",
+    "sensor_params_plotting", "standard_curves", "stations", "sensor_inventory", "data",
+]
+# Present with their schema and no rows: usernames, password hashes and free text.
+PORTAL_DB_EMPTY_TABLES = ["users", "data_requests", "notes"]
+PORTAL_DB_STATIONS = 3
+PORTAL_DB_ROWS = 60
+PORTAL_DB_BUDGET_BYTES = 256 * 1024  # per portal
+
 
 class Aliases:
     """Assigns PREFIX01..n by order of first appearance. Never persisted."""
@@ -101,17 +119,20 @@ def parse_create_columns(sql, table):
     return [cm.group(1) for cm in (re.match(r"\s*`([^`]+)`\s", l) for l in m.group(1).splitlines()) if cm]
 
 
-def split_tuples(values_blob):
-    """Split a MySQL VALUES blob into rows of raw field strings.
+def scan_tuples(values_blob):
+    """Split a MySQL VALUES blob into rows of (value, literal) fields.
 
     Hand-rolled because the blob mixes quoted strings containing commas and parentheses with bare
     numbers and NULLs; a naive split on '),(' corrupts any row holding a comma inside a string.
+    The literal is the field as the dump wrote it, quotes and escapes included, which is what
+    re-emitting SQL needs.
     """
-    rows, field, row = [], [], []
+    rows, field, lit, row = [], [], [], []
     in_str = escaped = False
     depth = 0
     for ch in values_blob:
         if in_str:
+            lit.append(ch)
             if escaped:
                 field.append(ch); escaped = False
             elif ch == "\\":
@@ -122,25 +143,49 @@ def split_tuples(values_blob):
                 field.append(ch)
             continue
         if ch == "'":
-            in_str = True
+            in_str = True; lit.append(ch)
         elif ch == "(":
             depth += 1
             if depth == 1:
-                field, row = [], []
+                field, lit, row = [], [], []
         elif ch == ")":
             depth -= 1
             if depth == 0:
-                row.append("".join(field)); rows.append(row); field = []
+                row.append(("".join(field), "".join(lit))); rows.append(row); field, lit = [], []
         elif ch == "," and depth == 1:
-            row.append("".join(field)); field = []
+            row.append(("".join(field), "".join(lit))); field, lit = [], []
         elif depth == 1:
-            field.append(ch)
+            field.append(ch); lit.append(ch)
     return rows
+
+
+def split_tuples(values_blob):
+    """Rows of unquoted field values."""
+    return [[v for v, _ in row] for row in scan_tuples(values_blob)]
 
 
 def extract_insert(sql, table):
     m = re.search(r"INSERT INTO `%s` VALUES (.*?);\n" % re.escape(table), sql, re.S)
     return split_tuples(m.group(1)) if m else []
+
+
+def extract_insert_literals(sql, table):
+    m = re.search(r"INSERT INTO `%s` VALUES (.*?);\n" % re.escape(table), sql, re.S)
+    return [[lit for _, lit in row] for row in scan_tuples(m.group(1))] if m else []
+
+
+def extract_ddl(sql, table):
+    """The dump's own DROP and CREATE for one table, verbatim.
+
+    The DDL is the connector's contract: a renamed column has to break the fixture the way it
+    breaks the portal, so it is copied rather than regenerated.
+    """
+    m = re.search(
+        r"DROP TABLE IF EXISTS `%s`;.*?SET character_set_client = @saved_cs_client \*/;\n"
+        % re.escape(table), sql, re.S)
+    if not m:
+        raise SystemExit(f"DDL for table `{table}` not found in dump")
+    return m.group(0)
 
 
 def norm(v):
@@ -215,6 +260,121 @@ def build_portal(dump_path, label, out_dir, stations):
         vals[present.index("station")] = stations.get(r[st_i])
         out.append(vals)
     write_csv(out_dir / f"portal_grab_rows_{label}.csv", present, out)
+
+
+# ---------------------------------------------------------------- portal database fixture
+
+def sql_literal(value):
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def raw(literal):
+    """The value a dump literal carries: strings unquoted, NULL and numbers as written."""
+    if len(literal) > 1 and literal.startswith("'") and literal.endswith("'"):
+        return (literal[1:-1].replace("\\'", "'").replace('\\"', '"')
+                .replace("\\\\", "\\"))
+    return norm(literal)
+
+
+def pick_stations(data_rows, station_i, station_rows, name_i, inventory, limit):
+    """The named stations carrying the most `data` rows, in the order the portal lists them.
+
+    A station the inventory knows outranks a denser one that it does not, so the fixture always
+    carries the instrument path the connector reads `sensor_inventory` for.
+    """
+    counts = collections.Counter(raw(r[station_i]) for r in data_rows)
+    named = [raw(r[name_i]) for r in station_rows]
+    ranked = sorted(named, key=lambda n: (n not in inventory, -counts[n]))[:limit]
+    return [n for n in named if n in ranked]
+
+
+def pick_data_rows(data_rows, cols, kept, limit):
+    """An early and a late block per kept station, plus the rows the scenarios need.
+
+    The block pair is what leaves a real span with no rows: the middle is dropped, nothing is
+    invented, and every emitted row is a row the portal holds.
+    """
+    st_i = cols.index("station")
+    d_i, t_i = cols.index("DATE_reading"), cols.index("TIME_reading")
+    gmt_i = cols.index("Convert_to_GMT")
+    rep_i = [cols.index(c) for c in cols if re.search(r"_rep_\d+$", c)]
+    curve_i = [cols.index(c) for c in cols if c.endswith("_std_curve_id")]
+
+    picked = []
+    per_station = max(2, limit // max(1, len(kept)))
+    for station in kept:
+        chrono = sorted((r for r in data_rows if raw(r[st_i]) == station),
+                        key=lambda r: (raw(r[d_i]), raw(r[t_i])))
+        head = per_station // 2
+        block = chrono[:head] + chrono[len(chrono) - (per_station - head):]
+        chosen = {id(r) for r in block}
+        for extra in (lambda r: bool(rep_i) and all(raw(r[i]) for i in rep_i[:3]),
+                      lambda r: any(raw(r[i]) for i in curve_i),
+                      lambda r: raw(r[gmt_i]) not in ("", "00:00:00")):
+            if not any(extra(r) for r in block):
+                match = next((r for r in chrono if extra(r) and id(r) not in chosen), None)
+                if match:
+                    block.append(match); chosen.add(id(match))
+        picked.extend(block)
+    picked.sort(key=lambda r: (raw(r[st_i]), raw(r[d_i]), raw(r[t_i])))
+    return picked
+
+
+def emit_table(table, cols, rows):
+    if not rows:
+        return ""
+    return (f"INSERT INTO `{table}` VALUES "
+            + ",".join("(" + ",".join(r) + ")" for r in rows) + ";\n")
+
+
+def build_portal_db(dump_path, label, out_dir, stations, catchments):
+    """One loadable `.sql` per portal: the DDL verbatim, pseudonymised rows, no identities.
+
+    It loads through the same `docker-entrypoint-initdb.d` mount the compose fixture uses, so a
+    test may point `PORTAL_DB_URL` at either this or the developer-local production dump.
+    """
+    sql = Path(dump_path).read_text(encoding="utf8", errors="replace")
+    cols = {t: parse_create_columns(sql, t) for t in PORTAL_DB_TABLES}
+    rows = {t: extract_insert_literals(sql, t) for t in PORTAL_DB_TABLES}
+
+    st_name_i = cols["stations"].index("name")
+    inv_st = cols["sensor_inventory"].index("station")
+    inventory = {raw(r[inv_st]) for r in rows["sensor_inventory"]}
+    kept = pick_stations(rows["data"], cols["data"].index("station"),
+                         rows["stations"], st_name_i, inventory, PORTAL_DB_STATIONS)
+    rows["data"] = pick_data_rows(rows["data"], cols["data"], kept, PORTAL_DB_ROWS)
+    rows["stations"] = [r for r in rows["stations"] if raw(r[st_name_i]) in kept]
+    rows["sensor_inventory"] = [r for r in rows["sensor_inventory"]
+                                if raw(r[inv_st]) in kept]
+
+    for table in PORTAL_DB_TABLES:
+        c = cols[table]
+        for r in rows[table]:
+            for i, name in enumerate(c):
+                if name == "description":
+                    r[i] = "NULL"
+                elif name == "station":
+                    r[i] = sql_literal(stations.get(raw(r[i])))
+        if table == "stations":
+            fn, cm = c.index("full_name"), c.index("catchment")
+            for r in rows[table]:
+                alias = stations.get(raw(r[st_name_i]))
+                r[st_name_i] = sql_literal(alias)
+                r[fn] = sql_literal(f"Station {alias}")
+                r[cm] = sql_literal(catchments.get(raw(r[cm])))
+
+    body = [f"-- Pseudonymised {label} portal fixture, written by scripts/build-test-fixtures.py",
+            "-- --emit-portal-db. The schema is the production DDL verbatim; the rows are real",
+            "-- rows with every station identity mapped and every free-text column dropped.",
+            sql[:sql.index("DROP TABLE IF EXISTS")]]
+    for table in PORTAL_DB_TABLES:
+        body.append(extract_ddl(sql, table))
+        body.append(emit_table(table, cols[table], rows[table]))
+    for table in PORTAL_DB_EMPTY_TABLES:
+        body.append(extract_ddl(sql, table))
+    body.append(sql[sql.index("/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;"):])
+
+    (out_dir / f"portal_db_{label}.sql").write_text("\n".join(body), encoding="utf8")
 
 
 # ---------------------------------------------------------------- NOMIS
@@ -384,10 +544,12 @@ def build_viewlinc(viewlinc_dir, out_dir):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--viewlinc-dir", required=True)
+    ap.add_argument("--viewlinc-dir")
     ap.add_argument("--portal-dump", action="append", default=[])
     ap.add_argument("--nomis-dump")
     ap.add_argument("--out", default="tests/fixtures")
+    ap.add_argument("--emit-portal-db", action="store_true",
+                    help="also write a loadable portal database per --portal-dump")
     args = ap.parse_args()
 
     out_dir = Path(args.out)
@@ -396,16 +558,23 @@ def main():
     stations = Aliases("S")
     glaciers = Aliases("G")
     locations = Aliases("L")
+    catchments = Aliases("C")
 
-    for dump in args.portal_dump:
-        label = Path(dump).stem.split("_")[0]
+    labelled = [(dump, Path(dump).stem.split("_")[0]) for dump in args.portal_dump]
+    for dump, label in labelled:
         build_portal(dump, label, out_dir, stations)
+    # After every slice, never interleaved: the alias map assigns by order of first appearance, so
+    # a database built in between would renumber the stations the committed slices carry.
+    for dump, label in labelled:
+        if args.emit_portal_db:
+            build_portal_db(dump, label, out_dir, stations, catchments)
     if args.nomis_dump:
         build_nomis(args.nomis_dump, out_dir, glaciers, locations)
-    renames = build_viewlinc(args.viewlinc_dir, out_dir)
+    renames = build_viewlinc(args.viewlinc_dir, out_dir) if args.viewlinc_dir else {}
 
     print("pseudonym mapping (not written to disk):", file=sys.stderr)
-    for label, alias in list(stations.items()) + list(glaciers.items()) + list(locations.items()):
+    for label, alias in (list(stations.items()) + list(glaciers.items())
+                         + list(locations.items()) + list(catchments.items())):
         print(f"  {label} -> {alias}", file=sys.stderr)
     for src, dst in renames.items():
         print(f"  {src} -> {dst}", file=sys.stderr)
@@ -417,6 +586,13 @@ def main():
     print(f"{'total':38} {total / 1024:7.1f} KB")
     if total > BUDGET_BYTES:
         raise SystemExit(f"fixtures exceed the {BUDGET_BYTES // 1024}KB budget")
+
+    for p in sorted(out_dir.glob("portal_db_*.sql")):
+        size = p.stat().st_size
+        print(f"{p.name:38} {size / 1024:7.1f} KB")
+        if size > PORTAL_DB_BUDGET_BYTES:
+            raise SystemExit(
+                f"{p.name} exceeds the {PORTAL_DB_BUDGET_BYTES // 1024}KB budget")
 
 
 if __name__ == "__main__":

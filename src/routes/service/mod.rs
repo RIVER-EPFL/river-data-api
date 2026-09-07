@@ -198,6 +198,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/parameter_groups",
             admin_write_crud(ParameterGroup::router(db)),
         )
+
         .nest(
             "/parameter_group_members",
             admin_write_crud(ParameterGroupMember::router(db)),

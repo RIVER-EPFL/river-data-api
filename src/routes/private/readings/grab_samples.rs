@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::routes::private::sync::replicate_audit as audit;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
@@ -1414,6 +1415,7 @@ pub async fn insert_grab_samples(
                                 *time,
                                 serde_json::json!({ "claim": "replaced", "kept": entries }),
                                 serde_json::json!({ "kept": true }),
+                                "pending",
                             )
                             .await?;
                             kept_total += kept.len();
@@ -1667,7 +1669,7 @@ pub async fn open_unverified_holds<C: sea_orm::ConnectionTrait>(
                 "UPDATE replicate_audit_holds SET computed = $4, created_at = NOW() \
                  WHERE site_id = $1 AND parameter_id = $2 AND group_time = $3 \
                    AND kind = 'unverified_entry' AND status IN ('pending', 'deferred')",
-                binds.clone(),
+                binds,
             ))
             .await?
             .rows_affected();
@@ -1676,18 +1678,22 @@ pub async fn open_unverified_holds<C: sea_orm::ConnectionTrait>(
         }
         // Two saves at one slot instant see no row to update and both insert; the conflict
         // clause makes the loser refresh the hold instead of failing its whole save.
-        conn.execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO replicate_audit_holds \
-                 (stream_id, site_id, parameter_id, group_time, kind, expected, computed, delta, \
-                  status) \
-             VALUES (NULL, $1, $2, $3, 'unverified_entry', '{\"state\": \"verified\"}'::jsonb, \
-                     $4, '{}'::jsonb, 'pending') \
-             ON CONFLICT (kind, site_id, parameter_id, group_time) \
-                 WHERE stream_id IS NULL AND status = 'pending' \
-             DO UPDATE SET computed = EXCLUDED.computed, created_at = NOW()",
-            binds,
-        ))
+        audit::upsert_hold(
+            conn,
+            &audit::Hold {
+                key: audit::HoldKey::Slot {
+                    site_id,
+                    parameter_id: *parameter_id,
+                    group_time: *at,
+                },
+                kind: "unverified_entry",
+                expected: serde_json::json!({ "state": "verified" }),
+                computed: serde_json::json!({ "state": "unverified", "entered_by": actor }),
+                delta: serde_json::json!({}),
+                status: "pending",
+                tool: None,
+            },
+        )
         .await?;
     }
     Ok(())

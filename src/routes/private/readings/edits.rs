@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::readings::decisions::{self, Kind, NewValue, Origin, Selection};
+use crate::routes::private::readings::decisions::{self, Kind, Origin, Selection};
 use crate::routes::private::tools::scripts::actor_label;
 
 /// What one row's record says, reduced to what the routing turns on.
