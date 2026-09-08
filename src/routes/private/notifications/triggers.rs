@@ -124,6 +124,13 @@ pub async fn run(state: &AppState, channels: &[Box<dyn NotificationChannel>]) {
     }
 }
 
+/// A notification's stored state and when it last fired.
+#[derive(FromQueryResult)]
+struct StoredState {
+    state: String,
+    last_notified_at: DateTime<Utc>,
+}
+
 async fn state_get(
     db: &DatabaseConnection,
     kind: &str,
@@ -137,13 +144,11 @@ async fn state_get(
             [kind.into(), key.into()],
         ))
         .await?;
-    match row {
-        Some(r) => Ok(Some((
-            r.try_get("", "state")?,
-            r.try_get("", "last_notified_at")?,
-        ))),
-        None => Ok(None),
-    }
+    row.map(|r| {
+        let stored = StoredState::from_query_result(&r, "")?;
+        Ok((stored.state, stored.last_notified_at))
+    })
+    .transpose()
 }
 
 async fn state_upsert(

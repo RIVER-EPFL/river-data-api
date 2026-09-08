@@ -6,7 +6,7 @@
 //! a later cycle, once pairing has created the site.
 
 use axum::{Json, extract::State};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -39,6 +39,13 @@ pub struct NoteItem {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RegisterNotesResponse {
     pub notes: Vec<NoteOutcome>,
+}
+
+/// What the upsert did with one registered note.
+#[derive(FromQueryResult)]
+struct UpsertedNote {
+    id: Uuid,
+    created: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -139,11 +146,11 @@ pub async fn register_notes(
             ))
             .await?;
 
-        let outcome = match row {
-            Some(row) => NoteOutcome {
+        let outcome = match row.map(|r| UpsertedNote::from_query_result(&r, "")).transpose()? {
+            Some(upserted) => NoteOutcome {
                 source_key: item.source_key.clone(),
-                id: Some(row.try_get::<Uuid>("", "id")?),
-                status: if row.try_get::<bool>("", "created")? {
+                id: Some(upserted.id),
+                status: if upserted.created {
                     "created".into()
                 } else {
                     "updated".into()

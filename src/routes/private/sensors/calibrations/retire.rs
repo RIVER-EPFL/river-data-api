@@ -307,6 +307,13 @@ pub async fn unretire_calibration(
     }))
 }
 
+/// A curve's instrument and whether it has been retired.
+#[derive(FromQueryResult)]
+struct CurveState {
+    sensor_id: Uuid,
+    retired_at: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+}
+
 async fn load<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<(Uuid, Option<DateTime<Utc>>)> {
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(
@@ -316,10 +323,10 @@ async fn load<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<(Uuid, Option
         ))
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Calibration {id} not found")))?;
+    let curve = CurveState::from_query_result(&row, "")?;
     Ok((
-        row.try_get("", "sensor_id")?,
-        row.try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "retired_at")?
-            .map(|t| t.with_timezone(&Utc)),
+        curve.sensor_id,
+        curve.retired_at.map(|t| t.with_timezone(&Utc)),
     ))
 }
 

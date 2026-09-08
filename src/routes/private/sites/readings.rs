@@ -1167,6 +1167,13 @@ struct ReplicateRow {
 /// An instant every one of whose rows carries `withdrawn_at` is served by nothing, so a chart drawn
 /// from the readings response alone cannot tell it from a visit never made. This is what lets it
 /// say so.
+/// One parameter's withdrawn-row count over the window.
+#[derive(FromQueryResult)]
+struct WithdrawnCount {
+    parameter_id: Uuid,
+    withdrawn_count: i64,
+}
+
 async fn count_withdrawn_instants(
     db: &sea_orm::DatabaseConnection,
     site_id: Uuid,
@@ -1209,13 +1216,9 @@ async fn count_withdrawn_instants(
         ))
         .await?;
     let mut counts = HashMap::with_capacity(rows.len());
-    for row in rows {
-        if let (Ok(id), Ok(n)) = (
-            row.try_get::<Uuid>("", "parameter_id"),
-            row.try_get::<i64>("", "withdrawn_count"),
-        ) {
-            counts.insert(id, n);
-        }
+    for row in &rows {
+        let withdrawn = WithdrawnCount::from_query_result(row, "")?;
+        counts.insert(withdrawn.parameter_id, withdrawn.withdrawn_count);
     }
     Ok(counts)
 }

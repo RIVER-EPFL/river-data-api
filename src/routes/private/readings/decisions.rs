@@ -51,6 +51,10 @@ pub enum Kind {
     /// upsert writes the value, this says the slot's first number arrived and under which
     /// formula version.
     DerivedComputed,
+    /// A reprocess re-derived a reading's attribution or its corrected value from the deployment
+    /// and calibration timelines (Q118, Q125, M160). Record only, and only where the run moved
+    /// something: the bulk statements write the columns, this says what they were before.
+    Reprocess,
     Rollback,
 }
 
@@ -77,6 +81,7 @@ impl Kind {
             Self::FormulaTransition => "formula_transition",
             Self::CurveRecompose => "curve_recompose",
             Self::DerivedComputed => "derived_computed",
+            Self::Reprocess => "reprocess",
             Self::Rollback => "rollback",
         }
     }
@@ -102,6 +107,7 @@ impl Kind {
             Self::FormulaTransition,
             Self::CurveRecompose,
             Self::DerivedComputed,
+            Self::Reprocess,
             Self::Rollback,
         ]
         .into_iter()
@@ -134,6 +140,7 @@ impl Kind {
             | Self::FormulaTransition
             | Self::CurveRecompose
             | Self::DerivedComputed
+            | Self::Reprocess
             | Self::Rollback => &[],
         }
     }
@@ -181,6 +188,9 @@ impl Kind {
             // Its own family: a value's arrival is not superseded by anything, and a slot that
             // was unattributed and computed again is a second arrival, not a replacement.
             Self::DerivedComputed => Some("derived_arrival"),
+            // Its own family: a re-derivation replaces neither a curation decision nor the
+            // re-derivation before it, each of which moved the row from a different state.
+            Self::Reprocess => Some("reprocess"),
             Self::Rollback => None,
         }
     }
@@ -195,6 +205,13 @@ impl Kind {
             Self::CurveRecompose => &["calibrated_value"],
             Self::DerivedComputed => &["raw_value", "derived_version_id"],
             Self::SlotMove => &["site_id", "parameter_id"],
+            Self::Reprocess => &[
+                "site_id",
+                "sensor_id",
+                "deployment_id",
+                "calibration_id",
+                "calibrated_value",
+            ],
             other => other.projected_columns(),
         }
     }
@@ -228,10 +245,11 @@ impl Kind {
 /// curation writer appends a decision of the given kind; a derivation writer appends nothing and
 /// must honour pins. A new writer declares itself here or the classification test fails.
 ///
-/// Two derivations are the exception (Q116, Q118): a recompute that moves a stored value records
-/// the move, because the ledger is the one place a value's history is read from and a value that
-/// changed under a new formula version, or under a curve the sweep repaired it to, would
-/// otherwise leave no trace of having changed.
+/// The derivations that move a stored value are the exception (Q116, Q118, Q125): a recompute
+/// records the move, because the ledger is the one place a value's history is read from and a
+/// value that changed under a new formula version, under a curve the sweep repaired it to, or
+/// under the timelines a reprocess re-derives from, would otherwise leave no trace of having
+/// changed. A reprocess records only the readings it moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Writer {
     FlagRoute,
@@ -286,9 +304,8 @@ impl Writer {
             Self::DerivedRecompute => Some((Kind::FormulaTransition, Origin::System)),
             Self::JanitorRecompose => Some((Kind::CurveRecompose, Origin::Janitor)),
             Self::DerivedGapFill => Some((Kind::DerivedComputed, Origin::System)),
-            Self::ReprocessSensor
-            | Self::ReprocessSlot
-            | Self::CalibrationResolver
+            Self::ReprocessSensor | Self::ReprocessSlot => Some((Kind::Reprocess, Origin::System)),
+            Self::CalibrationResolver
             | Self::BackfillAttribution
             | Self::PairingBackfill
             | Self::MeasurementRetag
@@ -1488,7 +1505,8 @@ pub fn projected_state(newest_first: &[FoldEntry]) -> ProjectedColumns {
 }
 
 /// The same fold in SQL, anti-joined against the readings: every key whose folded columns are not
-/// what its live decisions say they should be. Report-only, because which side is wrong is a
+/// what its live decisions say they should be, with the columns the reading holds and the map its
+/// decisions fold to (`folded`), so a caller can show a person which side says what. Report-only, because which side is wrong is a
 /// decision (a rollback, or a fresh decision), never something a sweep may pick.
 ///
 /// It folds every column a decision's own assertion determines. The one it cannot is
@@ -1513,7 +1531,7 @@ pub fn inconsistent_rows_sql() -> String {
                                OR d.replicate_index = r.replicate_index)
                           AND d.rolled_back_by IS NULL)
      )
-     SELECT c.stream_id, c.time, c.replicate_index
+     SELECT c.*, e.m AS folded
      FROM candidate c
      LEFT JOIN LATERAL (
          SELECT jsonb_object_agg(a.col, a.val) AS m
@@ -1788,15 +1806,14 @@ pub async fn open_set<C: ConnectionTrait>(
 }
 
 /// Record how many rows the set decided, which is what the surfaces report.
-pub async fn close_set<C: ConnectionTrait>(
-    conn: &C,
-    set_id: Uuid,
-    rows: u64,
-) -> AppResult<()> {
+pub async fn close_set<C: ConnectionTrait>(conn: &C, set_id: Uuid, rows: u64) -> AppResult<()> {
     conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE reading_decision_sets SET rows_decided = $2 WHERE id = $1",
-        [set_id.into(), i64::try_from(rows).unwrap_or(i64::MAX).into()],
+        [
+            set_id.into(),
+            i64::try_from(rows).unwrap_or(i64::MAX).into(),
+        ],
     ))
     .await?;
     Ok(())
@@ -2037,7 +2054,6 @@ pub async fn enqueue_pin_reprocess_for_decision(
     )
     .await
 }
-
 
 /// Who owns an output slot at a visit (Q40, Q47): the calculation, or a person who detached it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
@@ -2601,14 +2617,18 @@ mod tests {
                 Kind::CurveRecompose,
                 Origin::Janitor,
             ),
-            (Writer::DerivedGapFill, Kind::DerivedComputed, Origin::System),
+            (
+                Writer::DerivedGapFill,
+                Kind::DerivedComputed,
+                Origin::System,
+            ),
+            (Writer::ReprocessSensor, Kind::Reprocess, Origin::System),
+            (Writer::ReprocessSlot, Kind::Reprocess, Origin::System),
         ];
         for (w, k, o) in curation {
             assert_eq!(w.decision(), Some((k, o)), "{w:?}");
         }
         for w in [
-            Writer::ReprocessSensor,
-            Writer::ReprocessSlot,
             Writer::CalibrationResolver,
             Writer::BackfillAttribution,
             Writer::PairingBackfill,

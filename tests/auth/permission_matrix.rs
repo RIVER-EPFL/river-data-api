@@ -616,6 +616,7 @@ fn table() -> Table {
             ("GET", "/api/sites/{id}/visits"),
             ("GET", "/api/visits"),
             ("GET", "/api/collection_events/{id}/detail"),
+            ("GET", "/api/actions/curation_drift"),
         ],
     );
 

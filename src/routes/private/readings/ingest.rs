@@ -1169,6 +1169,13 @@ pub struct IngestStatusEventsResponse {
 
 /// Stream-based status event ingestion (non-numeric device states like "low_battery").
 /// Hypertable inserts keyed by stream_id. Requires `write_data`.
+/// The newest status event stored for a stream, which decides what is new and what repeats.
+#[derive(FromQueryResult)]
+struct StatusTip {
+    time: sea_orm::prelude::DateTimeWithTimeZone,
+    value: Option<String>,
+}
+
 #[utoipa::path(
     post,
     path = "/api/ingest/status_events",
@@ -1247,16 +1254,9 @@ pub async fn ingest_status_events(
         .await?;
     // The tip decides which events are new and which are a repeat of the stored value, so a row
     // that will not decode is an error: reading it as "no tip" would re-admit everything.
-    let tip_time: Option<chrono::DateTime<Utc>> = tip
-        .as_ref()
-        .map(|r| r.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time"))
-        .transpose()?
-        .map(|t| t.with_timezone(&Utc));
-    let mut last_value: Option<String> = tip
-        .as_ref()
-        .map(|r| r.try_get::<Option<String>>("", "value"))
-        .transpose()?
-        .flatten();
+    let tip = tip.map(|r| StatusTip::from_query_result(&r, "")).transpose()?;
+    let tip_time: Option<chrono::DateTime<Utc>> = tip.as_ref().map(|t| t.time.with_timezone(&Utc));
+    let mut last_value: Option<String> = tip.and_then(|t| t.value);
     payload.events.sort_by_key(|e| e.time);
     let before_dedup = payload.events.len();
     payload.events.retain(|e| {
@@ -1334,6 +1334,13 @@ pub async fn ingest_status_events(
 
 /// The (site_id, parameter_id) a stream's pairing resolves to. Both are `None` when the stream is
 /// unpaired, ie. its readings land unattributed and stay out of the rollups until it is paired.
+/// The slot a paired stream resolves to.
+#[derive(FromQueryResult)]
+struct PairedSlot {
+    site_id: Uuid,
+    parameter_id: Uuid,
+}
+
 async fn resolve_stream_slot(
     db: &sea_orm::DatabaseConnection,
     site_parameter_id: Option<Uuid>,
@@ -1351,13 +1358,9 @@ async fn resolve_stream_slot(
     else {
         return Ok((None, None));
     };
-    let site_id: Uuid = row
-        .try_get("", "site_id")
-        .map_err(|e| AppError::Internal(format!("Failed to read site_id: {e}")))?;
-    let parameter_id: Uuid = row
-        .try_get("", "parameter_id")
-        .map_err(|e| AppError::Internal(format!("Failed to read parameter_id: {e}")))?;
-    Ok((Some(site_id), Some(parameter_id)))
+    let slot = PairedSlot::from_query_result(&row, "")
+        .map_err(|e| AppError::Internal(format!("Failed to read the paired slot: {e}")))?;
+    Ok((Some(slot.site_id), Some(slot.parameter_id)))
 }
 
 /// Project-scope check for stream-based ingest. A scoped token may only write to a stream paired

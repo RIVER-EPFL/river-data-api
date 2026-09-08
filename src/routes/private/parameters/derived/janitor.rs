@@ -1,5 +1,5 @@
 use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use uuid::Uuid;
 
 const MAX_GAPS_PER_RUN: usize = 50_000;
@@ -83,6 +83,13 @@ fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> Statement {
 /// Reports progress into the caller's job rather than opening one of its own: the janitor always
 /// runs as a step of the worker-pool `janitor_service` job, and a second row opened from inside that
 /// job would carry no lease, so nothing could ever reclaim it.
+/// One instant of a derived slot the sweep found stale.
+#[derive(FromQueryResult)]
+struct StaleSlot {
+    site_id: Uuid,
+    time: chrono::DateTime<chrono::FixedOffset>,
+}
+
 pub async fn run_once(
     db: &DatabaseConnection,
     ctx: Option<&JobContext>,
@@ -108,9 +115,9 @@ pub async fn run_once(
         if ctx.is_some_and(JobContext::is_cancelled) {
             break;
         }
-        let site_id: Uuid = row.try_get("", "site_id")?;
-        let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
-        let utc_time = time.with_timezone(&chrono::Utc);
+        let slot = StaleSlot::from_query_result(row, "")?;
+        let site_id = slot.site_id;
+        let utc_time = slot.time.with_timezone(&chrono::Utc);
         match crate::routes::private::sensors::calibrations::service::recalculate_derived_at_timestamp(
             db, site_id, utc_time,
         )

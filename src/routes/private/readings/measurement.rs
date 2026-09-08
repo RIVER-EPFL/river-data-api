@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -24,6 +24,13 @@ pub fn validate_measurement_type(value: Option<&str>) -> Result<(), AppError> {
 
 /// Map each sensor to the measurement_type its `data_frequency` implies: 'low' → 'spot'
 /// (lab/campaign cadence), 'high' → 'continuous'. One query for the whole batch.
+/// An instrument's declared cadence, as the classification chain reads it.
+#[derive(FromQueryResult)]
+struct SensorFrequency {
+    id: Uuid,
+    data_frequency: String,
+}
+
 pub async fn measurement_types_for_sensors<C: ConnectionTrait>(
     db: &C,
     sensor_ids: &[Uuid],
@@ -40,9 +47,15 @@ pub async fn measurement_types_for_sensors<C: ConnectionTrait>(
         .await?;
     let mut map = HashMap::with_capacity(rows.len());
     for row in &rows {
-        let id: Uuid = row.try_get("", "id")?;
-        let freq: String = row.try_get("", "data_frequency")?;
-        map.insert(id, if freq == "low" { "spot" } else { "continuous" });
+        let sensor = SensorFrequency::from_query_result(row, "")?;
+        map.insert(
+            sensor.id,
+            if sensor.data_frequency == "low" {
+                "spot"
+            } else {
+                "continuous"
+            },
+        );
     }
     Ok(map)
 }

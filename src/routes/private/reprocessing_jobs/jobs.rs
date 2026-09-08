@@ -215,7 +215,7 @@ impl Job for ReprocessSensor {
         let sensor_id = required_uuid(ctx.params(), "sensor_id")?;
         ctx.info(&format!("Reprocessing readings for sensor {sensor_id}"))
             .await;
-        let count = reprocess_sensor_readings(ctx.db(), sensor_id).await?;
+        let count = reprocess_sensor_readings(ctx.db(), sensor_id, Some(ctx.job_id())).await?;
         if let Ok(Some(row)) = ctx
             .db()
             .query_one_raw(Statement::from_sql_and_values(
@@ -317,9 +317,10 @@ impl Job for ReprocessSlot {
         let site_id = required_uuid(ctx.params(), "site_id")?;
         let parameter_id = required_uuid(ctx.params(), "parameter_id")?;
         let count =
-            reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id).await? as i64;
+            reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id, Some(ctx.job_id()))
+                .await? as i64;
         if let Some(sensor_id) = optional_uuid(ctx.params(), "sensor_id") {
-            reprocess_sensor_readings(ctx.db(), sensor_id).await?;
+            reprocess_sensor_readings(ctx.db(), sensor_id, Some(ctx.job_id())).await?;
         }
         ctx.set_site(site_id).await;
         ctx.report(
@@ -379,11 +380,12 @@ impl Job for ReprocessDeployment {
                 .flatten(),
         };
         let count = if let Some(parameter_id) = parameter_id {
-            reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id).await? as i64
+            reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id, Some(ctx.job_id()))
+                .await? as i64
         } else {
             0
         };
-        reprocess_sensor_readings(ctx.db(), sensor_id).await?;
+        reprocess_sensor_readings(ctx.db(), sensor_id, Some(ctx.job_id())).await?;
         ctx.set_site(site_id).await;
         ctx.report(
             JobReport::new()
@@ -834,9 +836,14 @@ impl Job for ReprocessAll {
 
         let mut results = Vec::with_capacity(slot_count);
         for (site_id, parameter_id) in slots {
-            let moved = reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id)
-                .await
-                .map(|n| n as i64);
+            let moved = reprocess_site_parameter_readings(
+                ctx.db(),
+                site_id,
+                parameter_id,
+                Some(ctx.job_id()),
+            )
+            .await
+            .map(|n| n as i64);
             results.push((
                 serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
                 moved,
@@ -965,9 +972,14 @@ impl Job for BackfillAttribution {
         let slots = uuid_pair_array(ctx.params(), "slots");
         let mut results = Vec::with_capacity(slots.len());
         for (site_id, parameter_id) in slots {
-            let moved = reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id)
-                .await
-                .map(|n| n as i64);
+            let moved = reprocess_site_parameter_readings(
+                ctx.db(),
+                site_id,
+                parameter_id,
+                Some(ctx.job_id()),
+            )
+            .await
+            .map(|n| n as i64);
             results.push((
                 serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
                 moved,
@@ -1002,7 +1014,7 @@ impl Job for BackfillCalibrations {
         let sensors = uuid_array(ctx.params(), "sensors");
         let mut results = Vec::with_capacity(sensors.len());
         for sensor_id in sensors {
-            let moved = reprocess_sensor_readings(ctx.db(), sensor_id)
+            let moved = reprocess_sensor_readings(ctx.db(), sensor_id, Some(ctx.job_id()))
                 .await
                 .map(|n| n as i64);
             results.push((serde_json::json!({ "sensor_id": sensor_id }), moved));
@@ -1278,7 +1290,12 @@ impl Job for JanitorRun {
         //    it eventual, so a hook that never fired costs staleness rather than a wrong number.
         //    Refreshed over the span it moved, before the rollups below settle for this tick.
         let mut recomposed = 0u64;
-        match crate::routes::private::sensors::calibrations::service::sweep_curve_drift(db, Some(ctx.job_id())).await {
+        match crate::routes::private::sensors::calibrations::service::sweep_curve_drift(
+            db,
+            Some(ctx.job_id()),
+        )
+        .await
+        {
             Ok(drift) if drift.moved > 0 => {
                 recomposed = drift.moved;
                 tracing::info!(
@@ -1362,57 +1379,13 @@ impl Job for JanitorRun {
         )
         .await;
 
-        // 4. Report, never repair: readings whose curation columns are not the fold of their
-        //    live decisions. Which side is wrong is a decision (a rollback, or a fresh decision),
-        //    so a sweep may not pick one.
-        let curation_drift =
-            match crate::routes::private::readings::decisions::curation_drift_count(db).await {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Janitor: curation drift count failed");
-                    0
-                }
-            };
-        if curation_drift > 0 {
-            ctx.log(
-                "warn",
-                &format!(
-                    "{curation_drift} readings disagree with their decision record; nothing was changed"
-                ),
-                serde_json::json!({}),
-            )
-            .await;
-        }
-
-        // 5. Report, never repair: readings that say nothing about where they came from. A
-        //    writer that stamps no kind, or a kind whose record is missing, is a defect in that
-        //    writer, so the sweep counts them and leaves them alone.
-        let provenance_untold =
-            match crate::routes::private::readings::provenance::untold_count(db).await {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Janitor: untold provenance count failed");
-                    0
-                }
-            };
-        if provenance_untold > 0 {
-            ctx.log(
-                "warn",
-                &format!("{provenance_untold} readings record no origin; nothing was changed"),
-                serde_json::json!({}),
-            )
-            .await;
-        }
-
         // What this tick actually changed, so a run's effect is readable per job rather than only
         // in its logs.
         ctx.report(
             JobReport::new()
                 .scope("full_refresh", do_full)
                 .count("recomposed", recomposed)
-                .count("pruned", pruned)
-                .count("curation_drift", curation_drift)
-                .count("provenance_untold", provenance_untold),
+                .count("pruned", pruned),
         )
         .await;
         Ok(pruned as i64)
@@ -1722,7 +1695,8 @@ impl Job for PushSubscriptionReconcile {
                         "Push subscription reconciliation: users pruned"
                     );
                 }
-                ctx.report(JobReport::new().count("revoked", o.revoked)).await;
+                ctx.report(JobReport::new().count("revoked", o.revoked))
+                    .await;
                 Ok(o.total() as i64)
             }
             Err(e) => Err(e),
@@ -1921,8 +1895,10 @@ impl Job for MeasurementRetag {
                 ))
                 .await?;
             for row in &conflicting {
-                let StreamRef { source_system: system, source_key: key } =
-                    StreamRef::from_query_result(row, "")?;
+                let StreamRef {
+                    source_system: system,
+                    source_key: key,
+                } = StreamRef::from_query_result(row, "")?;
                 ctx.log(
                     "warn",
                     &format!(

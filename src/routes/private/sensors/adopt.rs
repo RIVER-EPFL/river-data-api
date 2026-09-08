@@ -4,8 +4,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, Set,
-    Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
+    QueryFilter, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -382,6 +382,13 @@ pub struct AdoptSuggestion {
 }
 
 /// Suggested deploy dates for a sensor: now, the end of its last deployment, and its first reading.
+/// The two dates an adopt suggestion is drawn from, either of which may be absent.
+#[derive(FromQueryResult)]
+struct SuggestionRow {
+    end_last: Option<DateTime<chrono::FixedOffset>>,
+    first_reading: Option<DateTime<chrono::FixedOffset>>,
+}
+
 #[utoipa::path(
     get,
     path = "/api/sensors/{sensor_id}/adopt_suggestions",
@@ -408,17 +415,14 @@ pub async fn adopt_suggestions(
             [sensor_id.into()],
         ))
         .await?;
-    let (end_of_last_deployment, first_reading) = match row {
-        Some(r) => (
-            r.try_get::<DateTime<chrono::FixedOffset>>("", "end_last")
-                .ok()
-                .map(|t| t.with_timezone(&Utc)),
-            r.try_get::<DateTime<chrono::FixedOffset>>("", "first_reading")
-                .ok()
-                .map(|t| t.with_timezone(&Utc)),
-        ),
-        None => (None, None),
-    };
+    // Both columns are nullable: a sensor with no prior deployment and no readings has neither.
+    let suggestions = row.map(|r| SuggestionRow::from_query_result(&r, "")).transpose()?;
+    let (end_of_last_deployment, first_reading) = suggestions.map_or((None, None), |s| {
+        (
+            s.end_last.map(|t| t.with_timezone(&Utc)),
+            s.first_reading.map(|t| t.with_timezone(&Utc)),
+        )
+    });
     Ok(Json(AdoptSuggestion {
         now: Utc::now(),
         end_of_last_deployment,

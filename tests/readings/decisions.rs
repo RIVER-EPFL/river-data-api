@@ -1391,3 +1391,104 @@ async fn arrival(f: &Fixture) -> String {
     .try_get::<String>("", "v")
     .unwrap()
 }
+
+/// Scenario: the projection trigger is what the drift report detects a failure of, so the
+/// invariant it holds is asserted at the trigger rather than only through a sweep (M143).
+///
+/// Expected behaviour: appending a decision of each writable kind writes that kind's projected
+/// columns onto the reading, in the writer's own transaction.
+#[tokio::test]
+#[serial]
+async fn every_writable_kind_projects_its_columns_onto_the_reading() {
+    let f = setup().await;
+    seed_group(&f, &[1.0]).await;
+
+    let cases: [(Kind, serde_json::Value, &str, &str); 6] = [
+        (
+            Kind::Flag,
+            json!({ "reason": "spike" }),
+            "is_flagged",
+            "true",
+        ),
+        (Kind::Unflag, json!({}), "is_flagged", "false"),
+        (
+            Kind::Withdraw,
+            json!({ "reason": "absent at source" }),
+            "withdrawn_at IS NOT NULL",
+            "true",
+        ),
+        (
+            Kind::Reassert,
+            json!({}),
+            "withdrawn_at IS NOT NULL",
+            "false",
+        ),
+        (Kind::UnverifiedEntry, json!({}), "unverified", "true"),
+        (Kind::Verify, json!({}), "unverified", "false"),
+    ];
+
+    for (kind, new, column, expected) in cases {
+        record(&f.db, decision(&f, kind, Some(0), new)).await;
+        let projected = crate::common::e2e::scalar(
+            &f.db,
+            &format!(
+                "SELECT COALESCE(({column})::text, 'false') FROM readings \
+                  WHERE stream_id = '{}' AND time = '{AT}' AND replicate_index = 0",
+                f.stream
+            ),
+        )
+        .await;
+        assert_eq!(projected, expected, "a {} projects {column}", kind.as_str());
+        assert!(
+            drift_keys(&f.db).await.is_empty(),
+            "a projected decision is not drift"
+        );
+    }
+}
+
+/// Scenario: the drift count moved off the janitor tick onto a request (Q126), and a count nobody
+/// can open is a number without a subject.
+///
+/// Expected behaviour: `GET /actions/curation_drift` answers with the count and the disagreeing
+/// readings, each naming what the row holds and what its decisions fold to; a consistent database
+/// answers zero and an empty list.
+#[tokio::test]
+#[serial]
+async fn the_drift_report_lists_the_readings_behind_its_count() {
+    let f = setup().await;
+    seed_group(&f, &[1.0]).await;
+    record(
+        &f.db,
+        decision(&f, Kind::Flag, Some(0), json!({ "reason": "spike" })),
+    )
+    .await;
+
+    let (status, body) =
+        crate::common::get_json_with_token(&f.app, "/api/actions/curation_drift", &f.token).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total"], 0, "a projected decision is not drift");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 0);
+
+    // A column written behind the record is exactly what the report is for.
+    crate::common::exec(
+        &f.db,
+        &format!(
+            "UPDATE readings SET is_flagged = false WHERE stream_id = '{}' \
+               AND time = '{AT}' AND replicate_index = 0",
+            f.stream
+        ),
+    )
+    .await;
+
+    let (status, body) =
+        crate::common::get_json_with_token(&f.app, "/api/actions/curation_drift", &f.token).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total"], 1);
+    let row = &body["rows"][0];
+    assert_eq!(row["stream_id"], f.stream.to_string());
+    assert_eq!(row["stored"]["is_flagged"], false);
+    assert_eq!(
+        row["folded"]["is_flagged"], true,
+        "the fold says what the decision asserted"
+    );
+}

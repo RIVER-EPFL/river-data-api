@@ -145,6 +145,13 @@ pub fn violations_sql(site_id: Uuid, param_ids: Option<Vec<Uuid>>, min_severity:
 
 /// How many breaching readings each parameter contributes over a range, from the same definition
 /// [`violations_sql`] serves, so a count and the export it gates cannot disagree.
+/// One parameter's row count over a range.
+#[derive(FromQueryResult)]
+struct ParameterCount {
+    pid: Uuid,
+    n: i64,
+}
+
 pub async fn count_violations_by_parameter(
     db: &sea_orm::DatabaseConnection,
     site_id: Uuid,
@@ -168,10 +175,8 @@ pub async fn count_violations_by_parameter(
         ))
         .await?
     {
-        counts.insert(
-            row.try_get::<Uuid>("", "pid")?,
-            row.try_get::<i64>("", "n")?,
-        );
+        let counted = ParameterCount::from_query_result(&row, "")?;
+        counts.insert(counted.pid, counted.n);
     }
     Ok(counts)
 }

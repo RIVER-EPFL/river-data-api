@@ -49,6 +49,13 @@ pub struct RegisterAnnotationsResponse {
     pub annotations: Vec<AnnotationOutcome>,
 }
 
+/// A stored annotation the upsert left alone, and whether its text has moved at source.
+#[derive(FromQueryResult)]
+struct ExistingAnnotation {
+    id: Uuid,
+    frozen: bool,
+}
+
 /// What the upsert did with one registered annotation.
 #[derive(FromQueryResult)]
 struct UpsertedAnnotation {
@@ -212,10 +219,11 @@ pub async fn register_annotations(
                             item.source_key
                         ))
                     })?;
+                let seen = ExistingAnnotation::from_query_result(&existing, "")?;
                 AnnotationOutcome {
                     source_key: item.source_key.clone(),
-                    id: Some(existing.try_get::<Uuid>("", "id")?),
-                    status: if existing.try_get::<bool>("", "frozen")? {
+                    id: Some(seen.id),
+                    status: if seen.frozen {
                         "frozen".into()
                     } else {
                         "unchanged".into()

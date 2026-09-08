@@ -19,6 +19,10 @@ use crate::routes::private::{projects, sites};
 /// 2.4.0: `include_sample_stats` publishes n, mean, sd, min and max per instant with the slot's
 /// declared sd estimator beside the sd, and a slot declaring `decimal_places` has every served
 /// value, statistic and aggregate expressed at those places.
+///
+/// A slot declaring none is served as stored, and that is a decision rather than an omission
+/// (Q124): the platform default of two places belongs to the forms, and the public arm never
+/// rounds a value nobody declared a precision for.
 pub const SERVING_CONTRACT_VERSION: &str = "2.4.0";
 
 /// Cache for public project configurations

@@ -213,6 +213,13 @@ struct ChannelCounts {
     sent_30d: i64,
 }
 
+/// One channel the caller has overridden, and what they set it to.
+#[derive(FromQueryResult)]
+struct ChannelOverride {
+    channel: String,
+    enabled: bool,
+}
+
 #[utoipa::path(
     get,
     path = "/api/notifications/channels",
@@ -247,10 +254,8 @@ pub async fn list_channels(
         .await?;
     let mut chosen = std::collections::HashMap::new();
     for row in &mine {
-        chosen.insert(
-            row.try_get::<String>("", "channel")?,
-            row.try_get::<bool>("", "enabled")?,
-        );
+        let override_row = ChannelOverride::from_query_result(row, "")?;
+        chosen.insert(override_row.channel, override_row.enabled);
     }
     Ok(Json(
         super::CHANNELS

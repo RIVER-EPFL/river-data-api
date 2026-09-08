@@ -453,7 +453,8 @@ async fn recalled_inputs_take_their_derived_output_out_of_the_site() {
     // One input reading inside the deployment and one after it closed, each with the derived value
     // that was computed from it.
     let input_stream = create_paired_stream(&db, "derived-recall-input", PARAM_S1_TEMP_ID).await;
-    let derived_stream = create_paired_stream(&db, "derived-recall-output", &derived_sp.to_string()).await;
+    let derived_stream =
+        create_paired_stream(&db, "derived-recall-output", &derived_sp.to_string()).await;
     for (time, value) in [("2025-04-15T00:00:00Z", 4.0), ("2025-07-15T00:00:00Z", 7.0)] {
         exec(
             &db,
@@ -477,7 +478,7 @@ async fn recalled_inputs_take_their_derived_output_out_of_the_site() {
         .await;
     }
 
-    reprocess_sensor_readings(&db, sensor.id)
+    reprocess_sensor_readings(&db, sensor.id, None)
         .await
         .expect("reprocess");
 
@@ -540,6 +541,7 @@ async fn slot_reprocess_recalls_only_after_the_first_deployment() {
         &db,
         SITE1_ID.parse().unwrap(),
         GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
+        None,
     )
     .await
     .expect("reprocess");
@@ -571,7 +573,8 @@ async fn slot_reprocess_recalls_only_after_the_first_deployment() {
 
     for (i, row) in rows.iter().skip(5).enumerate() {
         assert_eq!(
-            row.site_id, None,
+            row.site_id,
+            None,
             "month {} falls after the deployment closed and is recalled out of the site",
             i + 6
         );
@@ -643,6 +646,7 @@ async fn slot_reprocess_leaves_spot_grabs_untouched() {
         &db,
         SITE1_ID.parse().unwrap(),
         GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
+        None,
     )
     .await
     .expect("reprocess");
@@ -1441,6 +1445,7 @@ async fn slot_reprocess_picks_the_later_of_two_open_windows() {
         &db,
         SITE1_ID.parse().unwrap(),
         GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
+        None,
     )
     .await
     .expect("reprocess");
@@ -1470,4 +1475,100 @@ async fn slot_reprocess_picks_the_later_of_two_open_windows() {
     assert_eq!(still_open, 1, "the per-slot arm does not chain windows");
 
     cleanup_test_db(&db).await;
+}
+
+/// Scenario: a deployment closes in June, the slot holds readings on either side of it, and a
+/// reprocess runs under a tracked job.
+/// Expected behaviour: every reading the run moved carries a `reprocess` decision naming the
+/// column's state on both sides, the `system` origin and the job that made the move (Q118, Q125);
+/// a second run over the settled rows moves nothing and records nothing.
+#[tokio::test]
+#[serial]
+async fn a_reprocess_records_the_readings_it_moved_against_its_job() {
+    use river_db::routes::private::sensors::calibrations::service::reprocess_sensor_readings;
+    use sea_orm::Statement;
+
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let sensor = create_sensor(&db, "Ledger-Probe-01", GLOBAL_PARAM_TEMP_ID).await;
+    let deployment = deploy_sensor_for_parameter(
+        &db,
+        sensor.id,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        dt("2025-03-01T00:00:00Z"),
+    )
+    .await;
+    end_deployment(&db, deployment, dt("2025-06-01T00:00:00Z")).await;
+
+    // One reading the deployment covers and one after it closed, both attributed to the site as a
+    // pairing would leave them.
+    let stream = create_paired_stream(&db, "ledger-probe", PARAM_S1_TEMP_ID).await;
+    for (time, value) in [("2025-04-15T00:00:00Z", 4.0), ("2025-07-15T00:00:00Z", 7.0)] {
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO readings \
+                 (stream_id, site_id, parameter_id, time, raw_value, sensor_id, replicate_index) \
+                 VALUES ('{stream}', '{SITE1_ID}', '{GLOBAL_PARAM_TEMP_ID}', '{time}', {value}, '{}', 0)",
+                sensor.id
+            ),
+        )
+        .await;
+    }
+
+    let job = uuid::Uuid::new_v4();
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO reprocessing_jobs (id, trigger_type, status) \
+             VALUES ('{job}', 'reprocess_sensor', 'running')"
+        ),
+    )
+    .await;
+
+    reprocess_sensor_readings(&db, sensor.id, Some(job))
+        .await
+        .expect("reprocess");
+
+    let recalled = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT d.old ->> 'site_id' AS was, d.new ->> 'site_id' AS became, \
+                        d.actor, d.origin, d.job_id \
+                   FROM reading_decisions d \
+                  WHERE d.kind = 'reprocess' AND d.time = '2025-07-15T00:00:00Z' \
+                    AND d.old ? 'site_id'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the recalled reading records its move");
+    assert_eq!(recalled.try_get::<String>("", "was").unwrap(), SITE1_ID);
+    assert!(
+        recalled
+            .try_get::<Option<String>>("", "became")
+            .unwrap()
+            .is_none(),
+        "a recalled reading moves to no site"
+    );
+    assert_eq!(recalled.try_get::<String>("", "actor").unwrap(), "system");
+    assert_eq!(recalled.try_get::<String>("", "origin").unwrap(), "system");
+    assert_eq!(recalled.try_get::<uuid::Uuid>("", "job_id").unwrap(), job);
+
+    let recorded = "SELECT count(*)::bigint FROM reading_decisions WHERE kind = 'reprocess'";
+    let after_first = crate::common::e2e::count(&db, recorded).await;
+    assert!(after_first > 0, "the run that moved readings recorded them");
+
+    reprocess_sensor_readings(&db, sensor.id, Some(job))
+        .await
+        .expect("reprocess again");
+    let after_second = crate::common::e2e::count(&db, recorded).await;
+    assert_eq!(
+        after_second, after_first,
+        "a reading a reprocess visits and does not move records nothing"
+    );
 }

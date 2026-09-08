@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use crate::common::{AppEvent, AppState, EventSender};
@@ -163,6 +163,13 @@ async fn reconcile(
     Ok(stats)
 }
 
+/// The slot an open alarm event stands on.
+#[derive(FromQueryResult)]
+struct OpenAlarmSlot {
+    site_id: Uuid,
+    parameter_id: Uuid,
+}
+
 async fn reconcile_cadence(
     db: &DatabaseConnection,
     slots: Option<&[(Uuid, Uuid)]>,
@@ -215,9 +222,8 @@ async fn reconcile_cadence(
         ))
         .await?
     {
-        let site_id: Uuid = row.try_get("", "site_id")?;
-        let parameter_id: Uuid = row.try_get("", "parameter_id")?;
-        open_keys.insert((site_id, parameter_id));
+        let slot = OpenAlarmSlot::from_query_result(&row, "")?;
+        open_keys.insert((slot.site_id, slot.parameter_id));
     }
 
     let mut stats = SweepStats::default();

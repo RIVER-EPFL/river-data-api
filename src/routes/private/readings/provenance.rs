@@ -521,58 +521,6 @@ pub fn provenance_kind_for_run(run_source: Option<&str>) -> &'static str {
     }
 }
 
-/// Whether a reading's provenance is untold: nothing on the row records where it came from, and
-/// nothing it points at can be asked.
-///
-/// The kinds that store a blob are only as good as the blob; `sync` and `derived` are resolved, so
-/// what they need is a referent that answers; `manual` is complete on its own (the person, the
-/// time and the check are on the row); `migration` is the name for an origin nobody recorded, so
-/// it is untold by definition and is what the count is mostly about.
-#[must_use]
-pub fn provenance_untold(kind: Option<&str>, has_blob: bool, referent_resolves: bool) -> bool {
-    match kind {
-        None | Some("migration") => true,
-        Some("tool_run" | "chain" | "csv_import") => !has_blob,
-        Some("derived") => !referent_resolves,
-        _ => false,
-    }
-}
-
-/// The readings [`provenance_untold`] holds, as one statement. Report-only: which side is wrong is
-/// a question about the writer, not something a sweep may decide.
-#[must_use]
-pub fn untold_rows_sql() -> String {
-    "SELECT r.stream_id, r.time, r.replicate_index, r.provenance_kind
-       FROM readings r
-      WHERE r.provenance_kind IS NULL
-         OR r.provenance_kind = 'migration'
-         OR (r.provenance_kind IN ('tool_run', 'chain', 'csv_import') AND r.provenance IS NULL)
-         OR (r.provenance_kind = 'derived' AND NOT EXISTS (
-                SELECT 1 FROM calculation_formulas d
-                 WHERE d.output_parameter_id = r.parameter_id))"
-        .to_string()
-}
-
-/// How many readings say nothing about where they came from. The janitor reports it; nothing
-/// repairs it.
-pub async fn untold_count<C: sea_orm::ConnectionTrait>(conn: &C) -> crate::error::AppResult<i64> {
-    let row = conn
-        .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT count(*)::bigint AS n FROM ({}) untold",
-                untold_rows_sql()
-            ),
-        ))
-        .await?
-        .ok_or_else(|| {
-            crate::error::AppError::Internal(
-                "counting untold provenance returned no row".to_string(),
-            )
-        })?;
-    Ok(row.try_get("", "n")?)
-}
-
 #[derive(Debug, FromQueryResult)]
 pub struct RawRow {
     pub stream_id: Uuid,
@@ -1055,7 +1003,10 @@ async fn fetch_covering_receipts(
         ))
         .await?;
     let mut out = HashMap::new();
-    for row in rows.iter().map(|r| CoveringReceipt::from_query_result(r, "")) {
+    for row in rows
+        .iter()
+        .map(|r| CoveringReceipt::from_query_result(r, ""))
+    {
         let row = row?;
         out.insert(
             row.stream_id,
@@ -1228,7 +1179,10 @@ type FormulaVersion = (i32, String, String);
 async fn fetch_calculations(
     db: &sea_orm::DatabaseConnection,
     rows: &[RawRow],
-) -> AppResult<(HashMap<Uuid, CalculationInfo>, HashMap<Uuid, FormulaVersion>)> {
+) -> AppResult<(
+    HashMap<Uuid, CalculationInfo>,
+    HashMap<Uuid, FormulaVersion>,
+)> {
     let parameter_ids: Vec<Uuid> = rows
         .iter()
         .filter(|r| r.measurement_type.as_deref() == Some("derived"))
@@ -1358,36 +1312,6 @@ mod tests {
         assert_eq!(classify_source("derived"), "derived");
         assert_eq!(classify_source("cnet"), "sync");
         assert_eq!(classify_source("grab_sample"), "manual");
-    }
-
-    #[test]
-    fn test_a_row_that_records_nothing_is_untold() {
-        assert!(super::provenance_untold(None, false, false));
-        assert!(super::provenance_untold(Some("migration"), true, true));
-    }
-
-    #[test]
-    fn test_a_stored_kind_is_only_as_good_as_its_blob() {
-        assert!(super::provenance_untold(Some("tool_run"), false, true));
-        assert!(super::provenance_untold(Some("chain"), false, true));
-        assert!(super::provenance_untold(Some("csv_import"), false, true));
-        assert!(!super::provenance_untold(Some("tool_run"), true, false));
-    }
-
-    #[test]
-    fn test_a_resolved_kind_wants_a_referent_that_answers() {
-        assert!(super::provenance_untold(Some("derived"), false, false));
-        assert!(!super::provenance_untold(Some("derived"), false, true));
-        assert!(
-            !super::provenance_untold(Some("sync"), false, false),
-            "a sync row's story is its stream and the receipt covering the instant, which the FK \
-             guarantees is there"
-        );
-        assert!(
-            !super::provenance_untold(Some("manual"), false, false),
-            "a hand entry is complete on the row: the person, the time and the check"
-        );
-        assert!(!super::provenance_untold(Some("batch"), false, false));
     }
 
     #[test]

@@ -129,7 +129,8 @@ struct ResolvedParam {
 }
 
 /// The value expressed at the slot's declared decimal places. A slot with no declaration is
-/// served as stored; the private API and the site exports never round.
+/// served as stored; the private API and the site exports never round. The forms' platform default
+/// of two places stops at the forms and is deliberately not read here (Q124).
 fn expressed(value: f64, decimal_places: Option<i16>) -> f64 {
     match decimal_places {
         Some(places) => {

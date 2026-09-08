@@ -48,6 +48,7 @@ mod m20260910_000024_janitor_recompose_decision;
 mod m20260910_000025_derived_computed_decision;
 pub mod m20260910_000026_roll_back_live_pins;
 pub mod m20260910_000027_subscribe_by_channel;
+mod m20260910_000028_reprocess_decision;
 pub mod portal_seed;
 
 pub struct Migrator;
@@ -104,6 +105,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260910_000025_derived_computed_decision::Migration),
             Box::new(m20260910_000026_roll_back_live_pins::Migration),
             Box::new(m20260910_000027_subscribe_by_channel::Migration),
+            Box::new(m20260910_000028_reprocess_decision::Migration),
         ]
     }
 }

@@ -1,10 +1,12 @@
 //! How long each stored record is kept, in one place, with the reason for each.
 //!
-//! Five records answer "what happened to this value": the decisions taken on it, the holds raised
-//! about it, the receipt of the pass that carried it, the sync event that ran that pass, and the
-//! job that reprocessed it. They are pruned on four different clocks by two different jobs, so the
-//! shortest horizon among them is how far back that answer reaches. Stating them together is what
-//! makes that visible; whether they should share one horizon is Q119.
+//! A value's durable history is the decisions taken on it and the holds raised about it, and
+//! nothing prunes either: every change a person or a job makes to a reading appends a
+//! `reading_decisions` row, so that history is complete however far back it is asked (Q119).
+//! The receipt of the pass that carried it, the sync event that ran that pass and the job that
+//! reprocessed it are operational records with their own volumes and their own horizons; they
+//! record that a run happened and what it touched, not what a value became, so pruning one takes
+//! nothing out of the history.
 
 use crate::config::Config;
 
@@ -133,16 +135,6 @@ impl Retention {
             },
         ]
     }
-
-    /// The shortest horizon among the records a value's history is assembled from, which is how
-    /// far back that history is complete.
-    #[must_use]
-    pub fn history_horizon_days(self) -> Option<u32> {
-        self.records()
-            .iter()
-            .filter_map(|r| r.kept.horizon_days())
-            .min()
-    }
 }
 
 #[cfg(test)]
@@ -175,10 +167,5 @@ mod tests {
             .map(|r| r.table)
             .collect();
         assert_eq!(kept, vec!["reading_decisions", "replicate_audit_holds"]);
-    }
-
-    #[test]
-    fn the_history_reaches_back_only_as_far_as_its_shortest_lived_record() {
-        assert_eq!(defaults().history_horizon_days(), Some(14));
     }
 }

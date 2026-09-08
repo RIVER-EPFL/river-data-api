@@ -25,18 +25,10 @@ pub struct MemberStatistics {
     /// The divisor the slot declares, NULL where it declares none. Never inferred.
     #[schema(required)]
     pub sd_estimator: Option<String>,
+    /// The places the slot declares, NULL where it declares none. Never inferred: the formatter
+    /// that renders the number owns the fallback (Q128).
     #[schema(required)]
     pub decimal_places: Option<i32>,
-}
-
-/// The places a form renders a value at when the site declares none. Rounding is presentation, so
-/// full resolution is what is stored and this is only how much of it is shown (Q120).
-pub const DEFAULT_DECIMAL_PLACES: i32 = 2;
-
-/// The places a form renders a member at: what the slot declares, else the platform default. A
-/// group declares none, so there is nothing above the site in the chain (Q120).
-fn resolved_decimal_places(declared: Option<i16>) -> i32 {
-    declared.map_or(DEFAULT_DECIMAL_PLACES, i32::from)
 }
 
 /// The statistics a member shows, which is nothing at all unless it is entered several times.
@@ -101,6 +93,7 @@ pub struct DefinitionMember {
     pub label: String,
     #[schema(required)]
     pub units: Option<String>,
+    /// The places the slot declares, NULL where it declares none (Q128).
     #[schema(required)]
     pub decimal_places: Option<i32>,
     #[schema(required)]
@@ -193,13 +186,15 @@ pub async fn group_definition(
             role: Role::parse(&member.role).unwrap_or(Role::EntryOnly),
             section: section.clone(),
         });
-        // Places come from the slot or from the platform default; the group declares none (Q120).
+        // Places are the slot's declaration or nothing at all: a group declares none (Q120), and
+        // nothing here invents one, so an undeclared slot renders through the formatter's own
+        // fallback like every other value in the app (Q128).
         let slot = declared.get(&member.parameter_id);
-        let decimal_places = resolved_decimal_places(slot.and_then(|d| d.decimal_places));
+        let decimal_places = slot.and_then(|d| d.decimal_places).map(i32::from);
         let statistics = member_statistics(
             &member.code,
             member.replicates.as_ref(),
-            Some(decimal_places),
+            decimal_places,
             slot.and_then(|d| d.sd_estimator.clone()),
         );
         members.push(DefinitionMember {
@@ -207,7 +202,7 @@ pub async fn group_definition(
             code: member.code,
             label: member.label,
             units: member.units,
-            decimal_places: Some(decimal_places),
+            decimal_places,
             description: member.description,
             role: member.role,
             ordinal: member.ordinal,
@@ -329,11 +324,16 @@ mod tests {
         assert_eq!(stats.decimal_places, Some(2));
     }
 
+    /// A slot that declares no places is one no source and no lab has spoken for, so the
+    /// definition says so rather than inventing a precision (Q128).
     #[test]
-    fn test_places_come_from_the_slot_or_from_the_platform_default() {
-        assert_eq!(resolved_decimal_places(Some(4)), 4);
-        assert_eq!(resolved_decimal_places(Some(0)), 0);
-        assert_eq!(resolved_decimal_places(None), DEFAULT_DECIMAL_PLACES);
+    fn test_an_undeclared_slot_carries_no_places() {
+        assert_eq!(
+            member_statistics("doc", Some(&spec()), None, Some("sample".into()))
+                .expect("a replicated member carries statistics")
+                .decimal_places,
+            None
+        );
     }
 
     #[test]

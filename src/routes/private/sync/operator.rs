@@ -3,7 +3,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, sea_query::Expr,
+    ActiveModelTrait, ColumnTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Set,
+    sea_query::Expr,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -75,6 +76,13 @@ fn compute_health(
 
 /// The first error of a service's most recent cycle that reported one, or None when its recent
 /// cycles were clean. One query for every service on the page.
+/// The last error a sync service recorded, if it recorded one.
+#[derive(FromQueryResult)]
+struct LastFailure {
+    service_id: Uuid,
+    error: Option<String>,
+}
+
 async fn recent_errors<C: sea_orm::ConnectionTrait>(
     conn: &C,
     service_ids: &[Uuid],
@@ -95,9 +103,9 @@ async fn recent_errors<C: sea_orm::ConnectionTrait>(
         .await?;
     let mut out = std::collections::HashMap::new();
     for row in &rows {
-        let id: Uuid = row.try_get("", "service_id")?;
-        if let Ok(Some(error)) = row.try_get::<Option<String>>("", "error") {
-            out.insert(id, error);
+        let failure = LastFailure::from_query_result(row, "")?;
+        if let Some(error) = failure.error {
+            out.insert(failure.service_id, error);
         }
     }
     Ok(out)

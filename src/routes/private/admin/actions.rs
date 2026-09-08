@@ -315,6 +315,15 @@ pub struct ReprocessAllResponse {
 /// has a deployment. Use after correcting deployment/calibration windows in bulk (the backdate of
 /// historical attribution). Each slot is reprocessed via the decompression-safe
 /// `reprocess_site_parameter_readings`; runs as one tracked job. Requires `write_data`.
+/// One (site, parameter) slot a backdate pass will cover.
+#[derive(FromQueryResult)]
+struct BackdateSlot {
+    #[allow(dead_code)]
+    site_id: Uuid,
+    #[allow(dead_code)]
+    parameter_id: Uuid,
+}
+
 #[utoipa::path(
     post,
     path = "/api/actions/reprocess_all",
@@ -344,12 +353,10 @@ pub async fn reprocess_all(
     // Count the slots only to report it back synchronously; the job re-reads `sensor_deployments`
     // itself, so a rerun reflects the current topology.
     let slot_count = slot_rows
-        .into_iter()
-        .filter(|r| {
-            r.try_get::<Uuid>("", "site_id").is_ok()
-                && r.try_get::<Uuid>("", "parameter_id").is_ok()
-        })
-        .count();
+        .iter()
+        .map(|r| BackdateSlot::from_query_result(r, ""))
+        .collect::<Result<Vec<_>, _>>()?
+        .len();
 
     // One backdate at a time: a second request while one is queued joins it rather than starting a
     // concurrent pass over every slot. The claim releases the key, so a run already under way still
@@ -1925,4 +1932,105 @@ pub async fn undeclared_sd_estimators(
         total_population_signature_holds: slots.iter().map(|s| s.population_signature_holds).sum(),
         slots,
     }))
+}
+
+/// One reading whose curation columns are not the fold of its live decisions.
+#[derive(Debug, Serialize, ToSchema, sea_orm::FromQueryResult)]
+pub struct CurationDriftRow {
+    pub stream_id: Uuid,
+    pub time: chrono::DateTime<chrono::FixedOffset>,
+    pub replicate_index: i16,
+    #[schema(required)]
+    pub site_id: Option<Uuid>,
+    #[schema(required)]
+    pub parameter_id: Option<Uuid>,
+    /// The curation columns the reading holds.
+    #[schema(value_type = Object)]
+    pub stored: serde_json::Value,
+    /// What the reading's live decisions fold to. A column absent from it is one no decision
+    /// asserts, which is not a disagreement.
+    #[schema(value_type = Object)]
+    pub folded: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CurationDriftResponse {
+    /// Every disagreeing reading, not only the ones listed below.
+    pub total: i64,
+    /// The first `limit` of them, newest first, so a person can open one.
+    pub rows: Vec<CurationDriftRow>,
+}
+
+/// Readings whose curation columns disagree with the decisions recorded against them.
+///
+/// The columns are the projection of the record, written by the same trigger in the writer's
+/// transaction, so a disagreement means something wrote a column without recording the decision,
+/// or a decision failed to project. Read-only: which side is wrong is itself a decision, a
+/// rollback or a fresh decision, so nothing here picks one.
+#[utoipa::path(
+    get,
+    path = "/api/actions/curation_drift",
+    params(("limit" = Option<u32>, Query, description = "How many rows to list, default 50, max 500")),
+    responses((status = 200, description = "Readings that disagree with their decision record", body = CurationDriftResponse)),
+    tag = "actions"
+)]
+pub async fn curation_drift(
+    State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    Query(params): Query<CurationDriftQuery>,
+) -> AppResult<Json<CurationDriftResponse>> {
+    use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
+
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    // A reading outside the token's projects is not this caller's to see, and an unpaired one
+    // belongs to no project at all, so a scoped caller is shown neither.
+    let project_filter = project_filter_sql(&scope, "st.project_id", &mut values)
+        .map(|predicate| format!("WHERE {predicate}"))
+        .unwrap_or_default();
+    values.push(i64::from(limit).into());
+    let limit_param = values.len();
+
+    let sql = format!(
+        r"SELECT d.stream_id, d.time, d.replicate_index, r.site_id, r.parameter_id,
+                 jsonb_strip_nulls(jsonb_build_object(
+                     'is_flagged', d.is_flagged, 'flag_reason', d.flag_reason,
+                     'withdrawn_at', d.withdrawn_at, 'withdrawn_reason', d.withdrawn_reason,
+                     'unverified', d.unverified, 'standard_curve_id', d.standard_curve_id,
+                     'calibration_id', d.calibration_id, 'sensor_id', d.sensor_id,
+                     'raw_value', d.raw_value)) AS stored,
+                 COALESCE(d.folded, '{{}}'::jsonb) AS folded
+          FROM ({drift}) d
+          JOIN readings r ON r.stream_id = d.stream_id AND r.time = d.time
+                         AND r.replicate_index = d.replicate_index
+          LEFT JOIN sites st ON st.id = r.site_id
+          {project_filter}
+          ORDER BY d.time DESC
+          LIMIT ${limit_param}",
+        drift = crate::routes::private::readings::decisions::inconsistent_rows_sql(),
+    );
+
+    let rows = app_state
+        .db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await?
+        .iter()
+        .map(|row| CurationDriftRow::from_query_result(row, ""))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(CurationDriftResponse {
+        total: crate::routes::private::readings::decisions::curation_drift_count(&app_state.db)
+            .await?,
+        rows,
+    }))
+}
+
+/// How many drift rows to list beside the count.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct CurationDriftQuery {
+    pub limit: Option<u32>,
 }

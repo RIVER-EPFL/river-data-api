@@ -208,6 +208,14 @@ const SLOT_SCOPE: &str = "EXISTS (SELECT 1 FROM site_parameters sp \
 
 /// Bring stored samples into line with their slot's declared sd estimator, with the job's own
 /// options exposed: a window, a stream scope, and `override_instants`.
+/// How many samples a declaration change would recompute, by whether the instant declared for
+/// itself.
+#[derive(FromQueryResult)]
+struct RetagCounts {
+    slot_rows: i64,
+    instant_rows: i64,
+}
+
 #[utoipa::path(
     post,
     path = "/api/actions/retag_sd_estimator",
@@ -308,12 +316,9 @@ pub async fn retag_sd_estimator(
             binds,
         ))
         .await?;
-    let (slot_rows, instant_rows) = row.map_or(Ok((0_i64, 0_i64)), |row| {
-        Ok::<_, sea_orm::DbErr>((
-            row.try_get::<i64>("", "slot_rows")?,
-            row.try_get::<i64>("", "instant_rows")?,
-        ))
-    })?;
+    let counts = row.map(|row| RetagCounts::from_query_result(&row, "")).transpose()?;
+    let (slot_rows, instant_rows) =
+        counts.map_or((0, 0), |c| (c.slot_rows, c.instant_rows));
     let affected = if payload.override_instants {
         slot_rows + instant_rows
     } else {

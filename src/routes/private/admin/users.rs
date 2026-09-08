@@ -5,7 +5,7 @@ use axum::{
     routing::get,
 };
 use chrono::Utc;
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -1027,6 +1027,13 @@ pub struct SetGrantsRequest {
 
 /// List the projects a user is granted, with names. Administrators are unrestricted (they are never
 /// granted rows); this reflects only the stored grant set. Requires `require_admin`.
+/// One project a user holds a grant on.
+#[derive(FromQueryResult)]
+struct GrantRow {
+    id: uuid::Uuid,
+    name: String,
+}
+
 #[utoipa::path(
     get,
     path = "/api/users/{id}/grants",
@@ -1053,13 +1060,14 @@ pub async fn list_user_grants(
     // grant list than the user holds.
     let grants = rows
         .iter()
-        .map(|r| {
-            Ok(crate::routes::private::me::GrantedProject {
-                project_id: r.try_get::<uuid::Uuid>("", "id")?,
-                name: r.try_get::<String>("", "name")?,
-            })
+        .map(|r| GrantRow::from_query_result(r, ""))
+        .collect::<Result<Vec<GrantRow>, _>>()?
+        .into_iter()
+        .map(|g| crate::routes::private::me::GrantedProject {
+            project_id: g.id,
+            name: g.name,
         })
-        .collect::<AppResult<Vec<_>>>()?;
+        .collect();
     Ok(Json(grants))
 }
 

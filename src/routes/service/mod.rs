@@ -518,6 +518,8 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/collection_events/{id}/detail",
             get(crate::routes::private::collection_events::visits::get_event_detail),
         )
+        // The rows carry a reading's stored value, so this is data rather than metadata.
+        .route("/actions/curation_drift", get(actions::curation_drift))
         .layer(middleware::from_fn(require_read_data))
         .with_state(state.clone());
 

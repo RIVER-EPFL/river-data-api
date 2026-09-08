@@ -5,7 +5,7 @@
 //! rule lives in this crate because the API crate depends on it and not the other way round; it is
 //! the only place both the seed and the authoring path can read one implementation.
 
-use sea_orm_migration::sea_orm::{ConnectionTrait, DbErr, Statement};
+use sea_orm_migration::sea_orm::{ConnectionTrait, DbErr, FromQueryResult, Statement};
 use sha2::{Digest, Sha256};
 
 /// Serialise a value with object keys in sorted order, so two equivalent manifests produce the
@@ -97,6 +97,13 @@ pub struct StoredVersionContent {
 ///
 /// Costs one round trip before the insert. The alternative, inserting and then hashing what came
 /// back, needs a transaction to keep a row that failed the duplicate check from existing.
+/// The manifest and cases as the database normalises them, still text.
+#[derive(FromQueryResult)]
+struct Normalised {
+    manifest: String,
+    test_cases: String,
+}
+
 pub async fn stored_version_content<C: ConnectionTrait>(
     db: &C,
     script: &str,
@@ -121,8 +128,10 @@ pub async fn stored_version_content<C: ConnectionTrait>(
         .ok_or_else(|| {
             DbErr::Custom("normalising the version content returned no row".to_string())
         })?;
-    let manifest: String = row.try_get("", "manifest")?;
-    let test_cases: String = row.try_get("", "test_cases")?;
+    let Normalised {
+        manifest,
+        test_cases,
+    } = Normalised::from_query_result(&row, "")?;
     let content_hash = version_content_hash(
         script,
         entry_function,

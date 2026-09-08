@@ -231,6 +231,7 @@ fn recompose_statement(rows_sql: &str, scope_sql: &str) -> String {
 ///
 /// `pick` is the lateral that ranks the windows, `selection` chooses the rows as `r`, and
 /// `returning` is appended verbatim so a caller that needs the instants it wrote can ask for them.
+/// `picked` carries the row's state before the write (`p_was_*`) for a caller that records the move.
 /// The lateral is an outer join: a reading no window covers has to be reachable, because a repoint
 /// must be able to clear a correction as well as replace one.
 pub(super) fn repoint_statement(pick: &str, selection: &str, returning: &str) -> String {
@@ -255,6 +256,8 @@ pub(super) fn repoint_statement(pick: &str, selection: &str, returning: &str) ->
                 SELECT r.stream_id AS p_stream_id, r.time AS p_time,
                        r.replicate_index AS p_replicate_index,
                        r.standard_curve_id AS p_standard_curve_id,
+                       r.calibration_id AS p_was_calibration_id,
+                       r.calibrated_value AS p_was_calibrated_value,
                        cw.id AS cal_id, cw.slope, cw.intercept
                 FROM readings r
                 LEFT JOIN LATERAL ({pick}) cw ON true
@@ -512,12 +515,6 @@ struct InputRow {
     measurement_type: Option<String>,
 }
 
-#[derive(FromQueryResult)]
-struct SlotInstant {
-    site_id: Uuid,
-    time: chrono::DateTime<chrono::FixedOffset>,
-}
-
 struct DerivedWork {
     site_param_id: Uuid,
     derived_definition_id: Uuid,
@@ -615,7 +612,6 @@ async fn build_evaluation_order(
         ))
     })
 }
-
 
 async fn get_or_create_derived_stream(
     db: &DatabaseConnection,
@@ -787,29 +783,6 @@ async fn resolve_variables_for_derived(
         };
     }
     Ok(Some(Some(variables)))
-}
-
-/// The `(site, instant)` pairs a recall is about to clear, read before the UPDATE runs. A cleared
-/// instant is no longer selected by the cascade's own query, so it is carried across explicitly:
-/// the derived value computed from an input that has just left the site must go with it.
-async fn recalled_instants<C: ConnectionTrait>(
-    conn: &C,
-    predicate: &str,
-    values: Vec<sea_orm::Value>,
-) -> Result<Vec<(Uuid, chrono::DateTime<Utc>)>, sea_orm::DbErr> {
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!("SELECT DISTINCT r.site_id, r.time FROM readings r WHERE {predicate}"),
-            values,
-        ))
-        .await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let SlotInstant { site_id, time } = SlotInstant::from_query_result(&row, "")?;
-        out.push((site_id, time.with_timezone(&Utc)));
-    }
-    Ok(out)
 }
 
 /// Clear the site off a stored derived row, the unattributed state a recalled input leaves it in.
@@ -1133,6 +1106,14 @@ impl Scope {
         }
     }
 
+    /// The reading columns the attribution step writes, which is what its ledger row records.
+    fn attribution_columns(self) -> &'static [&'static str] {
+        match self {
+            Self::Sensor(_) => &["deployment_id", "site_id"],
+            Self::Slot { .. } => &["sensor_id", "deployment_id", "site_id"],
+        }
+    }
+
     /// Which readings the attribution step considers, beyond the window overlap.
     fn attribution_scope(self) -> &'static str {
         match self {
@@ -1195,16 +1176,75 @@ impl Scope {
     }
 }
 
+/// The `was_`/`now_` pairs a recording statement returns for the columns it wrote, read from the
+/// pre-update snapshot and the target row.
+fn moved_pairs(was: &str, now: &str, columns: &[&str]) -> String {
+    columns
+        .iter()
+        .map(|c| format!("{was}.{c} AS was_{c}, {now}.{c} AS now_{c}"))
+        .collect::<Vec<_>>()
+        .join(",\n                      ")
+}
+
+/// Wrap one of the engine's statements in the ledger insert Q118 and Q125 require: a row per
+/// reading the run actually moved, naming the state of each written column on both sides and the
+/// job that made the move, in the same transaction as the write.
+///
+/// `update_sql` ends in a `RETURNING` of `stream_id`, `time`, `replicate_index`, the `site_id` the
+/// cascade follows, and a `was_<col>`/`now_<col>` pair per column in `columns`. A visited row whose
+/// columns all came back the same is not a move and records nothing; the statement still returns
+/// it, so the caller's count and cascade are unchanged.
+fn record_moved(update_sql: &str, columns: &[&str], job_param: usize) -> String {
+    let pairs = |side: &str| {
+        columns
+            .iter()
+            .map(|c| format!("'{c}', to_jsonb(m.{side}_{c})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let changed = columns
+        .iter()
+        .map(|c| format!("m.was_{c} IS DISTINCT FROM m.now_{c}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    format!(
+        r"WITH moved AS (
+            {update_sql}
+          ), recorded AS (
+            INSERT INTO reading_decisions
+                (stream_id, time, replicate_index, kind, old, new, actor, origin, supersedes,
+                 job_id)
+            SELECT m.stream_id, m.time, m.replicate_index, '{kind}',
+                   jsonb_build_object({old}), jsonb_build_object({new}),
+                   'system', '{origin}',
+                   (SELECT p.id FROM reading_decisions p
+                     WHERE p.stream_id = m.stream_id AND p.time = m.time
+                       AND p.replicate_index IS NOT DISTINCT FROM m.replicate_index
+                       AND p.kind = '{kind}' AND p.rolled_back_by IS NULL
+                     ORDER BY p.at DESC, p.id DESC LIMIT 1),
+                   ${job_param}
+              FROM moved m
+             WHERE {changed}
+          )
+          SELECT site_id, time FROM moved",
+        old = pairs("was"),
+        new = pairs("now"),
+        kind = decisions::Kind::Reprocess.as_str(),
+        origin = decisions::Origin::System.as_str(),
+    )
+}
+
 pub async fn reprocess_sensor_readings(
     db: &DatabaseConnection,
     sensor_id: Uuid,
+    job_id: Option<Uuid>,
 ) -> Result<usize, sea_orm::DbErr> {
     // Repair a `valid_until` a bulk load left NULL, so the stored window agrees with the one the
     // resolver serves. `pick_calibration_lateral` is single-valued whether or not windows overlap,
     // so the derivation does not need this; what needs it is the curve editor, which reads
     // `valid_until` and would otherwise show a window open past the point a later curve takes over.
     recompute_valid_until(db, sensor_id).await?;
-    reprocess(db, Scope::Sensor(sensor_id)).await
+    reprocess(db, Scope::Sensor(sensor_id), job_id).await
 }
 
 /// Per-(site, parameter) reprocess. See [`Scope::Slot`].
@@ -1212,6 +1252,7 @@ pub async fn reprocess_site_parameter_readings(
     db: &DatabaseConnection,
     site_id: Uuid,
     parameter_id: Uuid,
+    job_id: Option<Uuid>,
 ) -> Result<usize, sea_orm::DbErr> {
     reprocess(
         db,
@@ -1219,6 +1260,7 @@ pub async fn reprocess_site_parameter_readings(
             site_id,
             parameter_id,
         },
+        job_id,
     )
     .await
 }
@@ -1242,31 +1284,52 @@ pub async fn reprocess_site_parameter_readings(
 /// per-statement decompression cap: a deep-historical reprocess rewrites rows in compressed
 /// (>30-day) chunks and would otherwise abort the job. The cascade and the rollup refresh run after
 /// the commit, since a continuous-aggregate refresh cannot run inside a transaction.
-pub async fn reprocess(db: &DatabaseConnection, scope: Scope) -> Result<usize, sea_orm::DbErr> {
+///
+/// Each step records what it moved as a `reprocess` decision naming `job_id` (Q118, Q125), in its
+/// own statement, so a reading that changed site, instrument or corrected value under a re-derived
+/// timeline says so in the one place a value's history is read from. A visited row the step leaves
+/// as it found it records nothing.
+pub async fn reprocess(
+    db: &DatabaseConnection,
+    scope: Scope,
+    job_id: Option<Uuid>,
+) -> Result<usize, sea_orm::DbErr> {
     let values = scope.values();
+    // The ledger insert's own bind, after the scope's one or two.
+    let job_param = values.len() + 1;
+    let mut params = values.clone();
+    params.push(job_id.into());
 
     // Step 1, attribution. On the slot arm this runs BEFORE the curve resolution and the order is
     // the contract: step 2 resolves against `r.sensor_id`, so it picks the curves of the owner
     // step 1 just wrote. Resolving first would stamp the outgoing instrument's curve on a reading
     // the swap hands to the incoming one, and nothing repairs that afterwards.
-    let attribution_sql = format!(
-        r"UPDATE readings r
+    let attribution_sql = record_moved(
+        &format!(
+            r"UPDATE readings r
             SET {set}
             FROM (
                 SELECT id, sensor_id, site_id, parameter_id, deployed_from,
                        COALESCE(deployed_until, 'infinity'::timestamptz) AS deployed_until
                 FROM sensor_deployments
                 WHERE {deployments}
-            ) dw
-            WHERE {scope_sql}
+            ) dw, readings prev
+            WHERE prev.stream_id = r.stream_id
+              AND prev.time = r.time
+              AND prev.replicate_index = r.replicate_index
+              AND {scope_sql}
               AND {windowed}
               AND r.time >= dw.deployed_from
               AND r.time < dw.deployed_until
-            RETURNING r.site_id, r.time",
-        set = scope.attribution_set(),
-        deployments = scope.deployments_predicate(),
-        scope_sql = scope.attribution_scope(),
-        windowed = attribution_derivable("r"),
+            RETURNING r.stream_id, r.time, r.replicate_index, r.site_id, {pairs}",
+            set = scope.attribution_set(),
+            deployments = scope.deployments_predicate(),
+            scope_sql = scope.attribution_scope(),
+            windowed = attribution_derivable("r"),
+            pairs = moved_pairs("prev", "r", scope.attribution_columns()),
+        ),
+        scope.attribution_columns(),
+        job_param,
     );
 
     // Step 2, the curve. The pick is `resolver::pick_calibration_lateral`, the same ranking the
@@ -1281,37 +1344,63 @@ pub async fn reprocess(db: &DatabaseConnection, scope: Scope) -> Result<usize, s
             windowed = calibration_derivable("r"),
             orphaned = orphaned_correction_rows("r"),
         ),
-        "\n            RETURNING tgt.site_id, tgt.time",
+        r"
+            RETURNING tgt.stream_id, tgt.time, tgt.replicate_index, tgt.site_id,
+                      picked.p_was_calibration_id AS was_calibration_id,
+                      tgt.calibration_id AS now_calibration_id,
+                      picked.p_was_calibrated_value AS was_calibrated_value,
+                      tgt.calibrated_value AS now_calibrated_value",
+    );
+    let calibration_sql = record_moved(
+        &calibration_sql,
+        &["calibration_id", "calibrated_value"],
+        job_param,
     );
 
     // Step 3, the grabs: they keep the curves they were entered against, and their value follows
     // those curves' current coefficients.
-    let spot_sql = format!(
-        "{} RETURNING tgt.site_id, tgt.time",
-        recompose_statement("r.measurement_type = 'spot'", scope.readings_predicate())
+    let spot_sql = record_moved(
+        &format!(
+            r"{} RETURNING tgt.stream_id, tgt.time, tgt.replicate_index, tgt.site_id,
+                      r.calibrated_value AS was_calibrated_value,
+                      tgt.calibrated_value AS now_calibrated_value",
+            recompose_statement("r.measurement_type = 'spot'", scope.readings_predicate())
+        ),
+        &["calibrated_value"],
+        job_param,
     );
 
+    // Step 4, the recall. The site it clears is returned from the pre-update snapshot, because the
+    // cascade has to reach the instant a derived value must follow its input out of, and after the
+    // write the row names no site at all.
     let recall_predicate = scope.recall_predicate();
-    let recall_sql = format!(
-        "UPDATE readings r SET site_id = NULL, deployment_id = NULL WHERE {recall_predicate}"
+    let recall_columns = ["site_id", "deployment_id"];
+    let recall_sql = record_moved(
+        &format!(
+            r"UPDATE readings r
+            SET site_id = NULL, deployment_id = NULL
+            FROM readings prev
+            WHERE prev.stream_id = r.stream_id
+              AND prev.time = r.time
+              AND prev.replicate_index = r.replicate_index
+              AND ({recall_predicate})
+            RETURNING r.stream_id, r.time, r.replicate_index, prev.site_id, {pairs}",
+            pairs = moved_pairs("prev", "r", &recall_columns),
+        ),
+        &recall_columns,
+        job_param,
     );
 
     let (readings_updated, cascade) = crate::common::bulk_write::guarded(db, async |txn| {
         let mut touched: Vec<(Uuid, DateTime<Utc>)> = Vec::new();
         let mut readings_updated = 0usize;
         for sql in [&attribution_sql, &calibration_sql, &spot_sql] {
-            readings_updated += write_and_collect(txn, sql, values.clone(), &mut touched).await?;
+            readings_updated += write_and_collect(txn, sql, params.clone(), &mut touched).await?;
         }
 
-        // The instants the recall clears are read before it runs: afterwards they carry no site,
-        // and they are exactly the ones whose derived output has to follow its input out of it.
-        touched.extend(recalled_instants(txn, &recall_predicate, values.clone()).await?);
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &recall_sql,
-            values.clone(),
-        ))
-        .await?;
+        // The recall's rows are not part of `readings_updated`: it clears an attribution rather
+        // than re-deriving one.
+        write_and_collect(txn, &recall_sql, params.clone(), &mut touched).await?;
 
         touched.sort_unstable();
         touched.dedup();
@@ -1355,9 +1444,16 @@ pub async fn reprocess(db: &DatabaseConnection, scope: Scope) -> Result<usize, s
     Ok(readings_updated)
 }
 
-/// Run one of the engine's statements, collecting the attributed instants it wrote. Each ends in
-/// `RETURNING <target>.site_id, <target>.time`; an unattributed row returns a NULL site and is not
-/// an instant anything derives from.
+/// Run one of the engine's statements, collecting the attributed instants it wrote. Each is a
+/// [`record_moved`] wrapper returning `site_id` and `time` per row it touched; an unattributed row
+/// returns a NULL site and is not an instant anything derives from.
+/// One reading a recompute moved, and the slot it belongs to.
+#[derive(FromQueryResult)]
+struct MovedReading {
+    site_id: Option<Uuid>,
+    time: chrono::DateTime<chrono::FixedOffset>,
+}
+
 async fn write_and_collect<C: ConnectionTrait>(
     conn: &C,
     sql: &str,
@@ -1372,9 +1468,10 @@ async fn write_and_collect<C: ConnectionTrait>(
         ))
         .await?;
     for row in &rows {
-        let time: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
-        if let Ok(site_id) = row.try_get::<Uuid>("", "site_id") {
-            touched.push((site_id, time.with_timezone(&Utc)));
+        // `site_id` is nullable on an unpaired reading, which has no slot to touch.
+        let moved = MovedReading::from_query_result(row, "")?;
+        if let Some(site_id) = moved.site_id {
+            touched.push((site_id, moved.time.with_timezone(&Utc)));
         }
     }
     Ok(rows.len())
@@ -1396,6 +1493,19 @@ mod tests {
         // NULL on either side is foreign, not skipped: a reading with no instrument corrected by
         // somebody's curve is exactly the case worth listing.
         assert!(foreign_curve_rows("r", "sc").contains("IS DISTINCT FROM"));
+    }
+
+    /// A reprocess visits far more readings than it moves, and Q125 bounds the ledger to the ones
+    /// that moved.
+    #[test]
+    fn a_recording_statement_inserts_only_where_a_written_column_differs() {
+        let sql = record_moved("UPDATE readings", &["site_id", "deployment_id"], 3);
+        assert!(sql.contains("m.was_site_id IS DISTINCT FROM m.now_site_id"));
+        assert!(sql.contains("m.was_deployment_id IS DISTINCT FROM m.now_deployment_id"));
+        assert!(sql.contains("'site_id', to_jsonb(m.was_site_id)"));
+        assert!(sql.contains("'site_id', to_jsonb(m.now_site_id)"));
+        assert!(sql.contains("'reprocess'"), "the kind is named: {sql}");
+        assert!(sql.contains("$3"), "the job is the statement's last bind: {sql}");
     }
 
     #[test]
