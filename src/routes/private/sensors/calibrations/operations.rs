@@ -1,6 +1,5 @@
-use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource, MergeIntoActiveModel};
-use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, Statement};
+use sea_orm::{ConnectionTrait, EntityTrait, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use super::model::SensorCalibration;
@@ -22,8 +21,8 @@ const DUPLICATE_INSTANT: &str = "A calibration for this sensor and parameter alr
 /// from the sensor's first parameter-bearing curve, so the channel the row lands on is not knowable
 /// here without restating the trigger's rule: treating the instant itself as taken is the answer
 /// that needs no second copy of it.
-async fn duplicate_instant_exists(
-    db: &DatabaseConnection,
+async fn duplicate_instant_exists<C: ConnectionTrait>(
+    db: &C,
     sensor_id: Uuid,
     parameter_id: Option<Uuid>,
     valid_from: chrono::DateTime<chrono::Utc>,
@@ -66,8 +65,8 @@ fn valid_until_provenance(
 /// Chain the sensor's windows, then enqueue the reprocess that re-derives its readings. Every
 /// calibration write does exactly this and differs only in the trigger it records, so the three
 /// hooks call it rather than restating it.
-async fn reprocess_after_calibration_write(
-    db: &DatabaseConnection,
+async fn reprocess_after_calibration_write<C: ConnectionTrait>(
+    db: &C,
     trigger: &str,
     sensor_id: Uuid,
     calibration_id: Uuid,
@@ -93,7 +92,7 @@ async fn reprocess_after_calibration_write(
 /// How many readings hold a live `calibration_pin` naming this curve, or `None` when there are
 /// none. The repoint that clears the way for the delete excludes pinned rows, so each one still
 /// names the curve when the DELETE runs and the foreign key refuses the statement.
-async fn pinned_readings(db: &DatabaseConnection, id: Uuid) -> Result<Option<i64>, ApiError> {
+async fn pinned_readings<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<Option<i64>, ApiError> {
     let sql = format!(
         "SELECT count(*) AS n FROM readings r
          WHERE r.calibration_id = $1 AND NOT ({not_pinned})",
@@ -118,13 +117,12 @@ async fn pinned_readings(db: &DatabaseConnection, id: Uuid) -> Result<Option<i64
     Ok((n > 0).then_some(n))
 }
 
-#[async_trait]
 impl CRUDOperations for SensorCalibrationOperations {
     type Resource = SensorCalibration;
 
-    async fn before_create(
+    async fn before_create<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         data: &<SensorCalibration as CRUDResource>::CreateModel,
     ) -> Result<(), ApiError> {
         if duplicate_instant_exists(db, data.sensor_id, data.parameter_id, data.valid_from, None)
@@ -135,9 +133,9 @@ impl CRUDOperations for SensorCalibrationOperations {
         Ok(())
     }
 
-    async fn before_update(
+    async fn before_update<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         id: Uuid,
         data: &<SensorCalibration as CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
@@ -195,9 +193,9 @@ impl CRUDOperations for SensorCalibrationOperations {
     /// moved the row onto the operator-window branch of `recompute_valid_until`, where `LEAST`
     /// ignores a NULL and the window can no longer reopen when the following curve is deleted. Set
     /// on the active model, a rejected update leaves the row exactly as it was.
-    async fn perform_update(
+    async fn perform_update<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         id: Uuid,
         data: <SensorCalibration as CRUDResource>::UpdateModel,
     ) -> Result<SensorCalibration, ApiError> {
@@ -219,25 +217,29 @@ impl CRUDOperations for SensorCalibrationOperations {
         Ok(SensorCalibration::from(updated))
     }
 
-    async fn after_create(
+    async fn after_create<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         entity: &mut SensorCalibration,
     ) -> Result<(), ApiError> {
         reprocess_after_calibration_write(db, "calibration_create", entity.sensor_id, entity.id)
             .await
     }
 
-    async fn after_update(
+    async fn after_update<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         entity: &mut SensorCalibration,
     ) -> Result<(), ApiError> {
         reprocess_after_calibration_write(db, "calibration_update", entity.sensor_id, entity.id)
             .await
     }
 
-    async fn perform_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<Uuid, ApiError> {
+    async fn perform_delete<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<Uuid, ApiError> {
         let row = super::model::Entity::find_by_id(id)
             .one(db)
             .await

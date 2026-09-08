@@ -7,6 +7,8 @@ pub mod reconcile;
 pub mod registry;
 pub mod routes;
 pub mod schedule;
+pub mod schedule_model;
+pub mod schedule_operations;
 pub mod schedule_routes;
 pub mod scheduler;
 pub mod worker;

@@ -1,6 +1,5 @@
-use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use super::model::CollectionEvent;
@@ -9,7 +8,7 @@ pub struct CollectionEventOperations;
 
 /// How many readings the event holds. The FK is `ON DELETE SET NULL`, so a delete would leave
 /// them attached to no visit with no route to re-attach them.
-async fn attached_readings(db: &DatabaseConnection, id: Uuid) -> Result<i64, ApiError> {
+async fn attached_readings<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<i64, ApiError> {
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -24,11 +23,14 @@ async fn attached_readings(db: &DatabaseConnection, id: Uuid) -> Result<i64, Api
         .map(Option::unwrap_or_default)
 }
 
-#[async_trait]
 impl CRUDOperations for CollectionEventOperations {
     type Resource = CollectionEvent;
 
-    async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
+    async fn before_delete<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<(), ApiError> {
         let n = attached_readings(db, id).await?;
         if n > 0 {
             return Err(ApiError::conflict(format!(

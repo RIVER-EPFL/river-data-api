@@ -24,7 +24,7 @@ use crate::routes::private::{
 };
 
 /// Grabs are spot measurements by definition: a bottle, not a logger cadence.
-const GRAB_MEASUREMENT_TYPE: &str = "spot";
+const GRAB_MEASUREMENT_TYPE: &str = river_data_core::models::MeasurementType::Spot.as_str();
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -369,7 +369,7 @@ async fn get_or_create_grab_stream(
         metadata: Set(serde_json::json!({})),
         site_parameter_id: Set(site_parameter_id),
         sensor_id: Set(None),
-        measurement_type: Set(Some("spot".to_string())),
+        measurement_type: Set(Some(GRAB_MEASUREMENT_TYPE.to_string())),
         is_active: Set(true),
         discovered_at: Set(now.into()),
         paired_at: Set(site_parameter_id.map(|_| now.into())),

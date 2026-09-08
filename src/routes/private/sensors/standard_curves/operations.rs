@@ -1,6 +1,5 @@
-use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use super::model::StandardCurve;
@@ -15,7 +14,7 @@ pub struct StandardCurveOperations;
 /// reprocess the readings its window covers. A standard curve is picked by hand for one measurement,
 /// so there is no window to reprocess and no way to tell which readings the operator meant to change.
 /// A corrected curve is a new row, and the affected grabs are re-entered against it.
-async fn curve_is_used(db: &DatabaseConnection, id: Uuid) -> Result<bool, ApiError> {
+async fn curve_is_used<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<bool, ApiError> {
     let found = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -32,7 +31,7 @@ async fn curve_is_used(db: &DatabaseConnection, id: Uuid) -> Result<bool, ApiErr
 
 /// How many curves were copied from this one. A copy records where its coefficients came from, and
 /// the reference is the only statement that it is a copy at all, so the row it names stays.
-async fn copies_made_from(db: &DatabaseConnection, id: Uuid) -> Result<i64, ApiError> {
+async fn copies_made_from<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<i64, ApiError> {
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -47,13 +46,12 @@ async fn copies_made_from(db: &DatabaseConnection, id: Uuid) -> Result<i64, ApiE
         .map(Option::unwrap_or_default)
 }
 
-#[async_trait]
 impl CRUDOperations for StandardCurveOperations {
     type Resource = StandardCurve;
 
-    async fn before_create(
+    async fn before_create<C: ConnectionTrait + TransactionTrait>(
         &self,
-        _db: &DatabaseConnection,
+        _db: &C,
         data: &<StandardCurve as crudcrate::CRUDResource>::CreateModel,
     ) -> Result<(), ApiError> {
         if data.slope == 0.0 {
@@ -64,9 +62,9 @@ impl CRUDOperations for StandardCurveOperations {
         Ok(())
     }
 
-    async fn before_update(
+    async fn before_update<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         id: Uuid,
         data: &<StandardCurve as crudcrate::CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
@@ -102,7 +100,11 @@ impl CRUDOperations for StandardCurveOperations {
     /// foreign key already refuses it, but reports a constraint violation the CRUD layer surfaces as
     /// an internal error, so the check here is what makes it a stated 400 while the constraint stays
     /// the backstop for raw SQL.
-    async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
+    async fn before_delete<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<(), ApiError> {
         if curve_is_used(db, id).await? {
             return Err(ApiError::bad_request(format!(
                 "Standard curve {id} has been applied to readings and cannot be deleted: the \

@@ -48,7 +48,10 @@ async fn merge_site_parameters_runs_as_job_and_deletes_source() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(crate::common::jobs::wait_for_job(&db, &job_id).await, "completed");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&db, &job_id).await,
+        "completed"
+    );
 
     assert!(
         !site_parameter_exists(&db, crate::common::PARAM_S1_DO_ID).await,
@@ -57,6 +60,30 @@ async fn merge_site_parameters_runs_as_job_and_deletes_source() {
     assert!(
         site_parameter_exists(&db, crate::common::PARAM_S1_TEMP_ID).await,
         "the target survives"
+    );
+
+    // The slot that was absorbed is deleted, so the entry under the survivor is the only place the
+    // merge can be read back from (M124).
+    let entry = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT subject, old_value FROM change_audit WHERE change = 'site_parameter_merge' \
+             ORDER BY changed_at DESC LIMIT 1"
+                .to_string(),
+        ))
+        .await
+        .expect("the trail is readable")
+        .expect("the merge left an entry");
+    let subject: String = entry.try_get("", "subject").expect("subject");
+    let old_value: serde_json::Value = entry.try_get("", "old_value").expect("old_value");
+    assert_eq!(
+        subject,
+        format!("site_parameter:{}", crate::common::PARAM_S1_TEMP_ID)
+    );
+    assert_eq!(
+        old_value["source"]["id"],
+        crate::common::PARAM_S1_DO_ID,
+        "the entry keeps the slot that was absorbed: {old_value}"
     );
 
     crate::common::cleanup_test_db(&db).await;

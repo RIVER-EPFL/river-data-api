@@ -71,7 +71,10 @@ impl Job for ProbeService {
 }
 
 async fn setup(test_name: &str) -> Option<(DatabaseConnection, Router)> {
-    if !crate::common::profile::Service::Keycloak.require(test_name).await {
+    if !crate::common::profile::Service::Keycloak
+        .require(test_name)
+        .await
+    {
         return None;
     }
     let db = crate::common::setup_test_db().await;
@@ -110,8 +113,8 @@ async fn intern_jwt() -> String {
     kc::get_keycloak_jwt("intern1", "intern1").await
 }
 
-async fn patch_schedule(app: &Router, job: &str, body: &Value, jwt: &str) -> (u16, String) {
-    crate::common::patch_json_with_token(app, &format!("/api/schedules/{job}"), body, jwt).await
+async fn update_schedule(app: &Router, job: &str, body: &Value, jwt: &str) -> (u16, String) {
+    crate::common::put_json_with_token(app, &format!("/api/schedules/{job}"), body, jwt).await
 }
 
 async fn audit_entries(app: &Router, job: &str, jwt: &str) -> Vec<Value> {
@@ -298,7 +301,7 @@ async fn unknown_policy_values_are_rejected_and_leave_the_schedule_unchanged() {
     let intern = intern_jwt().await;
     seed_probe(&db, REJECT_PROBE).await;
 
-    let (status, body) = patch_schedule(
+    let (status, body) = update_schedule(
         &app,
         REJECT_PROBE,
         &json!({ "overlap_policy": "sometimes" }),
@@ -311,7 +314,7 @@ async fn unknown_policy_values_are_rejected_and_leave_the_schedule_unchanged() {
         "the refusal names the values the operator may choose: {body}"
     );
 
-    let (status, body) = patch_schedule(
+    let (status, body) = update_schedule(
         &app,
         REJECT_PROBE,
         &json!({ "catchup_policy": "eventually" }),
@@ -326,7 +329,7 @@ async fn unknown_policy_values_are_rejected_and_leave_the_schedule_unchanged() {
 
     // River sits one level below the manager that `require_manage_sensors` asks for.
     let (status, body) =
-        patch_schedule(&app, REJECT_PROBE, &json!({ "enabled": false }), &river).await;
+        update_schedule(&app, REJECT_PROBE, &json!({ "enabled": false }), &river).await;
     assert_eq!(
         status, 403,
         "editing a schedule is a manager action, not a river one: {body}"
@@ -412,7 +415,7 @@ async fn allow_concurrent_lets_a_due_slot_enqueue_while_a_run_is_in_flight() {
         "only the in-flight run exists before the policy is changed"
     );
 
-    let (status, body) = patch_schedule(
+    let (status, body) = update_schedule(
         &app,
         OVERLAP_PROBE,
         &json!({ "overlap_policy": "allow_concurrent" }),
@@ -502,7 +505,7 @@ async fn catchup_skip_is_persisted_audited_and_suppresses_a_missed_slot() {
     let manager = manager_jwt().await;
     let registry = seed_probe(&db, CATCHUP_PROBE).await;
 
-    let (status, body) = patch_schedule(
+    let (status, body) = update_schedule(
         &app,
         CATCHUP_PROBE,
         &json!({ "catchup_policy": "skip" }),
@@ -574,7 +577,7 @@ async fn disabling_a_schedule_halts_the_tick_and_re_enabling_resets_the_grid() {
     let seeded_slot = next_run_at(&db, ENABLED_PROBE).await;
 
     let (status, body) =
-        patch_schedule(&app, ENABLED_PROBE, &json!({ "enabled": false }), &manager).await;
+        update_schedule(&app, ENABLED_PROBE, &json!({ "enabled": false }), &manager).await;
     assert_eq!(status, 200, "a manager may disable a schedule: {body}");
     let view: Value = serde_json::from_str(&body).expect("the PATCH returns the updated schedule");
     assert_eq!(
@@ -600,7 +603,7 @@ async fn disabling_a_schedule_halts_the_tick_and_re_enabling_resets_the_grid() {
     );
 
     let (status, body) =
-        patch_schedule(&app, ENABLED_PROBE, &json!({ "enabled": true }), &manager).await;
+        update_schedule(&app, ENABLED_PROBE, &json!({ "enabled": true }), &manager).await;
     assert_eq!(status, 200, "a manager may re-enable a schedule: {body}");
     let view: Value = serde_json::from_str(&body).expect("the PATCH returns the updated schedule");
     assert_eq!(

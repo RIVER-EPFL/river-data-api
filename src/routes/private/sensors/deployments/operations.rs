@@ -1,6 +1,5 @@
-use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, Statement};
+use sea_orm::{ConnectionTrait, EntityTrait, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use super::model::SensorDeployment;
@@ -30,8 +29,8 @@ fn reject_inverted_window(
 /// (site, parameter) by deployment timeline, stamping `sensor_id` onto previously unattributed
 /// (NULL-sensor) history, then a per-sensor pass to reconcile the sensor's own rows at any vacated
 /// slot. `parameter_id` is the deployment's authored parameter (passed through to the job).
-async fn spawn_slot_reprocess(
-    db: &DatabaseConnection,
+async fn spawn_slot_reprocess<C: ConnectionTrait>(
+    db: &C,
     sensor_id: Uuid,
     site_id: Uuid,
     parameter_id: Uuid,
@@ -50,13 +49,12 @@ async fn spawn_slot_reprocess(
     Ok(())
 }
 
-#[async_trait]
 impl CRUDOperations for SensorDeploymentOperations {
     type Resource = SensorDeployment;
 
-    async fn before_create(
+    async fn before_create<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         data: &<SensorDeployment as CRUDResource>::CreateModel,
     ) -> Result<(), ApiError> {
         reject_inverted_window(data.deployed_from, data.deployed_until)?;
@@ -126,12 +124,12 @@ impl CRUDOperations for SensorDeploymentOperations {
     // another sensor's slot would otherwise hit `excl_deployment_site_param_slot` as a raw 500.
     // Every rejection comes first (excluding the row being edited from the slot check), then the
     // boundary follow, then the auto-recall of the sensor's other open deployments when this edit
-    // keeps/makes it open. The recall and the CrudCrate-applied UPDATE are separate statements
-    // (hooks don't share the update's txn), so the EXCLUDE constraint remains the atomic backstop
-    // and `after_update`'s recompute re-chains the sensor's own timeline.
-    async fn before_update(
+    // keeps/makes it open. The recall and the CrudCrate-applied UPDATE are separate statements on
+    // one transaction, so the EXCLUDE constraint remains the atomic backstop and `after_update`'s
+    // recompute re-chains the sensor's own timeline.
+    async fn before_update<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         id: Uuid,
         data: &<SensorDeployment as CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
@@ -258,9 +256,9 @@ impl CRUDOperations for SensorDeploymentOperations {
         Ok(())
     }
 
-    async fn after_create(
+    async fn after_create<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         entity: &mut SensorDeployment,
     ) -> Result<(), ApiError> {
         recompute_deployed_until(db, entity.sensor_id)
@@ -281,9 +279,9 @@ impl CRUDOperations for SensorDeploymentOperations {
         Ok(())
     }
 
-    async fn after_update(
+    async fn after_update<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         entity: &mut SensorDeployment,
     ) -> Result<(), ApiError> {
         recompute_deployed_until(db, entity.sensor_id)
@@ -304,7 +302,11 @@ impl CRUDOperations for SensorDeploymentOperations {
         Ok(())
     }
 
-    async fn perform_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<Uuid, ApiError> {
+    async fn perform_delete<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<Uuid, ApiError> {
         let row = super::model::Entity::find_by_id(id)
             .one(db)
             .await

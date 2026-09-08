@@ -31,8 +31,11 @@ pub fn worker_id() -> String {
 /// Enqueue a `queued` job for the worker pool. A set `dedupe_key` makes the enqueue idempotent (a
 /// duplicate inserts nothing and returns `None`), which keeps two replicas racing a scheduler tick
 /// from double-firing one run.
-pub async fn enqueue(
-    db: &DatabaseConnection,
+///
+/// Called from a CRUD hook, `db` is the transaction the write runs in: the row is invisible to the
+/// pool until that commits, and a write that fails takes its job with it.
+pub async fn enqueue<C: ConnectionTrait>(
+    db: &C,
     trigger_type: &str,
     sensor_id: Option<Uuid>,
     trigger_id: Option<Uuid>,

@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
-use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use crate::common::{AppEvent, AppState, EventSender};
@@ -60,15 +60,15 @@ pub struct SweepStats {
 
 /// One reconciliation tick. Idempotent: safe to call repeatedly (the partial unique index on open
 /// events makes open-or-update a no-op when nothing changed).
-pub async fn evaluate_alarm_events(db: &DatabaseConnection) -> AppResult<SweepStats> {
+pub async fn evaluate_alarm_events<C: ConnectionTrait>(db: &C) -> AppResult<SweepStats> {
     reconcile(db, None).await
 }
 
 /// Scoped reconcile for just the given `(site_id, parameter_id)` slots, the event-driven entry
 /// point (ingest / threshold / config change). Only opens/updates/resolves events within these
 /// slots; alarms outside them are never touched (so it's safe to fire on a partial change).
-pub async fn reconcile_open_alarms(
-    db: &DatabaseConnection,
+pub async fn reconcile_open_alarms<C: ConnectionTrait>(
+    db: &C,
     slots: &[(Uuid, Uuid)],
 ) -> AppResult<SweepStats> {
     reconcile(db, Some(slots)).await
@@ -78,8 +78,8 @@ pub async fn reconcile_open_alarms(
 /// if anything opened or resolved (mirroring the periodic tick). Never fails the caller, it logs
 /// and swallows errors, so wiring it into a write/config path can never break that path. The
 /// periodic backstop still reconciles everything regardless.
-pub async fn reconcile_and_notify(
-    db: &DatabaseConnection,
+pub async fn reconcile_and_notify<C: ConnectionTrait>(
+    db: &C,
     events: &EventSender,
     slots: &[(Uuid, Uuid)],
 ) {
@@ -103,7 +103,7 @@ pub async fn reconcile_and_notify(
 /// slots (derived recompute, calibration/deployment reprocess) where enumerating the exact affected
 /// slots isn't worth it. Reconciles every active slot, cheap (O(active slots) index lookups), and
 /// emits SSE on change. Error-safe.
-pub async fn reconcile_all_and_notify(db: &DatabaseConnection, events: &EventSender) {
+pub async fn reconcile_all_and_notify<C: ConnectionTrait>(db: &C, events: &EventSender) {
     match evaluate_alarm_events(db).await {
         Ok(stats) => {
             if stats.opened > 0 || stats.resolved > 0 {
@@ -117,19 +117,19 @@ pub async fn reconcile_all_and_notify(db: &DatabaseConnection, events: &EventSen
     }
 }
 
-/// [`reconcile_all_and_notify`] for contexts that only hold a `&DatabaseConnection` (CrudCrate
-/// operation hooks). Inside a request it records the debt and [`coalesce_reconcile`] pays it once;
+/// [`reconcile_all_and_notify`] for a CrudCrate operation hook, which is handed the transaction the
+/// write runs in. Inside a request it records the debt and [`coalesce_reconcile`] pays it once;
 /// anywhere else it reconciles on the spot. Uses the process-global event sender; a missing sender
 /// (some unit tests) just skips the SSE. Never returns an error, a failed reconcile must not fail
 /// the CRUD operation that triggered it.
-pub async fn reconcile_all_from_hook(db: &DatabaseConnection) {
+pub async fn reconcile_all_from_hook<C: ConnectionTrait>(db: &C) {
     if record_owed() {
         return;
     }
     reconcile_all_now(db).await;
 }
 
-async fn reconcile_all_now(db: &DatabaseConnection) {
+async fn reconcile_all_now<C: ConnectionTrait>(db: &C) {
     match crate::common::global_event_sender() {
         Some(events) => reconcile_all_and_notify(db, &events).await,
         None => {
@@ -143,8 +143,8 @@ async fn reconcile_all_now(db: &DatabaseConnection) {
 /// One reconciliation tick. `slots = None` reconciles every active slot (backstop); `slots = Some`
 /// restricts every step to those slots. Idempotent: the partial unique index on open events makes
 /// open-or-update a no-op when nothing changed.
-async fn reconcile(
-    db: &DatabaseConnection,
+async fn reconcile<C: ConnectionTrait>(
+    db: &C,
     slots: Option<&[(Uuid, Uuid)]>,
 ) -> AppResult<SweepStats> {
     if matches!(slots, Some(s) if s.is_empty()) {
@@ -170,8 +170,8 @@ struct OpenAlarmSlot {
     parameter_id: Uuid,
 }
 
-async fn reconcile_cadence(
-    db: &DatabaseConnection,
+async fn reconcile_cadence<C: ConnectionTrait>(
+    db: &C,
     slots: Option<&[(Uuid, Uuid)]>,
     spot: bool,
 ) -> AppResult<SweepStats> {

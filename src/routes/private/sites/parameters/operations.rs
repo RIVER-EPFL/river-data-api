@@ -1,8 +1,5 @@
-use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::{
-    ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait, Statement, TransactionTrait,
-};
+use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use super::model::SiteParameter;
@@ -10,15 +7,29 @@ use crate::routes::private::sensors::identity::require_measuring_instrument;
 
 pub struct SiteParameterOperations;
 
-#[async_trait]
 impl CRUDOperations for SiteParameterOperations {
     type Resource = SiteParameter;
+
+    /// The change-audit trigger reads the writer from the transaction, so the label is declared on
+    /// every write this entity makes, before any hook or statement on it (B185).
+    async fn after_begin<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+    ) -> Result<(), ApiError> {
+        crate::common::actor::declare(db)
+            .await
+            .map_err(ApiError::database)
+    }
 
     /// Retire everything the slot owns before it goes away: unattribute its readings and status
     /// events, delete the samples nothing references any more, release the streams that fed it,
     /// and rebuild the rollups. `retire_slot` also does the `data_streams` NULLing the foreign key
     /// requires, so the delete CrudCrate performs next succeeds.
-    async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
+    async fn before_delete<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<(), ApiError> {
         crate::routes::private::data_streams::views::retire_slot(
             db,
             crate::routes::private::data_streams::views::SlotScope::SiteParameter(id),
@@ -31,9 +42,9 @@ impl CRUDOperations for SiteParameterOperations {
     /// A slot names the instrument that measures it, so the row it names has to be one something
     /// was measured on. A bookkeeping instrument stands in for a slot that has declared nothing,
     /// and declaring it would record the absence of an answer as an answer.
-    async fn before_create(
+    async fn before_create<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         data: &<SiteParameter as CRUDResource>::CreateModel,
     ) -> Result<(), ApiError> {
         if let Some(sensor_id) = data.instrument_sensor_id {
@@ -46,9 +57,9 @@ impl CRUDOperations for SiteParameterOperations {
 
     /// The twin of `before_create`: the declaration is patchable, and the picker that sets it is
     /// the surface an operator reaches it through.
-    async fn before_update(
+    async fn before_update<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         _id: Uuid,
         data: &<SiteParameter as CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
@@ -60,35 +71,30 @@ impl CRUDOperations for SiteParameterOperations {
         Ok(())
     }
 
-    /// The insert and the name backfill are one transaction.
+    /// The insert and the name backfill, on the transaction the orchestrator opened.
     ///
     /// `name` is the slot's fulltext and sort key, so a row must never be visible without one, and
     /// a hook cannot supply it: the create model is immutable in `before_create` and `after_create`
-    /// runs after the insert has committed. Both statements go here, on one transaction.
-    async fn perform_create(
+    /// runs after the insert. Both statements go here, and the write they make is one because the
+    /// lifecycle is one transaction; opening another here would only nest a savepoint inside it.
+    async fn perform_create<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         data: <SiteParameter as CRUDResource>::CreateModel,
     ) -> Result<SiteParameter, ApiError> {
-        let txn = db.begin().await.map_err(ApiError::database)?;
-        // The change-audit trigger reads the writer from the transaction; this is the one that
-        // makes it a name rather than NULL.
-        crate::common::actor::declare(&txn)
-            .await
-            .map_err(ApiError::database)?;
         let active: <SiteParameter as CRUDResource>::ActiveModelType = data.into();
-        let model = active.insert(&txn).await.map_err(ApiError::database)?;
+        let model = active.insert(db).await.map_err(ApiError::database)?;
         let mut entity = SiteParameter::from(model);
 
         // A human-readable name from the parameter when the client omitted it.
         if entity.name.trim().is_empty()
             && let Some(parameter) =
                 crate::routes::private::parameters::Entity::find_by_id(entity.parameter_id)
-                    .one(&txn)
+                    .one(db)
                     .await
                     .map_err(ApiError::database)?
         {
-            txn.execute_raw(Statement::from_sql_and_values(
+            db.execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "UPDATE site_parameters SET name = $1 WHERE id = $2",
                 [parameter.name.clone().into(), entity.id.into()],
@@ -98,13 +104,12 @@ impl CRUDOperations for SiteParameterOperations {
             entity.name = parameter.name;
         }
 
-        txn.commit().await.map_err(ApiError::database)?;
         Ok(entity)
     }
 
-    async fn after_create(
+    async fn after_create<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         entity: &mut SiteParameter,
     ) -> Result<(), ApiError> {
         // `is_active` and `is_public` defaults live in the model's `on_create`, so an omitted
@@ -169,16 +174,20 @@ impl CRUDOperations for SiteParameterOperations {
     // Breach evaluation only considers slots whose site_parameter is active, so toggling
     // `is_active` (or removing the slot) can open or resolve alarms with no new reading.
     // Reconcile immediately instead of waiting for the backstop sweep.
-    async fn after_update(
+    async fn after_update<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         _entity: &mut SiteParameter,
     ) -> Result<(), ApiError> {
         crate::routes::private::alarms::sweeper::reconcile_all_from_hook(db).await;
         Ok(())
     }
 
-    async fn after_delete(&self, db: &DatabaseConnection, _id: Uuid) -> Result<(), ApiError> {
+    async fn after_delete<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        _id: Uuid,
+    ) -> Result<(), ApiError> {
         crate::routes::private::alarms::sweeper::reconcile_all_from_hook(db).await;
         Ok(())
     }
@@ -187,8 +196,8 @@ impl CRUDOperations for SiteParameterOperations {
 /// The definition that produces a parameter, if one does. A calculation names the parameter it
 /// outputs, and an output has exactly one producer (`idx_derived_definitions_output_parameter`),
 /// so the slot needs no reference of its own.
-async fn definition_producing(
-    db: &DatabaseConnection,
+async fn definition_producing<C: ConnectionTrait>(
+    db: &C,
     parameter_id: Uuid,
 ) -> Result<Option<Uuid>, ApiError> {
     let row = db

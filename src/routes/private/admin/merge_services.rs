@@ -73,6 +73,61 @@ async fn refuse_on_collision<C: ConnectionTrait>(
 /// cap lifted, so it applies whole or not at all even when the readings sit in compressed chunks;
 /// the rollup refresh follows the commit, since `refresh_continuous_aggregate` cannot run inside a
 /// transaction block.
+/// The row as it stands, for the trail to keep after the merge deletes it.
+async fn row_snapshot<C: ConnectionTrait>(
+    txn: &C,
+    table: &str,
+    id: Uuid,
+) -> AppResult<serde_json::Value> {
+    let row = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &format!("SELECT to_jsonb(t) AS row FROM {table} t WHERE t.id = $1"),
+            vec![id.into()],
+        ))
+        .await
+        .map_err(AppError::Database)?;
+    Ok(row
+        .map(|r| r.try_get::<serde_json::Value>("", "row"))
+        .transpose()
+        .map_err(AppError::Database)?
+        .unwrap_or(serde_json::Value::Null))
+}
+
+/// One entry per merge, in the merge's own transaction, so a rolled-back merge leaves none.
+///
+/// The per-row triggers see the survivor unchanged and the source deleted, and say nothing about
+/// the two being one action or about what moved between them. A merge is one operator decision over
+/// many rows and the trail has to hold it as one, which is what makes it rectifiable (Q87).
+async fn record_merge<C: ConnectionTrait>(
+    txn: &C,
+    subject: &str,
+    target_id: Uuid,
+    source: serde_json::Value,
+    counts: serde_json::Value,
+    actor: &str,
+) -> AppResult<()> {
+    let target = row_snapshot(txn, &format!("{subject}s"), target_id).await?;
+    let mut absorbed = serde_json::Map::new();
+    absorbed.insert("source".to_string(), source);
+    absorbed.insert("counts".to_string(), counts);
+    txn.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO change_audit (subject, change, changed_by, old_value, new_value) \
+         VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)",
+        [
+            format!("{subject}:{target_id}").into(),
+            format!("{subject}_merge").into(),
+            actor.into(),
+            serde_json::Value::Object(absorbed).to_string().into(),
+            target.to_string().into(),
+        ],
+    ))
+    .await
+    .map_err(AppError::Database)?;
+    Ok(())
+}
+
 pub async fn merge_site_parameters(
     db: &DatabaseConnection,
     req: &MergeSiteParametersRequest,
@@ -100,12 +155,26 @@ pub async fn merge_site_parameters(
         refuse_on_collision(txn, scope, source_param_id, target_param_id).await?;
         let moved = move_slot_rows(txn, scope, source_param_id, target_param_id, actor).await?;
         let streams_updated = update_data_streams(txn, source_id, target_id).await?;
+        let source_row = row_snapshot(txn, "site_parameters", source_id).await?;
         delete_source(
             txn,
             source_id,
             source_site_id,
             source_param_id,
             target_param_id,
+        )
+        .await?;
+        record_merge(
+            txn,
+            "site_parameter",
+            target_id,
+            source_row,
+            serde_json::json!({
+                "merged_readings": moved.readings,
+                "merged_status_events": moved.status_events,
+                "streams_updated": streams_updated,
+            }),
+            actor,
         )
         .await?;
 
@@ -295,14 +364,13 @@ async fn refuse_derived_cycle<C: sea_orm::ConnectionTrait>(
     let resolve = |id: Uuid| if id == source_id { target_id } else { id };
     let mut index: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
     let mut order_of: Vec<Uuid> = Vec::new();
-    let slot = |id: Uuid,
-                    index: &mut std::collections::HashMap<Uuid, usize>,
-                    order_of: &mut Vec<Uuid>| {
-        *index.entry(id).or_insert_with(|| {
-            order_of.push(id);
-            order_of.len() - 1
-        })
-    };
+    let slot =
+        |id: Uuid, index: &mut std::collections::HashMap<Uuid, usize>, order_of: &mut Vec<Uuid>| {
+            *index.entry(id).or_insert_with(|| {
+                order_of.push(id);
+                order_of.len() - 1
+            })
+        };
     let mut edges: Vec<(usize, usize)> = Vec::new();
     let mut definition_of: std::collections::HashMap<usize, String> =
         std::collections::HashMap::new();
@@ -357,7 +425,22 @@ pub async fn merge_parameters(
             merge_site_parameters_per_site(txn, source_id, target_id, actor).await?;
 
         let swept = reassign_parameter_references(txn, source_id, target_id, actor).await?;
+        let source_row = row_snapshot(txn, "parameters", source_id).await?;
         delete_parameter(txn, source_id).await?;
+        record_merge(
+            txn,
+            "parameter",
+            target_id,
+            source_row,
+            serde_json::json!({
+                "sites_merged": sites_merged,
+                "sites_reassigned": sites_reassigned,
+                "readings_moved": moved.readings + swept.readings,
+                "streams_updated": moved.streams,
+            }),
+            actor,
+        )
+        .await?;
 
         Ok((
             MergeParametersResponse {

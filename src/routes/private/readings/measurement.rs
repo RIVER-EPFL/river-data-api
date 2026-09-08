@@ -1,18 +1,36 @@
 use std::collections::HashMap;
 
+use river_data_core::models::MeasurementType;
 use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use crate::error::AppError;
 
+/// `POST /streams/retag` and the `measurement_retag` job take this alongside the vocabulary: it
+/// writes nothing to `data_streams` and aligns each reading with its own stream's declaration.
+pub const RETAG_DECLARED: &str = "declared";
+
+fn expected(extra: &[&str]) -> String {
+    let mut names: Vec<&str> = MeasurementType::ALL
+        .iter()
+        .map(MeasurementType::as_str)
+        .collect();
+    names.extend_from_slice(extra);
+    let last = names.pop().expect("the vocabulary is never empty");
+    format!("{}, or {last}", names.join(", "))
+}
+
 /// Why this classification is not admissible, or `None` when it is. Callers that refuse the whole
 /// request raise it as a 400; callers that skip the offending reading need the reason as a value.
 pub fn measurement_type_rejection(value: Option<&str>) -> Option<String> {
     match value {
-        None | Some("continuous" | "spot" | "derived") => None,
-        Some(other) => Some(format!(
-            "invalid measurement_type '{other}' (expected continuous, spot, or derived)"
-        )),
+        None => None,
+        Some(other) => MeasurementType::from_str(other).is_none().then(|| {
+            format!(
+                "invalid measurement_type '{other}' (expected {})",
+                expected(&[])
+            )
+        }),
     }
 }
 
@@ -20,6 +38,18 @@ pub fn measurement_type_rejection(value: Option<&str>) -> Option<String> {
 /// no CHECK on readings.measurement_type, so bad values would otherwise persist silently).
 pub fn validate_measurement_type(value: Option<&str>) -> Result<(), AppError> {
     measurement_type_rejection(value).map_or(Ok(()), |reason| Err(AppError::BadRequest(reason)))
+}
+
+/// Why this retag target is not admissible, or `None` when it is. The route and the job body both
+/// read it, so a stored job row replayed by rerun is held to the same vocabulary as the request
+/// that made it.
+pub fn retag_target_rejection(value: &str) -> Option<String> {
+    (MeasurementType::from_str(value).is_none() && value != RETAG_DECLARED).then(|| {
+        format!(
+            "invalid measurement_type '{value}' (expected {})",
+            expected(&[RETAG_DECLARED])
+        )
+    })
 }
 
 /// Map each sensor to the measurement_type its `data_frequency` implies: 'low' → 'spot'
@@ -51,9 +81,9 @@ pub async fn measurement_types_for_sensors<C: ConnectionTrait>(
         map.insert(
             sensor.id,
             if sensor.data_frequency == "low" {
-                "spot"
+                MeasurementType::Spot.as_str()
             } else {
-                "continuous"
+                MeasurementType::Continuous.as_str()
             },
         );
     }
@@ -77,5 +107,35 @@ pub fn resolve_measurement_type(
                 .and_then(|id| sensor_types.get(&id))
                 .map(|t| (*t).to_string())
         })
-        .unwrap_or_else(|| "continuous".to_string())
+        .unwrap_or_else(|| MeasurementType::Continuous.as_str().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_measurement_type_rejection_admits_every_member() {
+        for v in MeasurementType::ALL {
+            assert_eq!(measurement_type_rejection(Some(v.as_str())), None);
+        }
+        assert_eq!(measurement_type_rejection(None), None);
+    }
+
+    #[test]
+    fn test_measurement_type_rejection_names_the_whole_vocabulary() {
+        let reason = measurement_type_rejection(Some("spott")).expect("a typo is refused");
+        for v in MeasurementType::ALL {
+            assert!(reason.contains(v.as_str()), "{reason} omits {v}");
+        }
+    }
+
+    #[test]
+    fn test_retag_target_rejection_admits_the_vocabulary_and_declared() {
+        for v in MeasurementType::ALL {
+            assert_eq!(retag_target_rejection(v.as_str()), None);
+        }
+        assert_eq!(retag_target_rejection(RETAG_DECLARED), None);
+        assert!(retag_target_rejection("hourly").is_some());
+    }
 }

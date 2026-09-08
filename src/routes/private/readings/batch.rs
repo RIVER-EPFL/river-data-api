@@ -104,7 +104,8 @@ pub mod admission {
         }
         Some(format!(
             "Replicate index {replicate_index} is only valid on a spot reading; {} readings are served at index 0 alone",
-            measurement_type.unwrap_or("continuous")
+            measurement_type
+                .unwrap_or(river_data_core::models::MeasurementType::Continuous.as_str())
         ))
     }
 
@@ -388,7 +389,7 @@ pub struct CurveClaim<'a> {
 
 /// Classification a hand-picked curve belongs to: a curve is fitted for one measurement, and a
 /// logger cadence has no such measurement to pick it for.
-const CURVE_MEASUREMENT_TYPE: &str = "spot";
+const CURVE_MEASUREMENT_TYPE: &str = river_data_core::models::MeasurementType::Spot.as_str();
 
 /// The standard curves a request names, refused unless every reading naming one may carry it.
 ///

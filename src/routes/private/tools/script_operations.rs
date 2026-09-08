@@ -1,11 +1,10 @@
 //! The rules the generated CRUD cannot state: the name a tool is reached by, and the two counts a
 //! reader wants beside a calculation.
 
-use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
-    QueryOrder, Statement,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait,
+    FromQueryResult, QueryFilter, QueryOrder, Statement, TransactionTrait,
 };
 use uuid::Uuid;
 
@@ -44,7 +43,7 @@ struct VersionCounts {
 }
 
 /// The version count and the live version's number, for a page of calculations.
-async fn counts(db: &DatabaseConnection, ids: &[Uuid]) -> Result<Vec<VersionCounts>, ApiError> {
+async fn counts<C: ConnectionTrait>(db: &C, ids: &[Uuid]) -> Result<Vec<VersionCounts>, ApiError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -68,35 +67,49 @@ async fn counts(db: &DatabaseConnection, ids: &[Uuid]) -> Result<Vec<VersionCoun
 
 pub struct ToolScriptOperations;
 
-#[async_trait]
 impl CRUDOperations for ToolScriptOperations {
     type Resource = ToolScript;
 
-    /// The name is normalised before the insert rather than validated in `before_create`, which
-    /// is handed the request by reference and cannot correct it.
-    async fn create(
+    /// The engine is checked before the insert; the name is normalised in `perform_create`, which
+    /// takes the request by value. `before_create` is handed it by reference and cannot correct it.
+    async fn before_create<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
-        mut data: <ToolScript as crudcrate::CRUDResource>::CreateModel,
-    ) -> Result<ToolScript, ApiError> {
-        data.name = normalise_name(&data.name)?;
+        _db: &C,
+        data: &<ToolScript as crudcrate::CRUDResource>::CreateModel,
+    ) -> Result<(), ApiError> {
+        normalise_name(&data.name)?;
         if let Some(engine) = data.engine.as_deref() {
             check_engine(engine)?;
         }
+        Ok(())
+    }
+
+    /// The insert with the name normalised, and the unique violation read as the conflict it is.
+    async fn perform_create<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        mut data: <ToolScript as crudcrate::CRUDResource>::CreateModel,
+    ) -> Result<ToolScript, ApiError> {
+        data.name = normalise_name(&data.name)?;
         let name = data.name.clone();
-        self.perform_create(db, data).await.map_err(|e| {
-            if e.to_string().contains("idx_tool_scripts_name") {
-                ApiError::conflict(format!("a tool named '{name}' already exists"))
-            } else {
-                e
-            }
-        })
+        let active: <ToolScript as crudcrate::CRUDResource>::ActiveModelType = data.into();
+        active
+            .insert(db)
+            .await
+            .map(ToolScript::from)
+            .map_err(|e| {
+                if e.to_string().contains("idx_tool_scripts_name") {
+                    ApiError::conflict(format!("a tool named '{name}' already exists"))
+                } else {
+                    ApiError::database(e)
+                }
+            })
     }
 
     /// The name is `exclude(update)`, so an update can only reach the engine.
-    async fn before_update(
+    async fn before_update<C: ConnectionTrait + TransactionTrait>(
         &self,
-        _db: &DatabaseConnection,
+        _db: &C,
         _id: Uuid,
         data: &<ToolScript as crudcrate::CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
@@ -107,9 +120,9 @@ impl CRUDOperations for ToolScriptOperations {
     }
 
     /// The version history, newest first, and which of them is live.
-    async fn after_get_one(
+    async fn after_get_one<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         entity: &mut ToolScript,
     ) -> Result<(), ApiError> {
         let versions = super::version_model::Entity::find()
@@ -135,9 +148,9 @@ impl CRUDOperations for ToolScriptOperations {
         Ok(())
     }
 
-    async fn after_get_all(
+    async fn after_get_all<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         entities: &mut Vec<<ToolScript as crudcrate::CRUDResource>::ListModel>,
     ) -> Result<(), ApiError> {
         let ids: Vec<Uuid> = entities.iter().map(|e| e.id).collect();

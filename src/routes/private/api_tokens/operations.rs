@@ -1,19 +1,17 @@
-use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::{ActiveModelTrait, DatabaseConnection, Set};
+use sea_orm::{ActiveModelTrait, ConnectionTrait, Set, TransactionTrait};
 
 use super::model::{self, ApiToken};
 use super::service::mint_api_token;
 
 pub struct ApiTokenOperations;
 
-#[async_trait]
 impl CRUDOperations for ApiTokenOperations {
     type Resource = ApiToken;
 
-    async fn perform_create(
+    async fn perform_create<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         data: <ApiToken as CRUDResource>::CreateModel,
     ) -> Result<ApiToken, ApiError> {
         let minted = mint_api_token();

@@ -62,9 +62,7 @@ impl AuthContext {
     #[must_use]
     pub fn highest_role(&self) -> Option<Role> {
         match self {
-            AuthContext::Keycloak { roles, .. } => {
-                roles.iter().max_by_key(|r| r.level()).cloned()
-            }
+            AuthContext::Keycloak { roles, .. } => roles.iter().max_by_key(|r| r.level()).cloned(),
             AuthContext::ApiToken { .. } => None,
         }
     }
@@ -310,13 +308,7 @@ pub async fn require_write_data(request: Request, next: Next) -> Response {
 /// `write_data`. An intern's entry lands unverified and cannot displace a stored value; the
 /// handler enforces both.
 pub async fn require_enter_field_data(request: Request, next: Next) -> Response {
-    authz::check(
-        Capability::EnterFieldData,
-        TokenAccess::Same,
-        request,
-        next,
-    )
-    .await
+    authz::check(Capability::EnterFieldData, TokenAccess::Same, request, next).await
 }
 
 /// Requires the `manage_sensors` capability (MANAGER member; token with write_metadata).
@@ -594,10 +586,9 @@ fn check_scope_outcome(
     };
     match outcome {
         // Every owning/target project must be in scope (a single owner, or owner + repoint target).
-        ScopeOutcome::RequireAll(projects) => {
-            (projects.is_empty() || !projects.iter().all(|p| scope.allows_project(*p)))
-                .then(outside)
-        }
+        ScopeOutcome::RequireAll(projects) => (projects.is_empty()
+            || !projects.iter().all(|p| scope.allows_project(*p)))
+        .then(outside),
         // At least one must be in scope, matches read confinement for a multi-project entity (a
         // calibration is visible/writable if its sensor touches a granted project). Empty fails closed.
         ScopeOutcome::RequireAny(projects) => {
@@ -680,6 +671,53 @@ fn batch_elements(
     }
 }
 
+/// The owning project(s) of one row, as SQL keyed by its id, for every entity whose rows belong to a
+/// project. `None` is the answer for a global entity: the catalog, the operational tables, and a
+/// schedule, none of which has a project dimension at all.
+///
+/// This is the only list of those entities, so the question "does this entity have a project?" and
+/// the query that answers it cannot drift apart. `sensor_calibrations` and `standard_curves` resolve
+/// through a deployment set rather than one row and are handled by their own branches, so they
+/// appear here only to be named as scoped.
+fn project_scope_sql(entity: &str) -> Option<&'static str> {
+    Some(match entity {
+        "sensor_calibrations" => {
+            "SELECT DISTINCT s.project_id FROM sensor_calibrations c \
+             JOIN sensor_deployments d ON d.sensor_id = c.sensor_id \
+             JOIN sites s ON s.id = d.site_id WHERE c.id = $1"
+        }
+        "standard_curves" => {
+            "SELECT DISTINCT s.project_id FROM standard_curves c \
+             JOIN sensor_deployments d ON d.sensor_id = c.sensor_id \
+             JOIN sites s ON s.id = d.site_id WHERE c.id = $1"
+        }
+        "sites" => "SELECT project_id FROM sites WHERE id = $1",
+        "subprojects" => "SELECT project_id FROM subprojects WHERE id = $1",
+        "site_parameters" => {
+            "SELECT s.project_id FROM site_parameters sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = $1"
+        }
+        "notes" => {
+            "SELECT s.project_id FROM notes n JOIN sites s ON s.id = n.site_id WHERE n.id = $1"
+        }
+        "annotations" => {
+            "SELECT s.project_id FROM annotations a JOIN sites s ON s.id = a.site_id WHERE a.id = $1"
+        }
+        "sensor_deployments" => {
+            "SELECT s.project_id FROM sensor_deployments d JOIN sites s ON s.id = d.site_id WHERE d.id = $1"
+        }
+        "alarm_thresholds" => {
+            "SELECT s.project_id FROM alarm_thresholds t JOIN sites s ON s.id = t.site_id WHERE t.id = $1"
+        }
+        "samples" => {
+            "SELECT s.project_id FROM samples sm JOIN sites s ON s.id = sm.site_id WHERE sm.id = $1"
+        }
+        "data_streams" => {
+            "SELECT s.project_id FROM data_streams ds JOIN site_parameters sp ON sp.id = ds.site_parameter_id JOIN sites s ON s.id = sp.site_id WHERE ds.id = $1"
+        }
+        _ => return None,
+    })
+}
+
 async fn resolve_scope_project(
     db: &sea_orm::DatabaseConnection,
     entity: &str,
@@ -694,20 +732,19 @@ async fn resolve_scope_project(
 
     // Update / delete: resolve the owning project(s) from the existing row.
     if let Some(id) = id {
+        // Whether the entity has a project at all is decided before the id is read, so a global
+        // entity keyed by something other than a UUID (`schedules` is keyed by job name) is answered
+        // by its own rule rather than refused for the shape of its key.
+        let Some(sql) = project_scope_sql(entity) else {
+            return ScopeOutcome::Global(format!("Project-scoped token cannot modify '{entity}'"));
+        };
         let Ok(uuid) = Uuid::parse_str(id) else {
             return ScopeOutcome::Unresolved("Could not resolve target".to_string());
         };
         // sensor_calibrations spans every project its sensor is deployed to; matches read scoping
         // (visible/writable if the sensor touches a granted project), so require ANY.
         if entity == "sensor_calibrations" {
-            let projects = distinct_projects(
-                db,
-                "SELECT DISTINCT s.project_id FROM sensor_calibrations c \
-                 JOIN sensor_deployments d ON d.sensor_id = c.sensor_id \
-                 JOIN sites s ON s.id = d.site_id WHERE c.id = $1",
-                uuid,
-            )
-            .await;
+            let projects = distinct_projects(db, sql, uuid).await;
             return require_any(projects, "calibration");
         }
         // A standard curve belongs to an instrument, so it spans the project set that instrument
@@ -715,46 +752,9 @@ async fn resolve_scope_project(
         // resolution reads as no project dimension rather than as a denial; see
         // [`require_any_or_unbound`].
         if entity == "standard_curves" {
-            let projects = distinct_projects(
-                db,
-                "SELECT DISTINCT s.project_id FROM standard_curves c \
-                 JOIN sensor_deployments d ON d.sensor_id = c.sensor_id \
-                 JOIN sites s ON s.id = d.site_id WHERE c.id = $1",
-                uuid,
-            )
-            .await;
+            let projects = distinct_projects(db, sql, uuid).await;
             return require_any_or_unbound(projects, "standard curve");
         }
-        let sql = match entity {
-            "sites" => "SELECT project_id FROM sites WHERE id = $1",
-            "subprojects" => "SELECT project_id FROM subprojects WHERE id = $1",
-            "site_parameters" => {
-                "SELECT s.project_id FROM site_parameters sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = $1"
-            }
-            "notes" => {
-                "SELECT s.project_id FROM notes n JOIN sites s ON s.id = n.site_id WHERE n.id = $1"
-            }
-            "annotations" => {
-                "SELECT s.project_id FROM annotations a JOIN sites s ON s.id = a.site_id WHERE a.id = $1"
-            }
-            "sensor_deployments" => {
-                "SELECT s.project_id FROM sensor_deployments d JOIN sites s ON s.id = d.site_id WHERE d.id = $1"
-            }
-            "alarm_thresholds" => {
-                "SELECT s.project_id FROM alarm_thresholds t JOIN sites s ON s.id = t.site_id WHERE t.id = $1"
-            }
-            "samples" => {
-                "SELECT s.project_id FROM samples sm JOIN sites s ON s.id = sm.site_id WHERE sm.id = $1"
-            }
-            "data_streams" => {
-                "SELECT s.project_id FROM data_streams ds JOIN site_parameters sp ON sp.id = ds.site_parameter_id JOIN sites s ON s.id = sp.site_id WHERE ds.id = $1"
-            }
-            other => {
-                return ScopeOutcome::Global(format!(
-                    "Project-scoped token cannot modify '{other}'"
-                ));
-            }
-        };
         // The owning project of the existing row, plus any repoint target in the update body: moving a
         // site to another subproject, or a subproject to another project, must land in a scope the
         // caller also holds. All resolved projects must be in scope.
@@ -1148,7 +1148,7 @@ pub async fn inject_read_scope(request: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{batch_elements, parse_crud_target, CrudTarget};
+    use super::{CrudTarget, batch_elements, parse_crud_target};
     use axum::http::Method;
     use serde_json::json;
 

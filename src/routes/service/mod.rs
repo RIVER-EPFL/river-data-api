@@ -35,6 +35,7 @@ use crate::routes::private::{
     projects::subprojects::Subproject,
     readings::samples::Sample,
     reprocessing_jobs::ReprocessingJob,
+    reprocessing_jobs::schedule_model::Schedule,
     sensors::Sensor,
     sensors::calibrations::SensorCalibration,
     sensors::deployments::SensorDeployment,
@@ -182,6 +183,9 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/sensor_deployments",
             sensor_crud(SensorDeployment::router(db)),
         )
+        // A schedule's rows are a projection of the job registry, so the entity mounts read and
+        // update only; `run_now` and the edit trail stay their own routes beside it.
+        .nest("/schedules", sensor_crud(Schedule::router(db)))
         // Field metadata, not sensor movement: a standard curve affects only the grabs an operator
         // enters against it, so the person entering the plate's readings adds its curve in the same
         // sitting. `sensor_crud` (MANAGER) is the alternative, and would make them wait on a manager.
@@ -543,14 +547,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             get(crate::routes::private::parameters::groups::definition::group_definition),
         )
         .route(
-            "/schedules",
-            get(crate::routes::private::reprocessing_jobs::schedule_routes::list_schedules),
-        )
-        .route(
-            "/schedules/{job_name}",
-            get(crate::routes::private::reprocessing_jobs::schedule_routes::get_schedule),
-        )
-        .route(
             "/schedules/{job_name}/audit",
             get(crate::routes::private::reprocessing_jobs::schedule_routes::get_schedule_audit),
         )
@@ -606,10 +602,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .route(
             "/reprocessing_jobs/{id}/cancel",
             post(crate::routes::private::reprocessing_jobs::routes::cancel_job),
-        )
-        .route(
-            "/schedules/{job_name}",
-            patch(crate::routes::private::reprocessing_jobs::schedule_routes::update_schedule),
         )
         .route(
             "/schedules/{job_name}/run_now",

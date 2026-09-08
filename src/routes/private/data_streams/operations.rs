@@ -1,6 +1,5 @@
-use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use super::model::DataStream;
@@ -9,7 +8,7 @@ use super::replicates;
 pub struct DataStreamOperations;
 
 /// The stream's registered replicate-family key, when it has one.
-async fn family_key(db: &DatabaseConnection, id: Uuid) -> Result<Option<String>, ApiError> {
+async fn family_key<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<Option<String>, ApiError> {
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -23,7 +22,6 @@ async fn family_key(db: &DatabaseConnection, id: Uuid) -> Result<Option<String>,
         .map_err(ApiError::database)
 }
 
-#[async_trait]
 impl CRUDOperations for DataStreamOperations {
     type Resource = DataStream;
 
@@ -31,9 +29,9 @@ impl CRUDOperations for DataStreamOperations {
     /// and `/streams/retag` already refuse it, and a plain PATCH must not be the one route that
     /// can move the column. Clearing it (NULL) is refused too, the classification would then fall
     /// through to the owning sensor's data_frequency and can resolve continuous.
-    async fn before_update(
+    async fn before_update<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         id: Uuid,
         data: &<DataStream as crudcrate::CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
@@ -53,9 +51,9 @@ impl CRUDOperations for DataStreamOperations {
     }
 
     /// The replicate assignments, read out of the metadata the stream already carries.
-    async fn after_get_one(
+    async fn after_get_one<C: ConnectionTrait + TransactionTrait>(
         &self,
-        _db: &DatabaseConnection,
+        _db: &C,
         entity: &mut DataStream,
     ) -> Result<(), ApiError> {
         entity.replicates = super::replicates::ReplicateSpec::from_metadata(&entity.metadata)

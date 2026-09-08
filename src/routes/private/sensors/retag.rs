@@ -3,6 +3,7 @@
 //! continuous aggregates over the affected window.
 
 use axum::{Json, extract::State};
+use river_data_core::models::MeasurementType;
 use sea_orm::{ConnectionTrait, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -81,7 +82,7 @@ pub async fn retag_frequency(
         .await?;
         crate::routes::private::data_streams::replicates::refuse_family_retag(
             &families,
-            "continuous",
+            MeasurementType::Continuous.as_str(),
         )?;
     }
 
@@ -100,10 +101,11 @@ pub async fn retag_frequency(
 
     let job_id = if req.retag_existing {
         let target = if req.data_frequency == "low" {
-            "spot"
+            MeasurementType::Spot
         } else {
-            "continuous"
-        };
+            MeasurementType::Continuous
+        }
+        .as_str();
         crate::routes::private::reprocessing_jobs::worker::enqueue(
             &state.db,
             "measurement_retag",

@@ -5,7 +5,7 @@
 //! formulas present, and activates it. A run pins that version, so a recompute reproduces the
 //! value the audit compares against.
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
@@ -24,8 +24,8 @@ struct CalculationRow {
     active_version_id: Option<Uuid>,
 }
 
-async fn load_calculation(
-    db: &DatabaseConnection,
+async fn load_calculation<C: ConnectionTrait>(
+    db: &C,
     script_id: Uuid,
 ) -> AppResult<Option<CalculationRow>> {
     let Some(row) = db
@@ -65,8 +65,8 @@ struct StoredCalculation {
 /// Mint and activate a version for a formula calculation whose formula set has changed. A script
 /// calculation is authored through the version routes and is left alone; an unchanged formula set
 /// mints nothing.
-pub async fn mint_formula_version(
-    db: &DatabaseConnection,
+pub async fn mint_formula_version<C: ConnectionTrait>(
+    db: &C,
     script_id: Uuid,
     actor: Option<&str>,
 ) -> AppResult<Option<Uuid>> {
@@ -147,8 +147,8 @@ pub async fn mint_formula_version(
 /// Idempotent, and cheap: the mint is a no-op when the content hash already matches, so this is
 /// what the definition hooks call, including after a delete where the calculation the definition
 /// belonged to is no longer readable from the row.
-pub async fn mint_stale_formula_versions(
-    db: &DatabaseConnection,
+pub async fn mint_stale_formula_versions<C: ConnectionTrait>(
+    db: &C,
     actor: Option<&str>,
 ) -> AppResult<()> {
     let rows = db
@@ -176,7 +176,7 @@ pub fn audit_dedupe_key(name: &str) -> String {
 /// the visits whose provenance names this calculation, and repair stays the scoped
 /// `event_recompute` a person asks for. This is the policy `constants/operations.rs` already
 /// applies to a constant edit, which is the same kind of change.
-pub async fn audit_after_activation(db: &DatabaseConnection, name: &str) {
+pub async fn audit_after_activation<C: ConnectionTrait>(db: &C, name: &str) {
     let key = audit_dedupe_key(name);
     if let Err(e) = crate::routes::private::reprocessing_jobs::worker::enqueue(
         db,
@@ -192,8 +192,8 @@ pub async fn audit_after_activation(db: &DatabaseConnection, name: &str) {
     }
 }
 
-async fn activate(
-    db: &DatabaseConnection,
+async fn activate<C: ConnectionTrait>(
+    db: &C,
     script_id: Uuid,
     from: Option<Uuid>,
     to: Uuid,
@@ -248,8 +248,8 @@ fn manifest_codes(manifest: &serde_json::Value) -> (Vec<String>, Vec<String>) {
 
 /// Catalog ids by lowercased code, for the codes asked for. A code the catalog does not hold is
 /// simply absent, which is what the caller has to decide about.
-async fn ids_by_code(
-    db: &DatabaseConnection,
+async fn ids_by_code<C: ConnectionTrait>(
+    db: &C,
     codes: &[String],
 ) -> AppResult<std::collections::HashMap<String, Uuid>> {
     let mut wanted: Vec<String> = codes.to_vec();
@@ -273,8 +273,8 @@ async fn ids_by_code(
 /// The calculations bound to a group, as the reshape rules read them: name, inputs and outputs
 /// resolved from each calculation's *active* version. A calculation with no active version
 /// produces nothing yet and is not one.
-pub async fn calculations_of_group(
-    db: &DatabaseConnection,
+pub async fn calculations_of_group<C: ConnectionTrait>(
+    db: &C,
     group_id: Uuid,
 ) -> AppResult<Vec<rules::Calculation>> {
     let rows = db
@@ -310,8 +310,8 @@ pub async fn calculations_of_group(
 /// A calculation reads and writes only its group's members, in the roles they declare. The
 /// manifest names catalog codes; the group names parameter ids, so the codes are resolved first
 /// and an unknown code is itself a refusal.
-pub async fn check_manifest_against_group(
-    db: &DatabaseConnection,
+pub async fn check_manifest_against_group<C: ConnectionTrait>(
+    db: &C,
     group_id: Uuid,
     name: &str,
     manifest: &serde_json::Value,

@@ -1,6 +1,5 @@
-use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement, TransactionTrait};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -16,8 +15,8 @@ use crate::routes::private::tools::formula::free_identifiers;
 /// stored value was made with stays recoverable. A definition attached to a calculation is
 /// versioned by `tool_script_versions` instead, through `mint_stale_formula_versions`, so this
 /// covers only the standalone kind the per-reading engine serves.
-async fn mint_derived_version(
-    db: &DatabaseConnection,
+async fn mint_derived_version<C: ConnectionTrait>(
+    db: &C,
     definition_id: Uuid,
     formula: &str,
     actor: Option<&str>,
@@ -53,7 +52,7 @@ async fn mint_derived_version(
 }
 
 /// Whether this definition is the standalone kind, ie. not attached to a calculation.
-async fn is_standalone(db: &DatabaseConnection, definition_id: Uuid) -> Result<bool, ApiError> {
+async fn is_standalone<C: ConnectionTrait>(db: &C, definition_id: Uuid) -> Result<bool, ApiError> {
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -97,8 +96,8 @@ struct ResolvedSources {
 /// constants table, exactly as the script engine binds a declared constant. A column of `sites`
 /// is a property of the station rather than a measurement, so it is recorded as a site source and
 /// resolved from the site row at calculate time, never asked for at the visit.
-async fn resolve_variables(
-    db: &DatabaseConnection,
+async fn resolve_variables<C: ConnectionTrait>(
+    db: &C,
     formula: &str,
 ) -> Result<ResolvedSources, ApiError> {
     let var_names = free_identifiers(formula);
@@ -143,7 +142,7 @@ async fn resolve_variables(
 
 /// The columns of the `sites` row, which is what a site source may name (D13: any column is
 /// resolvable, and the kind check at calculate time is what refuses a text one in a number input).
-async fn site_columns_of(db: &DatabaseConnection) -> Result<Vec<String>, ApiError> {
+async fn site_columns_of<C: ConnectionTrait>(db: &C) -> Result<Vec<String>, ApiError> {
     let rows = db
         .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -163,7 +162,7 @@ async fn site_columns_of(db: &DatabaseConnection) -> Result<Vec<String>, ApiErro
 }
 
 /// Whether the constants table holds this name.
-async fn names_a_constant(db: &DatabaseConnection, name: &str) -> Result<bool, ApiError> {
+async fn names_a_constant<C: ConnectionTrait>(db: &C, name: &str) -> Result<bool, ApiError> {
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -202,7 +201,7 @@ struct DerivedGraph {
 }
 
 impl DerivedGraph {
-    async fn load(db: &DatabaseConnection) -> Result<Self, ApiError> {
+    async fn load<C: ConnectionTrait>(db: &C) -> Result<Self, ApiError> {
         let mut graph = Self::default();
         let definitions = db
             .query_all_raw(Statement::from_string(
@@ -319,8 +318,8 @@ fn validate_dependency_chain(
 }
 
 /// Load the graph and validate against it, the shape the CRUD hooks use.
-async fn validate_against_stored_graph(
-    db: &DatabaseConnection,
+async fn validate_against_stored_graph<C: ConnectionTrait>(
+    db: &C,
     output_parameter_id: Option<Uuid>,
     resolved_params: &[(String, Uuid)],
 ) -> Result<(), ApiError> {
@@ -330,8 +329,8 @@ async fn validate_against_stored_graph(
 }
 
 /// The catalog parameter a code already names, if any.
-async fn existing_parameter_id(
-    db: &DatabaseConnection,
+async fn existing_parameter_id<C: ConnectionTrait>(
+    db: &C,
     code: &str,
 ) -> Result<Option<Uuid>, ApiError> {
     let row = db
@@ -356,8 +355,8 @@ struct StoredDefinition {
 }
 
 /// The parameter a stored definition produces, and its formula.
-async fn stored_definition(
-    db: &DatabaseConnection,
+async fn stored_definition<C: ConnectionTrait>(
+    db: &C,
     id: Uuid,
 ) -> Result<(Option<Uuid>, String), ApiError> {
     let row = db
@@ -375,8 +374,8 @@ async fn stored_definition(
 }
 
 /// Delete existing sources and insert new ones for a derived definition.
-async fn sync_sources(
-    db: &DatabaseConnection,
+async fn sync_sources<C: ConnectionTrait>(
+    db: &C,
     definition_id: Uuid,
     resolved: &ResolvedSources,
 ) -> Result<(), ApiError> {
@@ -429,8 +428,8 @@ async fn sync_sources(
 
 /// Ensure a row in the `parameters` table exists for a derived definition's output,
 /// and link it via `output_parameter_id`. Returns the parameter UUID.
-async fn ensure_output_parameter(
-    db: &DatabaseConnection,
+async fn ensure_output_parameter<C: ConnectionTrait>(
+    db: &C,
     entity: &mut CalculationFormula,
 ) -> Result<Uuid, ApiError> {
     // Reuse existing link if present
@@ -520,13 +519,16 @@ async fn ensure_output_parameter(
 
 pub struct CalculationFormulaOperations;
 
-#[async_trait]
 impl CRUDOperations for CalculationFormulaOperations {
     type Resource = CalculationFormula;
 
     /// A slot naming this definition is left as it is: `entry_mode` is the site's own declaration
     /// that it computes the parameter, and it outlives whichever calculation produced it.
-    async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
+    async fn before_delete<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<(), ApiError> {
         db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "DELETE FROM derived_parameter_sources WHERE derived_definition_id = $1",
@@ -538,9 +540,9 @@ impl CRUDOperations for CalculationFormulaOperations {
         Ok(())
     }
 
-    async fn before_create(
+    async fn before_create<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         data: &<CalculationFormula as CRUDResource>::CreateModel,
     ) -> Result<(), ApiError> {
         validate_formula(&data.formula)?;
@@ -552,9 +554,9 @@ impl CRUDOperations for CalculationFormulaOperations {
         Ok(())
     }
 
-    async fn after_create(
+    async fn after_create<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         entity: &mut CalculationFormula,
     ) -> Result<(), ApiError> {
         let resolved = resolve_variables(db, &entity.formula).await?;
@@ -591,9 +593,9 @@ impl CRUDOperations for CalculationFormulaOperations {
         Ok(())
     }
 
-    async fn before_update(
+    async fn before_update<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         id: Uuid,
         data: &<CalculationFormula as CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
@@ -608,9 +610,9 @@ impl CRUDOperations for CalculationFormulaOperations {
         Ok(())
     }
 
-    async fn after_update(
+    async fn after_update<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         entity: &mut CalculationFormula,
     ) -> Result<(), ApiError> {
         let resolved = resolve_variables(db, &entity.formula).await?;
@@ -645,7 +647,11 @@ impl CRUDOperations for CalculationFormulaOperations {
         Ok(())
     }
 
-    async fn after_delete(&self, db: &DatabaseConnection, _id: Uuid) -> Result<(), ApiError> {
+    async fn after_delete<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        _id: Uuid,
+    ) -> Result<(), ApiError> {
         crate::routes::private::tools::calculation_versions::mint_stale_formula_versions(db, None)
             .await
             .map_err(|e| ApiError::bad_request(e.to_string()))

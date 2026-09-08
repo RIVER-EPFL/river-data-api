@@ -645,3 +645,82 @@ async fn a_formula_producing_the_merged_away_parameter_produces_the_survivor() {
         "the formula produces the survivor"
     );
 }
+
+/// Scenario: two catalog entries for one analyte are merged, and later someone has to work out what
+/// happened.
+///
+/// Expected behaviour: one entry under the survivor says the two became one, keeps the row that was
+/// absorbed and the counts of what moved, and names who did it. The per-row triggers see only an
+/// unchanged survivor and a deleted source, which cannot say what to undo (M124). A merge that
+/// fails writes none, because the entry is in the merge's own transaction.
+#[tokio::test]
+#[serial]
+async fn a_merge_leaves_one_entry_naming_both_sides() {
+    let (db, _, _) = setup().await;
+
+    async fn entry(db: &DatabaseConnection) -> Option<sea_orm::QueryResult> {
+        use sea_orm::{ConnectionTrait, Statement};
+        db.query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT subject, change, changed_by, old_value, new_value FROM change_audit \
+             WHERE change = 'parameter_merge' ORDER BY changed_at DESC LIMIT 1"
+                .to_string(),
+        ))
+        .await
+        .expect("the trail is readable")
+    }
+
+    let refused = merge_parameters(
+        &db,
+        &merge_req(
+            crate::common::GLOBAL_PARAM_DO_ID,
+            "00000000-0000-4000-a000-0000000000ff",
+        ),
+        "tester",
+    )
+    .await;
+    assert!(refused.is_err(), "a merge onto an absent target is refused");
+    assert!(
+        entry(&db).await.is_none(),
+        "a refused merge writes no entry"
+    );
+
+    let result = merge_parameters(
+        &db,
+        &merge_req(
+            crate::common::GLOBAL_PARAM_DO_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+        ),
+        "tester",
+    )
+    .await
+    .expect("merge should succeed");
+
+    let row = entry(&db).await.expect("the merge left an entry");
+    let subject: String = row.try_get("", "subject").expect("subject");
+    let changed_by: Option<String> = row.try_get("", "changed_by").expect("changed_by");
+    let old_value: serde_json::Value = row.try_get("", "old_value").expect("old_value");
+    let new_value: serde_json::Value = row.try_get("", "new_value").expect("new_value");
+
+    assert_eq!(
+        subject,
+        format!("parameter:{}", crate::common::GLOBAL_PARAM_TEMP_ID),
+        "the entry is filed under the survivor"
+    );
+    assert_eq!(changed_by.as_deref(), Some("tester"));
+    assert_eq!(
+        old_value["source"]["id"],
+        crate::common::GLOBAL_PARAM_DO_ID,
+        "the entry keeps the row that was absorbed: {old_value}"
+    );
+    assert_eq!(
+        old_value["counts"]["readings_moved"],
+        serde_json::json!(result.readings_moved),
+        "the counts are the ones the merge reported: {old_value}"
+    );
+    assert_eq!(
+        new_value["id"],
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        "and the row that survived: {new_value}"
+    );
+}

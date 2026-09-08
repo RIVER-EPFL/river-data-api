@@ -748,7 +748,7 @@ async fn constant_id(db: &DatabaseConnection, name: &str) -> String {
         &format!(
             "INSERT INTO constants (id, name, value, units, description) \
              VALUES (gen_random_uuid(), '{name}', 0.209446, 'mol/mol', 'oxygen mole fraction') \
-             ON CONFLICT (name) DO NOTHING"
+             ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value"
         ),
     )
     .await;
@@ -813,7 +813,16 @@ async fn a_constant_value_edit_queues_one_audit_naming_it() {
     assert_eq!(queued.len(), 1, "one audit for the change: {queued:?}");
     assert_eq!(queued[0]["constant"], "xO2");
 
-    // The dedupe key coalesces a second edit of the same constant into the pending run.
+    // The key coalesces only while the run is still waiting: a claim releases it, because a change
+    // landing mid-run needs a run of its own. The worker pool is live here, so the pending state is
+    // restored rather than raced for.
+    crate::common::exec(
+        &db,
+        "UPDATE reprocessing_jobs SET status = 'queued', lease_expires_at = NULL, \
+         dedupe_key = 'event_audit:constant:xO2' WHERE trigger_type = 'event_audit'",
+    )
+    .await;
+
     let (status, body) = crate::common::put_json_with_token(
         &app,
         &format!("/api/constants/{id}"),

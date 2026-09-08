@@ -1032,11 +1032,10 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crudcrate"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c1522727d6a5cac975918ccd24a1f927a0e7b023d1c6f2d74366dfb35bc2a91"
+checksum = "30564a4646d54509f42aff2231474b27a6f38743fefdab769a335dc73ebc8b31"
 dependencies = [
- "async-trait",
  "axum",
  "chrono",
  "crudcrate-derive",
@@ -1052,9 +1051,9 @@ dependencies = [
 
 [[package]]
 name = "crudcrate-derive"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e693998c98bf602473a3010eff71d59991857772b5e9e1a3fbd66d847eabf1f2"
+checksum = "f470c64e200acc65c8f8d72002b6f0bb2a5b1d0f00fad5f0b0b29ccd0a78215b"
 dependencies = [
  "convert_case",
  "heck 0.5.0",
@@ -3353,7 +3352,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3614,9 +3613,9 @@ dependencies = [
 
 [[package]]
 name = "river-data-core"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87c9145d9460221ea330b2977751b276f431cbd8d0d999306430b9bd576e37d1"
+checksum = "bae30957f5c28e8d1ed471ed5817552475d890760b4f723e27563de34d38372d"
 dependencies = [
  "async-trait",
  "chrono",

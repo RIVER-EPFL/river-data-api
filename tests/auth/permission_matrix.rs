@@ -128,7 +128,6 @@ impl Caller {
     }
 }
 
-
 // --- The routes ---
 
 /// What a route's scope layer does to a caller whose project access is confined, on top of the
@@ -273,6 +272,10 @@ struct Entity {
     write: Capability,
     token: TokenAccess,
     crud: CrudScope,
+    /// The route families the entity mounts, out of `create`, `read`, `update` and `delete`. An
+    /// entity whose rows are a projection of something else declares fewer, and a family it does
+    /// not mount is not a route at all, so there is no answer for the table to state.
+    families: &'static [&'static str],
 }
 
 fn entities() -> Vec<Entity> {
@@ -282,6 +285,7 @@ fn entities() -> Vec<Entity> {
         write,
         token,
         crud,
+        families: &["create", "read", "update", "delete"],
     };
     let field = |name, crud| {
         entity(
@@ -377,6 +381,10 @@ fn entities() -> Vec<Entity> {
         admin_only("sync_commands"),
         admin_only("sync_events"),
         admin_only("pairing_plans"),
+        Entity {
+            families: &["read", "update"],
+            ..sensor("schedules", CrudScope::Global)
+        },
     ]
 }
 
@@ -404,23 +412,27 @@ fn table() -> Table {
             CrudScope::Global | CrudScope::UnboundIsGlobal => Scope::GlobalCatalog,
             CrudScope::ProjectBound => Scope::UnresolvedProject,
         };
-        t.add(
-            "POST",
-            "crud:create",
-            format!("/api/{}", e.name),
-            e.write,
-            e.token,
-            create,
-        );
-        t.with_body(serde_json::json!({}));
-        t.add(
-            "DELETE",
-            "crud:delete",
-            format!("/api/{}/{MISSING_ID}", e.name),
-            e.write,
-            e.token,
-            delete,
-        );
+        if e.families.contains(&"create") {
+            t.add(
+                "POST",
+                "crud:create",
+                format!("/api/{}", e.name),
+                e.write,
+                e.token,
+                create,
+            );
+            t.with_body(serde_json::json!({}));
+        }
+        if e.families.contains(&"delete") {
+            t.add(
+                "DELETE",
+                "crud:delete",
+                format!("/api/{}/{MISSING_ID}", e.name),
+                e.write,
+                e.token,
+                delete,
+            );
+        }
     }
 
     // /projects and /sites carry read views beside their CRUD.
@@ -726,10 +738,7 @@ fn table() -> Table {
             ("POST", "/api/sync/replicate_audit_holds/{id}/resolve"),
             ("POST", "/api/sync/replicate_audit_holds/{id}/reopen"),
             ("POST", "/api/sync/replicate_audit_holds/acknowledge_bulk"),
-            (
-                "GET",
-                "/api/sync/replicate_reconciliation/duplicate_slots",
-            ),
+            ("GET", "/api/sync/replicate_reconciliation/duplicate_slots"),
             ("GET", "/api/sync/replicate_reconciliation/candidates"),
             ("POST", "/api/sync/replicate_reconciliation"),
             ("GET", "/api/sync/change_proposals"),
@@ -976,7 +985,10 @@ async fn principals(
             Caller::WriteDataToken,
             Some(crate::common::seed_token_write_data_only(db).await),
         ),
-        (Caller::FullToken, Some(crate::common::seed_token_full(db).await)),
+        (
+            Caller::FullToken,
+            Some(crate::common::seed_token_full(db).await),
+        ),
         (
             Caller::SyncSession,
             Some(crate::common::seed_sync_session_token(db).await.0),
@@ -984,8 +996,12 @@ async fn principals(
         (
             Caller::ScopedToken,
             Some(
-                crate::common::seed_api_token(db, crate::common::full_permissions(), Some(PROJECT_ID))
-                    .await,
+                crate::common::seed_api_token(
+                    db,
+                    crate::common::full_permissions(),
+                    Some(PROJECT_ID),
+                )
+                .await,
             ),
         ),
     ];
@@ -1001,7 +1017,10 @@ async fn principals(
                 ensure_realm_user(user, user, &[&level.role().to_string()]).await;
                 grant_project(db, &keycloak_user_id(user).await, PROJECT_ID).await;
             }
-            out.push((Caller::Member(level), Some(get_keycloak_jwt(user, user).await)));
+            out.push((
+                Caller::Member(level),
+                Some(get_keycloak_jwt(user, user).await),
+            ));
         }
     }
     out
@@ -1012,7 +1031,9 @@ async fn principals(
 async fn every_route_answers_every_caller_as_the_policy_says() {
     let with_keycloak = keycloak_reachable().await;
     if !with_keycloak {
-        eprintln!("SKIP levels: keycloak unreachable (start the dev stack, or set TEST_KEYCLOAK_URL)");
+        eprintln!(
+            "SKIP levels: keycloak unreachable (start the dev stack, or set TEST_KEYCLOAK_URL)"
+        );
     }
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
@@ -1069,7 +1090,8 @@ async fn scope_confinement_denies_another_projects_row() {
     grant_project(&db, &keycloak_user_id("manager1").await, PROJECT_ID).await;
     let member = get_keycloak_jwt("manager1", "manager1").await;
     let scoped =
-        crate::common::seed_api_token(&db, crate::common::full_permissions(), Some(PROJECT_ID)).await;
+        crate::common::seed_api_token(&db, crate::common::full_permissions(), Some(PROJECT_ID))
+            .await;
 
     // Two rows per route: the granted project answers, the other one does not.
     let reads = [
@@ -1121,15 +1143,29 @@ async fn scope_confinement_denies_another_projects_row() {
 
     // A name resolves the same way an id does: a site addressed by name outside the grant is no
     // more reachable than one addressed by uuid.
-    let s = status_of(&app, "GET", "/api/sites/Outside%20Site/detail", None, Some(&scoped)).await;
+    let s = status_of(
+        &app,
+        "GET",
+        "/api/sites/Outside%20Site/detail",
+        None,
+        Some(&scoped),
+    )
+    .await;
     assert!(s == 403 || s == 404, "a foreign site by name answers {s}");
 
     // The unconfined half: an unscoped key reaches both projects, so the denials above are
     // confinement rather than the row being unreachable.
-    let unscoped = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let unscoped =
+        crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     for site in [SITE1_ID, OTHER_SITE_ID] {
-        let s = status_of(&app, "GET", &format!("/api/sites/{site}/detail"), None, Some(&unscoped))
-            .await;
+        let s = status_of(
+            &app,
+            "GET",
+            &format!("/api/sites/{site}/detail"),
+            None,
+            Some(&unscoped),
+        )
+        .await;
         assert_eq!(s, 200, "an unscoped key reaches {site}");
     }
 

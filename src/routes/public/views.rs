@@ -541,12 +541,10 @@ pub async fn get_readings(
     let end = end_parsed;
     let format = query.format.to_lowercase();
     let measurement_type = query.measurement_type.as_deref().unwrap_or("");
-    if !measurement_type.is_empty()
-        && !matches!(measurement_type, "continuous" | "spot" | "derived")
-    {
-        return Err(AppError::BadRequest(format!(
-            "invalid measurement_type '{measurement_type}' (expected continuous, spot, or derived)"
-        )));
+    if !measurement_type.is_empty() {
+        crate::routes::private::readings::measurement::validate_measurement_type(Some(
+            measurement_type,
+        ))?;
     }
     let include_measurement_type = query.include_measurement_type.unwrap_or(false);
     let include_sample_stats = query.include_sample_stats.unwrap_or(false);

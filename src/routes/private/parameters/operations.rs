@@ -1,6 +1,5 @@
-use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations};
-use sea_orm::DatabaseConnection;
+use sea_orm::{ConnectionTrait, TransactionTrait};
 use uuid::Uuid;
 
 use super::model::Parameter;
@@ -12,11 +11,25 @@ use crate::routes::private::alarms::sweeper::reconcile_all_from_hook;
 /// immediately instead of waiting for the backstop sweep.
 pub struct ParameterOperations;
 
-#[async_trait]
 impl CRUDOperations for ParameterOperations {
     type Resource = Parameter;
 
-    async fn after_delete(&self, db: &DatabaseConnection, _id: Uuid) -> Result<(), ApiError> {
+    /// The change-audit trigger reads the writer from the transaction, so the label is declared on
+    /// every write this entity makes, before any hook or statement on it (B185).
+    async fn after_begin<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+    ) -> Result<(), ApiError> {
+        crate::common::actor::declare(db)
+            .await
+            .map_err(ApiError::database)
+    }
+
+    async fn after_delete<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        _id: Uuid,
+    ) -> Result<(), ApiError> {
         reconcile_all_from_hook(db).await;
         Ok(())
     }

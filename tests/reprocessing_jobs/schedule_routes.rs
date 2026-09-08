@@ -61,14 +61,14 @@ async fn audit_count(db: &DatabaseConnection, job_name: &str) -> i64 {
 
 #[tokio::test]
 #[serial]
-async fn patch_recomputes_next_run_on_interval_change() {
+async fn an_interval_change_recomputes_next_run() {
     let (db, app, token) = setup().await;
     insert_schedule(&db, JOB, 3600).await;
 
     let before = next_run_at(&db, JOB).await;
 
     // Lower the interval, next_run_at should snap to now + the new (shorter) interval.
-    let (status, body) = crate::common::patch_json_with_token(
+    let (status, body) = crate::common::put_json_with_token(
         &app,
         &format!("/api/schedules/{JOB}"),
         &serde_json::json!({ "interval_seconds": 60 }),
@@ -95,11 +95,11 @@ async fn patch_recomputes_next_run_on_interval_change() {
 
 #[tokio::test]
 #[serial]
-async fn patch_interval_zero_is_rejected() {
+async fn an_interval_of_zero_is_rejected() {
     let (db, app, token) = setup().await;
     insert_schedule(&db, JOB, 3600).await;
 
-    let (status, _body) = crate::common::patch_json_with_token(
+    let (status, _body) = crate::common::put_json_with_token(
         &app,
         &format!("/api/schedules/{JOB}"),
         &serde_json::json!({ "interval_seconds": 0 }),
@@ -112,10 +112,10 @@ async fn patch_interval_zero_is_rejected() {
 
 #[tokio::test]
 #[serial]
-async fn patch_unknown_job_name_is_404() {
+async fn an_unknown_job_name_is_404() {
     let (db, app, token) = setup().await;
     // No row for this job_name.
-    let (status, _body) = crate::common::patch_json_with_token(
+    let (status, _body) = crate::common::put_json_with_token(
         &app,
         "/api/schedules/no_such_service",
         &serde_json::json!({ "enabled": false }),
@@ -128,11 +128,11 @@ async fn patch_unknown_job_name_is_404() {
 
 #[tokio::test]
 #[serial]
-async fn patch_invalid_tunables_is_400_with_message() {
+async fn invalid_tunables_are_400_with_message() {
     let (db, app, token) = setup().await;
     insert_schedule(&db, JOB, 3600).await;
 
-    let (status, body) = crate::common::patch_json_with_token(
+    let (status, body) = crate::common::put_json_with_token(
         &app,
         &format!("/api/schedules/{JOB}"),
         &serde_json::json!({ "tunables": { "retention_days": -5 } }),
@@ -155,7 +155,7 @@ async fn patch_invalid_tunables_is_400_with_message() {
         "a rejected PATCH writes no audit row"
     );
 
-    let (status, body) = crate::common::patch_json_with_token(
+    let (status, body) = crate::common::put_json_with_token(
         &app,
         &format!("/api/schedules/{JOB}"),
         &serde_json::json!({ "tunables": { "retention_dayz": 7 } }),
@@ -178,11 +178,36 @@ async fn patch_invalid_tunables_is_400_with_message() {
 
 #[tokio::test]
 #[serial]
-async fn patch_valid_tunables_persist_and_audit_row_written() {
+async fn an_edit_answers_with_the_row_a_read_would() {
+    let (db, app, token) = setup().await;
+    insert_schedule(&db, JOB, 600).await;
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/schedules/{JOB}"),
+        &serde_json::json!({ "enabled": true }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let updated: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        updated["tunables_schema"].is_array(),
+        "the edit's answer carries what the form renders: {updated}"
+    );
+    assert!(
+        updated["running"].is_boolean(),
+        "and whether a run is in flight: {updated}"
+    );
+    crate::common::cleanup_test_db(&db).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn valid_tunables_persist_and_leave_an_audit_row() {
     let (db, app, token) = setup().await;
     insert_schedule(&db, JOB, 3600).await;
 
-    let (status, body) = crate::common::patch_json_with_token(
+    let (status, body) = crate::common::put_json_with_token(
         &app,
         &format!("/api/schedules/{JOB}"),
         &serde_json::json!({ "tunables": { "retention_days": 30 } }),
@@ -352,7 +377,11 @@ async fn a_schedule_states_the_tunables_its_job_accepts() {
         .find(|r| r["job_name"] == serde_json::json!(JOB))
         .expect("the janitor is listed");
     let specs = janitor["tunables_schema"].as_array().expect("a spec list");
-    assert_eq!(specs.len(), 1, "the janitor declares one tunable: {janitor}");
+    assert_eq!(
+        specs.len(),
+        1,
+        "the janitor declares one tunable: {janitor}"
+    );
     assert_eq!(specs[0]["key"], serde_json::json!("retention_days"));
     assert_eq!(specs[0]["kind"]["type"], serde_json::json!("integer"));
     assert_eq!(specs[0]["min"], serde_json::json!(1));

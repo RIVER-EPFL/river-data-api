@@ -13,7 +13,7 @@ use crate::common::bulk_write;
 use crate::error::AppResult;
 
 /// Grabs are spot measurements: a bottle, not a logger cadence.
-pub const SPOT: &str = "spot";
+pub const SPOT: &str = river_data_core::models::MeasurementType::Spot.as_str();
 
 /// How many readings sharing a slot instant make a sample. A single measurement is a reading, not
 /// a group of them: mean, min and max would be the value and sd undefined, so the row would only
@@ -146,7 +146,10 @@ mod tests {
     #[test]
     fn a_group_is_two_or_more_readings() {
         assert!(!forms_sample(0), "an empty group is not a sample");
-        assert!(!forms_sample(1), "a single measurement is the reading itself");
+        assert!(
+            !forms_sample(1),
+            "a single measurement is the reading itself"
+        );
         assert!(forms_sample(2), "two readings at one instant are a group");
         assert!(forms_sample(3));
         assert_eq!(MIN_REPLICATES, 2);
@@ -171,6 +174,9 @@ mod tests {
             sql.contains("r.sample_id IS NULL"),
             "already-stamped readings are not regrouped: {sql}"
         );
-        assert!(sql.contains("r.stream_id = $1"), "the caller's scope applies: {sql}");
+        assert!(
+            sql.contains("r.stream_id = $1"),
+            "the caller's scope applies: {sql}"
+        );
     }
 }

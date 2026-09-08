@@ -5,7 +5,7 @@ use axum::{
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
-    FromQueryResult, QueryFilter, Set, Statement,
+    FromQueryResult, QueryFilter, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -319,9 +319,7 @@ pub async fn stream_stats(
             [id.into()],
         ))
         .await?;
-    let latest_value: Option<f64> = latest_row
-        .map(|r| r.try_get("", "raw_value"))
-        .transpose()?;
+    let latest_value: Option<f64> = latest_row.map(|r| r.try_get("", "raw_value")).transpose()?;
 
     Ok(Json(StreamStatsResponse {
         stream_id: id,
@@ -560,13 +558,9 @@ pub async fn register_stream(
     ProjectScope(scope): ProjectScope,
     Json(mut payload): Json<RegisterStreamRequest>,
 ) -> AppResult<Json<DataStream>> {
-    if let Some(mt) = payload.measurement_type.as_deref()
-        && !matches!(mt, "continuous" | "spot" | "derived")
-    {
-        return Err(AppError::BadRequest(format!(
-            "invalid measurement_type '{mt}' (expected continuous, spot, or derived)"
-        )));
-    }
+    crate::routes::private::readings::measurement::validate_measurement_type(
+        payload.measurement_type.as_deref(),
+    )?;
     if let Some(spec) = payload.replicates.as_mut() {
         spec.validate(payload.measurement_type.as_deref())?;
         // The stored column-to-index mapping is authoritative and append-only: readings carry
@@ -1150,46 +1144,43 @@ pub async fn retag_streams(
             "provide stream_ids and/or source_system".to_string(),
         ));
     }
-    if !matches!(
-        req.measurement_type.as_str(),
-        "continuous" | "spot" | "derived" | "declared"
-    ) {
-        return Err(AppError::BadRequest(format!(
-            "invalid measurement_type '{}' (expected continuous, spot, derived, or declared)",
-            req.measurement_type
-        )));
+    if let Some(reason) =
+        crate::routes::private::readings::measurement::retag_target_rejection(&req.measurement_type)
+    {
+        return Err(AppError::BadRequest(reason));
     }
 
     // "declared" writes nothing to `data_streams`; it aligns each reading with its own stream's
     // declaration, which for a family stream is already spot.
-    let streams_updated = if req.measurement_type == "declared" {
-        0
-    } else {
-        if req.measurement_type != "spot" {
-            let families = super::replicates::family_keys_in_streams(
-                &state.db,
-                &req.stream_ids,
-                req.source_system.as_deref(),
-            )
-            .await?;
-            super::replicates::refuse_family_retag(&families, &req.measurement_type)?;
-        }
+    let streams_updated =
+        if req.measurement_type == crate::routes::private::readings::measurement::RETAG_DECLARED {
+            0
+        } else {
+            if req.measurement_type != "spot" {
+                let families = super::replicates::family_keys_in_streams(
+                    &state.db,
+                    &req.stream_ids,
+                    req.source_system.as_deref(),
+                )
+                .await?;
+                super::replicates::refuse_family_retag(&families, &req.measurement_type)?;
+            }
 
-        state
-            .db
-            .execute_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE data_streams SET measurement_type = $1, updated_at = now() \
+            state
+                .db
+                .execute_raw(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "UPDATE data_streams SET measurement_type = $1, updated_at = now() \
                  WHERE id = ANY($2) OR ($3::text IS NOT NULL AND source_system = $3)",
-                [
-                    req.measurement_type.clone().into(),
-                    req.stream_ids.clone().into(),
-                    req.source_system.clone().into(),
-                ],
-            ))
-            .await?
-            .rows_affected()
-    };
+                    [
+                        req.measurement_type.clone().into(),
+                        req.stream_ids.clone().into(),
+                        req.source_system.clone().into(),
+                    ],
+                ))
+                .await?
+                .rows_affected()
+        };
 
     let job_id = if req.retag_existing {
         crate::routes::private::reprocessing_jobs::worker::enqueue(
@@ -1495,7 +1486,10 @@ async fn resolve_retire_target<C: ConnectionTrait>(
 ///
 /// A slot the scope cannot resolve reports an empty range rather than an error, so retiring a row
 /// that is already gone is not a failure.
-pub async fn retire_slot(db: &DatabaseConnection, scope: SlotScope) -> AppResult<TouchedRange> {
+pub async fn retire_slot<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    scope: SlotScope,
+) -> AppResult<TouchedRange> {
     let touched = bulk_write::guarded(db, async |txn| {
         let Some(target) = resolve_retire_target(txn, scope).await? else {
             return Ok(TouchedRange::default());

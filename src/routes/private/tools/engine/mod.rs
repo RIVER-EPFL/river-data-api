@@ -530,8 +530,8 @@ fn name_pairs(raw: &serde_json::Value) -> Vec<(String, String)> {
 }
 
 /// The formulas attached to the given calculations, as `(script_id, formula)` pairs.
-pub async fn load_formulas(
-    db: &DatabaseConnection,
+pub async fn load_formulas<C: ConnectionTrait>(
+    db: &C,
     script_ids: &[Uuid],
 ) -> AppResult<Vec<(Uuid, super::formula::PinnedFormula)>> {
     if script_ids.is_empty() {

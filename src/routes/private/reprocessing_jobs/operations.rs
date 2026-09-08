@@ -1,6 +1,5 @@
-use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::DatabaseConnection;
+use sea_orm::{ConnectionTrait, TransactionTrait};
 
 use super::model::ReprocessingJob;
 use super::registry;
@@ -10,13 +9,12 @@ use super::registry;
 /// from a copy of the lists.
 pub struct ReprocessingJobOperations;
 
-#[async_trait]
 impl CRUDOperations for ReprocessingJobOperations {
     type Resource = ReprocessingJob;
 
-    async fn after_get_one(
+    async fn after_get_one<C: ConnectionTrait + TransactionTrait>(
         &self,
-        _db: &DatabaseConnection,
+        _db: &C,
         entity: &mut ReprocessingJob,
     ) -> Result<(), ApiError> {
         entity.rerunnable = registry::is_rerunnable(&entity.trigger_type);
@@ -24,9 +22,9 @@ impl CRUDOperations for ReprocessingJobOperations {
         Ok(())
     }
 
-    async fn after_get_all(
+    async fn after_get_all<C: ConnectionTrait + TransactionTrait>(
         &self,
-        _db: &DatabaseConnection,
+        _db: &C,
         entities: &mut Vec<<ReprocessingJob as CRUDResource>::ListModel>,
     ) -> Result<(), ApiError> {
         for entity in entities {

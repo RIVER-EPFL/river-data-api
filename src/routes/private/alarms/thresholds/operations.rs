@@ -1,6 +1,5 @@
-use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations};
-use sea_orm::DatabaseConnection;
+use sea_orm::{ConnectionTrait, TransactionTrait};
 use uuid::Uuid;
 
 use super::model::AlarmThreshold;
@@ -12,29 +11,32 @@ use crate::routes::private::alarms::sweeper::reconcile_all_from_hook;
 /// fans out across every site carrying the parameter anyway.
 pub struct AlarmThresholdOperations;
 
-#[async_trait]
 impl CRUDOperations for AlarmThresholdOperations {
     type Resource = AlarmThreshold;
 
-    async fn after_create(
+    async fn after_create<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         _entity: &mut AlarmThreshold,
     ) -> Result<(), ApiError> {
         reconcile_all_from_hook(db).await;
         Ok(())
     }
 
-    async fn after_update(
+    async fn after_update<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         _entity: &mut AlarmThreshold,
     ) -> Result<(), ApiError> {
         reconcile_all_from_hook(db).await;
         Ok(())
     }
 
-    async fn after_delete(&self, db: &DatabaseConnection, _id: Uuid) -> Result<(), ApiError> {
+    async fn after_delete<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        _id: Uuid,
+    ) -> Result<(), ApiError> {
         reconcile_all_from_hook(db).await;
         Ok(())
     }

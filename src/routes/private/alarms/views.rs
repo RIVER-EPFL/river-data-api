@@ -12,9 +12,9 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::common::paging::Window;
 use crate::common::bulk;
 use crate::common::middleware::{AuthContext, ProjectScope};
+use crate::common::paging::Window;
 use crate::common::scope::{
     Unowned, project_filter_sql, project_of_alarm_event, require_row_in_scope,
 };
@@ -28,8 +28,7 @@ use super::thresholds::resolution::ResolvedThreshold;
 use super::types::{
     AcknowledgedAlarmResponse, ActiveAlarm, ActiveAlarmsResponse, AlarmEventResponse,
     AlarmEventsQuery, AlarmEventsResponse, AlarmSeverityCounts, AlarmSiteSummary,
-    AlarmSummaryResponse, AlarmViolationsResponse, ParameterViolationData,
-    SiteAlarmsQuery,
+    AlarmSummaryResponse, AlarmViolationsResponse, ParameterViolationData, SiteAlarmsQuery,
 };
 use crate::routes::private::sites::types::{ProjectRef, SiteRef};
 
@@ -488,8 +487,8 @@ impl ActiveAlarmRow {
 /// set" so the persisted events never diverge from what `/alarms/active` would compute.
 /// `spot` selects the cadence lens: grab series and sensor series are evaluated independently,
 /// so a monthly grab can neither mask nor phantom-resolve a sensor breach.
-pub(crate) async fn fetch_active_alarm_rows(
-    db: &sea_orm::DatabaseConnection,
+pub(crate) async fn fetch_active_alarm_rows<C: ConnectionTrait>(
+    db: &C,
     scope: &crate::common::authz::AccessScope,
     slots: Option<&[(Uuid, Uuid)]>,
     spot: bool,

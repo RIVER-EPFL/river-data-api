@@ -1,7 +1,6 @@
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement, TransactionTrait};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -9,16 +8,15 @@ use super::model::Sensor;
 
 pub struct SensorOperations;
 
-#[async_trait]
 impl CRUDOperations for SensorOperations {
     type Resource = Sensor;
 
     /// Mirrors `/sensors/retag_frequency`: a sensor reaching a replicate-family stream cannot be
     /// classified high-frequency through entity CRUD either, so the two routes to the same column
     /// hold the same rule.
-    async fn before_update(
+    async fn before_update<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         id: Uuid,
         data: &<Sensor as CRUDResource>::UpdateModel,
     ) -> Result<(), crudcrate::ApiError> {
@@ -32,7 +30,7 @@ impl CRUDOperations for SensorOperations {
                 .map_err(|e| crudcrate::ApiError::internal(e.to_string(), None))?;
             crate::routes::private::data_streams::replicates::refuse_family_retag(
                 &families,
-                "continuous",
+                river_data_core::models::MeasurementType::Continuous.as_str(),
             )
             .map_err(|e| crudcrate::ApiError::bad_request(e.to_string()))?;
         }
@@ -41,7 +39,11 @@ impl CRUDOperations for SensorOperations {
 
     /// The dependent tables all reference sensors without ON DELETE, so the constraint would
     /// refuse this anyway; the check turns that into a stated 400 instead of an internal error.
-    async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
+    async fn before_delete<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<(), ApiError> {
         let blocking = db
             .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
@@ -78,9 +80,9 @@ impl CRUDOperations for SensorOperations {
         Ok(())
     }
 
-    async fn after_get_one(
+    async fn after_get_one<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         entity: &mut Sensor,
     ) -> Result<(), ApiError> {
         let mut enriched = enrich(db, &[entity.id]).await?;
@@ -90,9 +92,9 @@ impl CRUDOperations for SensorOperations {
         Ok(())
     }
 
-    async fn after_get_all(
+    async fn after_get_all<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         entities: &mut Vec<<Sensor as CRUDResource>::ListModel>,
     ) -> Result<(), ApiError> {
         if entities.is_empty() {
@@ -205,8 +207,8 @@ impl Enrichment {
 /// Summaries instead of an unbounded readings scan, whose planning cost grows with the
 /// hypertable's chunk count: the count is the hourly rollup's population plus recent spot rows,
 /// and the newest instant is the stream ingest cursor with the rollup's newest bucket as fallback.
-async fn enrich(
-    db: &DatabaseConnection,
+async fn enrich<C: ConnectionTrait>(
+    db: &C,
     ids: &[Uuid],
 ) -> Result<HashMap<Uuid, Enrichment>, ApiError> {
     let mut out: HashMap<Uuid, Enrichment> = HashMap::new();

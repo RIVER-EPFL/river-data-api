@@ -1803,12 +1803,14 @@ impl Job for MeasurementRetag {
         let target = params
             .get("target")
             .and_then(serde_json::Value::as_str)
-            .filter(|t| matches!(*t, "continuous" | "spot" | "derived" | "declared"))
+            .filter(|t| {
+                crate::routes::private::readings::measurement::retag_target_rejection(t).is_none()
+            })
             .ok_or_else(|| DbErr::Custom("measurement_retag needs target".to_string()))?
             .to_string();
         // 'declared' aligns each reading with its own stream's classification, for source systems
         // that mix grab and logger columns.
-        let declared = target == "declared";
+        let declared = target == crate::routes::private::readings::measurement::RETAG_DECLARED;
         let sensor_ids = uuid_array(params, "sensor_ids");
         let stream_ids = uuid_array(params, "stream_ids");
         let source_system = params

@@ -1,6 +1,5 @@
-use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, Statement};
+use sea_orm::{ConnectionTrait, EntityTrait, FromQueryResult, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use super::group_model::ParameterGroup;
@@ -10,7 +9,7 @@ use super::rules::{self, Member, Role};
 pub struct ParameterGroupOperations;
 
 /// One membership row by id, reduced to what the reshape rules read.
-async fn member_row(db: &DatabaseConnection, id: Uuid) -> Result<Option<Member>, ApiError> {
+async fn member_row<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<Option<Member>, ApiError> {
     let Some(row) = super::member_model::Entity::find_by_id(id)
         .one(db)
         .await
@@ -37,7 +36,7 @@ struct MembershipRow {
 }
 
 /// Every membership row, reduced to what the reshape rules read.
-async fn all_members(db: &DatabaseConnection) -> Result<Vec<Member>, ApiError> {
+async fn all_members<C: ConnectionTrait>(db: &C) -> Result<Vec<Member>, ApiError> {
     let rows = db
         .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -63,8 +62,8 @@ async fn all_members(db: &DatabaseConnection) -> Result<Vec<Member>, ApiError> {
 
 /// The candidate's catalog code, and the codes of the group's members entered several times. The
 /// statistics rule reads both: what is being added, and what the group already computes.
-async fn codes_for_statistics_rule(
-    db: &DatabaseConnection,
+async fn codes_for_statistics_rule<C: ConnectionTrait>(
+    db: &C,
     group_id: Uuid,
     parameter_id: Uuid,
 ) -> Result<(String, Vec<String>), ApiError> {
@@ -93,13 +92,27 @@ async fn codes_for_statistics_rule(
     Ok((code, replicated))
 }
 
-#[async_trait]
 impl CRUDOperations for ParameterGroupOperations {
     type Resource = ParameterGroup;
 
+    /// The change-audit trigger reads the writer from the transaction, so the label is declared on
+    /// every write this entity makes, before any hook or statement on it (B185).
+    async fn after_begin<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+    ) -> Result<(), ApiError> {
+        crate::common::actor::declare(db)
+            .await
+            .map_err(ApiError::database)
+    }
+
     /// The FK is `ON DELETE RESTRICT`, which would surface as a raw 500; the rule says what to do
     /// about it instead.
-    async fn before_delete(&self, db: &DatabaseConnection, id: Uuid) -> Result<(), ApiError> {
+    async fn before_delete<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<(), ApiError> {
         rules::may_delete(id, &all_members(db).await?)
             .map_err(|refusal| ApiError::bad_request(refusal.to_string()))
     }
@@ -107,16 +120,26 @@ impl CRUDOperations for ParameterGroupOperations {
 
 pub struct ParameterGroupMemberOperations;
 
-#[async_trait]
 impl CRUDOperations for ParameterGroupMemberOperations {
     type Resource = ParameterGroupMember;
+
+    /// The change-audit trigger reads the writer from the transaction, so the label is declared on
+    /// every write this entity makes, before any hook or statement on it (B185).
+    async fn after_begin<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+    ) -> Result<(), ApiError> {
+        crate::common::actor::declare(db)
+            .await
+            .map_err(ApiError::database)
+    }
 
     /// A parameter belongs to at most one group. The UNIQUE index is the backstop; this names the
     /// group that already holds it. A group's replicated members carry their own mean and sd, so
     /// the catalog parameters the portals stored those in are refused as members.
-    async fn before_create(
+    async fn before_create<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         data: &<ParameterGroupMember as CRUDResource>::CreateModel,
     ) -> Result<(), ApiError> {
         if Role::parse(&data.role).is_none() {
@@ -137,9 +160,9 @@ impl CRUDOperations for ParameterGroupMemberOperations {
     /// The role CHECK is the backstop; this names the value instead of raising a raw 500. A move
     /// between groups is the reshape, so it is held to [`rules::may_move`]: an `output` does not
     /// leave while a calculation in its group still writes it.
-    async fn before_update(
+    async fn before_update<C: ConnectionTrait + TransactionTrait>(
         &self,
-        db: &DatabaseConnection,
+        db: &C,
         id: Uuid,
         data: &<ParameterGroupMember as CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
