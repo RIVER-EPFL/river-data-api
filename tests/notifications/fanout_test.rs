@@ -3,7 +3,7 @@
 //! to enabled + subscribed. A site-level "off" override suppresses that site only; a system-wide
 //! alert (no slot) ignores per-slot overrides.
 
-use river_db::routes::private::notifications::{KindGroup, Slot, web_push::slot_subscriptions};
+use river_db::routes::private::notifications::{Slot, web_push::slot_subscriptions};
 use sea_orm::DatabaseConnection;
 use serial_test::serial;
 
@@ -33,8 +33,8 @@ async fn mute_site(db: &DatabaseConnection, sub: &str) {
     crate::common::exec(
         db,
         &format!(
-            "INSERT INTO notification_subscriptions (keycloak_sub, kind_group, site_id, enabled) \
-             VALUES ('{sub}', 'alarms', '{site}', FALSE)",
+            "INSERT INTO notification_subscriptions (keycloak_sub, channel, site_id, enabled) \
+             VALUES ('{sub}', 'alarm_opened', '{site}', FALSE)",
             site = crate::common::SITE1_ID,
         ),
     )
@@ -72,7 +72,7 @@ async fn web_push_fanout_respects_subscription_and_channel_toggle() {
         parameter_id: crate::common::GLOBAL_PARAM_TURB_ID.parse().unwrap(),
     };
 
-    let scoped = slot_subscriptions(&db, &Some(slot), Some(KindGroup::Alarms))
+    let scoped = slot_subscriptions(&db, &Some(slot), "alarm_opened")
         .await
         .unwrap();
     assert_eq!(
@@ -81,7 +81,7 @@ async fn web_push_fanout_respects_subscription_and_channel_toggle() {
         "only the subscribed, push-enabled endpoint"
     );
 
-    let all = slot_subscriptions(&db, &None, None).await.unwrap();
+    let all = slot_subscriptions(&db, &None, "test").await.unwrap();
     assert_eq!(
         endpoints(&all),
         vec!["https://push.example.com/a", "https://push.example.com/b"],
@@ -94,25 +94,25 @@ async fn web_push_fanout_respects_subscription_and_channel_toggle() {
 /// alarms alone.
 #[tokio::test]
 #[serial]
-async fn groups_default_alarms_on_and_sync_off() {
+async fn channels_default_alarms_on_and_the_rest_off() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
 
     push_sub(&db, "sub-quiet", "https://push.example.com/quiet").await;
     push_sub(&db, "sub-loud", "https://push.example.com/loud").await;
-    // Only "loud" asks for the sync group, and it turns the alarm group off site-wide.
+    // Only "loud" asks for the sync-silence channel, and it turns alarms off site-wide.
     crate::common::exec(
         &db,
-        "INSERT INTO notification_subscriptions (keycloak_sub, kind_group, enabled) \
-         VALUES ('sub-loud', 'sync', TRUE)",
+        "INSERT INTO notification_subscriptions (keycloak_sub, channel, enabled) \
+         VALUES ('sub-loud', 'sync_stale', TRUE)",
     )
     .await;
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO notification_subscriptions (keycloak_sub, kind_group, site_id, enabled) \
-             VALUES ('sub-loud', 'alarms', '{site}', FALSE)",
+            "INSERT INTO notification_subscriptions (keycloak_sub, channel, site_id, enabled) \
+             VALUES ('sub-loud', 'alarm_opened', '{site}', FALSE)",
             site = crate::common::SITE1_ID,
         ),
     )
@@ -124,7 +124,7 @@ async fn groups_default_alarms_on_and_sync_off() {
         parameter_id: crate::common::GLOBAL_PARAM_TURB_ID.parse().unwrap(),
     };
 
-    let alarms = slot_subscriptions(&db, &Some(slot.clone()), Some(KindGroup::Alarms))
+    let alarms = slot_subscriptions(&db, &Some(slot.clone()), "alarm_opened")
         .await
         .unwrap();
     assert_eq!(
@@ -133,21 +133,21 @@ async fn groups_default_alarms_on_and_sync_off() {
         "alarms reach the subscriber with no rows and skip the one who turned this site off"
     );
 
-    let sync_slot = slot_subscriptions(&db, &Some(slot), Some(KindGroup::Sync))
+    let sync_slot = slot_subscriptions(&db, &Some(slot), "sync_stale")
         .await
         .unwrap();
     assert_eq!(
         endpoints(&sync_slot),
         vec!["https://push.example.com/loud"],
-        "the sync group reaches only who asked for it, and the alarm mute does not apply"
+        "a sync channel reaches only who asked for it, and the alarm mute does not apply"
     );
 
-    let sync_wide = slot_subscriptions(&db, &None, Some(KindGroup::Sync))
+    let sync_wide = slot_subscriptions(&db, &None, "sync_stale")
         .await
         .unwrap();
     assert_eq!(
         endpoints(&sync_wide),
         vec!["https://push.example.com/loud"],
-        "a system-wide sync alert answers to the group-wide row"
+        "a system-wide sync alert answers to the channel-wide row"
     );
 }

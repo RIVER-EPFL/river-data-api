@@ -310,6 +310,7 @@ impl PlanWarning {
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanCurveRef {
     pub id: Uuid,
+    #[schema(required)]
     pub name: Option<String>,
     pub slope: f64,
     pub intercept: f64,
@@ -360,6 +361,7 @@ pub struct InstrumentNameConflict {
     pub id: Uuid,
     pub name: String,
     /// Where it came from, so an operator can tell a hand entry from an earlier import.
+    #[schema(required)]
     pub source_system: Option<String>,
     /// True when it already carries readings; attaching adds to them.
     pub has_readings: bool,

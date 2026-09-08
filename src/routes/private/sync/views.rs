@@ -136,6 +136,7 @@ pub struct CreatePairingPlanRequest {
 pub struct PlanJobQueued {
     /// Absent when the same action was already queued: `enqueue` dedupes rather than raising a
     /// second job for one plan.
+    #[schema(required)]
     pub job_id: Option<Uuid>,
     pub status: String,
 }
@@ -186,6 +187,7 @@ struct PlanSiteDeviceRow {
 #[derive(Serialize, ToSchema)]
 pub struct PlanSiteDevice {
     pub serial: String,
+    #[schema(required)]
     pub model: Option<String>,
     pub streams: i64,
 }
@@ -194,16 +196,27 @@ pub struct PlanSiteDevice {
 #[derive(Serialize, ToSchema)]
 pub struct PlanSiteMetadata {
     pub site_name: String,
+    #[schema(required)]
     pub latitude: Option<f64>,
+    #[schema(required)]
     pub longitude: Option<f64>,
+    #[schema(required)]
     pub altitude_m: Option<f64>,
+    #[schema(required)]
     pub glacier_name: Option<String>,
+    #[schema(required)]
     pub glacier_rgi: Option<String>,
+    #[schema(required)]
     pub location_type: Option<String>,
+    #[schema(required)]
     pub catchment: Option<String>,
+    #[schema(required)]
     pub full_name: Option<String>,
+    #[schema(required)]
     pub elevation: Option<f64>,
+    #[schema(required)]
     pub channel_id: Option<String>,
+    #[schema(required)]
     pub sample_interval_sec: Option<i64>,
     pub devices: Vec<PlanSiteDevice>,
 }
@@ -1291,7 +1304,9 @@ pub async fn plan_site_metadata(
 pub struct PlanInstrumentGroup {
     /// The decision's scope: `column:<curve column>` or `parameter:<source parameter>`, matching
     /// what an update to any member stream settles. Absent for an unbound instrument.
+    #[schema(required)]
     pub scope: Option<String>,
+    #[schema(required)]
     pub instrument_id: Option<Uuid>,
     pub name: String,
     pub source_key: String,
@@ -1301,19 +1316,23 @@ pub struct PlanInstrumentGroup {
     pub confirmed: bool,
     /// Whether readings under this decision will store a `standard_curve_id`.
     pub stamps_readings: bool,
+    #[schema(required)]
     pub curve_column: Option<String>,
     pub stream_count: usize,
     pub parameters: Vec<String>,
     pub site_count: usize,
     /// A stream to address an update to; every entry in the same scope moves with it.
+    #[schema(required)]
     pub anchor_stream_id: Option<Uuid>,
     pub curves: Vec<crate::routes::private::sync::service::PlanCurveRef>,
     /// What this decision proposed creating, kept through an attach so the picker can offer it
     /// back. Absent for an instrument that was never a proposal.
+    #[schema(required)]
     pub proposed_name: Option<String>,
     /// An instrument already carrying the proposed name, when the proposal collides with one.
     /// The row is then a choice (attach, or create a second) rather than a suggestion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub name_conflict: Option<crate::routes::private::sync::service::InstrumentNameConflict>,
 }
 
@@ -1333,6 +1352,7 @@ pub struct PlanUnassignedParameter {
     /// An instrument already carrying that name. Accepting the suggestion would create a second
     /// one beside it, so the row asks instead of suggesting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub name_conflict: Option<crate::routes::private::sync::service::InstrumentNameConflict>,
 }
 
@@ -1342,10 +1362,13 @@ pub struct PlanUnassignedParameter {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PlanCurveAssignment {
     pub id: Uuid,
+    #[schema(required)]
     pub name: Option<String>,
     pub slope: f64,
     pub intercept: f64,
+    #[schema(required)]
     pub r_squared: Option<f64>,
+    #[schema(required)]
     pub source_key: Option<String>,
     pub sensor_id: Uuid,
     pub instrument_name: String,
@@ -1354,7 +1377,9 @@ pub struct PlanCurveAssignment {
     pub reading_count: i64,
     /// The instrument this plan will move the curve onto when applied, by `source_key`, and the
     /// name the plan proposes for it. Absent when no assignment is pending.
+    #[schema(required)]
     pub pending_source_key: Option<String>,
+    #[schema(required)]
     pub pending_instrument_name: Option<String>,
 }
 
@@ -1370,9 +1395,12 @@ pub struct PlanCurveAssignment {
 pub struct PlanDeviceGroup {
     pub site: String,
     pub serial: String,
+    #[schema(required)]
     pub model: Option<String>,
     /// The inventory row this serial already resolves to, when it has one.
+    #[schema(required)]
     pub instrument_id: Option<Uuid>,
+    #[schema(required)]
     pub instrument_name: Option<String>,
     pub parameters: Vec<String>,
     pub stream_count: usize,

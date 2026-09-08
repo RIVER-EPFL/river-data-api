@@ -910,7 +910,9 @@ fn require_any_or_unbound(projects: Vec<Uuid>, what: &str) -> ScopeOutcome {
 }
 
 /// All distinct non-NULL `project_id`s a scope query resolves. A DB error yields an empty set, which
-/// the callers treat as unresolved → fail closed.
+/// the callers treat as unresolved → fail closed, and a row that will not decode is dropped for the
+/// same reason: every caller reads this set as what the principal may reach, so a short set refuses
+/// and never grants.
 async fn distinct_projects(db: &sea_orm::DatabaseConnection, sql: &str, id: Uuid) -> Vec<Uuid> {
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
     db.query_all_raw(Statement::from_sql_and_values(

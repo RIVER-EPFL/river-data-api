@@ -29,13 +29,24 @@ pub struct DeclareSdEstimatorRequest {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct DeclareSdEstimatorResponse {
     pub site_parameter_id: Uuid,
+    #[schema(required)]
     pub estimator: Option<String>,
+    #[schema(required)]
     pub previous: Option<String>,
     /// Samples the retag will recompute; 0 when clearing or nothing disagrees.
     pub samples_affected: i64,
     /// The tracked `sd_estimator_retag` job, present when a recompute was enqueued.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub job_id: Option<Uuid>,
+}
+
+/// The slot an estimator declaration is written onto, as it stands before the write.
+#[derive(FromQueryResult)]
+struct SlotDeclaration {
+    site_id: Uuid,
+    parameter_id: Uuid,
+    sd_estimator: Option<String>,
 }
 
 #[utoipa::path(
@@ -78,9 +89,11 @@ pub async fn declare_sd_estimator(
                     ))
                     .await?
                     .ok_or_else(|| sea_orm::DbErr::RecordNotFound(id.to_string()))?;
-                let site_id: Uuid = row.try_get("", "site_id")?;
-                let parameter_id: Uuid = row.try_get("", "parameter_id")?;
-                let previous: Option<String> = row.try_get("", "sd_estimator")?;
+                let SlotDeclaration {
+                    site_id,
+                    parameter_id,
+                    sd_estimator: previous,
+                } = SlotDeclaration::from_query_result(&row, "")?;
 
                 txn.execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
@@ -182,6 +195,7 @@ pub struct RetagSdEstimatorResponse {
     pub instant_decisions: i64,
     /// The tracked `sd_estimator_retag` job, present when something needed recomputing.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub job_id: Option<Uuid>,
 }
 

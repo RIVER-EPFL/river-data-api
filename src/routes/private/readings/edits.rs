@@ -279,6 +279,7 @@ pub struct InspectedRow {
     pub options: Vec<EditOption>,
     /// The run to reopen, when the route is the tool.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub tool_run_id: Option<Uuid>,
 }
 

@@ -228,6 +228,24 @@ mod kind_tests {
     }
 }
 
+#[derive(Debug, FromQueryResult)]
+struct InstrumentKindRow {
+    kind: Option<String>,
+    name: Option<String>,
+    is_lab_instrument: Option<bool>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct SlotNamesRow {
+    site_name: String,
+    parameter_name: String,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct FirstReadingRow {
+    first_reading: Option<DateTime<Utc>>,
+}
+
 /// Refuse an instrument nothing measures on, for the writes that name one: a slot's declaration
 /// and a deployment. `subject` names the write in the message, since the operator picked the row
 /// from a list and needs to be told why this one is not an answer.
@@ -236,24 +254,19 @@ pub async fn require_measuring_instrument<C: ConnectionTrait>(
     sensor_id: Uuid,
     subject: &str,
 ) -> AppResult<()> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT kind, name, is_lab_instrument FROM sensors WHERE id = $1",
-            [sensor_id.into()],
-        ))
-        .await?
-        .ok_or_else(|| AppError::BadRequest(format!("Instrument {sensor_id} not found")))?;
-    let kind = InstrumentKind::of(
-        row.try_get::<Option<String>>("", "kind")?.as_deref(),
-        row.try_get::<Option<bool>>("", "is_lab_instrument")?,
-    );
+    let row = InstrumentKindRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT kind, name, is_lab_instrument FROM sensors WHERE id = $1",
+        [sensor_id.into()],
+    ))
+    .one(db)
+    .await?
+    .ok_or_else(|| AppError::BadRequest(format!("Instrument {sensor_id} not found")))?;
+    let kind = InstrumentKind::of(row.kind.as_deref(), row.is_lab_instrument);
     if !kind.is_bookkeeping() {
         return Ok(());
     }
-    let name = row
-        .try_get::<Option<String>>("", "name")?
-        .unwrap_or_else(|| sensor_id.to_string());
+    let name = row.name.unwrap_or_else(|| sensor_id.to_string());
     Err(AppError::BadRequest(format!(
         "{name} is a {} row, which records that nothing was declared; it cannot be {subject}",
         kind.as_str()
@@ -489,18 +502,16 @@ async fn slot_instrument_name<C: ConnectionTrait>(
     site_id: Uuid,
     parameter_id: Uuid,
 ) -> AppResult<Option<String>> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT s.name AS site_name, p.name AS parameter_name \
+    let row = SlotNamesRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT s.name AS site_name, p.name AS parameter_name \
              FROM sites s, parameters p WHERE s.id = $1 AND p.id = $2",
-            [site_id.into(), parameter_id.into()],
-        ))
-        .await?;
+        [site_id.into(), parameter_id.into()],
+    ))
+    .one(db)
+    .await?;
     let Some(row) = row else { return Ok(None) };
-    let site: String = row.try_get("", "site_name")?;
-    let parameter: String = row.try_get("", "parameter_name")?;
-    Ok(Some(format!("{site} {parameter}")))
+    Ok(Some(format!("{} {}", row.site_name, row.parameter_name)))
 }
 
 /// Import-only: create or reuse the instrument for a stream and resolve its latest calibration,
@@ -558,16 +569,14 @@ pub async fn stream_history_start<C: ConnectionTrait>(
     db: &C,
     stream_id: Uuid,
 ) -> AppResult<DateTime<Utc>> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT MIN(time) AS first_reading FROM readings WHERE stream_id = $1",
-            [stream_id.into()],
-        ))
-        .await?;
-    let first = row
-        .and_then(|r| r.try_get::<Option<DateTime<Utc>>>("", "first_reading").ok())
-        .flatten();
+    let first = FirstReadingRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT MIN(time) AS first_reading FROM readings WHERE stream_id = $1",
+        [stream_id.into()],
+    ))
+    .one(db)
+    .await?
+    .and_then(|r| r.first_reading);
     Ok(first.unwrap_or_else(Utc::now))
 }
 

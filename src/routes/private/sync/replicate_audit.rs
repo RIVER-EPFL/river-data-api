@@ -871,21 +871,30 @@ struct ReopenHoldRow {
 pub struct HoldRow {
     pub id: Uuid,
     /// NULL on event-audit findings, which are keyed on (site, parameter, instant) instead.
+    #[schema(required)]
     pub stream_id: Option<Uuid>,
     /// `replicate_stats` | `source_modified` | `brake_fired` | `missing_output` | `stale_output`
     /// | `skipped_output`.
     pub kind: String,
+    #[schema(required)]
     pub source_system: Option<String>,
+    #[schema(required)]
     pub source_key: Option<String>,
     /// The stream's human name as registered by the source.
+    #[schema(required)]
     pub source_name: Option<String>,
     /// Site and parameter of the paired slot (or of the event finding itself); NULL while the
     /// stream is unpaired.
+    #[schema(required)]
     pub site_id: Option<Uuid>,
+    #[schema(required)]
     pub site_name: Option<String>,
+    #[schema(required)]
     pub parameter_name: Option<String>,
+    #[schema(required)]
     pub parameter_code: Option<String>,
     /// The tool an event finding names.
+    #[schema(required)]
     pub tool: Option<String>,
     pub paired: bool,
     pub group_time: DateTime<Utc>,
@@ -901,12 +910,16 @@ pub struct HoldRow {
     pub classification: String,
     /// The divisor `computed.sd` was computed under, 'sample' or 'population'. Recorded on the
     /// hold; a hold that predates the record reads the slot's declaration, else 'sample'.
+    #[schema(required)]
     pub sd_estimator: Option<String>,
     /// The decision record: latest action plus prior actions under `history`.
     #[schema(value_type = Object)]
+    #[schema(required)]
     pub resolution: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
+    #[schema(required)]
     pub acknowledged_by: Option<String>,
+    #[schema(required)]
     pub acknowledged_at: Option<DateTime<Utc>>,
     /// Disagreement size relative to the measurement scale: the greater of
     /// `mean_relative_delta` and `sd_relative_delta`; see [`RELATIVE_DELTA_SQL`].
@@ -1437,10 +1450,12 @@ pub struct ResolveHoldResponse {
     pub status: String,
     /// `estimator` mode: the tracked `sd_estimator_retag` recomputing the slot's samples.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub job_id: Option<Uuid>,
     /// `estimator` mode: samples this declaration changed, counted before the job for `slot`
     /// scope and exactly one for `instant`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub samples_affected: Option<i64>,
 }
 

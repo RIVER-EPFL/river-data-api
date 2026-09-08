@@ -4,7 +4,7 @@
 
 use axum::{Json, extract::State};
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -44,7 +44,9 @@ pub struct SamplePreviewRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, ToSchema)]
 pub struct PreviewStats {
     pub n: usize,
+    #[schema(required)]
     pub mean: Option<f64>,
+    #[schema(required)]
     pub sd: Option<f64>,
     /// 'sample' (divisor n-1) or 'population' (divisor n).
     pub sd_estimator: &'static str,
@@ -53,7 +55,9 @@ pub struct PreviewStats {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, ToSchema)]
 pub struct PreviewDelta {
     pub n: i64,
+    #[schema(required)]
     pub mean: Option<f64>,
+    #[schema(required)]
     pub sd: Option<f64>,
 }
 
@@ -72,8 +76,11 @@ pub struct PreviewReplicate {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct HoldMatch {
     pub hold_id: Uuid,
+    #[schema(required)]
     pub expected_mean: Option<f64>,
+    #[schema(required)]
     pub expected_sd: Option<f64>,
+    #[schema(required)]
     pub expected_n: Option<i64>,
     /// Whether the current statistics meet the expectation (they do not, or there is no hold).
     pub meets_now: bool,
@@ -91,6 +98,7 @@ pub struct SamplePreviewResponse {
     pub delta: PreviewDelta,
     pub replicates: Vec<PreviewReplicate>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub hold: Option<HoldMatch>,
 }
 
@@ -101,6 +109,18 @@ pub struct Replicate {
     pub value: f64,
     pub flagged: bool,
     pub withdrawn: bool,
+}
+
+/// One replicate as the preview query returns it: the slot it belongs to, and the four columns a
+/// [`Replicate`] is made of.
+#[derive(sea_orm::FromQueryResult)]
+struct PreviewRow {
+    site_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
+    replicate_index: i16,
+    value: f64,
+    flagged: bool,
+    withdrawn: bool,
 }
 
 /// The change being previewed.
@@ -257,16 +277,15 @@ pub async fn sample_preview(
     let mut replicates = Vec::with_capacity(rows.len());
     let mut slot: Option<(Uuid, Uuid)> = None;
     for row in &rows {
-        let site_id: Option<Uuid> = row.try_get("", "site_id")?;
-        let parameter_id: Option<Uuid> = row.try_get("", "parameter_id")?;
-        if let (Some(s), Some(p)) = (site_id, parameter_id) {
+        let row = PreviewRow::from_query_result(row, "")?;
+        if let (Some(s), Some(p)) = (row.site_id, row.parameter_id) {
             slot.get_or_insert((s, p));
         }
         replicates.push(Replicate {
-            index: row.try_get("", "replicate_index")?,
-            value: row.try_get("", "value")?,
-            flagged: row.try_get("", "flagged")?,
-            withdrawn: row.try_get("", "withdrawn")?,
+            index: row.replicate_index,
+            value: row.value,
+            flagged: row.flagged,
+            withdrawn: row.withdrawn,
         });
     }
     if let Some((site_id, _)) = slot {

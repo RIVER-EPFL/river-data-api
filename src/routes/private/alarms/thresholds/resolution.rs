@@ -15,9 +15,13 @@ use uuid::Uuid;
 /// The four numeric bounds that define a breach for one (parameter, site) slot.
 #[derive(Debug, Clone, Copy, FromQueryResult, serde::Serialize, utoipa::ToSchema)]
 pub struct ResolvedThreshold {
+    #[schema(required)]
     pub warning_min: Option<f64>,
+    #[schema(required)]
     pub warning_max: Option<f64>,
+    #[schema(required)]
     pub alarm_min: Option<f64>,
+    #[schema(required)]
     pub alarm_max: Option<f64>,
 }
 
@@ -97,9 +101,13 @@ pub fn violation_condition(
 pub struct ThresholdRow {
     pub site_id: Uuid,
     pub parameter_id: Uuid,
+    #[schema(required)]
     pub warning_min: Option<f64>,
+    #[schema(required)]
     pub warning_max: Option<f64>,
+    #[schema(required)]
     pub alarm_min: Option<f64>,
+    #[schema(required)]
     pub alarm_max: Option<f64>,
     /// `"site"` | `"global"`, which tier supplied this threshold.
     pub source: String,

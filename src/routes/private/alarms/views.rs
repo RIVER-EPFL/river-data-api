@@ -763,8 +763,11 @@ pub async fn acknowledge_alarm(
             [event_id.into(), actor.clone().into()],
         ))
         .await?;
+    // No row means the event was already resolved; a row that will not decode is an error, not
+    // the same answer.
     let acknowledged_at: chrono::DateTime<chrono::FixedOffset> = row
-        .and_then(|r| r.try_get("", "acknowledged_at").ok())
+        .map(|r| r.try_get("", "acknowledged_at"))
+        .transpose()?
         .ok_or_else(|| AppError::Conflict("Alarm already resolved".to_string()))?;
 
     Ok(Json(AcknowledgedAlarmResponse {
@@ -1145,7 +1148,8 @@ pub async fn get_alarm_events(
             values.clone(),
         ))
         .await?
-        .and_then(|row| row.try_get::<i64>("", "cnt").ok())
+        .map(|row| row.try_get::<i64>("", "cnt"))
+        .transpose()?
         .unwrap_or(0)
         .max(0) as usize;
 
@@ -1194,12 +1198,17 @@ pub struct ThresholdsQuery {
 pub struct ThresholdWithValue {
     pub site_id: Uuid,
     pub parameter_id: Uuid,
+    #[schema(required)]
     pub warning_min: Option<f64>,
+    #[schema(required)]
     pub warning_max: Option<f64>,
+    #[schema(required)]
     pub alarm_min: Option<f64>,
+    #[schema(required)]
     pub alarm_max: Option<f64>,
     pub source: String,
     /// Latest reading (last 30 days) for this slot, or null if none, display only.
+    #[schema(required)]
     pub current_value: Option<f64>,
 }
 

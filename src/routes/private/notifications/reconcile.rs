@@ -41,7 +41,23 @@ pub async fn sweep(state: &AppState) -> Result<SweepOutcome, sea_orm::DbErr> {
                     [sub.clone().into()],
                 ))
                 .await?;
-            outcome.revoked += res.rows_affected() as usize;
+            let removed = res.rows_affected();
+            outcome.revoked += removed as usize;
+            if removed > 0 {
+                // An access change is the one thing this sweep does that somebody may need to
+                // read back, and it belongs in the entity trail rather than the reading ledger
+                // (Q57, M164).
+                db.execute_raw(Statement::from_sql_and_values(
+                    PG,
+                    "INSERT INTO change_audit (subject, change, old_value, new_value, changed_by) \
+                     VALUES ($1, 'access_revoked', $2::jsonb, NULL, 'system')",
+                    [
+                        format!("push_subscriptions:{sub}").into(),
+                        serde_json::json!({ "removed": removed }).to_string().into(),
+                    ],
+                ))
+                .await?;
+            }
             tracing::info!(sub = %sub, "push_reconcile: pruned subscriptions for revoked user");
         }
     }

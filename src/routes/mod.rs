@@ -176,6 +176,7 @@ pub fn validate_optional_time_range(
         private::api_tokens::views::rotate_token,
         private::api_tokens::views::token_usage,
         private::notifications::me::get_my_notifications,
+        private::notifications::me::list_channels,
         private::notifications::me::update_my_notifications,
         private::notifications::me::set_my_subscriptions,
         private::notifications::me::register_push_subscription,
@@ -369,6 +370,13 @@ pub fn validate_optional_time_range(
             private::sites::types::SiteRef,
             private::sites::types::ProjectRef,
             private::sites::types::ParameterResponse,
+            // The three types a crudcrate `join` field is declared as. The joined rows travel as
+            // the entity's own api_struct rather than its `*Response`, so these are what the
+            // `$ref`s on `SiteParameterResponse.parameter`, `SensorResponse.deployments` and
+            // `CalculationFormulaResponse.sources` name.
+            private::parameters::Parameter,
+            private::parameters::derived::source_model::DerivedParameterSource,
+            private::sensors::deployments::SensorDeployment,
             private::sites::readings::ReadingsResponse,
             private::sites::readings::ParameterData,
             private::sites::readings::OriginRef,
@@ -940,4 +948,274 @@ pub fn build_router(state: AppState) -> Router {
         // the id the trace and the response carry. `SetRequestIdLayer` must be outermost.
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every `$ref` in the committed document names a schema the document carries.
+    ///
+    /// A dangling one is not a rendering blemish: a consumer that resolves the document, which is
+    /// what generating a client from it means, fails on the whole file rather than on that one
+    /// property. The document is the artefact `.github/workflows/openapi.yml` regenerates and
+    /// diffs, so asserting it here asserts what the router emits.
+    #[test]
+    fn test_every_schema_ref_in_the_committed_document_resolves() {
+        const DOCUMENT: &str = include_str!("../../docs/openapi.json");
+        let doc: serde_json::Value = serde_json::from_str(DOCUMENT).expect("the document parses");
+        let names: std::collections::BTreeSet<&str> = doc["components"]["schemas"]
+            .as_object()
+            .expect("the document declares schemas")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        let mut dangling = std::collections::BTreeSet::new();
+        collect_refs(&doc, &mut |r| {
+            if let Some(name) = r.strip_prefix("#/components/schemas/") {
+                if !names.contains(name) {
+                    dangling.insert(name.to_string());
+                }
+            }
+        });
+        assert!(
+            dangling.is_empty(),
+            "referenced and not declared: {dangling:?}"
+        );
+    }
+
+    /// The document says which `Option` fields are sent and which are omitted.
+    ///
+    /// utoipa marks every `Option<T>` not-required and nullable whatever serde does with it, so
+    /// both halves of the truth are lost. A field with no `skip_serializing_if` is always on the
+    /// wire and may be null: `#[schema(required)]`. A field with one is omitted when it is `None`
+    /// and is never null: `#[schema(nullable = false)]`. A struct that deserializes as well may be
+    /// read as a request, where an `Option` is genuinely optional; `#[serde(default)]` is how such
+    /// a field says so, and is what excuses it from the first rule. All three are derivable, so
+    /// they are asserted rather than trusted; a generated client that has to handle an absence or a
+    /// null that cannot happen is what stopped C114 replacing its hand-written types.
+    #[test]
+    fn test_the_document_says_which_optional_fields_are_sent_and_which_are_omitted() {
+        let (checked, wrong) = optional_fields_the_document_misdescribes();
+        assert!(
+            checked > 0,
+            "the scan found no schema struct at all, so it is asserting nothing"
+        );
+        assert!(
+            wrong.is_empty(),
+            "each is described as the opposite of what the wire does; \
+             an always-sent field takes #[schema(required)] and an omitted one \
+             #[schema(nullable = false)]: {wrong:?}"
+        );
+    }
+
+    /// The scan the test above asserts on, and the one below proves can fail: how many schema
+    /// structs were examined, and which of their fields the document misdescribes.
+    fn optional_fields_the_document_misdescribes() -> (usize, Vec<String>) {
+        let mut checked = 0;
+        let mut wrong = Vec::new();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for path in rust_sources(root) {
+            let src = std::fs::read_to_string(&path).expect("a source file reads");
+            let (c, m) = scan(&src);
+            checked += c;
+            wrong.extend(m);
+        }
+        (checked, wrong)
+    }
+
+    /// The attributes are what keep the test above green, so the same scan over a source missing
+    /// them must report both kinds. Without this, a scan that matched nothing would pass just as
+    /// quietly, which is what the first version of it did.
+    #[test]
+    fn test_the_scan_reports_a_field_that_lost_its_attribute() {
+        let source = "\
+#[derive(Serialize, ToSchema)]
+pub struct Answer {
+    pub id: Uuid,
+    #[schema(required)]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = \"Option::is_none\")]
+    #[schema(nullable = false)]
+    pub omitted: Option<String>,
+    #[serde(skip_serializing_if = \"Option::is_none\")]
+    pub omitted_unmarked: Option<String>,
+    pub bare: Option<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct Ask {
+    #[serde(skip_serializing_if = \"Option::is_none\")]
+    pub also_omitted: Option<String>,
+    pub filter: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct Both {
+    #[serde(default)]
+    pub asked: Option<String>,
+    pub answered: Option<String>,
+}
+";
+        let (checked, wrong) = scan(source);
+        assert_eq!(checked, 3, "every schema struct is scanned; only the rules differ");
+        assert_eq!(
+            wrong,
+            vec![
+                "Answer.omitted_unmarked".to_string(),
+                "Answer.bare".to_string(),
+                "Ask.also_omitted".to_string(),
+                "Both.answered".to_string(),
+            ],
+            "a request's plain Option is genuinely optional, and on a struct that travels both ways \
+             `#[serde(default)]` is what says so"
+        );
+    }
+
+    fn rust_sources(root: std::path::PathBuf) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    // This file declares no schema of its own, and the fixture below is source
+                    // text the scan would otherwise read as one.
+                    && !path.ends_with("routes/mod.rs")
+                {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// Walk one source line by line: attributes accumulate, a `pub struct` line consumes them, and
+    /// a struct ends at a closing brace on its own indent. Returns the schema structs examined and
+    /// the fields the document describes as the opposite of what the wire does.
+    fn scan(src: &str) -> (usize, Vec<String>) {
+        let mut checked = 0;
+        let mut missing = Vec::new();
+        let mut attrs = String::new();
+        // struct name, its indent, and which way it travels
+        let mut open: Option<(String, String, Travels)> = None;
+        for line in src.lines() {
+            let trimmed = line.trim_start();
+            let indent = &line[..line.len() - trimmed.len()];
+            if let Some((name, struct_indent, kind)) = &open {
+                if trimmed == "}" && indent == struct_indent {
+                    open = None;
+                    attrs.clear();
+                    continue;
+                }
+                if trimmed.starts_with("#[") {
+                    attrs.push_str(trimmed);
+                    continue;
+                }
+                if let Some(field) = trimmed.strip_prefix("pub ")
+                    && let Some((field_name, ty)) = field.split_once(british_colon())
+                    && ty.trim_start().starts_with("Option<")
+                {
+                    let omitted = attrs.contains("skip_serializing_if");
+                    // A struct that also deserializes may be read as a request, where an `Option`
+                    // is genuinely optional. `#[serde(default)]` is how such a field says so, so a
+                    // field without one is answering, not asking, whichever traits the struct has.
+                    let answered = match kind {
+                        Travels::Response => true,
+                        Travels::Request => false,
+                        Travels::Both => !attrs.contains("serde(default"),
+                    };
+                    let misdescribed = if omitted {
+                        !attrs.contains("nullable = false")
+                    } else {
+                        answered && !attrs.contains("schema(required")
+                    };
+                    if misdescribed {
+                        missing.push(format!("{name}.{field_name}"));
+                    }
+                }
+                if !trimmed.starts_with("///") && !trimmed.starts_with("//") {
+                    attrs.clear();
+                }
+                continue;
+            }
+            if trimmed.starts_with("#[") || trimmed.starts_with("///") || trimmed.starts_with("//")
+            {
+                attrs.push_str(trimmed);
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix("pub struct ")
+                && rest.ends_with('{')
+                && attrs.contains("ToSchema")
+            {
+                checked += 1;
+                let name = rest.trim_end_matches('{').trim();
+                let name = name.split(['<', ' ']).next().unwrap_or(name);
+                open = Some((name.to_string(), indent.to_string(), travels(&attrs)));
+                attrs.clear();
+                continue;
+            }
+            if !trimmed.is_empty() {
+                attrs.clear();
+            }
+        }
+        (checked, missing)
+    }
+
+    const fn british_colon() -> char {
+        ':'
+    }
+
+    /// Which way a schema struct travels, which is what decides whether an `Option` is a value the
+    /// API always sends or one a client may omit.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Travels {
+        /// Serializes only: every `Option` is on the wire, null when empty.
+        Response,
+        /// Deserializes only: every `Option` is the client's to omit.
+        Request,
+        /// Both, so the field itself says which, through `#[serde(default)]`.
+        Both,
+    }
+
+    fn travels(attrs: &str) -> Travels {
+        let Some(open) = attrs.find("#[derive(") else {
+            return Travels::Request;
+        };
+        let derives = &attrs[open + "#[derive(".len()..];
+        let Some(close) = derives.find(')') else {
+            return Travels::Request;
+        };
+        let derives = &derives[..close];
+        match (derives.contains("Serialize"), derives.contains("Deserialize")) {
+            (true, false) => Travels::Response,
+            (true, true) => Travels::Both,
+            _ => Travels::Request,
+        }
+    }
+
+    fn collect_refs(value: &serde_json::Value, found: &mut impl FnMut(&str)) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    if key == "$ref" {
+                        if let Some(r) = child.as_str() {
+                            found(r);
+                        }
+                    }
+                    collect_refs(child, found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_refs(item, found);
+                }
+            }
+            _ => {}
+        }
+    }
 }

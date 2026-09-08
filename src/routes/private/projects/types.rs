@@ -6,5 +6,6 @@ use uuid::Uuid;
 pub struct ProjectResponse {
     pub id: Uuid,
     pub name: String,
+    #[schema(required)]
     pub description: Option<String>,
 }

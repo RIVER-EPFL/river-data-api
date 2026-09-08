@@ -55,12 +55,15 @@ pub struct LedgerEntry {
     /// `error`, `warning` or `info`, derived per source shape at the read.
     pub severity: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub actor: Option<String>,
     /// What happened, in the source's own vocabulary.
     pub what: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub old: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub new: Option<serde_json::Value>,
     /// The row this entry is, so a reader can open it where it lives.
     pub id: Uuid,
@@ -69,7 +72,9 @@ pub struct LedgerEntry {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LedgerResponse {
     pub time: DateTime<Utc>,
+    #[schema(required)]
     pub site_id: Option<Uuid>,
+    #[schema(required)]
     pub parameter_id: Option<Uuid>,
     /// Entries newest first. `truncated` says the window held more than `limit`.
     pub entries: Vec<LedgerEntry>,

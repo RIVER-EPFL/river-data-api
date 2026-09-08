@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use super::group_model::ParameterGroup;
@@ -28,6 +28,14 @@ async fn member_row(db: &DatabaseConnection, id: Uuid) -> Result<Option<Member>,
     }))
 }
 
+/// One `parameter_group_members` row as stored, with the role still text.
+#[derive(FromQueryResult)]
+struct MembershipRow {
+    group_id: Uuid,
+    parameter_id: Uuid,
+    role: String,
+}
+
 /// Every membership row, reduced to what the reshape rules read.
 async fn all_members(db: &DatabaseConnection) -> Result<Vec<Member>, ApiError> {
     let rows = db
@@ -38,16 +46,15 @@ async fn all_members(db: &DatabaseConnection) -> Result<Vec<Member>, ApiError> {
         .await
         .map_err(ApiError::database)?;
     let mut members = Vec::with_capacity(rows.len());
-    for row in rows {
-        let role: String = row.try_get("", "role").map_err(ApiError::database)?;
-        let Some(role) = Role::parse(&role) else {
+    for row in &rows {
+        let membership = MembershipRow::from_query_result(row, "").map_err(ApiError::database)?;
+        // A role outside the vocabulary is a corrupt row, not a decode failure.
+        let Some(role) = Role::parse(&membership.role) else {
             continue;
         };
         members.push(Member {
-            group_id: row.try_get("", "group_id").map_err(ApiError::database)?,
-            parameter_id: row
-                .try_get("", "parameter_id")
-                .map_err(ApiError::database)?,
+            group_id: membership.group_id,
+            parameter_id: membership.parameter_id,
             role,
         });
     }

@@ -41,9 +41,10 @@ async fn copies_made_from(db: &DatabaseConnection, id: Uuid) -> Result<i64, ApiE
         ))
         .await
         .map_err(ApiError::database)?;
-    Ok(row
-        .and_then(|r| r.try_get::<i64>("", "n").ok())
-        .unwrap_or_default())
+    row.map(|r| r.try_get::<i64>("", "n"))
+        .transpose()
+        .map_err(ApiError::database)
+        .map(Option::unwrap_or_default)
 }
 
 #[async_trait]

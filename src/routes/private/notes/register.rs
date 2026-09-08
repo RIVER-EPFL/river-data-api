@@ -45,6 +45,7 @@ pub struct RegisterNotesResponse {
 pub struct NoteOutcome {
     pub source_key: String,
     /// None when the note was not stored (`unresolved`).
+    #[schema(required)]
     pub id: Option<Uuid>,
     /// created | updated | unchanged | unresolved
     pub status: String,

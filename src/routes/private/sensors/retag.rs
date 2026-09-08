@@ -29,6 +29,7 @@ pub struct RetagFrequencyResponse {
     pub sensors_updated: u64,
     pub data_frequency: String,
     /// The tracked `measurement_retag` job, when `retag_existing` was requested.
+    #[schema(required)]
     pub job_id: Option<Uuid>,
 }
 

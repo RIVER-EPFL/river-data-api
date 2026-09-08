@@ -115,10 +115,10 @@ async fn deployment_sites(
         ))
         .await
         .map_err(AppError::Database)?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| r.try_get::<Uuid>("", "site_id").ok())
-        .collect())
+    // A dropped row is a site the caller never hears about, so a decode failure is an error.
+    rows.iter()
+        .map(|r| Ok(r.try_get::<Uuid>("", "site_id")?))
+        .collect()
 }
 
 /// Refuse an untargeted run to a restricted caller: with nothing named, the action reaches every
@@ -501,6 +501,7 @@ pub struct RollbackDeploymentRequest {
 pub struct RollbackDeploymentResponse {
     pub status: String,
     pub readings_reassigned: u64,
+    #[schema(required)]
     pub previous_deployment_id: Option<Uuid>,
     /// The reprocess this rollback queued: the re-derivation runs as a tracked job, like every
     /// other caller's, rather than holding the request open for the whole cascade.
@@ -1328,6 +1329,7 @@ pub struct CalibrationBackfillCandidate {
     /// no `calibration_id`. A reprocess resolves every one of them.
     pub uncalibrated_count: i64,
     pub target_from: chrono::DateTime<chrono::Utc>,
+    #[schema(required)]
     pub earliest_calibration_from: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -1339,8 +1341,11 @@ pub struct CalibrationBackfillCandidate {
 /// definition this query uses), so nothing an operator can trigger overwrites one either.
 #[derive(Debug, Serialize, ToSchema, Clone)]
 pub struct OrphanedCorrection {
+    #[schema(required)]
     pub sensor_id: Option<Uuid>,
+    #[schema(required)]
     pub site_id: Option<Uuid>,
+    #[schema(required)]
     pub parameter_id: Option<Uuid>,
     pub count: i64,
     pub first_time: chrono::DateTime<chrono::Utc>,
@@ -1351,12 +1356,16 @@ pub struct OrphanedCorrection {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ForeignCurveUse {
     /// The instrument the readings name.
+    #[schema(required)]
     pub sensor_id: Option<Uuid>,
     /// The curve they are corrected by, which belongs to `curve_sensor_id`.
     pub standard_curve_id: Uuid,
     pub curve_sensor_id: Uuid,
+    #[schema(required)]
     pub curve_name: Option<String>,
+    #[schema(required)]
     pub site_id: Option<Uuid>,
+    #[schema(required)]
     pub parameter_id: Option<Uuid>,
     pub count: i64,
     pub first_time: chrono::DateTime<chrono::Utc>,
@@ -1377,6 +1386,7 @@ pub struct CalibrationBackfillCandidatesResponse {
     /// so it is a floor and not a total: an anomaly in older data is not absent, it was not looked
     /// at. Widen the window with `since`. `null` means the whole history was read, which is also
     /// what an empty database reports.
+    #[schema(required)]
     pub scanned_from: Option<chrono::DateTime<chrono::Utc>>,
 }
 

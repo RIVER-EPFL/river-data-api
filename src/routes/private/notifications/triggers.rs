@@ -119,6 +119,9 @@ pub async fn run(state: &AppState, channels: &[Box<dyn NotificationChannel>]) {
     if let Err(e) = derived_computed(state, channels).await {
         tracing::warn!(error = %e, "derived-computed trigger failed");
     }
+    if let Err(e) = operational_digests(state, channels).await {
+        tracing::warn!(error = %e, "operational-digest trigger failed");
+    }
 }
 
 async fn state_get(
@@ -818,6 +821,106 @@ async fn derived_computed(
     };
     let _ = deliver(state, channels, &msg, None).await;
     Ok(())
+}
+
+/// What the arms that keep the system running did, one channel each (Q57). None is on by default:
+/// a refresh or a prune is upkeep, and the person who wants to watch it says so. The number comes
+/// from the job rows the arm already writes, so nothing here counts anything twice.
+///
+/// Each entry is the kind, the job that does the work, the `detail.counts` key holding its number
+/// (`None` reads the job's own headline `readings_updated`), and how the message says it.
+const OPERATIONAL: [(&str, &str, Option<&str>, &str); 5] = [
+    (
+        "access_revoked",
+        "identity_reconcile",
+        Some("revoked"),
+        "push subscription(s) removed for people who lost their grant",
+    ),
+    (
+        "aggregates_refreshed",
+        "janitor_service",
+        Some("recomposed"),
+        "value(s) recomposed while the rollups were refreshed",
+    ),
+    (
+        "jobs_pruned",
+        "janitor_service",
+        Some("pruned"),
+        "tracked job row(s) aged out of the timeline",
+    ),
+    (
+        "sync_events_swept",
+        "sync_event_sweep",
+        Some("sync_events_closed"),
+        "stale sync event(s) marked failed",
+    ),
+    (
+        "ledger_pruned",
+        "sync_ledger_retention",
+        None,
+        "sync event(s) and ingest receipt(s) deleted by retention",
+    ),
+];
+
+async fn operational_digests(
+    state: &AppState,
+    channels: &[Box<dyn NotificationChannel>],
+) -> Result<(), DbErr> {
+    let db = &state.db;
+    for (kind, trigger_type, key, noun) in OPERATIONAL {
+        let since = state_get(db, kind, "all")
+            .await?
+            .map(|(_, at)| at)
+            .unwrap_or_else(|| Utc::now() - Duration::hours(CURVE_DRIFT_WINDOW_HOURS));
+        let n = job_total_since(db, trigger_type, key, since).await?;
+        if n == 0 {
+            state_clear(db, kind, "all").await?;
+            continue;
+        }
+        if !claim_cas(db, kind, "all", since).await? {
+            continue;
+        }
+        let msg = OutgoingMessage {
+            kind,
+            subject: format!("RIVER Data: {n} {noun}"),
+            body: format!("🧹 {n} {noun}. The run that did it is in the job timeline."),
+            // Upkeep spans the whole deployment, so it carries no slot.
+            slot: None,
+        };
+        let _ = deliver(state, channels, &msg, None).await;
+    }
+    Ok(())
+}
+
+/// What one job kind reports having done since `since`: the named `detail.counts` key summed over
+/// its completed runs, or the headline number each run returns when no key is named.
+async fn job_total_since(
+    db: &DatabaseConnection,
+    trigger_type: &str,
+    key: Option<&str>,
+    since: DateTime<Utc>,
+) -> Result<i64, DbErr> {
+    let value = match key {
+        Some(k) => format!("COALESCE((detail -> 'counts' ->> '{k}')::bigint, 0)"),
+        None => "COALESCE(readings_updated, 0)".to_string(),
+    };
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            PG,
+            &format!(
+                "SELECT COALESCE(SUM({value}), 0)::bigint AS n FROM reprocessing_jobs \
+                  WHERE trigger_type = $1 AND status = 'completed' AND completed_at > $2"
+            ),
+            [
+                trigger_type.into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(since).into(),
+            ],
+        ))
+        .await?;
+    match row {
+        Some(row) => row.try_get("", "n"),
+        None => Ok(0),
+    }
 }
 
 /// Readings a system-made change of one kind touched since `since`, counted from the ledger rows

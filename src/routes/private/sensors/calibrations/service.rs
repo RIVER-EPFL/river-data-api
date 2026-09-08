@@ -534,15 +534,15 @@ async fn newest_derived_version(
     db: &DatabaseConnection,
     definition_id: Uuid,
 ) -> Result<Option<Uuid>, sea_orm::DbErr> {
-    Ok(db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id FROM derived_parameter_definition_versions \
+    db.query_one_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT id FROM derived_parameter_definition_versions \
               WHERE definition_id = $1 ORDER BY version_no DESC LIMIT 1",
-            [definition_id.into()],
-        ))
-        .await?
-        .and_then(|row| row.try_get::<Uuid>("", "id").ok()))
+        [definition_id.into()],
+    ))
+    .await?
+    .map(|row| row.try_get::<Uuid>("", "id"))
+    .transpose()
 }
 
 /// The slots this site computes. The producing definition is the one whose output is the slot's
@@ -1345,7 +1345,7 @@ pub async fn reprocess(db: &DatabaseConnection, scope: Scope) -> Result<usize, s
         ))
         .await?;
     if let Some(row) = range
-        && let Ok(since) = row.try_get::<DateTime<Utc>>("", "min_time")
+        && let Some(since) = row.try_get::<Option<DateTime<Utc>>>("", "min_time")?
     {
         crate::common::aggregates::refresh(db, crate::common::aggregates::Window::Since(since))
             .await

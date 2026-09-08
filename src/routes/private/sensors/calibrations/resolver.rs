@@ -18,7 +18,7 @@
 //! one, and are matched by `readings.standard_curve_id`, never by window.
 
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -60,6 +60,15 @@ pub fn pick_calibration_lateral_excluding(sensor_expr: &str, exclude_expr: Optio
                    c.id DESC
           LIMIT 1"
     )
+}
+
+/// One instant's resolved curve, as the timeline query returns it.
+#[derive(sea_orm::FromQueryResult)]
+struct ResolvedCurve {
+    t: DateTime<chrono::FixedOffset>,
+    cal_id: Uuid,
+    slope: f64,
+    intercept: f64,
 }
 
 /// Resolve the covering calibration for each of `times` on one `(sensor, parameter)` channel.
@@ -104,13 +113,13 @@ pub async fn resolve_for_times<C: ConnectionTrait>(
         .await?;
 
     for row in &rows {
-        let t: DateTime<chrono::FixedOffset> = row.try_get("", "t")?;
+        let row = ResolvedCurve::from_query_result(row, "")?;
         out.insert(
-            t.with_timezone(&Utc),
+            row.t.with_timezone(&Utc),
             Curve {
-                id: row.try_get("", "cal_id")?,
-                slope: row.try_get("", "slope")?,
-                intercept: row.try_get("", "intercept")?,
+                id: row.cal_id,
+                slope: row.slope,
+                intercept: row.intercept,
             },
         );
     }

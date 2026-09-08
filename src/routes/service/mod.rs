@@ -790,6 +790,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
                     .get(me::list_push_subscriptions)
                     .delete(me::delete_push_subscription),
             )
+            .route("/notifications/channels", get(me::list_channels))
             .route("/notifications/me/push/test", post(me::test_push))
             .route("/notifications/me/push/ping", post(me::schedule_ping))
             .layer(middleware::from_fn(require_read_data))

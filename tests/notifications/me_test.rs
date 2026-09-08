@@ -66,6 +66,10 @@ async fn me_defaults_then_self_scoped_changes() {
     assert_eq!(subs.len(), 1);
     assert_eq!(subs[0]["site_id"], SITE1_ID);
     assert_eq!(subs[0]["enabled"], false);
+    assert_eq!(
+        subs[0]["channel"], "alarm_opened",
+        "a row naming no channel is the alarm channel, as it was before channels were separable"
+    );
 
     // A different user sees a separate, empty record.
     let admin = get_keycloak_jwt("admin", "admin").await;

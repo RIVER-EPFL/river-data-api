@@ -833,6 +833,7 @@ fn table() -> Table {
         ("PUT", "/api/notifications/me/subscriptions"),
         ("GET", "/api/notifications/me/push"),
         ("POST", "/api/notifications/me/push/ping"),
+        ("GET", "/api/notifications/channels"),
     ] {
         t.add(
             method,

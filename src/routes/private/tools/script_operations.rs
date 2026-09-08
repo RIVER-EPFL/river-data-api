@@ -4,8 +4,8 @@
 use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
-    Statement,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
+    QueryOrder, Statement,
 };
 use uuid::Uuid;
 
@@ -35,11 +35,16 @@ pub(crate) fn check_engine(engine: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// One calculation's version count and the number of the version that is live.
+#[derive(FromQueryResult)]
+struct VersionCounts {
+    id: Uuid,
+    active_version_no: Option<i32>,
+    version_count: i64,
+}
+
 /// The version count and the live version's number, for a page of calculations.
-async fn counts(
-    db: &DatabaseConnection,
-    ids: &[Uuid],
-) -> Result<Vec<(Uuid, Option<i32>, i64)>, ApiError> {
+async fn counts(db: &DatabaseConnection, ids: &[Uuid]) -> Result<Vec<VersionCounts>, ApiError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -56,17 +61,9 @@ async fn counts(
         ))
         .await
         .map_err(ApiError::database)?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in &rows {
-        out.push((
-            row.try_get("", "id").map_err(ApiError::database)?,
-            row.try_get("", "active_version_no")
-                .map_err(ApiError::database)?,
-            row.try_get("", "version_count")
-                .map_err(ApiError::database)?,
-        ));
-    }
-    Ok(out)
+    rows.iter()
+        .map(|row| VersionCounts::from_query_result(row, "").map_err(ApiError::database))
+        .collect()
 }
 
 pub struct ToolScriptOperations;
@@ -146,11 +143,9 @@ impl CRUDOperations for ToolScriptOperations {
         let ids: Vec<Uuid> = entities.iter().map(|e| e.id).collect();
         let counted = counts(db, &ids).await?;
         for entity in entities.iter_mut() {
-            if let Some((_, active_version_no, version_count)) =
-                counted.iter().find(|(id, _, _)| *id == entity.id)
-            {
-                entity.active_version_no = *active_version_no;
-                entity.version_count = *version_count;
+            if let Some(counts) = counted.iter().find(|c| c.id == entity.id) {
+                entity.active_version_no = counts.active_version_no;
+                entity.version_count = counts.version_count;
             }
         }
         Ok(())

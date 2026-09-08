@@ -57,6 +57,7 @@ pub struct RegisterSensorResponse {
     /// The instrument already holding the serial this registration offered, when that is why the
     /// serial was not claimed. The source's register is wrong or the two rows are one instrument;
     /// either way it is a person's call, so the registration succeeds and says so.
+    #[schema(required)]
     pub serial_claimed_by: Option<Uuid>,
 }
 

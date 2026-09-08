@@ -139,6 +139,7 @@ pub struct GrabSampleResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CurveApplication {
     pub id: Uuid,
+    #[schema(required)]
     pub name: Option<String>,
     pub slope: f64,
     pub intercept: f64,
@@ -152,11 +153,15 @@ pub struct GrabPreview {
     pub replicate_index: i16,
     pub raw_value: f64,
     /// The instrument's windowed calibration covering `time`, applied first.
+    #[schema(required)]
     pub base_calibration: Option<CurveApplication>,
     /// The operator's hand-picked curve, applied to the base's output.
+    #[schema(required)]
     pub standard_curve: Option<CurveApplication>,
     /// Both curves folded into one line, present when both apply.
+    #[schema(required)]
     pub composed_equation: Option<String>,
+    #[schema(required)]
     pub calibrated_value: Option<f64>,
 }
 
@@ -164,7 +169,9 @@ pub struct GrabPreview {
 pub struct ExistingReplicate {
     pub replicate_index: i16,
     pub raw_value: f64,
+    #[schema(required)]
     pub calibrated_value: Option<f64>,
+    #[schema(required)]
     pub standard_curve_id: Option<Uuid>,
 }
 
@@ -1712,7 +1719,10 @@ async fn tool_run_source(
             [run_id.into()],
         ))
         .await?;
-    Ok(row.and_then(|r| r.try_get("", "source").ok()))
+    Ok(row
+        .map(|r| r.try_get::<Option<String>>("", "source"))
+        .transpose()?
+        .flatten())
 }
 
 /// The instrument a hand-entered or calculated reading names, declared and never implied.

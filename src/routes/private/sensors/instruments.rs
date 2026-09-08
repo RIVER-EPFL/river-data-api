@@ -63,16 +63,23 @@ struct SensorCurveUsageRow {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CurveOverview {
     pub id: Uuid,
+    #[schema(required)]
     pub name: Option<String>,
     pub slope: f64,
     pub intercept: f64,
+    #[schema(required)]
     pub r_squared: Option<f64>,
+    #[schema(required)]
     pub source_system: Option<String>,
+    #[schema(required)]
     pub source_key: Option<String>,
+    #[schema(required)]
     pub created_at: Option<DateTime<Utc>>,
     /// Readings this curve corrected.
     pub reading_count: i64,
+    #[schema(required)]
     pub first_used: Option<DateTime<Utc>>,
+    #[schema(required)]
     pub last_used: Option<DateTime<Utc>>,
 }
 
@@ -81,18 +88,25 @@ pub struct InstrumentStreamRef {
     pub id: Uuid,
     pub source_system: String,
     pub source_key: String,
+    #[schema(required)]
     pub measurement_type: Option<String>,
     /// The paired slot, when the stream has one.
+    #[schema(required)]
     pub site_name: Option<String>,
+    #[schema(required)]
     pub parameter_code: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct InstrumentOverview {
     pub id: Uuid,
+    #[schema(required)]
     pub name: Option<String>,
+    #[schema(required)]
     pub serial_number: Option<String>,
+    #[schema(required)]
     pub manufacturer: Option<String>,
+    #[schema(required)]
     pub model: Option<String>,
     /// Kept as the flag has always read: everything that is not a field device. `kind` is what
     /// says which of the three.
@@ -100,7 +114,9 @@ pub struct InstrumentOverview {
     /// What this row is: `device`, `lab`, `source_parameter` or `entry_channel`. Resolved from the
     /// stored column, falling back to the flag for a row predating the backfill.
     pub kind: String,
+    #[schema(required)]
     pub source_system: Option<String>,
+    #[schema(required)]
     pub source_key: Option<String>,
     pub curves: Vec<CurveOverview>,
     pub streams: Vec<InstrumentStreamRef>,
@@ -257,9 +273,12 @@ pub struct CurveUsagePoint {
     pub time: DateTime<Utc>,
     pub replicate_index: i16,
     pub raw_value: f64,
+    #[schema(required)]
     pub calibrated_value: Option<f64>,
     pub is_flagged: bool,
+    #[schema(required)]
     pub site_name: Option<String>,
+    #[schema(required)]
     pub parameter_code: Option<String>,
 }
 
@@ -309,7 +328,9 @@ pub async fn get_curve_usage(
             [curve_id.into()],
         ))
         .await?
-        .map_or(0, |r| r.try_get::<i64>("", "n").unwrap_or(0));
+        .map(|r| r.try_get::<i64>("", "n"))
+        .transpose()?
+        .unwrap_or(0);
 
     let points = db
         .query_all_raw(Statement::from_sql_and_values(
@@ -359,7 +380,9 @@ pub struct SensorCurveUsage {
     pub curve_id: Uuid,
     /// Readings this curve corrected.
     pub reading_count: i64,
+    #[schema(required)]
     pub first_used: Option<DateTime<Utc>>,
+    #[schema(required)]
     pub last_used: Option<DateTime<Utc>>,
 }
 

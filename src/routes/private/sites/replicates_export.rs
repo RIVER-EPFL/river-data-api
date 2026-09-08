@@ -46,13 +46,17 @@ pub struct ReplicateRow {
     pub parameter: String,
     /// The instant's sample, `{code}_sample_id` on the site export. Null where the instant holds
     /// one measurement, which forms no sample.
+    #[schema(required)]
     pub sample_id: Option<Uuid>,
     pub replicate_index: i16,
     /// Corrected where a curve applied, raw otherwise: the value the statistics were computed from.
+    #[schema(required)]
     pub value: Option<f64>,
     pub flagged: bool,
     pub withdrawn: bool,
+    #[schema(required)]
     pub source_system: Option<String>,
+    #[schema(required)]
     pub source_key: Option<String>,
 }
 

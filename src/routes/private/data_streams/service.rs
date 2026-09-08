@@ -57,7 +57,8 @@ pub async fn site_parameter_of(
             [site_id.into(), parameter_id.into()],
         ))
         .await?
-        .and_then(|row| row.try_get::<Uuid>("", "id").ok()))
+        .map(|row| row.try_get::<Uuid>("", "id"))
+        .transpose()?)
 }
 
 pub async fn get_or_create_api_stream(

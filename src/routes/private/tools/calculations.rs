@@ -54,8 +54,10 @@ pub struct SlotCoverage {
     pub sites_configured: i64,
     pub reading_count: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub first_reading: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub last_reading: Option<DateTime<Utc>>,
     /// The source systems the stored values arrived on, so a value that came from the portal is
     /// not mistaken for one a run produced.

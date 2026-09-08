@@ -1,7 +1,9 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use chrono::{DateTime, Utc};
-use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, IntoActiveModel, Set, Statement};
+use sea_orm::{
+    ActiveModelTrait, ConnectionTrait, EntityTrait, FromQueryResult, IntoActiveModel, Set, Statement,
+};
 use serde::Serialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -77,11 +79,12 @@ pub async fn rotate_token(
 }
 
 /// One recorded use of an API token from the forensic audit log.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema, sea_orm::FromQueryResult)]
 pub struct TokenUsageEntry {
     pub method: String,
     pub path: String,
     pub status_code: i32,
+    #[schema(required)]
     pub project_scope: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
@@ -114,16 +117,7 @@ pub async fn token_usage(
 
     let entries = rows
         .iter()
-        .map(|r| -> AppResult<TokenUsageEntry> {
-            let created: DateTime<chrono::FixedOffset> = r.try_get("", "created_at")?;
-            Ok(TokenUsageEntry {
-                method: r.try_get("", "method")?,
-                path: r.try_get("", "path")?,
-                status_code: r.try_get("", "status_code")?,
-                project_scope: r.try_get::<Uuid>("", "project_scope").ok(),
-                created_at: created.with_timezone(&Utc),
-            })
-        })
+        .map(|r| Ok(TokenUsageEntry::from_query_result(r, "")?))
         .collect::<AppResult<Vec<_>>>()?;
 
     Ok(Json(entries))

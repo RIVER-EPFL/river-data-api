@@ -20,20 +20,28 @@ pub struct Proposal {
     pub stream_id: Uuid,
     pub source_system: String,
     pub source_key: String,
+    #[schema(required)]
     pub site_id: Option<Uuid>,
+    #[schema(required)]
     pub site_name: Option<String>,
+    #[schema(required)]
     pub parameter_id: Option<Uuid>,
+    #[schema(required)]
     pub parameter_code: Option<String>,
     pub time: DateTime<Utc>,
     pub replicate_index: i16,
     pub stored_raw_value: f64,
     pub proposed_raw_value: f64,
+    #[schema(required)]
     pub stored_standard_curve_id: Option<Uuid>,
+    #[schema(required)]
     pub proposed_standard_curve_id: Option<Uuid>,
     pub status: String,
     pub first_seen_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
+    #[schema(required)]
     pub decided_by: Option<String>,
+    #[schema(required)]
     pub decided_at: Option<DateTime<Utc>>,
 }
 

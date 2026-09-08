@@ -7,7 +7,8 @@
 
 use axum::{Json, extract::State};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, ExprTrait, QueryFilter, Set,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, ExprTrait, FromQueryResult,
+    QueryFilter, Set,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -606,6 +607,14 @@ pub(crate) fn readings_on_conflict(mode: ConflictMode) -> sea_orm::sea_query::On
 
 /// Batch insert readings keyed by (site_id, parameter_id). Auto-creates "api" streams when
 /// a (site, parameter) pair has none. 10MB body limit. Requires `write_data`.
+/// A stream's own classification and instrument, as a batch write reads them.
+#[derive(FromQueryResult)]
+struct StreamDefaults {
+    id: Uuid,
+    measurement_type: Option<String>,
+    sensor_id: Option<Uuid>,
+}
+
 #[utoipa::path(
     post,
     path = "/api/readings/batch",
@@ -712,11 +721,11 @@ pub async fn insert_batch_readings(
             ))
             .await?
         {
-            let id: Uuid = row.try_get("", "id")?;
-            if let Ok(Some(sensor_id)) = row.try_get::<Option<Uuid>>("", "sensor_id") {
-                stream_sensors.insert(id, sensor_id);
+            let stream = StreamDefaults::from_query_result(&row, "")?;
+            if let Some(sensor_id) = stream.sensor_id {
+                stream_sensors.insert(stream.id, sensor_id);
             }
-            map.insert(id, row.try_get("", "measurement_type")?);
+            map.insert(stream.id, stream.measurement_type);
         }
         map
     };

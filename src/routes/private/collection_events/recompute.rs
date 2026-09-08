@@ -8,15 +8,32 @@
 
 use std::collections::HashMap;
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use crate::error::AppResult;
 use crate::routes::private::reprocessing_jobs::worker;
 use crate::routes::private::tools::closure;
 
+#[derive(FromQueryResult)]
+struct EventSourceRow {
+    id: Uuid,
+    source: String,
+}
+
+#[derive(FromQueryResult)]
+struct LatestJobRow {
+    event_id: String,
+    status: String,
+}
+
+#[derive(FromQueryResult)]
+struct EventIdRow {
+    id: Uuid,
+}
+
 /// A visit a write touched, with the parameters it touched there.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, FromQueryResult)]
 pub struct TouchedEvent {
     pub id: Uuid,
     pub source: String,
@@ -43,29 +60,20 @@ pub async fn touched_events<C: ConnectionTrait>(
     row_predicate: &str,
     binds: Vec<sea_orm::Value>,
 ) -> AppResult<Vec<TouchedEvent>> {
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT ce.id, ce.source, array_agg(DISTINCT r.parameter_id) AS parameter_ids
+    Ok(TouchedEvent::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "SELECT ce.id, ce.source, array_agg(DISTINCT r.parameter_id) AS parameter_ids
                  FROM readings r
                  JOIN data_streams ds ON ds.id = r.stream_id
                  JOIN collection_events ce ON ce.id = r.collection_event_id
                  WHERE {row_predicate}
                  GROUP BY ce.id, ce.source"
-            ),
-            binds,
-        ))
-        .await?;
-    rows.iter()
-        .map(|r| {
-            Ok(TouchedEvent {
-                id: r.try_get("", "id")?,
-                source: r.try_get("", "source")?,
-                parameter_ids: r.try_get("", "parameter_ids")?,
-            })
-        })
-        .collect()
+        ),
+        binds,
+    ))
+    .all(conn)
+    .await?)
 }
 
 /// The same visits, from `(collection_event_id, parameter_id)` pairs a bulk write already knows.
@@ -83,23 +91,21 @@ pub async fn events_from_pairs<C: ConnectionTrait>(
         by_event.entry(*event_id).or_default().push(*parameter_id);
     }
     let ids: Vec<Uuid> = by_event.keys().copied().collect();
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, source FROM collection_events WHERE id = ANY($1)",
-            [ids.into()],
-        ))
-        .await?;
-    rows.iter()
-        .map(|r| {
-            let id: Uuid = r.try_get("", "id")?;
-            Ok(TouchedEvent {
-                parameter_ids: by_event.remove(&id).unwrap_or_default(),
-                source: r.try_get("", "source")?,
-                id,
-            })
+    let rows = EventSourceRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT id, source FROM collection_events WHERE id = ANY($1)",
+        [ids.into()],
+    ))
+    .all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| TouchedEvent {
+            parameter_ids: by_event.remove(&r.id).unwrap_or_default(),
+            source: r.source,
+            id: r.id,
         })
-        .collect()
+        .collect())
 }
 
 /// Enqueue `event_recompute` for every touched visit an enabled calculation reads. Returns the
@@ -180,42 +186,41 @@ pub async fn status_for(
         return Ok(out);
     }
     let ids: Vec<String> = event_ids.iter().map(ToString::to_string).collect();
-    let jobs = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT DISTINCT ON (params ->> 'collection_event_id')
+    let jobs = LatestJobRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT DISTINCT ON (params ->> 'collection_event_id')
                     params ->> 'collection_event_id' AS event_id, status
              FROM reprocessing_jobs
              WHERE trigger_type = 'event_recompute'
                AND params ->> 'collection_event_id' = ANY($1)
              ORDER BY params ->> 'collection_event_id', created_at DESC",
-            [ids.into()],
-        ))
-        .await?;
+        [ids.into()],
+    ))
+    .all(db)
+    .await?;
     let mut latest_job: HashMap<Uuid, String> = HashMap::new();
-    for row in &jobs {
-        let Ok(id) = row.try_get::<String>("", "event_id")?.parse::<Uuid>() else {
+    for row in jobs {
+        // `params ->> ...` is text, so the id is parsed rather than decoded; a row whose params
+        // carry something that is not a uuid belongs to no visit here.
+        let Ok(id) = row.event_id.parse::<Uuid>() else {
             continue;
         };
-        latest_job.insert(id, row.try_get("", "status")?);
+        latest_job.insert(id, row.status);
     }
-    let stale = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT DISTINCT ce.id
+    let stale = EventIdRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT DISTINCT ce.id
              FROM replicate_audit_holds h
              JOIN collection_events ce
                ON ce.site_id = h.site_id AND ce.collected_at = h.group_time
              WHERE h.kind IN ('stale_output', 'skipped_output')
                AND h.status = 'pending' AND h.stream_id IS NULL
                AND ce.id = ANY($1)",
-            [event_ids.to_vec().into()],
-        ))
-        .await?;
-    let mut stale_events: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-    for row in &stale {
-        stale_events.insert(row.try_get("", "id")?);
-    }
+        [event_ids.to_vec().into()],
+    ))
+    .all(db)
+    .await?;
+    let stale_events: std::collections::HashSet<Uuid> = stale.into_iter().map(|r| r.id).collect();
     for id in event_ids {
         out.insert(
             *id,

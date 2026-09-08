@@ -46,6 +46,7 @@ pub struct AppliedSlot {
     pub role: String,
     /// The slot's id, absent on a dry run.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub site_parameter_id: Option<Uuid>,
 }
 

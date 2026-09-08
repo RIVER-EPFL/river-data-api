@@ -51,6 +51,7 @@ pub struct ParameterInfo {
     pub name: String,
     pub units: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub description: Option<String>,
 }
 
@@ -224,7 +225,9 @@ pub async fn list_sites(
 pub struct SiteDetailResponse {
     pub site: SiteRef,
     pub parameters: Vec<ParameterInfo>,
+    #[schema(required)]
     pub data_start: Option<String>,
+    #[schema(required)]
     pub data_end: Option<String>,
     pub reading_count: i64,
 }
@@ -394,8 +397,10 @@ pub struct ReadingsQuery {
 pub struct ReadingsResponse {
     pub site: SiteRef,
     /// Earliest timestamp in the result.
+    #[schema(required)]
     pub start: Option<String>,
     /// Latest timestamp in the result.
+    #[schema(required)]
     pub end: Option<String>,
     /// Shared time axis for all parameters.
     pub times: Vec<String>,
@@ -413,10 +418,12 @@ pub struct ParameterData {
     /// Per-point measurement type (continuous/spot/derived), aligned with `values`.
     /// Only present when `include_measurement_type=true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub measurement_types: Option<Vec<Option<String>>>,
     /// The replicate statistics behind each value, aligned with `values`.
     /// Only present when `include_sample_stats=true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub sample_stats: Option<SampleStatsData>,
 }
 
@@ -427,6 +434,7 @@ pub struct ParameterData {
 pub struct SampleStatsData {
     /// The divisor every `sd` here was computed with: `sample` (n - 1) or `population` (n). Null
     /// when the slot has not declared one, in which case no `sd` is published.
+    #[schema(required)]
     pub sd_estimator: Option<String>,
     /// Replicates behind each value. Null where no value is served.
     pub n: Vec<Option<i64>>,

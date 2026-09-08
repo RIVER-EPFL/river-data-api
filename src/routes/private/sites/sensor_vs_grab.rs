@@ -56,18 +56,23 @@ pub struct SensorVsGrabRow {
     /// Grab sample collection time.
     pub time: DateTime<Utc>,
     /// Grab sample value (mean of replicates).
+    #[schema(required)]
     pub grab_value: Option<f64>,
     /// Grab sample standard deviation across replicates.
+    #[schema(required)]
     pub grab_sd: Option<f64>,
     /// Number of grab replicates.
     pub grab_n: i32,
     /// Mean continuous sensor reading over [time + window_start_hours, time + window_end_hours].
+    #[schema(required)]
     pub sensor_avg: Option<f64>,
     /// Standard deviation of continuous sensor readings in the window.
+    #[schema(required)]
     pub sensor_sd: Option<f64>,
     /// Number of continuous sensor readings in the window.
     pub sensor_n: i64,
     /// grab_value − sensor_avg (null when either side is missing).
+    #[schema(required)]
     pub difference: Option<f64>,
 }
 

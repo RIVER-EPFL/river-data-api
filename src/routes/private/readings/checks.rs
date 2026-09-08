@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use axum::{Json, extract::State};
-use sea_orm::{ConnectionTrait, EntityTrait, Statement};
+use sea_orm::{ConnectionTrait, EntityTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -114,9 +114,13 @@ pub struct SeasonalFinding {
     pub warning: bool,
     /// Pooled historical values in the seasonal window (unflagged spot replicates, all years).
     pub n: i64,
+    #[schema(required)]
     pub min: Option<f64>,
+    #[schema(required)]
     pub q10: Option<f64>,
+    #[schema(required)]
     pub q90: Option<f64>,
+    #[schema(required)]
     pub max: Option<f64>,
     /// A capped sample of the pooled values, for the distribution plot.
     pub distribution: Vec<f64>,
@@ -217,8 +221,20 @@ pub fn classify(
     SeasonalClass::Normal
 }
 
+/// One pooled value from the seasonal window, which is the whole row the distribution reads.
+#[derive(FromQueryResult)]
+struct PooledValue {
+    v: f64,
+}
+
+#[derive(FromQueryResult)]
+struct StoredCheck {
+    site_id: Uuid,
+    entries: serde_json::Value,
+}
+
 /// The pooled distribution of one slot for one entry instant.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, FromQueryResult)]
 pub struct SeasonalStats {
     pub n: i64,
     pub min: Option<f64>,
@@ -254,27 +270,20 @@ pub async fn seasonal_stats(
     parameter_id: Uuid,
     time: chrono::DateTime<chrono::Utc>,
 ) -> AppResult<SeasonalStats> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT COUNT(*) AS n,
+    SeasonalStats::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "SELECT COUNT(*) AS n,
                         MIN(v) AS min, MAX(v) AS max,
                         percentile_cont(0.1) WITHIN GROUP (ORDER BY v) AS q10,
                         percentile_cont(0.9) WITHIN GROUP (ORDER BY v) AS q90
                  FROM ({POOLED_ROWS_SQL}) pooled"
-            ),
-            window_params(site_id, parameter_id, time),
-        ))
-        .await?
-        .ok_or_else(|| AppError::Internal("seasonal stats query returned nothing".into()))?;
-    Ok(SeasonalStats {
-        n: row.try_get("", "n")?,
-        min: row.try_get("", "min")?,
-        max: row.try_get("", "max")?,
-        q10: row.try_get("", "q10")?,
-        q90: row.try_get("", "q90")?,
-    })
+        ),
+        window_params(site_id, parameter_id, time),
+    ))
+    .one(db)
+    .await?
+    .ok_or_else(|| AppError::Internal("seasonal stats query returned nothing".into()))
 }
 
 /// The most recent pooled values, capped, for the distribution plot.
@@ -286,16 +295,16 @@ async fn seasonal_distribution(
 ) -> AppResult<Vec<f64>> {
     let mut params = window_params(site_id, parameter_id, time).to_vec();
     params.push(DISTRIBUTION_CAP.into());
-    Ok(db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!("{POOLED_ROWS_SQL} ORDER BY time DESC LIMIT $5"),
-            params,
-        ))
-        .await?
-        .iter()
-        .filter_map(|r| r.try_get::<f64>("", "v").ok())
-        .collect())
+    Ok(PooledValue::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        format!("{POOLED_ROWS_SQL} ORDER BY time DESC LIMIT $5"),
+        params,
+    ))
+    .all(db)
+    .await?
+    .into_iter()
+    .map(|r| r.v)
+    .collect())
 }
 
 /// One screened cell of a wide file: which row and column it came from, and where it sits.
@@ -308,7 +317,9 @@ pub struct ScreenedCell {
     pub class: SeasonalClass,
     pub warning: bool,
     pub n: i64,
+    #[schema(required)]
     pub min: Option<f64>,
+    #[schema(required)]
     pub max: Option<f64>,
 }
 
@@ -463,23 +474,21 @@ pub async fn validate_check_claim(
     site_id: Uuid,
     pairs: &[(Uuid, f64)],
 ) -> AppResult<()> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT site_id, entries FROM seasonal_checks WHERE id = $1",
-            [check_id.into()],
-        ))
-        .await?
-        .ok_or_else(|| AppError::BadRequest(format!("Check {check_id} does not exist")))?;
-    let check_site: Uuid = row.try_get("", "site_id")?;
-    if check_site != site_id {
+    let row = StoredCheck::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT site_id, entries FROM seasonal_checks WHERE id = $1",
+        [check_id.into()],
+    ))
+    .one(db)
+    .await?
+    .ok_or_else(|| AppError::BadRequest(format!("Check {check_id} does not exist")))?;
+    if row.site_id != site_id {
         return Err(AppError::BadRequest(
             "The named check screened values for a different site".to_string(),
         ));
     }
-    let entries: serde_json::Value = row.try_get("", "entries")?;
     let checked: Vec<SeasonalCheckValue> =
-        serde_json::from_value(entries).map_err(|e| AppError::Internal(e.to_string()))?;
+        serde_json::from_value(row.entries).map_err(|e| AppError::Internal(e.to_string()))?;
     for (parameter_id, value) in pairs {
         let covered = checked
             .iter()

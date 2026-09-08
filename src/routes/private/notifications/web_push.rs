@@ -1,8 +1,8 @@
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use super::access::{accessible_project_ids, project_allowed};
-use super::{DeliveryResult, KindGroup, NotificationChannel, OutgoingMessage, Slot, kind_group};
+use super::{DeliveryResult, NotificationChannel, OutgoingMessage, Slot, on_by_default};
 use crate::common::AppState;
 use crate::config::Config;
 
@@ -24,8 +24,10 @@ impl WebPushChannel {
     }
 }
 
+#[derive(sea_orm::FromQueryResult)]
 pub struct Subscription {
     pub id: Uuid,
+    #[sea_orm(alias = "sub")]
     pub keycloak_sub: String,
     pub endpoint: String,
     pub p256dh: String,
@@ -52,9 +54,11 @@ fn deep_link_url(base: Option<&str>, slot: &Option<Slot>) -> Option<String> {
 pub async fn slot_subscriptions(
     db: &DatabaseConnection,
     slot: &Option<Slot>,
-    group: Option<KindGroup>,
+    kind: &str,
 ) -> Result<Vec<Subscription>, String> {
-    let Some(group) = group else {
+    if super::channel(kind).is_none() {
+        // A kind no channel answers for is addressed to whoever asked for it, never fanned out
+        // by subscription: the test send is the only one.
         return read_subscriptions(
             db,
             Statement::from_string(
@@ -63,7 +67,7 @@ pub async fn slot_subscriptions(
             ),
         )
         .await;
-    };
+    }
 
     let (site_id, parameter_id, project_id) = match slot {
         Some(s) => (Some(s.site_id), Some(s.parameter_id), s.project_id),
@@ -79,8 +83,8 @@ pub async fn slot_subscriptions(
                 site_id.into(),
                 parameter_id.into(),
                 project_id.into(),
-                group.as_str().into(),
-                group.subscribed_without_a_row().into(),
+                kind.into(),
+                on_by_default(kind).into(),
             ],
         ),
     )
@@ -93,13 +97,13 @@ const SELECT_ENABLED_SUBSCRIPTIONS: &str = "\
     LEFT JOIN notification_subscribers ns ON ns.keycloak_sub = wps.keycloak_sub \
     WHERE COALESCE(ns.web_push_enabled, true)";
 
-/// The most specific row the subscriber holds for this group wins: parameter, then site, then
-/// project, then the group-wide row. With none of them the group's own default stands.
+/// The most specific row the subscriber holds for this channel wins: parameter, then site,
+/// then project, then the channel-wide row. With none of them the channel's own default stands.
 const GROUP_SUBSCRIBED: &str = "\
     COALESCE(( \
       SELECT subq.enabled FROM notification_subscriptions subq \
       WHERE subq.keycloak_sub = wps.keycloak_sub \
-        AND subq.kind_group = $4 \
+        AND subq.channel = $4 \
         AND ( (subq.site_id = $1 AND subq.parameter_id = $2) \
            OR (subq.site_id = $1 AND subq.parameter_id IS NULL) \
            OR ($3::uuid IS NOT NULL AND subq.project_id = $3 \
@@ -119,17 +123,9 @@ async fn read_subscriptions(
         .query_all_raw(statement)
         .await
         .map_err(|e| e.to_string())?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        out.push(Subscription {
-            id: row.try_get("", "id").map_err(|e| e.to_string())?,
-            keycloak_sub: row.try_get("", "sub").map_err(|e| e.to_string())?,
-            endpoint: row.try_get("", "endpoint").map_err(|e| e.to_string())?,
-            p256dh: row.try_get("", "p256dh").map_err(|e| e.to_string())?,
-            auth: row.try_get("", "auth").map_err(|e| e.to_string())?,
-        });
-    }
-    Ok(out)
+    rows.iter()
+        .map(|row| Subscription::from_query_result(row, "").map_err(|e| e.to_string()))
+        .collect()
 }
 
 pub(super) async fn prune_subscription(db: &DatabaseConnection, id: Uuid) {
@@ -218,7 +214,7 @@ impl NotificationChannel for WebPushChannel {
 
     async fn deliver(&self, state: &AppState, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
         let db = &state.db;
-        let subscriptions = match slot_subscriptions(db, &msg.slot, kind_group(msg.kind)).await {
+        let subscriptions = match slot_subscriptions(db, &msg.slot, msg.kind).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "web_push: failed to load subscriptions");

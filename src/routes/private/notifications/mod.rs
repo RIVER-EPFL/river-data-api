@@ -34,76 +34,148 @@ pub struct Slot {
     pub parameter_id: Uuid,
 }
 
-/// The audience a notification kind is addressed to. A subscriber chooses groups, not kinds.
+/// A channel a subscriber chooses on its own. The kind is the channel (Q57): somebody who wants to
+/// hear about values changing under them and not about a stream going unpaired says so per kind,
+/// and a channel nobody subscribed to still records everything it would have said, in the ledger
+/// and on the alerts panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KindGroup {
-    Alarms,
-    Sync,
-    /// Instrument status forecast from a trend rather than a threshold breach. Opt-in: the person
-    /// who acts on it is whoever goes to the field, not whoever watches the data (Q81).
-    Prediction,
+pub struct Channel {
+    pub kind: &'static str,
+    /// What the channel is called where somebody chooses it.
+    pub label: &'static str,
+    /// What it sends, so the choice is made from the alerts and not from the name.
+    pub description: &'static str,
+    /// Whether a subscriber with no row for this channel is in its audience. The two alarm kinds
+    /// are, which is the audience every subscriber already had; everything else is asked for.
+    pub on_by_default: bool,
 }
 
-impl KindGroup {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Alarms => "alarms",
-            Self::Sync => "sync",
-            Self::Prediction => "prediction",
-        }
-    }
-
-    /// Whether a subscriber with no row for this group is in its audience.
-    #[must_use]
-    pub fn subscribed_without_a_row(self) -> bool {
-        matches!(self, Self::Alarms)
-    }
-
-    #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "alarms" => Some(Self::Alarms),
-            "sync" => Some(Self::Sync),
-            "prediction" => Some(Self::Prediction),
-            _ => None,
-        }
-    }
-
-    pub const ALL: [Self; 3] = [Self::Alarms, Self::Sync, Self::Prediction];
-}
-
-/// The group a kind is delivered to. `None` is a kind with no audience of its own: the test send
-/// addresses whoever asked for it.
-#[must_use]
-pub fn kind_group(kind: &str) -> Option<KindGroup> {
-    match kind {
-        "alarm_opened" | "alarm_resolved" => Some(KindGroup::Alarms),
-        "stale_data" | "sync_stale" | "sync_failure" | "streams_unpaired" | "holds_open"
-        | "job_failed" | "changes_pending" | "curve_drift" | "derived_computed" => {
-            Some(KindGroup::Sync)
-        }
-        "battery_forecast" => Some(KindGroup::Prediction),
-        _ => None,
-    }
-}
-
-/// Every kind the triggers emit. A kind absent from [`kind_group`] is delivered to every enabled
-/// recipient with no way to decline, so the list is here and the test below holds it to the map.
-pub const EMITTED_KINDS: [&str; 12] = [
-    "alarm_opened",
-    "alarm_resolved",
-    "battery_forecast",
-    "stale_data",
-    "sync_stale",
-    "sync_failure",
-    "streams_unpaired",
-    "holds_open",
-    "job_failed",
-    "changes_pending",
-    "curve_drift",
-    "derived_computed",
+/// Every kind the triggers emit, as the channel it is subscribed through. A kind absent from here
+/// would reach every enabled recipient with no way to decline, which is what the tests below hold
+/// the triggers to.
+pub const CHANNELS: [Channel; 17] = [
+    Channel {
+        kind: "alarm_opened",
+        label: "Alarm opened",
+        description: "A reading crossing a warning or alarm threshold.",
+        on_by_default: true,
+    },
+    Channel {
+        kind: "alarm_resolved",
+        label: "Alarm resolved",
+        description: "A slot that was breaching returning to range.",
+        on_by_default: true,
+    },
+    Channel {
+        kind: "battery_forecast",
+        label: "Instrument forecasts",
+        description:
+            "A battery whose voltage trend reaches the cutoff before the next field visit.",
+        on_by_default: false,
+    },
+    Channel {
+        kind: "stale_data",
+        label: "Site gone quiet",
+        description: "A site that has stopped sending data.",
+        on_by_default: false,
+    },
+    Channel {
+        kind: "sync_stale",
+        label: "Sync service silent",
+        description: "A sync service whose heartbeat has stopped.",
+        on_by_default: false,
+    },
+    Channel {
+        kind: "sync_failure",
+        label: "Sync failures",
+        description: "A sync cycle that ended in an error.",
+        on_by_default: false,
+    },
+    Channel {
+        kind: "streams_unpaired",
+        label: "Unpaired streams",
+        description: "A source sending readings into a stream that is paired to no slot.",
+        on_by_default: false,
+    },
+    Channel {
+        kind: "holds_open",
+        label: "Review queue",
+        description: "Audit holds waiting for somebody to decide them.",
+        on_by_default: false,
+    },
+    Channel {
+        kind: "job_failed",
+        label: "Failed jobs",
+        description: "A background job that has spent its retries.",
+        on_by_default: false,
+    },
+    Channel {
+        kind: "changes_pending",
+        label: "Source changes",
+        description: "Values a source changed after river-data stored them, and what arrived.",
+        on_by_default: false,
+    },
+    Channel {
+        kind: "curve_drift",
+        label: "Recomposed values",
+        description: "Stored values the janitor recomposed from the curves their readings name.",
+        on_by_default: false,
+    },
+    Channel {
+        kind: "derived_computed",
+        label: "Derived values computed",
+        description: "Derived values computed where none was stored.",
+        on_by_default: false,
+    },
+    Channel {
+        kind: "access_revoked",
+        label: "Access revoked",
+        description: "Push subscriptions removed because the person lost their grant.",
+        on_by_default: false,
+    },
+    Channel {
+        kind: "aggregates_refreshed",
+        label: "Rollups refreshed",
+        description: "Continuous aggregate refreshes, which is upkeep rather than a change.",
+        on_by_default: false,
+    },
+    Channel {
+        kind: "jobs_pruned",
+        label: "Job rows pruned",
+        description: "Tracked job rows aged out of the timeline by retention.",
+        on_by_default: false,
+    },
+    Channel {
+        kind: "sync_events_swept",
+        label: "Stale sync events closed",
+        description: "Sync events left running past the staleness threshold and marked failed.",
+        on_by_default: false,
+    },
+    Channel {
+        kind: "ledger_pruned",
+        label: "Sync ledger pruned",
+        description: "Sync events and ingest receipts deleted by their retention horizons.",
+        on_by_default: false,
+    },
 ];
+
+/// The channel a kind is subscribed through, or `None` for a kind no channel answers for.
+#[must_use]
+pub fn channel(kind: &str) -> Option<&'static Channel> {
+    CHANNELS.iter().find(|c| c.kind == kind)
+}
+
+/// Whether a subscriber holding no row for this kind is in its audience.
+#[must_use]
+pub fn on_by_default(kind: &str) -> bool {
+    channel(kind).is_some_and(|c| c.on_by_default)
+}
+
+/// Every kind the triggers emit, which is the channel table read as names.
+#[must_use]
+pub fn emitted_kinds() -> Vec<&'static str> {
+    CHANNELS.iter().map(|c| c.kind).collect()
+}
 
 /// The kind a message may carry without belonging to a group: the test send is addressed to
 /// whoever asked for it, never fanned out.
@@ -138,25 +210,34 @@ pub trait NotificationChannel: Send + Sync {
 mod tests {
     use super::*;
 
-    /// Every kind the triggers emit is delivered to a group. A kind the map does not answer for
-    /// reaches every enabled recipient with no way to decline, which is what M89 closed.
+    /// Every kind the triggers emit has a channel to decline it on. A kind no channel answers
+    /// for reaches every enabled recipient with no way to decline, which is what M89 closed and
+    /// M163 kept when the group became the kind.
     #[test]
-    fn test_kind_group_maps_every_emitted_kind() {
-        for kind in EMITTED_KINDS {
+    fn test_every_emitted_kind_has_a_channel() {
+        for kind in emitted_kinds() {
             assert!(
-                kind_group(kind).is_some(),
-                "'{kind}' is emitted and belongs to no group, so it is delivered to everyone"
+                channel(kind).is_some(),
+                "'{kind}' is emitted and belongs to no channel, so it is delivered to everyone"
             );
         }
-        assert_eq!(kind_group("alarm_opened"), Some(KindGroup::Alarms));
-        assert_eq!(kind_group("alarm_resolved"), Some(KindGroup::Alarms));
-        assert_eq!(kind_group("battery_forecast"), Some(KindGroup::Prediction));
-        assert_eq!(kind_group("stale_data"), Some(KindGroup::Sync));
-        assert_eq!(kind_group("sync_stale"), Some(KindGroup::Sync));
-        assert_eq!(kind_group("sync_failure"), Some(KindGroup::Sync));
-        assert_eq!(kind_group("streams_unpaired"), Some(KindGroup::Sync));
-        assert_eq!(kind_group("holds_open"), Some(KindGroup::Sync));
-        assert_eq!(kind_group("job_failed"), Some(KindGroup::Sync));
+        assert!(on_by_default("alarm_opened"), "the audience nobody opted into");
+        assert!(on_by_default("alarm_resolved"));
+        for kind in [
+            "battery_forecast",
+            "stale_data",
+            "sync_stale",
+            "sync_failure",
+            "streams_unpaired",
+            "holds_open",
+            "job_failed",
+            "changes_pending",
+            "curve_drift",
+            "derived_computed",
+        ] {
+            assert!(!on_by_default(kind), "'{kind}' is asked for, not assumed");
+        }
+        assert!(channel("test").is_none(), "the test send addresses whoever asked");
     }
 
     /// The list above is only as good as its completeness, so it is held to the sources: every
@@ -173,8 +254,8 @@ mod tests {
             for tail in source.split("kind: \"").skip(1) {
                 let kind = tail.split('"').next().unwrap_or_default();
                 assert!(
-                    kind == UNADDRESSED_KIND || EMITTED_KINDS.contains(&kind),
-                    "a message carries kind '{kind}', which is in neither EMITTED_KINDS nor the \
+                    kind == UNADDRESSED_KIND || emitted_kinds().contains(&kind),
+                    "a message carries kind '{kind}', which is on neither a channel nor the \
                      unaddressed test send, so nothing maps it to an audience"
                 );
             }
@@ -182,25 +263,12 @@ mod tests {
     }
 
     #[test]
-    fn test_test_send_belongs_to_no_group() {
-        assert_eq!(kind_group("test"), None);
-    }
-
-    #[test]
-    fn test_only_alarms_is_subscribed_without_a_row() {
-        assert!(KindGroup::Alarms.subscribed_without_a_row());
-        assert!(!KindGroup::Sync.subscribed_without_a_row());
-        assert!(
-            !KindGroup::Prediction.subscribed_without_a_row(),
-            "an instrument status forecast is never on by default"
-        );
-    }
-
-    #[test]
-    fn test_group_names_round_trip() {
-        for g in KindGroup::ALL {
-            assert_eq!(KindGroup::parse(g.as_str()), Some(g));
+    fn test_channel_names_are_the_kinds_and_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for c in CHANNELS {
+            assert!(seen.insert(c.kind), "'{}' is declared twice", c.kind);
+            assert_eq!(channel(c.kind), Some(&c));
+            assert!(!c.label.is_empty() && !c.description.is_empty());
         }
-        assert_eq!(KindGroup::parse("alarm"), None);
     }
 }

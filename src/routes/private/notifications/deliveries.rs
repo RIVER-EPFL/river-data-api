@@ -82,6 +82,7 @@ pub struct DeliveryRecipient {
     pub channel: String,
     pub recipient: String,
     pub status: String,
+    #[schema(required)]
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
 }
@@ -89,11 +90,14 @@ pub struct DeliveryRecipient {
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DeliveryMessage {
+    #[schema(required)]
     pub alarm_event_id: Option<Uuid>,
     pub kind: String,
     /// The second the message's rows were written in, which is the group key.
     pub at: DateTime<Utc>,
+    #[schema(required)]
     pub site_name: Option<String>,
+    #[schema(required)]
     pub parameter_name: Option<String>,
     pub counts: DeliveryCounts,
     pub recipients: Vec<DeliveryRecipient>,

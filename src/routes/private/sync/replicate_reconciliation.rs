@@ -26,6 +26,7 @@ pub struct FamilyCandidate {
     pub family_source_key: String,
     pub old_stream_id: Uuid,
     pub old_source_key: String,
+    #[schema(required)]
     pub site_parameter_id: Option<Uuid>,
     pub migrated: bool,
     pub old_readings: i64,
@@ -227,7 +228,9 @@ pub struct DuplicateSlotStream {
     pub source_system: String,
     pub source_key: String,
     pub readings: i64,
+    #[schema(required)]
     pub first_reading: Option<chrono::DateTime<chrono::Utc>>,
+    #[schema(required)]
     pub last_reading: Option<chrono::DateTime<chrono::Utc>>,
 }
 

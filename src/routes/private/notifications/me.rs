@@ -16,7 +16,7 @@ use crate::common::authz::AccessScope;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
 
-use super::KindGroup;
+use super::channel;
 use super::access::project_allowed;
 use super::dispatcher::log_delivery;
 
@@ -30,15 +30,18 @@ fn require_sub(auth: &AuthContext) -> AppResult<String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SubscriptionScope {
-    /// Which notifications the row answers for: `alarms` or `sync`. Absent means `alarms`, the
-    /// only group anyone was subscribed to before groups existed.
-    #[serde(default = "default_kind_group")]
-    pub kind_group: String,
+    /// The channel the row answers for, which is the notification kind (M163). Absent means
+    /// `alarm_opened`, the audience every subscriber had before channels were separable.
+    #[serde(default = "default_channel", alias = "kind_group")]
+    pub channel: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[schema(nullable = false)]
     pub project_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[schema(nullable = false)]
     pub site_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[schema(nullable = false)]
     pub parameter_id: Option<Uuid>,
     pub enabled: bool,
 }
@@ -47,7 +50,7 @@ pub struct SubscriptionScope {
 /// written before either existed takes the default rather than failing the whole read.
 #[derive(FromQueryResult)]
 struct StoredSubscription {
-    kind_group: Option<String>,
+    channel: Option<String>,
     project_id: Option<Uuid>,
     site_id: Option<Uuid>,
     parameter_id: Option<Uuid>,
@@ -62,8 +65,8 @@ pub struct MyNotifications {
     pub subscriptions: Vec<SubscriptionScope>,
 }
 
-fn default_kind_group() -> String {
-    KindGroup::Alarms.as_str().to_string()
+fn default_channel() -> String {
+    "alarm_opened".to_string()
 }
 
 async fn ensure_subscriber(state: &AppState, sub: &str) -> AppResult<()> {
@@ -89,9 +92,12 @@ async fn load(state: &AppState, sub: &str) -> AppResult<MyNotifications> {
             [sub.into()],
         ))
         .await?;
+    // No subscriber row means the default, which the query already spells; a row that will not
+    // decode is an error.
     let web_push_enabled = row
         .as_ref()
-        .and_then(|r| r.try_get::<bool>("", "web_push_enabled").ok())
+        .map(|r| r.try_get::<bool>("", "web_push_enabled"))
+        .transpose()?
         .unwrap_or(true);
 
     let push_count = state
@@ -102,14 +108,15 @@ async fn load(state: &AppState, sub: &str) -> AppResult<MyNotifications> {
             [sub.into()],
         ))
         .await?
-        .and_then(|r| r.try_get::<i64>("", "cnt").ok())
+        .map(|r| r.try_get::<i64>("", "cnt"))
+        .transpose()?
         .unwrap_or(0);
 
     let sub_rows = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
             PG,
-            "SELECT kind_group, project_id, site_id, parameter_id, enabled \
+            "SELECT channel, project_id, site_id, parameter_id, enabled \
              FROM notification_subscriptions WHERE keycloak_sub = $1",
             [sub.into()],
         ))
@@ -118,7 +125,7 @@ async fn load(state: &AppState, sub: &str) -> AppResult<MyNotifications> {
     for r in &sub_rows {
         let row = StoredSubscription::from_query_result(r, "")?;
         subscriptions.push(SubscriptionScope {
-            kind_group: row.kind_group.unwrap_or_else(default_kind_group),
+            channel: row.channel.unwrap_or_else(default_channel),
             project_id: row.project_id,
             site_id: row.site_id,
             parameter_id: row.parameter_id,
@@ -181,6 +188,90 @@ pub async fn update_my_notifications(
     Ok(Json(load(&state, &sub).await?))
 }
 
+/// One channel as the person choosing it sees it: what it sends, whether they are in its
+/// audience, and how often it has fired lately, so the volume is known before the box is ticked.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelView {
+    pub kind: String,
+    pub label: String,
+    pub description: String,
+    pub on_by_default: bool,
+    /// Whether the caller is in this channel's audience right now, their own rows applied.
+    pub subscribed: bool,
+    /// Notifications of this kind sent in the last day, week and month, across everyone.
+    pub sent_1d: i64,
+    pub sent_7d: i64,
+    pub sent_30d: i64,
+}
+
+#[derive(FromQueryResult)]
+struct ChannelCounts {
+    kind: String,
+    sent_1d: i64,
+    sent_7d: i64,
+    sent_30d: i64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/notifications/channels",
+    responses((status = 200, description = "Channels, with what each has sent lately", body = [ChannelView])),
+    tag = "notifications"
+)]
+pub async fn list_channels(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> AppResult<Json<Vec<ChannelView>>> {
+    let sub = require_sub(&auth)?;
+    let counts = state
+        .db
+        .query_all_raw(Statement::from_string(
+            PG,
+            "SELECT kind,                     count(*) FILTER (WHERE sent_at > now() - interval '1 day')::bigint AS sent_1d,                     count(*) FILTER (WHERE sent_at > now() - interval '7 days')::bigint AS sent_7d,                     count(*) FILTER (WHERE sent_at > now() - interval '30 days')::bigint AS sent_30d                FROM notification_log GROUP BY kind"
+                .to_string(),
+        ))
+        .await?;
+    let mut by_kind = std::collections::HashMap::new();
+    for row in &counts {
+        let c = ChannelCounts::from_query_result(row, "")?;
+        by_kind.insert(c.kind.clone(), c);
+    }
+    let mine = state
+        .db
+        .query_all_raw(Statement::from_sql_and_values(
+            PG,
+            "SELECT channel, enabled FROM notification_subscriptions               WHERE keycloak_sub = $1 AND project_id IS NULL AND site_id IS NULL                 AND parameter_id IS NULL",
+            [sub.into()],
+        ))
+        .await?;
+    let mut chosen = std::collections::HashMap::new();
+    for row in &mine {
+        chosen.insert(
+            row.try_get::<String>("", "channel")?,
+            row.try_get::<bool>("", "enabled")?,
+        );
+    }
+    Ok(Json(
+        super::CHANNELS
+            .iter()
+            .map(|c| {
+                let counts = by_kind.get(c.kind);
+                ChannelView {
+                    kind: c.kind.to_string(),
+                    label: c.label.to_string(),
+                    description: c.description.to_string(),
+                    on_by_default: c.on_by_default,
+                    subscribed: chosen.get(c.kind).copied().unwrap_or(c.on_by_default),
+                    sent_1d: counts.map_or(0, |c| c.sent_1d),
+                    sent_7d: counts.map_or(0, |c| c.sent_7d),
+                    sent_30d: counts.map_or(0, |c| c.sent_30d),
+                }
+            })
+            .collect(),
+    ))
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetSubscriptionsRequest {
     pub subscriptions: Vec<SubscriptionScope>,
@@ -207,10 +298,10 @@ pub async fn set_my_subscriptions(
     };
 
     for s in &req.subscriptions {
-        if KindGroup::parse(&s.kind_group).is_none() {
+        if channel(&s.channel).is_none() {
             return Err(AppError::BadRequest(format!(
-                "unknown notification group: {}",
-                s.kind_group
+                "unknown notification channel: {}",
+                s.channel
             )));
         }
         if let Some(pid) = s.project_id
@@ -233,11 +324,11 @@ pub async fn set_my_subscriptions(
         txn.execute_raw(Statement::from_sql_and_values(
             PG,
             "INSERT INTO notification_subscriptions \
-                (keycloak_sub, kind_group, project_id, site_id, parameter_id, enabled) \
+                (keycloak_sub, channel, project_id, site_id, parameter_id, enabled) \
              VALUES ($1, $2, $3, $4, $5, $6)",
             [
                 sub.clone().into(),
-                s.kind_group.clone().into(),
+                s.channel.clone().into(),
                 s.project_id.into(),
                 s.site_id.into(),
                 s.parameter_id.into(),
@@ -269,8 +360,10 @@ pub struct RegisterPushRequest {
 pub struct PushSubscriptionRow {
     pub id: Uuid,
     pub endpoint: String,
+    #[schema(required)]
     pub user_agent: Option<String>,
     pub created_at: DateTime<Utc>,
+    #[schema(required)]
     pub last_success_at: Option<DateTime<Utc>>,
 }
 
@@ -412,8 +505,10 @@ pub async fn schedule_ping(
 pub struct PushAttempt {
     pub id: Uuid,
     pub endpoint_tail: String,
+    #[schema(required)]
     pub user_agent: Option<String>,
     pub status: String,
+    #[schema(required)]
     pub error: Option<String>,
     pub pruned: bool,
 }
@@ -421,6 +516,16 @@ pub struct PushAttempt {
 fn endpoint_tail(endpoint: &str) -> String {
     let count = endpoint.chars().count();
     endpoint.chars().skip(count.saturating_sub(12)).collect()
+}
+
+/// One device a test send goes to.
+#[derive(FromQueryResult)]
+struct SendTarget {
+    id: Uuid,
+    endpoint: String,
+    p256dh: String,
+    auth: String,
+    user_agent: Option<String>,
 }
 
 async fn send_to_user(
@@ -468,18 +573,15 @@ async fn send_to_user(
 
     for row in rows {
         // A row that will not decode must not silence the devices queued behind it.
-        let decoded = (
-            row.try_get::<Uuid>("", "id"),
-            row.try_get::<String>("", "endpoint"),
-            row.try_get::<String>("", "p256dh"),
-            row.try_get::<String>("", "auth"),
-            row.try_get::<Option<String>>("", "user_agent"),
-        );
-        let (id, endpoint, p256dh, auth_key, user_agent) = match decoded {
-            (Ok(id), Ok(endpoint), Ok(p256dh), Ok(auth_key), Ok(user_agent)) => {
-                (id, endpoint, p256dh, auth_key, user_agent)
-            }
-            _ => {
+        let SendTarget {
+            id,
+            endpoint,
+            p256dh,
+            auth: auth_key,
+            user_agent,
+        } = match SendTarget::from_query_result(&row, "") {
+            Ok(target) => target,
+            Err(_) => {
                 tracing::warn!("push: skipping undecodable subscription row");
                 continue;
             }

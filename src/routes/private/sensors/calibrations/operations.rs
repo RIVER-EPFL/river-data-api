@@ -111,7 +111,9 @@ async fn pinned_readings(db: &DatabaseConnection, id: Uuid) -> Result<Option<i64
         .await
         .map_err(ApiError::database)?;
     let n = row
-        .and_then(|r| r.try_get::<i64>("", "n").ok())
+        .map(|r| r.try_get::<i64>("", "n"))
+        .transpose()
+        .map_err(ApiError::database)?
         .unwrap_or_default();
     Ok((n > 0).then_some(n))
 }

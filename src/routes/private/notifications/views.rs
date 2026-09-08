@@ -1,7 +1,7 @@
 //! Admin HTTP handlers for the notification layer.
 
 use axum::{Json, extract::State};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -23,6 +23,7 @@ pub struct TestSendRequest {
 pub struct TestResult {
     pub recipient: String,
     pub status: String,
+    #[schema(required)]
     pub error: Option<String>,
 }
 
@@ -106,12 +107,14 @@ pub async fn test_send(
     }))
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema, FromQueryResult)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriberRow {
     pub keycloak_sub: String,
     pub web_push_enabled: bool,
+    #[sea_orm(alias = "push_count")]
     pub push_subscription_count: i64,
+    #[sea_orm(alias = "overrides")]
     pub subscription_overrides: i64,
 }
 
@@ -146,14 +149,9 @@ pub async fn list_subscribers(
         ))
         .await?;
 
-    let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
-        out.push(SubscriberRow {
-            keycloak_sub: r.try_get("", "keycloak_sub")?,
-            web_push_enabled: r.try_get("", "web_push_enabled").unwrap_or(true),
-            push_subscription_count: r.try_get("", "push_count")?,
-            subscription_overrides: r.try_get("", "overrides")?,
-        });
-    }
+    let out = rows
+        .iter()
+        .map(|r| SubscriberRow::from_query_result(r, ""))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(out))
 }

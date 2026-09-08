@@ -23,7 +23,9 @@ pub struct MemberStatistics {
     pub mean_label: String,
     pub sd_label: String,
     /// The divisor the slot declares, NULL where it declares none. Never inferred.
+    #[schema(required)]
     pub sd_estimator: Option<String>,
+    #[schema(required)]
     pub decimal_places: Option<i32>,
 }
 
@@ -97,19 +99,25 @@ pub struct DefinitionMember {
     pub code: String,
     /// The group's label over the catalog's name.
     pub label: String,
+    #[schema(required)]
     pub units: Option<String>,
+    #[schema(required)]
     pub decimal_places: Option<i32>,
+    #[schema(required)]
     pub description: Option<String>,
     pub role: String,
     pub ordinal: i32,
     /// Display hint: the manifest section the group's calculation renders this field under. It
     /// labels a run of columns and never reorders them.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub section: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub replicates: Option<serde_json::Value>,
     /// The mean and sd columns a replicated member also shows. Absent on a member entered once.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub statistics: Option<MemberStatistics>,
 }
 
@@ -118,6 +126,7 @@ pub struct GroupDefinition {
     pub id: Uuid,
     pub code: String,
     pub label: String,
+    #[schema(required)]
     pub description: Option<String>,
     pub ordinal: i32,
     pub members: Vec<DefinitionMember>,

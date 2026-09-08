@@ -168,7 +168,12 @@ async fn blob_at_event(
             ],
         ))
         .await?;
-    Ok(row.and_then(|r| r.try_get("", "provenance").ok()))
+    // The column is nullable, so a row with no blob is None; a row that will not decode is an
+    // error, because the chain reads this to decide whether a run already stands.
+    Ok(row
+        .map(|r| r.try_get::<Option<serde_json::Value>>("", "provenance"))
+        .transpose()?
+        .flatten())
 }
 
 /// The request body for a run at this event: the prior run's stored inputs when one exists (minus

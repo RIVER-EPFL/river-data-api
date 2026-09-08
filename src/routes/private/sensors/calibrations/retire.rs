@@ -11,7 +11,7 @@ use axum::{
     extract::{Path, State},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -38,9 +38,11 @@ pub struct RetireRequest {
 pub struct RetireResponse {
     pub calibration_id: Uuid,
     pub sensor_id: Uuid,
+    #[schema(required)]
     pub retired_at: Option<DateTime<Utc>>,
     /// The decision set the move was recorded as, and what a rollback names. Absent on a dry run
     /// and on a curve no reading names.
+    #[schema(required)]
     pub set_id: Option<Uuid>,
     /// Readings currently corrected by this curve.
     pub readings: i64,
@@ -71,6 +73,15 @@ fn moved_rows_sql() -> String {
     )
 }
 
+/// What retiring a curve would move: the readings it corrected, and how they land.
+#[derive(sea_orm::FromQueryResult)]
+struct RetireCounts {
+    readings: i64,
+    repointed: i64,
+    uncorrected: i64,
+    pinned: i64,
+}
+
 async fn counts<C: ConnectionTrait>(
     conn: &C,
     id: Uuid,
@@ -93,11 +104,12 @@ async fn counts<C: ConnectionTrait>(
         ))
         .await?
         .ok_or_else(|| AppError::Internal("counting the curve's readings returned no row".into()))?;
+    let counts = RetireCounts::from_query_result(&row, "")?;
     Ok((
-        row.try_get("", "readings")?,
-        row.try_get("", "repointed")?,
-        row.try_get("", "uncorrected")?,
-        row.try_get("", "pinned")?,
+        counts.readings,
+        counts.repointed,
+        counts.uncorrected,
+        counts.pinned,
     ))
 }
 
@@ -225,6 +237,7 @@ pub struct UnretireResponse {
     pub calibration_id: Uuid,
     pub sensor_id: Uuid,
     /// The decision set that was inverted, if the retirement moved any reading.
+    #[schema(required)]
     pub set_id: Option<Uuid>,
     pub restored: usize,
 }

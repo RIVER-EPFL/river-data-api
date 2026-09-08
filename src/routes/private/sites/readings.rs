@@ -85,18 +85,22 @@ struct Annotations {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ReadingsResponse {
     /// Project this data belongs to
+    #[schema(required)]
     pub project: Option<ProjectRef>,
     /// Site this data belongs to
     pub site: SiteRef,
     /// Start of time range (null if no data)
+    #[schema(required)]
     pub start: Option<DateTime<Utc>>,
     /// End of time range (null if no data)
+    #[schema(required)]
     pub end: Option<DateTime<Utc>>,
     /// Array of timestamps (aligned to 10-minute intervals)
     pub times: Vec<DateTime<Utc>>,
     /// The replicate index of each row, present only under `include_replicates`. Replicates share
     /// a timestamp, so `times` alone does not identify a row there.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub replicate_indices: Option<Vec<i16>>,
     /// Array of parameters with their values
     pub parameters: Vec<ParameterData>,
@@ -111,58 +115,72 @@ pub struct ParameterData {
     pub code: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub display_name: Option<String>,
     #[serde(rename = "type")]
     pub sensor_type: String,
+    #[schema(required)]
     pub units: Option<String>,
     /// `site_parameters.decimal_places` for the slot, null when it declares none. The private arm
     /// serves values as stored; this is what a consumer needs to render them at the declared
     /// precision without asking a second endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub decimal_places: Option<i16>,
     /// Values array (same length as times, null for missing data)
     pub values: Vec<Option<f64>>,
     /// Severity levels (0=ok, 1=warning, 2=alarm). Only present when alarms=true.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub severities: Option<Vec<Option<i16>>>,
     /// Boolean flags marking outliers (same length as times). Only present when `include_flagged=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub flagged: Option<Vec<Option<bool>>>,
     /// Reasons for flagging (same length as times). Only present when `include_flagged=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub flag_reasons: Option<Vec<Option<String>>>,
     /// Per-point measurement type (continuous/spot/derived). Only present when `include_measurement_type=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub measurement_types: Option<Vec<Option<String>>>,
     /// Per-point base calibration reference (same length as times). Only present when
     /// `include_curves=true`. Null where no calibration was applied, which is what distinguishes an
     /// unrecorded base from an identity one.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub calibration_ids: Option<Vec<Option<Uuid>>>,
     /// Per-point standard curve reference, applied after the base calibration (same length as
     /// times). Only present when `include_curves=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub standard_curve_ids: Option<Vec<Option<Uuid>>>,
     /// Per-point sample stats with individual replicates (same length as times; null where the
     /// point is not a replicate group). Only present when `include_sample_stats=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub samples: Option<Vec<Option<SampleStatOut>>>,
     /// The streams paired into this slot (series-level; per-point exactness is
     /// `/readings/provenance`'s job). Only present when `include_origin=true`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub origins: Option<Vec<OriginRef>>,
     /// Whether each served spot point is a retracted instant (same length as times). Only present
     /// when `include_withdrawn=true`, which is also what makes such an instant served at all.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub withdrawn: Option<Vec<Option<bool>>>,
     /// Whether each served point still needs countersigning (same length as times). Always served,
     /// because it is the one surface that shows it: the public arm, the alarms and the seasonal
     /// check leave such a reading out entirely.
+    #[schema(required)]
     pub unverified: Option<Vec<Option<bool>>>,
     /// How many spot instants in the window the source has retracted in full, whether or not they
     /// are served. Present whenever the request covers the spot arm, so a chart can say a visit was
     /// taken back without fetching the points.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub withdrawn_count: Option<i64>,
 }
 
@@ -180,12 +198,15 @@ pub struct ReplicateOut {
     pub replicate_index: i16,
     pub raw_value: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub calibrated_value: Option<f64>,
     /// The base calibration this replicate was corrected with, null when none was.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub calibration_id: Option<Uuid>,
     /// The standard curve applied on top of the base calibration, null when none was.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub standard_curve_id: Option<Uuid>,
     pub flagged: bool,
     /// The source's claimed window no longer contains this replicate. It is excluded from the
@@ -200,20 +221,27 @@ pub struct SampleStatOut {
     pub sample_id: Uuid,
     pub n: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub mean: Option<f64>,
     /// The sd under the divisor the slot declares; `sd_estimator` names which. Both divisors are
     /// served beside it, so the one not declared stays readable.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub stdev: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub stdev_sample: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub stdev_population: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub median: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub min: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub max: Option<f64>,
     /// 'sample' | 'population', and what chose it ('default' is the fallback having applied).
     pub sd_estimator: String,

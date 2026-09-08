@@ -12,7 +12,7 @@
 //! is why the exclusion here is by pending recall rather than by sensor.
 
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DbErr, Statement};
+use sea_orm::{ConnectionTrait, DbErr, FromQueryResult, Statement};
 use uuid::Uuid;
 
 /// The window a caller is about to claim, and what the write will do to the slot before claiming it.
@@ -31,6 +31,15 @@ pub struct SlotRequest {
 
 /// A deployment already covering part of the requested window.
 #[derive(Debug, Clone, Copy)]
+/// The deployment row a slot query matched, before its timestamps are put in UTC.
+#[derive(FromQueryResult)]
+struct OccupantRow {
+    id: Uuid,
+    sensor_id: Uuid,
+    deployed_from: DateTime<chrono::FixedOffset>,
+    deployed_until: Option<DateTime<chrono::FixedOffset>>,
+}
+
 pub struct SlotOccupant {
     pub deployment_id: Uuid,
     pub sensor_id: Uuid,
@@ -73,14 +82,12 @@ pub async fn find_occupant<C: ConnectionTrait>(
     let Some(row) = row else {
         return Ok(None);
     };
-    let deployed_from: DateTime<chrono::FixedOffset> = row.try_get("", "deployed_from")?;
-    let deployed_until: Option<DateTime<chrono::FixedOffset>> =
-        row.try_get("", "deployed_until")?;
+    let occupant = OccupantRow::from_query_result(&row, "")?;
     Ok(Some(SlotOccupant {
-        deployment_id: row.try_get("", "id")?,
-        sensor_id: row.try_get("", "sensor_id")?,
-        deployed_from: deployed_from.with_timezone(&Utc),
-        deployed_until: deployed_until.map(|t| t.with_timezone(&Utc)),
+        deployment_id: occupant.id,
+        sensor_id: occupant.sensor_id,
+        deployed_from: occupant.deployed_from.with_timezone(&Utc),
+        deployed_until: occupant.deployed_until.map(|t| t.with_timezone(&Utc)),
     }))
 }
 

@@ -45,6 +45,14 @@ impl Service {
         }
     }
 
+    /// The profile that covers everything except this service, which the failure message offers.
+    fn excluded_by(self) -> Profile {
+        match self {
+            Service::Keycloak => Profile::NoKeycloak,
+            Service::ToolsRunner => Profile::NoR,
+        }
+    }
+
     /// Gate a test on this service: true to proceed, false when the profile excludes it.
     ///
     /// # Panics
@@ -56,10 +64,12 @@ impl Service {
         }
         assert!(
             self.reachable().await,
-            "test profile `{}` covers {}, but it is unreachable at {}, so {test_name} cannot run",
+            "test profile `{}` covers {}, but it is unreachable at {}, so {test_name} cannot run. \
+             Run it where the service is, or exclude it: {PROFILE_VAR}={}",
             profile.name(),
             self.name(),
-            self.url()
+            self.url(),
+            self.excluded_by().name()
         );
         true
     }
@@ -101,7 +111,17 @@ impl Profile {
     }
 }
 
-/// The profile this run declared. Unset is `all`, so a run that says nothing is held to everything.
+/// What a checkout covers when the run declares nothing: everything but the R tool runner.
+///
+/// The runner is published nowhere. In compose it is on an internal network with no `ports:`, and
+/// on k8s it is a sidecar bound to the pod's loopback, so a run from the host cannot reach it
+/// however healthy the container is. Holding an undeclared run to it makes the `tools` theme red
+/// for a reason that is not the caller's. Keycloak is the other way round: compose publishes 8180,
+/// which is what `keycloak_base_url` defaults to. The runs that do cover the runner say so:
+/// `TEST_PROFILE=all` in CI and in the compose watcher, which run beside it.
+pub const HOST_DEFAULT: Profile = Profile::NoR;
+
+/// The profile this run declared, or [`HOST_DEFAULT`] when it declared none.
 ///
 /// # Panics
 /// When `TEST_PROFILE` names a profile that does not exist.
@@ -110,7 +130,7 @@ pub fn selected() -> Profile {
     dotenvy::dotenv().ok();
     match std::env::var(PROFILE_VAR) {
         Ok(raw) => Profile::parse(&raw).unwrap_or_else(|e| panic!("{e}")),
-        Err(_) => Profile::All,
+        Err(_) => HOST_DEFAULT,
     }
 }
 
@@ -124,6 +144,14 @@ mod tests {
         assert_eq!(Profile::parse(" no-keycloak "), Ok(Profile::NoKeycloak));
         let err = Profile::parse("keycloak").unwrap_err();
         assert!(err.contains("unknown TEST_PROFILE `keycloak`"), "{err}");
+    }
+
+    /// The default is the one a checkout can actually meet: the runner is published nowhere, so an
+    /// undeclared run covering it would be red on every host.
+    #[test]
+    fn test_host_default_covers_keycloak_and_not_the_runner() {
+        assert!(super::HOST_DEFAULT.covers(Service::Keycloak));
+        assert!(!super::HOST_DEFAULT.covers(Service::ToolsRunner));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures::FutureExt;
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use super::job::JobRegistry;
@@ -65,6 +65,7 @@ pub async fn enqueue(
 }
 
 /// A row claimed off the queue.
+#[derive(FromQueryResult)]
 struct Claimed {
     id: Uuid,
     trigger_type: String,
@@ -83,10 +84,9 @@ async fn claim_one(
     db: &DatabaseConnection,
     worker_id: &str,
 ) -> Result<Option<Claimed>, sea_orm::DbErr> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "WITH claimable AS ( \
+    Claimed::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "WITH claimable AS ( \
                  SELECT id FROM reprocessing_jobs \
                  WHERE (status = 'queued' AND next_attempt_at <= now()) \
                     OR (status = 'running' \
@@ -104,20 +104,10 @@ async fn claim_one(
              FROM claimable c \
              WHERE j.id = c.id \
              RETURNING j.id, j.trigger_type, j.lease_epoch, j.params, j.retry_count",
-            [worker_id.into(), LEASE_SECONDS.into()],
-        ))
-        .await?;
-
-    match row {
-        Some(r) => Ok(Some(Claimed {
-            id: r.try_get("", "id")?,
-            trigger_type: r.try_get("", "trigger_type")?,
-            lease_epoch: r.try_get("", "lease_epoch")?,
-            params: r.try_get("", "params")?,
-            retry_count: r.try_get("", "retry_count").unwrap_or(0),
-        })),
-        None => Ok(None),
-    }
+        [worker_id.into(), LEASE_SECONDS.into()],
+    ))
+    .one(db)
+    .await
 }
 
 /// Renew the lease on a cadence while the job runs, and observe cross-replica cancellation: if
@@ -150,11 +140,14 @@ async fn heartbeat(
             ))
             .await;
         match renewed {
-            Ok(Some(r)) => {
-                if r.try_get::<bool>("", "cancel_requested").unwrap_or(false) {
-                    cancel.store(true, Ordering::Relaxed);
-                }
-            }
+            Ok(Some(r)) => match r.try_get::<bool>("", "cancel_requested") {
+                Ok(true) => cancel.store(true, Ordering::Relaxed),
+                Ok(false) => {}
+                // The row matched, so the lease is renewed and ownership is proven whatever the
+                // column decoded to. Cancellation is re-read on the next tick rather than guessed
+                // at here.
+                Err(e) => tracing::warn!(job_id = %job_id, error = %e, "cancel flag unreadable"),
+            },
             // No row matched → we lost the lease (reclaimed). Stop the job and stop heartbeating.
             Ok(None) => {
                 cancel.store(true, Ordering::Relaxed);

@@ -534,3 +534,63 @@ async fn recomposed_values_are_announced_once_from_the_ledger() {
         "the same moves are not announced twice"
     );
 }
+
+/// Scenario: the arms that keep the system running do their work, and each has a channel nobody is
+/// subscribed to by default (Q57, M164).
+///
+/// Expected behaviour: each says what it did, counted from the job rows it already writes, once
+/// per batch, and a kind whose jobs did nothing says nothing.
+#[tokio::test]
+#[serial]
+async fn the_upkeep_arms_each_report_what_they_did() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    crate::common::exec(
+        &db,
+        "INSERT INTO reprocessing_jobs (trigger_type, status, completed_at, detail) VALUES \
+           ('janitor_service', 'completed', NOW(), \
+            '{\"counts\": {\"pruned\": 7, \"recomposed\": 0}}'::jsonb), \
+           ('sync_event_sweep', 'completed', NOW(), \
+            '{\"counts\": {\"sync_events_closed\": 3}}'::jsonb), \
+           ('identity_reconcile', 'completed', NOW(), \
+            '{\"counts\": {\"revoked\": 2}}'::jsonb)",
+    )
+    .await;
+
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let channels: Vec<Box<dyn NotificationChannel>> =
+        vec![Box::new(MockChannel { sent: sent.clone() })];
+    triggers::run(&state, &channels).await;
+
+    {
+        let msgs = sent.lock().unwrap();
+        for (kind, count) in [("jobs_pruned", "7"), ("sync_events_swept", "3"), ("access_revoked", "2")]
+        {
+            let sent = kinds(&msgs, kind);
+            assert_eq!(sent.len(), 1, "{kind} is announced once: {msgs:?}");
+            assert!(
+                sent[0].subject.contains(count),
+                "{kind} names what it did: {}",
+                sent[0].subject
+            );
+        }
+        assert!(
+            kinds(&msgs, "aggregates_refreshed").is_empty(),
+            "a run that recomposed nothing says nothing"
+        );
+        assert!(
+            kinds(&msgs, "ledger_pruned").is_empty(),
+            "a kind whose jobs did not run says nothing"
+        );
+    }
+
+    sent.lock().unwrap().clear();
+    triggers::run(&state, &channels).await;
+    assert!(
+        kinds(&sent.lock().unwrap(), "jobs_pruned").is_empty(),
+        "the same work is not announced twice"
+    );
+}

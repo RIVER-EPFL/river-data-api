@@ -9,12 +9,15 @@ use crate::routes::private::sites::types::{ProjectRef, SiteRef};
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AlarmViolationsResponse {
     /// Project this data belongs to
+    #[schema(required)]
     pub project: Option<ProjectRef>,
     /// Site this data belongs to
     pub site: SiteRef,
     /// Start of time range (null if no violations)
+    #[schema(required)]
     pub start: Option<DateTime<Utc>>,
     /// End of time range (null if no violations)
+    #[schema(required)]
     pub end: Option<DateTime<Utc>>,
     /// Array of timestamps where violations occurred
     pub times: Vec<DateTime<Utc>>,
@@ -29,6 +32,7 @@ pub struct ParameterViolationData {
     pub name: String,
     #[serde(rename = "type")]
     pub sensor_type: String,
+    #[schema(required)]
     pub units: Option<String>,
     /// Values array (same length as times). Null at a timestamp where this parameter did not
     /// violate, matching every other series endpoint; the axis is the union across parameters.
@@ -73,19 +77,24 @@ pub struct ActiveAlarm {
     pub since: DateTime<Utc>,
     /// When the breach started (from the persisted alarm event).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub started_at: Option<DateTime<Utc>>,
     /// Persisted alarm-event id (present once the sweeper has recorded this breach).
     /// Acknowledge via `POST /api/alarms/{event_id}/acknowledge`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub event_id: Option<Uuid>,
     /// True when the open event has been acknowledged.
     pub acknowledged: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub acknowledged_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub acknowledged_by: Option<String>,
     /// Highest severity seen while this event has been open (1=warning, 2=alarm).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub max_severity: Option<i16>,
 }
 
@@ -119,15 +128,18 @@ pub struct AlarmSiteSummary {
     pub warning_count: usize,
     pub alarm_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub latest_reading_time: Option<DateTime<Utc>>,
     /// Most recent `last_seen_at` of an alarm event whose peak severity was a warning
     /// (`max_severity = 1`). Events that escalated to an alarm contribute to `last_alarm_at`
     /// instead, so the two timestamps are disjoint by peak severity.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub last_warning_at: Option<DateTime<Utc>>,
     /// Most recent `last_seen_at` of an alarm event that reached alarm severity
     /// (`max_severity = 2`).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub last_alarm_at: Option<DateTime<Utc>>,
 }
 
@@ -178,12 +190,16 @@ pub struct AlarmEventResponse {
     pub value_at_start: f64,
     pub last_value: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub resolved_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub resolved_value: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub acknowledged_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub acknowledged_by: Option<String>,
 }
 

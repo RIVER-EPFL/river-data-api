@@ -1,7 +1,8 @@
 use axum::{Json, extract::State};
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, Statement,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Set,
+    Statement,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -113,6 +114,7 @@ pub struct IngestResponse {
     /// The window the server accepted, echoed so a connector can detect an API image that
     /// silently ignored the claim (which would downgrade the source to append mode).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub accepted_window: Option<crate::routes::private::readings::reconcile::SourceWindow>,
     pub stream_id: Uuid,
     pub paired: bool,
@@ -1243,14 +1245,18 @@ pub async fn ingest_status_events(
             [payload.stream_id.into()],
         ))
         .await?;
+    // The tip decides which events are new and which are a repeat of the stored value, so a row
+    // that will not decode is an error: reading it as "no tip" would re-admit everything.
     let tip_time: Option<chrono::DateTime<Utc>> = tip
         .as_ref()
-        .and_then(|r| {
-            r.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time")
-                .ok()
-        })
+        .map(|r| r.try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time"))
+        .transpose()?
         .map(|t| t.with_timezone(&Utc));
-    let mut last_value: Option<String> = tip.as_ref().and_then(|r| r.try_get("", "value").ok());
+    let mut last_value: Option<String> = tip
+        .as_ref()
+        .map(|r| r.try_get::<Option<String>>("", "value"))
+        .transpose()?
+        .flatten();
     payload.events.sort_by_key(|e| e.time);
     let before_dedup = payload.events.len();
     payload.events.retain(|e| {
@@ -1384,6 +1390,14 @@ async fn enforce_ingest_scope(
 /// pairing); a group that matches again at source supersedes its open hold; a group an operator
 /// already ruled on (acknowledged or remediated) is left alone unless the portal's expected
 /// statistics have moved since the ruling, which opens a fresh hold.
+/// One stored replicate an audit expectation is compared against.
+#[derive(FromQueryResult)]
+struct StoredReplicate {
+    time: sea_orm::prelude::DateTimeWithTimeZone,
+    replicate_index: i16,
+    value: f64,
+}
+
 async fn run_replicate_audit(
     txn: &sea_orm::DatabaseTransaction,
     stream_id: Uuid,
@@ -1419,12 +1433,12 @@ async fn run_replicate_audit(
     let mut group_values: HashMap<chrono::DateTime<Utc>, Vec<audit::ReplicateValue>> =
         HashMap::new();
     for r in &rows {
-        let time: sea_orm::prelude::DateTimeWithTimeZone = r.try_get("", "time")?;
+        let stored = StoredReplicate::from_query_result(r, "")?;
+        let time = stored.time;
         if !audited_instants.contains(&time.with_timezone(&Utc)) {
             continue;
         }
-        let index: i16 = r.try_get("", "replicate_index")?;
-        let value: f64 = r.try_get("", "value")?;
+        let (index, value) = (stored.replicate_index, stored.value);
         group_values
             .entry(time.with_timezone(&Utc))
             .or_default()

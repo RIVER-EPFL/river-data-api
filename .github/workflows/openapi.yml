@@ -1,0 +1,48 @@
+name: OpenAPI document
+
+# The document is generated from the router itself, so a route or a schema type changes it without
+# anyone editing JSON, and this job is what makes the committed copy keep up: it regenerates and
+# fails on a diff, so a route change either brings the document with it or does not merge. The dump
+# serves nothing and issues no query, so it needs no database, only a URL for the config to accept.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/routes/**"
+      - "src/bin/dump_openapi.rs"
+      - "docs/openapi.json"
+      - ".github/workflows/openapi.yml"
+  pull_request:
+    paths:
+      - "src/routes/**"
+      - "src/bin/dump_openapi.rs"
+      - "docs/openapi.json"
+      - ".github/workflows/openapi.yml"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    env:
+      DATABASE_URL: postgresql://postgres:psql@localhost:5432/river
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Dump the document
+        run: cargo run --bin dump_openapi -- docs/openapi.json
+
+      - name: Fail on a stale document
+        run: |
+          if ! git diff --quiet -- docs/openapi.json; then
+            echo "docs/openapi.json is stale. Regenerate it with:"
+            echo "  cargo run --bin dump_openapi -- docs/openapi.json"
+            git diff --stat -- docs/openapi.json
+            exit 1
+          fi
+          echo "The document matches the router"

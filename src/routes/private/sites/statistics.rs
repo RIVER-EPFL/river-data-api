@@ -63,8 +63,10 @@ pub struct ParameterStatistics {
     pub code: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub units: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub decimal_places: Option<i16>,
     /// Instants in the range, whether or not each carries a value.
     pub time_points: i64,
@@ -73,18 +75,24 @@ pub struct ParameterStatistics {
     /// `time_points` less `n`, the portal's NA's row.
     pub nulls: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub median: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub mean: Option<f64>,
     /// Both divisors, named. Which one a slot declares governs its replicate groups, not a period
     /// summary, so neither is presented as the answer here.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub stdev_sample: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub stdev_population: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub min: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub max: Option<f64>,
 }
 
@@ -93,6 +101,7 @@ pub struct StatisticsResponse {
     pub site: SiteRef,
     pub start: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub end: Option<DateTime<Utc>>,
     /// `continuous` or `spot`: which cadence the rows summarise.
     pub measurement_type: String,

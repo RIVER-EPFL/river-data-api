@@ -49,6 +49,7 @@ pub fn bucket_interval(resolution: Resolution) -> &'static str {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AggregatesResponse {
     /// Project this data belongs to
+    #[schema(required)]
     pub project: Option<ProjectRef>,
     /// Site this data belongs to
     pub site: SiteRef,
@@ -72,12 +73,14 @@ pub struct ParameterAggregateData {
     /// Owning sensor for this series. Only present when `split_by_sensor=true` (null = the
     /// unattributed/legacy group). Absent in the default collapsed response.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub sensor_id: Option<Uuid>,
     /// Stable parameter code (catalog `code`), used as the CSV/NDJSON column key
     pub code: String,
     pub name: String,
     #[serde(rename = "type")]
     pub sensor_type: String,
+    #[schema(required)]
     pub units: Option<String>,
     /// Average values array (same length as times)
     pub avg: Vec<Option<f64>>,
@@ -89,6 +92,7 @@ pub struct ParameterAggregateData {
     pub count: Vec<i64>,
     /// Maximum severity level per bucket (0=ok, 1=warning, 2=alarm). Only present when alarms=true.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub max_severity: Option<Vec<Option<i16>>>,
     /// Count of flagged readings per bucket (always present).
     pub flagged_count: Vec<i64>,

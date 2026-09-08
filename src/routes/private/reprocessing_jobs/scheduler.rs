@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement,
-    TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
+    Statement, TransactionTrait,
 };
 
 use super::job::JobRegistry;
@@ -104,6 +104,18 @@ pub async fn tick(
 /// scheduled time (drift-free), and stamp `last_enqueued_at`, all in one transaction so a peer can't
 /// re-pick the same slot. Returns the claimed slot (whose job the caller then enqueues) or `None`
 /// when nothing is due.
+/// The schedule row a claim takes off the grid, decoded as one row rather than column by column.
+#[derive(sea_orm::FromQueryResult)]
+struct ClaimedSchedule {
+    id: uuid::Uuid,
+    job_name: String,
+    next_run_at: DateTime<Utc>,
+    interval_seconds: Option<i64>,
+    overlap_policy: Option<String>,
+    catchup_policy: Option<String>,
+    tunables: Option<serde_json::Value>,
+}
+
 async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, sea_orm::DbErr> {
     let txn = db.begin().await?;
     let row = txn
@@ -124,26 +136,21 @@ async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, s
         return Ok(None);
     };
 
-    let id: uuid::Uuid = row.try_get("", "id")?;
-    let job_name: String = row.try_get("", "job_name")?;
-    let scheduled_at: DateTime<Utc> = row.try_get("", "next_run_at")?;
-    let interval_seconds: i64 = row
-        .try_get::<i64>("", "interval_seconds")
-        .unwrap_or(0)
-        .max(1);
-    let overlap = OverlapPolicy::from_str_or_default(
-        row.try_get::<Option<String>>("", "overlap_policy")?
-            .as_deref(),
-    );
-    // `tunables` is `NOT NULL DEFAULT '{}'`; default to an empty object if a hand-edited row is null.
-    let tunables: serde_json::Value = row
-        .try_get::<Option<serde_json::Value>>("", "tunables")?
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    let catchup = CatchupPolicy::from_str_or_default(
-        row.try_get::<Option<String>>("", "catchup_policy")?
-            .as_deref(),
-    );
+    let ClaimedSchedule {
+        id,
+        job_name,
+        next_run_at: scheduled_at,
+        interval_seconds,
+        overlap_policy,
+        catchup_policy,
+        tunables,
+    } = ClaimedSchedule::from_query_result(&row, "")?;
+    // A cadence of zero would fire in a tight loop, the two policies read their own vocabularies,
+    // and `tunables` is `NOT NULL DEFAULT '{}'`, so a hand-edited null takes an empty object.
+    let interval_seconds = interval_seconds.unwrap_or(0).max(1);
+    let overlap = OverlapPolicy::from_str_or_default(overlap_policy.as_deref());
+    let catchup = CatchupPolicy::from_str_or_default(catchup_policy.as_deref());
+    let tunables = tunables.unwrap_or_else(|| serde_json::json!({}));
 
     // Advance the grid off the SCHEDULED time, not `now()`, so cadence never drifts by a run's own
     // latency and a downtime gap snaps forward to the next future slot (discarding the backlog).

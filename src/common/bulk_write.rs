@@ -18,11 +18,22 @@
 //! ```
 
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionSession, TransactionTrait};
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, FromQueryResult, Statement, TransactionSession,
+    TransactionTrait,
+};
 
 use crate::error::{AppError, AppResult};
 
 const LIFT_CAP: &str = "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0";
+
+/// The summary row a guarded statement reports, as the wrapper selects it.
+#[derive(FromQueryResult)]
+struct TouchedSummary {
+    touched_rows: i64,
+    min_time: Option<chrono::DateTime<chrono::Utc>>,
+    max_time: Option<chrono::DateTime<chrono::Utc>>,
+}
 
 /// Rows written by a guarded statement and the span of `time` they cover.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -142,11 +153,11 @@ pub async fn mutation<C: ConnectionTrait>(
     let row = conn.query_one_raw(wrapped).await?.ok_or_else(|| {
         AppError::Internal("Guarded mutation returned no summary row".to_string())
     })?;
-    let rows: i64 = row.try_get("", "touched_rows")?;
+    let summary = TouchedSummary::from_query_result(&row, "")?;
     Ok(TouchedRange {
-        rows: u64::try_from(rows).unwrap_or(0),
-        min_time: row.try_get("", "min_time")?,
-        max_time: row.try_get("", "max_time")?,
+        rows: u64::try_from(summary.touched_rows).unwrap_or(0),
+        min_time: summary.min_time,
+        max_time: summary.max_time,
     })
 }
 

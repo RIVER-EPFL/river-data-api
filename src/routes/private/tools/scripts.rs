@@ -653,6 +653,7 @@ pub struct DraftRunFailure {
     pub kind: DraftRunFailureKind,
     pub message: String,
     /// The R call that raised, when the runner named one.
+    #[schema(required)]
     pub call: Option<String>,
     pub traceback: Vec<String>,
 }
@@ -662,9 +663,11 @@ pub struct DraftRunResponse {
     /// True when `results` and the rest of the run fields are present; false when `failure` is.
     pub ran: bool,
     #[serde(flatten)]
+    #[schema(required)]
     pub run: Option<DraftRunResults>,
     /// Why the run ended without results. A failure here is a finding about the draft, not a
     /// failed request, so it travels at 200 next to `lint`.
+    #[schema(required)]
     pub failure: Option<DraftRunFailure>,
     /// Carries the runner the request reached; the version fields are null, nothing here is
     /// stored.
@@ -825,6 +828,7 @@ pub struct InspectScriptResponse {
     #[serde(flatten)]
     pub inspection: engine::ScriptInspection,
     /// Present only when the request carried a manifest.
+    #[schema(required)]
     pub reconciliation: Option<engine::ManifestReconciliation>,
 }
 
@@ -908,6 +912,7 @@ pub struct CaseResult {
     /// Per-key mismatches: expected vs got, or the missing/unexpected key.
     pub failures: Vec<String>,
     /// The runner's error text when the script itself failed.
+    #[schema(required)]
     pub error: Option<String>,
 }
 
@@ -915,6 +920,7 @@ pub struct CaseResult {
 pub struct ValidateResponse {
     pub passed: bool,
     pub cases: Vec<CaseResult>,
+    #[schema(required)]
     pub validated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -1217,8 +1223,10 @@ pub async fn activate_version(
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ActivationRecord {
+    #[schema(required)]
     pub from_version_no: Option<i32>,
     pub to_version_no: i32,
+    #[schema(required)]
     pub activated_by: Option<String>,
     pub activated_at: chrono::DateTime<chrono::Utc>,
 }

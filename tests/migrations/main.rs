@@ -14,6 +14,7 @@ mod derived_definition_versions;
 mod instrument_kind;
 mod one_doc_parameter;
 mod provenance_kind;
+mod roll_back_live_pins;
 mod sample_statistics;
 mod site_parameter_entry_mode;
 mod source_parameter_instrument_names;

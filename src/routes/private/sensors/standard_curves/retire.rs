@@ -29,6 +29,7 @@ pub struct RetireCurveRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RetireCurveResponse {
     pub standard_curve_id: Uuid,
+    #[schema(required)]
     pub retired_at: Option<DateTime<Utc>>,
     /// Readings this curve corrected. They keep it and keep their values; the count is what the
     /// surface states before the action runs.

@@ -26,8 +26,11 @@ pub struct ChannelHealth {
     pub name: String,
     pub available: bool,
     /// `None` until a probe has run for this channel.
+    #[schema(required)]
     pub healthy: Option<bool>,
+    #[schema(required)]
     pub detail: Option<String>,
+    #[schema(required)]
     pub checked_at: Option<DateTime<Utc>>,
 }
 

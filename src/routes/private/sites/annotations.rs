@@ -5,7 +5,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Statement};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
@@ -169,6 +171,22 @@ pub struct ExportSummaryResponse {
 /// What an export of this site and range can carry beyond the plain series: annotation, flagged,
 /// replicate and alarm counts, per parameter. The export dialog enables each option from these
 /// numbers and shows them beside it.
+/// Per-parameter annotation counts over the export's range.
+#[derive(FromQueryResult)]
+struct AnnotationCounts {
+    pid: Uuid,
+    ann_count: i64,
+    pts: i64,
+}
+
+/// Per-parameter flagged and extra-replicate counts over the same range.
+#[derive(FromQueryResult)]
+struct CurationCounts {
+    pid: Uuid,
+    flagged: i64,
+    reps: i64,
+}
+
 #[utoipa::path(
     get,
     path = "/api/sites/{site_id}/export/summary",
@@ -236,9 +254,10 @@ pub async fn get_site_export_summary(
         ))
         .await?;
     for r in &rows {
-        let s = slot(&mut by_param, r.try_get::<Uuid>("", "pid")?);
-        s.annotation_count = r.try_get::<i64>("", "ann_count")?;
-        s.annotated_points = r.try_get::<i64>("", "pts")?;
+        let counts = AnnotationCounts::from_query_result(r, "")?;
+        let s = slot(&mut by_param, counts.pid);
+        s.annotation_count = counts.ann_count;
+        s.annotated_points = counts.pts;
     }
 
     // Flagged and extra-replicate rows in one pass over the range's readings.
@@ -257,9 +276,10 @@ pub async fn get_site_export_summary(
         ))
         .await?;
     for r in &rows {
-        let s = slot(&mut by_param, r.try_get::<Uuid>("", "pid")?);
-        s.flagged_readings = r.try_get::<i64>("", "flagged")?;
-        s.replicate_readings = r.try_get::<i64>("", "reps")?;
+        let counts = CurationCounts::from_query_result(r, "")?;
+        let s = slot(&mut by_param, counts.pid);
+        s.flagged_readings = counts.flagged;
+        s.replicate_readings = counts.reps;
     }
 
     // Breaching readings, from the same definition `/sites/{id}/alarms` serves, so the count and

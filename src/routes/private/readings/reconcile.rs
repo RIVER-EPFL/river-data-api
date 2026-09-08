@@ -18,7 +18,7 @@
 //! arithmetic the database CHECKs.
 
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use utoipa::ToSchema;
@@ -57,6 +57,17 @@ pub struct SourceWindow {
 }
 
 /// One stored row of the window, as the diff reads it.
+#[derive(FromQueryResult)]
+struct StoredWindowRow {
+    time: sea_orm::prelude::DateTimeWithTimeZone,
+    replicate_index: i16,
+    raw_value: f64,
+    standard_curve_id: Option<Uuid>,
+    withdrawn: bool,
+    judgements: serde_json::Value,
+    touched: bool,
+}
+
 struct StoredRow {
     raw_value: f64,
     standard_curve_id: Option<Uuid>,
@@ -108,10 +119,9 @@ async fn stored_window<C: ConnectionTrait>(
     stream_id: Uuid,
     window: &SourceWindow,
 ) -> AppResult<HashMap<Key, StoredRow>> {
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
+    let rows = StoredWindowRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
                 "SELECT r.time, r.replicate_index, r.raw_value, r.standard_curve_id,
                         r.withdrawn_at IS NOT NULL AS withdrawn,
                         {judgements} AS judgements,
@@ -120,29 +130,26 @@ async fn stored_window<C: ConnectionTrait>(
                          OR r.label IS NOT NULL OR r.notes IS NOT NULL) AS touched
                  FROM readings r
                  WHERE r.stream_id = $1 AND r.time >= $2 AND r.time < $3",
-                judgements = super::decisions::live_judgements_sql("r")
-            ),
-            [
-                stream_id.into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(window.from).into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(window.to).into(),
-            ],
-        ))
-        .await?;
+            judgements = super::decisions::live_judgements_sql("r")
+        ),
+        [
+            stream_id.into(),
+            sea_orm::prelude::DateTimeWithTimeZone::from(window.from).into(),
+            sea_orm::prelude::DateTimeWithTimeZone::from(window.to).into(),
+        ],
+    ))
+    .all(conn)
+    .await?;
     let mut out = HashMap::with_capacity(rows.len());
-    for row in &rows {
-        let time = row
-            .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "time")?
-            .with_timezone(&Utc);
-        let index: i16 = row.try_get("", "replicate_index")?;
+    for row in rows {
         out.insert(
-            (time, index),
+            (row.time.with_timezone(&Utc), row.replicate_index),
             StoredRow {
-                raw_value: row.try_get("", "raw_value")?,
-                standard_curve_id: row.try_get("", "standard_curve_id")?,
-                withdrawn: row.try_get("", "withdrawn")?,
-                judgements: row.try_get("", "judgements")?,
-                touched: row.try_get("", "touched")?,
+                raw_value: row.raw_value,
+                standard_curve_id: row.standard_curve_id,
+                withdrawn: row.withdrawn,
+                judgements: row.judgements,
+                touched: row.touched,
             },
         );
     }

@@ -49,8 +49,7 @@ async fn query_grants(db: &DatabaseConnection, sub: &str) -> Result<HashSet<Uuid
             [sub.into()],
         ))
         .await?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| r.try_get::<Uuid>("", "project_id").ok())
-        .collect())
+    rows.iter()
+        .map(|r| Ok(r.try_get::<Uuid>("", "project_id")?))
+        .collect()
 }

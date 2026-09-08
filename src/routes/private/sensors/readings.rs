@@ -61,6 +61,14 @@ pub struct SensorReadingsQuery {
     pub parameter_id: Option<Uuid>,
 }
 
+/// The parameter a series resolves to. `default_units` is nullable in the catalog; the id is not,
+/// because both queries select it from the row they matched on.
+#[derive(FromQueryResult)]
+struct SeriesParameterRow {
+    parameter_id: Uuid,
+    default_units: Option<String>,
+}
+
 /// The parameter this response is about, and the units that go with it.
 ///
 /// One resolution step feeds both the reported identity and every query's predicate, so the
@@ -99,10 +107,8 @@ async fn resolve_series_parameter(
         row
     };
 
-    Ok((
-        row.try_get("", "parameter_id").ok(),
-        row.try_get("", "default_units").ok(),
-    ))
+    let resolved = SeriesParameterRow::from_query_result(&row, "")?;
+    Ok((Some(resolved.parameter_id), resolved.default_units))
 }
 
 /// Columnar raw + calibrated series for one channel of a sensor, aligned to `times`.
@@ -112,7 +118,9 @@ async fn resolve_series_parameter(
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SensorReadingsResponse {
     pub sensor_id: Uuid,
+    #[schema(required)]
     pub parameter_id: Option<Uuid>,
+    #[schema(required)]
     pub units: Option<String>,
     /// Resolution actually applied (`raw`, `hourly`, `daily`, `weekly`, `monthly`).
     pub resolution: String,
@@ -126,12 +134,15 @@ pub struct SensorReadingsResponse {
     pub site_ids: Vec<Option<Uuid>>,
     /// Earliest/latest reading time **attributed to this sensor** on the served parameter (full
     /// extent, independent of the query window).
+    #[schema(required)]
     pub data_start: Option<DateTime<Utc>>,
+    #[schema(required)]
     pub data_end: Option<DateTime<Utc>>,
     /// Earliest reading at the sensor's current (open) deployment slot, same site + parameter,
     /// regardless of `sensor_id`. This is the true backdate target: history before `data_start`
     /// that is not yet attributed to the sensor but would be claimed by backdating `deployed_from`.
     /// Null when the sensor has no open deployment.
+    #[schema(required)]
     pub slot_data_start: Option<DateTime<Utc>>,
 }
 
@@ -443,8 +454,10 @@ pub struct SensorBandsQuery {
 pub struct SensorDeploymentBand {
     pub deployment_id: Uuid,
     pub site_id: Uuid,
+    #[schema(required)]
     pub site_name: Option<String>,
     pub from: DateTime<Utc>,
+    #[schema(required)]
     pub until: Option<DateTime<Utc>>,
 }
 

@@ -146,15 +146,22 @@ pub(crate) fn admin_client(state: &AppState) -> AppResult<&KeycloakAdmin> {
 /// and a caller reading this see one shape.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct KeycloakUser {
+    #[schema(required)]
     pub id: Option<String>,
+    #[schema(required)]
     pub username: Option<String>,
+    #[schema(required)]
     pub email: Option<String>,
     #[serde(rename = "firstName")]
+    #[schema(required)]
     pub first_name: Option<String>,
     #[serde(rename = "lastName")]
+    #[schema(required)]
     pub last_name: Option<String>,
+    #[schema(required)]
     pub enabled: Option<bool>,
     #[serde(rename = "createdTimestamp")]
+    #[schema(required)]
     pub created_timestamp: Option<i64>,
     pub roles: Vec<String>,
 }
@@ -1042,15 +1049,17 @@ pub async fn list_user_grants(
         ))
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
+    // A row that will not decode is an error: silently dropping it would answer with a shorter
+    // grant list than the user holds.
     let grants = rows
         .iter()
-        .filter_map(|r| {
-            Some(crate::routes::private::me::GrantedProject {
-                project_id: r.try_get::<uuid::Uuid>("", "id").ok()?,
-                name: r.try_get::<String>("", "name").ok()?,
+        .map(|r| {
+            Ok(crate::routes::private::me::GrantedProject {
+                project_id: r.try_get::<uuid::Uuid>("", "id")?,
+                name: r.try_get::<String>("", "name")?,
             })
         })
-        .collect();
+        .collect::<AppResult<Vec<_>>>()?;
     Ok(Json(grants))
 }
 

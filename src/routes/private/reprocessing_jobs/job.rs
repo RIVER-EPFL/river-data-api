@@ -76,7 +76,9 @@ pub struct TunableSpec {
     pub key: &'static str,
     pub kind: TunableKind,
     /// Inclusive bounds for an integer or a duration in seconds.
+    #[schema(required)]
     pub min: Option<i64>,
+    #[schema(required)]
     pub max: Option<i64>,
     pub default: serde_json::Value,
     pub help: &'static str,

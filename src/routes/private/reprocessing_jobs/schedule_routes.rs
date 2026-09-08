@@ -25,14 +25,20 @@ use crate::error::{AppError, AppResult};
 pub struct ScheduleView {
     pub job_name: String,
     pub enabled: bool,
+    #[schema(required)]
     pub interval_seconds: Option<i64>,
+    #[schema(required)]
     pub next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[schema(required)]
     pub last_enqueued_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[schema(required)]
     pub overlap_policy: Option<String>,
+    #[schema(required)]
     pub catchup_policy: Option<String>,
     pub tunables: serde_json::Value,
     /// What this job accepts under `tunables`, from its own declaration. Empty means none.
     pub tunables_schema: Vec<job::TunableSpec>,
+    #[schema(required)]
     pub updated_by: Option<String>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     /// Whether a non-terminal job of this `job_name` is in flight (queued/pending/running/retrying).
@@ -360,6 +366,7 @@ pub async fn update_schedule(
 /// collision, an identical run_now in the same second) and whether one was created.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RunNowResponse {
+    #[schema(required)]
     pub job_id: Option<Uuid>,
     pub enqueued: bool,
 }

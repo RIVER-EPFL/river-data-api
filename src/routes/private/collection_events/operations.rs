@@ -18,9 +18,10 @@ async fn attached_readings(db: &DatabaseConnection, id: Uuid) -> Result<i64, Api
         ))
         .await
         .map_err(ApiError::database)?;
-    Ok(row
-        .map(|r| r.try_get::<i64>("", "n").unwrap_or(0))
-        .unwrap_or(0))
+    row.map(|r| r.try_get::<i64>("", "n"))
+        .transpose()
+        .map_err(ApiError::database)
+        .map(Option::unwrap_or_default)
 }
 
 #[async_trait]

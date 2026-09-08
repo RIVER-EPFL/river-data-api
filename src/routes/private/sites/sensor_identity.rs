@@ -29,12 +29,16 @@ pub struct SensorIdentityQuery {
 pub struct IdentityBand {
     pub deployment_id: Uuid,
     pub sensor_id: Uuid,
+    #[schema(required)]
     pub sensor_serial: Option<String>,
+    #[schema(required)]
     pub sensor_name: Option<String>,
     pub site_id: Uuid,
+    #[schema(required)]
     pub site_name: Option<String>,
     pub parameter_id: Uuid,
     pub from: DateTime<Utc>,
+    #[schema(required)]
     pub until: Option<DateTime<Utc>>,
 }
 
@@ -45,6 +49,7 @@ pub struct CalibrationMarker {
     pub slope: f64,
     pub intercept: f64,
     pub valid_from: DateTime<Utc>,
+    #[schema(required)]
     pub valid_until: Option<DateTime<Utc>>,
 }
 

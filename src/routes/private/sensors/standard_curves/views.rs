@@ -5,11 +5,10 @@
 //! mapping follows the portal forward while history keeps the curve that produced it.
 
 use axum::{Json, extract::State};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
-    Statement, TransactionTrait,
-};
+    Statement, TransactionTrait, FromQueryResult,};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -302,12 +301,18 @@ pub struct LastUsedCurveQuery {
 pub struct LastUsedCurveResponse {
     pub site_id: Uuid,
     pub parameter_id: Uuid,
+    #[schema(required)]
     pub sensor_id: Option<Uuid>,
+    #[schema(required)]
     pub sensor_name: Option<String>,
+    #[schema(required)]
     pub standard_curve_id: Option<Uuid>,
+    #[schema(required)]
     pub curve_name: Option<String>,
+    #[schema(required)]
     pub curve_created_at: Option<chrono::DateTime<Utc>>,
     /// The instant of the grab the answer was read from.
+    #[schema(required)]
     pub used_at: Option<chrono::DateTime<Utc>>,
     /// How the answer was decided, for the picker to show beside it.
     pub method: String,
@@ -316,6 +321,18 @@ pub struct LastUsedCurveResponse {
 const LAST_USED_METHOD: &str = "The newest spot reading at this site and parameter that records \
     an instrument or a standard curve, withdrawn readings excluded. The instrument is the one the \
     reading names, or the curve's when the reading names none.";
+
+/// The one reading a slot's last hand-picked curve is read from. `time` is the instant it was
+/// used, which the response calls `used_at`.
+#[derive(FromQueryResult)]
+struct LastUsedRow {
+    time: Option<DateTime<Utc>>,
+    sensor_id: Option<Uuid>,
+    sensor_name: Option<String>,
+    standard_curve_id: Option<Uuid>,
+    curve_name: Option<String>,
+    curve_created_at: Option<DateTime<Utc>>,
+}
 
 /// `GET /sites/{id}/last_curve`: what the last grab at a slot was measured on and corrected
 /// with, so the picker opens where the previous batch left off. `read_data`.
@@ -395,16 +412,13 @@ pub async fn last_used_curve(
         method: LAST_USED_METHOD.to_string(),
     };
     if let Some(row) = row {
-        out.sensor_id = row.try_get("", "sensor_id")?;
-        out.sensor_name = row.try_get("", "sensor_name")?;
-        out.standard_curve_id = row.try_get("", "standard_curve_id")?;
-        out.curve_name = row.try_get("", "curve_name")?;
-        out.curve_created_at = row
-            .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "curve_created_at")?
-            .map(|t| t.with_timezone(&Utc));
-        out.used_at = row
-            .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "time")?
-            .map(|t| t.with_timezone(&Utc));
+        let last = LastUsedRow::from_query_result(&row, "")?;
+        out.sensor_id = last.sensor_id;
+        out.sensor_name = last.sensor_name;
+        out.standard_curve_id = last.standard_curve_id;
+        out.curve_name = last.curve_name;
+        out.curve_created_at = last.curve_created_at;
+        out.used_at = last.time;
     }
     Ok(Json(out))
 }

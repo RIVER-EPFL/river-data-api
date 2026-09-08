@@ -10,7 +10,7 @@ pub mod visits;
 pub use model::*;
 
 use axum::{Json, extract::Path, extract::State};
-use sea_orm::EntityTrait;
+use sea_orm::{EntityTrait, FromQueryResult};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -20,6 +20,7 @@ use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EnqueuedJobResponse {
+    #[schema(required)]
     pub job_id: Option<Uuid>,
 }
 
@@ -69,13 +70,15 @@ pub struct StageEventRequest {
     pub notes: Option<String>,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema, sea_orm::FromQueryResult)]
 pub struct StagedEvent {
     pub id: Uuid,
     pub site_id: Uuid,
     pub collected_at: chrono::DateTime<chrono::Utc>,
     pub source: String,
+    #[schema(required)]
     pub created_by: Option<String>,
+    #[schema(required)]
     pub notes: Option<String>,
     /// False when the visit already stood at this instant, so a second tool joins it.
     pub created: bool,
@@ -139,17 +142,7 @@ pub async fn stage_collection_event(
         .await?
         .ok_or_else(|| AppError::Internal("Staging returned no visit".to_string()))?;
 
-    Ok(Json(StagedEvent {
-        id: row.try_get("", "id")?,
-        site_id: row.try_get("", "site_id")?,
-        collected_at: row
-            .try_get::<sea_orm::prelude::DateTimeWithTimeZone>("", "collected_at")?
-            .with_timezone(&chrono::Utc),
-        source: row.try_get("", "source")?,
-        created_by: row.try_get("", "created_by")?,
-        notes: row.try_get("", "notes")?,
-        created: row.try_get("", "created")?,
-    }))
+    Ok(Json(StagedEvent::from_query_result(&row, "")?))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

@@ -123,6 +123,7 @@ pub struct FieldFormula {
 pub struct ManifestField {
     pub name: String,
     pub label: String,
+    #[schema(required)]
     pub units: Option<String>,
     /// Whether a row that carries anything at all has to carry this field.
     pub required: bool,
@@ -132,6 +133,7 @@ pub struct ManifestField {
     /// Whether the field reaches the request body. A field that does not is typed on the bench
     /// to feed a computed field, or shown as a check on one.
     pub send: bool,
+    #[schema(required)]
     pub computed: Option<FieldFormula>,
 }
 
@@ -159,6 +161,7 @@ pub struct ManifestStructure {
     pub fields: Vec<ManifestField>,
     /// `rows` layout: rows offered before anything is entered.
     pub rows: u32,
+    #[schema(required)]
     pub max_rows: Option<u32>,
     pub row_labels: RowLabels,
     /// `lists` layout: values per field.
@@ -415,34 +418,44 @@ pub struct ManifestParam {
     pub name: String,
     pub label: String,
     pub kind: String,
+    #[schema(required)]
     pub units: Option<String>,
     pub required: bool,
+    #[schema(required)]
     pub default: Option<serde_json::Value>,
+    #[schema(required)]
     pub when: Option<ParamWhen>,
     /// What a structured param's value holds. Absent on a scalar param, and on a structured one
     /// whose columns nothing has declared yet.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub structure: Option<ManifestStructure>,
     /// Help text shown beside the field.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub description: Option<String>,
     /// Key of the manifest section the field renders under.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub section: Option<String>,
     /// `replicates` only: the catalog parameter (`parameters.code`) the entered replicates are
     /// readings of. The save stores each position as that parameter's reading at its index.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub parameter_code: Option<String>,
     /// `replicates` only: how many rows the form opens with. The count is never a limit.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub suggested: Option<u32>,
     /// `replicates` only: the curve slot whose chosen curve corrects the stored replicates.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub curve: Option<String>,
     /// The catalog parameter `parameter_code` resolves to, filled by `GET /tools` against the
     /// database serving the request. Never authored, and never stored: a manifest travels between
     /// databases, so the resolution belongs to the response rather than to the declaration.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub parameter: Option<ResolvedParameter>,
 }
 
@@ -580,6 +593,7 @@ pub struct ManifestOutput {
     /// the database will later serve, divisor included. The script never computes it; a script
     /// value under the same key is discarded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub aggregate: Option<String>,
 }
 
@@ -603,6 +617,7 @@ pub struct ManifestCurve {
     #[serde(default)]
     pub required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub description: Option<String>,
 }
 
@@ -613,6 +628,7 @@ pub struct ManifestSection {
     pub key: String,
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub description: Option<String>,
 }
 
@@ -679,6 +695,7 @@ pub struct ManifestEventInput {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Manifest {
     pub label: String,
+    #[schema(required)]
     pub description: Option<String>,
     pub params: Vec<ManifestParam>,
     pub outputs: Vec<ManifestOutput>,
@@ -692,6 +709,7 @@ pub struct Manifest {
     /// Nothing server-side reads it: the seasonal check and the event audit take no input from
     /// the manifest. The only validation is that it is an object.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub qc: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sections: Vec<ManifestSection>,

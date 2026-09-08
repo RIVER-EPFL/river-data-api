@@ -9,7 +9,7 @@
 //! describes the curve as it is now, not the curve the value was made with.
 
 use axum::{Json, extract::State};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Statement};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -49,10 +49,19 @@ pub struct RegisterAnnotationsResponse {
     pub annotations: Vec<AnnotationOutcome>,
 }
 
+/// What the upsert did with one registered annotation.
+#[derive(FromQueryResult)]
+struct UpsertedAnnotation {
+    id: Uuid,
+    created: bool,
+    frozen: bool,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AnnotationOutcome {
     pub source_key: String,
     /// None when the annotation was not stored (`unpaired`).
+    #[schema(required)]
     pub id: Option<Uuid>,
     /// created | updated | unchanged | frozen | unpaired
     pub status: String,
@@ -166,17 +175,20 @@ pub async fn register_annotations(
             ))
             .await?;
         let outcome = match row {
-            Some(row) => AnnotationOutcome {
-                source_key: item.source_key.clone(),
-                id: Some(row.try_get::<Uuid>("", "id")?),
-                status: if row.try_get::<bool>("", "created")? {
-                    "created".into()
-                } else if row.try_get::<bool>("", "frozen")? {
-                    "frozen".into()
-                } else {
-                    "updated".into()
-                },
-            },
+            Some(row) => {
+                let upserted = UpsertedAnnotation::from_query_result(&row, "")?;
+                AnnotationOutcome {
+                    source_key: item.source_key.clone(),
+                    id: Some(upserted.id),
+                    status: if upserted.created {
+                        "created".into()
+                    } else if upserted.frozen {
+                        "frozen".into()
+                    } else {
+                        "updated".into()
+                    },
+                }
+            }
             None => {
                 let existing = db
                     .query_one_raw(Statement::from_sql_and_values(

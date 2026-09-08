@@ -119,6 +119,7 @@ pub struct AdoptResponse {
     pub site_parameter_id: Uuid,
     pub site_parameter_created: bool,
     pub deployed_from: DateTime<Utc>,
+    #[schema(required)]
     pub deployed_until: Option<DateTime<Utc>>,
     pub job_id: Uuid,
 }
@@ -374,7 +375,9 @@ pub async fn adopt_sensor(
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AdoptSuggestion {
     pub now: DateTime<Utc>,
+    #[schema(required)]
     pub end_of_last_deployment: Option<DateTime<Utc>>,
+    #[schema(required)]
     pub first_reading: Option<DateTime<Utc>>,
 }
 
@@ -445,11 +448,13 @@ pub struct SwapRequest {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SwapResponse {
+    #[schema(required)]
     pub ended_deployment_id: Option<Uuid>,
     pub started_deployment_id: Uuid,
     pub site_id: Uuid,
     pub parameter_id: Uuid,
     pub at: DateTime<Utc>,
+    #[schema(required)]
     pub outgoing_job_id: Option<Uuid>,
     pub incoming_job_id: Uuid,
 }

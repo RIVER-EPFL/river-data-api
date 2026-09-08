@@ -391,6 +391,7 @@ pub struct DecisionRow {
     pub id: Uuid,
     pub stream_id: Uuid,
     pub time: chrono::DateTime<chrono::Utc>,
+    #[schema(required)]
     pub replicate_index: Option<i16>,
     pub kind: Kind,
     #[schema(value_type = Object)]
@@ -399,13 +400,18 @@ pub struct DecisionRow {
     pub new: serde_json::Value,
     pub actor: String,
     pub at: chrono::DateTime<chrono::Utc>,
+    #[schema(required)]
     pub reason: Option<String>,
     pub origin: Origin,
+    #[schema(required)]
     pub supersedes: Option<Uuid>,
+    #[schema(required)]
     pub rolled_back_by: Option<Uuid>,
+    #[schema(required)]
     pub set_id: Option<Uuid>,
     /// The tracked job that made a system change, where one did. Cleared when that job row is
     /// pruned, so an old decision keeps its record and loses only the link to the run.
+    #[schema(required)]
     pub job_id: Option<Uuid>,
     /// Whether `rollback` accepts this kind at all. A kind that projects no column has nothing to
     /// restore, so the reader offers no undo for it rather than learning that from a 409.

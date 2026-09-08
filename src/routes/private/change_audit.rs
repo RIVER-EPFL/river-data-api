@@ -9,7 +9,7 @@ use axum::{
     Json,
     extract::{Query, State},
 };
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -21,15 +21,18 @@ use crate::error::AppResult;
 const LIMIT: u64 = 100;
 
 /// One entry as the API exposes it.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema, FromQueryResult)]
 pub struct ChangeEntry {
     pub changed_at: chrono::DateTime<chrono::Utc>,
+    #[schema(required)]
     pub changed_by: Option<String>,
     /// What happened, as the writer named it: `schedule_update`, `member_insert`, and so on.
     pub change: String,
     #[schema(value_type = Option<Object>)]
+    #[schema(required)]
     pub old_value: Option<serde_json::Value>,
     #[schema(value_type = Option<Object>)]
+    #[schema(required)]
     pub new_value: Option<serde_json::Value>,
 }
 
@@ -45,17 +48,9 @@ pub async fn entries_for<C: ConnectionTrait>(db: &C, subject: &str) -> AppResult
             [subject.into(), LIMIT.into()],
         ))
         .await?;
-    let mut out = Vec::with_capacity(rows.len());
-    for r in &rows {
-        out.push(ChangeEntry {
-            changed_at: r.try_get("", "changed_at")?,
-            changed_by: r.try_get("", "changed_by")?,
-            change: r.try_get("", "change")?,
-            old_value: r.try_get("", "old_value")?,
-            new_value: r.try_get("", "new_value")?,
-        });
-    }
-    Ok(out)
+    rows.iter()
+        .map(|r| Ok(ChangeEntry::from_query_result(r, "")?))
+        .collect()
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]

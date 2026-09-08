@@ -22,6 +22,7 @@ pub struct GrantedProject {
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct Me {
     pub sub: String,
+    #[schema(required)]
     pub email: Option<String>,
     pub is_admin: bool,
     /// The caller's highest access level as a bare token (`administrator`|`manager`|`river`|`intern`).
@@ -107,6 +108,7 @@ pub struct NavigatorSite {
 pub struct NavigatorSubproject {
     /// `None` for sites without a subproject (defensive, the sites trigger normally assigns the
     /// project's default subproject).
+    #[schema(required)]
     pub id: Option<Uuid>,
     pub name: String,
     pub sites: Vec<NavigatorSite>,

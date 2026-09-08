@@ -36,8 +36,8 @@ pub async fn distinct_status_codes(
 
     let status_codes = rows
         .iter()
-        .filter_map(|r| r.try_get::<i32>("", "status_code").ok())
-        .collect();
+        .map(|r| Ok(r.try_get::<i32>("", "status_code")?))
+        .collect::<AppResult<Vec<i32>>>()?;
 
     Ok(Json(AuditStatusCodes { status_codes }))
 }

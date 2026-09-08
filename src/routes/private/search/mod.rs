@@ -42,7 +42,9 @@ pub struct SiteResult {
 #[derive(Debug, Serialize, FromQueryResult, ToSchema)]
 pub struct SensorResult {
     pub id: Uuid,
+    #[schema(required)]
     pub serial_number: Option<String>,
+    #[schema(required)]
     pub name: Option<String>,
 }
 

@@ -36,6 +36,7 @@ pub struct ResolvedParameter {
     pub id: Uuid,
     pub code: String,
     pub name: String,
+    #[schema(required)]
     pub default_units: Option<String>,
     /// True for a catalog entry created mechanically rather than by a person.
     pub needs_review: bool,
@@ -324,6 +325,7 @@ async fn missing_constants(db: &DatabaseConnection, names: &[String]) -> AppResu
 pub struct ToolOutput {
     #[serde(flatten)]
     pub declared: ManifestOutput,
+    #[schema(required)]
     pub parameter: Option<ResolvedParameter>,
 }
 
@@ -332,6 +334,7 @@ pub struct ToolOutput {
 pub struct ToolDescriptor {
     pub name: String,
     pub label: String,
+    #[schema(required)]
     pub description: Option<String>,
     pub endpoint: String,
     pub params: Vec<ManifestParam>,
@@ -343,6 +346,7 @@ pub struct ToolDescriptor {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub event_inputs: Vec<ManifestEventInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub qc: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sections: Vec<ManifestSection>,
@@ -357,10 +361,14 @@ pub struct ToolDescriptor {
 /// that produced the number is not stored anywhere.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ToolVersionRef {
+    #[schema(required)]
     pub script_version_id: Option<Uuid>,
+    #[schema(required)]
     pub version_no: Option<i32>,
     pub content_hash: String,
+    #[schema(required)]
     pub runner_image: Option<String>,
+    #[schema(required)]
     pub r_version: Option<String>,
 }
 

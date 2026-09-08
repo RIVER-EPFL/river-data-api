@@ -17,6 +17,7 @@ use crate::error::{AppError, AppResult};
 pub struct CalibrationWindowPoint {
     pub time: DateTime<Utc>,
     pub raw_value: f64,
+    #[schema(required)]
     pub calibrated_value: Option<f64>,
     pub is_flagged: bool,
 }
@@ -27,16 +28,28 @@ pub struct CalibrationWindowPoint {
 pub struct CalibrationWindowResponse {
     pub calibration_id: Uuid,
     pub sensor_id: Uuid,
+    #[schema(required)]
     pub parameter_id: Option<Uuid>,
     pub slope: f64,
     pub intercept: f64,
     pub valid_from: DateTime<Utc>,
+    #[schema(required)]
     pub valid_until: Option<DateTime<Utc>>,
     pub point_count: i64,
     pub points: Vec<CalibrationWindowPoint>,
 }
 
 const MAX_POINTS: i64 = 2000;
+
+/// The curve whose window the readings are counted against.
+#[derive(sea_orm::FromQueryResult)]
+struct CurveRow {
+    parameter_id: Option<Uuid>,
+    slope: f64,
+    intercept: f64,
+    valid_from: DateTime<chrono::FixedOffset>,
+    valid_until: Option<DateTime<chrono::FixedOffset>>,
+}
 
 /// `GET /sensor_calibrations/{id}/window`, the readings a calibration window resolves. `read_data`.
 #[utoipa::path(
@@ -87,11 +100,13 @@ pub async fn get_calibration_window(
             None => String::new(),
         }
     };
-    let parameter_id: Option<Uuid> = cal.try_get("", "parameter_id")?;
-    let slope: f64 = cal.try_get("", "slope")?;
-    let intercept: f64 = cal.try_get("", "intercept")?;
-    let valid_from: DateTime<chrono::FixedOffset> = cal.try_get("", "valid_from")?;
-    let valid_until: Option<DateTime<chrono::FixedOffset>> = cal.try_get("", "valid_until")?;
+    let CurveRow {
+        parameter_id,
+        slope,
+        intercept,
+        valid_from,
+        valid_until,
+    } = CurveRow::from_query_result(&cal, "")?;
 
     let vf: sea_orm::Value = valid_from.into();
     let vu: sea_orm::Value = match valid_until {

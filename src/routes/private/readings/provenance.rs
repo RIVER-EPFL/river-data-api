@@ -36,17 +36,23 @@ pub struct ProvenanceQuery {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProvenanceResponse {
     pub time: DateTime<Utc>,
+    #[schema(required)]
     pub site_id: Option<Uuid>,
+    #[schema(required)]
     pub parameter_id: Option<Uuid>,
     /// What the instant measured, named. The record was serving bare numbers under a bare uuid.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub parameter_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub parameter_name: Option<String>,
     /// The slot's unit when it declares one, the catalog default otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub units: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub decimal_places: Option<i16>,
     /// More than one stream serves this (site, parameter) at this instant.
     pub duplicate_slot: bool,
@@ -60,11 +66,14 @@ pub struct ProvenanceRecord {
     pub readings: Vec<ReadingFacet>,
     pub chain: ChainInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub event: Option<EventRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub computation: Option<ComputationInfo>,
     /// The formula that produced a derived value, the counterpart of a tool run's record.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub calculation: Option<CalculationInfo>,
     pub holds: Vec<HoldRef>,
 }
@@ -75,21 +84,26 @@ pub struct OriginInfo {
     pub source_system: String,
     pub source_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub source_name: Option<String>,
     /// 'sync' | 'manual' | 'csv' | 'api', from the stream's source system.
     pub classification: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub paired_at: Option<DateTime<Utc>>,
     /// Latest first-arrival stamp in the replicate group: when these rows first existed. NULL
     /// means they predate tracking. Nothing moves it, so a corrected row still reports its own.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub ingested_at: Option<DateTime<Utc>>,
     /// When the value the group currently serves arrived: the latest live value correction's `at`
     /// where one exists, and the first arrival otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub value_arrived_at: Option<DateTime<Utc>>,
     /// The latest windowed-ingest pass whose claimed window covers the instant.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub receipt: Option<ReceiptSummary>,
 }
 
@@ -97,7 +111,9 @@ pub struct OriginInfo {
 pub struct ReceiptSummary {
     pub id: Uuid,
     pub at: DateTime<Utc>,
+    #[schema(required)]
     pub window_from: Option<DateTime<Utc>>,
+    #[schema(required)]
     pub window_to: Option<DateTime<Utc>>,
     pub submitted: i32,
     pub new_rows: i32,
@@ -113,32 +129,42 @@ pub struct ReadingFacet {
     pub replicate_index: i16,
     pub raw_value: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub calibrated_value: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub measurement_type: Option<String>,
     pub is_flagged: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub flag_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub withdrawn_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub withdrawn_reason: Option<String>,
     /// A pending entry: stored and shown here, never published (Q18, Q21).
     pub unverified: bool,
     /// When this row first existed. Nothing moves it.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub ingested_at: Option<DateTime<Utc>>,
     /// When the value this row currently serves arrived: its latest live value correction's `at`,
     /// else its first arrival.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub value_arrived_at: Option<DateTime<Utc>>,
     /// Where this value came from, one of `PROVENANCE_KINDS`. A `sync` or `derived` row's story is
     /// resolved from the stream, the receipt and the definition; the others carry a stored blob.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub provenance_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub calibration: Option<CalibrationRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub standard_curve: Option<CurveRef>,
 }
 
@@ -149,10 +175,12 @@ pub struct CalibrationRef {
     pub intercept: f64,
     pub valid_from: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub valid_until: Option<DateTime<Utc>>,
     /// Set when the curve has been retired: the reading keeps the value it produced, and no new
     /// measurement resolves it (M146).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub retired_at: Option<DateTime<Utc>>,
 }
 
@@ -162,19 +190,23 @@ pub struct CurveRef {
     /// The lab instrument the curve belongs to, which is where its record lives.
     pub sensor_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub name: Option<String>,
     pub slope: f64,
     pub intercept: f64,
     /// Set when the lab has taken the curve out of circulation (M147). The value stands.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub retired_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ChainInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub sensor: Option<SensorRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub deployment: Option<DeploymentRef>,
     /// Live instrument or calibration pins on the group: attribution a person decided, which
     /// reprocess leaves alone.
@@ -276,14 +308,17 @@ pub struct PinRef {
     /// `instrument_pin` | `calibration_pin`.
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub replicate_index: Option<i16>,
     #[schema(value_type = Object)]
     pub target: serde_json::Value,
     pub actor: String,
     pub at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub set_id: Option<Uuid>,
 }
 
@@ -291,12 +326,16 @@ pub struct PinRef {
 pub struct SensorRef {
     pub id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub serial_number: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub manufacturer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub model: Option<String>,
 }
 
@@ -305,9 +344,11 @@ pub struct DeploymentRef {
     pub id: Uuid,
     pub site_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub site_name: Option<String>,
     pub deployed_from: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub deployed_until: Option<DateTime<Utc>>,
 }
 
@@ -317,6 +358,7 @@ pub struct EventRef {
     pub collected_at: DateTime<Utc>,
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub created_by: Option<String>,
 }
 
@@ -330,15 +372,20 @@ pub struct CalculationInfo {
     pub name: String,
     /// The version the stored value names, absent when the value predates versioning.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub version_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub version_no: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub formula: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub content_hash: Option<String>,
     /// The definition's newest version, so a value made by an older one is visible as such.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub active_version_no: Option<i32>,
 }
 
@@ -346,44 +393,60 @@ pub struct CalculationInfo {
 pub struct ComputationInfo {
     /// The statistics row, when the instant carries two or more replicates.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub sample_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub created_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub notes: Option<String>,
     /// The server-built tool-run blob stored on the reading, verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub provenance: Option<serde_json::Value>,
     /// The run's minting path: 'interactive' | 'csv_import' | 'chain'.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub run_source: Option<String>,
     /// Which divisor this group's served standard deviation uses ('sample' = n-1, 'population' =
     /// n) and what chose it. `sd_estimator_source` 'default' means nothing declared one, so the
     /// number is served under a convention nobody stated. Absent on a single measurement, which
     /// has no standard deviation.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub sd_estimator: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub sd_estimator_source: Option<String>,
     /// The group's statistics, the numbers the chart plotted and drew its bar from. Without these
     /// the record shows the replicates and a sentence about the divisor, and never what was served.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub n: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub mean: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub stdev: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub stdev_sample: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub stdev_population: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub median: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub min: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub max: Option<f64>,
 }
 

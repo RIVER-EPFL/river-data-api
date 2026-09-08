@@ -21,7 +21,7 @@ async fn stored_value(db: &DatabaseConnection, id: Uuid) -> Result<Option<f64>, 
         ))
         .await
         .map_err(|e| ApiError::from(e))?;
-    Ok(row.and_then(|r| r.try_get::<f64>("", "value").ok()))
+    Ok(row.map(|r| r.try_get::<f64>("", "value")).transpose()?)
 }
 
 #[must_use]

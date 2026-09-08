@@ -33,8 +33,11 @@ pub struct StreamStatsResponse {
     pub reading_count: i64,
     /// Rows stamped withdrawn by windowed reconciliation (included in `reading_count`).
     pub withdrawn_count: i64,
+    #[schema(required)]
     pub min_time: Option<chrono::DateTime<Utc>>,
+    #[schema(required)]
     pub max_time: Option<chrono::DateTime<Utc>>,
+    #[schema(required)]
     pub latest_value: Option<f64>,
 }
 
@@ -42,7 +45,9 @@ pub struct StreamStatsResponse {
 pub struct PreviewReplicate {
     pub replicate_index: i16,
     /// The source column this index is pinned to, when the stream declares a replicate spec.
+    #[schema(required)]
     pub column: Option<String>,
+    #[schema(required)]
     pub value: Option<f64>,
     pub is_flagged: bool,
     pub withdrawn: bool,
@@ -55,7 +60,9 @@ pub struct PreviewInstant {
     /// Recomputed here from the served replicates, which is what `samples` holds for a paired
     /// stream. Shown so the review can see the statistics the pairing will produce before it
     /// produces them.
+    #[schema(required)]
     pub mean: Option<f64>,
+    #[schema(required)]
     pub sd: Option<f64>,
     pub n: usize,
 }
@@ -339,6 +346,12 @@ pub struct ReceiptsQuery {
 /// The stored shapes the hand mappings above read. Derived, so a column added to a query and not
 /// to its reader is a compile error rather than a field left at its default.
 #[derive(FromQueryResult)]
+struct SlotKeyRow {
+    site_id: Uuid,
+    parameter_id: Uuid,
+}
+
+#[derive(FromQueryResult)]
 struct StoredReceipt {
     id: Uuid,
     at: chrono::DateTime<chrono::FixedOffset>,
@@ -377,7 +390,9 @@ struct StoredStreamStats {
 pub struct ReceiptRow {
     pub id: Uuid,
     pub at: chrono::DateTime<Utc>,
+    #[schema(required)]
     pub window_from: Option<chrono::DateTime<Utc>>,
+    #[schema(required)]
     pub window_to: Option<chrono::DateTime<Utc>>,
     pub submitted: i32,
     pub new_rows: i32,
@@ -1109,6 +1124,7 @@ pub struct RetagStreamsResponse {
     pub streams_updated: u64,
     pub measurement_type: String,
     /// The tracked `measurement_retag` job, when `retag_existing` was requested.
+    #[schema(required)]
     pub job_id: Option<Uuid>,
 }
 
@@ -1444,21 +1460,19 @@ async fn resolve_retire_target<C: ConnectionTrait>(
             site_parameter_id: None,
         })),
         SlotScope::SiteParameter(sp_id) => {
-            let Some(row) = conn
-                .query_one_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT site_id, parameter_id FROM site_parameters WHERE id = $1",
-                    [sp_id.into()],
-                ))
-                .await?
+            let Some(row) = SlotKeyRow::find_by_statement(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT site_id, parameter_id FROM site_parameters WHERE id = $1",
+                [sp_id.into()],
+            ))
+            .one(conn)
+            .await?
             else {
                 return Ok(None);
             };
-            let site_id: Uuid = row.try_get("", "site_id")?;
-            let parameter_id: Uuid = row.try_get("", "parameter_id")?;
             Ok(Some(RetireTarget {
                 predicate: "site_id = $1 AND parameter_id = $2",
-                values: vec![site_id.into(), parameter_id.into()],
+                values: vec![row.site_id.into(), row.parameter_id.into()],
                 site_parameter_id: Some(sp_id),
             }))
         }

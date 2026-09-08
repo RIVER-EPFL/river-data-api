@@ -111,6 +111,7 @@ pub struct ImportCsvResponse {
     pub dry_run: bool,
     /// Staging session ID. Returned on every request; pass it back on subsequent requests
     /// (re-analyze, import) to avoid re-uploading the CSV.
+    #[schema(required)]
     pub session_id: Option<Uuid>,
     /// Header → resolved catalog parameter name, for columns that will be ingested.
     pub mapped_columns: HashMap<String, String>,
@@ -127,11 +128,14 @@ pub struct ImportCsvResponse {
     pub replicate_groups: usize,
     /// Readings inserted (0 for `dry_run`).
     pub inserted_total: usize,
+    #[schema(required)]
     pub earliest: Option<chrono::DateTime<chrono::Utc>>,
+    #[schema(required)]
     pub latest: Option<chrono::DateTime<chrono::Utc>>,
     /// Background reprocessing job recomputing derived parameters + refreshing aggregates over the
     /// imported range. Poll `GET /api/reprocessing_jobs/{id}` for progress. `null` when nothing was
     /// inserted (idempotent re-import) or on `dry_run`.
+    #[schema(required)]
     pub derived_job_id: Option<Uuid>,
     /// Distinct timestamps queued for derived recompute by that job.
     pub derived_timestamps: usize,
@@ -162,6 +166,7 @@ pub struct ImportCsvResponse {
     pub curves: Vec<ImportCurve>,
     /// The seasonal screen over the file's cells. `null` for a continuous file, which the check
     /// does not apply to (its history is spot readings).
+    #[schema(required)]
     pub check: Option<ImportCheck>,
 }
 
@@ -171,6 +176,7 @@ pub struct ImportCsvResponse {
 pub struct ImportCheck {
     /// The stored check a commit must name. Set by `dry_run`; echoed by a commit that named one;
     /// `null` on a commit that needed none (nothing outside the range).
+    #[schema(required)]
     pub check_id: Option<Uuid>,
     /// Cells screened.
     pub screened: usize,
@@ -264,9 +270,12 @@ pub struct ImportCurve {
     pub label: String,
     pub required: bool,
     /// The CSV column supplying a curve id per row, when one is headed with the slot's name.
+    #[schema(required)]
     pub column: Option<String>,
     /// The request-level curve every row takes unless its column cell names another.
+    #[schema(required)]
     pub standard_curve_id: Option<Uuid>,
+    #[schema(required)]
     pub name: Option<String>,
 }
 
@@ -446,10 +455,12 @@ pub async fn import_csv(
                 .to_owned(),
         ))
         .await?;
+    // A dropped row would let a derived output through as if nothing produced it, so a decode
+    // failure is an error rather than a shorter set.
     let derived_outputs: HashSet<Uuid> = derived_rows
         .iter()
-        .filter_map(|r| r.try_get::<Uuid>("", "output_parameter_id").ok())
-        .collect();
+        .map(|r| Ok(r.try_get::<Uuid>("", "output_parameter_id")?))
+        .collect::<AppResult<HashSet<Uuid>>>()?;
 
     // Global catalog fallback: lower(name) -> id, lower(alias) -> id.
     let catalog_rows = state

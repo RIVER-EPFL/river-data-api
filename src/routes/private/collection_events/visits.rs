@@ -46,8 +46,10 @@ pub struct VisitRow {
     /// 'manual' | 'portal_sync'.
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub created_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub notes: Option<String>,
     /// Parameters with at least one non-withdrawn reading at this visit.
     pub parameters_filled: i64,
@@ -64,6 +66,7 @@ pub struct VisitCell {
     pub parameter_id: Uuid,
     /// The served value: sample mean, else the lowest live replicate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub value: Option<f64>,
     /// Every replicate in the group is flagged.
     pub flagged: bool,
@@ -78,25 +81,34 @@ pub struct VisitCell {
     /// The group's statistics, so a triplicate and a single measurement do not render identically.
     /// `n` counts what the mean stands on, which is `n_total` less the exclusions.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub n: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub stdev: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub median: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub min: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub max: Option<f64>,
     /// Which divisor produced `stdev`, and what chose it.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub sd_estimator: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub sd_estimator_source: Option<String>,
     /// Kind of the oldest open finding on this cell, when one exists.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub finding: Option<String>,
     /// How many open findings the cell carries, when more than one.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub finding_count: Option<i64>,
 }
 
@@ -108,9 +120,11 @@ pub struct ExpectedParameter {
     /// The unit the column's numbers are in, from the site's slot when it declares one and the
     /// catalog default otherwise. A grid of bare numbers cannot be read without it.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub units: Option<String>,
     /// `site_parameters.decimal_places` for the slot, null when it declares none.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub decimal_places: Option<i16>,
 }
 
@@ -274,7 +288,8 @@ pub async fn list_site_visits(
             binds.clone(),
         ))
         .await?
-        .map(|r| r.try_get("", "n").unwrap_or(0))
+        .map(|r| r.try_get::<i64>("", "n"))
+        .transpose()?
         .unwrap_or(0);
 
     // The column set is every parameter this site can hold a spot value for: the ones its visits
@@ -541,8 +556,10 @@ pub struct VisitListRow {
     /// 'manual' | 'portal_sync'.
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub created_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub notes: Option<String>,
     /// Parameters with at least one non-withdrawn reading at this visit.
     pub parameters_filled: i64,
@@ -620,7 +637,8 @@ pub async fn list_visits(
             binds.clone(),
         ))
         .await?
-        .map(|r| r.try_get("", "n").unwrap_or(0))
+        .map(|r| r.try_get::<i64>("", "n"))
+        .transpose()?
         .unwrap_or(0);
 
     let limit = limit_clause(paging, &mut binds);
@@ -677,8 +695,10 @@ pub struct EventDetailResponse {
     pub collected_at: DateTime<Utc>,
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub created_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub notes: Option<String>,
     /// The visit's recompute state: `current` | `queued` | `running` | `failed` | `stale`.
     pub recompute: String,
@@ -694,8 +714,10 @@ pub struct EventCell {
     /// Which feed these replicates came in on. Two streams can serve one slot at one instant, and
     /// then the grid shows two rows under one parameter name with nothing distinguishing them.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub source_system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub source_key: Option<String>,
     /// How these readings reached the store: `manual`, `csv`, `api` or `sync`. A measurement
     /// without a tool-run blob is not therefore hand-entered; it may be an import or a batch, and
@@ -707,22 +729,28 @@ pub struct EventCell {
     /// `manual` | `batch` | `sync` | `derived` | `migration`. Narrower than `origin`, which reads
     /// the stream alone and cannot tell a hand entry from a tool save on the same channel.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub provenance_kind: Option<String>,
     /// The blob's tool name, when one exists.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub tool: Option<String>,
     /// The value serving arm reports: sample mean, else the lowest unflagged live replicate.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub served_value: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub sample: Option<CellSample>,
     pub replicates: Vec<CellReplicate>,
     /// The instant's assembled record for this stream, the same shape `/readings/provenance`
     /// serves, so the point record opened from the grid needs no second fetch.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub record: Option<crate::routes::private::readings::provenance::ProvenanceRecord>,
     /// The oldest open event-audit finding for this cell.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub finding: Option<CellFinding>,
     /// The calculations that read this parameter, by tool name. A person typing into a field needs
     /// to see which script it feeds while typing it, not after the save.
@@ -731,6 +759,7 @@ pub struct EventCell {
     /// The calculation that writes this parameter, when one does. Its value is a computed output,
     /// not a measurement, and editing it is a different act from editing an input.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub written_by: Option<String>,
 }
 
@@ -738,20 +767,27 @@ pub struct EventCell {
 pub struct CellSample {
     pub sample_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub mean: Option<f64>,
     /// The sd under the divisor the slot declares. `sd_estimator` names which that is; the other
     /// travels beside it so a reviewer can read both without declaring anything first.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub stdev: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub stdev_sample: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub stdev_population: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub median: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub min: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub max: Option<f64>,
     pub n: i32,
     /// 'sample' | 'population', and what chose it ('default' is the fallback having applied).
@@ -764,22 +800,28 @@ pub struct CellReplicate {
     pub replicate_index: i16,
     pub raw_value: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub calibrated_value: Option<f64>,
     pub flagged: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub flag_reason: Option<String>,
     pub withdrawn: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub withdrawn_at: Option<DateTime<Utc>>,
     /// The base calibration this replicate was corrected with, null when none was.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub calibration_id: Option<Uuid>,
     /// The standard curve applied on top of the base calibration, null when none was.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub standard_curve_id: Option<Uuid>,
     /// The instrument the replicate names. The grid offers it back as the row's declaration, so
     /// re-entering a value does not silently re-attribute it to whatever the slot declares now.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub sensor_id: Option<Uuid>,
 }
 
@@ -789,6 +831,7 @@ pub struct CellFinding {
     /// `missing_output`, `stale_output` or `skipped_output`.
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub tool: Option<String>,
     pub status: String,
 }

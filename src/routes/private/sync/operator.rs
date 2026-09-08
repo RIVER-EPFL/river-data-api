@@ -34,15 +34,20 @@ pub struct SyncServiceResponse {
     pub status: String,
     pub paused: bool,
     /// Operator-set scheduled cadence in seconds; null means the service's own configuration.
+    #[schema(required)]
     pub sync_interval_secs: Option<i32>,
     /// Whether the weekly full re-assert queues a `trigger_full_sync` for this service.
     pub full_reassert_enabled: bool,
+    #[schema(required)]
     pub current_operation: Option<String>,
+    #[schema(required)]
     pub last_heartbeat: Option<String>,
+    #[schema(required)]
     pub last_sync_completed_at: Option<String>,
     /// The first error of the service's most recent cycle that reported one. Read from
     /// `sync_events`, not from `sync_services.last_error`: nothing has ever written that column and
     /// a service has no field to report an error through, so the row itself cannot carry one.
+    #[schema(required)]
     pub last_error: Option<String>,
     pub health: String,
     pub created_at: String,
@@ -128,13 +133,17 @@ pub struct SyncCommandResponse {
     pub service_id: Uuid,
     pub command: String,
     #[schema(value_type = Object)]
+    #[schema(required)]
     pub payload: Option<serde_json::Value>,
     pub status: String,
     #[schema(value_type = Object)]
+    #[schema(required)]
     pub result: Option<serde_json::Value>,
     pub created_at: String,
     pub expires_at: String,
+    #[schema(required)]
     pub acknowledged_at: Option<String>,
+    #[schema(required)]
     pub completed_at: Option<String>,
 }
 
@@ -176,6 +185,7 @@ pub struct CredentialResponse {
     pub id: Uuid,
     pub client_id: String,
     pub service_type: String,
+    #[schema(required)]
     pub service_id: Option<Uuid>,
     pub revoked: bool,
     pub created_at: String,
@@ -185,6 +195,7 @@ pub struct CredentialResponse {
 pub struct SyncEventResponse {
     pub id: Uuid,
     pub service_id: Uuid,
+    #[schema(required)]
     pub command_id: Option<Uuid>,
     pub event_type: String,
     pub status: String,
@@ -192,11 +203,15 @@ pub struct SyncEventResponse {
     pub readings_skipped: i64,
     pub status_events_synced: i64,
     #[schema(value_type = Object)]
+    #[schema(required)]
     pub errors: Option<serde_json::Value>,
     #[schema(value_type = Object)]
+    #[schema(required)]
     pub log: Option<serde_json::Value>,
     pub started_at: String,
+    #[schema(required)]
     pub completed_at: Option<String>,
+    #[schema(required)]
     pub duration_ms: Option<i64>,
 }
 

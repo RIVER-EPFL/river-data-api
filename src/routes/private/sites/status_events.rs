@@ -53,6 +53,7 @@ pub struct StatusEventData {
     pub time: DateTime<Utc>,
     pub value: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub sensor_id: Option<Uuid>,
 }
 
@@ -175,7 +176,8 @@ pub async fn get_site_status_events(
                 values.clone(),
             ))
             .await?
-            .and_then(|row| row.try_get::<i64>("", "cnt").ok())
+            .map(|row| row.try_get::<i64>("", "cnt"))
+            .transpose()?
             .unwrap_or(0)
             .max(0) as u64;
         Some(total)
