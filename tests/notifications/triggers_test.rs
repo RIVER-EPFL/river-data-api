@@ -478,3 +478,59 @@ async fn a_cycle_that_added_readings_says_so_even_with_nothing_held() {
         "the same arrivals are not announced twice inside the window"
     );
 }
+
+/// Scenario: the janitor's drift sweep recomposes stored values and records each move (Q57, Q118).
+///
+/// Expected behaviour: the moves are announced once with their count, the message says the change
+/// is on the reading and reversible, and the same moves are not announced again.
+#[tokio::test]
+#[serial]
+async fn recomposed_values_are_announced_once_from_the_ledger() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    let stream = turb_stream(&db).await;
+    insert_reading(&db, &stream, "NOW() - INTERVAL '10 minutes'").await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reading_decisions \
+                 (stream_id, time, replicate_index, kind, old, new, actor, origin) \
+             SELECT stream_id, time, replicate_index, 'curve_recompose', \
+                    '{{\"calibrated_value\": 21}}'::jsonb, '{{\"calibrated_value\": 51}}'::jsonb, \
+                    'system', 'janitor' \
+               FROM readings WHERE stream_id = '{stream}' ORDER BY time DESC LIMIT 1"
+        ),
+    )
+    .await;
+
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let channels: Vec<Box<dyn NotificationChannel>> =
+        vec![Box::new(MockChannel { sent: sent.clone() })];
+    triggers::run(&state, &channels).await;
+
+    {
+        let msgs = sent.lock().unwrap();
+        let drift = kinds(&msgs, "curve_drift");
+        assert_eq!(drift.len(), 1, "the sweep's moves are announced: {msgs:?}");
+        assert!(
+            drift[0].subject.contains("1 corrected value(s)"),
+            "the count is what moved: {}",
+            drift[0].subject
+        );
+        assert!(
+            drift[0].body.contains("rolled back"),
+            "the message says the move is reversible: {}",
+            drift[0].body
+        );
+    }
+
+    sent.lock().unwrap().clear();
+    triggers::run(&state, &channels).await;
+    assert!(
+        kinds(&sent.lock().unwrap(), "curve_drift").is_empty(),
+        "the same moves are not announced twice"
+    );
+}

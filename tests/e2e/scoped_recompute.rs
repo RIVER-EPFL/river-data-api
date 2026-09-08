@@ -36,14 +36,14 @@ async fn set_enabled(app: &axum::Router, admin: &str, name: &str, enabled: bool)
 #[serial]
 async fn a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findings() {
     use sea_orm::ConnectionTrait;
-    if !kc::require_keycloak_or_skip(
+    if !crate::common::profile::Service::Keycloak.require(
         "a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findings",
     )
     .await
     {
         return;
     }
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findings",
     )
     .await
@@ -317,10 +317,10 @@ async fn a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findin
 #[serial]
 async fn a_correction_cascades_is_recorded_and_is_reversible() {
     const AT: &str = "2025-07-08T09:00:00Z";
-    if !kc::require_keycloak_or_skip("a_correction_cascades_is_recorded_and_is_reversible").await {
+    if !crate::common::profile::Service::Keycloak.require("a_correction_cascades_is_recorded_and_is_reversible").await {
         return;
     }
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_correction_cascades_is_recorded_and_is_reversible",
     )
     .await

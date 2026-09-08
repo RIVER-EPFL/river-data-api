@@ -132,7 +132,7 @@ async fn an_unconfigured_runner_answers_503_and_says_so() {
 #[tokio::test]
 #[serial]
 async fn a_malformed_manifest_is_refused_without_the_runner() {
-    if !kc::require_keycloak_or_skip("a_malformed_manifest_is_refused_without_the_runner").await {
+    if !crate::common::profile::Service::Keycloak.require("a_malformed_manifest_is_refused_without_the_runner").await {
         return;
     }
     let db = crate::common::setup_test_db().await;

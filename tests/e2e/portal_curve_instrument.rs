@@ -7,9 +7,9 @@
 //!
 //! Expected behaviour: a curve column whose stem matches one of the source's own curve labels
 //! resolves to that instrument without being asked; one that matches nothing proposes a
-//! placeholder and blocks apply until an operator agrees to it; a stream with no curve column and
-//! no device serial gets no instrument at all, rather than one minted per stream. With the
-//! instrument in place, a reading naming the curve is stored instead of dropped.
+//! placeholder and blocks apply until an operator agrees to it; a stream with no curve column
+//! carries the default registration minted for it and the plan creates nothing further for it.
+//! With the instrument in place, a reading naming the curve is stored instead of dropped.
 //!
 //! Run: cargo test --test e2e portal_curve_instrument -- --test-threads=1
 
@@ -157,7 +157,7 @@ async fn create_plan(app: &Router, jwt: &str) -> serde_json::Value {
 #[tokio::test]
 #[serial]
 async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
-    if !kc::require_keycloak_or_skip("portal_curve_instrument").await {
+    if !crate::common::profile::Service::Keycloak.require("portal_curve_instrument").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -265,6 +265,7 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
     .await;
     assert_eq!(status, 200, "confirm the proposal ({status}): {patched}");
 
+    let before_apply = count(&db, "SELECT COUNT(*) FROM sensors").await;
     let counts = apply_plan(&app, &admin, &plan_id).await;
     assert_eq!(
         counts["instruments_created"], 1,
@@ -274,19 +275,20 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
 
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM sensors").await,
-        2,
-        "the curve's instrument plus the one confirmed in the review, and nothing else",
+        before_apply + 1,
+        "the apply creates the one instrument the operator confirmed, and nothing else",
     );
     assert_eq!(
         count(
             &db,
             &format!(
-                "SELECT COUNT(*) FROM data_streams WHERE id = '{plain}' AND sensor_id IS NULL"
+                "SELECT COUNT(*) FROM data_streams WHERE id = '{plain}' AND sensor_id IS NOT NULL"
             )
         )
         .await,
         1,
-        "a portal stream with no device serial and no curve column stays unattributed",
+        "a stream with no curve column keeps the instrument registration minted for it: no \
+         measurement without one, and the plan asks nothing about it",
     );
     assert_eq!(
         count(
@@ -395,7 +397,7 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
 #[tokio::test]
 #[serial]
 async fn an_instrument_is_attached_to_streams_whose_source_names_no_curve() {
-    if !kc::require_keycloak_or_skip("portal_curve_instrument").await {
+    if !crate::common::profile::Service::Keycloak.require("portal_curve_instrument").await {
         return;
     }
     let db = crate::common::setup_test_db().await;

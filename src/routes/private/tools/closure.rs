@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use serde::Serialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -17,7 +17,7 @@ use crate::error::AppResult;
 use super::chain::dependency_order;
 use super::engine;
 
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema, FromQueryResult)]
 pub struct ImpactParameter {
     pub parameter_id: Uuid,
     pub parameter_code: String,
@@ -141,19 +141,14 @@ pub async fn calculations_fed_by(
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, code FROM parameters WHERE id = ANY($1)",
+            "SELECT id AS parameter_id, code AS parameter_code FROM parameters WHERE id = ANY($1)",
             [parameter_ids.to_vec().into()],
         ))
         .await?;
-    let touched: Vec<ImpactParameter> = rows
+    let touched = rows
         .iter()
-        .map(|row| {
-            Ok(ImpactParameter {
-                parameter_id: row.try_get("", "id")?,
-                parameter_code: row.try_get("", "code")?,
-            })
-        })
-        .collect::<AppResult<_>>()?;
+        .map(|row| ImpactParameter::from_query_result(row, ""))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut impacts = fed_closure(&tools, &catalog, &order, &touched);
     impacts.extend(derived_fed_by(db, &touched).await?);
     Ok(impacts)
@@ -171,6 +166,18 @@ struct DerivedEdge {
     label: String,
     reads: Vec<String>,
     output: Option<ImpactParameter>,
+}
+
+/// One standalone definition as the query selects it: the parameters it reads arrive as a JSON
+/// array of codes, and the output is a `LEFT JOIN` so a definition with no output parameter is
+/// legitimately two nulls.
+#[derive(FromQueryResult)]
+struct DerivedEdgeRow {
+    code: String,
+    name: String,
+    output_id: Option<Uuid>,
+    output_code: Option<String>,
+    reads: serde_json::Value,
 }
 
 async fn derived_edges(db: &DatabaseConnection) -> AppResult<Vec<DerivedEdge>> {
@@ -193,12 +200,16 @@ async fn derived_edges(db: &DatabaseConnection) -> AppResult<Vec<DerivedEdge>> {
         .await?;
     let mut edges = Vec::with_capacity(rows.len());
     for row in &rows {
-        let reads: serde_json::Value = row.try_get("", "reads")?;
-        let output_id: Option<Uuid> = row.try_get("", "output_id")?;
-        let output_code: Option<String> = row.try_get("", "output_code")?;
+        let DerivedEdgeRow {
+            code,
+            name,
+            output_id,
+            output_code,
+            reads,
+        } = DerivedEdgeRow::from_query_result(row, "")?;
         edges.push(DerivedEdge {
-            code: row.try_get("", "code")?,
-            label: row.try_get("", "name")?,
+            code,
+            label: name,
             reads: reads
                 .as_array()
                 .map(|a| {

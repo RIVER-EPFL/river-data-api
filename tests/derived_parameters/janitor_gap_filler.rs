@@ -146,5 +146,61 @@ async fn test_janitor_fills_derived_gaps() {
         (got - expected).abs() < 1e-6,
         "expected {expected}, got {got}"
     );
+
+    // The value the second run computed is a change to the readings, so it is in the ledger with
+    // the version it was made under, and a run that computes the same number again adds nothing
+    // (Q57, Q118).
+    let arrivals = arrivals_at(&db, site_id, derived_param_uuid, new_source_time).await;
+    assert_eq!(arrivals.len(), 1, "the arrival is recorded once");
+    assert_eq!(arrivals[0].0, "system");
+    assert!(
+        arrivals[0].1["raw_value"].is_null(),
+        "nothing stood there before: {}",
+        arrivals[0].1
+    );
+    assert!(
+        (arrivals[0].2["raw_value"].as_f64().unwrap() - expected).abs() < 1e-6,
+        "the arrival names the value: {}",
+        arrivals[0].2
+    );
+
+    river_db::routes::private::parameters::derived::janitor::run_once(&db, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        arrivals_at(&db, site_id, derived_param_uuid, new_source_time)
+            .await
+            .len(),
+        1,
+        "an unchanged recompute is not a second arrival"
+    );
+}
+
+/// The `derived_computed` decisions on one derived slot's instant, as (actor, old, new).
+async fn arrivals_at(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    time: DateTime<Utc>,
+) -> Vec<(String, serde_json::Value, serde_json::Value)> {
+    db.query_all_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT d.actor, d.old, d.new FROM reading_decisions d \
+           JOIN readings r ON r.stream_id = d.stream_id AND r.time = d.time \
+          WHERE d.kind = 'derived_computed' AND r.site_id = $1 AND r.parameter_id = $2 \
+            AND d.time = $3",
+        [site_id.into(), parameter_id.into(), time.into()],
+    ))
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| {
+        (
+            r.try_get::<String>("", "actor").unwrap(),
+            r.try_get::<serde_json::Value>("", "old").unwrap(),
+            r.try_get::<serde_json::Value>("", "new").unwrap(),
+        )
+    })
+    .collect()
 }
 

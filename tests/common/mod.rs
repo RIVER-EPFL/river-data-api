@@ -7,6 +7,7 @@ pub mod fixtures;
 pub mod jobs;
 pub mod keycloak;
 pub mod plans;
+pub mod profile;
 pub mod seed;
 pub mod sensor_lifecycle;
 pub mod tools_runner;

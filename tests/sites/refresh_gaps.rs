@@ -14,7 +14,7 @@
 //! Every fixture timestamp is in the past, since the refresh window is `[since, NOW()]`. Suites own
 //! distinct months (2026-01 to 2026-05) so no two materialise the same bucket.
 //!
-//! These run as real Keycloak users and self-skip when Keycloak is unreachable. The janitor cadence
+//! These run as real Keycloak users, under a profile covering Keycloak. The janitor cadence
 //! suite is the exception: it needs a worker whose registry carries the recurring Services (the
 //! shared builders register only the on-demand jobs) and so builds its own app with an API token.
 //!
@@ -39,7 +39,7 @@ use crate::common::tracks;
 
 /// A Keycloak-authenticated app on a clean database, or `None` when Keycloak is unreachable.
 async fn keycloak_app(test_name: &str) -> Option<(DatabaseConnection, Router, String)> {
-    if !kc::require_keycloak_or_skip(test_name).await {
+    if !crate::common::profile::Service::Keycloak.require(test_name).await {
         return None;
     }
     let db = crate::common::setup_test_db().await;

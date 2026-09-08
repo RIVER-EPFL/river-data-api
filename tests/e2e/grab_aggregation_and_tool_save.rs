@@ -10,7 +10,7 @@ use serial_test::serial;
 #[tokio::test]
 #[serial]
 async fn grab_replicates_aggregate_then_tool_result_saved_to_station() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "grab_replicates_aggregate_then_tool_result_saved_to_station",
     )
     .await

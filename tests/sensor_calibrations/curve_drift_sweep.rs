@@ -104,7 +104,7 @@ async fn the_sweep_recomposes_a_value_left_behind_by_an_unhooked_coefficient_edi
         "the statement moved the curve and nothing recomputed the reading"
     );
 
-    let drift = sweep_curve_drift(&db).await.expect("sweep runs");
+    let drift = sweep_curve_drift(&db, None).await.expect("sweep runs");
     assert_eq!(drift.moved, 1, "the one drifted reading is recomposed");
     assert_eq!(stored(&db).await, (10.0, Some(51.0)), "5 * 10 + 1");
     assert!(
@@ -112,7 +112,7 @@ async fn the_sweep_recomposes_a_value_left_behind_by_an_unhooked_coefficient_edi
         "the sweep reports the span it moved, so the rollups can follow"
     );
 
-    let second = sweep_curve_drift(&db).await.expect("sweep runs");
+    let second = sweep_curve_drift(&db, None).await.expect("sweep runs");
     assert_eq!(second.moved, 0, "a settled row is not rewritten again");
 }
 
@@ -146,7 +146,7 @@ async fn the_sweep_composes_the_standard_curve_over_the_windowed_calibration() {
         &format!("UPDATE standard_curves SET slope = 4.0 WHERE id = '{curve}'"),
     )
     .await;
-    let drift = sweep_curve_drift(&db).await.expect("sweep runs");
+    let drift = sweep_curve_drift(&db, None).await.expect("sweep runs");
     assert_eq!(
         drift.moved, 1,
         "the lab curve moved, so the grab follows it"
@@ -162,7 +162,7 @@ async fn the_sweep_composes_the_standard_curve_over_the_windowed_calibration() {
         &format!("UPDATE sensor_calibrations SET slope = 5.0 WHERE id = '{calibration}'"),
     )
     .await;
-    let drift = sweep_curve_drift(&db).await.expect("sweep runs");
+    let drift = sweep_curve_drift(&db, None).await.expect("sweep runs");
     assert_eq!(drift.moved, 1, "and it follows the base curve too");
     assert_eq!(
         stored(&db).await,
@@ -192,7 +192,7 @@ async fn the_sweep_repairs_a_value_corrupted_in_place() {
     .await;
     assert_eq!(stored(&db).await.1, Some(12345.0), "the row is now wrong");
 
-    let drift = sweep_curve_drift(&db).await.expect("sweep runs");
+    let drift = sweep_curve_drift(&db, None).await.expect("sweep runs");
     assert_eq!(drift.moved, 1);
     assert_eq!(
         stored(&db).await,
@@ -230,7 +230,7 @@ async fn the_sweep_moves_nothing_on_clean_data() {
     .await;
     let value_before = stored(&db).await;
 
-    let drift = sweep_curve_drift(&db).await.expect("sweep runs");
+    let drift = sweep_curve_drift(&db, None).await.expect("sweep runs");
     assert_eq!(
         drift.moved, 0,
         "nothing had drifted, so nothing is rewritten"
@@ -278,7 +278,7 @@ async fn the_sweep_leaves_a_correction_no_curve_accounts_for() {
     )
     .await;
 
-    let drift = sweep_curve_drift(&db).await.expect("sweep runs");
+    let drift = sweep_curve_drift(&db, None).await.expect("sweep runs");
     assert_eq!(
         drift.moved, 0,
         "it names no curve, so there is nothing to recompose from"
@@ -452,7 +452,7 @@ async fn the_sweep_reports_the_visits_whose_inputs_it_moved() {
     )
     .await;
 
-    let drift = sweep_curve_drift(&db).await.expect("sweep runs");
+    let drift = sweep_curve_drift(&db, None).await.expect("sweep runs");
     assert_eq!(drift.moved, 1);
     assert_eq!(
         drift.touched,
@@ -467,4 +467,76 @@ async fn the_sweep_reports_the_visits_whose_inputs_it_moved() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].id, event_id);
     assert_eq!(events[0].source, "manual");
+}
+
+/// Scenario: the sweep changes a stored value, and the ledger is the one place a value's history
+/// is read from (Q118).
+/// Expected behaviour: the move is recorded as a `curve_recompose` decision naming both numbers,
+/// the janitor origin and the run that made it, and a repeat sweep records nothing.
+#[tokio::test]
+#[serial]
+async fn a_recomposed_value_records_the_move_against_the_run_that_made_it() {
+    let (db, app, token) = setup().await;
+    let (sensor, calibration) = deployed_lab_sensor(&db, 2.0, 1.0).await;
+    post_grab(&app, &token, sensor, None, 10.0).await;
+
+    crate::common::exec(
+        &db,
+        &format!("UPDATE sensor_calibrations SET slope = 5.0 WHERE id = '{calibration}'"),
+    )
+    .await;
+
+    let job = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reprocessing_jobs (id, trigger_type, status) \
+             VALUES ('{job}', 'maintenance', 'running')"
+        ),
+    )
+    .await;
+
+    let drift = sweep_curve_drift(&db, Some(job)).await.expect("sweep runs");
+    assert_eq!(drift.moved, 1);
+
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT d.old ->> 'calibrated_value' AS was, d.new ->> 'calibrated_value' AS became, \
+                        d.actor, d.origin, d.job_id, d.supersedes \
+                   FROM reading_decisions d JOIN readings r \
+                     ON r.stream_id = d.stream_id AND r.time = d.time \
+                    AND r.replicate_index = d.replicate_index \
+                  WHERE d.kind = 'curve_recompose' AND r.site_id = '{SITE1_ID}' \
+                    AND r.parameter_id = '{GLOBAL_PARAM_DO_ID}'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the move is recorded");
+    assert_eq!(row.try_get::<String>("", "was").unwrap(), "21");
+    assert_eq!(row.try_get::<String>("", "became").unwrap(), "51");
+    assert_eq!(row.try_get::<String>("", "origin").unwrap(), "janitor");
+    assert_eq!(row.try_get::<Uuid>("", "job_id").unwrap(), job);
+    assert!(
+        row.try_get::<Option<Uuid>>("", "supersedes")
+            .unwrap()
+            .is_none(),
+        "the first move on the reading supersedes nothing"
+    );
+
+    let second = sweep_curve_drift(&db, Some(job)).await.expect("sweep runs");
+    assert_eq!(second.moved, 0, "a settled row records nothing further");
+    let count: i64 = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM reading_decisions WHERE kind = 'curve_recompose'".to_string(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(count, 1);
 }

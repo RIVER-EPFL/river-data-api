@@ -422,6 +422,9 @@ const ACTIVE_TOOL_SQL: &str = r"
 /// One formula of a calculation as stored, before its `sources` blob is read into pairs.
 #[derive(FromQueryResult)]
 struct StoredFormula {
+    tool_script_id: Uuid,
+    sources: serde_json::Value,
+    site_sources: serde_json::Value,
     code: String,
     name: String,
     units: Option<String>,
@@ -430,6 +433,28 @@ struct StoredFormula {
     output_parameter_code: Option<String>,
     curve_slot: Option<String>,
     per_replicate: Option<String>,
+}
+
+/// A named constant as the runner receives it.
+#[derive(FromQueryResult)]
+struct StoredConstant {
+    name: String,
+    value: f64,
+}
+
+/// A site's name beside the whole row as jsonb, which is what a site source reads a property from.
+#[derive(FromQueryResult)]
+struct StoredSite {
+    name: String,
+    site: serde_json::Value,
+}
+
+/// The served spot value at one slot, which an event input resolves to. A NULL `value` is a slot
+/// with nothing served at the instant, not a decode failure.
+#[derive(FromQueryResult)]
+struct ServedSpotValue {
+    parameter_id: Uuid,
+    value: Option<f64>,
 }
 
 /// A standard curve as the runner receives its coefficients.
@@ -533,12 +558,11 @@ pub async fn load_formulas(
         .await?;
     let mut formulas = Vec::with_capacity(rows.len());
     for row in &rows {
-        let script_id: Uuid = row.try_get("", "tool_script_id")?;
-        let sources = name_pairs(&row.try_get("", "sources")?);
-        let site_sources = name_pairs(&row.try_get("", "site_sources")?);
         let stored = StoredFormula::from_query_result(row, "")?;
+        let sources = name_pairs(&stored.sources);
+        let site_sources = name_pairs(&stored.site_sources);
         formulas.push((
-            script_id,
+            stored.tool_script_id,
             super::formula::PinnedFormula {
                 code: stored.code,
                 label: stored.name,
@@ -776,9 +800,8 @@ async fn resolve_constants(
         ))
         .await?;
     for row in &rows {
-        let name: String = row.try_get("", "name")?;
-        let value: f64 = row.try_get("", "value")?;
-        out.insert(name, serde_json::json!(value));
+        let constant = StoredConstant::from_query_result(row, "")?;
+        out.insert(constant.name, serde_json::json!(constant.value));
     }
     if missing == MissingConstant::Refuse {
         // A version cannot be saved declaring a constant that does not exist, so reaching here
@@ -884,8 +907,10 @@ pub async fn resolve_site_inputs(
         ))
         .await?
         .ok_or_else(|| AppError::BadRequest(format!("Site {site_id} not found")))?;
-    let site_name: String = row.try_get("", "name")?;
-    let site: serde_json::Value = row.try_get("", "site")?;
+    let StoredSite {
+        name: site_name,
+        site,
+    } = StoredSite::from_query_result(&row, "")?;
 
     let mut resolved = Vec::new();
     for s in pending {
@@ -984,8 +1009,9 @@ pub async fn resolve_event_inputs(
         else {
             continue;
         };
-        let parameter_id: Uuid = row.try_get("", "parameter_id")?;
-        let Some(value) = row.try_get::<Option<f64>>("", "value")? else {
+        let served = ServedSpotValue::from_query_result(&row, "")?;
+        let parameter_id = served.parameter_id;
+        let Some(value) = served.value else {
             continue;
         };
         if let Some(param) = manifest.params.iter().find(|p| p.name == e.param)

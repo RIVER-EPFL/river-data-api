@@ -263,7 +263,7 @@ async fn ingest_cycle(app: &Router, jwt: &str, stream: &str, cycle: usize) {
 #[tokio::test]
 #[serial]
 async fn deploy_dialog_suggestions_then_redeploy_binds_the_slot() {
-    if !kc::require_keycloak_or_skip("deploy_dialog_suggestions").await {
+    if !crate::common::profile::Service::Keycloak.require("deploy_dialog_suggestions").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -423,7 +423,7 @@ async fn deploy_dialog_suggestions_then_redeploy_binds_the_slot() {
 #[tokio::test]
 #[serial]
 async fn recall_then_reopen_via_edit_dates_restores_attribution() {
-    if !kc::require_keycloak_or_skip("recall_then_reopen").await {
+    if !crate::common::profile::Service::Keycloak.require("recall_then_reopen").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -567,7 +567,7 @@ async fn recall_then_reopen_via_edit_dates_restores_attribution() {
 #[tokio::test]
 #[serial]
 async fn backdate_deployed_from_claims_unattributed_slot_history() {
-    if !kc::require_keycloak_or_skip("backdate_deployed_from").await {
+    if !crate::common::profile::Service::Keycloak.require("backdate_deployed_from").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -731,7 +731,7 @@ async fn backdate_deployed_from_claims_unattributed_slot_history() {
 #[tokio::test]
 #[serial]
 async fn calibration_candidates_then_backfill_calibrations() {
-    if !kc::require_keycloak_or_skip("calibration_candidates").await {
+    if !crate::common::profile::Service::Keycloak.require("calibration_candidates").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -999,7 +999,7 @@ async fn calibration_candidates_then_backfill_calibrations() {
 #[tokio::test]
 #[serial]
 async fn recalculate_action_rewrites_the_calibration_window() {
-    if !kc::require_keycloak_or_skip("recalculate_action").await {
+    if !crate::common::profile::Service::Keycloak.require("recalculate_action").await {
         return;
     }
     let db = crate::common::setup_test_db().await;

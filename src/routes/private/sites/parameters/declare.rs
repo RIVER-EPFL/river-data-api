@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, State},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -253,15 +253,15 @@ pub async fn retag_sd_estimator(
         let named: Vec<String> = undeclared
             .iter()
             .map(|row| {
-                let site: String = row.try_get("", "site_name").unwrap_or_default();
-                let parameter: String = row.try_get("", "parameter_name").unwrap_or_default();
-                let declared: Option<String> = row.try_get("", "sd_estimator").unwrap_or(None);
-                format!(
-                    "{site} / {parameter} ({})",
-                    declared.as_deref().unwrap_or("not declared")
-                )
+                let row = UndeclaredRow::from_query_result(row, "")?;
+                Ok(format!(
+                    "{} / {} ({})",
+                    row.site_name,
+                    row.parameter_name,
+                    row.sd_estimator.as_deref().unwrap_or("not declared")
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
         return Err(AppError::BadRequest(format!(
             "declare '{estimator}' on the slot first; it is not what {} declares",
             named.join(", ")
@@ -338,4 +338,13 @@ pub async fn retag_sd_estimator(
         instant_decisions: instant_rows,
         job_id,
     }))
+}
+
+/// One slot named in the refusal: the site, the parameter and whatever it declares, which is the
+/// thing the caller has to change.
+#[derive(sea_orm::FromQueryResult)]
+struct UndeclaredRow {
+    site_name: String,
+    parameter_name: String,
+    sd_estimator: Option<String>,
 }

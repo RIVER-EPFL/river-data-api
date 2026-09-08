@@ -8,8 +8,8 @@
 //! `common/cache.rs:140` skips the freshness probe whenever `end` is supplied; the one unbounded
 //! test is the one whose subject is the probe itself.
 //!
-//! These run as real Keycloak users, so they assert what a dashboard user is served, and self-skip
-//! when Keycloak is unreachable unless `REQUIRE_KEYCLOAK` is set. What a key is *made of* is not
+//! These run as real Keycloak users, so they assert what a dashboard user is served, and run only
+//! under a profile covering Keycloak. What a key is *made of* is not
 //! asserted here: `common/cache_key.rs` and the two `cache_key_tests` modules beside the handlers
 //! cover that with no database.
 //!
@@ -149,7 +149,7 @@ async fn ingest_one(app: &Router, jwt: &str, stream_id: &str, time: &str, raw_va
 #[tokio::test]
 #[serial]
 async fn a_write_invalidates_the_written_sites_cached_readings() {
-    if !kc::require_keycloak_or_skip("a_write_invalidates_cached_readings").await {
+    if !crate::common::profile::Service::Keycloak.require("a_write_invalidates_cached_readings").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -234,7 +234,7 @@ async fn a_write_invalidates_the_written_sites_cached_readings() {
 #[tokio::test]
 #[serial]
 async fn an_unbounded_read_reflects_a_backfilled_reading() {
-    if !kc::require_keycloak_or_skip("an_unbounded_read_reflects_a_backfilled_reading").await {
+    if !crate::common::profile::Service::Keycloak.require("an_unbounded_read_reflects_a_backfilled_reading").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -335,7 +335,7 @@ async fn an_unbounded_read_reflects_a_backfilled_reading() {
 #[tokio::test]
 #[serial]
 async fn a_write_invalidates_the_sites_public_cached_readings() {
-    if !kc::require_keycloak_or_skip("a_write_invalidates_the_sites_public_cached_readings").await {
+    if !crate::common::profile::Service::Keycloak.require("a_write_invalidates_the_sites_public_cached_readings").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -421,7 +421,7 @@ async fn a_write_invalidates_the_sites_public_cached_readings() {
 #[tokio::test]
 #[serial]
 async fn a_primed_cache_entry_is_not_served_outside_the_callers_project_scope() {
-    if !kc::require_keycloak_or_skip("a_primed_cache_entry_is_not_served_outside_scope").await {
+    if !crate::common::profile::Service::Keycloak.require("a_primed_cache_entry_is_not_served_outside_scope").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -512,7 +512,7 @@ async fn a_primed_cache_entry_is_not_served_outside_the_callers_project_scope() 
 #[tokio::test]
 #[serial]
 async fn pairing_a_stream_with_history_invalidates_the_slots_cached_readings() {
-    if !kc::require_keycloak_or_skip("pairing_invalidates_cached_readings").await {
+    if !crate::common::profile::Service::Keycloak.require("pairing_invalidates_cached_readings").await {
         return;
     }
     let db = crate::common::setup_test_db().await;

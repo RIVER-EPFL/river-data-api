@@ -284,7 +284,7 @@ async fn series(fx: &Fixture, sensor_id: &str, start: &str, end: &str) -> Series
 #[tokio::test]
 #[serial]
 async fn backfill_calibrations_resolves_covered_readings_and_creates_no_curve() {
-    if !kc::require_keycloak_or_skip("backfill_calibrations_window_boundaries").await {
+    if !crate::common::profile::Service::Keycloak.require("backfill_calibrations_window_boundaries").await {
         return;
     }
     let fx = onboard().await;
@@ -429,7 +429,7 @@ async fn backfill_calibrations_resolves_covered_readings_and_creates_no_curve() 
 #[tokio::test]
 #[serial]
 async fn a_refused_deployment_create_leaves_the_current_deployment_open() {
-    if !kc::require_keycloak_or_skip("refused_deployment_create_boundaries").await {
+    if !crate::common::profile::Service::Keycloak.require("refused_deployment_create_boundaries").await {
         return;
     }
     let fx = onboard().await;
@@ -520,7 +520,7 @@ async fn a_refused_deployment_create_leaves_the_current_deployment_open() {
 #[tokio::test]
 #[serial]
 async fn curves_sharing_a_valid_from_never_collapse_into_an_empty_window() {
-    if !kc::require_keycloak_or_skip("duplicate_valid_from_boundaries").await {
+    if !crate::common::profile::Service::Keycloak.require("duplicate_valid_from_boundaries").await {
         return;
     }
     let fx = onboard().await;
@@ -576,7 +576,7 @@ async fn curves_sharing_a_valid_from_never_collapse_into_an_empty_window() {
 #[tokio::test]
 #[serial]
 async fn rolling_back_into_a_refilled_slot_reports_a_conflict() {
-    if !kc::require_keycloak_or_skip("rollback_into_refilled_slot").await {
+    if !crate::common::profile::Service::Keycloak.require("rollback_into_refilled_slot").await {
         return;
     }
     let fx = onboard().await;
@@ -704,11 +704,12 @@ async fn rolling_back_into_a_refilled_slot_reports_a_conflict() {
 
 /// Deleting a curve a reading is pinned to must report the pin, not fail on the raw foreign key:
 /// the repoint that clears the way for the delete holds pinned rows back on purpose, so the
-/// reference the constraint protects is still there when the delete runs.
+/// reference the constraint protects is still there when the delete runs. Pins are historical
+/// (Q117) and this guard is what still stands over the rows that carry one.
 #[tokio::test]
 #[serial]
 async fn deleting_a_curve_a_reading_is_pinned_to_reports_the_pin() {
-    if !kc::require_keycloak_or_skip("delete_pinned_calibration").await {
+    if !crate::common::profile::Service::Keycloak.require("delete_pinned_calibration").await {
         return;
     }
     let fx = onboard().await;
@@ -719,20 +720,19 @@ async fn deleting_a_curve_a_reading_is_pinned_to_reports_the_pin() {
     let at = "2025-06-02T09:00:00Z";
     upload_history(&fx, &[(depth.as_str(), at, 10.0, sensor.as_str())]).await;
 
+    // Nothing records a pin any more (Q117), so the one this guard protects is a stored row: the
+    // projection trigger writes it onto the reading exactly as the removed route did.
     let stream = stream_carrying(&fx, &sensor).await;
-    let (status, body) = post_json_with_token(
-        &fx.app,
-        "/api/readings/pins",
-        &json!({
-            "kind": "calibration",
-            "target_id": curve,
-            "selection": { "keys": [{ "stream_id": stream, "time": at, "replicate_index": 0 }] },
-            "reason": "corrected against the curve entered that day",
-        }),
-        &fx.manager,
+    crate::common::exec(
+        &fx.db,
+        &format!(
+            "INSERT INTO reading_decisions
+                 (stream_id, time, replicate_index, kind, old, new, actor, origin)
+             VALUES ('{stream}', '{at}', 0, 'calibration_pin', '{{}}'::jsonb,
+                     jsonb_build_object('calibration_id', '{curve}'), 'test', 'manual')"
+        ),
     )
     .await;
-    assert_eq!(status, 200, "the reading is pinned to the curve: {body}");
 
     let (status, body) = delete_with_token(
         &fx.app,

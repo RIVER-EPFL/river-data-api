@@ -332,7 +332,7 @@ impl Fixture {
 #[tokio::test]
 #[serial]
 async fn routine_ingest_serves_the_active_calibration() {
-    if !kc::require_keycloak_or_skip("routine_ingest_serves_the_active_calibration").await {
+    if !crate::common::profile::Service::Keycloak.require("routine_ingest_serves_the_active_calibration").await {
         return;
     }
     let f = onboard().await;
@@ -420,7 +420,7 @@ async fn routine_ingest_serves_the_active_calibration() {
 #[tokio::test]
 #[serial]
 async fn operator_can_set_an_explicit_calibration_window() {
-    if !kc::require_keycloak_or_skip("operator_can_set_an_explicit_calibration_window").await {
+    if !crate::common::profile::Service::Keycloak.require("operator_can_set_an_explicit_calibration_window").await {
         return;
     }
     let f = onboard().await;
@@ -510,7 +510,7 @@ async fn operator_can_set_an_explicit_calibration_window() {
 #[tokio::test]
 #[serial]
 async fn ingest_stamps_the_curve_for_the_readings_own_parameter() {
-    if !kc::require_keycloak_or_skip("ingest_stamps_the_curve_for_the_readings_own_parameter").await
+    if !crate::common::profile::Service::Keycloak.require("ingest_stamps_the_curve_for_the_readings_own_parameter").await
     {
         return;
     }
@@ -603,7 +603,7 @@ async fn ingest_stamps_the_curve_for_the_readings_own_parameter() {
 #[tokio::test]
 #[serial]
 async fn grab_readings_receive_their_resolved_curve() {
-    if !kc::require_keycloak_or_skip("grab_readings_receive_their_resolved_curve").await {
+    if !crate::common::profile::Service::Keycloak.require("grab_readings_receive_their_resolved_curve").await {
         return;
     }
     let f = onboard().await;
@@ -704,7 +704,7 @@ async fn grab_readings_receive_their_resolved_curve() {
 #[tokio::test]
 #[serial]
 async fn stream_import_attributes_each_reading_to_its_covering_curve() {
-    if !kc::require_keycloak_or_skip("stream_import_attributes_each_reading_to_its_covering_curve")
+    if !crate::common::profile::Service::Keycloak.require("stream_import_attributes_each_reading_to_its_covering_curve")
         .await
     {
         return;
@@ -817,7 +817,7 @@ async fn stream_import_attributes_each_reading_to_its_covering_curve() {
 #[tokio::test]
 #[serial]
 async fn clearing_an_explicit_window_returns_the_curve_to_the_chain() {
-    if !kc::require_keycloak_or_skip("clearing_an_explicit_window_returns_the_curve_to_the_chain")
+    if !crate::common::profile::Service::Keycloak.require("clearing_an_explicit_window_returns_the_curve_to_the_chain")
         .await
     {
         return;
@@ -864,7 +864,7 @@ async fn clearing_an_explicit_window_returns_the_curve_to_the_chain() {
 #[tokio::test]
 #[serial]
 async fn an_explicit_window_is_shortened_to_the_next_curve() {
-    if !kc::require_keycloak_or_skip("an_explicit_window_is_shortened_to_the_next_curve").await {
+    if !crate::common::profile::Service::Keycloak.require("an_explicit_window_is_shortened_to_the_next_curve").await {
         return;
     }
     let f = onboard().await;
@@ -896,7 +896,7 @@ async fn an_explicit_window_is_shortened_to_the_next_curve() {
 #[tokio::test]
 #[serial]
 async fn an_inverted_explicit_window_is_refused() {
-    if !kc::require_keycloak_or_skip("an_inverted_explicit_window_is_refused").await {
+    if !crate::common::profile::Service::Keycloak.require("an_inverted_explicit_window_is_refused").await {
         return;
     }
     let f = onboard().await;

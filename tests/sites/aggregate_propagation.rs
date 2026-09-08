@@ -23,8 +23,7 @@
 //! materialised. Each suite owns a distinct month so no two suites materialise the same bucket.
 //!
 //! These run as real Keycloak users, each step at the lowest level that should be able to perform
-//! it, with the level below asserted refused. They self-skip when Keycloak is unreachable unless
-//! `REQUIRE_KEYCLOAK` is set.
+//! it, with the level below asserted refused. They run only under a profile covering Keycloak.
 
 use std::time::Duration;
 
@@ -336,7 +335,7 @@ async fn jobs_settled(db: &DatabaseConnection, timeout_secs: u64) -> bool {
 /// Track B onboarded from nothing by an administrator: project, site, parameter, site parameter,
 /// sensor, deployment and a registered stream, all through HTTP.
 async fn onboard(test_name: &str) -> Option<(DatabaseConnection, Router, String, tracks::Track)> {
-    if !kc::require_keycloak_or_skip(test_name).await {
+    if !crate::common::profile::Service::Keycloak.require(test_name).await {
         return None;
     }
     let db = crate::common::setup_test_db().await;

@@ -31,10 +31,10 @@ pub struct Model {
     pub role: String,
     /// The replicate spec for a member entered several times at one visit.
     pub replicates: Option<serde_json::Value>,
-    /// Per-group presentation overrides. NULL means the catalog parameter's own.
+    /// Per-group presentation overrides. NULL means the catalog parameter's own. Decimal places
+    /// are not among them: they are declared per slot, never per group (Q120).
     pub label: Option<String>,
     pub units: Option<String>,
-    pub decimal_places: Option<i32>,
     pub description: Option<String>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: chrono::DateTime<chrono::Utc>,

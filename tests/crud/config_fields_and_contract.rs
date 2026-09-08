@@ -2,8 +2,8 @@
 //! defects. Each test names the finding it proves in the comment above it.
 //!
 //! The person-flow tests run as a real Keycloak user, since the defects are about what an operator
-//! configures through the dashboard; they self-skip when Keycloak is unreachable unless
-//! `REQUIRE_KEYCLOAK` is set. The two list-contract tests use an API token so they always run.
+//! configures through the dashboard; they run only under a profile covering Keycloak. The two
+//! list-contract tests use an API token so they always run.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -64,7 +64,7 @@ fn csv_cell(body: &str, column: &str) -> String {
 #[tokio::test]
 #[serial]
 async fn site_parameter_create_honours_is_public() {
-    if !kc::require_keycloak_or_skip("site_parameter_create_honours_is_public").await {
+    if !crate::common::profile::Service::Keycloak.require("site_parameter_create_honours_is_public").await {
         return;
     }
     let db = setup_test_db().await;
@@ -180,7 +180,7 @@ async fn site_parameter_create_honours_is_public() {
 #[tokio::test]
 #[serial]
 async fn adopted_slot_reports_the_same_units_on_both_site_endpoints() {
-    if !kc::require_keycloak_or_skip("adopted_slot_reports_the_same_units").await {
+    if !crate::common::profile::Service::Keycloak.require("adopted_slot_reports_the_same_units").await {
         return;
     }
     let db = setup_test_db().await;
@@ -293,7 +293,7 @@ async fn adopted_slot_reports_the_same_units_on_both_site_endpoints() {
 #[tokio::test]
 #[serial]
 async fn site_parameter_display_config_reaches_a_reader() {
-    if !kc::require_keycloak_or_skip("site_parameter_display_config_reaches_a_reader").await {
+    if !crate::common::profile::Service::Keycloak.require("site_parameter_display_config_reaches_a_reader").await {
         return;
     }
     let db = setup_test_db().await;
@@ -653,7 +653,7 @@ impl NotificationChannel for RecordingChannel {
 #[tokio::test]
 #[serial]
 async fn muted_slot_receives_no_stale_data_notification() {
-    if !kc::require_keycloak_or_skip("muted_slot_receives_no_stale_data_notification").await {
+    if !crate::common::profile::Service::Keycloak.require("muted_slot_receives_no_stale_data_notification").await {
         return;
     }
     let db = setup_test_db().await;
@@ -759,7 +759,7 @@ async fn muted_slot_receives_no_stale_data_notification() {
 #[tokio::test]
 #[serial]
 async fn telegram_thresholds_reports_the_global_tier() {
-    if !kc::require_keycloak_or_skip("telegram_thresholds_reports_the_global_tier").await
+    if !crate::common::profile::Service::Keycloak.require("telegram_thresholds_reports_the_global_tier").await
     {
         return;
     }

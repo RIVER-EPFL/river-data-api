@@ -3,6 +3,8 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::routes::private::readings::decisions;
+
 /// The reprocess engines are driven by `Job::run`, whose error type is `DbErr`. The shared bulk-write
 /// and aggregate-refresh primitives report `AppError`; carrying the message through keeps a failed
 /// refresh a failed job rather than a job that reports `completed`.
@@ -373,7 +375,13 @@ pub struct CurveDrift {
 /// attributed to the wrong curve for its timestamp is consistent by this measure and is the
 /// reprocess engines' subject, not this one's. The span is returned for the caller's aggregate
 /// refresh, since a rewritten value leaves the rollups holding the old one.
-pub async fn sweep_curve_drift(db: &DatabaseConnection) -> crate::error::AppResult<CurveDrift> {
+///
+/// Every moved row records the move as a `curve_recompose` decision naming the run (Q118), in the
+/// same statement, so a value the sweep changed is not a number the ledger cannot account for.
+pub async fn sweep_curve_drift(
+    db: &DatabaseConnection,
+    job_id: Option<Uuid>,
+) -> crate::error::AppResult<CurveDrift> {
     let drifted = format!(
         "{corrected} AND tgt.calibrated_value IS DISTINCT FROM ({value})",
         corrected = corrected_rows("r"),
@@ -382,7 +390,23 @@ pub async fn sweep_curve_drift(db: &DatabaseConnection) -> crate::error::AppResu
     let sql = format!(
         "WITH drift AS (
             {update}
-            RETURNING tgt.time, tgt.collection_event_id, tgt.parameter_id
+            RETURNING tgt.stream_id, tgt.time, tgt.replicate_index, tgt.collection_event_id,
+                      tgt.parameter_id, r.calibrated_value AS was, tgt.calibrated_value AS became
+          ), recorded AS (
+            INSERT INTO reading_decisions
+                (stream_id, time, replicate_index, kind, old, new, actor, origin, supersedes,
+                 job_id)
+            SELECT d.stream_id, d.time, d.replicate_index, '{kind}',
+                   jsonb_build_object('calibrated_value', to_jsonb(d.was)),
+                   jsonb_build_object('calibrated_value', to_jsonb(d.became)),
+                   'system', '{origin}',
+                   (SELECT p.id FROM reading_decisions p
+                     WHERE p.stream_id = d.stream_id AND p.time = d.time
+                       AND p.replicate_index IS NOT DISTINCT FROM d.replicate_index
+                       AND p.kind = '{kind}' AND p.rolled_back_by IS NULL
+                     ORDER BY p.at DESC, p.id DESC LIMIT 1),
+                   $1
+              FROM drift d
           )
           SELECT count(*) AS moved, min(time) AS lo, max(time) AS hi,
                  (SELECT jsonb_agg(DISTINCT jsonb_build_array(collection_event_id, parameter_id))
@@ -390,14 +414,17 @@ pub async fn sweep_curve_drift(db: &DatabaseConnection) -> crate::error::AppResu
                    WHERE collection_event_id IS NOT NULL AND parameter_id IS NOT NULL) AS touched
             FROM drift",
         update = recompose_statement(&drifted, "TRUE"),
+        kind = decisions::Kind::CurveRecompose.as_str(),
+        origin = decisions::Origin::Janitor.as_str(),
     );
 
     // Drift in a chunk past the compression policy has to decompress, and the roll-up carries its
     // own `RETURNING tgt.time`, so this is `guarded` rather than `guarded_mutation`.
     let row = crate::common::bulk_write::guarded(db, async |txn| {
-        txn.query_one_raw(Statement::from_string(
+        txn.query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             sql,
+            [job_id.into()],
         ))
         .await
         .map_err(crate::error::AppError::Database)
@@ -810,6 +837,62 @@ async fn unattribute_derived_at(
     Ok(())
 }
 
+/// The stored derived row at a slot instant, as the transition record compares against.
+#[derive(sea_orm::FromQueryResult)]
+struct StoredDerived {
+    raw_value: Option<f64>,
+    derived_version_id: Option<Uuid>,
+}
+
+/// Record a derived value's move onto a new formula version, if it moved.
+///
+/// The kind projects no column: the upsert that follows is what writes the value. Nothing is
+/// recorded when no row is stored yet, because a first computation came from no version; the
+/// caller is told so, and records the arrival once the row exists.
+async fn record_formula_transition(
+    db: &DatabaseConnection,
+    stream_id: Uuid,
+    time: chrono::DateTime<chrono::Utc>,
+    result: f64,
+    version: Option<Uuid>,
+) -> Result<bool, sea_orm::DbErr> {
+    let stored = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT raw_value, derived_version_id FROM readings \
+             WHERE stream_id = $1 AND time = $2 AND replicate_index = 0",
+            [stream_id.into(), time.into()],
+        ))
+        .await?;
+    let Some(row) = stored else { return Ok(true) };
+    let prior = StoredDerived::from_query_result(&row, "")?;
+    if prior.raw_value == Some(result) && prior.derived_version_id == version {
+        return Ok(false);
+    }
+    decisions::record(
+        db,
+        &decisions::Decision {
+            key: decisions::DecisionKey {
+                stream_id,
+                time,
+                replicate_index: Some(0),
+            },
+            kind: decisions::Kind::FormulaTransition,
+            new: serde_json::json!({
+                "raw_value": result,
+                "derived_version_id": version,
+            }),
+            actor: "system".to_string(),
+            reason: None,
+            origin: decisions::Origin::System,
+            set_id: None,
+        },
+    )
+    .await
+    .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+    Ok(false)
+}
+
 async fn evaluate_and_upsert_derived(
     db: &DatabaseConnection,
     item: &DerivedWork,
@@ -837,6 +920,12 @@ async fn evaluate_and_upsert_derived(
     // The row names the formula text it was made with, so a later edit cannot rewrite the story of
     // what this number came from (Q89).
     let version = newest_derived_version(db, item.derived_definition_id).await?;
+
+    // A recompute that moves a stored value or the version it names records the move (Q116), so a
+    // person opening the value reads what it was and which formula edit changed it. Recorded
+    // before the write, because the decision captures `old` from the row as it still stands; a
+    // first insert is not a transition, and a pass that changes neither is not a decision.
+    let born = record_formula_transition(db, stream_id, time, result, version).await?;
 
     // The slot is re-asserted on conflict as well as on insert: a row this engine unattributed
     // when its inputs stopped resolving is the same row it writes when they resolve again, and
@@ -873,7 +962,34 @@ async fn evaluate_and_upsert_derived(
     )
     .await
     .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+    // A slot's first number is a change to the readings as much as a move is (Q57, Q118), and it
+    // is recorded after the write because the decision reads the row it is about.
+    if born {
+        record_derived_arrival(db, stream_id, time).await?;
+    }
     Ok(())
+}
+
+/// Record the arrival of a derived value, the state it arrived in read from the row itself.
+async fn record_derived_arrival(
+    db: &DatabaseConnection,
+    stream_id: Uuid,
+    time: chrono::DateTime<chrono::Utc>,
+) -> Result<(), sea_orm::DbErr> {
+    decisions::record_many(
+        db,
+        decisions::Kind::DerivedComputed,
+        "r.stream_id = $1 AND r.time = $2 AND r.replicate_index = 0",
+        vec![stream_id.into(), time.into()],
+        decisions::NewValue::Born,
+        "system",
+        None,
+        decisions::Origin::System,
+        None,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))
 }
 
 pub async fn recompute_valid_until<C: ConnectionTrait>(

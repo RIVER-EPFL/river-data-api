@@ -161,10 +161,10 @@ async fn sensor_vs_grab(
 #[tokio::test]
 #[serial]
 async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() {
-    if !kc::require_keycloak_or_skip("doc_tool_replicates_saved_at_a_station").await {
+    if !crate::common::profile::Service::Keycloak.require("doc_tool_replicates_saved_at_a_station").await {
         return;
     }
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "doc_tool_replicates_saved_at_a_station",
     )
     .await
@@ -481,7 +481,7 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
 #[tokio::test]
 #[serial]
 async fn sensor_vs_grab_window_edges_are_inclusive_and_configurable() {
-    if !kc::require_keycloak_or_skip("sensor_vs_grab_window_edges").await {
+    if !crate::common::profile::Service::Keycloak.require("sensor_vs_grab_window_edges").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -629,7 +629,7 @@ async fn sensor_vs_grab_window_edges_are_inclusive_and_configurable() {
 #[tokio::test]
 #[serial]
 async fn sensor_vs_grab_orders_grabs_and_reports_an_empty_post_grab_window() {
-    if !kc::require_keycloak_or_skip("sensor_vs_grab_ordering").await {
+    if !crate::common::profile::Service::Keycloak.require("sensor_vs_grab_ordering").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -829,7 +829,7 @@ async fn sensor_vs_grab_orders_grabs_and_reports_an_empty_post_grab_window() {
 #[tokio::test]
 #[serial]
 async fn sensor_vs_grab_empty_comparisons_and_invalid_windows() {
-    if !kc::require_keycloak_or_skip("sensor_vs_grab_edges").await {
+    if !crate::common::profile::Service::Keycloak.require("sensor_vs_grab_edges").await {
         return;
     }
     let db = crate::common::setup_test_db().await;

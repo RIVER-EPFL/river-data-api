@@ -18,7 +18,6 @@ mod historical_edit;
 mod last_used_curve;
 mod reprocessing;
 mod retirement;
-mod split_curve;
 mod standard_curves;
 mod window_boundaries;
 mod window_invariants;

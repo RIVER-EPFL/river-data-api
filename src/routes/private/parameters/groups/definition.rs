@@ -27,6 +27,16 @@ pub struct MemberStatistics {
     pub decimal_places: Option<i32>,
 }
 
+/// The places a form renders a value at when the site declares none. Rounding is presentation, so
+/// full resolution is what is stored and this is only how much of it is shown (Q120).
+pub const DEFAULT_DECIMAL_PLACES: i32 = 2;
+
+/// The places a form renders a member at: what the slot declares, else the platform default. A
+/// group declares none, so there is nothing above the site in the chain (Q120).
+fn resolved_decimal_places(declared: Option<i16>) -> i32 {
+    declared.map_or(DEFAULT_DECIMAL_PLACES, i32::from)
+}
+
 /// The statistics a member shows, which is nothing at all unless it is entered several times.
 fn member_statistics(
     code: &str,
@@ -60,7 +70,6 @@ struct MemberRow {
     description: Option<String>,
     role: String,
     ordinal: i32,
-    decimal_places: Option<i32>,
     replicates: Option<serde_json::Value>,
 }
 
@@ -73,10 +82,12 @@ struct GroupRow {
     ordinal: i32,
 }
 
+/// What one slot declares for a member: the divisor and the places, both nullable.
 #[derive(FromQueryResult)]
-struct DeclaredEstimator {
+struct SlotDeclaration {
     parameter_id: Uuid,
     sd_estimator: Option<String>,
+    decimal_places: Option<i16>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -145,7 +156,6 @@ pub async fn group_definition(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT m.parameter_id, p.code, COALESCE(m.label, p.name) AS label, \
                     COALESCE(m.units, NULLIF(p.default_units, '')) AS units, \
-                    COALESCE(m.decimal_places, NULL) AS decimal_places, \
                     COALESCE(m.description, p.description) AS description, \
                     m.role, m.ordinal, m.replicates \
                FROM parameter_group_members m \
@@ -157,8 +167,8 @@ pub async fn group_definition(
         .map_err(AppError::Database)?;
 
     let sections_by_code = manifest_sections(&state.db, id).await?;
-    let estimators = match query.site_id {
-        Some(site_id) => declared_estimators(&state.db, id, site_id).await?,
+    let declared = match query.site_id {
+        Some(site_id) => site_declarations(&state.db, id, site_id).await?,
         None => std::collections::HashMap::new(),
     };
 
@@ -174,18 +184,21 @@ pub async fn group_definition(
             role: Role::parse(&member.role).unwrap_or(Role::EntryOnly),
             section: section.clone(),
         });
+        // Places come from the slot or from the platform default; the group declares none (Q120).
+        let slot = declared.get(&member.parameter_id);
+        let decimal_places = resolved_decimal_places(slot.and_then(|d| d.decimal_places));
         let statistics = member_statistics(
             &member.code,
             member.replicates.as_ref(),
-            member.decimal_places,
-            estimators.get(&member.parameter_id).cloned().flatten(),
+            Some(decimal_places),
+            slot.and_then(|d| d.sd_estimator.clone()),
         );
         members.push(DefinitionMember {
             parameter_id: member.parameter_id,
             code: member.code,
             label: member.label,
             units: member.units,
-            decimal_places: member.decimal_places,
+            decimal_places: Some(decimal_places),
             description: member.description,
             role: member.role,
             ordinal: member.ordinal,
@@ -220,17 +233,18 @@ pub async fn group_definition(
     }))
 }
 
-/// What each of the group's parameters declares as its sd estimator at one site. A slot with no
-/// row, or a row declaring none, carries NULL: the divisor is a declaration and is never inferred.
-async fn declared_estimators(
+/// What each of the group's parameters declares at one site: the sd estimator, which is never
+/// inferred, and the decimal places a form renders at. A slot with no row, or a row declaring
+/// neither, carries NULL for both.
+async fn site_declarations(
     db: &sea_orm::DatabaseConnection,
     group_id: Uuid,
     site_id: Uuid,
-) -> AppResult<std::collections::HashMap<Uuid, Option<String>>> {
+) -> AppResult<std::collections::HashMap<Uuid, SlotDeclaration>> {
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT sp.parameter_id, sp.sd_estimator \
+            "SELECT sp.parameter_id, sp.sd_estimator, sp.decimal_places \
                FROM site_parameters sp \
                JOIN parameter_group_members m ON m.parameter_id = sp.parameter_id \
               WHERE m.group_id = $1 AND sp.site_id = $2",
@@ -240,8 +254,8 @@ async fn declared_estimators(
         .map_err(AppError::Database)?;
     let mut declared = std::collections::HashMap::new();
     for row in rows {
-        let row = DeclaredEstimator::from_query_result(&row, "").map_err(AppError::Database)?;
-        declared.insert(row.parameter_id, row.sd_estimator);
+        let row = SlotDeclaration::from_query_result(&row, "").map_err(AppError::Database)?;
+        declared.insert(row.parameter_id, row);
     }
     Ok(declared)
 }
@@ -304,6 +318,13 @@ mod tests {
         assert_eq!(stats.sd_label, "doc sd");
         assert_eq!(stats.sd_estimator.as_deref(), Some("sample"));
         assert_eq!(stats.decimal_places, Some(2));
+    }
+
+    #[test]
+    fn test_places_come_from_the_slot_or_from_the_platform_default() {
+        assert_eq!(resolved_decimal_places(Some(4)), 4);
+        assert_eq!(resolved_decimal_places(Some(0)), 0);
+        assert_eq!(resolved_decimal_places(None), DEFAULT_DECIMAL_PLACES);
     }
 
     #[test]

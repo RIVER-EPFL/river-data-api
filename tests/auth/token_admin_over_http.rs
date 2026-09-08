@@ -61,7 +61,7 @@ async fn seeded_db() -> sea_orm::DatabaseConnection {
 #[tokio::test]
 #[serial]
 async fn create_use_rotate_and_revoke_a_key_over_http() {
-    if !kc::require_keycloak_or_skip("create_use_rotate_and_revoke_a_key_over_http").await {
+    if !crate::common::profile::Service::Keycloak.require("create_use_rotate_and_revoke_a_key_over_http").await {
         return;
     }
     let db = seeded_db().await;
@@ -327,7 +327,7 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
 #[tokio::test]
 #[serial]
 async fn usage_view_and_audit_status_codes_over_http() {
-    if !kc::require_keycloak_or_skip("usage_view_and_audit_status_codes_over_http").await {
+    if !crate::common::profile::Service::Keycloak.require("usage_view_and_audit_status_codes_over_http").await {
         return;
     }
     let db = seeded_db().await;
@@ -512,7 +512,7 @@ async fn usage_view_and_audit_status_codes_over_http() {
 #[tokio::test]
 #[serial]
 async fn roles_endpoint_lists_only_river_access_levels() {
-    if !kc::require_keycloak_or_skip("roles_endpoint_lists_only_river_access_levels").await {
+    if !crate::common::profile::Service::Keycloak.require("roles_endpoint_lists_only_river_access_levels").await {
         return;
     }
     let db = crate::common::setup_test_db().await;

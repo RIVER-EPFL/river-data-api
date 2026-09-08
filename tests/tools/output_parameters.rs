@@ -159,12 +159,12 @@ fn output<'a>(outputs: &'a serde_json::Value, key: &str) -> &'a serde_json::Valu
 #[tokio::test]
 #[serial]
 async fn an_output_resolves_by_id_then_by_code() {
-    if !crate::common::tools_runner::require_runner_or_skip("an_output_resolves_by_id_then_by_code")
+    if !crate::common::profile::Service::ToolsRunner.require("an_output_resolves_by_id_then_by_code")
         .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_output_resolution").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_output_resolution").await {
         return;
     }
     let (app, admin, sid) = setup("output_resolution").await;
@@ -236,14 +236,14 @@ async fn an_output_resolves_by_id_then_by_code() {
 #[tokio::test]
 #[serial]
 async fn an_unknown_id_is_refused_and_an_unknown_code_is_reported() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "an_unknown_id_is_refused_and_an_unknown_code_is_reported",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_output_catalog_findings").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_output_catalog_findings").await {
         return;
     }
     let (app, admin, sid) = setup("output_catalog_findings").await;
@@ -307,14 +307,14 @@ async fn an_unknown_id_is_refused_and_an_unknown_code_is_reported() {
 #[tokio::test]
 #[serial]
 async fn an_id_and_a_code_naming_different_parameters_are_refused() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "an_id_and_a_code_naming_different_parameters_are_refused",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_output_disagreement").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_output_disagreement").await {
         return;
     }
     let (app, admin, sid) = setup("output_disagreement").await;
@@ -351,14 +351,14 @@ async fn an_id_and_a_code_naming_different_parameters_are_refused() {
 #[tokio::test]
 #[serial]
 async fn two_outputs_resolving_to_one_parameter_are_refused() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "two_outputs_resolving_to_one_parameter_are_refused",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_output_collision").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_output_collision").await {
         return;
     }
     let (app, admin, sid) = setup("output_collision").await;
@@ -392,14 +392,14 @@ async fn two_outputs_resolving_to_one_parameter_are_refused() {
 #[tokio::test]
 #[serial]
 async fn a_dangling_parameter_id_is_flagged_and_reported_at_activation() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_dangling_parameter_id_is_flagged_and_reported_at_activation",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_output_dangling_id").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_output_dangling_id").await {
         return;
     }
     let (app, admin, sid) = setup("output_dangling_id").await;
@@ -458,14 +458,14 @@ async fn a_dangling_parameter_id_is_flagged_and_reported_at_activation() {
 #[tokio::test]
 #[serial]
 async fn a_malformed_parameter_id_names_the_output_it_sits_on() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_malformed_parameter_id_names_the_output_it_sits_on",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_output_malformed_id").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_output_malformed_id").await {
         return;
     }
     let (app, admin, sid) = setup("output_malformed_id").await;
@@ -492,14 +492,14 @@ async fn a_malformed_parameter_id_names_the_output_it_sits_on() {
 #[tokio::test]
 #[serial]
 async fn a_manifest_declaring_a_nonexistent_constant_is_refused() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_manifest_declaring_a_nonexistent_constant_is_refused",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_constant_findings").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_constant_findings").await {
         return;
     }
     let (app, admin, sid) = setup("constant_findings").await;

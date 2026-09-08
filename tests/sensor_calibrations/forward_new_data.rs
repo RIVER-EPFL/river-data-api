@@ -316,7 +316,7 @@ async fn arrange(db: &DatabaseConnection, app: &Router, admin: &str) -> Fixture 
 #[tokio::test]
 #[serial]
 async fn forward_calibration_closes_the_previous_window_and_leaves_history_alone() {
-    if !kc::require_keycloak_or_skip("forward_calibration_closes_the_previous_window").await {
+    if !crate::common::profile::Service::Keycloak.require("forward_calibration_closes_the_previous_window").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -454,7 +454,7 @@ async fn forward_calibration_closes_the_previous_window_and_leaves_history_alone
 #[tokio::test]
 #[serial]
 async fn readings_ingested_after_the_new_calibration_carry_it_and_take_its_curve_on_reprocess() {
-    if !kc::require_keycloak_or_skip("readings_ingested_after_the_new_calibration").await {
+    if !crate::common::profile::Service::Keycloak.require("readings_ingested_after_the_new_calibration").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -615,7 +615,7 @@ async fn readings_ingested_after_the_new_calibration_carry_it_and_take_its_curve
 #[tokio::test]
 #[serial]
 async fn a_backdated_reading_resolves_to_the_older_window_not_the_latest_calibration() {
-    if !kc::require_keycloak_or_skip("backdated_reading_resolves_to_the_older_window").await {
+    if !crate::common::profile::Service::Keycloak.require("backdated_reading_resolves_to_the_older_window").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -753,7 +753,7 @@ async fn a_backdated_reading_resolves_to_the_older_window_not_the_latest_calibra
 #[tokio::test]
 #[serial]
 async fn aggregates_report_the_new_curve_for_the_new_bucket_and_leave_the_old_bucket_alone() {
-    if !kc::require_keycloak_or_skip("aggregates_report_the_new_curve").await {
+    if !crate::common::profile::Service::Keycloak.require("aggregates_report_the_new_curve").await {
         return;
     }
     let db = crate::common::setup_test_db().await;

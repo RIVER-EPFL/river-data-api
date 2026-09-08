@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sea_orm::{ConnectionTrait, DbErr, EntityTrait, Statement};
+use sea_orm::{ConnectionTrait, DbErr, EntityTrait, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use super::job::{Job, TunableKind, TunableSpec};
@@ -15,6 +15,33 @@ use crate::config::Config;
 use crate::routes::private::sensors::calibrations::service::{
     recalculate_derived_at_timestamp, reprocess_sensor_readings, reprocess_site_parameter_readings,
 };
+
+/// One instant of one site's derived work.
+#[derive(FromQueryResult)]
+struct DerivedInstant {
+    site_id: Uuid,
+    time: chrono::DateTime<chrono::FixedOffset>,
+}
+
+/// One instant, where the site is already known.
+#[derive(FromQueryResult)]
+struct InstantRow {
+    time: chrono::DateTime<chrono::FixedOffset>,
+}
+
+/// A (site, parameter) slot.
+#[derive(FromQueryResult)]
+struct SlotRow {
+    site_id: Uuid,
+    parameter_id: Uuid,
+}
+
+/// A stream named by its source pair.
+#[derive(FromQueryResult)]
+struct StreamRef {
+    source_system: String,
+    source_key: String,
+}
 
 /// `Job::run` answers in `DbErr`, the refresh in `AppError`. A refresh that could not run fails
 /// the job that asked for it rather than being logged and forgotten.
@@ -347,7 +374,9 @@ impl Job for ReprocessDeployment {
                     [sensor_id.into(), site_id.into()],
                 ))
                 .await?
-                .and_then(|r| r.try_get::<Uuid>("", "parameter_id").ok()),
+                .map(|r| r.try_get::<Option<Uuid>>("", "parameter_id"))
+                .transpose()?
+                .flatten(),
         };
         let count = if let Some(parameter_id) = parameter_id {
             reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id).await? as i64
@@ -461,14 +490,9 @@ impl Job for DerivedRecompute {
                 if ctx.is_cancelled() {
                     break;
                 }
-                let Ok(site_id) = row.try_get::<Uuid>("", "site_id") else {
-                    continue;
-                };
-                let Ok(time) = row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "time")
-                else {
-                    continue;
-                };
-                let utc_time = time.with_timezone(&chrono::Utc);
+                let instant = DerivedInstant::from_query_result(row, "")?;
+                let site_id = instant.site_id;
+                let utc_time = instant.time.with_timezone(&chrono::Utc);
                 match recalculate_derived_at_timestamp(ctx.db(), site_id, utc_time).await {
                     Ok(()) => {
                         filled += 1;
@@ -476,7 +500,7 @@ impl Job for DerivedRecompute {
                         filled_sites.insert(site_id);
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, time = %time, "Failed to recompute derived value")
+                        tracing::error!(error = %e, time = %utc_time, "Failed to recompute derived value")
                     }
                 }
                 if (i + 1) % 500 == 0 {
@@ -554,10 +578,9 @@ impl Job for DerivedAssignment {
             if ctx.is_cancelled() {
                 break;
             }
-            let Ok(time) = row.try_get::<chrono::DateTime<chrono::FixedOffset>>("", "time") else {
-                continue;
-            };
-            let utc = time.with_timezone(&chrono::Utc);
+            let utc = InstantRow::from_query_result(row, "")?
+                .time
+                .with_timezone(&chrono::Utc);
             if recalculate_derived_at_timestamp(ctx.db(), site_id, utc)
                 .await
                 .is_ok()
@@ -800,14 +823,12 @@ impl Job for ReprocessAll {
                 "SELECT DISTINCT site_id, parameter_id FROM sensor_deployments".to_owned(),
             ))
             .await?;
+        // Both columns are NOT NULL on `sensor_deployments`, so a row that does not decode is a
+        // slot silently left unbackdated rather than a deployment without one.
         let slots: Vec<(Uuid, Uuid)> = slot_rows
-            .into_iter()
-            .filter_map(|r| {
-                let s: Uuid = r.try_get("", "site_id").ok()?;
-                let p: Uuid = r.try_get("", "parameter_id").ok()?;
-                Some((s, p))
-            })
-            .collect();
+            .iter()
+            .map(|r| SlotRow::from_query_result(r, "").map(|s| (s.site_id, s.parameter_id)))
+            .collect::<Result<_, _>>()?;
         let slot_count = slots.len();
         ctx.info(&format!("Backdating {slot_count} slot(s)")).await;
 
@@ -1257,7 +1278,7 @@ impl Job for JanitorRun {
         //    it eventual, so a hook that never fired costs staleness rather than a wrong number.
         //    Refreshed over the span it moved, before the rollups below settle for this tick.
         let mut recomposed = 0u64;
-        match crate::routes::private::sensors::calibrations::service::sweep_curve_drift(db).await {
+        match crate::routes::private::sensors::calibrations::service::sweep_curve_drift(db, Some(ctx.job_id())).await {
             Ok(drift) if drift.moved > 0 => {
                 recomposed = drift.moved;
                 tracing::info!(
@@ -1648,7 +1669,9 @@ impl Job for SyncFullReassert {
             .await?;
         let services: Vec<String> = rows
             .iter()
-            .filter_map(|r| r.try_get::<Uuid>("", "service_id").ok())
+            .map(|r| r.try_get::<Uuid>("", "service_id"))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
             .map(|id| id.to_string())
             .collect();
         let queued = services.len();
@@ -1898,8 +1921,8 @@ impl Job for MeasurementRetag {
                 ))
                 .await?;
             for row in &conflicting {
-                let system: String = row.try_get("", "source_system")?;
-                let key: String = row.try_get("", "source_key")?;
+                let StreamRef { source_system: system, source_key: key } =
+                    StreamRef::from_query_result(row, "")?;
                 ctx.log(
                     "warn",
                     &format!(

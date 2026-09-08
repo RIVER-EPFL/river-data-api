@@ -157,7 +157,10 @@ async fn resolve_sensor_parameter<C: ConnectionTrait>(
         .await?;
     let params: Vec<Uuid> = rows
         .iter()
-        .filter_map(|r| r.try_get("", "parameter_id").ok())
+        .map(|r| r.try_get::<Option<Uuid>>("", "parameter_id"))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
         .collect();
     match params.as_slice() {
         [one] => Ok(*one),
@@ -192,7 +195,9 @@ async fn resolve_swap_parameter<C: ConnectionTrait>(
             [outgoing_sensor_id.into(), site_id.into()],
         ))
         .await?;
-    row.and_then(|r| r.try_get("", "parameter_id").ok())
+    row.map(|r| r.try_get::<Option<Uuid>>("", "parameter_id"))
+        .transpose()?
+        .flatten()
         .ok_or_else(|| {
             AppError::BadRequest(
                 "Outgoing sensor is not deployed at this site; pass parameter_id".to_string(),
@@ -536,7 +541,9 @@ pub async fn swap_sensors(
             ],
         ))
         .await?;
-    let ended_deployment_id: Option<Uuid> = ended.and_then(|r| r.try_get("", "id").ok());
+    // No row is no deployment to end, which is the open case the swap allows.
+    let ended_deployment_id: Option<Uuid> =
+        ended.map(|r| r.try_get("", "id")).transpose()?;
 
     // Start the incoming sensor at the same instant; half-open windows mean no overlap.
     let started_id = Uuid::new_v4();

@@ -454,8 +454,8 @@ pub async fn load_instrument_catalog(
         ))
         .await?
         .iter()
-        .filter_map(|r| r.try_get::<Uuid>("", "sensor_id").ok())
-        .collect();
+        .map(|r| r.try_get::<Uuid>("", "sensor_id"))
+        .collect::<Result<_, _>>()?;
     let mut by_name: HashMap<String, InstrumentNameConflict> = HashMap::new();
     for row in &named_rows {
         let Some(name) = row
@@ -640,6 +640,10 @@ pub fn resolve_instrument(
         });
     }
 
+    // Unconfirmed, and the apply refuses until an operator says yes (Q123). The name is a stem
+    // taken from a column heading, and a lab instrument is provenance: once readings name it,
+    // renaming is the only repair. The question this arm asks is which instrument fitted the curve
+    // the source says corrected these readings, and nothing here knows the answer.
     let name = format!("{stem} {source_system}");
     Some(PlanInstrumentRef {
         curve_column: Some(column),
@@ -648,7 +652,7 @@ pub fn resolve_instrument(
         source_key,
         resolved_by: "placeholder".to_string(),
         create: true,
-        confirmed: true,
+        confirmed: false,
         stamps_readings,
         curves: vec![],
         proposed_name: Some(name),
@@ -857,8 +861,8 @@ pub async fn create_plan(
         ))
         .await?
         .iter()
-        .filter_map(|r| r.try_get::<String>("", "source_key").ok())
-        .collect();
+        .map(|r| r.try_get::<String>("", "source_key"))
+        .collect::<Result<_, _>>()?;
     let streams: Vec<data_streams::Model> = streams
         .into_iter()
         .filter(|s| !superseded.contains(&s.source_key))
@@ -1775,8 +1779,8 @@ async fn plan_reading_references<C: ConnectionTrait>(
         ))
         .await?
         .iter()
-        .filter_map(|row| row.try_get::<Uuid>("", "id").ok())
-        .collect())
+        .map(|row| row.try_get::<Uuid>("", "id"))
+        .collect::<Result<_, _>>()?)
 }
 
 /// Attribute everything the plan's newly paired streams already hold, through the helper every
@@ -2598,7 +2602,9 @@ mod tests {
         let alone = super::resolve_instrument(Some(defaulted), Some("tss_std_curve_id"), "cnet", &c)
             .expect("a curve column resolves");
         assert_eq!(alone.resolved_by, "placeholder", "{alone:?}");
-        assert_eq!(alone.create, true, "{alone:?}");
+        assert!(alone.create, "{alone:?}");
+        // Unconfirmed: the apply refuses until an operator agrees to the name (Q123).
+        assert!(!alone.confirmed, "{alone:?}");
 
         // A default on a stream whose source names no curve column is left alone: nothing is being
         // asked, and the instrument it carries is the one its readings name.

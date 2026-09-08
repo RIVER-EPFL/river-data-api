@@ -23,12 +23,12 @@ const INTERN_TIME: &str = "2025-06-15T09:00:00Z";
 #[tokio::test]
 #[serial]
 async fn a_calculation_is_a_stored_run_and_the_save_carries_its_blob() {
-    if !kc::require_keycloak_or_skip("a_calculation_is_a_stored_run_and_the_save_carries_its_blob")
+    if !crate::common::profile::Service::Keycloak.require("a_calculation_is_a_stored_run_and_the_save_carries_its_blob")
         .await
     {
         return;
     }
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_calculation_is_a_stored_run_and_the_save_carries_its_blob",
     )
     .await
@@ -208,10 +208,10 @@ async fn a_calculation_is_a_stored_run_and_the_save_carries_its_blob() {
 #[tokio::test]
 #[serial]
 async fn a_forged_or_edited_tool_link_is_refused_at_the_gate() {
-    if !kc::require_keycloak_or_skip("a_forged_or_edited_tool_link_is_refused_at_the_gate").await {
+    if !crate::common::profile::Service::Keycloak.require("a_forged_or_edited_tool_link_is_refused_at_the_gate").await {
         return;
     }
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_forged_or_edited_tool_link_is_refused_at_the_gate",
     )
     .await
@@ -282,14 +282,14 @@ async fn a_forged_or_edited_tool_link_is_refused_at_the_gate() {
 #[tokio::test]
 #[serial]
 async fn a_site_input_resolves_from_the_site_and_a_missing_property_is_refused() {
-    if !kc::require_keycloak_or_skip(
+    if !crate::common::profile::Service::Keycloak.require(
         "a_site_input_resolves_from_the_site_and_a_missing_property_is_refused",
     )
     .await
     {
         return;
     }
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_site_input_resolves_from_the_site_and_a_missing_property_is_refused",
     )
     .await
@@ -473,10 +473,10 @@ async fn a_site_input_resolves_from_the_site_and_a_missing_property_is_refused()
 #[tokio::test]
 #[serial]
 async fn a_save_needs_the_site_to_carry_the_slot() {
-    if !kc::require_keycloak_or_skip("a_save_needs_the_site_to_carry_the_slot").await {
+    if !crate::common::profile::Service::Keycloak.require("a_save_needs_the_site_to_carry_the_slot").await {
         return;
     }
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_save_needs_the_site_to_carry_the_slot",
     )
     .await
@@ -581,10 +581,10 @@ async fn a_save_needs_the_site_to_carry_the_slot() {
 #[tokio::test]
 #[serial]
 async fn a_run_cannot_be_saved_onto_another_visit() {
-    if !kc::require_keycloak_or_skip("a_run_cannot_be_saved_onto_another_visit").await {
+    if !crate::common::profile::Service::Keycloak.require("a_run_cannot_be_saved_onto_another_visit").await {
         return;
     }
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_run_cannot_be_saved_onto_another_visit",
     )
     .await
@@ -703,10 +703,10 @@ async fn a_run_cannot_be_saved_onto_another_visit() {
 #[tokio::test]
 #[serial]
 async fn an_aggregate_output_cannot_be_saved_as_a_measurement() {
-    if !kc::require_keycloak_or_skip("an_aggregate_output_cannot_be_saved_as_a_measurement").await {
+    if !crate::common::profile::Service::Keycloak.require("an_aggregate_output_cannot_be_saved_as_a_measurement").await {
         return;
     }
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "an_aggregate_output_cannot_be_saved_as_a_measurement",
     )
     .await

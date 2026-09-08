@@ -99,11 +99,10 @@ jobs:
           TEST_KEYCLOAK_URL: http://localhost:8180/
           TEST_KEYCLOAK_REALM: river-data
           TEST_KEYCLOAK_CLIENT_ID: river-data-ui-local
-          # Without this a Keycloak-gated test skips silently, and a skip reports as a pass.
-          REQUIRE_KEYCLOAK: "1"
-          # Same shape for the OpenCPU tool runner: without it, a runner-gated test skips.
           TOOLS_RUNNER_URL: http://localhost:8006/ocpu
-          REQUIRE_TOOLS_RUNNER: "1"
+          # Both services are started above, so the run covers every gated test and an unreachable
+          # one fails rather than skipping.
+          TEST_PROFILE: all
           # libtest sizes its threads from this (2 MB default). The unoptimised `e2e` binary needs
           # 3-4 MB, measured, and aborts with SIGABRT below that, taking the rest of the run with it.
           RUST_MIN_STACK: "16777216"

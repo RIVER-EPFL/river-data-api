@@ -4,7 +4,7 @@
 //! the portal may show. Administrators are unrestricted, so their `grants` lists every project.
 
 use axum::{Extension, Json, extract::State};
-use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+use sea_orm::{ConnectionTrait, DatabaseBackend, FromQueryResult, Statement};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -112,6 +112,24 @@ pub struct NavigatorSubproject {
     pub sites: Vec<NavigatorSite>,
 }
 
+/// One row of the navigator tree, before it is folded into projects and subprojects.
+#[derive(FromQueryResult)]
+struct TreeRow {
+    project_id: Uuid,
+    project_name: String,
+    subproject_id: Option<Uuid>,
+    subproject_name: Option<String>,
+    site_id: Uuid,
+    site_name: String,
+}
+
+/// A project by id and name.
+#[derive(FromQueryResult)]
+struct NamedProject {
+    id: Uuid,
+    name: String,
+}
+
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct NavigatorProject {
     pub project_id: Uuid,
@@ -174,21 +192,17 @@ pub async fn get_my_sites(
     // Rows arrive grouped by the ORDER BY; fold them into the tree in one pass.
     let mut projects: Vec<NavigatorProject> = Vec::new();
     for row in &rows {
-        let (Ok(project_id), Ok(site_id), Ok(site_name)) = (
-            row.try_get::<Uuid>("", "project_id"),
-            row.try_get::<Uuid>("", "site_id"),
-            row.try_get::<String>("", "site_name"),
-        ) else {
-            continue;
-        };
-        let subproject_id = row
-            .try_get::<Option<Uuid>>("", "subproject_id")
-            .unwrap_or(None);
+        // A row that does not decode is a site missing from the caller's own navigator, so it is
+        // an error rather than a shorter tree.
+        let row = TreeRow::from_query_result(row, "").map_err(|e| AppError::Internal(e.to_string()))?;
 
-        if projects.last().is_none_or(|p| p.project_id != project_id) {
+        if projects
+            .last()
+            .is_none_or(|p| p.project_id != row.project_id)
+        {
             projects.push(NavigatorProject {
-                project_id,
-                name: row.try_get("", "project_name").unwrap_or_default(),
+                project_id: row.project_id,
+                name: row.project_name,
                 subprojects: Vec::new(),
             });
         }
@@ -196,22 +210,18 @@ pub async fn get_my_sites(
         if project
             .subprojects
             .last()
-            .is_none_or(|sp| sp.id != subproject_id)
+            .is_none_or(|sp| sp.id != row.subproject_id)
         {
             project.subprojects.push(NavigatorSubproject {
-                id: subproject_id,
-                name: row
-                    .try_get::<Option<String>>("", "subproject_name")
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default(),
+                id: row.subproject_id,
+                name: row.subproject_name.unwrap_or_default(),
                 sites: Vec::new(),
             });
         }
         let subproject = project.subprojects.last_mut().expect("just pushed");
         subproject.sites.push(NavigatorSite {
-            id: site_id,
-            name: site_name,
+            id: row.site_id,
+            name: row.site_name,
         });
     }
     Ok(Json(projects))
@@ -241,13 +251,14 @@ async fn named_projects(state: &AppState, ids: Option<&[Uuid]>) -> AppResult<Vec
         .query_all_raw(stmt)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| {
-            Some(GrantedProject {
-                project_id: r.try_get::<Uuid>("", "id").ok()?,
-                name: r.try_get::<String>("", "name").ok()?,
+    rows.iter()
+        .map(|r| {
+            let named = NamedProject::from_query_result(r, "")
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            Ok(GrantedProject {
+                project_id: named.id,
+                name: named.name,
             })
         })
-        .collect())
+        .collect()
 }

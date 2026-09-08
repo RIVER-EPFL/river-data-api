@@ -1,0 +1,204 @@
+//! Scenario: a formula is edited and the derived values it made are recomputed.
+//!
+//! Expected behaviour: each value that moves records one `formula_transition` decision naming the
+//! value and the version on both sides (Q116, M135), and a recompute that moves nothing records
+//! nothing, so the ledger grows with edits rather than with passes (T83).
+
+use chrono::{DateTime, Duration, Utc};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use serial_test::serial;
+use uuid::Uuid;
+
+const POLL_DEADLINE_SECS: u64 = 30;
+
+async fn setup() -> (DatabaseConnection, axum::Router, String) {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+    (db, app, token)
+}
+
+/// The stored derived value at the slot, polled until the compute lands.
+async fn derived_value(
+    db: &DatabaseConnection,
+    parameter_id: Uuid,
+    time: DateTime<Utc>,
+) -> Option<f64> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(POLL_DEADLINE_SECS);
+    while std::time::Instant::now() < deadline {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT raw_value FROM readings WHERE parameter_id = $1 AND time = $2 LIMIT 1",
+                [parameter_id.into(), time.into()],
+            ))
+            .await
+            .ok()
+            .flatten();
+        if let Some(r) = row
+            && let Ok(Some(v)) = r.try_get::<Option<f64>>("", "raw_value")
+        {
+            return Some(v);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    None
+}
+
+/// Every transition decision at one instant of the slot, oldest first, as `(old, new)` blobs.
+async fn transitions(
+    db: &DatabaseConnection,
+    parameter_id: Uuid,
+    time: DateTime<Utc>,
+) -> Vec<(serde_json::Value, serde_json::Value)> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT d.old, d.new FROM reading_decisions d \
+               JOIN readings r ON r.stream_id = d.stream_id AND r.time = d.time \
+              WHERE d.kind = 'formula_transition' AND r.parameter_id = $1 AND d.time = $2 \
+              ORDER BY d.at, d.id",
+            [parameter_id.into(), time.into()],
+        ))
+        .await
+        .expect("transitions");
+    rows.iter()
+        .map(|r| {
+            (
+                r.try_get::<serde_json::Value>("", "old").expect("old"),
+                r.try_get::<serde_json::Value>("", "new").expect("new"),
+            )
+        })
+        .collect()
+}
+
+/// Wait until the transition count stops being `before`, or give up. The recompute is a tracked
+/// job, so the decision lands after the endpoint answers.
+async fn wait_for_transitions(
+    db: &DatabaseConnection,
+    parameter_id: Uuid,
+    time: DateTime<Utc>,
+    before: usize,
+) -> Vec<(serde_json::Value, serde_json::Value)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(POLL_DEADLINE_SECS);
+    loop {
+        let rows = transitions(db, parameter_id, time).await;
+        if rows.len() != before || std::time::Instant::now() >= deadline {
+            return rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn a_recompute_records_the_move_and_a_pass_that_moves_nothing_records_nothing() {
+    let (db, app, token) = setup().await;
+
+    let code = format!("ftrans_{}", Uuid::new_v4().simple());
+    let (status, def) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/derived_parameters",
+        &serde_json::json!({
+            "code": code,
+            "name": "Formula transition fixture",
+            "units": "mg/L",
+            "formula": "Dissolved_O2 * 0.032",
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create ({status}): {def}");
+    let output = def["output_parameter_id"]
+        .as_str()
+        .expect("output")
+        .to_string();
+    let definition_id = def["id"].as_str().expect("id").to_string();
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/site_parameters",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "parameter_id": output,
+            "name": code,
+            "sensor_type": "derived",
+            "entry_mode": "tool",
+            "display_units": "mg/L",
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "assign ({status}): {body}");
+
+    let at: DateTime<Utc> = Utc::now() - Duration::hours(9);
+    let at = at - Duration::nanoseconds(i64::from(at.timestamp_subsec_nanos()));
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/readings/batch",
+        &serde_json::json!({
+            "readings": [{
+                "site_id": crate::common::SITE1_ID,
+                "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
+                "time": at.to_rfc3339(),
+                "raw_value": 250.0,
+            }]
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "ingest ({status}): {body}");
+
+    let parameter = Uuid::parse_str(&output).unwrap();
+    assert_eq!(
+        derived_value(&db, parameter, at).await,
+        Some(8.0), // 250.0 * 0.032
+        "the first computation lands"
+    );
+    assert!(
+        transitions(&db, parameter, at).await.is_empty(),
+        "a first computation came from no version, so it is not a transition"
+    );
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/derived_parameters/{definition_id}"),
+        &serde_json::json!({ "formula": "Dissolved_O2 * 0.064" }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "edit ({status}): {body}");
+
+    let uri = format!("/api/actions/derived_parameters/{definition_id}/recompute");
+    let (status, body) =
+        crate::common::post_json_with_token(&app, &uri, &serde_json::json!({}), &token).await;
+    assert!((200..300).contains(&status), "recompute ({status}): {body}");
+
+    let moved = wait_for_transitions(&db, parameter, at, 0).await;
+    assert_eq!(moved.len(), 1, "the move is recorded once: {moved:?}");
+    let (old, new) = &moved[0];
+    // jsonb normalises 8.0 to 8, so the numbers are compared as numbers.
+    assert_eq!(old["raw_value"].as_f64(), Some(8.0));
+    assert_eq!(new["raw_value"].as_f64(), Some(16.0)); // 250.0 * 0.064
+    assert!(
+        !old["derived_version_id"].is_null() && !new["derived_version_id"].is_null(),
+        "both sides name a version: {old} -> {new}"
+    );
+    assert_ne!(
+        old["derived_version_id"], new["derived_version_id"],
+        "the versions differ, which is the move"
+    );
+
+    // A second recompute with nothing edited moves nothing, so it decides nothing.
+    let (status, body) =
+        crate::common::post_json_with_token(&app, &uri, &serde_json::json!({}), &token).await;
+    assert!((200..300).contains(&status), "recompute ({status}): {body}");
+    let after = wait_for_transitions(&db, parameter, at, 1).await;
+    assert_eq!(
+        after.len(),
+        1,
+        "a recompute that changes no value writes no decision: {after:?}"
+    );
+}

@@ -6,7 +6,7 @@
 //! to every enabled channel. A muted slot is stamped without sending; a slot whose delivery fails on
 //! every channel is left unstamped so the next tick retries it.
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use crate::common::AppState;
@@ -20,6 +20,22 @@ struct Row {
     slot: (Uuid, Uuid),
     project_id: Uuid,
     event: PendingEvent,
+}
+
+/// One outbox row, as either arm of [`fetch_pending`] selects it. Both arms name the same columns,
+/// so the two differ in which severity and value they carry, not in shape. `units` is the
+/// parameter's own, which is legitimately null.
+#[derive(FromQueryResult)]
+struct PendingRow {
+    id: Uuid,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    project_id: Uuid,
+    site_name: String,
+    parameter_name: String,
+    units: Option<String>,
+    severity: i16,
+    value: f64,
 }
 
 /// Build the enabled channels from config. Empty when nothing is configured (the API runs fine
@@ -125,20 +141,18 @@ async fn fetch_pending(db: &DatabaseConnection, opened: bool) -> Result<Vec<Row>
         ))
         .await?;
     let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id: Uuid = row.try_get("", "id")?;
-        let site_id: Uuid = row.try_get("", "site_id")?;
-        let parameter_id: Uuid = row.try_get("", "parameter_id")?;
+    for row in &rows {
+        let r = PendingRow::from_query_result(row, "")?;
         out.push(Row {
-            id,
-            slot: (site_id, parameter_id),
-            project_id: row.try_get("", "project_id")?,
+            id: r.id,
+            slot: (r.site_id, r.parameter_id),
+            project_id: r.project_id,
             event: PendingEvent {
-                site_name: row.try_get("", "site_name")?,
-                parameter_name: row.try_get("", "parameter_name")?,
-                units: row.try_get("", "units").ok(),
-                severity: row.try_get("", "severity")?,
-                value: row.try_get("", "value")?,
+                site_name: r.site_name,
+                parameter_name: r.parameter_name,
+                units: r.units,
+                severity: r.severity,
+                value: r.value,
             },
         });
     }

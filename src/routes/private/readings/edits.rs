@@ -3,15 +3,18 @@
 //! Four steps over one selection, so every correction is provenance-routed, previewed, reversible
 //! and told in full:
 //!
-//! - **inspect** says which route each row takes and what may be done to it. A value a tool run
-//!   produced is never edited in place: it is reopened in its tool, edited there and re-saved,
-//!   which supersedes the outputs with fresh provenance. A value nothing computed is corrected
-//!   here.
+//! - **inspect** says which route each row takes and what may be done to it. A value whose slot a
+//!   calculation still owns is never edited in place: it is reopened in its tool, edited there and
+//!   re-saved, which supersedes the outputs with fresh provenance. A value nothing computed, or
+//!   one whose slot has been detached, is corrected here.
 //! - **preview** applies the decision inside a transaction, reads back the numbers it moved, and
 //!   rolls the transaction back, so what is shown is the write's own arithmetic rather than a
 //!   second implementation of it.
 //! - **commit** applies it for real, held to the previewed selection.
 //! - **rollback** inverts the decision, because nothing here deletes.
+
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use axum::{Json, extract::State};
 use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
@@ -22,7 +25,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::readings::decisions::{self, Kind, Origin, Selection};
+use crate::routes::private::readings::decisions::{self, Kind, Origin, Owner, Selection};
 use crate::common::actor::label;
 
 /// What one row's record says, reduced to what the routing turns on.
@@ -30,6 +33,9 @@ use crate::common::actor::label;
 pub struct RowProvenance {
     /// A tool run stands behind the value, so the tool owns it (Q8 option B).
     pub has_tool_run: bool,
+    /// The output slot at this visit has been taken off its calculation, so a person owns the
+    /// value (the `slot_owner` fold, Q47).
+    pub slot_detached: bool,
     /// The stream's classification: `sync` | `manual` | `csv` | `api`.
     pub classification: String,
     /// A curve an operator picked by hand produced the corrected value.
@@ -51,16 +57,16 @@ pub enum EditOption {
     ReopenRun,
     /// Take the output slot at this visit away from its calculation (admin only, M63).
     Detach,
+    /// Give a detached output slot back to its calculation (admin only).
+    Return,
     /// Correct the measurement in place.
     ValueCorrection,
     /// Choose a different hand-picked standard curve.
     Curve,
-    /// Pin the row to a calibration.
-    CalibrationPin,
-    /// Pin the row to an instrument.
-    InstrumentPin,
     /// The instrument comes from a deployment, so the fix is to the deployment, not the row.
     EditDeployment,
+    /// The corrected value comes from a calibration window, so the fix is to the window.
+    EditCalibration,
     Flag,
     Unflag,
     Withdraw,
@@ -76,10 +82,10 @@ impl EditOption {
     pub fn capability(self) -> crate::common::authz::Capability {
         use crate::common::authz::Capability;
         match self {
-            Self::Curve | Self::CalibrationPin | Self::InstrumentPin | Self::EditDeployment => {
+            Self::Curve | Self::EditDeployment | Self::EditCalibration => {
                 Capability::ManageSensors
             }
-            Self::Detach => Capability::Admin,
+            Self::Detach | Self::Return => Capability::Admin,
             _ => Capability::WriteData,
         }
     }
@@ -87,28 +93,34 @@ impl EditOption {
 
 /// The options a row's provenance permits, in the order the surface offers them.
 ///
-/// The rule is Q8's: the provenance already stored decides which path a cell takes. A tool-run
-/// value offers no in-place correction at all, because correcting it here would leave the run
-/// standing beside a number it did not produce.
+/// The rule is Q8's: the provenance already stored decides which path a cell takes. What decides
+/// is ownership rather than the presence of a run, so a tool-run value offers no in-place
+/// correction while its calculation owns the slot, and offers one once the slot is detached,
+/// which is the single override Q117 kept.
 #[must_use]
 pub fn edit_options(p: &RowProvenance) -> Vec<EditOption> {
     let mut options = Vec::new();
-    if p.has_tool_run {
+    if p.has_tool_run && !p.slot_detached {
         options.push(EditOption::ReopenRun);
         options.push(EditOption::Detach);
     } else {
+        if p.slot_detached {
+            options.push(EditOption::Return);
+        }
         options.push(EditOption::ValueCorrection);
         if p.has_standard_curve {
             options.push(EditOption::Curve);
         }
+        // Attribution is never stamped on a row (Q117): a wrong instrument is a wrong deployment
+        // and a wrong corrected value is a wrong calibration window, and the reprocess carries the
+        // correction through. So the surface points at the record that decides, and offers nothing
+        // where there is no such record to correct.
         if p.has_calibration {
-            options.push(EditOption::CalibrationPin);
+            options.push(EditOption::EditCalibration);
         }
-        if p.has_deployment {
-            options.push(EditOption::EditDeployment);
-        } else {
-            options.push(EditOption::InstrumentPin);
-        }
+        // With no deployment the fix is to create one, so the surface points at the deployment
+        // either way rather than falling silent where a pin used to be offered.
+        options.push(EditOption::EditDeployment);
     }
     options.push(if p.is_flagged {
         EditOption::Unflag
@@ -132,7 +144,7 @@ pub fn edit_options(p: &RowProvenance) -> Vec<EditOption> {
 #[serde(deny_unknown_fields)]
 pub struct EditDecision {
     /// `value_correction` | `flag` | `unflag` | `withdraw` | `reassert` | `curve` |
-    /// `calibration_pin` | `instrument_pin` | `verify` | `reject`.
+    /// `verify` | `reject`.
     pub kind: String,
     /// The corrected raw value, for `value_correction`.
     #[serde(default)]
@@ -173,8 +185,6 @@ impl EditDecision {
                 | Kind::Withdraw
                 | Kind::Reassert
                 | Kind::Curve
-                | Kind::CalibrationPin
-                | Kind::InstrumentPin
                 | Kind::Verify
                 | Kind::Reject
         ) {
@@ -224,14 +234,6 @@ impl EditDecision {
             Kind::Curve => (
                 serde_json::json!({ "standard_curve_id": target()? }),
                 EditOption::Curve,
-            ),
-            Kind::CalibrationPin => (
-                serde_json::json!({ "calibration_id": target()? }),
-                EditOption::CalibrationPin,
-            ),
-            Kind::InstrumentPin => (
-                serde_json::json!({ "sensor_id": target()? }),
-                EditOption::InstrumentPin,
             ),
             other => {
                 return Err(AppError::BadRequest(format!(
@@ -286,6 +288,7 @@ pub struct InspectResponse {
 }
 
 const ROW_SQL: &str = "SELECT r.stream_id, r.time, r.replicate_index, r.raw_value,
+        r.site_id, r.parameter_id,
         r.provenance ->> 'run_id' AS run_id,
         r.standard_curve_id IS NOT NULL AS has_curve,
         r.calibration_id IS NOT NULL AS has_calibration,
@@ -303,6 +306,8 @@ struct StoredRow {
     time: sea_orm::prelude::DateTimeWithTimeZone,
     replicate_index: i16,
     raw_value: f64,
+    site_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
     run_id: Option<String>,
     has_curve: bool,
     has_calibration: bool,
@@ -336,13 +341,27 @@ async fn inspect_rows<C: ConnectionTrait>(
         ))
         .await?;
     let mut out = Vec::with_capacity(rows.len());
+    let mut owners: HashMap<(Uuid, Uuid, chrono::DateTime<chrono::Utc>), Owner> = HashMap::new();
     for row in &rows {
         let row = StoredRow::from_query_result(row, "")?;
         // The run id is stored inside the provenance blob, so it arrives as text and is a run
         // reference only if it parses as one.
         let tool_run_id = row.run_id.as_deref().and_then(|s| s.parse::<Uuid>().ok());
+        let time = row.time.with_timezone(&chrono::Utc);
+        // Ownership is a fold over the slot's decisions, so it is read once per slot instant
+        // rather than once per replicate.
+        let mut owner = Owner::Tool;
+        if let (Some(site), Some(parameter)) = (row.site_id, row.parameter_id) {
+            owner = match owners.entry((site, parameter, time)) {
+                Entry::Occupied(e) => *e.get(),
+                Entry::Vacant(e) => {
+                    *e.insert(decisions::output_owner(conn, site, parameter, time).await?)
+                }
+            };
+        }
         let provenance = RowProvenance {
             has_tool_run: tool_run_id.is_some(),
+            slot_detached: owner == Owner::Manual,
             classification: classification(&row.source_system),
             has_standard_curve: row.has_curve,
             has_calibration: row.has_calibration,
@@ -353,7 +372,7 @@ async fn inspect_rows<C: ConnectionTrait>(
         };
         out.push(InspectedRow {
             stream_id: row.stream_id,
-            time: row.time.with_timezone(&chrono::Utc),
+            time,
             replicate_index: row.replicate_index,
             raw_value: row.raw_value,
             options: edit_options(&provenance),
@@ -549,7 +568,7 @@ async fn refuse_unrouted<C: ConnectionTrait>(
                 "the reading at {} replicate {} is not corrected here: {}",
                 row.time,
                 row.replicate_index,
-                if row.provenance.has_tool_run {
+                if row.provenance.has_tool_run && !row.provenance.slot_detached {
                     "a tool run produced it, so it is reopened in its tool and saved again"
                 } else {
                     "its provenance does not offer that edit"
@@ -696,17 +715,6 @@ pub async fn commit(
     propagate(&state, &recorded, &actor).await?;
 
     let (predicate, binds) = req.selection.predicate()?;
-    // A pin recorded here owes the same reprocess as one recorded through `/readings/pins`: the
-    // projection sets the column, and only the reprocess makes the correction follow it.
-    decisions::enqueue_attribution_pin(
-        &state.db,
-        kind,
-        (kind == Kind::InstrumentPin).then(|| req.decision.target_id).flatten(),
-        set_id,
-        &predicate,
-        binds.clone(),
-    )
-    .await?;
     let ids = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
@@ -962,16 +970,36 @@ mod tests {
     }
 
     #[test]
+    fn a_detached_slot_is_corrected_in_place_and_offers_the_way_back() {
+        let p = RowProvenance {
+            has_tool_run: true,
+            slot_detached: true,
+            ..manual()
+        };
+        let options = edit_options(&p);
+        assert!(
+            options.contains(&EditOption::ValueCorrection),
+            "the slot is off its calculation, so the value is a person's to write"
+        );
+        assert!(options.contains(&EditOption::Return));
+        assert!(!options.contains(&EditOption::ReopenRun));
+        assert!(
+            !options.contains(&EditOption::Detach),
+            "it is already detached, so detaching again is refused"
+        );
+    }
+
+    #[test]
     fn a_value_no_tool_produced_is_corrected_in_place() {
         let options = edit_options(&manual());
         assert!(options.contains(&EditOption::ValueCorrection));
         assert!(!options.contains(&EditOption::ReopenRun));
         assert!(!options.contains(&EditOption::Detach));
-        // Nothing corrected it, so there is no curve or calibration to change.
+        // Nothing corrected it, so there is no calibration window to point at; the instrument
+        // still comes from a deployment, and with none covering it the fix is to create one.
         assert!(!options.contains(&EditOption::Curve));
-        assert!(!options.contains(&EditOption::CalibrationPin));
-        // No deployment covers it, so the instrument is the row's to pin.
-        assert!(options.contains(&EditOption::InstrumentPin));
+        assert!(!options.contains(&EditOption::EditCalibration));
+        assert!(options.contains(&EditOption::EditDeployment));
     }
 
     #[test]
@@ -987,10 +1015,12 @@ mod tests {
             ..manual()
         };
         let options = edit_options(&windowed);
-        assert!(options.contains(&EditOption::CalibrationPin));
         assert!(
-            options.contains(&EditOption::EditDeployment)
-                && !options.contains(&EditOption::InstrumentPin),
+            options.contains(&EditOption::EditCalibration),
+            "a windowed correction is fixed in the window, not pinned on the row"
+        );
+        assert!(
+            options.contains(&EditOption::EditDeployment),
             "a deployed instrument is fixed in the deployment, not pinned on the row"
         );
     }
@@ -1033,8 +1063,8 @@ mod tests {
         }
         for option in [
             EditOption::Curve,
-            EditOption::CalibrationPin,
-            EditOption::InstrumentPin,
+            EditOption::EditCalibration,
+            EditOption::EditDeployment,
         ] {
             assert_eq!(option.capability(), Capability::ManageSensors, "{option:?}");
         }

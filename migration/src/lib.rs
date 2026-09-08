@@ -42,6 +42,10 @@ mod m20260910_000018_reading_change_proposals;
 pub mod m20260910_000019_ledger_lookup_indexes;
 mod m20260910_000020_formula_site_source;
 pub mod m20260910_000021_curve_retirement;
+mod m20260910_000022_formula_transition;
+mod m20260910_000023_drop_member_decimal_places;
+mod m20260910_000024_janitor_recompose_decision;
+mod m20260910_000025_derived_computed_decision;
 pub mod portal_seed;
 
 pub struct Migrator;
@@ -92,6 +96,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20260910_000019_ledger_lookup_indexes::Migration),
             Box::new(m20260910_000020_formula_site_source::Migration),
             Box::new(m20260910_000021_curve_retirement::Migration),
+            Box::new(m20260910_000022_formula_transition::Migration),
+            Box::new(m20260910_000023_drop_member_decimal_places::Migration),
+            Box::new(m20260910_000024_janitor_recompose_decision::Migration),
+            Box::new(m20260910_000025_derived_computed_decision::Migration),
         ]
     }
 }

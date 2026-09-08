@@ -24,6 +24,10 @@ pub enum Kind {
     Withdraw,
     Reassert,
     Curve,
+    /// Historical only (Q117): attribution is corrected on the deployment and the calibration
+    /// window, never stamped on a row, so nothing writes these any more. They stay in the
+    /// vocabulary because rows already carry them, and the reprocess still honours what they
+    /// pinned.
     CalibrationPin,
     InstrumentPin,
     SlotMove,
@@ -37,6 +41,16 @@ pub enum Kind {
     /// A curve that corrected readings was taken out of circulation, and they moved onto
     /// whatever else covers them (M146).
     CurveRetire,
+    /// A recompute moved a stored derived value onto a new formula version (Q116, M135). Record
+    /// only: the recompute writes the value, this says which version it came from and went to.
+    FormulaTransition,
+    /// The janitor's drift sweep recomposed a corrected value from the curves the row names
+    /// (Q118, M159). Record only, for the same reason: the sweep's own UPDATE writes the value.
+    CurveRecompose,
+    /// A derived value was computed where none was stored (Q57 arm 2, M162). Record only: the
+    /// upsert writes the value, this says the slot's first number arrived and under which
+    /// formula version.
+    DerivedComputed,
     Rollback,
 }
 
@@ -60,6 +74,9 @@ impl Kind {
             Self::Detach => "detach",
             Self::Return => "return",
             Self::CurveRetire => "curve_retire",
+            Self::FormulaTransition => "formula_transition",
+            Self::CurveRecompose => "curve_recompose",
+            Self::DerivedComputed => "derived_computed",
             Self::Rollback => "rollback",
         }
     }
@@ -82,6 +99,9 @@ impl Kind {
             Self::Detach,
             Self::Return,
             Self::CurveRetire,
+            Self::FormulaTransition,
+            Self::CurveRecompose,
+            Self::DerivedComputed,
             Self::Rollback,
         ]
         .into_iter()
@@ -107,8 +127,23 @@ impl Kind {
             Self::InstrumentPin => &["sensor_id"],
             Self::ValueCorrection => &["raw_value"],
             Self::UnverifiedEntry | Self::Verify => &["unverified"],
-            Self::SlotMove | Self::Chain | Self::Detach | Self::Return | Self::Rollback => &[],
+            Self::SlotMove
+            | Self::Chain
+            | Self::Detach
+            | Self::Return
+            | Self::FormulaTransition
+            | Self::CurveRecompose
+            | Self::DerivedComputed
+            | Self::Rollback => &[],
         }
+    }
+
+    /// Whether a writer may still record this kind. Attribution pins are historical (Q117): the
+    /// correction belongs on the deployment or the calibration window, and every reprocess carries
+    /// it through, so a row is never stamped with one again.
+    #[must_use]
+    pub fn writable(self) -> bool {
+        !matches!(self, Self::CalibrationPin | Self::InstrumentPin)
     }
 
     /// Whether [`rollback`] accepts a decision of this kind: it restores the columns the decision
@@ -137,6 +172,15 @@ impl Kind {
             Self::ValueCorrection => Some("value"),
             Self::UnverifiedEntry | Self::Verify => Some("verified"),
             Self::Chain | Self::Detach | Self::Return => Some("ownership"),
+            // Its own family: a transition supersedes neither a pin nor a value correction, and
+            // one edit's move must not hide the move before it.
+            Self::FormulaTransition => Some("formula"),
+            // Its own family: a sweep repairs a value the curves already decided, so it neither
+            // supersedes a correction nor hides the repair before it.
+            Self::CurveRecompose => Some("recompose"),
+            // Its own family: a value's arrival is not superseded by anything, and a slot that
+            // was unattributed and computed again is a second arrival, not a replacement.
+            Self::DerivedComputed => Some("derived_arrival"),
             Self::Rollback => None,
         }
     }
@@ -147,6 +191,9 @@ impl Kind {
     pub fn recorded_columns(self) -> &'static [&'static str] {
         match self {
             Self::Chain | Self::Detach | Self::Return => &["raw_value", "run_id"],
+            Self::FormulaTransition => &["raw_value", "derived_version_id"],
+            Self::CurveRecompose => &["calibrated_value"],
+            Self::DerivedComputed => &["raw_value", "derived_version_id"],
             Self::SlotMove => &["site_id", "parameter_id"],
             other => other.projected_columns(),
         }
@@ -180,6 +227,11 @@ impl Kind {
 /// Every code path that writes a curation column, and what it becomes under the record: a
 /// curation writer appends a decision of the given kind; a derivation writer appends nothing and
 /// must honour pins. A new writer declares itself here or the classification test fails.
+///
+/// Two derivations are the exception (Q116, Q118): a recompute that moves a stored value records
+/// the move, because the ledger is the one place a value's history is read from and a value that
+/// changed under a new formula version, or under a curve the sweep repaired it to, would
+/// otherwise leave no trace of having changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Writer {
     FlagRoute,
@@ -203,9 +255,11 @@ pub enum Writer {
     BackfillAttribution,
     PairingBackfill,
     JanitorRecompose,
+    DerivedGapFill,
     MeasurementRetag,
     SdEstimatorRetag,
     CurveRetirement,
+    DerivedRecompute,
 }
 
 impl Writer {
@@ -229,12 +283,14 @@ impl Writer {
             Self::ChainSave => Some((Kind::Chain, Origin::Chain)),
             Self::MergeMove => Some((Kind::SlotMove, Origin::Manual)),
             Self::CurveRetirement => Some((Kind::CurveRetire, Origin::Manual)),
+            Self::DerivedRecompute => Some((Kind::FormulaTransition, Origin::System)),
+            Self::JanitorRecompose => Some((Kind::CurveRecompose, Origin::Janitor)),
+            Self::DerivedGapFill => Some((Kind::DerivedComputed, Origin::System)),
             Self::ReprocessSensor
             | Self::ReprocessSlot
             | Self::CalibrationResolver
             | Self::BackfillAttribution
             | Self::PairingBackfill
-            | Self::JanitorRecompose
             | Self::MeasurementRetag
             | Self::SdEstimatorRetag => None,
         }
@@ -252,6 +308,7 @@ pub enum Origin {
     Rollback,
     Migration,
     System,
+    Janitor,
 }
 
 impl Origin {
@@ -266,6 +323,7 @@ impl Origin {
             Self::Rollback => "rollback",
             Self::Migration => "migration",
             Self::System => "system",
+            Self::Janitor => "janitor",
         }
     }
 }
@@ -292,12 +350,6 @@ struct SetRow {
 struct OwnershipRow {
     kind: String,
     at: sea_orm::prelude::DateTimeWithTimeZone,
-}
-
-#[derive(FromQueryResult)]
-struct ForeignCurveRow {
-    id: Uuid,
-    rows: i64,
 }
 
 #[derive(FromQueryResult)]
@@ -352,13 +404,16 @@ pub struct DecisionRow {
     pub supersedes: Option<Uuid>,
     pub rolled_back_by: Option<Uuid>,
     pub set_id: Option<Uuid>,
+    /// The tracked job that made a system change, where one did. Cleared when that job row is
+    /// pruned, so an old decision keeps its record and loses only the link to the run.
+    pub job_id: Option<Uuid>,
     /// Whether `rollback` accepts this kind at all. A kind that projects no column has nothing to
     /// restore, so the reader offers no undo for it rather than learning that from a 409.
     pub reversible: bool,
 }
 
 const ROW_COLUMNS: &str = "id, stream_id, time, replicate_index, kind, old, new, actor, at, reason, \
-                           origin, supersedes, rolled_back_by, set_id";
+                           origin, supersedes, rolled_back_by, set_id, job_id";
 
 /// The row every write of a decision set returns: how many landed and the span they cover.
 #[derive(sea_orm::FromQueryResult)]
@@ -387,6 +442,7 @@ struct StoredDecision {
     supersedes: Option<Uuid>,
     rolled_back_by: Option<Uuid>,
     set_id: Option<Uuid>,
+    job_id: Option<Uuid>,
 }
 
 fn row_from(r: &sea_orm::QueryResult) -> AppResult<DecisionRow> {
@@ -416,6 +472,7 @@ fn row_from(r: &sea_orm::QueryResult) -> AppResult<DecisionRow> {
             "rollback" => Origin::Rollback,
             "migration" => Origin::Migration,
             "system" => Origin::System,
+            "janitor" => Origin::Janitor,
             other => {
                 return Err(AppError::Internal(format!(
                     "unknown decision origin {other}"
@@ -425,6 +482,7 @@ fn row_from(r: &sea_orm::QueryResult) -> AppResult<DecisionRow> {
         supersedes: stored.supersedes,
         rolled_back_by: stored.rolled_back_by,
         set_id: stored.set_id,
+        job_id: stored.job_id,
     })
 }
 
@@ -458,6 +516,7 @@ async fn current_state<C: ConnectionTrait>(
                  'calibrated_value', calibrated_value,
                  'unverified', unverified,
                  'ingested_at', ingested_at,
+                 'derived_version_id', derived_version_id,
                  'run_id', provenance ->> 'run_id',
                  'site_id', site_id,
                  'parameter_id', parameter_id) AS state
@@ -542,6 +601,7 @@ pub async fn record<C: ConnectionTrait>(conn: &C, d: &Decision) -> AppResult<Uui
             "A rollback is recorded through rollback(), not as a decision of its own".to_string(),
         ));
     }
+    refuse_historical(d.kind)?;
     if d.kind.per_row_only() && d.key.replicate_index.is_none() {
         return Err(AppError::BadRequest(format!(
             "A {} names one replicate, not a group",
@@ -746,6 +806,7 @@ const STATE_SQL: &str = "jsonb_build_object(
     'calibrated_value', r.calibrated_value,
     'unverified', r.unverified,
     'ingested_at', r.ingested_at,
+    'derived_version_id', r.derived_version_id,
     'run_id', r.provenance ->> 'run_id',
     'site_id', r.site_id,
     'parameter_id', r.parameter_id)";
@@ -812,6 +873,19 @@ fn family_kinds(kind: Kind) -> Vec<String> {
 /// prior state as `old` and naming the decision each supersedes. `row_predicate` is SQL over
 /// `r` (`readings`) and `ds` (`data_streams`) with `binds` numbered from `$1`.
 #[allow(clippy::too_many_arguments)]
+/// Refuse a kind nothing writes any more, naming what to correct instead.
+fn refuse_historical(kind: Kind) -> AppResult<()> {
+    if kind.writable() {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(format!(
+        "'{}' is not recorded any more: a reading's instrument comes from its deployment and its \
+         correction from the calibration window, so the fix is to that record and the reprocess \
+         carries it through",
+        kind.as_str()
+    )))
+}
+
 pub async fn record_many<C: ConnectionTrait>(
     conn: &C,
     kind: Kind,
@@ -828,6 +902,7 @@ pub async fn record_many<C: ConnectionTrait>(
             "A rollback is recorded through rollback(), not in bulk".to_string(),
         ));
     }
+    refuse_historical(kind)?;
     let cols: Vec<String> = kind
         .recorded_columns()
         .iter()
@@ -963,6 +1038,7 @@ pub async fn record_keyed<C: ConnectionTrait>(
     if rows.is_empty() {
         return Ok(Recorded::default());
     }
+    refuse_historical(kind)?;
     let guard = guard.map(|g| format!(" AND ({g})")).unwrap_or_default();
     let times: Vec<String> = rows.iter().map(|(t, _, _)| t.to_rfc3339()).collect();
     let indices: Vec<i32> = rows.iter().map(|(_, i, _)| i32::from(*i)).collect();
@@ -1729,6 +1805,7 @@ pub async fn record_set<C: ConnectionTrait>(
     reason: Option<&str>,
     origin: Origin,
 ) -> AppResult<(Uuid, Recorded)> {
+    refuse_historical(kind)?;
     let (predicate, binds) = selection.predicate()?;
     let set_id = open_set(conn, kind, selection, new.clone(), actor, reason).await?;
     let recorded = match keyed_corrections(selection)? {
@@ -1898,138 +1975,6 @@ pub async fn enqueue_attribution_pin(
     Ok(jobs)
 }
 
-/// A standard curve the selection's corrected spot readings name that the incoming instrument does
-/// not own, with how many readings carry it.
-#[derive(Debug, Clone)]
-pub struct ForeignCurve {
-    pub id: Uuid,
-    pub rows: i64,
-}
-
-/// The curves an instrument pin would leave behind: named by a selected reading, owned by some
-/// instrument other than the one being pinned to.
-pub async fn foreign_curves<C: ConnectionTrait>(
-    conn: &C,
-    predicate: &str,
-    binds: Vec<sea_orm::Value>,
-    target_sensor: Uuid,
-) -> AppResult<Vec<ForeignCurve>> {
-    let mut binds = binds;
-    binds.push(target_sensor.into());
-    let n = binds.len();
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT sc.id, count(*) AS rows FROM readings r
-                   JOIN data_streams ds ON ds.id = r.stream_id
-                   JOIN standard_curves sc ON sc.id = r.standard_curve_id
-                  WHERE {predicate} AND sc.sensor_id <> ${n}
-                  GROUP BY sc.id"
-            ),
-            binds,
-        ))
-        .await?;
-    rows.iter()
-        .map(|r| {
-            let row = ForeignCurveRow::from_query_result(r, "")?;
-            Ok(ForeignCurve {
-                id: row.id,
-                rows: row.rows,
-            })
-        })
-        .collect()
-}
-
-/// Q112, applied in the pin's own transaction: copy each foreign curve onto the incoming
-/// instrument and re-point the readings at the copy, or clear the reference and let the reprocess
-/// recompose each value from the curves it still names.
-pub async fn apply_curve_on_split<C: ConnectionTrait>(
-    conn: &C,
-    choice: Option<CurveOnSplit>,
-    foreign: &[ForeignCurve],
-    target_sensor: Uuid,
-    predicate: &str,
-    binds: Vec<sea_orm::Value>,
-    actor: &str,
-) -> AppResult<()> {
-    if foreign.is_empty() {
-        return Ok(());
-    }
-    match choice {
-        None => Ok(()),
-        Some(CurveOnSplit::Drop) => {
-            let mut b = binds;
-            b.push(target_sensor.into());
-            let n = b.len();
-            conn.execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &format!(
-                    "UPDATE readings tgt SET standard_curve_id = NULL
-                       FROM readings r
-                       JOIN data_streams ds ON ds.id = r.stream_id
-                       JOIN standard_curves sc ON sc.id = r.standard_curve_id
-                      WHERE {predicate} AND sc.sensor_id <> ${n}
-                        AND tgt.stream_id = r.stream_id AND tgt.time = r.time
-                        AND tgt.replicate_index = r.replicate_index"
-                ),
-                b,
-            ))
-            .await?;
-            Ok(())
-        }
-        Some(CurveOnSplit::Copy) => {
-            for curve in foreign {
-                // One copy per original per instrument: pinning a second month onto the same
-                // instrument re-points at the copy the first one made.
-                let copy = conn
-                    .query_one_raw(Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        "WITH existing AS (
-                             SELECT id FROM standard_curves
-                              WHERE sensor_id = $1 AND copied_from_id = $2 LIMIT 1
-                         ), made AS (
-                             INSERT INTO standard_curves
-                                 (sensor_id, name, fitted_on, slope, intercept, r_squared, notes,
-                                  created_by, copied_from_id)
-                             SELECT $1, sc.name, sc.fitted_on, sc.slope, sc.intercept, sc.r_squared,
-                                    sc.notes, $3, sc.id
-                               FROM standard_curves sc
-                              WHERE sc.id = $2 AND NOT EXISTS (SELECT 1 FROM existing)
-                             RETURNING id
-                         )
-                         SELECT id FROM existing UNION ALL SELECT id FROM made",
-                        [target_sensor.into(), curve.id.into(), actor.into()],
-                    ))
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::Internal(format!("curve {} could not be copied", curve.id))
-                    })?;
-                let copy_id: Uuid = copy.try_get("", "id")?;
-                let mut b = binds.clone();
-                b.push(curve.id.into());
-                b.push(copy_id.into());
-                let orig = b.len() - 1;
-                let new = b.len();
-                conn.execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    &format!(
-                        "UPDATE readings tgt SET standard_curve_id = ${new}
-                           FROM readings r
-                           JOIN data_streams ds ON ds.id = r.stream_id
-                          WHERE {predicate} AND r.standard_curve_id = ${orig}
-                            AND tgt.stream_id = r.stream_id AND tgt.time = r.time
-                            AND tgt.replicate_index = r.replicate_index"
-                    ),
-                    b,
-                ))
-                .await?;
-            }
-            Ok(())
-        }
-    }
-}
-
 /// The reprocess an inverted pin owes, for a whole set. Clearing a pin changes what the window
 /// resolves, so the slots have to be re-derived exactly as they were when it was recorded; a set
 /// that recorded no pin enqueues nothing.
@@ -2087,307 +2032,6 @@ pub async fn enqueue_pin_reprocess_for_decision(
     .await
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PinKind {
-    Instrument,
-    Calibration,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct PinRequest {
-    pub kind: PinKind,
-    /// The sensor (instrument pin) or calibration (calibration pin) the readings belong to.
-    /// Omitted only when `new_instrument` mints the one the readings move to.
-    #[serde(default)]
-    pub target_id: Option<Uuid>,
-    /// Mint the instrument the readings are pinned to, in the pin's own transaction. A split onto
-    /// an analyser the inventory does not hold yet is one act, so the instrument and the decisions
-    /// stand or fall together (M133).
-    #[serde(default)]
-    pub new_instrument: Option<NewInstrument>,
-    pub selection: Selection,
-    #[serde(default)]
-    pub reason: Option<String>,
-    /// What to do with a standard curve the incoming instrument does not own (Q112). Required when
-    /// the selection holds a corrected spot reading naming one, refused otherwise: a curve belongs
-    /// to exactly one instrument, so a split has to say whether the correction travels.
-    #[serde(default)]
-    pub curves: Option<CurveOnSplit>,
-}
-
-/// The instrument a split mints for itself. Only what identifies it: a curve, a deployment and a
-/// calibration are its own later decisions.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct NewInstrument {
-    #[serde(default)]
-    pub serial_number: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub manufacturer: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
-    /// `device` (the default) or `lab`. A bookkeeping row is minted by the path that needs it and
-    /// never by a person, so nothing else is accepted here.
-    #[serde(default)]
-    pub kind: Option<String>,
-}
-
-/// The two answers Q112 admits for a corrected spot reading whose curve belongs to the instrument
-/// it is leaving.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CurveOnSplit {
-    /// Copy the curve onto the incoming instrument, naming the original, and point the readings at
-    /// the copy. The correction stands and the value does not move.
-    Copy,
-    /// Leave the readings on the incoming instrument with no standard curve. The reprocess then
-    /// recomposes each value from the curves it still names, which is the base calibration alone.
-    Drop,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct PinResponse {
-    pub set_id: Uuid,
-    /// The instrument or calibration the readings are pinned to, which is the minted one when the
-    /// request asked for a new instrument.
-    pub target_id: Uuid,
-    pub rows_decided: u64,
-    /// The slot reprocess jobs enqueued so the pinned rows' curves follow the pin.
-    pub jobs: Vec<Uuid>,
-}
-
-/// The instrument a split creates for itself, in the split's transaction. Everything else about it
-/// is a later decision: no deployment, no calibration, no curve.
-async fn mint_instrument<C: ConnectionTrait>(conn: &C, spec: &NewInstrument) -> AppResult<Uuid> {
-    let id = Uuid::new_v4();
-    let kind = spec.kind.clone().unwrap_or_else(|| "device".to_string());
-    conn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO sensors (id, serial_number, name, manufacturer, model, kind, \
-                              is_lab_instrument, is_active, data_frequency)
-         VALUES ($1, $2, $3, $4, $5, $6, $6 <> 'device', true,
-                 CASE WHEN $6 = 'device' THEN 'high' ELSE 'low' END)",
-        [
-            id.into(),
-            spec.serial_number.clone().into(),
-            spec.name.clone().into(),
-            spec.manufacturer.clone().into(),
-            spec.model.clone().into(),
-            kind.into(),
-        ],
-    ))
-    .await?;
-    Ok(id)
-}
-
-/// Pin a selection of readings to an instrument or a calibration (Q36 addendum): one decision
-/// per reading in one set, projected onto the rows now, and honoured by every later reprocess.
-/// The slots touched are reprocessed so a pinned instrument's own calibration windows apply.
-/// Requires `manage_sensors`.
-#[utoipa::path(
-    post,
-    path = "/api/readings/pins",
-    request_body = PinRequest,
-    responses(
-        (status = 200, description = "The set recorded", body = PinResponse),
-        (status = 400, description = "Empty selection or unknown target"),
-    ),
-    tag = "readings"
-)]
-pub async fn pin_readings(
-    State(state): State<AppState>,
-    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
-    Json(req): Json<PinRequest>,
-) -> AppResult<Json<PinResponse>> {
-    let actor = crate::common::actor::label(&auth);
-    let kind = match req.kind {
-        PinKind::Instrument => Kind::InstrumentPin,
-        PinKind::Calibration => Kind::CalibrationPin,
-    };
-    if req.new_instrument.is_some() && req.kind != PinKind::Instrument {
-        return Err(AppError::BadRequest(
-            "new_instrument belongs to an instrument pin; a calibration pin names an existing one"
-                .to_string(),
-        ));
-    }
-    if req.target_id.is_some() == req.new_instrument.is_some() {
-        return Err(AppError::BadRequest(
-            "name either target_id or new_instrument, not both and not neither".to_string(),
-        ));
-    }
-    if let Some(minted) = &req.new_instrument
-        && !matches!(minted.kind.as_deref(), None | Some("device") | Some("lab"))
-    {
-        return Err(AppError::BadRequest(
-            "a minted instrument is 'device' or 'lab'".to_string(),
-        ));
-    }
-    if let Some(target_id) = req.target_id {
-        let exists_sql = match req.kind {
-            PinKind::Instrument => "SELECT 1 FROM sensors WHERE id = $1",
-            PinKind::Calibration => "SELECT 1 FROM sensor_calibrations WHERE id = $1",
-        };
-        if state
-            .db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                exists_sql,
-                [target_id.into()],
-            ))
-            .await?
-            .is_none()
-        {
-            return Err(AppError::BadRequest(format!(
-                "No {} with id {}",
-                match req.kind {
-                    PinKind::Instrument => "sensor",
-                    PinKind::Calibration => "calibration",
-                },
-                target_id
-            )));
-        }
-    }
-    let (predicate, binds) = req.selection.predicate()?;
-    // A curve belongs to one instrument, so an instrument pin has to say what happens to a
-    // correction the incoming instrument does not own (Q112). Asked before anything is written. A
-    // minted instrument owns none, so every curve in the selection is foreign to it.
-    let foreign = if req.kind == PinKind::Instrument {
-        foreign_curves(
-            &state.db,
-            &predicate,
-            binds.clone(),
-            req.target_id.unwrap_or_else(Uuid::nil),
-        )
-        .await?
-    } else {
-        Vec::new()
-    };
-    if !foreign.is_empty() && req.curves.is_none() {
-        return Err(AppError::BadRequest(format!(
-            "{} of the selected readings are corrected by {} standard curve(s) the incoming \
-             instrument does not own; say `curves`: \"copy\" to copy them onto it, or \"drop\" to \
-             leave those readings with no standard curve",
-            foreign.iter().map(|c| c.rows).sum::<i64>(),
-            foreign.len()
-        )));
-    }
-    let (outcome, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
-        let target_id = match (&req.new_instrument, req.target_id) {
-            (Some(minted), _) => mint_instrument(txn, minted).await?,
-            (None, Some(id)) => id,
-            (None, None) => unreachable!("one of the two is present"),
-        };
-        let new = match req.kind {
-            PinKind::Instrument => serde_json::json!({ "sensor_id": target_id }),
-            PinKind::Calibration => serde_json::json!({ "calibration_id": target_id }),
-        };
-        let (set_id, recorded) = record_set(
-            txn,
-            kind,
-            &req.selection,
-            new,
-            &actor,
-            req.reason.as_deref(),
-            Origin::Manual,
-        )
-        .await?;
-        // An instrument minted for a split that decides nothing is an instrument holding nothing,
-        // with no record that a split was attempted. The mint goes back with the pin.
-        if req.new_instrument.is_some() && recorded.rows == 0 {
-            return Err(AppError::BadRequest(
-                "the selection holds no readings, so there is nothing to split and no instrument \
-                 is created"
-                    .to_string(),
-            ));
-        }
-        // In the same transaction as the pin: a reading is never left naming a curve of an
-        // instrument it does not belong to.
-        apply_curve_on_split(
-            txn,
-            req.curves,
-            &foreign,
-            target_id,
-            &predicate,
-            binds.clone(),
-            &actor,
-        )
-        .await?;
-        Ok(((set_id, target_id), recorded))
-    })
-    .await?;
-    let (set_id, target_id) = outcome;
-    let jobs = enqueue_attribution_pin(
-        &state.db,
-        kind,
-        (req.kind == PinKind::Instrument).then_some(target_id),
-        set_id,
-        &predicate,
-        binds,
-    )
-    .await?;
-    Ok(Json(PinResponse {
-        set_id,
-        target_id,
-        rows_decided: recorded.rows,
-        jobs,
-    }))
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct RollbackSetResponse {
-    pub set_id: Uuid,
-    pub rolled_back: usize,
-    pub jobs: Vec<Uuid>,
-}
-
-/// Roll a set back: every live decision it made is inverted and the slots reprocessed so the
-/// windows own the rows again. Requires `manage_sensors`.
-#[utoipa::path(
-    post,
-    path = "/api/readings/pins/{set_id}/rollback",
-    params(("set_id" = Uuid, Path, description = "Decision set id")),
-    responses(
-        (status = 200, description = "Rolled back", body = RollbackSetResponse),
-        (status = 404, description = "Unknown set"),
-        (status = 409, description = "Already rolled back"),
-    ),
-    tag = "readings"
-)]
-pub async fn rollback_pin_set(
-    State(state): State<AppState>,
-    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
-    axum::extract::Path(set_id): axum::extract::Path<Uuid>,
-) -> AppResult<Json<RollbackSetResponse>> {
-    let actor = crate::common::actor::label(&auth);
-    if state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT 1 FROM reading_decision_sets WHERE id = $1",
-            [set_id.into()],
-        ))
-        .await?
-        .is_none()
-    {
-        return Err(AppError::NotFound(format!(
-            "Decision set {set_id} not found"
-        )));
-    }
-    let (rolled_back, _) = crate::common::bulk_write::guarded(&state.db, async |txn| {
-        rollback_set(txn, set_id, &actor, Some("set rolled back")).await
-    })
-    .await?;
-    let jobs = enqueue_pin_reprocess_for_set(&state.db, set_id).await?;
-    Ok(Json(RollbackSetResponse {
-        set_id,
-        rolled_back,
-        jobs,
-    }))
-}
 
 /// Who owns an output slot at a visit (Q40, Q47): the calculation, or a person who detached it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
@@ -2882,6 +2526,42 @@ mod tests {
         );
     }
 
+    /// The rule Q117 settled, named where it can fail: attribution is corrected on the record that
+    /// decides it, so no writer records a pin. The kinds stay in the vocabulary because stored rows
+    /// carry them, which is what makes an accidental re-mint possible and this guard necessary.
+    #[test]
+    fn no_writer_records_an_attribution_pin() {
+        use super::Writer;
+        for kind in [Kind::CalibrationPin, Kind::InstrumentPin] {
+            assert!(!kind.writable(), "{kind:?}");
+            assert!(super::refuse_historical(kind).is_err(), "{kind:?}");
+        }
+        // Every other kind is still recordable, so the guard is a rule and not a blanket refusal.
+        for kind in [
+            Kind::Flag,
+            Kind::Curve,
+            Kind::ValueCorrection,
+            Kind::CurveRetire,
+            Kind::FormulaTransition,
+        ] {
+            assert!(kind.writable(), "{kind:?}");
+            assert!(super::refuse_historical(kind).is_ok(), "{kind:?}");
+        }
+        // No writer declares one either: the registry is the other half of the same rule.
+        for w in [
+            Writer::FlagRoute,
+            Writer::GrabReplace,
+            Writer::CurveRetirement,
+            Writer::DerivedRecompute,
+        ] {
+            let recorded = w.decision().map(|(k, _)| k);
+            assert!(
+                recorded != Some(Kind::CalibrationPin) && recorded != Some(Kind::InstrumentPin),
+                "{w:?} records {recorded:?}"
+            );
+        }
+    }
+
     #[test]
     fn every_writer_is_classified_and_derivation_writers_append_nothing() {
         use super::{Origin, Writer};
@@ -2905,6 +2585,17 @@ mod tests {
             ),
             (Writer::ChainSave, Kind::Chain, Origin::Chain),
             (Writer::MergeMove, Kind::SlotMove, Origin::Manual),
+            (
+                Writer::DerivedRecompute,
+                Kind::FormulaTransition,
+                Origin::System,
+            ),
+            (
+                Writer::JanitorRecompose,
+                Kind::CurveRecompose,
+                Origin::Janitor,
+            ),
+            (Writer::DerivedGapFill, Kind::DerivedComputed, Origin::System),
         ];
         for (w, k, o) in curation {
             assert_eq!(w.decision(), Some((k, o)), "{w:?}");
@@ -2915,7 +2606,6 @@ mod tests {
             Writer::CalibrationResolver,
             Writer::BackfillAttribution,
             Writer::PairingBackfill,
-            Writer::JanitorRecompose,
             Writer::MeasurementRetag,
             Writer::SdEstimatorRetag,
         ] {

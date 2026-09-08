@@ -220,7 +220,7 @@ async fn seed_claimable_history(
 #[tokio::test]
 #[serial]
 async fn alarm_thresholds_confines_slots_to_the_callers_projects() {
-    if !kc::require_keycloak_or_skip("alarm_thresholds_confines_slots_to_the_callers_projects")
+    if !crate::common::profile::Service::Keycloak.require("alarm_thresholds_confines_slots_to_the_callers_projects")
         .await
     {
         return;
@@ -296,7 +296,7 @@ async fn alarm_thresholds_confines_slots_to_the_callers_projects() {
 #[tokio::test]
 #[serial]
 async fn parameter_merges_hold_the_administrator_and_project_gates() {
-    if !kc::require_keycloak_or_skip("parameter_merges_hold_the_administrator_and_project_gates")
+    if !crate::common::profile::Service::Keycloak.require("parameter_merges_hold_the_administrator_and_project_gates")
         .await
     {
         return;
@@ -470,7 +470,7 @@ async fn parameter_merges_hold_the_administrator_and_project_gates() {
 #[tokio::test]
 #[serial]
 async fn slot_merge_holds_the_administrator_gate_inside_a_granted_project() {
-    if !kc::require_keycloak_or_skip(
+    if !crate::common::profile::Service::Keycloak.require(
         "slot_merge_holds_the_administrator_gate_inside_a_granted_project",
     )
     .await
@@ -580,7 +580,7 @@ async fn slot_merge_holds_the_administrator_gate_inside_a_granted_project() {
 #[tokio::test]
 #[serial]
 async fn rollback_deployment_needs_the_same_capability_as_deleting_the_deployment() {
-    if !kc::require_keycloak_or_skip(
+    if !crate::common::profile::Service::Keycloak.require(
         "rollback_deployment_needs_the_same_capability_as_deleting_the_deployment",
     )
     .await
@@ -750,7 +750,7 @@ async fn rollback_deployment_needs_the_same_capability_as_deleting_the_deploymen
 #[tokio::test]
 #[serial]
 async fn sensor_lifecycle_actions_refuse_another_projects_site_and_sensors() {
-    if !kc::require_keycloak_or_skip(
+    if !crate::common::profile::Service::Keycloak.require(
         "sensor_lifecycle_actions_refuse_another_projects_site_and_sensors",
     )
     .await
@@ -953,7 +953,7 @@ async fn sensor_lifecycle_actions_refuse_another_projects_site_and_sensors() {
 #[tokio::test]
 #[serial]
 async fn backfill_and_calibration_candidates_confine_to_the_callers_projects() {
-    if !kc::require_keycloak_or_skip(
+    if !crate::common::profile::Service::Keycloak.require(
         "backfill_and_calibration_candidates_confine_to_the_callers_projects",
     )
     .await
@@ -1083,7 +1083,7 @@ async fn backfill_and_calibration_candidates_confine_to_the_callers_projects() {
 #[tokio::test]
 #[serial]
 async fn site_targeted_actions_refuse_a_site_outside_the_callers_grants() {
-    if !kc::require_keycloak_or_skip(
+    if !crate::common::profile::Service::Keycloak.require(
         "site_targeted_actions_refuse_a_site_outside_the_callers_grants",
     )
     .await
@@ -1258,7 +1258,7 @@ async fn frames_until(
 #[tokio::test]
 #[serial]
 async fn granted_members_receive_job_frames_on_the_event_stream() {
-    if !kc::require_keycloak_or_skip("granted_members_receive_job_frames_on_the_event_stream").await
+    if !crate::common::profile::Service::Keycloak.require("granted_members_receive_job_frames_on_the_event_stream").await
     {
         return;
     }
@@ -1317,7 +1317,7 @@ async fn granted_members_receive_job_frames_on_the_event_stream() {
 #[tokio::test]
 #[serial]
 async fn listing_sync_credentials_is_administrator_only() {
-    if !kc::require_keycloak_or_skip("listing_sync_credentials_is_administrator_only").await {
+    if !crate::common::profile::Service::Keycloak.require("listing_sync_credentials_is_administrator_only").await {
         return;
     }
     let db = fresh_db().await;
@@ -1384,7 +1384,7 @@ async fn listing_sync_credentials_is_administrator_only() {
 #[tokio::test]
 #[serial]
 async fn alarm_acknowledgement_and_job_logs_are_confined_by_project() {
-    if !kc::require_keycloak_or_skip("alarm_acknowledgement_and_job_logs_are_confined_by_project")
+    if !crate::common::profile::Service::Keycloak.require("alarm_acknowledgement_and_job_logs_are_confined_by_project")
         .await
     {
         return;

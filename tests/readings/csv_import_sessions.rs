@@ -51,7 +51,7 @@ impl Fixture {
 }
 
 async fn setup(test_name: &str) -> Option<Fixture> {
-    if !kc::require_keycloak_or_skip(test_name).await {
+    if !crate::common::profile::Service::Keycloak.require(test_name).await {
         return None;
     }
     let db = crate::common::setup_test_db().await;

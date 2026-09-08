@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -63,9 +63,14 @@ async fn is_standalone(db: &DatabaseConnection, definition_id: Uuid) -> Result<b
         ))
         .await
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-    Ok(row
-        .and_then(|r| r.try_get::<bool>("", "standalone").ok())
-        .unwrap_or(false))
+    // No row is a definition that does not exist; a row that does not decode is an error, because
+    // `tool_script_id IS NULL` is never null.
+    row.map(|r| {
+        r.try_get::<bool>("", "standalone")
+            .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))
+    })
+    .transpose()
+    .map(|standalone| standalone.unwrap_or(false))
 }
 
 fn validate_formula(formula: &str) -> Result<(), ApiError> {
@@ -147,10 +152,14 @@ async fn site_columns_of(db: &DatabaseConnection) -> Result<Vec<String>, ApiErro
         ))
         .await
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| r.try_get::<String>("", "column_name").ok())
-        .collect())
+    // A skipped column is a site source refused for naming something that exists, so a decode
+    // failure is an error rather than a shorter list.
+    rows.iter()
+        .map(|r| {
+            r.try_get::<String>("", "column_name")
+                .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))
+        })
+        .collect()
 }
 
 /// Whether the constants table holds this name.
@@ -172,6 +181,18 @@ async fn names_a_constant(db: &DatabaseConnection, name: &str) -> Result<bool, A
 /// A definition is found by `output_parameter_id`, the column that says what it produces. Its own
 /// `code` names the formula, and the two are routinely spelled differently: `ensure_output_parameter`
 /// creates the output parameter rather than requiring them to agree.
+#[derive(FromQueryResult)]
+struct DefinitionRow {
+    id: Uuid,
+    output_parameter_id: Uuid,
+}
+
+#[derive(FromQueryResult)]
+struct SourceRow {
+    derived_definition_id: Uuid,
+    parameter_id: Uuid,
+}
+
 #[derive(Default)]
 struct DerivedGraph {
     /// Output parameter id to the definition producing it.
@@ -193,13 +214,11 @@ impl DerivedGraph {
             .await
             .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
         for row in &definitions {
-            let id: Uuid = row
-                .try_get("", "id")
+            let definition = DefinitionRow::from_query_result(row, "")
                 .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-            let output: Uuid = row
-                .try_get("", "output_parameter_id")
-                .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-            graph.definition_of.insert(output, id);
+            graph
+                .definition_of
+                .insert(definition.output_parameter_id, definition.id);
         }
 
         let sources = db
@@ -211,17 +230,13 @@ impl DerivedGraph {
             .await
             .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
         for row in &sources {
-            let definition_id: Uuid = row
-                .try_get("", "derived_definition_id")
-                .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-            let parameter_id: Uuid = row
-                .try_get("", "parameter_id")
+            let source = SourceRow::from_query_result(row, "")
                 .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
             graph
                 .sources_of
-                .entry(definition_id)
+                .entry(source.derived_definition_id)
                 .or_default()
-                .push(parameter_id);
+                .push(source.parameter_id);
         }
         Ok(graph)
     }
@@ -334,6 +349,12 @@ async fn existing_parameter_id(
     .transpose()
 }
 
+#[derive(FromQueryResult)]
+struct StoredDefinition {
+    output_parameter_id: Option<Uuid>,
+    formula: String,
+}
+
 /// The parameter a stored definition produces, and its formula.
 async fn stored_definition(
     db: &DatabaseConnection,
@@ -348,13 +369,9 @@ async fn stored_definition(
         .await
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?
         .ok_or_else(|| ApiError::not_found("Derived parameter definition", None))?;
-    let output = row
-        .try_get::<Option<Uuid>>("", "output_parameter_id")
+    let stored = StoredDefinition::from_query_result(&row, "")
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-    let formula = row
-        .try_get::<String>("", "formula")
-        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-    Ok((output, formula))
+    Ok((stored.output_parameter_id, stored.formula))
 }
 
 /// Delete existing sources and insert new ones for a derived definition.

@@ -12,7 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
@@ -45,7 +45,7 @@ pub struct ClosureQuery {
 
 /// What the store holds for one parameter of a calculation: whether anyone configured the slot,
 /// how much is there, and where it came from.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema, FromQueryResult)]
 pub struct SlotCoverage {
     pub parameter_id: Uuid,
     pub parameter_code: String,
@@ -154,7 +154,7 @@ pub async fn coverage_for(
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "SELECT p.id AS parameter_id, p.code, \
+                "SELECT p.id AS parameter_id, p.code AS parameter_code, \
                         COALESCE(cfg.sites_configured, 0) AS sites_configured, \
                         COALESCE(obs.reading_count, 0) AS reading_count, \
                         obs.first_reading, obs.last_reading, \
@@ -185,27 +185,10 @@ pub async fn coverage_for(
         ))
         .await?;
 
-    let mut coverage = Vec::with_capacity(rows.len());
-    for r in &rows {
-        coverage.push(SlotCoverage {
-            parameter_id: r.try_get("", "parameter_id")?,
-            parameter_code: r.try_get("", "code")?,
-            sites_configured: r.try_get("", "sites_configured")?,
-            reading_count: r.try_get("", "reading_count")?,
-            first_reading: r
-                .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "first_reading")?
-                .map(|t| t.with_timezone(&Utc)),
-            last_reading: r
-                .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "last_reading")?
-                .map(|t| t.with_timezone(&Utc)),
-            source_systems: r
-                .try_get::<Vec<String>>("", "source_systems")
-                .unwrap_or_default(),
-            run_sources: r
-                .try_get::<Vec<String>>("", "run_sources")
-                .unwrap_or_default(),
-        });
-    }
+    let coverage = rows
+        .iter()
+        .map(|r| SlotCoverage::from_query_result(r, ""))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(coverage)
 }
 

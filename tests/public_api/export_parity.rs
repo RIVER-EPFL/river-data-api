@@ -5,8 +5,8 @@
 //! a site reports the same definition of its own data to every consumer.
 //!
 //! Each test names the defect id it proves; the ids are documented in `../archived-documentation/defect-findings.md`.
-//! These run as a real Keycloak user so the flows are the ones a person performs, and self-skip
-//! when Keycloak is unreachable unless `REQUIRE_KEYCLOAK` is set.
+//! These run as a real Keycloak user so the flows are the ones a person performs, and run only
+//! under a profile covering Keycloak.
 //!
 //! Run: cargo test --test public_api export_parity -- --test-threads=1
 
@@ -213,7 +213,7 @@ fn ndjson_objects(body: &str) -> Vec<Value> {
 #[tokio::test]
 #[serial]
 async fn flagged_readings_are_served_consistently_by_count_series_and_aggregate() {
-    if !kc::require_keycloak_or_skip("flagged_readings_consistency").await {
+    if !crate::common::profile::Service::Keycloak.require("flagged_readings_consistency").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -370,7 +370,7 @@ async fn flagged_readings_are_served_consistently_by_count_series_and_aggregate(
 #[tokio::test]
 #[serial]
 async fn csv_and_ndjson_exports_honour_the_readings_opt_ins() {
-    if !kc::require_keycloak_or_skip("readings_export_opt_ins").await {
+    if !crate::common::profile::Service::Keycloak.require("readings_export_opt_ins").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -537,7 +537,7 @@ async fn csv_and_ndjson_exports_honour_the_readings_opt_ins() {
 #[tokio::test]
 #[serial]
 async fn sensor_readings_serve_one_parameter_not_every_channel() {
-    if !kc::require_keycloak_or_skip("sensor_readings_single_parameter").await {
+    if !crate::common::profile::Service::Keycloak.require("sensor_readings_single_parameter").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -653,7 +653,7 @@ async fn sensor_readings_serve_one_parameter_not_every_channel() {
 #[tokio::test]
 #[serial]
 async fn public_aggregates_list_only_the_requested_sites_parameters() {
-    if !kc::require_keycloak_or_skip("public_aggregate_phantom_series").await {
+    if !crate::common::profile::Service::Keycloak.require("public_aggregate_phantom_series").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -815,7 +815,7 @@ async fn public_aggregates_list_only_the_requested_sites_parameters() {
 #[tokio::test]
 #[serial]
 async fn site_alarms_leave_non_violating_timestamps_null_in_every_format() {
-    if !kc::require_keycloak_or_skip("site_alarms_null_fill").await {
+    if !crate::common::profile::Service::Keycloak.require("site_alarms_null_fill").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -946,7 +946,7 @@ async fn site_alarms_leave_non_violating_timestamps_null_in_every_format() {
 #[tokio::test]
 #[serial]
 async fn empty_results_are_delivered_in_the_requested_format() {
-    if !kc::require_keycloak_or_skip("empty_result_format").await {
+    if !crate::common::profile::Service::Keycloak.require("empty_result_format").await {
         return;
     }
     let db = crate::common::setup_test_db().await;

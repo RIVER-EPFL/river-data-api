@@ -19,8 +19,7 @@
 //!
 //! These run as real Keycloak users, each step as the level that owns it: provisioning and stream
 //! pairing are Administrator work, instrument and catalog surgery is MANAGER work, ingestion and
-//! flagging are RIVER work. They self-skip when Keycloak is unreachable unless `REQUIRE_KEYCLOAK`
-//! is set.
+//! flagging are RIVER work. They run only under a profile covering Keycloak.
 
 use axum::Router;
 use chrono::{DateTime, Duration, Utc};
@@ -209,7 +208,7 @@ fn readings_for(stream: &str) -> String {
 #[tokio::test]
 #[serial]
 async fn unpairing_a_stream_clears_readings_in_compressed_chunks() {
-    if !kc::require_keycloak_or_skip("unpairing_a_stream_clears_readings_in_compressed_chunks")
+    if !crate::common::profile::Service::Keycloak.require("unpairing_a_stream_clears_readings_in_compressed_chunks")
         .await
     {
         return;
@@ -340,7 +339,7 @@ async fn unpairing_a_stream_clears_readings_in_compressed_chunks() {
 #[tokio::test]
 #[serial]
 async fn deleting_a_calibration_or_deployment_rewrites_compressed_readings() {
-    if !kc::require_keycloak_or_skip("deleting_a_calibration_or_deployment_rewrites_compressed")
+    if !crate::common::profile::Service::Keycloak.require("deleting_a_calibration_or_deployment_rewrites_compressed")
         .await
     {
         return;
@@ -516,7 +515,7 @@ async fn deleting_a_calibration_or_deployment_rewrites_compressed_readings() {
 #[tokio::test]
 #[serial]
 async fn flagging_readings_is_all_or_nothing_and_refreshes_the_rollups() {
-    if !kc::require_keycloak_or_skip("flagging_readings_is_all_or_nothing").await {
+    if !crate::common::profile::Service::Keycloak.require("flagging_readings_is_all_or_nothing").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -660,7 +659,7 @@ async fn flagging_readings_is_all_or_nothing_and_refreshes_the_rollups() {
 #[tokio::test]
 #[serial]
 async fn merging_site_parameters_applies_every_step_or_none() {
-    if !kc::require_keycloak_or_skip("merging_site_parameters_applies_every_step_or_none").await {
+    if !crate::common::profile::Service::Keycloak.require("merging_site_parameters_applies_every_step_or_none").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -821,7 +820,7 @@ async fn merging_site_parameters_applies_every_step_or_none() {
 #[tokio::test]
 #[serial]
 async fn batch_overwrite_replaces_readings_in_compressed_chunks() {
-    if !kc::require_keycloak_or_skip("batch_overwrite_replaces_readings_in_compressed_chunks").await
+    if !crate::common::profile::Service::Keycloak.require("batch_overwrite_replaces_readings_in_compressed_chunks").await
     {
         return;
     }
@@ -941,7 +940,7 @@ async fn batch_overwrite_replaces_readings_in_compressed_chunks() {
 #[tokio::test]
 #[serial]
 async fn concurrent_pairings_of_one_stream_leave_a_single_winner() {
-    if !kc::require_keycloak_or_skip("concurrent_pairings_of_one_stream_leave_a_single_winner")
+    if !crate::common::profile::Service::Keycloak.require("concurrent_pairings_of_one_stream_leave_a_single_winner")
         .await
     {
         return;

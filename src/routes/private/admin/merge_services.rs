@@ -1,4 +1,4 @@
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -9,6 +9,26 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::views::{
     MoveScope, SlotMove, move_slot_rows, slot_move_collisions,
 };
+
+#[derive(Debug, FromQueryResult)]
+struct SlotRow {
+    id: Uuid,
+    site_id: Uuid,
+    parameter_id: Uuid,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct FormulaEdgeRow {
+    code: String,
+    output_parameter_id: Uuid,
+    parameter_id: Option<Uuid>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct SourceSlotRow {
+    id: Uuid,
+    site_id: Uuid,
+}
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct MergeSiteParametersRequest {
@@ -121,31 +141,24 @@ async fn validate_merge_candidates<C: ConnectionTrait>(
     source_id: Uuid,
     target_id: Uuid,
 ) -> AppResult<(Uuid, Uuid, Uuid, Uuid)> {
-    let sql = "SELECT id, site_id, parameter_id FROM site_parameters WHERE id = ANY($1)";
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            vec![vec![source_id, target_id].into()],
-        ))
-        .await
-        .map_err(AppError::Database)?;
+    let rows = SlotRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT id, site_id, parameter_id FROM site_parameters WHERE id = ANY($1)",
+        vec![vec![source_id, target_id].into()],
+    ))
+    .all(db)
+    .await
+    .map_err(AppError::Database)?;
 
     let mut source: Option<(Uuid, Uuid)> = None;
     let mut target: Option<(Uuid, Uuid)> = None;
 
     for row in &rows {
-        let id: Uuid = row.try_get("", "id").map_err(AppError::Database)?;
-        let site_id: Uuid = row.try_get("", "site_id").map_err(AppError::Database)?;
-        let param_id: Uuid = row
-            .try_get("", "parameter_id")
-            .map_err(AppError::Database)?;
-
-        if id == source_id {
-            source = Some((site_id, param_id));
+        if row.id == source_id {
+            source = Some((row.site_id, row.parameter_id));
         }
-        if id == target_id {
-            target = Some((site_id, param_id));
+        if row.id == target_id {
+            target = Some((row.site_id, row.parameter_id));
         }
     }
 
@@ -267,22 +280,22 @@ async fn refuse_derived_cycle<C: sea_orm::ConnectionTrait>(
     source_id: Uuid,
     target_id: Uuid,
 ) -> AppResult<()> {
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT d.id, d.code, d.output_parameter_id, src.parameter_id
+    let rows = FormulaEdgeRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT d.code, d.output_parameter_id, src.parameter_id
                FROM calculation_formulas d
                LEFT JOIN derived_parameter_sources src ON src.derived_definition_id = d.id
               WHERE d.output_parameter_id IS NOT NULL",
-            [],
-        ))
-        .await?;
+        [],
+    ))
+    .all(conn)
+    .await?;
 
     // Parameters as indices, with the merge applied: everything the source named is the target.
     let resolve = |id: Uuid| if id == source_id { target_id } else { id };
     let mut index: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
     let mut order_of: Vec<Uuid> = Vec::new();
-    let mut slot = |id: Uuid,
+    let slot = |id: Uuid,
                     index: &mut std::collections::HashMap<Uuid, usize>,
                     order_of: &mut Vec<Uuid>| {
         *index.entry(id).or_insert_with(|| {
@@ -293,11 +306,10 @@ async fn refuse_derived_cycle<C: sea_orm::ConnectionTrait>(
     let mut edges: Vec<(usize, usize)> = Vec::new();
     let mut definition_of: std::collections::HashMap<usize, String> =
         std::collections::HashMap::new();
-    for row in &rows {
-        let output: Uuid = resolve(row.try_get("", "output_parameter_id")?);
-        let to = slot(output, &mut index, &mut order_of);
-        definition_of.insert(to, row.try_get("", "code")?);
-        let Some(source) = row.try_get::<Option<Uuid>>("", "parameter_id")? else {
+    for row in rows {
+        let to = slot(resolve(row.output_parameter_id), &mut index, &mut order_of);
+        definition_of.insert(to, row.code);
+        let Some(source) = row.parameter_id else {
             continue;
         };
         let from = slot(resolve(source), &mut index, &mut order_of);
@@ -407,22 +419,22 @@ async fn merge_site_parameters_per_site(
 ) -> AppResult<(u64, u64, MergeTotals)> {
     let pg = sea_orm::DatabaseBackend::Postgres;
 
-    let source_sps = txn
-        .query_all_raw(Statement::from_sql_and_values(
-            pg,
-            "SELECT id, site_id FROM site_parameters WHERE parameter_id = $1",
-            vec![source_id.into()],
-        ))
-        .await
-        .map_err(AppError::Database)?;
+    let source_sps = SourceSlotRow::find_by_statement(Statement::from_sql_and_values(
+        pg,
+        "SELECT id, site_id FROM site_parameters WHERE parameter_id = $1",
+        vec![source_id.into()],
+    ))
+    .all(txn)
+    .await
+    .map_err(AppError::Database)?;
 
     let mut sites_merged: u64 = 0;
     let mut sites_reassigned: u64 = 0;
     let mut totals = MergeTotals::default();
 
     for row in &source_sps {
-        let sp_id: Uuid = row.try_get("", "id").map_err(AppError::Database)?;
-        let site_id: Uuid = row.try_get("", "site_id").map_err(AppError::Database)?;
+        let sp_id = row.id;
+        let site_id = row.site_id;
 
         let target_sp = txn
             .query_one_raw(Statement::from_sql_and_values(

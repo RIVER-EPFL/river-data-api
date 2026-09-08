@@ -80,7 +80,9 @@ pub fn kind_group(kind: &str) -> Option<KindGroup> {
     match kind {
         "alarm_opened" | "alarm_resolved" => Some(KindGroup::Alarms),
         "stale_data" | "sync_stale" | "sync_failure" | "streams_unpaired" | "holds_open"
-        | "job_failed" | "changes_pending" => Some(KindGroup::Sync),
+        | "job_failed" | "changes_pending" | "curve_drift" | "derived_computed" => {
+            Some(KindGroup::Sync)
+        }
         "battery_forecast" => Some(KindGroup::Prediction),
         _ => None,
     }
@@ -88,7 +90,7 @@ pub fn kind_group(kind: &str) -> Option<KindGroup> {
 
 /// Every kind the triggers emit. A kind absent from [`kind_group`] is delivered to every enabled
 /// recipient with no way to decline, so the list is here and the test below holds it to the map.
-pub const EMITTED_KINDS: [&str; 10] = [
+pub const EMITTED_KINDS: [&str; 12] = [
     "alarm_opened",
     "alarm_resolved",
     "battery_forecast",
@@ -99,6 +101,8 @@ pub const EMITTED_KINDS: [&str; 10] = [
     "holds_open",
     "job_failed",
     "changes_pending",
+    "curve_drift",
+    "derived_computed",
 ];
 
 /// The kind a message may carry without belonging to a group: the test send is addressed to

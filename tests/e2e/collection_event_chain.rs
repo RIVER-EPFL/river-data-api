@@ -157,14 +157,14 @@ async fn set_enabled(app: &axum::Router, admin: &str, name: &str, enabled: bool)
 #[tokio::test]
 #[serial]
 async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
-    if !kc::require_keycloak_or_skip(
+    if !crate::common::profile::Service::Keycloak.require(
         "two_tools_share_an_event_and_the_audit_and_executor_close_the_gap",
     )
     .await
     {
         return;
     }
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "two_tools_share_an_event_and_the_audit_and_executor_close_the_gap",
     )
     .await
@@ -526,14 +526,14 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
 #[serial]
 async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
     use sea_orm::ConnectionTrait;
-    if !kc::require_keycloak_or_skip(
+    if !crate::common::profile::Service::Keycloak.require(
         "an_upstream_correction_surfaces_as_stale_and_recompute_converges",
     )
     .await
     {
         return;
     }
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "an_upstream_correction_surfaces_as_stale_and_recompute_converges",
     )
     .await
@@ -765,14 +765,14 @@ async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
 #[serial]
 async fn an_unchanged_visit_recomputes_nothing_and_a_changed_input_reruns_once() {
     use sea_orm::ConnectionTrait;
-    if !kc::require_keycloak_or_skip(
+    if !crate::common::profile::Service::Keycloak.require(
         "an_unchanged_visit_recomputes_nothing_and_a_changed_input_reruns_once",
     )
     .await
     {
         return;
     }
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "an_unchanged_visit_recomputes_nothing_and_a_changed_input_reruns_once",
     )
     .await
@@ -1039,12 +1039,12 @@ async fn author_chain_with_failing_b(app: &axum::Router, admin: &str) {
 #[serial]
 async fn a_script_error_midway_skips_its_step_and_everything_downstream() {
     use sea_orm::ConnectionTrait;
-    if !kc::require_keycloak_or_skip("a_script_error_midway_skips_its_step_and_everything_downstream")
+    if !crate::common::profile::Service::Keycloak.require("a_script_error_midway_skips_its_step_and_everything_downstream")
         .await
     {
         return;
     }
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_script_error_midway_skips_its_step_and_everything_downstream",
     )
     .await

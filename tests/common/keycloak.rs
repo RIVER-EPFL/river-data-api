@@ -1,6 +1,6 @@
 //! Helpers for running the in-process app against the **dev Keycloak** (reused for JWT issuance +
-//! JWKS validation). Tests gate on `keycloak_reachable()` and skip when it's down, so the default
-//! suite stays green without Keycloak.
+//! JWKS validation). Tests gate on `Service::Keycloak.require`, which runs them when the profile
+//! covers Keycloak and fails when it does but Keycloak is not there.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,27 +78,6 @@ pub async fn keycloak_reachable() -> bool {
         return false;
     };
     matches!(client.get(&url).send().await, Ok(r) if r.status().is_success())
-}
-
-/// Gate a Keycloak-dependent test: true to proceed, false to skip.
-///
-/// Skipping reports as a pass, so a CI run with no Keycloak would silently assert nothing. Setting
-/// `REQUIRE_KEYCLOAK` turns the skip into a panic, which is what makes "the e2e suite runs in CI"
-/// mean anything. Left unset locally so a bare `cargo test` still works without the dev stack.
-pub async fn require_keycloak_or_skip(test_name: &str) -> bool {
-    if keycloak_reachable().await {
-        return true;
-    }
-    assert!(
-        std::env::var("REQUIRE_KEYCLOAK").is_err(),
-        "REQUIRE_KEYCLOAK is set but Keycloak at {} is unreachable, so {test_name} cannot run",
-        keycloak_base_url()
-    );
-    eprintln!(
-        "skipping {test_name}: Keycloak unreachable at {}",
-        keycloak_base_url()
-    );
-    false
 }
 
 /// Obtain a service-account admin token for the dev Keycloak's admin REST API (client credentials

@@ -141,7 +141,7 @@ async fn csv_track_with_import(
 #[tokio::test]
 #[serial]
 async fn job_log_tail_is_ordered_by_seq_and_returns_only_lines_after_it() {
-    if !kc::require_keycloak_or_skip("job_log_tail_ordering").await {
+    if !crate::common::profile::Service::Keycloak.require("job_log_tail_ordering").await {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -321,7 +321,7 @@ async fn job_log_tail_is_ordered_by_seq_and_returns_only_lines_after_it() {
 #[tokio::test]
 #[serial]
 async fn job_log_tail_requires_read_data() {
-    if !kc::require_keycloak_or_skip("job_log_tail_gate").await {
+    if !crate::common::profile::Service::Keycloak.require("job_log_tail_gate").await {
         return;
     }
     let db = crate::common::setup_test_db().await;

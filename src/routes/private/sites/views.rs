@@ -6,7 +6,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement,
+    ColumnTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement,
 };
 use uuid::Uuid;
 
@@ -41,6 +41,32 @@ struct RecentExtentRow {
     max_time: Option<DateTime<Utc>>,
     spot_count: i64,
     continuous_count: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct FlaggedHeadRow {
+    parameter_id: Uuid,
+    min_time: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct CursorRow {
+    parameter_id: Uuid,
+    max_time: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct DeployedFrequencyRow {
+    parameter_id: Option<Uuid>,
+    any_low: bool,
+    any_high: bool,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct DeclaredFrequencyRow {
+    parameter_id: Uuid,
+    any_spot: bool,
+    any_continuous: bool,
 }
 
 struct ParameterExtent {
@@ -142,37 +168,35 @@ async fn parameter_extents(
     .await?;
 
     let mut flagged_heads: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
-    for row in db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT parameter_id, MIN(time) AS min_time FROM readings \
+    for row in FlaggedHeadRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT parameter_id, MIN(time) AS min_time FROM readings \
              WHERE site_id = $1 AND parameter_id IS NOT NULL AND is_flagged \
              GROUP BY parameter_id",
-            [site_id.into()],
-        ))
-        .await?
+        [site_id.into()],
+    ))
+    .all(db)
+    .await?
     {
-        let parameter_id: Uuid = row.try_get("", "parameter_id")?;
-        if let Ok(t) = row.try_get::<DateTime<Utc>>("", "min_time") {
-            flagged_heads.insert(parameter_id, t);
+        if let Some(t) = row.min_time {
+            flagged_heads.insert(row.parameter_id, t);
         }
     }
 
     let mut cursors: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
-    for row in db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT sp.parameter_id, MAX(ds.last_data_time) AS max_time \
+    for row in CursorRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT sp.parameter_id, MAX(ds.last_data_time) AS max_time \
              FROM data_streams ds JOIN site_parameters sp ON ds.site_parameter_id = sp.id \
              WHERE sp.site_id = $1 AND ds.last_data_time IS NOT NULL \
              GROUP BY sp.parameter_id",
-            [site_id.into()],
-        ))
-        .await?
+        [site_id.into()],
+    ))
+    .all(db)
+    .await?
     {
-        let parameter_id: Uuid = row.try_get("", "parameter_id")?;
-        if let Ok(t) = row.try_get::<DateTime<Utc>>("", "max_time") {
-            cursors.insert(parameter_id, t);
+        if let Some(t) = row.max_time {
+            cursors.insert(row.parameter_id, t);
         }
     }
 
@@ -249,25 +273,22 @@ async fn declared_frequencies(
 ) -> AppResult<HashMap<Uuid, &'static str>> {
     let mut map: HashMap<Uuid, &'static str> = HashMap::new();
 
-    for row in db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT d.parameter_id, bool_or(sn.data_frequency = 'low') AS any_low, \
+    for row in DeployedFrequencyRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT d.parameter_id, bool_or(sn.data_frequency = 'low') AS any_low, \
                     bool_or(sn.data_frequency = 'high') AS any_high \
              FROM sensor_deployments d JOIN sensors sn ON sn.id = d.sensor_id \
              WHERE d.site_id = $1 AND d.deployed_until IS NULL \
              GROUP BY d.parameter_id",
-            [site_id.into()],
-        ))
-        .await?
+        [site_id.into()],
+    ))
+    .all(db)
+    .await?
     {
-        let parameter_id: Option<Uuid> = row.try_get("", "parameter_id")?;
-        let any_low: bool = row.try_get("", "any_low")?;
-        let any_high: bool = row.try_get("", "any_high")?;
-        if let Some(pid) = parameter_id {
+        if let Some(pid) = row.parameter_id {
             map.insert(
                 pid,
-                match (any_high, any_low) {
+                match (row.any_high, row.any_low) {
                     (false, true) => "low",
                     (true, true) => "mixed",
                     _ => "high",
@@ -276,24 +297,21 @@ async fn declared_frequencies(
         }
     }
 
-    for row in db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT sp.parameter_id, bool_or(ds.measurement_type = 'spot') AS any_spot, \
+    for row in DeclaredFrequencyRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT sp.parameter_id, bool_or(ds.measurement_type = 'spot') AS any_spot, \
                     bool_or(ds.measurement_type <> 'spot') AS any_continuous \
              FROM site_parameters sp JOIN data_streams ds ON ds.site_parameter_id = sp.id \
              WHERE sp.site_id = $1 AND ds.measurement_type IS NOT NULL \
              GROUP BY sp.parameter_id",
-            [site_id.into()],
-        ))
-        .await?
+        [site_id.into()],
+    ))
+    .all(db)
+    .await?
     {
-        let parameter_id: Uuid = row.try_get("", "parameter_id")?;
-        let any_spot: bool = row.try_get("", "any_spot")?;
-        let any_continuous: bool = row.try_get("", "any_continuous")?;
         map.insert(
-            parameter_id,
-            match (any_continuous, any_spot) {
+            row.parameter_id,
+            match (row.any_continuous, row.any_spot) {
                 (false, true) => "low",
                 (true, true) => "mixed",
                 _ => "high",

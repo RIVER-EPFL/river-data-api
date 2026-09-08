@@ -17,7 +17,9 @@
 //! *any* of them is, matching how the same rows are filtered on read. A write that must hold every
 //! project goes through [`require_sites_in_scope`].
 
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
+use sea_orm::{
+    ConnectionTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Statement,
+};
 use uuid::Uuid;
 
 use crate::common::authz::AccessScope;
@@ -190,6 +192,13 @@ pub async fn project_of_sensor(db: &DatabaseConnection, sensor_id: Uuid) -> AppR
     .await
 }
 
+/// One row of a resolver query: whether the row targets nothing, and the project it reaches.
+#[derive(FromQueryResult)]
+struct ScopeRow {
+    untargeted: bool,
+    project_id: Option<Uuid>,
+}
+
 /// Run a resolver query returning `(untargeted, project_id)` rows and classify the result.
 async fn resolve(db: &DatabaseConnection, sql: &str, id: Uuid) -> AppResult<RowProject> {
     let rows = db
@@ -202,19 +211,21 @@ async fn resolve(db: &DatabaseConnection, sql: &str, id: Uuid) -> AppResult<RowP
     if rows.is_empty() {
         return Ok(RowProject::Missing);
     }
-    let mut projects: Vec<Uuid> = rows
+    // A row this resolver cannot read is not a row that belongs to no project: the caller's reach
+    // would then be decided by which default was typed. Every query above selects `untargeted` as
+    // a boolean and `project_id` as a nullable uuid, so a failure to decode either is the query
+    // and its resolver disagreeing, and it is answered as an error.
+    let resolved = rows
         .iter()
-        .filter_map(|r| r.try_get::<Option<Uuid>>("", "project_id").ok().flatten())
-        .collect();
+        .map(|r| ScopeRow::from_query_result(r, ""))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut projects: Vec<Uuid> = resolved.iter().filter_map(|r| r.project_id).collect();
     projects.sort_unstable();
     projects.dedup();
     if !projects.is_empty() {
         return Ok(RowProject::In(projects));
     }
-    let untargeted = rows
-        .iter()
-        .any(|r| r.try_get::<bool>("", "untargeted").unwrap_or(false));
-    Ok(if untargeted {
+    Ok(if resolved.iter().any(|r| r.untargeted) {
         RowProject::Global
     } else {
         RowProject::Unresolved

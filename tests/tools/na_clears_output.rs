@@ -147,7 +147,7 @@ async fn setup(temperature: f64) -> (DatabaseConnection, river_db::common::AppSt
 #[tokio::test]
 #[serial]
 async fn a_recompute_that_yields_na_withdraws_the_stored_output() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_recompute_that_yields_na_withdraws_the_stored_output",
     )
     .await
@@ -181,7 +181,7 @@ async fn a_recompute_that_yields_na_withdraws_the_stored_output() {
 #[tokio::test]
 #[serial]
 async fn a_computed_value_replaces_the_stored_one_and_withdraws_nothing() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_computed_value_replaces_the_stored_one_and_withdraws_nothing",
     )
     .await
@@ -203,7 +203,7 @@ async fn a_computed_value_replaces_the_stored_one_and_withdraws_nothing() {
 #[tokio::test]
 #[serial]
 async fn a_judged_output_keeps_its_value_when_the_recompute_yields_na() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_judged_output_keeps_its_value_when_the_recompute_yields_na",
     )
     .await

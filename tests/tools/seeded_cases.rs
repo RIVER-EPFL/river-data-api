@@ -49,7 +49,7 @@ async fn active_versions(db: &DatabaseConnection) -> Vec<ActiveVersion> {
 #[tokio::test]
 #[serial]
 async fn every_active_tool_version_passes_its_stored_cases() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "every_active_tool_version_passes_its_stored_cases",
     )
     .await

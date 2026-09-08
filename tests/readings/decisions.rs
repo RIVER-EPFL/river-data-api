@@ -128,6 +128,30 @@ async fn record(db: &DatabaseConnection, d: Decision) -> Uuid {
         .expect("decision recorded")
 }
 
+/// Insert a decision of a kind nothing records any more (Q117), which is how a stored one exists:
+/// the trigger projects it and the drift report folds it exactly as when a route wrote it.
+async fn record_historical(db: &DatabaseConnection, d: &Decision) {
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO reading_decisions
+                 (stream_id, time, replicate_index, kind, old, new, actor, reason, origin)
+             VALUES ('{stream}', '{time}', {index}, '{kind}', '{{}}'::jsonb, '{new}'::jsonb,
+                     '{actor}', 'test', 'manual')",
+            stream = d.key.stream_id,
+            time = d.key.time.to_rfc3339(),
+            index = d
+                .key
+                .replicate_index
+                .map_or("NULL".to_string(), |i| i.to_string()),
+            kind = d.kind.as_str(),
+            new = d.new,
+            actor = d.actor,
+        ),
+    )
+    .await;
+}
+
 #[tokio::test]
 #[serial]
 async fn a_flag_projects_in_the_same_transaction_and_an_unflag_supersedes_it() {
@@ -708,185 +732,6 @@ async fn a_derivation_writer_appends_no_decision() {
     );
 }
 
-// --- Pins: a set-level attribution that reprocess honours (M59) ----------------------------
-
-async fn sensor_of(f: &Fixture, at: &str) -> Option<String> {
-    f.db.query_one_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        format!(
-            "SELECT sensor_id::text AS sensor_id FROM readings \
-                 WHERE stream_id = '{}' AND time = '{at}' AND replicate_index = 0",
-            f.stream
-        ),
-    ))
-    .await
-    .unwrap()
-    .and_then(|r| r.try_get::<Option<String>>("", "sensor_id").ok().flatten())
-}
-
-#[tokio::test]
-#[serial]
-async fn a_pinned_instrument_survives_reprocess_and_a_rolled_back_pin_returns_the_window() {
-    let f = setup().await;
-    let times = [
-        "2025-06-15T10:00:00Z",
-        "2025-06-15T11:00:00Z",
-        "2025-06-15T12:00:00Z",
-    ];
-    for (i, t) in times.iter().enumerate() {
-        crate::common::exec(
-            &f.db,
-            &format!(
-                "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, \
-                 calibrated_value, replicate_index, measurement_type) \
-                 VALUES ('{}', '{}', '{}', '{t}', {i}, {i}, 0, 'continuous')",
-                f.stream,
-                crate::common::SITE1_ID,
-                crate::common::GLOBAL_PARAM_TEMP_ID
-            ),
-        )
-        .await;
-    }
-    let a = crate::common::e2e::create_sensor(
-        &f.app,
-        &f.token,
-        crate::common::GLOBAL_PARAM_TEMP_ID,
-        "PIN-A",
-    )
-    .await;
-    let b = crate::common::e2e::create_sensor(
-        &f.app,
-        &f.token,
-        crate::common::GLOBAL_PARAM_TEMP_ID,
-        "PIN-B",
-    )
-    .await;
-    crate::common::e2e::create_deployment(
-        &f.app,
-        &f.token,
-        &a,
-        crate::common::SITE1_ID,
-        crate::common::GLOBAL_PARAM_TEMP_ID,
-        "2025-06-01T00:00:00Z",
-    )
-    .await;
-    assert!(crate::common::e2e::wait_for_jobs_by_trigger(&f.db, "deployment_create", 60).await);
-    for t in times {
-        assert_eq!(
-            sensor_of(&f, t).await.as_deref(),
-            Some(a.as_str()),
-            "window owns {t}"
-        );
-    }
-
-    // Two rows turn out to be instrument B's: pinned as one set.
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &f.app,
-        "/api/readings/pins",
-        &serde_json::json!({
-            "kind": "instrument",
-            "target_id": b,
-            "selection": { "keys": [
-                { "stream_id": f.stream, "time": times[1], "replicate_index": 0 },
-                { "stream_id": f.stream, "time": times[2], "replicate_index": 0 },
-            ]},
-            "reason": "logged by the spare probe",
-        }),
-        &f.token,
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["rows_decided"], 2);
-    let set_id = body["set_id"].as_str().unwrap().to_string();
-    assert!(crate::common::e2e::wait_for_jobs_by_trigger(&f.db, "attribution_pin", 60).await);
-    assert_eq!(sensor_of(&f, times[0]).await.as_deref(), Some(a.as_str()));
-    assert_eq!(sensor_of(&f, times[1]).await.as_deref(), Some(b.as_str()));
-    assert_eq!(sensor_of(&f, times[2]).await.as_deref(), Some(b.as_str()));
-
-    // A reprocess of the slot re-derives by window and leaves the pinned rows alone.
-    river_db::routes::private::sensors::calibrations::service::reprocess_site_parameter_readings(
-        &f.db,
-        crate::common::SITE1_ID.parse().unwrap(),
-        crate::common::GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
-    )
-    .await
-    .expect("reprocess runs");
-    assert_eq!(sensor_of(&f, times[0]).await.as_deref(), Some(a.as_str()));
-    assert_eq!(
-        sensor_of(&f, times[1]).await.as_deref(),
-        Some(b.as_str()),
-        "the pin holds"
-    );
-    assert_eq!(
-        sensor_of(&f, times[2]).await.as_deref(),
-        Some(b.as_str()),
-        "the pin holds"
-    );
-
-    // The provenance record shows the pin on the pinned instant and none on the other.
-    let (status, record) = crate::common::get_json_with_token(
-        &f.app,
-        &format!(
-            "/api/readings/provenance?stream_id={}&time={}",
-            f.stream, times[1]
-        ),
-        &f.token,
-    )
-    .await;
-    assert_eq!(status, 200, "{record}");
-    let pins = &record["records"][0]["chain"]["pins"];
-    assert_eq!(pins.as_array().map(Vec::len), Some(1), "{record}");
-    assert_eq!(pins[0]["kind"], "instrument_pin");
-    assert_eq!(pins[0]["target"]["sensor_id"], b);
-    let (_, record) = crate::common::get_json_with_token(
-        &f.app,
-        &format!(
-            "/api/readings/provenance?stream_id={}&time={}",
-            f.stream, times[0]
-        ),
-        &f.token,
-    )
-    .await;
-    assert!(record["records"][0]["chain"]["pins"].is_null(), "{record}");
-
-    // Rolling the set back returns the rows to the window, and a second rollback is refused.
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &f.app,
-        &format!("/api/readings/pins/{set_id}/rollback"),
-        &serde_json::json!({}),
-        &f.token,
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["rolled_back"], 2);
-    assert!(crate::common::e2e::wait_for_jobs_by_trigger(&f.db, "attribution_pin", 60).await);
-    for t in times {
-        assert_eq!(
-            sensor_of(&f, t).await.as_deref(),
-            Some(a.as_str()),
-            "window owns {t} again"
-        );
-    }
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &f.app,
-        &format!("/api/readings/pins/{set_id}/rollback"),
-        &serde_json::json!({}),
-        &f.token,
-    )
-    .await;
-    assert_eq!(status, 409, "{body}");
-
-    // An empty selection is refused before anything is recorded.
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &f.app,
-        "/api/readings/pins",
-        &serde_json::json!({ "kind": "instrument", "target_id": b, "selection": {} }),
-        &f.token,
-    )
-    .await;
-    assert_eq!(status, 400, "{body}");
-}
-
 /// Every key the record and the reading disagree about, as the janitor counts them.
 async fn drift_keys(db: &DatabaseConnection) -> Vec<(Uuid, i16)> {
     let rows = db
@@ -1377,7 +1222,12 @@ async fn every_kind_moves_exactly_the_columns_it_declares() {
         )
         .await;
         let before = snapshot(&f, 0).await;
-        record(&f.db, decision(&f, kind, Some(0), new)).await;
+        let d = decision(&f, kind, Some(0), new);
+        if kind.writable() {
+            record(&f.db, d).await;
+        } else {
+            record_historical(&f.db, &d).await;
+        }
         let after = snapshot(&f, 0).await;
         let mut declared: Vec<String> = kind
             .projected_columns()
@@ -1448,9 +1298,9 @@ async fn the_drift_report_folds_every_column_a_decision_asserts() {
         "an instrument nothing pinned is not a disagreement"
     );
 
-    record(
+    record_historical(
         &f.db,
-        decision(
+        &decision(
             &f,
             Kind::InstrumentPin,
             Some(0),

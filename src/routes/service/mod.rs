@@ -574,10 +574,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         .route("/actions/reprocess", post(actions::reprocess_sensor))
         .route(
-            "/readings/pins",
-            post(crate::routes::private::readings::decisions::pin_readings),
-        )
-        .route(
             "/sensor_calibrations/{id}/retire",
             post(crate::routes::private::sensors::calibrations::retire::retire_calibration),
         )
@@ -592,10 +588,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .route(
             "/standard_curves/{id}/unretire",
             post(crate::routes::private::sensors::standard_curves::retire::unretire_standard_curve),
-        )
-        .route(
-            "/readings/pins/{set_id}/rollback",
-            post(crate::routes::private::readings::decisions::rollback_pin_set),
         )
         .route(
             "/actions/derived_parameters/{id}/recompute",

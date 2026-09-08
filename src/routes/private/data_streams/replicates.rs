@@ -202,6 +202,18 @@ pub fn pin_assignments(
     Ok(stored)
 }
 
+/// The `source_key` column of a family scan. `data_streams.source_key` is NOT NULL, so a row that
+/// does not decode is a family missing from a set that decides whether a retag is refused, not a
+/// stream without a key.
+fn source_keys(rows: &[sea_orm::QueryResult]) -> AppResult<Vec<String>> {
+    rows.iter()
+        .map(|r| {
+            r.try_get::<String>("", "source_key")
+                .map_err(AppError::from)
+        })
+        .collect()
+}
+
 /// The `source_key`s of the replicate families in a stream selection, matching the selection
 /// `/streams/retag` updates.
 pub async fn family_keys_in_streams<C: ConnectionTrait>(
@@ -223,10 +235,7 @@ pub async fn family_keys_in_streams<C: ConnectionTrait>(
             ],
         ))
         .await?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| r.try_get::<String>("", "source_key").ok())
-        .collect())
+    source_keys(&rows)
 }
 
 /// The `source_key`s of the replicate families these sensors reach: streams the sensor owns, and
@@ -248,10 +257,7 @@ pub async fn family_keys_for_sensors<C: ConnectionTrait>(
             [sensor_ids.to_vec().into(), METADATA_KEY.into()],
         ))
         .await?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| r.try_get::<String>("", "source_key").ok())
-        .collect())
+    source_keys(&rows)
 }
 
 /// The `source_key`s of the replicate families a `measurement_retag` scope reaches, mirroring the
@@ -282,10 +288,7 @@ pub async fn family_keys_in_retag_scope<C: ConnectionTrait>(
             ],
         ))
         .await?;
-    Ok(rows
-        .iter()
-        .filter_map(|r| r.try_get::<String>("", "source_key").ok())
-        .collect())
+    source_keys(&rows)
 }
 
 /// A replicate family stays classified spot for the same reason one may not be registered any

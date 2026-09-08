@@ -2,7 +2,7 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -38,7 +38,20 @@ pub struct JobLogsQuery {
     pub limit: Option<u64>,
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, FromQueryResult)]
+struct CancelTargetRow {
+    trigger_type: String,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct RerunTargetRow {
+    trigger_type: String,
+    sensor_id: Option<Uuid>,
+    trigger_id: Option<Uuid>,
+    params: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema, FromQueryResult)]
 pub struct JobLogLine {
     pub seq: i64,
     pub ts: chrono::DateTime<chrono::Utc>,
@@ -69,29 +82,16 @@ pub async fn get_job_logs(
     let limit = i64::try_from(q.limit.unwrap_or(1000).min(5000)).unwrap_or(1000);
     let after = q.after_seq.unwrap_or(-1);
 
-    let rows = state
-        .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT seq, ts, level, message, context \
+    let out = JobLogLine::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT seq, ts, level, message, context \
              FROM reprocessing_job_logs \
              WHERE job_id = $1 AND seq > $2 \
              ORDER BY seq ASC LIMIT $3",
-            [id.into(), after.into(), limit.into()],
-        ))
-        .await?;
-
-    let mut out = Vec::with_capacity(rows.len());
-    for r in &rows {
-        let ts: chrono::DateTime<chrono::FixedOffset> = r.try_get("", "ts")?;
-        out.push(JobLogLine {
-            seq: r.try_get("", "seq")?,
-            ts: ts.with_timezone(&chrono::Utc),
-            level: r.try_get("", "level")?,
-            message: r.try_get("", "message")?,
-            context: r.try_get("", "context")?,
-        });
-    }
+        [id.into(), after.into(), limit.into()],
+    ))
+    .all(&state.db)
+    .await?;
     Ok(Json(out))
 }
 
@@ -122,17 +122,16 @@ pub async fn cancel_job(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<CancelResponse>> {
     confine_job(&state, &scope, id).await?;
-    let row = state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT trigger_type, status FROM reprocessing_jobs WHERE id = $1",
-            [id.into()],
-        ))
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("job {id} not found")))?;
+    let row = CancelTargetRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT trigger_type FROM reprocessing_jobs WHERE id = $1",
+        [id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("job {id} not found")))?;
 
-    let trigger_type: String = row.try_get("", "trigger_type")?;
+    let trigger_type = row.trigger_type;
     if !super::registry::is_cancellable(&trigger_type) {
         return Err(AppError::Conflict(format!(
             "jobs of type '{trigger_type}' cannot be cancelled once running"
@@ -193,20 +192,21 @@ pub async fn rerun_job(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<RerunResponse>> {
     confine_job(&state, &scope, id).await?;
-    let row = state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT trigger_type, sensor_id, trigger_id, params FROM reprocessing_jobs WHERE id = $1",
-            [id.into()],
-        ))
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("job {id} not found")))?;
+    let row = RerunTargetRow::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT trigger_type, sensor_id, trigger_id, params FROM reprocessing_jobs WHERE id = $1",
+        [id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("job {id} not found")))?;
 
-    let trigger_type: String = row.try_get("", "trigger_type")?;
-    let sensor_id: Option<Uuid> = row.try_get("", "sensor_id")?;
-    let trigger_id: Option<Uuid> = row.try_get("", "trigger_id")?;
-    let params: serde_json::Value = row.try_get("", "params").unwrap_or(serde_json::Value::Null);
+    let RerunTargetRow {
+        trigger_type,
+        sensor_id,
+        trigger_id,
+        params,
+    } = row;
 
     if !super::registry::is_rerunnable(&trigger_type) {
         return Err(AppError::Conflict(format!(

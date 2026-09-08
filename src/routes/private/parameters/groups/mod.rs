@@ -6,12 +6,13 @@
 //! - `label`: the member's, else `parameters.name`
 //! - `units`: the member's, else `parameters.default_units` (empty string reads as absent)
 //! - `description`: the member's, else `parameters.description`
-//! - `decimal_places`: the member's, else none
 //!
-//! `site_parameters` enters only for `sd_estimator`, and only when the caller names a site: the
-//! divisor is declared per slot and is never inferred. The site's own `decimal_places`, which is
-//! what the public API rounds with, is not in the chain, so a member declaring none carries none
-//! and a consumer that rounds does it from `/sites/{id}/parameters`.
+//! `decimal_places` is the exception and resolves nothing from the member, because a group does not
+//! declare one (Q120): it is `site_parameters.decimal_places` when the caller names a site, else the
+//! platform default of 2. Rounding is presentation and full resolution is what is stored, so a slot
+//! that wants more or fewer places declares them, and the number a form shows is the number the
+//! public API rounds with. `site_parameters` also supplies `sd_estimator`, and only when the caller
+//! names a site: the divisor is declared per slot and is never inferred.
 
 pub mod definition;
 pub mod intermediates;

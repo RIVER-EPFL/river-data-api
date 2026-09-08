@@ -69,14 +69,14 @@ fn cases(expected: f64) -> serde_json::Value {
 #[tokio::test]
 #[serial]
 async fn a_version_is_identified_by_its_whole_content_and_carries_a_note() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_version_is_identified_by_its_whole_content_and_carries_a_note",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_script_content_identity").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_script_content_identity").await {
         return;
     }
     let (app, admin, sid) = setup("content_identity").await;
@@ -173,14 +173,14 @@ async fn a_version_is_identified_by_its_whole_content_and_carries_a_note() {
 #[tokio::test]
 #[serial]
 async fn activation_credits_the_caller_not_the_request_body() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "activation_credits_the_caller_not_the_request_body",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_script_activation_actor").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_script_activation_actor").await {
         return;
     }
     let (app, admin, sid) = setup("activation_actor").await;
@@ -226,14 +226,14 @@ async fn activation_credits_the_caller_not_the_request_body() {
 #[tokio::test]
 #[serial]
 async fn validation_applies_the_manifest_the_calculate_path_applies() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "validation_applies_the_manifest_the_calculate_path_applies",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_script_validation_manifest").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_script_validation_manifest").await {
         return;
     }
     let (app, admin, sid) = setup("validation_manifest").await;
@@ -325,14 +325,14 @@ const LINT_SUBJECT: &str = r#"tool <- function(inputs, constants, curves) {
 #[tokio::test]
 #[serial]
 async fn the_lint_names_file_writes_and_reads_strings_as_strings() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "the_lint_names_file_writes_and_reads_strings_as_strings",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_script_lint").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_script_lint").await {
         return;
     }
     let (app, admin, sid) = setup("lint_subject").await;
@@ -386,14 +386,14 @@ async fn the_lint_names_file_writes_and_reads_strings_as_strings() {
 #[tokio::test]
 #[serial]
 async fn a_script_that_does_not_parse_as_r_is_refused_with_its_line() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_script_that_does_not_parse_as_r_is_refused_with_its_line",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_script_syntax").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_script_syntax").await {
         return;
     }
     let (app, admin, sid) = setup("syntax_subject").await;
@@ -442,14 +442,14 @@ const BYPASS_SUBJECT: &str = r####"tool <- function(inputs, constants, curves) {
 #[tokio::test]
 #[serial]
 async fn no_spelling_of_a_forbidden_call_gets_past_the_lint() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "no_spelling_of_a_forbidden_call_gets_past_the_lint",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_script_bypass").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_script_bypass").await {
         return;
     }
     let (app, admin, sid) = setup("bypass_subject").await;
@@ -513,14 +513,14 @@ const INDIRECTION_SUBJECT: &str = r#"tool <- function(inputs, constants, curves)
 #[tokio::test]
 #[serial]
 async fn a_forbidden_name_is_reached_through_an_index_a_slot_or_a_namespace() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_forbidden_name_is_reached_through_an_index_a_slot_or_a_namespace",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_script_indirection").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_script_indirection").await {
         return;
     }
     let (app, admin, sid) = setup("indirection_subject").await;
@@ -577,14 +577,14 @@ async fn a_forbidden_name_is_reached_through_an_index_a_slot_or_a_namespace() {
 #[tokio::test]
 #[serial]
 async fn a_raw_string_does_not_blind_the_line_after_it() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_raw_string_does_not_blind_the_line_after_it",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_script_raw_string").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_script_raw_string").await {
         return;
     }
     let (app, admin, sid) = setup("raw_string_subject").await;
@@ -662,14 +662,14 @@ async fn stored_stamp(db: &DatabaseConnection, vid: &str) -> Option<String> {
 #[tokio::test]
 #[serial]
 async fn a_failed_revalidation_clears_the_stamp_and_blocks_activation() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_failed_revalidation_clears_the_stamp_and_blocks_activation",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_script_stale_stamp").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_script_stale_stamp").await {
         return;
     }
     let (app, admin, sid, db) = setup_with_db("stale_stamp_subject").await;
@@ -745,14 +745,14 @@ async fn a_failed_revalidation_clears_the_stamp_and_blocks_activation() {
 #[tokio::test]
 #[serial]
 async fn activation_runs_the_cases_rather_than_trusting_the_stamp() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "activation_runs_the_cases_rather_than_trusting_the_stamp",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_script_activation_runs_cases").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_script_activation_runs_cases").await {
         return;
     }
     let (app, admin, sid, db) = setup_with_db("activation_gate_subject").await;
@@ -831,14 +831,14 @@ async fn activation_runs_the_cases_rather_than_trusting_the_stamp() {
 #[tokio::test]
 #[serial]
 async fn every_shipped_tool_script_passes_the_lint() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "every_shipped_tool_script_passes_the_lint",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_script_seed_lint").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_script_seed_lint").await {
         return;
     }
     let (app, admin, sid, db) = setup_with_db("seed_lint_subject").await;
@@ -889,14 +889,14 @@ async fn every_shipped_tool_script_passes_the_lint() {
 #[tokio::test]
 #[serial]
 async fn an_authored_hash_recomputes_from_the_stored_version() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "an_authored_hash_recomputes_from_the_stored_version",
     )
     .await
     {
         return;
     }
-    if !kc::require_keycloak_or_skip("tool_script_stored_hash").await {
+    if !crate::common::profile::Service::Keycloak.require("tool_script_stored_hash").await {
         return;
     }
     let (app, admin, sid) = setup("stored_hash").await;

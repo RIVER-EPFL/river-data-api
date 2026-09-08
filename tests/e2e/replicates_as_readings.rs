@@ -64,7 +64,7 @@ fn reading(sensor_id: &str, curve_id: &str, value: f64, index: i16) -> serde_jso
 #[tokio::test]
 #[serial]
 async fn typed_replicates_are_stored_at_their_index_with_the_curve_the_run_applied() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "typed_replicates_are_stored_at_their_index_with_the_curve_the_run_applied",
     )
     .await
@@ -174,7 +174,7 @@ async fn typed_replicates_are_stored_at_their_index_with_the_curve_the_run_appli
 #[tokio::test]
 #[serial]
 async fn a_replicate_the_run_did_not_consume_is_refused() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_replicate_the_run_did_not_consume_is_refused",
     )
     .await
@@ -242,7 +242,7 @@ const POPULATION_SD: f64 = 1.632_993_161_855_452;
 #[tokio::test]
 #[serial]
 async fn a_per_instant_declaration_moves_the_sd_the_tool_displays() {
-    if !crate::common::tools_runner::require_runner_or_skip(
+    if !crate::common::profile::Service::ToolsRunner.require(
         "a_per_instant_declaration_moves_the_sd_the_tool_displays",
     )
     .await

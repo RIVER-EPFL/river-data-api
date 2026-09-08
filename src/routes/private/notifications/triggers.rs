@@ -113,6 +113,12 @@ pub async fn run(state: &AppState, channels: &[Box<dyn NotificationChannel>]) {
     if let Err(e) = changes_pending(state, channels).await {
         tracing::warn!(error = %e, "pending-change trigger failed");
     }
+    if let Err(e) = curve_drift(state, channels).await {
+        tracing::warn!(error = %e, "curve-drift trigger failed");
+    }
+    if let Err(e) = derived_computed(state, channels).await {
+        tracing::warn!(error = %e, "derived-computed trigger failed");
+    }
 }
 
 async fn state_get(
@@ -742,6 +748,99 @@ async fn arrivals_by_source(
     rows.iter()
         .map(|r| Ok((r.try_get("", "source_system")?, r.try_get("", "n")?)))
         .collect()
+}
+
+/// The longest a recomposed value goes unannounced when the digest cannot be claimed.
+const CURVE_DRIFT_WINDOW_HOURS: i64 = 24;
+
+/// Values the janitor recomposed because they had drifted from the curves their own rows name
+/// (Q57, Q118). The sweep repairs and records rather than asking, so this says what moved and
+/// where to read it, and the ledger carries the rollback.
+async fn curve_drift(
+    state: &AppState,
+    channels: &[Box<dyn NotificationChannel>],
+) -> Result<(), DbErr> {
+    let db = &state.db;
+    let since = state_get(db, "curve_drift", "all")
+        .await?
+        .map(|(_, at)| at)
+        .unwrap_or_else(|| Utc::now() - Duration::hours(CURVE_DRIFT_WINDOW_HOURS));
+    let moved = decisions_since(db, "curve_recompose", since).await?;
+    if moved == 0 {
+        state_clear(db, "curve_drift", "all").await?;
+        return Ok(());
+    }
+    if !claim_cas(db, "curve_drift", "all", since).await? {
+        return Ok(());
+    }
+    let msg = OutgoingMessage {
+        kind: "curve_drift",
+        subject: format!("RIVER Data: {moved} corrected value(s) recomposed"),
+        body: format!(
+            "🧮 {moved} stored value(s) no longer matched the curves their readings name and were \
+             recomposed from them. Each move is recorded on the reading and can be rolled back \
+             from its history."
+        ),
+        // The sweep spans every slot whose curves moved, so it carries no single scope.
+        slot: None,
+    };
+    let _ = deliver(state, channels, &msg, None).await;
+    Ok(())
+}
+
+/// Derived values computed where none was stored, announced the way recomposed ones are (Q57).
+async fn derived_computed(
+    state: &AppState,
+    channels: &[Box<dyn NotificationChannel>],
+) -> Result<(), DbErr> {
+    let db = &state.db;
+    let since = state_get(db, "derived_computed", "all")
+        .await?
+        .map(|(_, at)| at)
+        .unwrap_or_else(|| Utc::now() - Duration::hours(CURVE_DRIFT_WINDOW_HOURS));
+    let computed = decisions_since(db, "derived_computed", since).await?;
+    if computed == 0 {
+        state_clear(db, "derived_computed", "all").await?;
+        return Ok(());
+    }
+    if !claim_cas(db, "derived_computed", "all", since).await? {
+        return Ok(());
+    }
+    let msg = OutgoingMessage {
+        kind: "derived_computed",
+        subject: format!("RIVER Data: {computed} derived value(s) computed"),
+        body: format!(
+            "🧮 {computed} derived value(s) were computed where none was stored. Each one names \
+             the formula version it was made with, on the reading."
+        ),
+        // The fill spans every slot with a gap, so it carries no single scope.
+        slot: None,
+    };
+    let _ = deliver(state, channels, &msg, None).await;
+    Ok(())
+}
+
+/// Readings a system-made change of one kind touched since `since`, counted from the ledger rows
+/// that change writes.
+async fn decisions_since(
+    db: &DatabaseConnection,
+    kind: &str,
+    since: DateTime<Utc>,
+) -> Result<i64, DbErr> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            PG,
+            "SELECT count(*)::bigint AS n FROM reading_decisions WHERE kind = $1 AND at > $2",
+            [
+                kind.into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(since).into(),
+            ],
+        ))
+        .await?;
+    match row {
+        Some(row) => row.try_get("", "n"),
+        None => Ok(0),
+    }
 }
 
 /// Hours between repeat alerts while jobs of one kind keep failing.

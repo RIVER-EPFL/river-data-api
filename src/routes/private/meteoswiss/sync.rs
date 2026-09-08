@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DbErr, Statement};
+use sea_orm::{ConnectionTrait, DbErr, FromQueryResult, Statement};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -19,6 +19,7 @@ const SOURCE_SYSTEM: &str = "meteoswiss";
 const CHUNK: usize = 500;
 
 /// A site that has declared which station reports for it.
+#[derive(Debug, FromQueryResult)]
 pub struct Subscriber {
     pub site_id: Uuid,
     pub site_name: String,
@@ -179,24 +180,16 @@ async fn fetch(client: &reqwest::Client, url: &str) -> Result<String, String> {
 }
 
 pub async fn subscribers<C: ConnectionTrait>(db: &C) -> Result<Vec<Subscriber>, DbErr> {
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, name, upper(btrim(meteoswiss_station_abbr)) AS station
+    Subscriber::find_by_statement(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT id AS site_id, name AS site_name,
+                upper(btrim(meteoswiss_station_abbr)) AS station
                FROM sites
               WHERE btrim(coalesce(meteoswiss_station_abbr, '')) <> ''
               ORDER BY name",
-        ))
-        .await?;
-    rows.iter()
-        .map(|row| {
-            Ok(Subscriber {
-                site_id: row.try_get("", "id")?,
-                site_name: row.try_get("", "name")?,
-                station: row.try_get("", "station")?,
-            })
-        })
-        .collect()
+    ))
+    .all(db)
+    .await
 }
 
 pub async fn parameter_id<C: ConnectionTrait>(db: &C) -> Result<Option<Uuid>, DbErr> {

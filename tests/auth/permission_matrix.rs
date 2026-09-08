@@ -654,8 +654,6 @@ fn table() -> Table {
         &[
             ("POST", "/api/actions/sensor_calibrations/{id}/recalculate"),
             ("POST", "/api/actions/reprocess"),
-            ("POST", "/api/readings/pins"),
-            ("POST", "/api/readings/pins/{set_id}/rollback"),
             ("POST", "/api/actions/derived_parameters/{id}/recompute"),
             ("POST", "/api/actions/invalidate_public_config/{code}"),
             ("POST", "/api/reprocessing_jobs/{id}/rerun"),
@@ -665,6 +663,10 @@ fn table() -> Table {
             ("POST", "/api/site_parameters/{id}/declare_sd_estimator"),
             ("POST", "/api/actions/retag_sd_estimator"),
             ("POST", "/api/parameter_groups/{id}/intermediates"),
+            ("POST", "/api/sensor_calibrations/{id}/retire"),
+            ("POST", "/api/sensor_calibrations/{id}/unretire"),
+            ("POST", "/api/standard_curves/{id}/retire"),
+            ("POST", "/api/standard_curves/{id}/unretire"),
             ("POST", "/api/sites/{site_id}/parameter_groups"),
         ],
     );

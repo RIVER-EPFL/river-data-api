@@ -268,12 +268,12 @@ pub async fn rebuild_alarm_events(
             values,
         ))
         .await?
+        .iter()
+        .map(|r| SlotRow::from_query_result(r, ""))
+        .collect::<Result<Vec<_>, _>>()?
         .into_iter()
-        .filter_map(|r| {
-            let s: Uuid = r.try_get("", "site_id").ok()?;
-            let p: Uuid = r.try_get("", "parameter_id").ok()?;
-            Some((s, p))
-        })
+        // A reading with no slot has no thresholds to evaluate against.
+        .filter_map(|r| Some((r.site_id?, r.parameter_id?)))
         .collect();
 
     let mut total = 0i64;
@@ -289,12 +289,12 @@ pub async fn rebuild_alarm_events(
                     [s.into(), p.into()],
                 ))
                 .await?;
-            let lo = row
-                .as_ref()
-                .and_then(|r| r.try_get::<DateTime<Utc>>("", "lo").ok());
-            let hi = row
-                .as_ref()
-                .and_then(|r| r.try_get::<DateTime<Utc>>("", "hi").ok());
+            // MIN/MAX over an empty slot are NULL, which is the "no readings" case below.
+            let extent = row
+                .map(|r| ExtentRow::from_query_result(&r, ""))
+                .transpose()?;
+            let lo = extent.as_ref().and_then(|e| e.lo);
+            let hi = extent.as_ref().and_then(|e| e.hi);
             match (start.or(lo), end.or(hi)) {
                 (Some(a), Some(b)) => (a, b),
                 _ => continue, // no readings for this slot
@@ -313,4 +313,18 @@ pub async fn rebuild_alarm_events(
     }
 
     Ok(total)
+}
+
+/// A slot the rebuild covers, and the extent of its readings. Every column is nullable: an
+/// unattributed reading names no slot, and MIN/MAX over an empty one is NULL.
+#[derive(sea_orm::FromQueryResult)]
+struct SlotRow {
+    site_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
+}
+
+#[derive(sea_orm::FromQueryResult)]
+struct ExtentRow {
+    lo: Option<DateTime<Utc>>,
+    hi: Option<DateTime<Utc>>,
 }
