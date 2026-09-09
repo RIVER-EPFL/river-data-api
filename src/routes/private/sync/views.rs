@@ -450,6 +450,16 @@ pub struct UpdatePairingPlanRequest {
     /// Objects the review has accepted or taken back, `{kind}:{name}` as the card names them.
     #[serde(default)]
     objects: Vec<PlanObjectUpdate>,
+    /// Register rows the review has decided to admit or leave behind, by the source's own key.
+    #[serde(default)]
+    instruments: Vec<PlanProposalUpdate>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct PlanProposalUpdate {
+    source_key: String,
+    admit: bool,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -976,6 +986,16 @@ pub async fn update_pairing_plan(
     let mut accepted = plan.accepted_objects.0.clone();
     apply_object_updates(&mut accepted, &req.objects, &crate::common::actor::label(&auth));
 
+    let mut proposals = plan.instrument_proposals.0.clone();
+    for update in &req.instruments {
+        if let Some(proposal) = proposals
+            .iter_mut()
+            .find(|p| p.source_key == update.source_key)
+        {
+            proposal.admit = update.admit;
+        }
+    }
+
     let summary = serde_json::to_value(crate::routes::private::sync::service::compute_summary_pub(
         &entries,
     ))
@@ -988,12 +1008,14 @@ pub async fn update_pairing_plan(
         .execute_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE pairing_plans SET entries = $1, curve_assignments = $2, summary = $3, \
-             accepted_objects = $4, version = version + 1 WHERE id = $5 AND version = $6",
+             accepted_objects = $4, instrument_proposals = $5, version = version + 1 \
+             WHERE id = $6 AND version = $7",
             [
                 serde_json::to_value(&entries).unwrap_or_default().into(),
                 serde_json::to_value(&intents).unwrap_or_default().into(),
                 summary.into(),
                 serde_json::to_value(&accepted).unwrap_or_default().into(),
+                serde_json::to_value(&proposals).unwrap_or_default().into(),
                 id.into(),
                 req.expected_version.into(),
             ],

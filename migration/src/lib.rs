@@ -18,7 +18,7 @@ mod m20260908_000003_source_identity_hold_uniq;
 mod m20260908_000004_notification_kind_groups;
 mod m20260908_000005_curve_fitted_on;
 pub mod m20260908_000006_one_doc_parameter;
-pub mod m20260908_000007_seed_portal_parameter_groups;
+mod m20260908_000007_seed_portal_parameter_groups;
 pub mod m20260908_000008_channel_health_into_state;
 mod m20260909_000001_seed_metalp_parameter_groups;
 pub mod m20260910_000001_change_audit;
@@ -51,7 +51,9 @@ pub mod m20260910_000027_subscribe_by_channel;
 mod m20260910_000028_reprocess_decision;
 mod m20260910_000029_sync_source_system;
 mod m20260910_000030_plan_accepted_objects;
-pub mod portal_seed;
+pub mod m20260910_000031_stage_unpaired_readings;
+mod m20260910_000032_formula_intermediate;
+mod m20260910_000033_instrument_proposals;
 
 pub struct Migrator;
 
@@ -110,6 +112,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260910_000028_reprocess_decision::Migration),
             Box::new(m20260910_000029_sync_source_system::Migration),
             Box::new(m20260910_000030_plan_accepted_objects::Migration),
+            Box::new(m20260910_000031_stage_unpaired_readings::Migration),
+            Box::new(m20260910_000032_formula_intermediate::Migration),
+            Box::new(m20260910_000033_instrument_proposals::Migration),
         ]
     }
 }

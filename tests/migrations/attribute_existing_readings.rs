@@ -40,7 +40,8 @@ async fn restore_fixture_default(db: &DatabaseConnection) {
     crate::common::exec(
         db,
         "ALTER TABLE readings ADD CONSTRAINT readings_instrument_required \
-         CHECK ((sensor_id IS NOT NULL) OR (measurement_type IS NOT DISTINCT FROM 'derived'))",
+         CHECK ((sensor_id IS NOT NULL) OR (site_id IS NULL) \
+                OR (measurement_type IS NOT DISTINCT FROM 'derived'))",
     )
     .await;
     crate::common::exec(

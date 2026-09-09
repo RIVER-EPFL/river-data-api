@@ -1,10 +1,11 @@
-//! No measurement without an instrument.
+//! No attributed measurement without an instrument.
 //!
 //! A reading whose instrument is unknown has lost its provenance and nothing recovers it later, so
 //! the rule is held by the database rather than by each writer: `readings_inherit_stream_instrument`
 //! fills the column from the row's own stream when a writer names none, and
-//! `readings_instrument_required` refuses what is left. A derived value carries the slot but no
-//! instrument and is the one exemption.
+//! `readings_instrument_required` refuses what is left. Two rows are exempt: a derived value, which
+//! carries the slot it was computed for and was measured by nothing, and a staged one on an
+//! unpaired stream, which names no site either because no plan has said what it is (B223).
 //!
 //! Run: cargo test --test readings instrument_required -- --test-threads=1
 
@@ -25,6 +26,8 @@ async fn setup() -> (axum::Router, sea_orm::DatabaseConnection, String) {
     (crate::common::build_test_app(db.clone()), db, token)
 }
 
+/// An attributed reading: it names the slot, which is what puts it under the rule. A row naming no
+/// site is staged and exempt, which [`insert_staged_reading`] is for.
 async fn insert_reading(
     db: &sea_orm::DatabaseConnection,
     stream_id: Uuid,
@@ -32,9 +35,30 @@ async fn insert_reading(
 ) -> Result<(), sea_orm::DbErr> {
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO readings (stream_id, time, replicate_index, raw_value, measurement_type, \
+                               site_id, parameter_id) \
+         VALUES ($1, $2::timestamptz, 0, 1.0, $3, $4::uuid, $5::uuid)",
+        [
+            stream_id.into(),
+            AT.into(),
+            measurement_type.into(),
+            SITE1_ID.into(),
+            GLOBAL_PARAM_TEMP_ID.into(),
+        ],
+    ))
+    .await
+    .map(|_| ())
+}
+
+async fn insert_staged_reading(
+    db: &sea_orm::DatabaseConnection,
+    stream_id: Uuid,
+) -> Result<(), sea_orm::DbErr> {
+    db.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO readings (stream_id, time, replicate_index, raw_value, measurement_type) \
-         VALUES ($1, $2::timestamptz, 0, 1.0, $3)",
-        [stream_id.into(), AT.into(), measurement_type.into()],
+         VALUES ($1, $2::timestamptz, 0, 1.0, 'spot')",
+        [stream_id.into(), AT.into()],
     ))
     .await
     .map(|_| ())
@@ -46,14 +70,22 @@ async fn insert_untyped_reading(
 ) -> Result<(), sea_orm::DbErr> {
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO readings (stream_id, time, replicate_index, raw_value) \
-         VALUES ($1, $2::timestamptz, 0, 1.0)",
-        [stream_id.into(), AT.into()],
+        "INSERT INTO readings (stream_id, time, replicate_index, raw_value, site_id, \
+                               parameter_id) \
+         VALUES ($1, $2::timestamptz, 0, 1.0, $3::uuid, $4::uuid)",
+        [
+            stream_id.into(),
+            AT.into(),
+            SITE1_ID.into(),
+            GLOBAL_PARAM_TEMP_ID.into(),
+        ],
     ))
     .await
     .map(|_| ())
 }
 
+/// A stream paired to the seeded slot, which is what makes its readings attributed and so subject
+/// to the rule. [`unpaired_stream`] is the other half.
 async fn create_stream(
     db: &sea_orm::DatabaseConnection,
     sensor_id: Option<Uuid>,
@@ -61,12 +93,35 @@ async fn create_stream(
     let id = Uuid::new_v4();
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO data_streams (id, source_system, source_key, is_active, sensor_id) \
-         VALUES ($1, 'instrument-required', $2, true, $3)",
-        [id.into(), id.to_string().into(), sensor_id.into()],
+        "INSERT INTO data_streams (id, source_system, source_key, is_active, sensor_id, \
+                                   site_parameter_id) \
+         VALUES ($1, 'instrument-required', $2, true, $3, \
+                 (SELECT id FROM site_parameters \
+                   WHERE site_id = $4::uuid AND parameter_id = $5::uuid))",
+        [
+            id.into(),
+            id.to_string().into(),
+            sensor_id.into(),
+            SITE1_ID.into(),
+            GLOBAL_PARAM_TEMP_ID.into(),
+        ],
     ))
     .await
     .expect("create stream");
+    id
+}
+
+async fn unpaired_stream(db: &sea_orm::DatabaseConnection) -> Uuid {
+    let id = Uuid::new_v4();
+    db.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO data_streams (id, source_system, source_key, is_active, sensor_id, \
+                                   site_parameter_id) \
+         VALUES ($1, 'instrument-required', $2, true, NULL, NULL)",
+        [id.into(), id.to_string().into()],
+    ))
+    .await
+    .expect("create unpaired stream");
     id
 }
 
@@ -119,6 +174,18 @@ async fn a_reading_with_no_instrument_anywhere_is_refused_unless_derived() {
     insert_reading(&db, stream_id, "derived")
         .await
         .expect("a derived value carries no instrument and is stored");
+
+    // The other exemption: nothing has said what an unpaired stream's readings are, so they are
+    // staged rather than attributed to the channel's own instrument.
+    let staged = unpaired_stream(&db).await;
+    insert_staged_reading(&db, staged)
+        .await
+        .expect("a staged reading is stored naming nothing");
+    assert_eq!(
+        sensor_of(&db, staged).await,
+        None,
+        "a staged reading names no instrument"
+    );
 }
 
 /// Expected behaviour: the grab entry path attributes what it writes, so a hand-entered value names

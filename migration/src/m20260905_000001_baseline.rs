@@ -7,9 +7,9 @@ use sea_orm_migration::prelude::*;
 /// tables are never created, the continuous aggregates are defined once instead of three times,
 /// and `standard_curves` is created in the shape it ends up with.
 ///
-/// The schema and seed sections below were generated from a fully migrated database rather than
-/// written by hand, which is what makes the seed rows exact: the tool script text, its normalised
-/// manifest and test-case jsonb and its content hash are stored as they were computed.
+/// The schema below was generated from a fully migrated database rather than written by hand. It
+/// creates the schema and nothing else: a database starts blank, and every parameter, constant,
+/// tool script and instrument arrives through the plan or the form an operator validates (Q134).
 ///
 /// This cannot be applied to a database that already holds rows, and there is no schema-only route
 /// for one: 26 of the migrations it replaces rewrite existing rows, so skipping them leaves the
@@ -37,9 +37,7 @@ use sea_orm_migration::prelude::*;
 /// ```
 ///
 /// Then dump that copy `--data-only --exclude-table-data='_timescaledb_internal.*'`, build the
-/// target from this baseline, `TRUNCATE constants, parameters, tool_scripts, tool_script_versions,
-/// tool_script_activations CASCADE` so the seeds below do not collide with the dump's own copies,
-/// and restore. `scripts/dbdiff.sh` compares the result against the carried-forward copy; it
+/// target from this baseline and restore. `scripts/dbdiff.sh` compares the result against the carried-forward copy; it
 /// normalises TimescaleDB's internal aggregate numbering and skips `reprocessing_jobs`, which the
 /// split migration queues work into and an empty database has none of.
 #[derive(DeriveMigrationName)]
@@ -212,7 +210,8 @@ CREATE FUNCTION public.readings_inherit_stream_instrument() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
             BEGIN
-                IF NEW.sensor_id IS NULL AND NEW.measurement_type IS DISTINCT FROM 'derived' THEN
+                IF NEW.sensor_id IS NULL AND NEW.site_id IS NOT NULL
+                   AND NEW.measurement_type IS DISTINCT FROM 'derived' THEN
                     SELECT sensor_id INTO NEW.sensor_id FROM data_streams WHERE id = NEW.stream_id;
                 END IF;
                 RETURN NEW;
@@ -284,7 +283,7 @@ CREATE TABLE public.readings (
     created_by text,
     unverified boolean DEFAULT false NOT NULL,
     CONSTRAINT readings_withdrawn_spot_only CHECK (((withdrawn_at IS NULL) OR ((measurement_type)::text = 'spot'::text))),
-    CONSTRAINT readings_instrument_required CHECK (((sensor_id IS NOT NULL) OR ((measurement_type)::text IS NOT DISTINCT FROM 'derived'::text)))
+    CONSTRAINT readings_instrument_required CHECK (((sensor_id IS NOT NULL) OR (site_id IS NULL) OR ((measurement_type)::text IS NOT DISTINCT FROM 'derived'::text)))
 );
 
 CREATE TABLE public.alarm_events (
@@ -1667,41 +1666,6 @@ SELECT add_continuous_aggregate_policy('readings_weekly',
 SELECT add_continuous_aggregate_policy('readings_monthly',
     start_offset => INTERVAL '3 months', end_offset => INTERVAL '1 month', schedule_interval => INTERVAL '1 month', if_not_exists => TRUE);
 
--- ===========================================================================
--- Rows the migration chain seeded, dumped rather than recomputed so the tool script
--- text, its normalised manifest and test-case jsonb and its content hash are exact.
--- ===========================================================================
-
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('714f9826-4216-42f2-ad6d-b8a95899bd85', 'gas_const_r_atm', 0.0820574, 'L*atm/(mol*K)', 'Ideal gas constant (R) in L*atm/(mol*K)', '2026-09-04 12:10:27.649872+00');
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('70b877bb-dc39-4627-a01f-1828148633c0', 'h_co2_29815k', 0.034733, 'M/atm', 'Henry volatility constant for CO2 at 298.15K', '2026-09-04 12:10:27.649872+00');
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('7343056a-4178-4e76-9b90-60e90cd687c6', 'c_const', 2400, 'K', 'Constant C of van''t Hoff equation (K)', '2026-09-04 12:10:27.649872+00');
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('697c695c-fab5-47e9-ad15-6ea4a35c1a72', 'vol_sa', 0.03, 'L', 'Volume of SA in syringe', '2026-09-04 12:10:27.898738+00');
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('f8c8b614-46c2-425d-87f2-5d99159311a4', 'vol_water', 0.03, 'L', 'Volume of water in syringe', '2026-09-04 12:10:27.898738+00');
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('377d50b9-75d5-4710-b2a8-1ea2c7b1a60a', 'lab_press_avg_atm', 0.957237, 'atm', 'Lab pressure (average of past years)', '2026-09-04 12:10:27.898738+00');
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('7f40c736-07dc-49a5-960e-260df897f793', 'lab_temp_avg_degC', 22.5, 'degC', 'Lab temp (average of past years)', '2026-09-04 12:10:27.898738+00');
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('22fede87-6784-4478-8cbf-bcc8e8ed4495', 'h_ch4_29815k', 0.00213, 'M/atm', 'Henry constant for CH4 at 298.15K', '2026-09-04 12:10:27.898738+00');
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('89eb1e90-2790-457f-bd91-43098934b44e', 'gas_const_r_mol', 8.31446, 'J/(K*mol)', 'Ideal gas constant (R) in J/(K*mol)', '2026-09-04 12:10:27.649872+00');
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('57db1913-d35d-41ec-ad26-d20ce46b4564', 'vial_volume', 12.168, 'mL', 'Max DIC vial volume', '2026-09-04 12:10:27.649872+00');
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('05a58e95-b3e5-46c5-aa8b-629ef217912a', 'h3po4_added', 0.3, 'mL', 'Volume of added H3PO4', '2026-09-04 12:10:27.649872+00');
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('f3844df4-b718-4f45-a011-f588ed900c2c', 'ch4_in_sa', 2e-06, NULL, 'Fraction of CH4 in standard air (dimensionless)', '2026-09-04 12:10:27.649872+00');
-
-INSERT INTO public.parameters (id, code, name, default_units, category, description, aliases, default_warning_min, default_warning_max, default_alarm_min, default_alarm_max, created_at, needs_review) VALUES ('91b027c4-396b-4c9b-b855-0ed3dfcbd207', 'DOC', 'Dissolved organic carbon', 'ppb', 'measurement', NULL, '{}', NULL, NULL, NULL, NULL, '2026-09-04 12:10:27.928014+00', true);
-
-INSERT INTO public.tool_scripts (id, name, label, description, active_version_id, created_by, created_at, updated_at, enabled) VALUES ('8183564e-05b4-4956-89d4-c8013cca066f', 'doc', 'DOC', 'Dissolved organic carbon: the analyser replicates are stored as readings, corrected through the chosen standard curve, and their mean and standard deviation are the served DOC.', NULL, 'seed', '2026-09-04 12:10:27.924083+00', '2026-09-04 12:10:27.924083+00', true);
-
-INSERT INTO public.tool_script_versions (id, tool_script_id, version_no, script, entry_function, manifest, test_cases, content_hash, created_by, created_at, validated_at, note) VALUES ('abc3ee60-2bb7-474b-91e9-d76754dea651', '8183564e-05b4-4956-89d4-c8013cca066f', 1, '# DOC is data entry: the replicates are stored as readings, the chosen standard curve corrects
-# them, and the manifest''s aggregate outputs (mean, sd) are computed by the engine over the
-# curve-applied values, so the preview equals what the database will serve. Nothing is left for
-# the script to calculate.
-
-tool <- function(inputs, constants, curves) {
-  list()
-}
-', 'tool', '{"label": "DOC", "curves": [{"name": "std_curve", "label": "Standard curve (DOC corr)", "required": false, "description": "Applied to every replicate before averaging: corrected = slope * measured + intercept."}], "params": [{"kind": "replicates", "name": "DOC", "when": null, "curve": "std_curve", "label": "DOC", "units": "ppb", "default": null, "section": "lab", "required": false, "suggested": 3, "description": "One value per analyser vial, in run order. Add or remove vials as measured; a blank vial is a gap, never a shift.", "parameter_code": "DOC"}], "outputs": [{"key": "DOC_avg_ppb", "label": "DOC average", "units": "ppb", "aggregate": "mean", "aggregate_of": "DOC", "per_replicate": false, "suggested_parameter_code": null}, {"key": "DOC_sd_ppb", "label": "DOC standard deviation", "units": "ppb", "aggregate": "sd", "aggregate_of": "DOC", "per_replicate": false, "suggested_parameter_code": null}], "sections": [{"key": "lab", "label": "Lab measurements"}], "constants": [], "description": "Dissolved organic carbon: the analyser replicates are stored as readings, corrected through the chosen standard curve, and their mean and standard deviation are the served DOC.", "match_keywords": ["doc", "organic carbon", "dissolved organic"]}', '{"cases": [{"name": "rust_pin_with_curve", "absent": [], "curves": {"std_curve": {"slope": 1.05, "intercept": -2.0}}, "inputs": {"DOC": [120.0, 125.0, 118.0]}, "expected": {"DOC_sd_ppb": 3.78582883923719, "DOC_avg_ppb": 125.05}, "constants": {}}, {"name": "golden_no_curve", "absent": [], "curves": {}, "inputs": {"DOC": [120.0, 125.0, 118.0]}, "expected": {"DOC_sd_ppb": 3.60555127546399, "DOC_avg_ppb": 121.0}, "constants": {}}, {"name": "single_replicate_omits_sd", "absent": ["DOC_sd_ppb"], "curves": {}, "inputs": {"DOC": [120.0]}, "expected": {"DOC_avg_ppb": 120.0}, "constants": {}}, {"name": "lone_second_replicate_stays_on_its_own_number", "absent": ["DOC_sd_ppb"], "curves": {}, "inputs": {"DOC": [null, 120.0]}, "expected": {"DOC_avg_ppb": 120.0}, "constants": {}}, {"name": "all_null_omits_both", "absent": ["DOC_avg_ppb", "DOC_sd_ppb"], "curves": {}, "inputs": {"DOC": [null, null, null]}, "expected": {}, "constants": {}}, {"name": "one_null_no_curve", "absent": [], "curves": {}, "inputs": {"DOC": [120.0, null, 118.0]}, "expected": {"DOC_sd_ppb": 1.4142135623731, "DOC_avg_ppb": 119.0}, "constants": {}}, {"name": "golden_avg_rand_1", "absent": [], "curves": {"std_curve": {"slope": 0.961278225202113, "intercept": -0.97404258325696}}, "inputs": {"DOC": [190.671224833932, 245.170278369915, 230.796007509343]}, "expected": {"DOC_sd_ppb": 27.1515432188154, "DOC_avg_ppb": 212.633998467253}, "constants": {}}, {"name": "golden_avg_rand_9_null_with_curve", "absent": [], "curves": {"std_curve": {"slope": 1.10074498825707, "intercept": 2.28358845226467}}, "inputs": {"DOC": [null, 467.760288110003, 472.654093289748]}, "expected": {"DOC_sd_ppb": 3.8090651005153, "DOC_avg_ppb": 519.861797057587}, "constants": {}}, {"name": "golden_sd_rand_1_with_curve", "absent": [], "curves": {"std_curve": {"slope": 0.932979776454158, "intercept": -3.29249400179833}}, "inputs": {"DOC": [108.206150960177, 429.328132607043, 410.717265773565]}, "expected": {"DOC_sd_ppb": 168.186120201977, "DOC_avg_ppb": 291.60734550696}, "constants": {}}, {"name": "golden_sd_rand_2_no_curve", "absent": [], "curves": {}, "inputs": {"DOC": [74.2234499659389, 429.851801227778, 476.666156097781]}, "expected": {"DOC_sd_ppb": 220.084544270995, "DOC_avg_ppb": 326.913802430499}, "constants": {}}, {"name": "no_replicates_omits_both", "absent": ["DOC_avg_ppb", "DOC_sd_ppb"], "curves": {}, "inputs": {}, "expected": {}, "constants": {}}, {"name": "two_replicates_third_absent", "absent": [], "curves": {"std_curve": {"slope": 1.01862098516431, "intercept": -4.9273814773187}}, "inputs": {"DOC": [271.935691975523, 399.443094816525]}, "expected": {"DOC_sd_ppb": 91.8402423462114, "DOC_avg_ppb": 337.012879132948}, "constants": {}}, {"name": "five_replicates", "absent": [], "curves": {}, "inputs": {"DOC": [120.0, 125.0, 118.0, 122.5, 119.75]}, "expected": {"DOC_sd_ppb": 2.7294688127912363, "DOC_avg_ppb": 121.05}, "constants": {}}, {"name": "five_replicates_with_curve", "absent": [], "curves": {"std_curve": {"slope": 1.05, "intercept": -2.0}}, "inputs": {"DOC": [120.0, 125.0, 118.0, 122.5, 119.75]}, "expected": {"DOC_sd_ppb": 2.865942253430795, "DOC_avg_ppb": 125.1025}, "constants": {}}, {"name": "ten_replicates", "absent": [], "curves": {}, "inputs": {"DOC": [101.0, 102.5, 99.0, 100.25, 103.0, 98.5, 101.75, 100.0, 102.0, 99.5]}, "expected": {"DOC_sd_ppb": 1.536590742882148, "DOC_avg_ppb": 100.75}, "constants": {}}, {"name": "no_replicates_at_all", "absent": ["DOC_avg_ppb", "DOC_sd_ppb"], "curves": {}, "inputs": {}, "expected": {}, "constants": {}}, {"name": "empty_list_is_no_replicates", "absent": ["DOC_avg_ppb", "DOC_sd_ppb"], "curves": {}, "inputs": {"DOC": []}, "expected": {}, "constants": {}}], "notes": "No portal-vs-Rust divergence for this tool: both average the curve-corrected replicates and take their sd (na.rm). The three replicates are declared as the portal''s own columns DOC_rep_1/2/3 and read by name, so a replicate entered alone keeps its number (lone_second_replicate_stays_on_its_own_number); an absent replicate is NA in the row the portal builds. A lone replicate yields an average and no sd: calcSd returns the ''KEEP OLD'' sentinel, which carries the stored value forward in the portal, and this tool is stateless, so the key is omitted. The sentinel is the only omission; no plausibility filter is applied, so a NaN or Inf would be emitted as the portal displays it. calcMean and calcSd over finite replicates reach neither, so no case pins one. Inputs reshaped to the replicates vector; expected values unchanged. The five-, ten- and empty-replicate cases pin the width generalisation.", "tolerance": 0.000000001}', 'sha256:90284796affc9f931c0e91c5ebe1cd3a3188cca537e34bc873460d599e3b20fb', 'seed', '2026-09-04 12:10:27.924083+00', '2026-09-04 12:10:27.924083+00', NULL);
-
-INSERT INTO public.tool_script_activations (id, tool_script_id, from_version_id, to_version_id, activated_by, activated_at) VALUES ('7fe1a009-07e0-4ffc-8e76-df411d5b6ffb', '8183564e-05b4-4956-89d4-c8013cca066f', NULL, 'abc3ee60-2bb7-474b-91e9-d76754dea651', 'seed', '2026-09-04 12:10:27.924083+00');
-
-UPDATE public.tool_scripts SET active_version_id = 'abc3ee60-2bb7-474b-91e9-d76754dea651' WHERE id = '8183564e-05b4-4956-89d4-c8013cca066f';
 "#;
 
 #[async_trait::async_trait]

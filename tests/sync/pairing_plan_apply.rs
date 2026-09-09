@@ -16,6 +16,18 @@ pub fn job_id_of(text: &str) -> String {
         .to_string()
 }
 
+async fn count(db: &sea_orm::DatabaseConnection, from: &str) -> i64 {
+    db.query_one_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!("SELECT COUNT(*)::bigint AS n FROM {from}"),
+    ))
+    .await
+    .unwrap()
+    .unwrap()
+    .try_get::<i64>("", "n")
+    .unwrap()
+}
+
 async fn scalar_opt_uuid(db: &sea_orm::DatabaseConnection, sql: &str) -> Option<Uuid> {
     db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
@@ -430,4 +442,231 @@ async fn apply_reports_its_progress_over_the_plan_s_entries() {
     );
 
     crate::common::cleanup_test_db(&db).await;
+}
+
+/// Scenario: a source that declares its own category registry on each stream, on a database that
+/// holds no parameter groups.
+///
+/// Expected behaviour: the plan proposes the group, the apply creates it once for every column of
+/// that category and places each parameter in it at the position and role the registry gives,
+/// and a parameter an operator has already placed keeps the placement it has.
+#[tokio::test]
+#[serial]
+async fn apply_creates_the_group_the_source_registry_names() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    for (key, column, ordinal, role) in [
+        ("cat-a", "WTW_pH_1", 3, "measured"),
+        ("cat-b", "Field_BP", 8, "output"),
+    ] {
+        let stream_id = Uuid::new_v4();
+        let metadata = serde_json::json!({
+            "hierarchy": { "project": "Test Project", "site": "Site 1", "parameter": column },
+            "units": "-",
+            "parameter": {
+                "column_name": column,
+                "category": "Field data",
+                "category_ordinal": ordinal,
+                "role": role,
+                "description": "from field sheet",
+            },
+        });
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO data_streams (id, source_system, source_key, source_name, metadata, is_active) \
+                 VALUES ('{stream_id}', 'catsrc', '{key}', 'Site 1 - {column}', '{}'::jsonb, true)",
+                metadata.to_string().replace('\'', "''")
+            ),
+        )
+        .await;
+    }
+
+    let (status, plan) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/pairing-plans",
+        &serde_json::json!({ "source_system": "catsrc" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "create plan: {plan}");
+    assert_eq!(
+        plan["summary"]["groups_to_create"],
+        serde_json::json!(1),
+        "one category behind both columns: {}",
+        plan["summary"]
+    );
+    let group = &plan["entries"][0]["parameter"]["group"];
+    assert_eq!(group["code"], serde_json::json!("field_data"), "{group}");
+    assert_eq!(group["label"], serde_json::json!("Field data"), "{group}");
+    assert_eq!(group["create"], serde_json::json!(true), "{group}");
+
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id, "apply", &token).await;
+    assert!((200..300).contains(&status), "apply ({status}): {text}");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await,
+        "completed"
+    );
+
+    let placed = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT p.code AS code, m.ordinal AS ordinal, m.role AS role, g.code AS group_code \
+             FROM parameter_group_members m \
+             JOIN parameter_groups g ON g.id = m.group_id \
+             JOIN parameters p ON p.id = m.parameter_id \
+             ORDER BY m.ordinal"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    let placed: Vec<(String, i32, String, String)> = placed
+        .iter()
+        .map(|row| {
+            (
+                row.try_get::<String>("", "code").unwrap(),
+                row.try_get::<i32>("", "ordinal").unwrap(),
+                row.try_get::<String>("", "role").unwrap(),
+                row.try_get::<String>("", "group_code").unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        placed,
+        vec![
+            ("WTW_pH_1".into(), 3, "measured".into(), "field_data".into()),
+            ("Field_BP".into(), 8, "output".into(), "field_data".into()),
+        ],
+        "both columns land in the one group, at the registry's positions and roles"
+    );
+
+    let groups = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COUNT(*)::bigint AS n FROM parameter_groups".to_string(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(groups, 1, "the group is created once, not once per column");
+}
+
+/// Scenario: a portal's own instrument register, offered by the connector and admitted by a plan.
+///
+/// Expected behaviour: nothing exists until the apply runs, the plan carries every offered row, a
+/// row the review declines is left behind as a proposal, and the admitted one becomes an instrument
+/// under the source's own key with its serial.
+#[tokio::test]
+#[serial]
+async fn the_source_register_becomes_instruments_only_when_a_plan_admits_it() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let stream_id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, metadata, is_active) \
+             VALUES ('{stream_id}', 'regsrc', 'FP1:Depth', 'FP1 - Depth', \
+                     '{{\"hierarchy\": {{\"project\": \"Test Project\", \"site\": \"Site 1\", \"parameter\": \"Depth\"}}, \"units\": \"mm\"}}'::jsonb, true)"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/sensors/proposals",
+        &serde_json::json!({
+            "source_system": "regsrc",
+            "instruments": [
+                { "source_key": "sensor_inventory:62", "name": "Turbidity probe FP1",
+                  "serial_number": "919402", "model": "OBS-3+", "is_lab_instrument": false,
+                  "metadata": { "station": "FP1", "installed_on": "2019-06-01" } },
+                { "source_key": "sensor_inventory:63", "name": "Retired probe",
+                  "is_lab_instrument": false }
+            ]
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "the register is offered: {body}");
+    assert!(body.contains("\"stored\":2"), "{body}");
+
+    // Offered is not created.
+    let sensors_now = count(&db, "sensors WHERE source_system = 'regsrc'").await;
+    assert_eq!(sensors_now, 0, "a proposal creates no instrument");
+
+    let (status, plan) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/pairing-plans",
+        &serde_json::json!({ "source_system": "regsrc" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "create plan: {plan}");
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+    let offered = plan["instrument_proposals"].as_array().expect("proposals");
+    assert_eq!(offered.len(), 2, "the plan carries the register: {plan}");
+    assert!(
+        offered.iter().all(|p| p["admit"] == serde_json::json!(true)),
+        "proposed admitted, since the register is the lab's own record: {plan}"
+    );
+
+    // The review leaves one behind.
+    let (status, body) = crate::common::patch_plan_with_token(
+        &app,
+        &plan_id,
+        &serde_json::json!({
+            "instruments": [{ "source_key": "sensor_inventory:63", "admit": false }],
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "decline ({status}): {body}");
+
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id, "apply", &token).await;
+    assert!((200..300).contains(&status), "apply ({status}): {text}");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await,
+        "completed"
+    );
+
+    let admitted = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT source_key, name, serial_number, model FROM sensors \
+              WHERE source_system = 'regsrc' AND source_key LIKE 'sensor_inventory:%' \
+              ORDER BY source_key"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(admitted.len(), 1, "only the admitted row became an instrument");
+    assert_eq!(
+        admitted[0].try_get::<String>("", "source_key").unwrap(),
+        "sensor_inventory:62"
+    );
+    assert_eq!(
+        admitted[0]
+            .try_get::<Option<String>>("", "serial_number")
+            .unwrap()
+            .as_deref(),
+        Some("919402"),
+        "the register's serial travels with it"
+    );
+
+    let left = count(&db, "instrument_proposals WHERE source_system = 'regsrc'").await;
+    assert_eq!(left, 1, "the declined row stays a proposal for the next plan");
 }

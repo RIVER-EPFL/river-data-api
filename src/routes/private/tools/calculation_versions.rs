@@ -9,7 +9,7 @@ use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
-use crate::routes::private::parameters::groups::rules::{self, Member, Role};
+use crate::routes::private::parameters::groups::rules;
 
 use super::engine::{self, Engine};
 use super::formula;
@@ -94,9 +94,7 @@ pub async fn mint_formula_version<C: ConnectionTrait>(
         "manifest": manifest,
     }));
 
-    if let Some(group_id) = calculation.parameter_group_id {
-        check_manifest_against_group(db, group_id, &calculation.name, &manifest).await?;
-    }
+    check_manifest_codes_resolve(db, &calculation.name, &manifest).await?;
 
     if let Some(existing) = db
         .query_one_raw(Statement::from_sql_and_values(
@@ -307,12 +305,14 @@ pub async fn calculations_of_group<C: ConnectionTrait>(
     Ok(out)
 }
 
-/// A calculation reads and writes only its group's members, in the roles they declare. The
-/// manifest names catalog codes; the group names parameter ids, so the codes are resolved first
-/// and an unknown code is itself a refusal.
-pub async fn check_manifest_against_group<C: ConnectionTrait>(
+/// Every parameter a manifest names exists in the catalog.
+///
+/// It used to also require each one to be a member of the calculation's own group in the role the
+/// member declared. Q135 retired that: roles are read off the calculations and a group is a way to
+/// list many parameters together, so a calculation reads any catalog parameter. What is left is
+/// that a code it names must resolve to one.
+pub async fn check_manifest_codes_resolve<C: ConnectionTrait>(
     db: &C,
-    group_id: Uuid,
     name: &str,
     manifest: &serde_json::Value,
 ) -> AppResult<()> {
@@ -337,40 +337,7 @@ pub async fn check_manifest_against_group<C: ConnectionTrait>(
         }
     }
 
-    let member_rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT group_id, parameter_id, role FROM parameter_group_members",
-            [],
-        ))
-        .await?;
-    let mut members = Vec::with_capacity(member_rows.len());
-    for row in &member_rows {
-        let row = MemberRow::from_query_result(row, "")?;
-        let Some(role) = Role::parse(&row.role) else {
-            continue;
-        };
-        members.push(Member {
-            group_id: row.group_id,
-            parameter_id: row.parameter_id,
-            role,
-        });
-    }
-
-    let calculation = rules::Calculation {
-        group_id,
-        name: name.to_string(),
-        inputs: input_codes
-            .iter()
-            .filter_map(|c| by_code.get(c).copied())
-            .collect(),
-        outputs: output_codes
-            .iter()
-            .filter_map(|c| by_code.get(c).copied())
-            .collect(),
-    };
-    rules::validate_calculation(&calculation, &members)
-        .map_err(|refusal| AppError::BadRequest(format!("calculation {name}: {refusal}")))
+    Ok(())
 }
 
 fn codes_of_event_inputs(manifest: &serde_json::Value) -> Vec<String> {
@@ -395,13 +362,6 @@ fn codes_of_event_inputs(manifest: &serde_json::Value) -> Vec<String> {
 struct ActiveManifestRow {
     name: String,
     manifest: serde_json::Value,
-}
-
-#[derive(FromQueryResult)]
-struct MemberRow {
-    group_id: Uuid,
-    parameter_id: Uuid,
-    role: String,
 }
 
 #[derive(FromQueryResult)]

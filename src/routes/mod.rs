@@ -256,6 +256,7 @@ pub fn validate_optional_time_range(
         private::data_streams::views::stream_receipts,
         private::data_streams::views::register_stream,
         private::sensors::register::register_sensor,
+        private::sensors::register::propose_instruments,
         private::sensors::standard_curves::views::register_standard_curve,
         private::sensors::standard_curves::views::last_used_curve,
         private::sensors::instruments::get_instruments_overview,

@@ -43,6 +43,10 @@ pub struct PinnedFormula {
     /// input's, never one the calculation assigns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_replicate: Option<String>,
+    /// A step of the calculation rather than a measurement: it stores nothing and is no output of
+    /// the manifest, and its value reaches the formulas after it under this formula's own code.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub intermediate: bool,
 }
 
 /// The coefficients a resolved curve slot binds into a formula.
@@ -339,8 +343,11 @@ pub fn manifest_json(
             }));
         }
     }
+    // An intermediate is no output: it saves nowhere, so a manifest naming it would offer to store
+    // a step of the arithmetic.
     let outputs: Vec<serde_json::Value> = ordered
         .iter()
+        .filter(|f| !f.intermediate)
         .map(|f| {
             let mut output = json!({
                 "key": f.code,
@@ -421,9 +428,17 @@ fn evaluate_set(
     let ordered = in_order(formulas)?;
     let mut produced: HashMap<String, f64> = HashMap::new();
     let mut at_index: HashMap<String, f64> = HashMap::new();
+    // An intermediate stores nothing, so it is named by its own code rather than by a parameter,
+    // and reaches a later formula as a variable of that name.
+    let mut steps: HashMap<String, f64> = HashMap::new();
+    let mut steps_at_index: HashMap<String, f64> = HashMap::new();
     let mut results = Vec::with_capacity(ordered.len());
     for formula in &ordered {
         let mut variables: HashMap<String, f64> = constants.clone();
+        variables.extend(steps.iter().map(|(k, v)| (k.clone(), *v)));
+        if formula.per_replicate.is_some() && chain_replicates {
+            variables.extend(steps_at_index.iter().map(|(k, v)| (k.clone(), *v)));
+        }
         let mut skipped = None;
         for (variable, parameter_code) in &formula.sources {
             let code = parameter_code.to_lowercase();
@@ -472,13 +487,19 @@ fn evaluate_set(
         // than feeding the next formula, which would turn one NA into a whole calculation of them.
         // A per-replicate value is one repeat, so it travels only to a later per-replicate formula
         // at this index; a scalar formula reading that parameter takes the stored mean instead.
-        if !value.is_nan()
-            && let Some(code) = &formula.output_parameter_code
-        {
-            if formula.per_replicate.is_none() {
-                produced.insert(code.to_lowercase(), value);
-            } else if chain_replicates {
-                at_index.insert(code.to_lowercase(), value);
+        if !value.is_nan() {
+            if formula.intermediate {
+                if formula.per_replicate.is_none() {
+                    steps.insert(formula.code.clone(), value);
+                } else if chain_replicates {
+                    steps_at_index.insert(formula.code.clone(), value);
+                }
+            } else if let Some(code) = &formula.output_parameter_code {
+                if formula.per_replicate.is_none() {
+                    produced.insert(code.to_lowercase(), value);
+                } else if chain_replicates {
+                    at_index.insert(code.to_lowercase(), value);
+                }
             }
         }
         results.push(Evaluated {
@@ -613,6 +634,7 @@ mod tests {
             site_sources: Vec::new(),
             curve_slot: None,
             per_replicate: None,
+            intermediate: false,
         }
     }
 
@@ -847,6 +869,36 @@ mod tests {
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0]["key"], "suva");
         assert_eq!(outputs[0]["suggested_parameter_code"], "suva");
+    }
+
+    /// Scenario: pCO2's shape, where the pressure choice is a step of the arithmetic and only the
+    /// value after it is a measurement of anything.
+    ///
+    /// Expected behaviour: the intermediate is evaluated and reported under its own code, the
+    /// formula after it reads it as a variable of that name, and the manifest offers only the
+    /// output that saves.
+    #[test]
+    fn test_an_intermediate_feeds_the_next_formula_and_is_no_output() {
+        let mut bp = formula("bp", 1, "field_bp * 1.0", None, &[("field_bp", "Field_BP")]);
+        bp.intermediate = true;
+        let pco2 = formula("pco2", 2, "bp * 2", Some("pCO2_HS_uatm"), &[]);
+        let set = vec![bp, pco2];
+
+        let manifest = manifest_json("pCO2", None, &set).expect("the set has an order");
+        let outputs = manifest["outputs"].as_array().unwrap();
+        assert_eq!(outputs.len(), 1, "only what saves is an output: {manifest}");
+        assert_eq!(outputs[0]["key"], "pco2");
+
+        let inputs = HashMap::from([("field_bp".to_string(), 950.0)]);
+        let results = evaluate(&set, &inputs, &HashMap::new(), &HashMap::new()).expect("evaluates");
+        assert_eq!(results.len(), 2, "the run reports the step too");
+        assert_eq!(results[0].code, "bp");
+        assert_eq!(results[0].value, Some(950.0));
+        assert_eq!(
+            results[1].value,
+            Some(1900.0),
+            "the formula after it read the step by its own code"
+        );
     }
 
     /// Scenario: a formula reads the station's elevation, which is a column of the site row and

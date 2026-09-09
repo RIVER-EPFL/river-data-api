@@ -235,7 +235,17 @@ pub async fn list_channels(
         .db
         .query_all_raw(Statement::from_string(
             PG,
-            "SELECT kind,                     count(*) FILTER (WHERE sent_at > now() - interval '1 day')::bigint AS sent_1d,                     count(*) FILTER (WHERE sent_at > now() - interval '7 days')::bigint AS sent_7d,                     count(*) FILTER (WHERE sent_at > now() - interval '30 days')::bigint AS sent_30d                FROM notification_log GROUP BY kind"
+            // A send is a delivery the dispatcher recorded as `sent`; a failed or muted attempt is
+            // not one, and the card says what the channel has sent lately. `created_at` is the
+            // only time the row carries.
+            "SELECT kind,
+                    count(*) FILTER (WHERE status = 'sent'
+                        AND created_at > now() - interval '1 day')::bigint AS sent_1d,
+                    count(*) FILTER (WHERE status = 'sent'
+                        AND created_at > now() - interval '7 days')::bigint AS sent_7d,
+                    count(*) FILTER (WHERE status = 'sent'
+                        AND created_at > now() - interval '30 days')::bigint AS sent_30d
+               FROM notification_log GROUP BY kind"
                 .to_string(),
         ))
         .await?;

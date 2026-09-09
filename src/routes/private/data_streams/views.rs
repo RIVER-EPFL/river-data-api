@@ -619,34 +619,17 @@ pub async fn register_stream(
         .await?
         .0;
 
-    let mut stream = data_streams::Entity::find_by_id(registered.id)
+    let stream = data_streams::Entity::find_by_id(registered.id)
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::Internal("Failed to fetch registered stream".to_string()))?;
 
-    // Every feed carries an instrument from the moment it is discovered: a reading whose
-    // instrument is unknown has lost its provenance, and the only point where nothing is missing
-    // yet is registration. The source's own identity decides which one (the channel for a device
-    // feed, the source's parameter instrument otherwise), so a later pairing plan reports the
-    // instrument the stream already names rather than asking for one.
-    if stream.sensor_id.is_none() {
-        let hierarchy = crate::routes::private::sync::service::extract_hierarchy(&stream);
-        let name_hint = (!hierarchy.site.is_empty() && !hierarchy.parameter.is_empty())
-            .then(|| format!("{} {}", hierarchy.site, hierarchy.parameter));
-        crate::routes::private::sensors::identity::resolve_or_mint_stream_instrument(
-            &state.db,
-            &stream,
-            name_hint.as_deref(),
-            crate::routes::private::sensors::identity::InstrumentKind::SourceParameter,
-        )
-        .await?;
-        stream = data_streams::Entity::find_by_id(stream.id)
-            .one(&state.db)
-            .await?
-            .ok_or_else(|| {
-                AppError::Internal("Failed to re-fetch registered stream".to_string())
-            })?;
-    }
+    // Registration mints nothing. Which instrument produced a feed is a decision, and the plan is
+    // where it is put to an operator (Q134): a row minted here answers it before anyone is asked,
+    // and the plan then has to see through its own defaults to offer a real choice. The descriptor
+    // it carries is the plan's evidence, not its conclusion, so the metadata is kept and the
+    // column stays NULL until the pairing mints one. A reading that arrives meanwhile is staged
+    // (B223), which is what makes the column's absence safe.
 
     // A feed that describes its device can report a different one than the instrument it is
     // attached to was minted with, which is a probe swap. The channel is the identity, so nothing

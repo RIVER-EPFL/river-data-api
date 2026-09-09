@@ -608,15 +608,10 @@ pub fn resolve_instrument(
     let stamps_readings = curve_column.is_some();
     let curve_column = curve_column.map(str::to_string);
 
-    // A registration-minted default is not an attribution: it is the row that kept the stream's
-    // readings from naming nothing. A stream whose source names a curve column is asking which
-    // instrument produced that correction, and a default is not an answer to it, so the resolution
-    // continues past this arm and ends in the source's own instrument or a proposal. A default on a
-    // stream with no curve column stands: there is no question to ask.
-    let defaulted = stream_sensor_id.is_some_and(|id| catalog.defaulted.contains(&id));
-    let asks_for_an_instrument = defaulted && curve_column.is_some();
-
-    if let Some(id) = stream_sensor_id.filter(|_| !asks_for_an_instrument) {
+    // An instrument the stream already names is an attribution somebody made: a declaration on the
+    // descriptor, a pairing, or an operator's repoint. Registration mints none (M172), so there is
+    // no default to see through here any more.
+    if let Some(id) = stream_sensor_id {
         let (name, source_key) = catalog
             .by_id
             .get(&id)
@@ -629,7 +624,7 @@ pub fn resolve_instrument(
             source_key: source_key.unwrap_or_default(),
             resolved_by: "stream".to_string(),
             create: false,
-            defaulted,
+            defaulted: catalog.defaulted.contains(&id),
             confirmed: true,
             stamps_readings,
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
@@ -818,9 +813,88 @@ pub struct PlanParamRef {
     pub units: String,
     #[serde(default)]
     pub group_key: Option<String>,
+    /// The parameter group the source's registry places this column in, resolved against the
+    /// groups that already exist. Absent where the source declares no category.
+    #[serde(default)]
+    #[schema(required)]
+    pub group: Option<PlanGroupRef>,
     #[serde(default)]
     #[schema(required)]
     pub original_names: Vec<String>,
+}
+
+/// The parameter group a column belongs to, as the source's own registry places it.
+///
+/// A group is one decision behind every column of its category, so the plan carries it on each
+/// entry and the apply creates it once. `ordinal` is the member's position within the group, which
+/// is the registry's own order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PlanGroupRef {
+    #[schema(required)]
+    pub id: Option<Uuid>,
+    /// The group's stable code, slugged from the label the source gives it.
+    pub code: String,
+    pub label: String,
+    /// The member's position within the group.
+    pub ordinal: i32,
+    /// `measured` | `entry_only` | `output`, as the source's calculations make it.
+    pub role: String,
+    #[schema(required)]
+    pub description: Option<String>,
+    pub create: bool,
+}
+
+/// A group's code: lowercase, non-alphanumerics collapsed to underscores. The rule the portal seed
+/// used, so a database carrying groups from either route agrees with itself.
+#[must_use]
+pub fn group_code(label: &str) -> String {
+    let mut code = String::with_capacity(label.len());
+    let mut pending_break = false;
+    for c in label.chars() {
+        if c.is_ascii_alphanumeric() {
+            if pending_break && !code.is_empty() {
+                code.push('_');
+            }
+            pending_break = false;
+            code.extend(c.to_lowercase());
+        } else {
+            pending_break = true;
+        }
+    }
+    code
+}
+
+/// The group a stream's metadata places its column in, where the source declares one.
+#[must_use]
+pub fn plan_group(metadata: &serde_json::Value) -> Option<PlanGroupRef> {
+    let param = metadata.get("parameter")?;
+    let label = param.get("category")?.as_str()?.trim();
+    if label.is_empty() {
+        return None;
+    }
+    let role = param
+        .get("role")
+        .and_then(|v| v.as_str())
+        .filter(|r| matches!(*r, "measured" | "entry_only" | "output"))
+        .unwrap_or("entry_only");
+    Some(PlanGroupRef {
+        id: None,
+        code: group_code(label),
+        label: label.to_string(),
+        ordinal: param
+            .get("category_ordinal")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|o| i32::try_from(o).ok())
+            .unwrap_or(0),
+        role: role.to_string(),
+        description: param
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(ToString::to_string),
+        create: true,
+    })
 }
 
 #[derive(
@@ -860,6 +934,10 @@ pub struct PlanSummary {
     #[serde(default)]
     #[schema(required)]
     pub parameters_to_create: usize,
+    /// Distinct parameter groups the source's registry names that the database does not hold.
+    #[serde(default)]
+    #[schema(required)]
+    pub groups_to_create: usize,
     /// Distinct lab instruments the apply would create, and how many of those an operator has
     /// not yet agreed to. Apply refuses while the second is non-zero.
     #[serde(default)]
@@ -1056,6 +1134,7 @@ pub async fn create_plan(
                 create: false,
                 units: h.units,
                 group_key: None,
+                group: plan_group(&stream.metadata),
                 original_names: vec![],
             },
             confidence: "none".to_string(),
@@ -1136,6 +1215,9 @@ pub async fn create_plan(
     }
 
     let summary = compute_summary(&entries);
+    // The register rows this source has offered and no plan has taken yet. Snapshotted onto the
+    // plan so the review's decisions are the plan's, like every other proposal it carries.
+    let proposals = pending_instrument_proposals(db, source_system).await?;
 
     let plan = pairing_plans::ActiveModel {
         id: Set(Uuid::new_v4()),
@@ -1146,6 +1228,7 @@ pub async fn create_plan(
         entries: Set(PlanEntries(entries)),
         curve_assignments: Set(PlanCurveIntents::default()),
         accepted_objects: Set(PlanAcceptedObjects::default()),
+        instrument_proposals: Set(PlanInstrumentProposals(proposals)),
         version: Set(0),
         created_at: Set(Utc::now().into()),
         applied_at: Set(None),
@@ -1173,6 +1256,14 @@ pub struct ApplyResult {
     #[serde(default)]
     #[schema(required)]
     pub curves_assigned: u32,
+    /// Parameter groups the source's registry named that the database did not hold, and the
+    /// memberships placed in them.
+    #[serde(default)]
+    #[schema(required)]
+    pub groups_created: u32,
+    #[serde(default)]
+    #[schema(required)]
+    pub group_members_created: u32,
     pub readings_backfilled: u64,
 }
 
@@ -1274,6 +1365,7 @@ async fn assign_plan_curves<C: ConnectionTrait>(
 
 struct EntityCaches {
     projects: HashMap<String, Uuid>,
+    groups: HashMap<String, Uuid>,
     sites: HashMap<String, Uuid>,
     params: HashMap<String, Uuid>,
     site_params: HashMap<(Uuid, Uuid), Uuid>,
@@ -1282,6 +1374,8 @@ struct EntityCaches {
 
 struct ApplyCounters {
     projects_created: u32,
+    groups_created: u32,
+    group_members_created: u32,
     sites_created: u32,
     params_created: u32,
     sp_created: u32,
@@ -1382,6 +1476,7 @@ pub async fn apply_plan(
 
     let mut caches = EntityCaches {
         projects: HashMap::new(),
+        groups: HashMap::new(),
         sites: HashMap::new(),
         params: HashMap::new(),
         site_params: HashMap::new(),
@@ -1389,6 +1484,8 @@ pub async fn apply_plan(
     };
     let mut counters = ApplyCounters {
         projects_created: 0,
+        groups_created: 0,
+        group_members_created: 0,
         sites_created: 0,
         params_created: 0,
         sp_created: 0,
@@ -1400,6 +1497,10 @@ pub async fn apply_plan(
 
     let minted = mint_plan_instruments(&txn, &plan.source_system, &entries).await?;
     counters.instruments_created = minted.len() as u32;
+    // The source's own register, admitted by the same apply: an instrument exists because a plan an
+    // operator validated created it, whether it came from a feed or from the register (Q134).
+    counters.instruments_created +=
+        admit_instrument_proposals(&txn, &plan.source_system, &plan.instrument_proposals.0).await?;
     counters.curves_assigned = assign_plan_curves(&txn, &curve_intents, &minted).await?;
 
     // How far the apply has got, on the pool connection rather than inside `txn`, so the operator
@@ -1541,6 +1642,8 @@ pub async fn apply_plan(
         streams_skipped: counters.streams_skipped,
         instruments_created: counters.instruments_created,
         curves_assigned: counters.curves_assigned,
+        groups_created: counters.groups_created,
+        group_members_created: counters.group_members_created,
         readings_backfilled,
     };
 
@@ -1590,6 +1693,17 @@ async fn resolve_plan_entry<C: ConnectionTrait>(
         &mut counters.params_created,
     )
     .await?;
+    if let Some(group) = entry.parameter.group.as_ref() {
+        place_in_group(
+            txn,
+            parameter_id,
+            group,
+            &mut caches.groups,
+            &mut counters.groups_created,
+            &mut counters.group_members_created,
+        )
+        .await?;
+    }
     let site_parameter_id = resolve_or_create_site_param(
         txn,
         site_id,
@@ -1600,6 +1714,82 @@ async fn resolve_plan_entry<C: ConnectionTrait>(
     )
     .await?;
     Ok((site_parameter_id, parameter_id))
+}
+
+/// Put one parameter in the group its source's registry names, creating the group on first use.
+///
+/// A parameter belongs to at most one group (`parameter_group_members.parameter_id` is UNIQUE), so
+/// a parameter someone has already placed keeps the placement it has: the apply fills a gap, it
+/// does not move what an operator decided. The group's own ordinal is its first member's, which is
+/// the order the registry lists the categories in.
+async fn place_in_group<C: ConnectionTrait>(
+    txn: &C,
+    parameter_id: Uuid,
+    group: &PlanGroupRef,
+    cache: &mut HashMap<String, Uuid>,
+    groups_created: &mut u32,
+    members_created: &mut u32,
+) -> AppResult<()> {
+    let group_id = match cache.get(&group.code) {
+        Some(&id) => id,
+        None => {
+            let id = group.id.unwrap_or_else(Uuid::new_v4);
+            let written = txn
+                .execute_raw(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "INSERT INTO parameter_groups (id, code, label, ordinal) \
+                     VALUES ($1, $2, $3, $4) ON CONFLICT (code) DO NOTHING",
+                    [
+                        id.into(),
+                        group.code.clone().into(),
+                        group.label.clone().into(),
+                        group.ordinal.into(),
+                    ],
+                ))
+                .await?;
+            if written.rows_affected() > 0 {
+                *groups_created += 1;
+            }
+            // The insert may have lost the race with another entry of this same pass, so the id is
+            // read back rather than assumed.
+            let resolved = txn
+                .query_one_raw(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT id FROM parameter_groups WHERE code = $1",
+                    [group.code.clone().into()],
+                ))
+                .await?
+                .ok_or_else(|| {
+                    AppError::Internal(format!(
+                        "parameter group '{}' was neither found nor created",
+                        group.code
+                    ))
+                })?
+                .try_get::<Uuid>("", "id")?;
+            cache.insert(group.code.clone(), resolved);
+            resolved
+        }
+    };
+    let written = txn
+        .execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO parameter_group_members \
+                 (id, group_id, parameter_id, ordinal, role, description) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (parameter_id) DO NOTHING",
+            [
+                Uuid::new_v4().into(),
+                group_id.into(),
+                parameter_id.into(),
+                group.ordinal.into(),
+                group.role.clone().into(),
+                group.description.clone().into(),
+            ],
+        ))
+        .await?;
+    if written.rows_affected() > 0 {
+        *members_created += 1;
+    }
+    Ok(())
 }
 
 /// The names a new slot may take, most preferred first: the parameter's label, then the label
@@ -1754,6 +1944,125 @@ async fn resolve_or_create_site_param<C: ConnectionTrait>(
 /// Create the lab instruments a plan's confirmed entries ask for, one per `source_key` however
 /// many streams share it, and return them by that key. Find-or-create, so re-running an apply
 /// after a partial failure resolves the same rows.
+/// One row of a source's own instrument register, as the plan puts it to the operator.
+///
+/// The register is the only record of which probe carried which serial and when it was installed,
+/// and it goes with the portal, so it travels ahead of the plan and waits (M185). Admitting one is
+/// the plan's act, like creating a site: nothing exists until the apply runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PlanInstrumentProposal {
+    /// The source's own identity for it, e.g. `sensor_inventory:62`.
+    pub source_key: String,
+    pub name: String,
+    #[schema(required)]
+    pub serial_number: Option<String>,
+    #[schema(required)]
+    pub manufacturer: Option<String>,
+    #[schema(required)]
+    pub model: Option<String>,
+    #[schema(required)]
+    pub notes: Option<String>,
+    pub is_lab_instrument: bool,
+    /// Whatever the register holds that river-data has no column for: the station it was installed
+    /// at, the dates, the state the lab recorded.
+    #[schema(required)]
+    pub metadata: Option<serde_json::Value>,
+    /// Whether the apply creates it. Proposed admitted: the register is the lab's own record, so
+    /// the question is which rows to leave behind rather than which to take.
+    pub admit: bool,
+}
+
+/// The register rows waiting for this source, as the plan carries them.
+#[derive(
+    Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema,
+    sea_orm::FromJsonQueryResult,
+)]
+#[serde(transparent)]
+pub struct PlanInstrumentProposals(pub Vec<PlanInstrumentProposal>);
+
+/// The proposals a source has offered and no plan has admitted yet.
+pub async fn pending_instrument_proposals<C: ConnectionTrait>(
+    db: &C,
+    source_system: &str,
+) -> AppResult<Vec<PlanInstrumentProposal>> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT source_key, name, serial_number, manufacturer, model, notes, \
+                    is_lab_instrument, metadata \
+               FROM instrument_proposals WHERE source_system = $1 ORDER BY source_key",
+            [source_system.into()],
+        ))
+        .await?;
+    let mut proposals = Vec::with_capacity(rows.len());
+    for row in &rows {
+        proposals.push(PlanInstrumentProposal {
+            source_key: row.try_get("", "source_key")?,
+            name: row.try_get("", "name")?,
+            serial_number: row.try_get("", "serial_number")?,
+            manufacturer: row.try_get("", "manufacturer")?,
+            model: row.try_get("", "model")?,
+            notes: row.try_get("", "notes")?,
+            is_lab_instrument: row.try_get("", "is_lab_instrument")?,
+            metadata: row.try_get("", "metadata")?,
+            admit: true,
+        });
+    }
+    Ok(proposals)
+}
+
+/// Create the register rows the review admitted, in the apply's transaction, and clear them from
+/// the queue. A row left unadmitted stays a proposal: the next plan offers it again.
+async fn admit_instrument_proposals<C: ConnectionTrait>(
+    txn: &C,
+    source_system: &str,
+    proposals: &[PlanInstrumentProposal],
+) -> AppResult<u32> {
+    let mut created = 0u32;
+    for proposal in proposals.iter().filter(|p| p.admit) {
+        let id = upsert_source_instrument(
+            txn,
+            source_system,
+            &proposal.source_key,
+            &proposal.name,
+            if proposal.is_lab_instrument {
+                InstrumentKind::Lab
+            } else {
+                InstrumentKind::Device
+            },
+            "high",
+            proposal.metadata.clone(),
+        )
+        .await?;
+        // The serial is claimed only where no other instrument holds it: METALP's register carries
+        // one serial on two probes, and losing the instrument over that would be worse than storing
+        // it without one.
+        if let Some(serial) = proposal.serial_number.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            txn.execute_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE sensors SET serial_number = $2, manufacturer = $3, model = $4 \
+                  WHERE id = $1 \
+                    AND NOT EXISTS (SELECT 1 FROM sensors o WHERE o.serial_number = $2 AND o.id <> $1)",
+                [
+                    id.into(),
+                    serial.to_string().into(),
+                    proposal.manufacturer.clone().into(),
+                    proposal.model.clone().into(),
+                ],
+            ))
+            .await?;
+        }
+        txn.execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "DELETE FROM instrument_proposals WHERE source_system = $1 AND source_key = $2",
+            [source_system.into(), proposal.source_key.clone().into()],
+        ))
+        .await?;
+        created += 1;
+    }
+    Ok(created)
+}
+
 async fn mint_plan_instruments<C: ConnectionTrait>(
     txn: &C,
     source_system: &str,
@@ -1928,6 +2237,8 @@ async fn finalize_plan<C: ConnectionTrait>(
         streams_skipped: counters.streams_skipped,
         instruments_created: counters.instruments_created,
         curves_assigned: counters.curves_assigned,
+        groups_created: counters.groups_created,
+        group_members_created: counters.group_members_created,
         readings_backfilled,
     };
 
@@ -2129,6 +2440,16 @@ fn compute_summary(entries: &[PlanEntry]) -> PlanSummary {
         .collect::<std::collections::HashSet<_>>()
         .len();
 
+    // A group is one decision behind every column of its category, so it is counted by code.
+    let groups_to_create = entries
+        .iter()
+        .filter(|e| e.action == "pair")
+        .filter_map(|e| e.parameter.group.as_ref())
+        .filter(|g| g.create)
+        .map(|g| &g.code)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+
     // Instruments are counted by identity, not by entry: one curve column serves every station in
     // the source, so 31 DOC streams create at most one instrument.
     let instruments_to_create = entries
@@ -2170,6 +2491,7 @@ fn compute_summary(entries: &[PlanEntry]) -> PlanSummary {
         projects_to_create,
         sites_to_create,
         parameters_to_create: params_to_create,
+        groups_to_create,
         instruments_to_create,
         instruments_unconfirmed,
         unique_projects: unique_projects.len(),
@@ -2309,6 +2631,9 @@ pub struct EntityCatalog {
     pub projects: Vec<(Uuid, String)>,
     pub sites: Vec<(Uuid, String)>,
     pub params: Vec<CatalogParam>,
+    /// Parameter groups that already exist, by code, so a proposal resolves onto one rather than
+    /// proposing a second group under a name the database already carries.
+    pub groups: Vec<(Uuid, String)>,
 }
 
 pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityCatalog> {
@@ -2324,6 +2649,20 @@ pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityC
         .into_iter()
         .map(|s| (s.id, s.name))
         .collect();
+    let groups = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id, code FROM parameter_groups".to_string(),
+        ))
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<Uuid>("", "id")?,
+                row.try_get::<String>("", "code")?,
+            ))
+        })
+        .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
     // Usage per parameter in one pass. `readings.parameter_id` is indexed and the group-by is over
     // the slots, not the hypertable's rows, so this stays a catalog-sized query.
     let mut usage: HashMap<Uuid, (i64, i64)> = HashMap::new();
@@ -2370,6 +2709,7 @@ pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityC
         projects,
         sites,
         params,
+        groups,
     })
 }
 
@@ -2388,6 +2728,15 @@ pub fn reclassify_entry(entry: &mut PlanEntry, catalog: &EntityCatalog) {
     let (param_id, param_create) = match_entity_display(&entry.parameter.name, &catalog.params);
     entry.parameter.id = param_id;
     entry.parameter.create = param_create;
+
+    if let Some(group) = entry.parameter.group.as_mut() {
+        let existing = catalog
+            .groups
+            .iter()
+            .find(|(_, code)| code.eq_ignore_ascii_case(&group.code));
+        group.id = existing.map(|(id, _)| *id);
+        group.create = existing.is_none();
+    }
 
     entry.warnings.clear();
     if site_create

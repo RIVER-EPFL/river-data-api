@@ -3,7 +3,8 @@ use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::routes::private::sync::service::{
-    ApplyResult, PlanAcceptedObjects, PlanCurveIntents, PlanEntries, PlanSummary,
+    ApplyResult, PlanAcceptedObjects, PlanCurveIntents, PlanEntries, PlanInstrumentProposals,
+    PlanSummary,
 };
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize, EntityToModels)]
@@ -37,6 +38,11 @@ pub struct Model {
     #[sea_orm(column_type = "JsonBinary")]
     #[crudcrate(exclude(create, update), on_create = PlanAcceptedObjects::default())]
     pub accepted_objects: PlanAcceptedObjects,
+    /// The source's own instrument register, waiting for this plan to admit it (M185). Each row
+    /// carries `admit`, which the review turns off for one it wants left behind.
+    #[sea_orm(column_type = "JsonBinary")]
+    #[crudcrate(exclude(create, update), on_create = PlanInstrumentProposals::default())]
+    pub instrument_proposals: PlanInstrumentProposals,
     /// Bumped by every edit. A PATCH or an apply names the version it read, so a second writer
     /// on one draft is refused rather than carrying the first writer's decisions away.
     #[crudcrate(exclude(create, update), on_create = 0)]

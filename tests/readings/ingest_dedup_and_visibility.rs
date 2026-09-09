@@ -452,7 +452,8 @@ async fn ingest_overwrite_keeps_a_hand_picked_curve_and_recomposes_through_it() 
 
 /// Expected behaviour: a device status is attributed to the instrument its stream names, the way
 /// a reading on the same stream is. The Vaisala service cannot name one, since the stream list it
-/// reads carries no instrument.
+/// reads carries no instrument, and a stream carries none until it is paired (M172), so the
+/// pairing is what puts an instrument on the channel for both arms to take.
 #[tokio::test]
 #[serial]
 async fn ingest_status_event_takes_the_stream_instrument() {
@@ -460,7 +461,16 @@ async fn ingest_status_event_takes_the_stream_instrument() {
     crate::common::cleanup_test_db(&db).await;
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
+    crate::common::seed_test_data(&db).await;
     let stream = register_stream(&app, &token, "se-instrument").await;
+    let (status, paired) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/streams/{stream}/pair"),
+        &serde_json::json!({ "site_parameter_id": crate::common::PARAM_S1_TEMP_ID }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "pair ({status}): {paired}");
 
     let (status, body) = crate::common::post_json_parse_with_token(
         &app,

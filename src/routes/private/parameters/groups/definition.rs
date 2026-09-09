@@ -169,6 +169,10 @@ pub async fn group_definition(
         .map_err(AppError::Database)?;
 
     let sections_by_code = manifest_sections(&state.db, id).await?;
+    // The role follows from the calculations, never from the stored column (Q135): a parameter a
+    // formula writes is an output, one a formula reads is measured, the rest are entered and read
+    // by nothing.
+    let roles = calculation_roles(&state.db).await?;
     let declared = match query.site_id {
         Some(site_id) => site_declarations(&state.db, id, site_id).await?,
         None => std::collections::HashMap::new(),
@@ -183,7 +187,7 @@ pub async fn group_definition(
             parameter_id: member.parameter_id,
             code: member.code.clone(),
             ordinal: member.ordinal,
-            role: Role::parse(&member.role).unwrap_or(Role::EntryOnly),
+            role: *roles.get(&member.parameter_id).unwrap_or(&Role::EntryOnly),
             section: section.clone(),
         });
         // Places are the slot's declaration or nothing at all: a group declares none (Q120), and
@@ -204,7 +208,11 @@ pub async fn group_definition(
             units: member.units,
             decimal_places,
             description: member.description,
-            role: member.role,
+            role: roles
+                .get(&member.parameter_id)
+                .unwrap_or(&Role::EntryOnly)
+                .as_str()
+                .to_string(),
             ordinal: member.ordinal,
             section,
             replicates: member.replicates,
@@ -266,6 +274,44 @@ async fn site_declarations(
 
 /// The section each field renders under, by catalog code, taken from the active manifest of the
 /// calculation bound to this group. Empty where no calculation is bound or it declares none.
+/// What each parameter is to the formulas: written by one, read by one, or neither.
+///
+/// One pass over every formula and its sources, since a group's definition is read for a page and
+/// the calculation set is catalog-sized. A formula's output parameter is its own; its inputs are
+/// the `derived_parameter_sources` rows naming it.
+async fn calculation_roles(
+    db: &sea_orm::DatabaseConnection,
+) -> AppResult<std::collections::HashMap<Uuid, Role>> {
+    let mut roles = std::collections::HashMap::new();
+    let read = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT DISTINCT parameter_id FROM derived_parameter_sources".to_string(),
+        ))
+        .await
+        .map_err(AppError::Database)?;
+    for row in &read {
+        let id: Uuid = row.try_get("", "parameter_id").map_err(AppError::Database)?;
+        roles.insert(id, Role::Measured);
+    }
+    // Written last: what a formula writes is what the parameter is, even where another reads it.
+    let written = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT DISTINCT output_parameter_id FROM calculation_formulas               WHERE output_parameter_id IS NOT NULL"
+                .to_string(),
+        ))
+        .await
+        .map_err(AppError::Database)?;
+    for row in &written {
+        let id: Uuid = row
+            .try_get("", "output_parameter_id")
+            .map_err(AppError::Database)?;
+        roles.insert(id, Role::Output);
+    }
+    Ok(roles)
+}
+
 async fn manifest_sections(
     db: &sea_orm::DatabaseConnection,
     group_id: Uuid,

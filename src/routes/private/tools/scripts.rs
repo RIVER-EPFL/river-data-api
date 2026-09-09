@@ -1174,17 +1174,15 @@ pub async fn activate_version(
     let mut manifest = engine::parse_manifest(&version.manifest)
         .map_err(|e| AppError::BadRequest(format!("invalid manifest: {e}")))?;
     let summary = load_script(&state, id).await?;
-    // A calculation bound to a group reads and writes only that group's members, in the roles the
-    // group declares. Checked at activation, where the version becomes the one that runs.
-    if let Some(group_id) = summary.parameter_group_id {
-        super::calculation_versions::check_manifest_against_group(
-            &state.db,
-            group_id,
-            &summary.name,
-            &version.manifest,
-        )
-        .await?;
-    }
+    // Every parameter a manifest names has to be one the catalog holds. Checked at activation,
+    // where the version becomes the one that runs. Which group those parameters belong to decides
+    // nothing (Q135).
+    super::calculation_versions::check_manifest_codes_resolve(
+        &state.db,
+        &summary.name,
+        &version.manifest,
+    )
+    .await?;
     let catalog = engine::check_manifest_against_catalog(
         &state.db,
         &mut manifest,

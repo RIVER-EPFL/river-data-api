@@ -80,6 +80,22 @@ async fn list_reads_latest_from_cursor_and_rollup() {
     .await;
     assert_eq!(status, 200, "ingest ({status}): {body}");
 
+    // The stream is unpaired, so its readings are staged and name no instrument (B223): the
+    // cursor still says when the channel last reported, and no value is attributed to the
+    // instrument yet.
+    let row = sensor_row(&fx, &cursor_sensor).await;
+    assert_eq!(row["last_reading_at"], "2025-06-10T09:00:00Z", "{row}");
+    assert!(row["last_reading_value"].is_null(), "{row}");
+
+    // Pairing attributes them, and the column answers from the instrument's own readings.
+    let (status, paired) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        &format!("/api/streams/{stream_id}/pair"),
+        &json!({ "site_parameter_id": crate::common::PARAM_S1_TEMP_ID }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "pair ({status}): {paired}");
     let row = sensor_row(&fx, &cursor_sensor).await;
     assert_eq!(row["last_reading_at"], "2025-06-10T09:00:00Z", "{row}");
     assert_eq!(row["last_reading_value"], 2.5, "{row}");

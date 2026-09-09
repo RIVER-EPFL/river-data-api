@@ -1893,6 +1893,17 @@
             "minimum": 0,
             "type": "integer"
           },
+          "group_members_created": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "groups_created": {
+            "description": "Parameter groups the source's registry named that the database did not hold, and the\nmemberships placed in them.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
           "instruments_created": {
             "format": "int32",
             "minimum": 0,
@@ -1943,6 +1954,8 @@
           "streams_skipped",
           "instruments_created",
           "curves_assigned",
+          "groups_created",
+          "group_members_created",
           "readings_backfilled"
         ],
         "type": "object"
@@ -2392,6 +2405,12 @@
           "formula": {
             "type": "string"
           },
+          "intermediate": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "name": {
             "type": "string"
           },
@@ -2459,6 +2478,10 @@
             "format": "uuid",
             "type": "string"
           },
+          "intermediate": {
+            "description": "A step of the calculation rather than a measurement of anything (M180): it mints no catalog\nparameter, is not saved and is not a manifest output, and its value is handed to the\nformulas after it and reported in the run under this formula's own code.",
+            "type": "boolean"
+          },
           "name": {
             "type": "string"
           },
@@ -2511,6 +2534,7 @@
           "ordinal",
           "curve_slot",
           "per_replicate",
+          "intermediate",
           "created_at",
           "sources"
         ],
@@ -2547,6 +2571,10 @@
           "id": {
             "format": "uuid",
             "type": "string"
+          },
+          "intermediate": {
+            "description": "A step of the calculation rather than a measurement of anything (M180): it mints no catalog\nparameter, is not saved and is not a manifest output, and its value is handed to the\nformulas after it and reported in the run under this formula's own code.",
+            "type": "boolean"
           },
           "name": {
             "type": "string"
@@ -2600,6 +2628,7 @@
           "ordinal",
           "curve_slot",
           "per_replicate",
+          "intermediate",
           "created_at",
           "sources"
         ],
@@ -2628,6 +2657,12 @@
           "formula": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "intermediate": {
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -10729,6 +10764,10 @@
             "format": "uuid",
             "type": "string"
           },
+          "instrument_proposals": {
+            "$ref": "#/components/schemas/PlanInstrumentProposals",
+            "description": "The source's own instrument register, waiting for this plan to admit it (M185). Each row\ncarries `admit`, which the review turns off for one it wants left behind."
+          },
           "source_system": {
             "type": "string"
           },
@@ -10753,6 +10792,7 @@
           "entries",
           "curve_assignments",
           "accepted_objects",
+          "instrument_proposals",
           "version",
           "created_at",
           "applied_at",
@@ -10835,6 +10875,10 @@
             "format": "uuid",
             "type": "string"
           },
+          "instrument_proposals": {
+            "$ref": "#/components/schemas/PlanInstrumentProposals",
+            "description": "The source's own instrument register, waiting for this plan to admit it (M185). Each row\ncarries `admit`, which the review turns off for one it wants left behind."
+          },
           "source_system": {
             "type": "string"
           },
@@ -10859,6 +10903,7 @@
           "entries",
           "curve_assignments",
           "accepted_objects",
+          "instrument_proposals",
           "version",
           "created_at",
           "applied_at",
@@ -10910,6 +10955,10 @@
             "format": "uuid",
             "type": "string"
           },
+          "instrument_proposals": {
+            "$ref": "#/components/schemas/PlanInstrumentProposals",
+            "description": "The source's own instrument register, waiting for this plan to admit it (M185). Each row\ncarries `admit`, which the review turns off for one it wants left behind."
+          },
           "source_system": {
             "type": "string"
           },
@@ -10934,6 +10983,7 @@
           "entries",
           "curve_assignments",
           "accepted_objects",
+          "instrument_proposals",
           "version",
           "created_at",
           "applied_at",
@@ -12821,6 +12871,53 @@
         ],
         "type": "object"
       },
+      "PlanGroupRef": {
+        "description": "The parameter group a column belongs to, as the source's own registry places it.\n\nA group is one decision behind every column of its category, so the plan carries it on each\nentry and the apply creates it once. `ordinal` is the member's position within the group, which\nis the registry's own order.",
+        "properties": {
+          "code": {
+            "description": "The group's stable code, slugged from the label the source gives it.",
+            "type": "string"
+          },
+          "create": {
+            "type": "boolean"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": "string"
+          },
+          "ordinal": {
+            "description": "The member's position within the group.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "role": {
+            "description": "`measured` | `entry_only` | `output`, as the source's calculations make it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "label",
+          "ordinal",
+          "role",
+          "description",
+          "create"
+        ],
+        "type": "object"
+      },
       "PlanInstrumentGroup": {
         "description": "One instrument decision in a pairing plan: the instrument, what it covers, and the curves it\nowns. Only instruments the plan actually binds are listed; the rest of the inventory is\nreachable through the picker, so this stays a list of decisions rather than a catalog.",
         "properties": {
@@ -12922,6 +13019,71 @@
           "proposed_name"
         ],
         "type": "object"
+      },
+      "PlanInstrumentProposal": {
+        "description": "Create the lab instruments a plan's confirmed entries ask for, one per `source_key` however\nmany streams share it, and return them by that key. Find-or-create, so re-running an apply\nafter a partial failure resolves the same rows.\nOne row of a source's own instrument register, as the plan puts it to the operator.\n\nThe register is the only record of which probe carried which serial and when it was installed,\nand it goes with the portal, so it travels ahead of the plan and waits (M185). Admitting one is\nthe plan's act, like creating a site: nothing exists until the apply runs.",
+        "properties": {
+          "admit": {
+            "description": "Whether the apply creates it. Proposed admitted: the register is the lab's own record, so\nthe question is which rows to leave behind rather than which to take.",
+            "type": "boolean"
+          },
+          "is_lab_instrument": {
+            "type": "boolean"
+          },
+          "manufacturer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "description": "Whatever the register holds that river-data has no column for: the station it was installed\nat, the dates, the state the lab recorded."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "notes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serial_number": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_key": {
+            "description": "The source's own identity for it, e.g. `sensor_inventory:62`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_key",
+          "name",
+          "serial_number",
+          "manufacturer",
+          "model",
+          "notes",
+          "is_lab_instrument",
+          "metadata",
+          "admit"
+        ],
+        "type": "object"
+      },
+      "PlanInstrumentProposals": {
+        "description": "The register rows waiting for this source, as the plan carries them.",
+        "items": {
+          "$ref": "#/components/schemas/PlanInstrumentProposal"
+        },
+        "type": "array"
       },
       "PlanInstrumentRef": {
         "description": "The instrument a plan entry's curve references resolve to, and how that was decided.",
@@ -13076,6 +13238,17 @@
           "create": {
             "type": "boolean"
           },
+          "group": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanGroupRef",
+                "description": "The parameter group the source's registry places this column in, resolved against the\ngroups that already exist. Absent where the source declares no category."
+              }
+            ]
+          },
           "group_key": {
             "type": [
               "string",
@@ -13115,7 +13288,24 @@
           "name",
           "create",
           "units",
+          "group",
           "original_names"
+        ],
+        "type": "object"
+      },
+      "PlanProposalUpdate": {
+        "additionalProperties": false,
+        "properties": {
+          "admit": {
+            "type": "boolean"
+          },
+          "source_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_key",
+          "admit"
         ],
         "type": "object"
       },
@@ -13355,6 +13545,11 @@
             "minimum": 0,
             "type": "integer"
           },
+          "groups_to_create": {
+            "description": "Distinct parameter groups the source's registry names that the database does not hold.",
+            "minimum": 0,
+            "type": "integer"
+          },
           "instruments_to_create": {
             "description": "Distinct lab instruments the apply would create, and how many of those an operator has\nnot yet agreed to. Apply refuses while the second is non-zero.",
             "minimum": 0,
@@ -13420,6 +13615,7 @@
           "projects_to_create",
           "sites_to_create",
           "parameters_to_create",
+          "groups_to_create",
           "instruments_to_create",
           "instruments_unconfirmed",
           "unique_projects",
@@ -14139,6 +14335,46 @@
           "last_seen_at",
           "decided_by",
           "decided_at"
+        ],
+        "type": "object"
+      },
+      "ProposeInstrumentsRequest": {
+        "additionalProperties": false,
+        "description": "A source's whole instrument register, offered for a plan to admit.",
+        "properties": {
+          "instruments": {
+            "items": {
+              "$ref": "#/components/schemas/SensorUpsert"
+            },
+            "type": "array"
+          },
+          "source_system": {
+            "description": "The sync source the register belongs to, e.g. \"metalp\".",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_system",
+          "instruments"
+        ],
+        "type": "object"
+      },
+      "ProposeInstrumentsResponse": {
+        "properties": {
+          "already_admitted": {
+            "description": "Proposals a plan has already admitted, which are instruments now and are left alone.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stored": {
+            "description": "Rows now held as proposals, whether this call created or refreshed them.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "stored",
+          "already_admitted"
         ],
         "type": "object"
       },
@@ -23092,6 +23328,13 @@
             "format": "int32",
             "type": "integer"
           },
+          "instruments": {
+            "description": "Register rows the review has decided to admit or leave behind, by the source's own key.",
+            "items": {
+              "$ref": "#/components/schemas/PlanProposalUpdate"
+            },
+            "type": "array"
+          },
           "objects": {
             "description": "Objects the review has accepted or taken back, `{kind}:{name}` as the card names them.",
             "items": {
@@ -28338,7 +28581,7 @@
     },
     "/api/derived_parameters": {
       "get": {
-        "description": "Retrieves all calculation_formulas.\n\nThis resource manages calculation_formula items\n\nAdditional sortable columns: \n- code\n- ordinal\n- created_at.\n\nAdditional filterable columns: \n- code\n- tool_script_id\n- ordinal\n- curve_slot\n- per_replicate.",
+        "description": "Retrieves all calculation_formulas.\n\nThis resource manages calculation_formula items\n\nAdditional sortable columns: \n- code\n- ordinal\n- created_at.\n\nAdditional filterable columns: \n- code\n- tool_script_id\n- ordinal\n- curve_slot\n- per_replicate\n- intermediate.",
         "operationId": "get_all_calculation_formulas",
         "parameters": [
           {
@@ -37169,6 +37412,38 @@
           }
         },
         "summary": "Create many sensors"
+      }
+    },
+    "/api/sensors/proposals": {
+      "post": {
+        "description": "Nothing is created: an instrument exists once a pairing plan an operator validated creates it\n(Q134). A row already admitted as an instrument under the same provenance is skipped rather than\nre-proposed, so a sync does not offer back what the operator already took.",
+        "operationId": "propose_instruments",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProposeInstrumentsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProposeInstrumentsResponse"
+                }
+              }
+            },
+            "description": "Register stored"
+          }
+        },
+        "summary": "Store a source's instrument register as proposals. Requires `write_metadata`.",
+        "tags": [
+          "sensors"
+        ]
       }
     },
     "/api/sensors/register": {

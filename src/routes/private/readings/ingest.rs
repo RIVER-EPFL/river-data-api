@@ -546,6 +546,13 @@ pub async fn ingest_readings(
                 .sensor_id
                 .or(stream.sensor_id)
                 .or_else(|| owner.and_then(|o| o.sensor_id));
+            // A reading on an unpaired stream is staged: nothing has said which instrument
+            // measured it, and the channel's registration default is not that answer (B223). What
+            // the caller declared is kept, because that is a claim somebody made; what would be
+            // derived here waits for the pairing, which stamps site, parameter and instrument
+            // together. The cadence still reads the channel's instrument above: which device a
+            // feed comes through is a fact about the channel, not a claim about the measurement.
+            let stored_sensor_id = if paired { sensor_id } else { r.sensor_id };
             // The one curve this reading is stored against: the caller's if it named one, else
             // whichever window covers its own time. Both `calibration_id` and `calibrated_value`
             // are derived from it, so a later reprocess re-resolving the same windows recomputes
@@ -577,16 +584,23 @@ pub async fn ingest_readings(
                 // between sites while the stream keeps pointing at one slot.
                 site_id: Set(site_id.map(|paired| slot.and_then(|s| s.site_id).unwrap_or(paired))),
                 parameter_id: Set(parameter_id),
-                calibrated_value: Set(match (curve, standard) {
+                calibrated_value: Set(match (curve.filter(|_| paired), standard) {
                     (None, None) => None,
                     (base, standard) => Some(apply_curves(r.raw_value, base, standard)),
                 }),
-                sensor_id: Set(sensor_id),
-                calibration_id: Set(curve.map(|c| c.id)),
-                deployment_id: Set(r
-                    .deployment_id
-                    .or_else(|| slot.and_then(|s| s.deployment_id))
-                    .or_else(|| owner.and_then(|o| o.deployment_id))),
+                sensor_id: Set(stored_sensor_id),
+                calibration_id: Set(if paired {
+                    curve.map(|c| c.id)
+                } else {
+                    r.calibration_id
+                }),
+                deployment_id: Set(if paired {
+                    r.deployment_id
+                        .or_else(|| slot.and_then(|s| s.deployment_id))
+                        .or_else(|| owner.and_then(|o| o.deployment_id))
+                } else {
+                    r.deployment_id
+                }),
                 measurement_type: Set(Some(
                     crate::routes::private::readings::measurement::resolve_measurement_type(
                         r.measurement_type.as_deref(),

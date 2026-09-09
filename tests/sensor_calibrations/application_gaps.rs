@@ -740,9 +740,9 @@ async fn stream_import_attributes_each_reading_to_its_covering_curve() {
         "import reuses the instrument the stream is linked to: {imported}"
     );
     assert_eq!(
-        imported["attributed"], 0,
-        "the stream declared its instrument at registration, so its readings were attributed as \
-         they were written and import finds nothing left to stamp: {imported}"
+        imported["attributed"], 2,
+        "the stream is unpaired, so its readings were staged as they were written and the import \
+         is what stamps them: {imported}"
     );
 
     let rows = sl::get_readings(&f.db, as_uuid(&f.stream)).await;
@@ -786,9 +786,9 @@ async fn stream_import_attributes_each_reading_to_its_covering_curve() {
         "a stream with no instrument mints its own: {imported}"
     );
     assert_eq!(
-        imported["attributed"], 0,
-        "registration attached the instrument the import adopts and the insert stamped the row \
-         from it, so the import moves nothing: {imported}"
+        imported["attributed"], 1,
+        "the row was staged while the stream was unpaired, so the import stamps it with the \
+         instrument it adopts: {imported}"
     );
 
     let fresh_rows = sl::get_readings(&f.db, as_uuid(&fresh_stream)).await;

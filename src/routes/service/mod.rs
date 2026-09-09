@@ -321,6 +321,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             post(crate::routes::private::sensors::register::register_sensor),
         )
         .route(
+            "/sensors/proposals",
+            post(crate::routes::private::sensors::register::propose_instruments),
+        )
+        .route(
             "/notes/register",
             post(crate::routes::private::notes::register::register_notes),
         )

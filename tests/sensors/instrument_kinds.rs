@@ -8,8 +8,9 @@
 //!
 //! Run: cargo test --test sensors instrument_kinds -- --test-threads=1
 
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, EntityTrait, Statement};
 use serde_json::json;
+use uuid::Uuid;
 use serial_test::serial;
 
 async fn kind_of(db: &sea_orm::DatabaseConnection, sensor_id: &str) -> String {
@@ -24,6 +25,62 @@ async fn kind_of(db: &sea_orm::DatabaseConnection, sensor_id: &str) -> String {
     row.try_get::<String>("", "kind").expect("kind")
 }
 
+async fn frequency_of(db: &sea_orm::DatabaseConnection, sensor_id: &str) -> String {
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT data_frequency FROM sensors WHERE id = '{sensor_id}'"),
+        ))
+        .await
+        .expect("query")
+        .expect("the instrument exists");
+    row.try_get::<String>("", "data_frequency")
+        .expect("data_frequency")
+}
+
+/// Register a feed and mint its instrument the way the pairing does. Registration itself attaches
+/// none, so this is what stands in for the pairing in a test about which kind each path stamps.
+async fn mint_for_feed(
+    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    token: &str,
+    source_system: &str,
+    source_key: &str,
+    metadata: serde_json::Value,
+) -> String {
+    let (status, stream) = crate::common::post_json_parse_with_token(
+        app,
+        "/api/streams/register",
+        &json!({
+            "source_system": source_system,
+            "source_key": source_key,
+            "metadata": metadata,
+        }),
+        token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "register ({status}): {stream}");
+    assert!(
+        stream["sensor_id"].is_null(),
+        "registration mints nothing: {stream}"
+    );
+    let id: Uuid = stream["id"].as_str().expect("stream id").parse().expect("uuid");
+    let model = river_db::routes::private::data_streams::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .expect("query stream")
+        .expect("the stream exists");
+    river_db::routes::private::sensors::identity::resolve_or_mint_stream_instrument(
+        db,
+        &model,
+        None,
+        river_db::routes::private::sensors::identity::InstrumentKind::SourceParameter,
+    )
+    .await
+    .expect("mint the instrument")
+    .to_string()
+}
+
 #[tokio::test]
 #[serial]
 async fn each_minting_path_stamps_what_it_made() {
@@ -33,33 +90,31 @@ async fn each_minting_path_stamps_what_it_made() {
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
 
+    // Registration mints nothing (M172), so both feed paths are exercised through the function the
+    // pairing and the plan apply mint with.
     // A device feed: the channel is the instrument.
-    let (status, stream) = crate::common::post_json_parse_with_token(
+    let device = mint_for_feed(
+        &db,
         &app,
-        "/api/streams/register",
-        &json!({
-            "source_system": "vaisala",
-            "source_key": "kinds-device",
-            "metadata": {"device": {"logger_serial": "LOG-1"}},
-        }),
         &token,
+        "vaisala",
+        "kinds-device",
+        json!({"device": {"logger_serial": "LOG-1"}}),
     )
     .await;
-    assert!((200..300).contains(&status), "register ({status}): {stream}");
-    let device = stream["sensor_id"].as_str().expect("device instrument");
-    assert_eq!(kind_of(&db, device).await, "device");
+    assert_eq!(kind_of(&db, &device).await, "device");
 
     // A feed that describes no device: one instrument per parameter across every station.
-    let (status, stream) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/streams/register",
-        &json!({"source_system": "cnet", "source_key": "FP1:DOC_avg_ppb"}),
-        &token,
-    )
-    .await;
-    assert!((200..300).contains(&status), "register ({status}): {stream}");
-    let source_parameter = stream["sensor_id"].as_str().expect("source instrument");
-    assert_eq!(kind_of(&db, source_parameter).await, "source_parameter");
+    let source_parameter =
+        mint_for_feed(&db, &app, &token, "cnet", "FP1:DOC_avg_ppb", json!({})).await;
+    assert_eq!(kind_of(&db, &source_parameter).await, "source_parameter");
+    // A bookkeeping row carries no evidence about cadence, and `data_frequency` is read as one by
+    // the measurement-type chain, so 'high' is what keeps that rung silent.
+    assert_eq!(
+        frequency_of(&db, &source_parameter).await,
+        "high",
+        "a bookkeeping instrument classifies nothing"
+    );
 
     // A hand-entered value: the slot's own entry channel, never the deployed probe.
     let (status, body) = crate::common::post_json_with_token(
@@ -162,8 +217,24 @@ async fn the_inventory_separates_the_kinds() {
         ids.contains(&sensor["id"].as_str().unwrap()),
         "the hand-created instrument is a device: {body}"
     );
+    // Registration mints nothing, so there is no bookkeeping row to exclude yet: minting one the
+    // way the pairing does is what puts it in the inventory, and the filter still leaves it out.
+    let bookkeeping = mint_for_feed(&db, &app, &token, "cnet", "FP2:NO2_mgL:minted", json!({})).await;
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sensors?filter={filter}&page=1&per_page=100"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "list ({status}): {body}");
+    let ids: Vec<&str> = body
+        .as_array()
+        .expect("array body")
+        .iter()
+        .map(|s| s["id"].as_str().unwrap_or_default())
+        .collect();
     assert!(
-        !ids.contains(&stream["sensor_id"].as_str().unwrap()),
+        !ids.contains(&bookkeeping.as_str()),
         "the minted bookkeeping row is not offered as one: {body}"
     );
 

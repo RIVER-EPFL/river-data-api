@@ -139,3 +139,51 @@ async fn push_device_registers_lists_and_deletes_by_endpoint() {
         "the device count follows the delete"
     );
 }
+
+/// Scenario: the settings page's channel list, over a log holding one delivered and one failed
+/// attempt on the same channel.
+///
+/// Expected behaviour: the route answers, and each channel reports what it sent, not what it
+/// attempted.
+#[tokio::test]
+#[serial]
+async fn channels_report_what_was_sent_not_what_was_attempted() {
+    require_keycloak!();
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let user_sub = keycloak_user_id("user").await;
+    grant_project(&db, &user_sub, PROJECT_ID).await;
+
+    for (status, age) in [("sent", "1 hour"), ("failed", "1 hour"), ("sent", "40 days")] {
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO notification_log (kind, channel, recipient, status, created_at) \
+                 VALUES ('alarm_opened', 'web_push', 'someone', '{status}', \
+                         now() - interval '{age}')"
+            ),
+        )
+        .await;
+    }
+
+    let app = crate::common::keycloak::build_test_app_with_keycloak(db).await;
+    let user = get_keycloak_jwt("user", "user").await;
+    let (s, body) =
+        crate::common::get_json_with_token(&app, "/api/notifications/channels", &user).await;
+    assert_eq!(s, 200, "the channel list answers: {body}");
+
+    let opened = body
+        .as_array()
+        .expect("a channel per kind")
+        .iter()
+        .find(|c| c["kind"] == serde_json::json!("alarm_opened"))
+        .expect("the alarm_opened channel");
+    assert_eq!(opened["sent1d"], serde_json::json!(1), "{opened}");
+    assert_eq!(opened["sent7d"], serde_json::json!(1), "{opened}");
+    assert_eq!(
+        opened["sent30d"],
+        serde_json::json!(1),
+        "the 40-day-old send is outside every window: {opened}"
+    );
+}

@@ -8,29 +8,17 @@ use sea_orm_migration::prelude::*;
 /// than a table the code knows: `meteoswiss_sync` reads this column and does nothing for a site
 /// that leaves it null.
 ///
-/// The catalog parameter is seeded here so the first sync has somewhere to land. Units are the
-/// hectopascals `prestas0` reports; the procedure's pascals are a factor the formula carries.
+/// The catalog parameter is not seeded with it: a database starts blank and a parameter is
+/// something somebody at this lab agreed to (Q134). `meteoswiss_sync` says so and does nothing
+/// until one exists, so a site naming a station before the parameter is a log line, not a loss.
+/// Its units are the hectopascals `prestas0` reports; the procedure's pascals are a factor the
+/// formula carries.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
-const UP: &str = "
-    ALTER TABLE public.sites ADD COLUMN IF NOT EXISTS meteoswiss_station_abbr text;
+const UP: &str = "ALTER TABLE public.sites ADD COLUMN IF NOT EXISTS meteoswiss_station_abbr text;";
 
-    INSERT INTO public.parameters (code, name, default_units, category, description)
-    SELECT 'barometric_pressure', 'Barometric Pressure', 'hPa', 'measurement',
-           'Station-level barometric pressure, MeteoSwiss SMN variable prestas0.'
-     WHERE NOT EXISTS (
-       SELECT 1 FROM public.parameters WHERE LOWER(code) = 'barometric_pressure'
-     );
-";
-
-const DOWN: &str = "
-    ALTER TABLE public.sites DROP COLUMN IF EXISTS meteoswiss_station_abbr;
-
-    DELETE FROM public.parameters p
-     WHERE LOWER(p.code) = 'barometric_pressure'
-       AND NOT EXISTS (SELECT 1 FROM public.site_parameters sp WHERE sp.parameter_id = p.id);
-";
+const DOWN: &str = "ALTER TABLE public.sites DROP COLUMN IF EXISTS meteoswiss_station_abbr;";
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {

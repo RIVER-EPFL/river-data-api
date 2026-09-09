@@ -239,6 +239,81 @@ async fn ingest_attributes_a_row_to_the_streams_instrument_and_falls_back_to_the
     crate::common::cleanup_test_db(&fx.db).await;
 }
 
+/// Expected behaviour: a reading on an unpaired stream is staged, so it names no instrument. The
+/// plan has not said which instrument measured it, and a minted channel default is not an answer:
+/// the pairing backfill is what stamps site, parameter and instrument together.
+#[tokio::test]
+#[serial]
+async fn an_unpaired_stream_stages_its_readings_rather_than_attributing_them() {
+    let fx = setup().await;
+    let unpaired = Uuid::new_v4();
+    fx.db
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO data_streams (id, source_system, source_key, is_active, sensor_id, \
+                                       site_parameter_id) \
+             VALUES ($1, 'attribution-order', 'ingest-unpaired', true, $2, NULL)",
+            [unpaired.into(), fx.channel.into()],
+        ))
+        .await
+        .expect("create unpaired stream");
+
+    let (status, body) = crate::common::post_json_with_token(
+        &fx.app,
+        "/api/ingest",
+        &json!({
+            "stream_id": unpaired,
+            "readings": [{ "time": AT, "raw_value": 3.0 }],
+        }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "ingest on an unpaired stream ({status}): {body}");
+
+    let row = fx
+        .db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT sensor_id, site_id, parameter_id, calibration_id, deployment_id \
+                   FROM readings WHERE stream_id = '{unpaired}' AND time = '{AT}'"
+            ),
+        ))
+        .await
+        .expect("query readings")
+        .expect("the reading is stored");
+    for column in [
+        "sensor_id",
+        "site_id",
+        "parameter_id",
+        "calibration_id",
+        "deployment_id",
+    ] {
+        assert_eq!(
+            row.try_get::<Option<Uuid>>("", column).unwrap(),
+            None,
+            "a staged reading names no {column}"
+        );
+    }
+
+    // Pairing is what attributes it, and the instrument arrives with the site and the parameter.
+    let (status, body) = crate::common::post_json_with_token(
+        &fx.app,
+        &format!("/api/streams/{unpaired}/pair"),
+        &json!({ "site_parameter_id": crate::common::PARAM_S1_TEMP_ID }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "pair ({status}): {body}");
+    assert_eq!(
+        stored_instrument(&fx.db, unpaired).await,
+        Some(fx.channel),
+        "the backfill stamps the instrument the pairing settled on"
+    );
+
+    crate::common::cleanup_test_db(&fx.db).await;
+}
+
 /// The CSV importer writes to the slot's own stream, so its comparison is the deployed instrument
 /// against the one that stream carries.
 #[tokio::test]

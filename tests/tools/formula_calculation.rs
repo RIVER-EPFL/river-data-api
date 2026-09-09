@@ -399,15 +399,21 @@ async fn a_formula_edit_enqueues_its_own_audit() {
     assert_eq!(rewrites, 0, "a formula edit repairs nothing by itself");
 }
 
+/// Scenario: a calculation reading a catalog parameter that belongs to no group of its own, and
+/// writing an output nobody declared on the group first.
+///
+/// Expected behaviour: both are taken. Q135 made the role a property of the calculation and the
+/// group a way to list many parameters together, so nothing here is a boundary. This is the
+/// inverse of the refusal that stood until then.
 #[tokio::test]
 #[serial]
-async fn a_calculation_may_not_read_outside_its_group() {
+async fn a_calculation_reads_any_catalog_parameter_and_declares_its_own_output() {
     let group_id = "00000000-0000-4000-c000-000000000104";
     let (db, app, token) = setup().await;
     seed_calculation(&db, group_id).await;
-    // Conductivity is in the catalog and in no group, so the calculation may not read it.
+    // Conductivity is in the catalog and in no group; the output is declared by this formula
+    // alone, with no member row written by hand first.
     let script_id = calculation_id(&db).await;
-    declare_output(&db, group_id, "temp_ratio_out").await;
     let (status, text) = add_formula(
         &app,
         &token,
@@ -417,14 +423,13 @@ async fn a_calculation_may_not_read_outside_its_group() {
         1,
     )
     .await;
-    assert_eq!(status, 400, "the create should be refused: {text}");
     assert!(
-        text.contains("measured or entry_only member"),
-        "the refusal says why: {text}"
+        (200..300).contains(&status),
+        "the create is taken ({status}): {text}"
     );
     assert!(
-        active_version(&db).await.is_none(),
-        "nothing was minted for a refused formula set"
+        active_version(&db).await.is_some(),
+        "and its version is minted, so the calculation runs"
     );
 }
 

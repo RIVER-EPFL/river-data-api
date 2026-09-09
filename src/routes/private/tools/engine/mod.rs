@@ -441,6 +441,7 @@ struct StoredFormula {
     output_parameter_code: Option<String>,
     curve_slot: Option<String>,
     per_replicate: Option<String>,
+    intermediate: bool,
 }
 
 /// A named constant as the runner receives it.
@@ -541,7 +542,7 @@ pub async fn load_formulas<C: ConnectionTrait>(
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT d.tool_script_id, d.code, d.name, NULLIF(d.units, '') AS units, d.formula,
-                    d.ordinal, d.curve_slot, d.per_replicate,
+                    d.ordinal, d.curve_slot, d.per_replicate, d.intermediate,
                     out.code AS output_parameter_code,
                     COALESCE(
                         (SELECT jsonb_agg(jsonb_build_array(src.variable_name, p.code)
@@ -582,6 +583,7 @@ pub async fn load_formulas<C: ConnectionTrait>(
                 site_sources,
                 curve_slot: stored.curve_slot,
                 per_replicate: stored.per_replicate,
+                intermediate: stored.intermediate,
             },
         ));
     }

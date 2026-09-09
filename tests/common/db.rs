@@ -153,6 +153,10 @@ pub async fn setup_test_db() -> DatabaseConnection {
 
     stop_background_policies(&db).await;
 
+    // The reference rows a deployment's operator authors for themselves (Q134: a database starts
+    // blank). The suites that read them want them there, so the fixture installs them.
+    exec_unprepared(&db, include_str!("../fixtures/reference_rows.sql")).await;
+
     // Every channel carries an instrument in the deployed system: registration mints one, and a
     // reading may not be stored without naming what measured it. A fixture stream built by raw SQL
     // has no source to mint from, so the suite gives it [`FIXTURE_SENSOR_ID`] as the column
@@ -373,7 +377,8 @@ pub async fn seed_before_instrument_rule(db: &DatabaseConnection, statements: &[
     exec(
         db,
         "ALTER TABLE readings ADD CONSTRAINT readings_instrument_required \
-         CHECK ((sensor_id IS NOT NULL) OR (measurement_type IS NOT DISTINCT FROM 'derived')) \
+         CHECK ((sensor_id IS NOT NULL) OR (site_id IS NULL) \
+                OR (measurement_type IS NOT DISTINCT FROM 'derived')) \
          NOT VALID",
     )
     .await;

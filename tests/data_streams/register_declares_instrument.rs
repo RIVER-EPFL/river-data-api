@@ -94,12 +94,16 @@ async fn register_attaches_the_declared_instrument_and_pairing_reuses_it() {
 }
 
 /// Scenario: a source registers a channel and names no instrument.
-/// Expected behaviour: the feed is attached to the source's own instrument for the parameter it
-/// carries, so nothing it later writes can be a measurement of nothing.
+/// Expected behaviour: the stream carries none either. Which instrument produced a feed is a
+/// decision the pairing plan puts to an operator (Q134), and a row minted at registration is that
+/// decision taken by nobody: it pre-empts the plan's proposal and leaves 309 rows in the inventory
+/// before anyone has opened one. The feed still stores readings, staged (B223), until the plan
+/// mints the instrument and the pairing stamps them.
 #[tokio::test]
 #[serial]
-async fn register_omitting_the_instrument_attaches_the_source_parameter_instrument() {
+async fn register_omitting_the_instrument_leaves_the_stream_without_one() {
     let (app, token, db) = setup().await;
+    let before = sensor_count(&db).await;
 
     let (status, stream) = crate::common::post_json_parse_with_token(
         &app,
@@ -113,44 +117,14 @@ async fn register_omitting_the_instrument_attaches_the_source_parameter_instrume
     )
     .await;
     assert_eq!(status, 200, "register ({status}): {stream}");
-    let sensor_id = stream["sensor_id"]
-        .as_str()
-        .expect("an omitted instrument is minted, not left null");
-
-    let row = {
-        use sea_orm::{ConnectionTrait, Statement};
-        db.query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT source_key FROM sensors WHERE id = $1::uuid",
-            [sensor_id.into()],
-        ))
-        .await
-        .expect("query")
-        .expect("the minted instrument exists")
-    };
-    assert_eq!(
-        row.try_get::<String>("", "source_key").expect("source_key"),
-        "declare:Temperature",
-        "the instrument is keyed on the source and the parameter, one per parameter across sites"
+    assert!(
+        stream["sensor_id"].is_null(),
+        "registration mints no instrument: {stream}"
     );
-
-    // A second channel of the same parameter at another station resolves the same instrument.
-    let (status, sibling) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/streams/register",
-        &json!({
-            "source_system": "declare",
-            "source_key": "no-sensor-2",
-            "metadata": { "hierarchy": { "site": "S2", "parameter": "Temperature" } },
-        }),
-        &token,
-    )
-    .await;
-    assert_eq!(status, 200, "register ({status}): {sibling}");
     assert_eq!(
-        sibling["sensor_id"].as_str(),
-        Some(sensor_id),
-        "one instrument per (source, parameter): {sibling}"
+        sensor_count(&db).await,
+        before,
+        "and creates no inventory row for one"
     );
 }
 
@@ -477,44 +451,6 @@ async fn concurrent_identity_changes_converge_on_one_hold() {
     assert_eq!(open, 1, "one channel, one standing identity hold");
 }
 
-/// A source-parameter instrument serves every station reporting the parameter, so it is named for
-/// the parameter and the source and the second station neither mints another nor renames it.
-#[tokio::test]
-#[serial]
-async fn a_parameter_instrument_is_named_for_its_parameter_not_its_first_station() {
-    let (app, token, db) = setup().await;
-
-    let mut ids = vec![];
-    for station in ["FP1", "FP3"] {
-        let (status, stream) = crate::common::post_json_parse_with_token(
-            &app,
-            "/api/streams/register",
-            &json!({
-                "source_system": "cnet",
-                "source_key": format!("{station}:DOC_avg_ppb"),
-                "source_name": format!("{station} DOC"),
-                "metadata": {
-                    "hierarchy": { "project": "CNET", "site": station, "parameter": "DOC_avg_ppb" }
-                },
-            }),
-            &token,
-        )
-        .await;
-        assert_eq!(status, 200, "register {station} ({status}): {stream}");
-        ids.push(
-            stream["sensor_id"]
-                .as_str()
-                .expect("the feed carries an instrument")
-                .to_string(),
-        );
-    }
-    assert_eq!(ids[0], ids[1], "one instrument for the parameter");
-
-    let name = scalar_string(&db, &format!("SELECT name AS v FROM sensors WHERE id = '{}'", ids[0]))
-        .await;
-    assert_eq!(name, "DOC_avg_ppb (cnet)", "no station is in the name");
-}
-
 async fn scalar_i64(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
     use sea_orm::{ConnectionTrait, Statement};
     db.query_one_raw(Statement::from_string(
@@ -528,15 +464,3 @@ async fn scalar_i64(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
     .expect("value")
 }
 
-async fn scalar_string(db: &sea_orm::DatabaseConnection, sql: &str) -> String {
-    use sea_orm::{ConnectionTrait, Statement};
-    db.query_one_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        sql.to_string(),
-    ))
-    .await
-    .expect("query")
-    .expect("row")
-    .try_get::<String>("", "v")
-    .expect("value")
-}

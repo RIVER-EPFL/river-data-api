@@ -195,3 +195,92 @@ mod tests {
         );
     }
 }
+
+/// A source's whole instrument register, offered for a plan to admit.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProposeInstrumentsRequest {
+    /// The sync source the register belongs to, e.g. "metalp".
+    pub source_system: String,
+    pub instruments: Vec<river_data_core::models::SensorUpsert>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProposeInstrumentsResponse {
+    /// Rows now held as proposals, whether this call created or refreshed them.
+    pub stored: usize,
+    /// Proposals a plan has already admitted, which are instruments now and are left alone.
+    pub already_admitted: usize,
+}
+
+/// Store a source's instrument register as proposals. Requires `write_metadata`.
+///
+/// Nothing is created: an instrument exists once a pairing plan an operator validated creates it
+/// (Q134). A row already admitted as an instrument under the same provenance is skipped rather than
+/// re-proposed, so a sync does not offer back what the operator already took.
+#[utoipa::path(
+    post,
+    path = "/api/sensors/proposals",
+    request_body = ProposeInstrumentsRequest,
+    responses((status = 200, description = "Register stored", body = ProposeInstrumentsResponse)),
+    tag = "sensors"
+)]
+pub async fn propose_instruments(
+    State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
+    Json(payload): Json<ProposeInstrumentsRequest>,
+) -> AppResult<Json<ProposeInstrumentsResponse>> {
+    let source_system = crate::common::provenance::source_system(&auth, &payload.source_system)?;
+    let mut stored = 0usize;
+    let mut already_admitted = 0usize;
+    for instrument in &payload.instruments {
+        let key = instrument.source_key.trim();
+        if key.is_empty() {
+            return Err(AppError::BadRequest(
+                "source_key identifies the instrument and cannot be empty".to_string(),
+            ));
+        }
+        let admitted = sensors::Entity::find()
+            .filter(sensors::Column::SourceSystem.eq(source_system.clone()))
+            .filter(sensors::Column::SourceKey.eq(key.to_string()))
+            .one(&state.db)
+            .await?;
+        if admitted.is_some() {
+            already_admitted += 1;
+            continue;
+        }
+        state
+            .db
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "INSERT INTO instrument_proposals \
+                     (source_system, source_key, name, serial_number, manufacturer, model, notes, \
+                      is_lab_instrument, data_frequency, metadata) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                 ON CONFLICT (source_system, source_key) DO UPDATE SET \
+                     name = EXCLUDED.name, serial_number = EXCLUDED.serial_number, \
+                     manufacturer = EXCLUDED.manufacturer, model = EXCLUDED.model, \
+                     notes = EXCLUDED.notes, is_lab_instrument = EXCLUDED.is_lab_instrument, \
+                     data_frequency = EXCLUDED.data_frequency, metadata = EXCLUDED.metadata, \
+                     last_seen_at = now()",
+                [
+                    source_system.clone().into(),
+                    key.to_string().into(),
+                    instrument.name.clone().into(),
+                    instrument.serial_number.clone().into(),
+                    instrument.manufacturer.clone().into(),
+                    instrument.model.clone().into(),
+                    instrument.notes.clone().into(),
+                    instrument.is_lab_instrument.into(),
+                    instrument.data_frequency.clone().into(),
+                    instrument.metadata.clone().into(),
+                ],
+            ))
+            .await?;
+        stored += 1;
+    }
+    Ok(Json(ProposeInstrumentsResponse {
+        stored,
+        already_admitted,
+    }))
+}

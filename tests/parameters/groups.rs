@@ -198,7 +198,7 @@ async fn every_change_appends_a_history_row() {
 #[tokio::test]
 #[serial]
 async fn the_definition_document_is_the_group_in_its_own_order() {
-    let (_db, app, token) = setup().await;
+    let (db, app, token) = setup().await;
     let group = create_group(&app, &token, "dom").await;
     let group_id = group["id"].as_str().unwrap().to_string();
 
@@ -237,12 +237,50 @@ async fn the_definition_document_is_the_group_in_its_own_order() {
         members[0]["parameter_id"],
         crate::common::GLOBAL_PARAM_TEMP_ID
     );
-    assert_eq!(members[0]["role"], "measured");
+    // No calculation touches either yet, so neither is measured nor an output: the role is what
+    // the calculations make of the parameter, never what the membership row was created with
+    // (Q135).
+    assert_eq!(members[0]["role"], "entry_only", "{text}");
     assert_eq!(
         members[1]["parameter_id"],
         crate::common::GLOBAL_PARAM_DO_ID
     );
-    assert_eq!(members[1]["role"], "output");
+    assert_eq!(members[1]["role"], "entry_only", "{text}");
+
+    // One formula writing DO and reading Temperature moves both.
+    let formula_id = uuid::Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO calculation_formulas (id, code, formula, output_parameter_id, ordinal) \
+             VALUES ('{formula_id}', 'do_from_temp', 'Temperature * 2', \
+                     '{}', 0)",
+            crate::common::GLOBAL_PARAM_DO_ID
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO derived_parameter_sources \
+                 (id, derived_definition_id, parameter_id, variable_name) \
+             VALUES (gen_random_uuid(), '{formula_id}', '{}', 'Temperature')",
+            crate::common::GLOBAL_PARAM_TEMP_ID
+        ),
+    )
+    .await;
+
+    let (status, text) = crate::common::get_with_token(
+        &app,
+        &format!("/api/parameter_groups/{group_id}/definition"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "definition ({status}): {text}");
+    let doc: serde_json::Value = serde_json::from_str(&text).expect("definition is JSON");
+    let members = doc["members"].as_array().expect("members array");
+    assert_eq!(members[0]["role"], "measured", "read by a formula: {text}");
+    assert_eq!(members[1]["role"], "output", "written by one: {text}");
     assert!(
         members[0]["label"].as_str().is_some_and(|l| !l.is_empty()),
         "the label falls back to the catalog name: {text}"

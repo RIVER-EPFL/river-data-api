@@ -45,6 +45,11 @@ pub struct Model {
     /// replicate identity is the named input's, so nothing here assigns a column position.
     #[crudcrate(filterable)]
     pub per_replicate: Option<String>,
+    /// A step of the calculation rather than a measurement of anything (M180): it mints no catalog
+    /// parameter, is not saved and is not a manifest output, and its value is handed to the
+    /// formulas after it and reported in the run under this formula's own code.
+    #[crudcrate(filterable, on_create = false)]
+    pub intermediate: bool,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     #[sea_orm(ignore)]

@@ -336,17 +336,15 @@ async fn a_device_instrument_is_named_after_the_slot_it_serves() {
 }
 
 /// Scenario: a lab feed that reached the database the way production feeds do, through
-/// `/streams/register`, which mints its instrument at registration
-/// (`sensors::operations::resolve_or_mint_stream_instrument`).
+/// `/streams/register`, which mints nothing (M172).
 ///
-/// Expected behaviour: Q76's Option A holds on that path too. Registration having answered the
-/// question does not leave the plan with nothing to say: the entry is reported as decided, carrying
-/// the proposal the operator overrides, rather than being silently absent from the tab. Every other
-/// test in this suite seeds by hand, so this is the only one that exercises the instrument the
-/// production path actually attaches.
+/// Expected behaviour: the plan is where the instrument is decided. The entry carries the
+/// proposal the apply will mint, pre-agreed the way Q76's Option A asks, rather than an
+/// instrument registration had already chosen. Every other test in this suite seeds by hand, so
+/// this is the only one that exercises what the production path actually leaves behind.
 #[tokio::test]
 #[serial]
-async fn a_registered_feed_reaches_the_plan_already_decided() {
+async fn a_registered_feed_reaches_the_plan_as_a_proposal() {
     let (app, token, db) = setup().await;
 
     let (status, registered) = crate::common::post_json_parse_with_token(
@@ -378,8 +376,7 @@ async fn a_registered_feed_reaches_the_plan_already_decided() {
         .and_then(|s| s.parse::<Uuid>().ok())
         .unwrap_or_else(|| panic!("no stream id: {registered}"));
 
-    // Registration attached one, which is the invariant that no reading exists without an
-    // instrument. This is what used to leave the tab with nothing to ask.
+    // Registration attached none: the plan is the only writer of instruments.
     let attached = scalar_i64(
         &db,
         &format!(
@@ -388,7 +385,7 @@ async fn a_registered_feed_reaches_the_plan_already_decided() {
         ),
     )
     .await;
-    assert_eq!(attached, 1, "registration attached an instrument");
+    assert_eq!(attached, 0, "registration attached no instrument");
 
     let plan = create_plan(&app, &token).await;
     let entry = entry_for(&plan, stream);
@@ -397,19 +394,18 @@ async fn a_registered_feed_reaches_the_plan_already_decided() {
         serde_json::json!(true),
         "the entry arrives decided rather than unanswered: {entry}"
     );
-    // Resolved from the stream, not proposed: registration already created the instrument, so the
-    // entry names an existing one (`id` and `name`) and creates nothing. A feed whose instrument
-    // does not exist yet is the other shape, `resolved_by: "parameter"` carrying a `proposed_name`,
-    // which `an_attached_instrument_returns_to_the_plan_s_own_proposal` pins.
+    // Proposed, not resolved: nothing has minted one, so the entry names what the apply will
+    // create, keyed on the source's parameter.
     assert_eq!(
         entry["instrument"]["resolved_by"],
-        serde_json::json!("stream"),
-        "the instrument comes from the feed itself: {entry}"
+        serde_json::json!("parameter"),
+        "the instrument is the plan's own proposal: {entry}"
     );
-    assert_eq!(entry["instrument"]["create"], serde_json::json!(false));
+    assert_eq!(entry["instrument"]["create"], serde_json::json!(true));
     assert!(
-        entry["instrument"]["id"].is_string() && entry["instrument"]["name"].is_string(),
-        "and it names the instrument registration minted: {entry}"
+        entry["instrument"]["id"].is_null()
+            && entry["instrument"]["proposed_name"].is_string(),
+        "it names no existing row and carries the name it proposes: {entry}"
     );
 
     let plan_id = plan["id"].as_str().expect("plan id").to_string();

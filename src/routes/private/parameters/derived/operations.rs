@@ -431,7 +431,13 @@ async fn sync_sources<C: ConnectionTrait>(
 async fn ensure_output_parameter<C: ConnectionTrait>(
     db: &C,
     entity: &mut CalculationFormula,
-) -> Result<Uuid, ApiError> {
+) -> Result<Option<Uuid>, ApiError> {
+    // An intermediate is a step, not a measurement: nothing stores its value, so no parameter is
+    // minted for it and a formula turned intermediate gives up the link it had.
+    if entity.intermediate {
+        entity.output_parameter_id = None;
+        return Ok(None);
+    }
     // Reuse existing link if present
     if let Some(existing_id) = entity.output_parameter_id {
         // Keep the parameter row in sync
@@ -448,7 +454,7 @@ async fn ensure_output_parameter<C: ConnectionTrait>(
         ))
         .await
         .map_err(|e| ApiError::internal(format!("Failed to update output parameter: {e}"), None))?;
-        return Ok(existing_id);
+        return Ok(Some(existing_id));
     }
 
     // Create or find the output parameter
@@ -514,7 +520,7 @@ async fn ensure_output_parameter<C: ConnectionTrait>(
     .map_err(|e| ApiError::internal(format!("Failed to link output parameter: {e}"), None))?;
 
     entity.output_parameter_id = Some(param_id);
-    Ok(param_id)
+    Ok(Some(param_id))
 }
 
 pub struct CalculationFormulaOperations;
@@ -563,7 +569,8 @@ impl CRUDOperations for CalculationFormulaOperations {
         sync_sources(db, entity.id, &resolved).await?;
 
         // Auto-create a corresponding entry in the parameters table so this
-        // derived output can be referenced as a parameter_id in site_parameters.
+        // derived output can be referenced as a parameter_id in site_parameters. An intermediate
+        // is a step of the calculation and measures nothing, so it mints none (M180).
         ensure_output_parameter(db, entity).await?;
 
         // A formula of a calculation is part of its version, so the calculation is re-minted.
@@ -618,7 +625,7 @@ impl CRUDOperations for CalculationFormulaOperations {
         let resolved = resolve_variables(db, &entity.formula).await?;
         sync_sources(db, entity.id, &resolved).await?;
 
-        // Keep the output parameter in sync
+        // Keep the output parameter in sync; an intermediate has none to keep.
         ensure_output_parameter(db, entity).await?;
 
         crate::routes::private::tools::calculation_versions::mint_stale_formula_versions(db, None)

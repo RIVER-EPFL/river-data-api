@@ -62,10 +62,6 @@ pub enum Refusal {
     ProducedHere { calculation: String },
     /// A group with members is not deleted; its members are moved first.
     GroupHasMembers { count: usize },
-    /// A calculation's output is not an `output` member of its group.
-    OutputNotDeclared { parameter_id: Uuid },
-    /// A calculation's input is not a `measured` or `entry_only` member of its group.
-    InputNotDeclared { parameter_id: Uuid },
     /// The parameter is the mean or sd of a replicated member of the same group.
     StatisticOfMember { member_code: String },
 }
@@ -83,14 +79,6 @@ impl fmt::Display for Refusal {
             Self::GroupHasMembers { count } => {
                 write!(f, "group still has {count} members; move them out first")
             }
-            Self::OutputNotDeclared { parameter_id } => write!(
-                f,
-                "parameter {parameter_id} is produced by the calculation but is not an output member of its group"
-            ),
-            Self::InputNotDeclared { parameter_id } => write!(
-                f,
-                "parameter {parameter_id} is read by the calculation but is not a measured or entry_only member of its group"
-            ),
             Self::StatisticOfMember { member_code } => write!(
                 f,
                 "this is the mean or sd of member {member_code}, which the samples trigger computes; it renders beside that member and is not one"
@@ -172,37 +160,21 @@ pub fn may_delete(group_id: Uuid, members: &[Member]) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// A calculation reads and writes only its own group's members, in the roles those members declare.
-pub fn validate_calculation(calculation: &Calculation, members: &[Member]) -> Result<(), Refusal> {
-    let role_of = |parameter_id: Uuid| {
-        members
-            .iter()
-            .find(|m| m.group_id == calculation.group_id && m.parameter_id == parameter_id)
-            .map(|m| m.role)
-    };
-    for output in &calculation.outputs {
-        if role_of(*output) != Some(Role::Output) {
-            return Err(Refusal::OutputNotDeclared {
-                parameter_id: *output,
-            });
-        }
+/// What a parameter is to the calculations, which is what its role says (Q135).
+///
+/// The role is read off the calculations, never set by hand: a parameter one writes is an output,
+/// one a calculation reads is measured, and a parameter no calculation touches is entered and read
+/// by nothing. A calculation may read any catalog parameter, so a group is a way to list many
+/// parameters together, not a boundary a calculation is confined to.
+#[must_use]
+pub fn derive_role(parameter_id: Uuid, calculations: &[Calculation]) -> Role {
+    if calculations.iter().any(|c| c.outputs.contains(&parameter_id)) {
+        return Role::Output;
     }
-    for input in &calculation.inputs {
-        match role_of(*input) {
-            Some(Role::Measured | Role::EntryOnly) => {}
-            // A calculation may read an output it produces itself: that is the two-stage shape
-            // Q95 decided, where stage 1 stores one value per replicate index and stage 2 reads
-            // the family's trigger-derived mean back. Any other output stays refused, so a
-            // calculation still cannot read what a different one writes.
-            Some(Role::Output) if calculation.outputs.contains(input) => {}
-            _ => {
-                return Err(Refusal::InputNotDeclared {
-                    parameter_id: *input,
-                });
-            }
-        }
+    if calculations.iter().any(|c| c.inputs.contains(&parameter_id)) {
+        return Role::Measured;
     }
-    Ok(())
+    Role::EntryOnly
 }
 
 #[cfg(test)]
@@ -323,76 +295,28 @@ mod tests {
         assert_eq!(may_delete(id(1), &[]), Ok(()));
     }
 
+    /// Scenario: pCO2, which reads a field-data parameter of another group and writes its own,
+    /// and whose stage 2 reads what its stage 1 wrote.
+    ///
+    /// Expected behaviour: the role follows from the calculations. Nothing is refused for crossing
+    /// a group, because a group is a filter and not a boundary (Q135).
     #[test]
-    fn test_validate_calculation_accepts_a_fully_declared_calculation() {
-        let members = [
-            member(1, 10, Role::Measured),
-            member(1, 11, Role::EntryOnly),
-            member(1, 20, Role::Output),
-        ];
-        assert_eq!(validate_calculation(&dom_calculation(), &members), Ok(()));
-    }
-
-    #[test]
-    fn test_validate_calculation_refuses_an_output_that_is_not_an_output_member() {
-        let members = [
-            member(1, 10, Role::Measured),
-            member(1, 11, Role::EntryOnly),
-            member(1, 20, Role::Measured),
-        ];
-        assert_eq!(
-            validate_calculation(&dom_calculation(), &members),
-            Err(Refusal::OutputNotDeclared {
-                parameter_id: id(20)
-            })
-        );
-    }
-
-    #[test]
-    fn test_validate_calculation_refuses_an_input_from_another_group() {
-        let members = [
-            member(1, 10, Role::Measured),
-            member(2, 11, Role::Measured),
-            member(1, 20, Role::Output),
-        ];
-        assert_eq!(
-            validate_calculation(&dom_calculation(), &members),
-            Err(Refusal::InputNotDeclared {
-                parameter_id: id(11)
-            })
-        );
-    }
-
-    #[test]
-    fn test_validate_calculation_refuses_an_input_declared_as_an_output() {
-        let members = [
-            member(1, 10, Role::Output),
-            member(1, 11, Role::EntryOnly),
-            member(1, 20, Role::Output),
-        ];
-        assert_eq!(
-            validate_calculation(&dom_calculation(), &members),
-            Err(Refusal::InputNotDeclared {
-                parameter_id: id(10)
-            })
-        );
-    }
-
-    /// The two-stage shape: an intermediate the calculation both writes and reads back.
-    #[test]
-    fn test_validate_calculation_admits_an_intermediate_it_produces_itself() {
-        let two_stage = Calculation {
+    fn test_derive_role_reads_the_calculations_never_a_declaration() {
+        let pco2 = Calculation {
             group_id: id(1),
             name: "pco2".to_string(),
+            // 11 is a field_data member; 20 is written by stage 1 and read by stage 2.
             inputs: vec![id(11), id(20)],
             outputs: vec![id(20), id(21)],
         };
-        let members = [
-            member(1, 11, Role::Measured),
-            member(1, 20, Role::Output),
-            member(1, 21, Role::Output),
-        ];
-        assert_eq!(validate_calculation(&two_stage, &members), Ok(()));
+        let calculations = [pco2];
+        assert_eq!(derive_role(id(11), &calculations), Role::Measured);
+        assert_eq!(derive_role(id(21), &calculations), Role::Output);
+        // Written and read by the same calculation: what it writes is what it is.
+        assert_eq!(derive_role(id(20), &calculations), Role::Output);
+        // Touched by no calculation: entered at a visit and read by nothing.
+        assert_eq!(derive_role(id(99), &calculations), Role::EntryOnly);
+        assert_eq!(derive_role(id(11), &[]), Role::EntryOnly);
     }
 
     #[test]
