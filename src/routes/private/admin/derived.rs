@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::error::AppResult;
+use crate::routes::private::admin::actions::QueuedJobResponse;
 
 /// Recompute every derived value for a given derived parameter definition. Backfills via
 /// joining source readings; tracked as a `reprocessing_jobs` row. Refreshes continuous
@@ -15,7 +16,7 @@ use crate::error::AppResult;
     path = "/api/actions/derived_parameters/{id}/recompute",
     params(("id" = Uuid, Path, description = "Derived parameter definition UUID")),
     responses(
-        (status = 200, description = "Background recompute job triggered with job_id"),
+        (status = 200, description = "Background recompute job triggered", body = QueuedJobResponse),
         (status = 404, description = "Derived parameter definition not found"),
     ),
     tag = "actions"
@@ -23,11 +24,9 @@ use crate::error::AppResult;
 pub async fn recompute_derived(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<QueuedJobResponse>> {
     let job_id = spawn_recompute_derived(&state.db, state.events.clone(), id).await?;
-    Ok(Json(
-        serde_json::json!({ "status": "queued", "job_id": job_id }),
-    ))
+    Ok(Json(QueuedJobResponse::queued(Some(job_id))))
 }
 
 /// Enqueue a durable `derived_recompute` job for one derived parameter definition. Runs on the

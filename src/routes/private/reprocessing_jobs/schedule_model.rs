@@ -57,10 +57,10 @@ pub struct Model {
     #[crudcrate(non_db_attr = true, exclude(create, update), default = false)]
     pub running: bool,
     /// What this job accepts under `tunables`, from its own declaration, as the form reads it.
-    /// `[]` means none. It is the job's `TunableSpec` list serialised, not a stored column.
+    /// `[]` means none. It is the job's own declaration, not a stored column.
     #[sea_orm(ignore)]
-    #[crudcrate(non_db_attr = true, exclude(create, update), default = serde_json::json!([]))]
-    pub tunables_schema: serde_json::Value,
+    #[crudcrate(non_db_attr = true, exclude(create, update), default = Vec::new())]
+    pub tunables_schema: Vec<super::job::TunableSpec>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

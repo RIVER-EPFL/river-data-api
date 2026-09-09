@@ -19,6 +19,18 @@ use crate::error::{AppError, AppResult};
 pub const SAMPLE: &str = "sample";
 pub const POPULATION: &str = "population";
 
+/// The two values an estimator field carries, for the document.
+///
+/// The estimator itself travels as a string, because it is a column value the whole ingest path
+/// compares against [`SAMPLE`] and [`POPULATION`]. This names the pair so a schema field declares
+/// what it may hold rather than "a string", and a generated client reads the two.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SdEstimator {
+    Sample,
+    Population,
+}
+
 /// Where a sample's estimator came from, most specific first. Stored on the row beside the value
 /// it chose, so "computed under no declaration" stays distinguishable from "declared sample".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

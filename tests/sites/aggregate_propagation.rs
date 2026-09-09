@@ -1572,7 +1572,7 @@ async fn a_stored_value_edited_out_of_band_is_recovered_by_a_full_refresh() {
         .as_str()
         .unwrap_or_else(|| panic!("the refresh returns its job id: {queued}"))
         .to_string();
-    // Polled as an administrator, not as the river member who triggered it: `inject_read_scope`
+    // Polled as an administrator, not as the river member who triggered it: `inject_project_scope`
     // scopes `reprocessing_jobs` by `sensor_id IN (scoped sensors)`, and a refresh_aggregates job
     // carries a NULL sensor_id, so the member who queued it gets a 404 on its own job.
     assert_eq!(

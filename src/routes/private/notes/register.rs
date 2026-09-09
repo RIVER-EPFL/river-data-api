@@ -6,12 +6,14 @@
 //! a later cycle, once pairing has created the site.
 
 use axum::{Json, extract::State};
-use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
+use crudcrate::UpsertStatus;
+use sea_orm::{ConnectionTrait, Set, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use super::{ActiveModel, Note};
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 
@@ -39,13 +41,6 @@ pub struct NoteItem {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RegisterNotesResponse {
     pub notes: Vec<NoteOutcome>,
-}
-
-/// What the upsert did with one registered note.
-#[derive(FromQueryResult)]
-struct UpsertedNote {
-    id: Uuid,
-    created: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -112,70 +107,24 @@ pub async fn register_notes(
             continue;
         };
 
-        // Single-statement upsert: the DO UPDATE's WHERE makes an identical re-assert return no
-        // row (unchanged), and `xmax = 0` distinguishes an insert from an update.
-        let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "INSERT INTO notes
-                     (id, site_id, text, verified, created_by, source_system, source_key,
-                      created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-                 ON CONFLICT (source_system, source_key)
-                     WHERE source_system IS NOT NULL AND source_key IS NOT NULL
-                     DO UPDATE SET site_id = EXCLUDED.site_id,
-                                   text = EXCLUDED.text,
-                                   verified = EXCLUDED.verified,
-                                   updated_at = NOW()
-                     WHERE (notes.site_id, notes.text, notes.verified)
-                           IS DISTINCT FROM
-                           (EXCLUDED.site_id, EXCLUDED.text, EXCLUDED.verified)
-                 RETURNING id, (xmax = 0) AS created",
-                [
-                    Uuid::new_v4().into(),
-                    site_id.into(),
-                    item.text.clone().into(),
-                    item.verified.into(),
-                    format!("sync:{source_system}").into(),
-                    source_system.clone().into(),
-                    item.source_key.clone().into(),
-                ],
-            ))
-            .await?;
-
-        let outcome = match row.map(|r| UpsertedNote::from_query_result(&r, "")).transpose()? {
-            Some(upserted) => NoteOutcome {
-                source_key: item.source_key.clone(),
-                id: Some(upserted.id),
-                status: if upserted.created {
-                    "created".into()
-                } else {
-                    "updated".into()
-                },
+        let active = ActiveModel {
+            site_id: Set(site_id),
+            text: Set(item.text.clone()),
+            verified: Set(item.verified),
+            created_by: Set(Some(format!("sync:{source_system}"))),
+            source_system: Set(Some(source_system.clone())),
+            source_key: Set(Some(item.source_key.clone())),
+            ..Default::default()
+        };
+        let (note, status) = crate::common::provenance::register::<Note>(db, active).await?;
+        let outcome = NoteOutcome {
+            source_key: item.source_key.clone(),
+            id: Some(note.id),
+            status: match status {
+                UpsertStatus::Created => "created".into(),
+                UpsertStatus::Updated => "updated".into(),
+                UpsertStatus::Unchanged => "unchanged".into(),
             },
-            None => {
-                let existing = db
-                    .query_one_raw(Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        "SELECT id FROM notes WHERE source_system = $1 AND source_key = $2",
-                        [
-                            payload.source_system.clone().into(),
-                            item.source_key.clone().into(),
-                        ],
-                    ))
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::Internal(format!(
-                            "note upsert for {} returned no row and no stored row exists",
-                            item.source_key
-                        ))
-                    })?;
-                NoteOutcome {
-                    source_key: item.source_key.clone(),
-                    id: Some(existing.try_get::<Uuid>("", "id")?),
-                    status: "unchanged".into(),
-                }
-            }
         };
         outcomes.push(outcome);
     }

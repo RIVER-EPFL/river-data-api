@@ -286,7 +286,7 @@ async fn janitor_full_refresh_follows_the_operator_cadence() {
         "the janitor seeds a schedule row: {schedules}"
     );
     for name in names.iter().filter(|n| *n != "janitor_service") {
-        let (status, body) = crate::common::patch_json_with_token(
+        let (status, body) = crate::common::put_json_with_token(
             &app,
             &format!("/api/schedules/{name}"),
             &json!({ "enabled": false }),
@@ -296,7 +296,7 @@ async fn janitor_full_refresh_follows_the_operator_cadence() {
         assert_eq!(status, 200, "disable schedule {name} ({status}): {body}");
     }
 
-    let (status, patched) = crate::common::patch_json_with_token(
+    let (status, patched) = crate::common::put_json_with_token(
         &app,
         "/api/schedules/janitor_service",
         &json!({ "interval_seconds": 21_600 }),

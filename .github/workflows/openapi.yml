@@ -3,7 +3,8 @@ name: OpenAPI document
 # The document is generated from the router itself, so a route or a schema type changes it without
 # anyone editing JSON, and this job is what makes the committed copy keep up: it regenerates and
 # fails on a diff, so a route change either brings the document with it or does not merge. The dump
-# serves nothing and issues no query, so it needs no database, only a URL for the config to accept.
+# serves nothing and issues no query, so it needs neither a database nor any configuration. The
+# same comparison runs in the test suite, which is what covers a change outside the paths below.
 on:
   push:
     branches: [main]
@@ -23,9 +24,6 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
-
-    env:
-      DATABASE_URL: postgresql://postgres:psql@localhost:5432/river
 
     steps:
       - uses: actions/checkout@v4

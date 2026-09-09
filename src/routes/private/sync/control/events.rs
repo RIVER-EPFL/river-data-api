@@ -2,13 +2,28 @@ use axum::Json;
 use axum::extract::{Path, State};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, EntityTrait, Set};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::session::SyncServiceContext;
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sync::{events_model, services_model};
+
+/// The row a sync service's event create wrote.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct CreatedSyncEventResponse {
+    pub id: String,
+    pub service_id: Uuid,
+    pub status: String,
+}
+
+/// What an update to a sync service's own row answers with.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct UpdatedResponse {
+    /// `true`, always: the row is written by the time the response is written.
+    pub updated: bool,
+}
 use river_data_core::models::{SyncEventStatus, SyncEventType};
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -42,7 +57,7 @@ pub struct UpdateSyncEventRequest {
     path = "/api/sync/events",
     request_body = CreateSyncEventRequest,
     responses(
-        (status = 200, description = "Event created; id and status returned"),
+        (status = 200, description = "Event created", body = CreatedSyncEventResponse),
         (status = 400, description = "Invalid event_type or status"),
         (status = 401, description = "Invalid session token"),
         (status = 403, description = "service_id does not match authenticated service"),
@@ -53,7 +68,7 @@ pub async fn create_sync_event(
     State(state): State<AppState>,
     ctx: SyncServiceContext,
     Json(req): Json<CreateSyncEventRequest>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<CreatedSyncEventResponse>> {
     if req.service_id != ctx.service_id {
         return Err(AppError::Forbidden(
             "Event service_id does not match authenticated service".to_string(),
@@ -104,11 +119,11 @@ pub async fn create_sync_event(
 
     let inserted = event.insert(&state.db).await?;
 
-    Ok(Json(serde_json::json!({
-        "id": inserted.id.to_string(),
-        "service_id": inserted.service_id,
-        "status": inserted.status,
-    })))
+    Ok(Json(CreatedSyncEventResponse {
+        id: inserted.id.to_string(),
+        service_id: inserted.service_id,
+        status: inserted.status,
+    }))
 }
 
 /// Sync service updates an in-progress event with metrics, errors, or completion status.
@@ -120,7 +135,7 @@ pub async fn create_sync_event(
     params(("id" = Uuid, Path, description = "Sync event UUID")),
     request_body = UpdateSyncEventRequest,
     responses(
-        (status = 200, description = "Event updated"),
+        (status = 200, description = "Event updated", body = UpdatedResponse),
         (status = 401, description = "Invalid session token"),
         (status = 403, description = "Event belongs to a different service"),
         (status = 404, description = "Event not found"),
@@ -132,7 +147,7 @@ pub async fn update_sync_event(
     ctx: SyncServiceContext,
     Path(event_id): Path<Uuid>,
     Json(req): Json<UpdateSyncEventRequest>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<UpdatedResponse>> {
     let event = events_model::Entity::find_by_id(event_id)
         .one(&state.db)
         .await?
@@ -189,5 +204,5 @@ pub async fn update_sync_event(
         svc_active.update(&state.db).await?;
     }
 
-    Ok(Json(serde_json::json!({"updated": true})))
+    Ok(Json(UpdatedResponse { updated: true }))
 }

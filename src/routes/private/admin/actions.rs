@@ -149,14 +149,14 @@ pub struct RefreshAggregatesRequest {
     path = "/api/actions/refresh_aggregates",
     request_body = RefreshAggregatesRequest,
     responses(
-        (status = 200, description = "Refresh triggered; returns job_id and status 'pending'"),
+        (status = 200, description = "Refresh triggered", body = QueuedJobResponse),
     ),
     tag = "actions"
 )]
 pub async fn refresh_aggregates(
     State(app_state): State<AppState>,
     Json(payload): Json<RefreshAggregatesRequest>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<QueuedJobResponse>> {
     let trigger_type = if payload.full {
         "refresh_aggregates_full"
     } else {
@@ -174,9 +174,18 @@ pub async fn refresh_aggregates(
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    Ok(Json(
-        serde_json::json!({ "job_id": job_id, "status": "queued" }),
-    ))
+    Ok(Json(QueuedJobResponse::queued(job_id)))
+}
+
+/// What a computation request enqueues: the job, and how many instants it covers.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ComputeDerivedResponse {
+    /// The row enqueued, or null where an identical job was already queued.
+    #[schema(required)]
+    pub job_id: Option<Uuid>,
+    /// `queued`, always.
+    pub status: String,
+    pub total_timestamps: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -199,7 +208,7 @@ pub struct SiteTimestamps {
     path = "/api/actions/compute_derived",
     request_body = ComputeDerivedRequest,
     responses(
-        (status = 200, description = "Computation triggered; returns job_id, status 'pending', total_timestamps"),
+        (status = 200, description = "Computation triggered", body = ComputeDerivedResponse),
         (status = 403, description = "A named site is outside the caller's projects, or no site was named"),
     ),
     tag = "actions"
@@ -208,7 +217,7 @@ pub async fn compute_derived(
     State(app_state): State<AppState>,
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<ComputeDerivedRequest>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<ComputeDerivedResponse>> {
     let sites: Vec<Uuid> = payload
         .site_timestamps
         .iter()
@@ -245,11 +254,11 @@ pub async fn compute_derived(
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    Ok(Json(serde_json::json!({
-        "job_id": job_id,
-        "status": "queued",
-        "total_timestamps": total_timestamps,
-    })))
+    Ok(Json(ComputeDerivedResponse {
+        job_id,
+        status: "queued".to_string(),
+        total_timestamps,
+    }))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -266,7 +275,7 @@ pub struct ReprocessSensorRequest {
     path = "/api/actions/reprocess",
     request_body = ReprocessSensorRequest,
     responses(
-        (status = 200, description = "Reprocessing triggered; returns job_id and status 'pending'"),
+        (status = 200, description = "Reprocessing triggered", body = QueuedJobResponse),
         (status = 403, description = "The sensor is deployed only outside the caller's projects"),
         (status = 404, description = "No such sensor"),
     ),
@@ -276,7 +285,7 @@ pub async fn reprocess_sensor(
     State(app_state): State<AppState>,
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<ReprocessSensorRequest>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<QueuedJobResponse>> {
     let sensor_id = payload.sensor_id;
     // A sensor that has never been deployed belongs to no project, and neither do its readings, so
     // it stays reachable: an instrument sits in inventory before anyone decides where it goes.
@@ -294,13 +303,40 @@ pub async fn reprocess_sensor(
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    Ok(Json(
-        serde_json::json!({ "job_id": job_id, "status": "queued" }),
-    ))
+    Ok(Json(QueuedJobResponse::queued(job_id)))
 }
 
 /// One backdate is in flight at a time, so every request carries the same key.
 const REPROCESS_ALL_DEDUPE_KEY: &str = "reprocess_all";
+
+/// What one reconciliation pass changed.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReconcileAlarmsResponse {
+    pub opened: usize,
+    pub updated: usize,
+    pub resolved: usize,
+}
+
+/// What a route that enqueues one job answers with: the row it enqueued, and the state that row is
+/// in when the response is written.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct QueuedJobResponse {
+    /// The row enqueued, or null where an identical job was already queued under the same dedupe
+    /// key and this request added none.
+    #[schema(required)]
+    pub job_id: Option<Uuid>,
+    /// `queued`, always.
+    pub status: String,
+}
+
+impl QueuedJobResponse {
+    pub(crate) fn queued(job_id: Option<Uuid>) -> Self {
+        Self {
+            job_id,
+            status: "queued".to_string(),
+        }
+    }
+}
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ReprocessAllResponse {
@@ -421,7 +457,7 @@ pub struct RebuildAlarmEventsRequest {
     path = "/api/actions/rebuild_alarm_events",
     request_body = RebuildAlarmEventsRequest,
     responses(
-        (status = 200, description = "Rebuild triggered; returns job_id and status 'pending'"),
+        (status = 200, description = "Rebuild triggered", body = QueuedJobResponse),
         (status = 403, description = "The named site is outside the caller's projects, or no site was named"),
     ),
     tag = "actions"
@@ -430,7 +466,7 @@ pub async fn rebuild_alarm_events(
     State(app_state): State<AppState>,
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<RebuildAlarmEventsRequest>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<QueuedJobResponse>> {
     let RebuildAlarmEventsRequest {
         site_id,
         parameter_id,
@@ -459,9 +495,7 @@ pub async fn rebuild_alarm_events(
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    Ok(Json(
-        serde_json::json!({ "job_id": job_id, "status": "queued" }),
-    ))
+    Ok(Json(QueuedJobResponse::queued(job_id)))
 }
 
 /// Force a full open-alarm reconcile right now, instead of waiting for the periodic backstop
@@ -473,13 +507,17 @@ pub async fn rebuild_alarm_events(
     post,
     path = "/api/actions/reconcile_alarms",
     responses(
-        (status = 200, description = "Reconcile complete; counts of opened/updated/resolved events"),
+        (
+            status = 200,
+            description = "Reconcile complete; counts of opened/updated/resolved events",
+            body = ReconcileAlarmsResponse
+        ),
     ),
     tag = "actions"
 )]
 pub async fn reconcile_alarms(
     State(app_state): State<AppState>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<ReconcileAlarmsResponse>> {
     let stats =
         crate::routes::private::alarms::sweeper::evaluate_alarm_events(&app_state.db).await?;
 
@@ -492,11 +530,11 @@ pub async fn reconcile_alarms(
             });
     }
 
-    Ok(Json(serde_json::json!({
-        "opened": stats.opened,
-        "updated": stats.updated,
-        "resolved": stats.resolved,
-    })))
+    Ok(Json(ReconcileAlarmsResponse {
+        opened: stats.opened,
+        updated: stats.updated,
+        resolved: stats.resolved,
+    }))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -550,7 +588,7 @@ pub async fn rollback_deployment(
         .ok_or_else(|| AppError::NotFound("Deployment not found".into()))?;
 
     // A deployment is always at a site, so its project is the site's. This deletes the row, the
-    // same destruction `DELETE /sensor_deployments/{id}` performs under `enforce_scope_on_crud`.
+    // same destruction `DELETE /sensor_deployments/{id}` performs under `inject_project_scope`.
     // `deployed_until` is the boundary the rolled-back deployment vacates; the previous one
     // re-extends to it (NULL = the target was open-ended, so the previous reopens open-ended too).
     let target = RollbackTargetRow::from_query_result(&target, "")

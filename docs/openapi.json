@@ -3476,7 +3476,12 @@
             "type": "string"
           },
           "provenance": {
-            "description": "The server-built tool-run blob stored on the reading, verbatim."
+            "additionalProperties": {},
+            "description": "The server-built tool-run blob stored on the reading, verbatim.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
           },
           "run_source": {
             "description": "The run's minting path: 'interactive' | 'csv_import' | 'chain'.",
@@ -3520,6 +3525,33 @@
         },
         "required": [
           "site_timestamps"
+        ],
+        "type": "object"
+      },
+      "ComputeDerivedResponse": {
+        "description": "What a computation request enqueues: the job, and how many instants it covers.",
+        "properties": {
+          "job_id": {
+            "description": "The row enqueued, or null where an identical job was already queued.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`queued`, always.",
+            "type": "string"
+          },
+          "total_timestamps": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "job_id",
+          "status",
+          "total_timestamps"
         ],
         "type": "object"
       },
@@ -3816,6 +3848,27 @@
         "required": [
           "version",
           "lint"
+        ],
+        "type": "object"
+      },
+      "CreatedSyncEventResponse": {
+        "description": "The row a sync service's event create wrote.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "service_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "service_id",
+          "status"
         ],
         "type": "object"
       },
@@ -7015,10 +7068,14 @@
             "type": "object"
           },
           "sd_estimator": {
-            "description": "The divisor `computed.sd` was computed under, 'sample' or 'population'. Recorded on the\nhold; a hold that predates the record reads the slot's declaration, else 'sample'.",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SdEstimator",
+                "description": "The divisor `computed.sd` was computed under, 'sample' or 'population'. Recorded on the\nhold; a hold that predates the record reads the slot's declaration, else 'sample'."
+              }
             ]
           },
           "sd_relative_delta": {
@@ -8119,6 +8176,23 @@
         ],
         "type": "object"
       },
+      "InvalidatedConfigResponse": {
+        "description": "What an invalidation answers with: the project whose cache was dropped.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "status": {
+            "description": "`invalidated`, always.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "code"
+        ],
+        "type": "object"
+      },
       "IssueCommandRequest": {
         "properties": {
           "command": {
@@ -9114,8 +9188,21 @@
       "MovedRow": {
         "description": "One replicate as the preview reports it: before and after.",
         "properties": {
-          "after": {},
-          "before": {},
+          "after": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "before": {
+            "additionalProperties": {},
+            "description": "The columns this row moves, keyed by column name.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "replicate_index": {
             "format": "int32",
             "type": "integer"
@@ -9141,8 +9228,21 @@
       "MovedSample": {
         "description": "One group's statistics, before and after.",
         "properties": {
-          "after": {},
-          "before": {},
+          "after": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "before": {
+            "additionalProperties": {},
+            "description": "The statistics this group moves, keyed by column name.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "sample_id": {
             "format": "uuid",
             "type": "string"
@@ -12514,8 +12614,8 @@
             ]
           },
           "sd_estimator": {
-            "description": "'sample' (divisor n-1) or 'population' (divisor n).",
-            "type": "string"
+            "$ref": "#/components/schemas/SdEstimator",
+            "description": "'sample' (divisor n-1) or 'population' (divisor n)."
           }
         },
         "required": [
@@ -13001,6 +13101,28 @@
         ],
         "type": "object"
       },
+      "QueuedJobResponse": {
+        "description": "What a route that enqueues one job answers with: the row it enqueued, and the state that row is\nin when the response is written.",
+        "properties": {
+          "job_id": {
+            "description": "The row enqueued, or null where an identical job was already queued under the same dedupe\nkey and this request added none.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`queued`, always.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "status"
+        ],
+        "type": "object"
+      },
       "ReadingFacet": {
         "properties": {
           "calibrated_value": {
@@ -13290,6 +13412,19 @@
         },
         "type": "object"
       },
+      "RecalculateResponse": {
+        "description": "The job a recalculation enqueued.",
+        "properties": {
+          "job_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "type": "object"
+      },
       "ReceiptRow": {
         "properties": {
           "at": {
@@ -13456,6 +13591,29 @@
           "stream_id",
           "total",
           "receipts"
+        ],
+        "type": "object"
+      },
+      "ReconcileAlarmsResponse": {
+        "description": "What one reconciliation pass changed.",
+        "properties": {
+          "opened": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "resolved": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "updated": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "opened",
+          "updated",
+          "resolved"
         ],
         "type": "object"
       },
@@ -13958,10 +14116,14 @@
             ]
           },
           "sd_estimator": {
-            "description": "Which divisor this source computes its standard deviation with: `sample` (n-1) or\n`population` (n). Absent means the source has not said, which is the honest answer for the\nportals that used both over the years; the slot's declaration then decides, and absent that\nthe samples are recorded undeclared and their audit disagreements are held for a decision.\nNothing infers this from the data.",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SdEstimator",
+                "description": "Which divisor this source computes its standard deviation with: `sample` (n-1) or\n`population` (n). Absent means the source has not said, which is the honest answer for the\nportals that used both over the years; the slot's declaration then decides, and absent that\nthe samples are recorded undeclared and their audit disagreements are held for a decision.\nNothing infers this from the data."
+              }
             ]
           },
           "source_columns": {
@@ -14763,6 +14925,19 @@
         ],
         "type": "object"
       },
+      "RevokedResponse": {
+        "description": "What a revocation answers with.",
+        "properties": {
+          "revoked": {
+            "description": "`true`, always: the row is revoked by the time the response is written.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "revoked"
+        ],
+        "type": "object"
+      },
       "RolesAssigned": {
         "description": "A role assignment that took effect. The roles themselves are read back through the user.",
         "properties": {
@@ -15406,7 +15581,11 @@
           },
           "tunables": {},
           "tunables_schema": {
-            "description": "What this job accepts under `tunables`, from its own declaration, as the form reads it.\n`[]` means none. It is the job's `TunableSpec` list serialised, not a stored column."
+            "description": "What this job accepts under `tunables`, from its own declaration, as the form reads it.\n`[]` means none. It is the job's own declaration, not a stored column.",
+            "items": {
+              "$ref": "#/components/schemas/TunableSpec"
+            },
+            "type": "array"
           },
           "updated_at": {
             "format": "date-time",
@@ -15495,7 +15674,11 @@
           },
           "tunables": {},
           "tunables_schema": {
-            "description": "What this job accepts under `tunables`, from its own declaration, as the form reads it.\n`[]` means none. It is the job's `TunableSpec` list serialised, not a stored column."
+            "description": "What this job accepts under `tunables`, from its own declaration, as the form reads it.\n`[]` means none. It is the job's own declaration, not a stored column.",
+            "items": {
+              "$ref": "#/components/schemas/TunableSpec"
+            },
+            "type": "array"
           },
           "updated_at": {
             "format": "date-time",
@@ -15722,6 +15905,14 @@
           "namespaces"
         ],
         "type": "object"
+      },
+      "SdEstimator": {
+        "description": "The two values an estimator field carries, for the document.\n\nThe estimator itself travels as a string, because it is a column value the whole ingest path\ncompares against [`SAMPLE`] and [`POPULATION`]. This names the pair so a schema field declares\nwhat it may hold rather than \"a string\", and a generated client reads the two.",
+        "enum": [
+          "sample",
+          "population"
+        ],
+        "type": "string"
       },
       "SearchResponse": {
         "properties": {
@@ -19336,8 +19527,8 @@
             "type": "array"
           },
           "sd_estimator": {
-            "description": "The divisor the standard deviations below were computed under, resolved the way the write\npath resolves it: the stream's spec, then the slot's declaration, else the fallback.",
-            "type": "string"
+            "$ref": "#/components/schemas/SdEstimator",
+            "description": "The divisor the standard deviations below were computed under, resolved the way the write\npath resolves it: the stream's spec, then the slot's declaration, else the fallback."
           },
           "sd_estimator_source": {
             "description": "What chose it: 'stream', 'slot', or 'default' for the undeclared fallback.",
@@ -20648,6 +20839,69 @@
         ],
         "type": "object"
       },
+      "ThresholdWithValue": {
+        "description": "One resolved threshold plus the slot's latest reading value, for the UI thresholds table.",
+        "properties": {
+          "alarm_max": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "alarm_min": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "current_value": {
+            "description": "Latest reading (last 30 days) for this slot, or null if none, display only.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "parameter_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "site_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "warning_max": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "warning_min": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "site_id",
+          "parameter_id",
+          "warning_min",
+          "warning_max",
+          "alarm_min",
+          "alarm_max",
+          "source",
+          "current_value"
+        ],
+        "type": "object"
+      },
       "TokenUsageEntry": {
         "description": "One recorded use of an API token from the forensic audit log.",
         "properties": {
@@ -21238,6 +21492,113 @@
         ],
         "type": "object"
       },
+      "TunableKind": {
+        "oneOf": [
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "integer"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "boolean"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A count of seconds, rendered as a duration.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "duration"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "options": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "type": {
+                "enum": [
+                  "enum"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "options",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "TunableSpec": {
+        "description": "What one operator-settable input a job accepts looks like: enough for a form to build a field\nand for the server to refuse a value the job would not read.",
+        "properties": {
+          "default": {},
+          "help": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TunableKind"
+          },
+          "max": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "min": {
+            "description": "Inclusive bounds for an integer or a duration in seconds.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "key",
+          "kind",
+          "min",
+          "max",
+          "default",
+          "help"
+        ],
+        "type": "object"
+      },
       "UndeclaredEstimatorSlot": {
         "properties": {
           "open_holds": {
@@ -21555,6 +21916,19 @@
         "required": [
           "errors",
           "log"
+        ],
+        "type": "object"
+      },
+      "UpdatedResponse": {
+        "description": "What an update to a sync service's own row answers with.",
+        "properties": {
+          "updated": {
+            "description": "`true`, always: the row is written by the time the response is written.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "updated"
         ],
         "type": "object"
       },
@@ -22018,7 +22392,14 @@
         },
         "responses": {
           "200": {
-            "description": "Computation triggered; returns job_id, status 'pending', total_timestamps"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComputeDerivedResponse"
+                }
+              }
+            },
+            "description": "Computation triggered"
           },
           "403": {
             "description": "A named site is outside the caller's projects, or no site was named"
@@ -22082,7 +22463,14 @@
         ],
         "responses": {
           "200": {
-            "description": "Background recompute job triggered with job_id"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueuedJobResponse"
+                }
+              }
+            },
+            "description": "Background recompute job triggered"
           },
           "404": {
             "description": "Derived parameter definition not found"
@@ -22178,6 +22566,13 @@
         ],
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidatedConfigResponse"
+                }
+              }
+            },
             "description": "Cache invalidated"
           }
         },
@@ -22317,7 +22712,14 @@
         },
         "responses": {
           "200": {
-            "description": "Rebuild triggered; returns job_id and status 'pending'"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueuedJobResponse"
+                }
+              }
+            },
+            "description": "Rebuild triggered"
           },
           "403": {
             "description": "The named site is outside the caller's projects, or no site was named"
@@ -22334,6 +22736,13 @@
         "operationId": "reconcile_alarms",
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReconcileAlarmsResponse"
+                }
+              }
+            },
             "description": "Reconcile complete; counts of opened/updated/resolved events"
           }
         },
@@ -22358,7 +22767,14 @@
         },
         "responses": {
           "200": {
-            "description": "Refresh triggered; returns job_id and status 'pending'"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueuedJobResponse"
+                }
+              }
+            },
+            "description": "Refresh triggered"
           }
         },
         "summary": "Refresh of TimescaleDB continuous aggregates, tracked as a `reprocessing_jobs` row.\nReturns immediately with the job id; the refresh runs in a background task with a\n10-minute timeout (a timeout marks the job `failed`). Requires `write_data`.",
@@ -22382,7 +22798,14 @@
         },
         "responses": {
           "200": {
-            "description": "Reprocessing triggered; returns job_id and status 'pending'"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueuedJobResponse"
+                }
+              }
+            },
+            "description": "Reprocessing triggered"
           },
           "403": {
             "description": "The sensor is deployed only outside the caller's projects"
@@ -22507,6 +22930,13 @@
         ],
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecalculateResponse"
+                }
+              }
+            },
             "description": "Reprocessing job spawned"
           },
           "404": {
@@ -23270,6 +23700,16 @@
         ],
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ThresholdWithValue"
+                  },
+                  "type": "array"
+                }
+              }
+            },
             "description": "Resolved thresholds + current value per (site, parameter)"
           }
         },
@@ -39970,6 +40410,13 @@
         },
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdatedResponse"
+                }
+              }
+            },
             "description": "Command updated"
           },
           "400": {
@@ -40061,6 +40508,13 @@
         ],
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevokedResponse"
+                }
+              }
+            },
             "description": "Credential revoked, active sessions terminated"
           },
           "404": {
@@ -40169,7 +40623,14 @@
         },
         "responses": {
           "200": {
-            "description": "Event created; id and status returned"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedSyncEventResponse"
+                }
+              }
+            },
+            "description": "Event created"
           },
           "400": {
             "description": "Invalid event_type or status"
@@ -40214,6 +40675,13 @@
         },
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdatedResponse"
+                }
+              }
+            },
             "description": "Event updated"
           },
           "401": {
@@ -41209,6 +41677,13 @@
         ],
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevokedResponse"
+                }
+              }
+            },
             "description": "Service revoked"
           }
         },

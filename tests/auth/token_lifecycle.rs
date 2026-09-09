@@ -194,11 +194,12 @@ async fn scoped_metadata_key_confined_and_blocked_from_global_catalog() {
         "in-scope delete-by-id must succeed, got {s}"
     );
 
-    // Resolve-by-id against a CROSS-project resource is blocked before reaching the handler.
+    // Resolve-by-id against a CROSS-project resource finds nothing: the scope condition confines
+    // the lookup, so a row outside the key's project is a row that is not there.
     let (s, _) =
         crate::common::delete_with_token(&app, &format!("/api/sites/{SITE_B_ID}"), &key).await;
     assert_eq!(
-        s, 403,
+        s, 404,
         "scoped key cannot delete a cross-project site by id"
     );
 

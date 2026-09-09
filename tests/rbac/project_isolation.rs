@@ -73,7 +73,7 @@ async fn ungranted_river_user_is_denied_everywhere() {
     );
 
     // Every write into a project the member isn't granted is refused.
-    let note = serde_json::json!({ "site_id": SITE1_ID, "content": "x" });
+    let note = serde_json::json!({ "site_id": SITE1_ID, "text": "x" });
     let (s, _) = crate::common::post_json_with_token(&app, "/api/notes", &note, &jwt).await;
     assert_eq!(s, 403, "ungranted member cannot write field metadata");
 
@@ -154,10 +154,12 @@ async fn granted_manager_cannot_mutate_other_projects_sample() {
         .await;
     }
 
+    // An excluded row answers 404 rather than 403: the scope condition confines the lookup, so a
+    // row outside the caller's projects is one that is not there.
     let (s, _) =
         crate::common::delete_with_token(&app, &format!("/api/samples/{sample_b}"), &jwt).await;
     assert_eq!(
-        s, 403,
+        s, 404,
         "manager cannot delete a sample in an ungranted project"
     );
 
@@ -213,7 +215,7 @@ async fn granted_manager_cannot_mutate_other_projects_calibration() {
     }
 
     let patch = serde_json::json!({ "slope": 3.0 });
-    let (s, _) = crate::common::patch_json_with_token(
+    let (s, _) = crate::common::put_json_with_token(
         &app,
         &format!("/api/sensor_calibrations/{cal_b}"),
         &patch,
@@ -221,11 +223,11 @@ async fn granted_manager_cannot_mutate_other_projects_calibration() {
     )
     .await;
     assert_eq!(
-        s, 403,
-        "manager cannot patch a calibration for a sensor deployed only in project B"
+        s, 404,
+        "manager cannot update a calibration for a sensor deployed only in project B"
     );
 
-    let (s, body) = crate::common::patch_json_with_token(
+    let (s, body) = crate::common::put_json_with_token(
         &app,
         &format!("/api/sensor_calibrations/{cal_a}"),
         &patch,
@@ -234,7 +236,7 @@ async fn granted_manager_cannot_mutate_other_projects_calibration() {
     .await;
     assert!(
         passed_auth(s),
-        "manager can patch a calibration for a sensor in the granted project: {s} {body}"
+        "manager can update a calibration for a sensor in the granted project: {s} {body}"
     );
 }
 

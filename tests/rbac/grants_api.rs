@@ -100,7 +100,7 @@ async fn put_grants_busts_cache_and_gates_writes() {
     let river1_id = keycloak_user_id("river1").await;
     let admin = get_keycloak_jwt("admin", "admin").await;
     let river = get_keycloak_jwt("river1", "river1").await;
-    let note = serde_json::json!({ "site_id": SITE1_ID, "content": "grant check" });
+    let note = serde_json::json!({ "site_id": SITE1_ID, "text": "grant check" });
 
     // No grant yet → the write is refused (and this caches the empty grant set).
     let (s, _) = crate::common::post_json_with_token(&app, "/api/notes", &note, &river).await;

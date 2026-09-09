@@ -537,448 +537,6 @@ pub async fn deny_scoped_token(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
-/// Mutating-CRUD scope guard, layered on the entity router. For a restricted principal performing a
-/// create/update/delete, resolves the target row's owning project and rejects anything outside the
-/// principal's scope. Applies to both a project-scoped API token and a non-admin Keycloak member
-/// (confined to their granted project set). Unrestricted principals (administrators, unscoped/sync
-/// tokens) pass through untouched (and pay no body-buffering cost).
-///
-/// The global catalog (`parameters`, `sensors`, `constants`, …) has no owning project. A **scoped
-/// API token** is denied it (fail closed, a per-client key can never mutate shared metadata). A
-/// **Keycloak member** is allowed through: their capability gate already decides whether they may
-/// write it (e.g. catalog writes are Administrator-only, so a non-admin member never reaches those
-/// routes anyway), and global catalog entities are legitimately managed by members.
-pub async fn enforce_scope_on_crud(
-    state: axum::extract::State<AppState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let (scope, is_token) = match request.extensions().get::<AuthContext>() {
-        Some(ctx @ (AuthContext::ApiToken { .. } | AuthContext::SyncService { .. })) => {
-            (ctx.access_scope(), true)
-        }
-        Some(ctx @ AuthContext::Keycloak { .. }) => (ctx.access_scope(), false),
-        None => return next.run(request).await,
-    };
-    if !scope.is_restricted() {
-        return next.run(request).await;
-    }
-
-    if matches!(
-        *request.method(),
-        Method::GET | Method::HEAD | Method::OPTIONS
-    ) {
-        return next.run(request).await;
-    }
-
-    let path = request.uri().path().to_string();
-    let method = request.method().clone();
-    let Some((entity, target)) = parse_crud_target(&path) else {
-        return AppError::Forbidden("You cannot perform this operation".to_string())
-            .into_response();
-    };
-    let entity = entity.to_string();
-
-    // Buffer the body so a create payload can be inspected and then forwarded intact.
-    let (parts, body) = request.into_parts();
-    let bytes = match axum::body::to_bytes(body, 4 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => {
-            return AppError::BadRequest("Request body too large".to_string()).into_response();
-        }
-    };
-    let json: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
-
-    // Every row the request touches must clear the check on its own; one element outside the
-    // caller's projects refuses the whole batch.
-    let elements: Vec<(Option<String>, Option<serde_json::Value>)> = match target {
-        CrudTarget::Collection => vec![(None, json.clone())],
-        CrudTarget::Row(id) => vec![(Some(id), json.clone())],
-        CrudTarget::Batch => match batch_elements(&method, json.as_ref()) {
-            Some(elements) if !elements.is_empty() => elements,
-            Some(_) => {
-                // Nothing to authorise, and nothing for the handler to do either.
-                let request = Request::from_parts(parts, axum::body::Body::from(bytes));
-                return next.run(request).await;
-            }
-            None => {
-                return AppError::Forbidden(
-                    "Could not resolve the rows this batch acts on".to_string(),
-                )
-                .into_response();
-            }
-        },
-    };
-
-    for (id, body) in &elements {
-        if let Some(refusal) = check_scope_outcome(
-            resolve_scope_project(&state.db, &entity, id.as_deref(), body.as_ref()).await,
-            &scope,
-            is_token,
-        ) {
-            return refusal;
-        }
-    }
-
-    let request = Request::from_parts(parts, axum::body::Body::from(bytes));
-    next.run(request).await
-}
-
-/// The refusal a resolved outcome earns, or `None` when the caller may proceed.
-fn check_scope_outcome(
-    outcome: ScopeOutcome,
-    scope: &crate::common::authz::AccessScope,
-    is_token: bool,
-) -> Option<Response> {
-    let outside = || {
-        AppError::Forbidden("That resource is outside your project access".to_string())
-            .into_response()
-    };
-    match outcome {
-        // Every owning/target project must be in scope (a single owner, or owner + repoint target).
-        ScopeOutcome::RequireAll(projects) => (projects.is_empty()
-            || !projects.iter().all(|p| scope.allows_project(*p)))
-        .then(outside),
-        // At least one must be in scope, matches read confinement for a multi-project entity (a
-        // calibration is visible/writable if its sensor touches a granted project). Empty fails closed.
-        ScopeOutcome::RequireAny(projects) => {
-            (!projects.iter().any(|p| scope.allows_project(*p))).then(outside)
-        }
-        // A project-scoped entity whose owning project couldn't be resolved (row missing/unbound, or a
-        // create that omits the owning FK to dodge the check): fail closed for any restricted principal.
-        // Administrators never reach here, the unrestricted early-return above skips this whole guard.
-        ScopeOutcome::Unresolved(msg) => Some(AppError::Forbidden(msg).into_response()),
-        // An entity with no project dimension (global catalog: parameters, constants, sensors, …):
-        // a project-scoped token may not touch it; a member may (their role capability governs shared
-        // metadata writes).
-        ScopeOutcome::Global(msg) => is_token.then(|| AppError::Forbidden(msg).into_response()),
-    }
-}
-
-enum ScopeOutcome {
-    /// All listed projects must be in the caller's scope (owning project + any repoint target).
-    RequireAll(Vec<Uuid>),
-    /// At least one listed project must be in scope (a multi-project entity). Empty → fail closed.
-    RequireAny(Vec<Uuid>),
-    /// Project-scoped but the owning project couldn't be resolved → fail closed for restricted callers.
-    Unresolved(String),
-    /// No project dimension (global catalog) → members allowed (role governs), tokens denied.
-    Global(String),
-}
-
-/// What a CRUD request acts on.
-#[derive(Debug, PartialEq, Eq)]
-enum CrudTarget {
-    /// `POST /{entity}`: the row is described by the body alone.
-    Collection,
-    /// `PATCH|DELETE /{entity}/{id}`: one row, named in the path.
-    Row(String),
-    /// `POST|PATCH|DELETE /{entity}/batch`: several rows, each named in the body. `batch` is a
-    /// sub-route, not an id, so parsing it as one fails closed on every batch write.
-    Batch,
-}
-
-/// Extract `(entity, target)` from a CRUD path like `/api/site_parameters/{id}`.
-fn parse_crud_target(path: &str) -> Option<(&str, CrudTarget)> {
-    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let start = segs.iter().position(|s| *s == "api").map_or(0, |i| i + 1);
-    let entity = segs.get(start)?;
-    let target = match segs.get(start + 1) {
-        None => CrudTarget::Collection,
-        Some(&"batch") => CrudTarget::Batch,
-        Some(id) => CrudTarget::Row((*id).to_string()),
-    };
-    Some((entity, target))
-}
-
-/// The (id, body) pairs a batch request acts on, one per element, by the shape crudcrate's batch
-/// handlers take: `POST` an array of create payloads, `PATCH` an array of `{id, data}`, `DELETE`
-/// an array of ids. `None` when the body is not the array the route requires, which fails closed.
-fn batch_elements(
-    method: &Method,
-    body: Option<&serde_json::Value>,
-) -> Option<Vec<(Option<String>, Option<serde_json::Value>)>> {
-    let items = body?.as_array()?;
-    match *method {
-        Method::POST => Some(
-            items
-                .iter()
-                .map(|item| (None, Some(item.clone())))
-                .collect(),
-        ),
-        Method::PATCH => items
-            .iter()
-            .map(|item| {
-                let id = item.get("id")?.as_str()?.to_string();
-                Some((Some(id), item.get("data").cloned()))
-            })
-            .collect(),
-        Method::DELETE => items
-            .iter()
-            .map(|item| Some((Some(item.as_str()?.to_string()), None)))
-            .collect(),
-        _ => None,
-    }
-}
-
-/// The owning project(s) of one row, as SQL keyed by its id, for every entity whose rows belong to a
-/// project. `None` is the answer for a global entity: the catalog, the operational tables, and a
-/// schedule, none of which has a project dimension at all.
-///
-/// This is the only list of those entities, so the question "does this entity have a project?" and
-/// the query that answers it cannot drift apart. `sensor_calibrations` and `standard_curves` resolve
-/// through a deployment set rather than one row and are handled by their own branches, so they
-/// appear here only to be named as scoped.
-fn project_scope_sql(entity: &str) -> Option<&'static str> {
-    Some(match entity {
-        "sensor_calibrations" => {
-            "SELECT DISTINCT s.project_id FROM sensor_calibrations c \
-             JOIN sensor_deployments d ON d.sensor_id = c.sensor_id \
-             JOIN sites s ON s.id = d.site_id WHERE c.id = $1"
-        }
-        "standard_curves" => {
-            "SELECT DISTINCT s.project_id FROM standard_curves c \
-             JOIN sensor_deployments d ON d.sensor_id = c.sensor_id \
-             JOIN sites s ON s.id = d.site_id WHERE c.id = $1"
-        }
-        "sites" => "SELECT project_id FROM sites WHERE id = $1",
-        "subprojects" => "SELECT project_id FROM subprojects WHERE id = $1",
-        "site_parameters" => {
-            "SELECT s.project_id FROM site_parameters sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = $1"
-        }
-        "notes" => {
-            "SELECT s.project_id FROM notes n JOIN sites s ON s.id = n.site_id WHERE n.id = $1"
-        }
-        "annotations" => {
-            "SELECT s.project_id FROM annotations a JOIN sites s ON s.id = a.site_id WHERE a.id = $1"
-        }
-        "sensor_deployments" => {
-            "SELECT s.project_id FROM sensor_deployments d JOIN sites s ON s.id = d.site_id WHERE d.id = $1"
-        }
-        "alarm_thresholds" => {
-            "SELECT s.project_id FROM alarm_thresholds t JOIN sites s ON s.id = t.site_id WHERE t.id = $1"
-        }
-        "samples" => {
-            "SELECT s.project_id FROM samples sm JOIN sites s ON s.id = sm.site_id WHERE sm.id = $1"
-        }
-        "data_streams" => {
-            "SELECT s.project_id FROM data_streams ds JOIN site_parameters sp ON sp.id = ds.site_parameter_id JOIN sites s ON s.id = sp.site_id WHERE ds.id = $1"
-        }
-        _ => return None,
-    })
-}
-
-async fn resolve_scope_project(
-    db: &sea_orm::DatabaseConnection,
-    entity: &str,
-    id: Option<&str>,
-    body: Option<&serde_json::Value>,
-) -> ScopeOutcome {
-    let fk = |key: &str| {
-        body.and_then(|b| b.get(key))
-            .and_then(serde_json::Value::as_str)
-            .and_then(|s| Uuid::parse_str(s).ok())
-    };
-
-    // Update / delete: resolve the owning project(s) from the existing row.
-    if let Some(id) = id {
-        // Whether the entity has a project at all is decided before the id is read, so a global
-        // entity keyed by something other than a UUID (`schedules` is keyed by job name) is answered
-        // by its own rule rather than refused for the shape of its key.
-        let Some(sql) = project_scope_sql(entity) else {
-            return ScopeOutcome::Global(format!("Project-scoped token cannot modify '{entity}'"));
-        };
-        let Ok(uuid) = Uuid::parse_str(id) else {
-            return ScopeOutcome::Unresolved("Could not resolve target".to_string());
-        };
-        // sensor_calibrations spans every project its sensor is deployed to; matches read scoping
-        // (visible/writable if the sensor touches a granted project), so require ANY.
-        if entity == "sensor_calibrations" {
-            let projects = distinct_projects(db, sql, uuid).await;
-            return require_any(projects, "calibration");
-        }
-        // A standard curve belongs to an instrument, so it spans the project set that instrument
-        // has been deployed to. A bench instrument is deployed nowhere, which is why the empty
-        // resolution reads as no project dimension rather than as a denial; see
-        // [`require_any_or_unbound`].
-        if entity == "standard_curves" {
-            let projects = distinct_projects(db, sql, uuid).await;
-            return require_any_or_unbound(projects, "standard curve");
-        }
-        // The owning project of the existing row, plus any repoint target in the update body: moving a
-        // site to another subproject, or a subproject to another project, must land in a scope the
-        // caller also holds. All resolved projects must be in scope.
-        let mut projects = distinct_projects(db, sql, uuid).await;
-        if projects.is_empty() {
-            return ScopeOutcome::Unresolved(
-                "Target not found within your project access".to_string(),
-            );
-        }
-        match entity {
-            "sites" => {
-                if let Some(sp) = fk("subproject_id") {
-                    projects.extend(
-                        distinct_projects(
-                            db,
-                            "SELECT project_id FROM subprojects WHERE id = $1",
-                            sp,
-                        )
-                        .await,
-                    );
-                } else if let Some(p) = fk("project_id") {
-                    projects.push(p);
-                }
-            }
-            "subprojects" => {
-                if let Some(p) = fk("project_id") {
-                    projects.push(p);
-                }
-            }
-            _ => {}
-        }
-        return ScopeOutcome::RequireAll(projects);
-    }
-
-    // Create: resolve the owning project from the request body's foreign key.
-    if body.is_none() {
-        return ScopeOutcome::Unresolved("Missing request body".to_string());
-    }
-
-    match entity {
-        "sites" => match (fk("project_id"), fk("subproject_id")) {
-            (Some(p), _) => ScopeOutcome::RequireAll(vec![p]),
-            (None, Some(sp)) => require_all(
-                distinct_projects(db, "SELECT project_id FROM subprojects WHERE id = $1", sp).await,
-            ),
-            (None, None) => {
-                ScopeOutcome::Unresolved("Site create must specify project_id or subproject_id".to_string())
-            }
-        },
-        "subprojects" => fk("project_id").map_or_else(
-            || ScopeOutcome::Unresolved("Subproject create must specify project_id".to_string()),
-            |p| ScopeOutcome::RequireAll(vec![p]),
-        ),
-        "site_parameters" | "notes" | "annotations" | "sensor_deployments" | "samples" => {
-            match fk("site_id") {
-                Some(site) => require_all(
-                    distinct_projects(db, "SELECT project_id FROM sites WHERE id = $1", site).await,
-                ),
-                None => ScopeOutcome::Unresolved(format!("{entity} create must specify site_id")),
-            }
-        }
-        "alarm_thresholds" => match fk("site_id") {
-            Some(site) => require_all(
-                distinct_projects(db, "SELECT project_id FROM sites WHERE id = $1", site).await,
-            ),
-            None => ScopeOutcome::Unresolved(
-                "Project-scoped token cannot create a global (site-less) alarm threshold".to_string(),
-            ),
-        },
-        "sensor_calibrations" => match fk("sensor_id") {
-            Some(sensor) => require_any(
-                distinct_projects(
-                    db,
-                    "SELECT DISTINCT s.project_id FROM sensor_deployments d \
-                     JOIN sites s ON s.id = d.site_id WHERE d.sensor_id = $1",
-                    sensor,
-                )
-                .await,
-                "calibration",
-            ),
-            None => ScopeOutcome::Unresolved("Calibration create must specify sensor_id".to_string()),
-        },
-        "standard_curves" => match fk("sensor_id") {
-            Some(sensor) => require_any_or_unbound(
-                distinct_projects(
-                    db,
-                    "SELECT DISTINCT s.project_id FROM sensor_deployments d \
-                     JOIN sites s ON s.id = d.site_id WHERE d.sensor_id = $1",
-                    sensor,
-                )
-                .await,
-                "standard curve",
-            ),
-            None => {
-                ScopeOutcome::Unresolved("Standard curve create must specify sensor_id".to_string())
-            }
-        },
-        "data_streams" => match fk("site_parameter_id") {
-            Some(sp) => require_all(
-                distinct_projects(
-                    db,
-                    "SELECT s.project_id FROM site_parameters sp JOIN sites s ON s.id = sp.site_id WHERE sp.id = $1",
-                    sp,
-                )
-                .await,
-            ),
-            None => ScopeOutcome::Unresolved(
-                "Project-scoped token cannot create an unpaired stream".to_string(),
-            ),
-        },
-        other => ScopeOutcome::Global(format!("Project-scoped token cannot create '{other}'")),
-    }
-}
-
-/// Build a `RequireAll` from resolved projects, or `Unresolved` when nothing resolved (a create FK
-/// pointing at a missing/unbound site).
-fn require_all(projects: Vec<Uuid>) -> ScopeOutcome {
-    if projects.is_empty() {
-        ScopeOutcome::Unresolved("Target is not bound to a project".to_string())
-    } else {
-        ScopeOutcome::RequireAll(projects)
-    }
-}
-
-/// Build a `RequireAny` from resolved projects, or `Unresolved` when the entity resolves to no project
-/// at all (e.g. a calibration for a never-deployed sensor), fail closed for a restricted caller.
-fn require_any(projects: Vec<Uuid>, what: &str) -> ScopeOutcome {
-    if projects.is_empty() {
-        ScopeOutcome::Unresolved(format!("This {what} is not within your project access"))
-    } else {
-        ScopeOutcome::RequireAny(projects)
-    }
-}
-
-/// As [`require_any`], but treating "resolves to no project" as no project dimension rather than as
-/// a failed resolution.
-///
-/// Deployment-derived scope answers "which sites has this instrument stood at", and for a lab
-/// instrument the answer is none: it is bench equipment shared across projects and is never
-/// deployed. Failing closed there would make the entity uncreatable for exactly the population it
-/// describes, rather than protecting a boundary, because an instrument bound to no project has no
-/// boundary to cross. `sensors` itself is already global catalog for the same reason. A project
-/// scoped token is still refused, and the caller's role still governs, so the level split between a
-/// curve and the windowed calibration beside it is unaffected.
-fn require_any_or_unbound(projects: Vec<Uuid>, what: &str) -> ScopeOutcome {
-    if projects.is_empty() {
-        ScopeOutcome::Global(format!(
-            "Project-scoped token cannot create a {what} on an instrument bound to no project"
-        ))
-    } else {
-        ScopeOutcome::RequireAny(projects)
-    }
-}
-
-/// All distinct non-NULL `project_id`s a scope query resolves. A DB error yields an empty set, which
-/// the callers treat as unresolved → fail closed, and a row that will not decode is dropped for the
-/// same reason: every caller reads this set as what the principal may reach, so a short set refuses
-/// and never grants.
-async fn distinct_projects(db: &sea_orm::DatabaseConnection, sql: &str, id: Uuid) -> Vec<Uuid> {
-    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-    db.query_all_raw(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        sql,
-        [id.into()],
-    ))
-    .await
-    .map(|rows| {
-        rows.iter()
-            .filter_map(|r| r.try_get::<Option<Uuid>>("", "project_id").ok().flatten())
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
 /// Reject the request if a restricted principal is writing to any site outside its scope. No-op for
 /// unrestricted callers (administrators, unscoped/sync tokens). `site_ids` are the distinct sites
 /// the request would touch; an unknown site is also rejected. Applies uniformly to a project-scoped
@@ -1101,12 +659,55 @@ fn scoped_site_parameter_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::Sel
         .into_query()
 }
 
-/// Row-filter confining a CRUD entity's *read* (list / get-by-id) to a restricted principal's
-/// project set, or `None` for global-catalog, operational, and admin-only entities (reading shared
-/// definitions like `parameters`/`constants` is intended). Built as a subquery so it adds no
-/// round-trip and references only the entity's own columns; rows whose scoping column is NULL
-/// (unpaired streams, site-less global thresholds) fall out by construction.
-fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm::Condition> {
+/// Which side of a CRUD route [`crud_scope_condition`] is answering for. Almost every entity gives
+/// one answer to all three; the exceptions are the rows whose project is derived from where an
+/// instrument has been deployed, and they are named in the match.
+///
+/// A lab instrument is bench equipment shared across projects and is never deployed, so "which
+/// projects does this row belong to" answers "none" for the inventory itself and for a curve
+/// measured on it. Reading such a row is confined (it is listed only where the instrument stood),
+/// but refusing to *write* one would make the shared inventory unmaintainable by the very people
+/// who keep it, so a member's write treats an unbound row as having no project boundary to cross.
+/// A project-scoped API token is refused it either way: an unbound row is shared metadata, and a
+/// per-client key never writes that.
+#[derive(Clone, Copy, PartialEq)]
+enum Direction {
+    /// A list or a get.
+    Read,
+    /// A write by a non-admin Keycloak member, confined to their granted projects.
+    MemberWrite,
+    /// A write by a project-scoped API token.
+    TokenWrite,
+}
+
+/// Subquery selecting every sensor id that has any deployment at all. Its complement is the bench
+/// inventory, which belongs to no project.
+fn deployed_sensor_ids_query() -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::sensors::deployments;
+    use sea_orm::{EntityTrait, QuerySelect, QueryTrait};
+    deployments::Entity::find()
+        .select_only()
+        .column(deployments::Column::SensorId)
+        .into_query()
+}
+
+/// Row-filter confining a CRUD entity to a restricted principal's project set, or `None` for
+/// global-catalog, operational, and admin-only entities (reading shared definitions like
+/// `parameters`/`constants` is intended). Built as a subquery so it adds no round-trip and
+/// references only the entity's own columns; rows whose scoping column is NULL (unpaired streams,
+/// site-less global thresholds) fall out by construction.
+///
+/// This is the only statement of the rule. It confines reads and writes alike: crudcrate filters a
+/// list by it, 404s a get or an update or a delete it excludes, and refuses a create or an update
+/// whose resulting row falls outside it.
+///
+/// `direction` is where the read and the write rules part, which they do only for the rows whose
+/// project comes from an instrument's deployments; see [`Direction`].
+fn crud_scope_condition(
+    entity: &str,
+    projects: &[Uuid],
+    direction: Direction,
+) -> Option<sea_orm::Condition> {
     use crate::routes::private::{
         alarms::thresholds, annotations, data_streams, notes, projects as projects_entity,
         projects::subprojects, readings::samples, reprocessing_jobs, sensors,
@@ -1116,6 +717,10 @@ fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm:
     use sea_orm::{ColumnTrait, Condition};
     let ids = || projects.iter().copied();
     let expr = match entity {
+        // Writing a project is an administrative act over the container itself, not a write
+        // inside it, so it carries no project dimension to be confined by. Reads are confined to
+        // the granted set.
+        "projects" if direction != Direction::Read => return None,
         "projects" => projects_entity::Column::Id.is_in(ids()),
         "subprojects" => subprojects::Column::ProjectId.is_in(ids()),
         "sites" => sites::Column::ProjectId.is_in(ids()),
@@ -1133,16 +738,32 @@ fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm:
         "samples" => samples::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
         "data_streams" => data_streams::Column::SiteParameterId
             .in_subquery(scoped_site_parameter_ids_query(projects)),
+        // The instrument inventory is shared: a sensor row carries no project of its own, and a
+        // sensor being added has stood nowhere yet. Reads are confined to where it has been
+        // deployed; writes are catalog writes, governed by the caller's role and refused to a
+        // project-scoped token by `inject_project_scope`.
+        "sensors" if direction != Direction::Read => return None,
         "sensors" => sensors::Column::Id.in_subquery(scoped_sensor_ids_query(projects)),
         "sensor_calibrations" => {
             calibrations::Column::SensorId.in_subquery(scoped_sensor_ids_query(projects))
         }
         "standard_curves" => {
-            standard_curves::Column::SensorId.in_subquery(scoped_sensor_ids_query(projects))
+            let scoped =
+                standard_curves::Column::SensorId.in_subquery(scoped_sensor_ids_query(projects));
+            return Some(if direction == Direction::MemberWrite {
+                Condition::any().add(scoped).add(
+                    standard_curves::Column::SensorId.not_in_subquery(deployed_sensor_ids_query()),
+                )
+            } else {
+                Condition::all().add(scoped)
+            });
         }
         // Mirrors `scope::project_of_job`: a job belongs to its site, else to the projects its
         // sensor is deployed into, and a job targeting neither is global. Returning early here
         // would hide global jobs (a CSV import targets no sensor) from the member who started one.
+        // A job is an operational row, not a project's. Writing one is administrative, and a
+        // global job (a CSV import targets no sensor) belongs to no project to be confined by.
+        "reprocessing_jobs" if direction != Direction::Read => return None,
         "reprocessing_jobs" => {
             return Some(
                 Condition::any()
@@ -1166,110 +787,157 @@ fn crud_read_scope_condition(entity: &str, projects: &[Uuid]) -> Option<sea_orm:
     Some(Condition::all().add(expr))
 }
 
-/// Read-side project-scope confinement for the CRUD entity routers. For a restricted principal (a
-/// scoped API token, or a non-admin Keycloak member confined to their grant set) injects a CrudCrate
-/// [`crudcrate::ScopeCondition`] so the generated handlers filter list results to that project set
-/// and turn an out-of-scope get-by-id into a 404. No-op for unrestricted principals, for write
-/// methods (mutations are confined by [`enforce_scope_on_crud`]), and for global/operational
-/// entities. Custom sub-routes (e.g. `/sites/{id}/readings`) don't read the extension and keep their
-/// own manual scope checks.
-pub async fn inject_read_scope(request: Request, next: Next) -> Response {
-    let scope = request
-        .extensions()
-        .get::<AuthContext>()
-        .map_or(AccessScope::Unrestricted, AuthContext::access_scope);
-    let Some(project_ids) = scope.project_ids() else {
+/// Project-scope confinement for the CRUD entity routers. For a restricted principal (a scoped API
+/// token, or a non-admin Keycloak member confined to their grant set) injects a CrudCrate
+/// [`crudcrate::ScopeCondition`], which confines every generated handler: a list is filtered to the
+/// project set, a get, update or delete of an excluded row is a 404, and a create or update whose
+/// resulting row would fall outside it is refused inside the write's own transaction. No-op for
+/// unrestricted principals. Custom sub-routes (e.g. `/sites/{id}/readings`) don't read the
+/// extension and keep their own manual scope checks.
+///
+/// The entities [`crud_scope_condition`] answers `None` for have no project dimension: the shared
+/// catalog, the operational tables, a schedule. A **Keycloak member** may write those (their role
+/// capability already governs shared metadata, and catalog writes are Administrator-only anyway); a
+/// **project-scoped API token** may not, and is refused here, since a per-client key has no business
+/// mutating what every project reads. That refusal is the one rule a row filter cannot express,
+/// because there is no row column to filter on.
+pub async fn inject_project_scope(request: Request, next: Next) -> Response {
+    let Some(auth) = request.extensions().get::<AuthContext>() else {
         return next.run(request).await;
     };
-    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+    let is_token = matches!(
+        auth,
+        AuthContext::ApiToken { .. } | AuthContext::SyncService { .. }
+    );
+    let Some(project_ids) = auth.access_scope().project_ids() else {
         return next.run(request).await;
-    }
-    if let Some((entity, _id)) = parse_crud_target(request.uri().path())
-        && let Some(condition) = crud_read_scope_condition(entity, &project_ids)
-    {
-        let mut request = request;
-        request
-            .extensions_mut()
-            .insert(crudcrate::ScopeCondition::new(condition));
+    };
+    let Some(entity) = crud_entity(request.uri().path()) else {
         return next.run(request).await;
+    };
+    let writing = !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    );
+    let direction = match (writing, is_token) {
+        (false, _) => Direction::Read,
+        (true, false) => Direction::MemberWrite,
+        (true, true) => Direction::TokenWrite,
+    };
+    match crud_scope_condition(entity, &project_ids, direction) {
+        Some(condition) => {
+            let mut request = request;
+            request
+                .extensions_mut()
+                .insert(crudcrate::ScopeCondition::new(condition));
+            next.run(request).await
+        }
+        None if writing && is_token => AppError::Forbidden(format!(
+            "Project-scoped token cannot modify '{entity}'"
+        ))
+        .into_response(),
+        None => next.run(request).await,
     }
-    next.run(request).await
+}
+
+/// The entity segment of a CRUD path like `/api/site_parameters/{id}`, which is what names the row
+/// filter. The segments after it are the handler's business.
+fn crud_entity(path: &str) -> Option<&str> {
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let start = segs.iter().position(|s| *s == "api").map_or(0, |i| i + 1);
+    segs.get(start).copied()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CrudTarget, batch_elements, parse_crud_target};
-    use axum::http::Method;
-    use serde_json::json;
+    use super::{Direction, crud_entity, crud_scope_condition};
+    use uuid::Uuid;
 
     #[test]
-    fn test_parse_crud_target_reads_batch_as_a_sub_route_not_an_id() {
+    fn test_crud_entity_reads_the_entity_and_ignores_what_follows_it() {
+        assert_eq!(crud_entity("/api/site_parameters"), Some("site_parameters"));
         assert_eq!(
-            parse_crud_target("/api/site_parameters/batch"),
-            Some(("site_parameters", CrudTarget::Batch)),
-            "parsed as an id, `batch` fails the UUID parse and refuses every scoped batch write"
+            crud_entity("/api/site_parameters/batch"),
+            Some("site_parameters"),
+            "`batch` is a sub-route of the entity, not another entity"
         );
         assert_eq!(
-            parse_crud_target("/api/site_parameters"),
-            Some(("site_parameters", CrudTarget::Collection))
+            crud_entity("/api/site_parameters/0189d3f0-0000-4000-8000-000000000000"),
+            Some("site_parameters")
         );
-        assert_eq!(
-            parse_crud_target("/api/site_parameters/0189d3f0-0000-4000-8000-000000000000"),
-            Some((
-                "site_parameters",
-                CrudTarget::Row("0189d3f0-0000-4000-8000-000000000000".to_string())
-            ))
-        );
+        assert_eq!(crud_entity("/"), None);
     }
 
+    /// An entity answering `None` has no project dimension, which is what makes
+    /// `inject_project_scope` refuse a scoped token's write to it. The refusal is the one rule no
+    /// row filter can state, so the set it applies to is asserted here.
     #[test]
-    fn test_batch_elements_follow_each_route_s_body_shape() {
-        let creates = json!([{ "site_id": "a" }, { "site_id": "b" }]);
+    fn test_the_entities_with_no_project_dimension_are_the_ones_a_scoped_token_is_refused() {
+        let projects = [Uuid::nil()];
+        let none_for = |direction| {
+            let mut names: Vec<&str> = Vec::new();
+            for entity in [
+                "projects", "sites", "site_parameters", "notes", "annotations", "samples",
+                "subprojects", "data_streams", "alarm_thresholds", "sensor_deployments",
+                "sensor_calibrations", "standard_curves", "sensors", "reprocessing_jobs",
+                "parameters", "constants", "schedules", "collection_events",
+            ] {
+                if crud_scope_condition(entity, &projects, direction).is_none() {
+                    names.push(entity);
+                }
+            }
+            names
+        };
         assert_eq!(
-            batch_elements(&Method::POST, Some(&creates)),
-            Some(vec![
-                (None, Some(json!({ "site_id": "a" }))),
-                (None, Some(json!({ "site_id": "b" }))),
-            ])
+            none_for(Direction::Read),
+            ["parameters", "constants", "schedules", "collection_events"],
+            "a read is confined for every entity whose rows carry a project"
         );
-
-        let updates = json!([{ "id": "one", "data": { "name": "x" } }]);
-        assert_eq!(
-            batch_elements(&Method::PATCH, Some(&updates)),
-            Some(vec![(
-                Some("one".to_string()),
-                Some(json!({ "name": "x" }))
-            )])
-        );
-
-        let deletes = json!(["one", "two"]);
-        assert_eq!(
-            batch_elements(&Method::DELETE, Some(&deletes)),
-            Some(vec![
-                (Some("one".to_string()), None),
-                (Some("two".to_string()), None),
-            ])
-        );
+        let expected = [
+            "projects",
+            "sensors",
+            "reprocessing_jobs",
+            "parameters",
+            "constants",
+            "schedules",
+            "collection_events",
+        ];
+        for direction in [Direction::MemberWrite, Direction::TokenWrite] {
+            let mut got = none_for(direction);
+            got.sort_unstable();
+            let mut want = expected;
+            want.sort_unstable();
+            assert_eq!(got, want, "the shared inventory is written as catalog, not as a project's");
+        }
     }
 
-    /// A body that is not the array the route takes resolves no rows, so the caller is refused
-    /// rather than passed through unchecked.
+    /// The bench instrument is the one row a member may write and may not read, so the asymmetry is
+    /// asserted rather than described.
     #[test]
-    fn test_batch_elements_refuse_a_body_that_names_no_rows() {
-        assert_eq!(batch_elements(&Method::POST, None), None);
-        assert_eq!(
-            batch_elements(&Method::POST, Some(&json!({ "site_id": "a" }))),
-            None
+    fn test_only_a_members_write_reaches_a_curve_on_an_instrument_deployed_nowhere() {
+        let projects = [Uuid::nil()];
+        let sql = |entity: &str, direction| {
+            format!(
+                "{:?}",
+                crud_scope_condition(entity, &projects, direction).expect("a project-bound entity")
+            )
+        };
+        assert_ne!(
+            sql("standard_curves", Direction::Read),
+            sql("standard_curves", Direction::MemberWrite),
+            "a member's write must reach a curve on an instrument deployed nowhere"
         );
         assert_eq!(
-            batch_elements(&Method::PATCH, Some(&json!([{ "data": {} }]))),
-            None,
-            "an update element naming no id"
+            sql("standard_curves", Direction::Read),
+            sql("standard_curves", Direction::TokenWrite),
+            "a project-scoped token is confined to where the instrument stood, in both directions"
         );
-        assert_eq!(
-            batch_elements(&Method::DELETE, Some(&json!([{ "id": "one" }]))),
-            None,
-            "a delete element that is not an id string"
-        );
+        for entity in ["sites", "notes", "sensor_calibrations", "data_streams"] {
+            assert_eq!(
+                sql(entity, Direction::Read),
+                sql(entity, Direction::MemberWrite),
+                "{entity} has one rule in every direction"
+            );
+        }
     }
 }

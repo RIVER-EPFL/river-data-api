@@ -268,7 +268,7 @@ async fn revoking_a_credential_kills_enrollment_and_live_sessions() {
     )
     .await
     .expect("revoke");
-    assert_eq!(revoked["revoked"], true);
+    assert!(revoked.revoked);
 
     assert_eq!(
         count(

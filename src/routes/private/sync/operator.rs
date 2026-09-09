@@ -683,6 +683,13 @@ pub async fn list_credentials(
     ))
 }
 
+/// What a revocation answers with.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct RevokedResponse {
+    /// `true`, always: the row is revoked by the time the response is written.
+    pub revoked: bool,
+}
+
 /// Revoke an enrollment credential and immediately invalidate every active session
 /// token bound to its service. Subsequent heartbeat or command updates will be rejected
 /// as 401. Requires Keycloak Administrator (`require_admin` upstream).
@@ -691,7 +698,7 @@ pub async fn list_credentials(
     path = "/api/sync/credentials/{id}/revoke",
     params(("id" = Uuid, Path, description = "Credential UUID")),
     responses(
-        (status = 200, description = "Credential revoked, active sessions terminated"),
+        (status = 200, description = "Credential revoked, active sessions terminated", body = RevokedResponse),
         (status = 404, description = "Credential not found"),
     ),
     tag = "sync"
@@ -699,7 +706,7 @@ pub async fn list_credentials(
 pub async fn revoke_credential(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<RevokedResponse>> {
     let cred = sync_service_credentials::Entity::find_by_id(id)
         .one(&state.db)
         .await?
@@ -716,7 +723,7 @@ pub async fn revoke_credential(
             .await?;
     }
 
-    Ok(Json(serde_json::json!({"revoked": true})))
+    Ok(Json(RevokedResponse { revoked: true }))
 }
 
 /// Paginated list of sync events (newest first). Returns a `Content-Range` header for
@@ -766,14 +773,14 @@ pub async fn list_sync_events(
     path = "/api/sync/services/{id}/revoke",
     params(("id" = Uuid, Path, description = "Sync service UUID")),
     responses(
-        (status = 200, description = "Service revoked"),
+        (status = 200, description = "Service revoked", body = RevokedResponse),
     ),
     tag = "sync"
 )]
 pub async fn revoke_service(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<RevokedResponse>> {
     sync_service_credentials::Entity::update_many()
         .col_expr(sync_service_credentials::Column::Revoked, Expr::value(true))
         .filter(sync_service_credentials::Column::ServiceId.eq(id))
@@ -785,7 +792,7 @@ pub async fn revoke_service(
         .exec(&state.db)
         .await?;
 
-    Ok(Json(serde_json::json!({"revoked": true})))
+    Ok(Json(RevokedResponse { revoked: true }))
 }
 
 #[cfg(test)]

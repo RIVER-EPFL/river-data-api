@@ -910,7 +910,7 @@ pub struct HoldRow {
     pub classification: String,
     /// The divisor `computed.sd` was computed under, 'sample' or 'population'. Recorded on the
     /// hold; a hold that predates the record reads the slot's declaration, else 'sample'.
-    #[schema(required)]
+    #[schema(required, value_type = Option<crate::routes::private::readings::sd_estimator::SdEstimator>)]
     pub sd_estimator: Option<String>,
     /// The decision record: latest action plus prior actions under `history`.
     #[schema(value_type = Object)]

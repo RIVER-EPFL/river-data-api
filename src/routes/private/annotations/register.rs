@@ -9,12 +9,14 @@
 //! describes the curve as it is now, not the curve the value was made with.
 
 use axum::{Json, extract::State};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Statement};
+use crudcrate::UpsertStatus;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use super::{ActiveModel, Annotation, Column, Entity, Model};
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::{data_streams, sites::parameters as site_parameters};
@@ -47,21 +49,6 @@ pub struct AnnotationItem {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RegisterAnnotationsResponse {
     pub annotations: Vec<AnnotationOutcome>,
-}
-
-/// A stored annotation the upsert left alone, and whether its text has moved at source.
-#[derive(FromQueryResult)]
-struct ExistingAnnotation {
-    id: Uuid,
-    frozen: bool,
-}
-
-/// What the upsert did with one registered annotation.
-#[derive(FromQueryResult)]
-struct UpsertedAnnotation {
-    id: Uuid,
-    created: bool,
-    frozen: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -117,6 +104,24 @@ pub async fn register_annotations(
         })
         .collect();
 
+    // The stored rows this pass re-asserts, read once: a row that already names a curve is
+    // frozen, and which half the source moved is what the outcome reports.
+    let mut keys: Vec<String> = payload
+        .annotations
+        .iter()
+        .map(|a| a.source_key.clone())
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let stored: HashMap<String, Model> = Entity::find()
+        .filter(Column::SourceSystem.eq(source_system.clone()))
+        .filter(Column::SourceKey.is_in(keys))
+        .all(db)
+        .await?
+        .into_iter()
+        .filter_map(|a| a.source_key.clone().map(|key| (key, a)))
+        .collect();
+
     let mut outcomes = Vec::with_capacity(payload.annotations.len());
     for item in &payload.annotations {
         if item.source_key.trim().is_empty() {
@@ -130,103 +135,57 @@ pub async fn register_annotations(
             });
             continue;
         };
-        // Single-statement upsert: the DO UPDATE's WHERE makes an identical re-assert return no
-        // row (unchanged), and `xmax = 0` distinguishes an insert from an update. A row that
-        // already names a curve keeps its curve and text, so the update only moves the slot and
-        // instant; `frozen` reports the text or curve the source sent and the row did not take.
-        let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "INSERT INTO annotations
-                     (id, site_id, parameter_id, start_time, end_time, text, category,
-                      created_by, source_system, source_key, standard_curve_id, created_at)
-                 VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $9, $10, NOW())
-                 ON CONFLICT (source_system, source_key)
-                     WHERE source_system IS NOT NULL AND source_key IS NOT NULL
-                     DO UPDATE SET site_id = EXCLUDED.site_id,
-                                   parameter_id = EXCLUDED.parameter_id,
-                                   start_time = EXCLUDED.start_time,
-                                   end_time = EXCLUDED.end_time,
-                                   text = CASE WHEN annotations.standard_curve_id IS NULL
-                                               THEN EXCLUDED.text ELSE annotations.text END,
-                                   standard_curve_id = COALESCE(annotations.standard_curve_id,
-                                                                EXCLUDED.standard_curve_id),
-                                   category = EXCLUDED.category
-                     WHERE (annotations.site_id, annotations.parameter_id,
-                            annotations.start_time, annotations.end_time,
-                            annotations.category)
-                           IS DISTINCT FROM
-                           (EXCLUDED.site_id, EXCLUDED.parameter_id,
-                            EXCLUDED.start_time, EXCLUDED.end_time, EXCLUDED.category)
-                        OR (annotations.standard_curve_id IS NULL
-                            AND (annotations.text, annotations.standard_curve_id)
-                                IS DISTINCT FROM (EXCLUDED.text, EXCLUDED.standard_curve_id))
-                 RETURNING id, (xmax = 0) AS created,
-                           (text IS DISTINCT FROM $5
-                            OR standard_curve_id IS DISTINCT FROM $10) AS frozen",
-                [
-                    Uuid::new_v4().into(),
-                    site_id.into(),
-                    parameter_id.into(),
-                    sea_orm::prelude::DateTimeWithTimeZone::from(item.time).into(),
-                    item.text.clone().into(),
-                    item.category.clone().into(),
-                    format!("sync:{source_system}").into(),
-                    source_system.clone().into(),
-                    item.source_key.clone().into(),
-                    item.standard_curve_id.into(),
-                ],
-            ))
-            .await?;
-        let outcome = match row {
-            Some(row) => {
-                let upserted = UpsertedAnnotation::from_query_result(&row, "")?;
-                AnnotationOutcome {
-                    source_key: item.source_key.clone(),
-                    id: Some(upserted.id),
-                    status: if upserted.created {
-                        "created".into()
-                    } else if upserted.frozen {
-                        "frozen".into()
-                    } else {
-                        "updated".into()
-                    },
+        let stored = stored.get(&item.source_key);
+        // A row that already names a curve keeps the curve and the text the value was made with,
+        // so the registration moves only its slot, instant and category; `frozen` reports the text
+        // or curve the source sent and the row did not take.
+        let frozen = stored.is_some_and(|a| a.standard_curve_id.is_some());
+        let mut active = ActiveModel {
+            site_id: Set(site_id),
+            parameter_id: Set(parameter_id),
+            start_time: Set(item.time),
+            end_time: Set(item.time),
+            category: Set(item.category.clone()),
+            created_by: Set(Some(format!("sync:{source_system}"))),
+            source_system: Set(Some(source_system.clone())),
+            source_key: Set(Some(item.source_key.clone())),
+            standard_curve_id: Set(item.standard_curve_id),
+            ..Default::default()
+        };
+        if !frozen {
+            active.text = Set(item.text.clone());
+        }
+        let (annotation, status) =
+            crate::common::provenance::register::<Annotation>(db, active).await?;
+        // The curve is excluded from the create model, so an upsert never writes one onto a
+        // stored row; a row that names none takes the curve of the first pass that does.
+        let adopts_curve = stored.is_some_and(|a| a.standard_curve_id.is_none())
+            && item.standard_curve_id.is_some();
+        if adopts_curve {
+            let mut claim = ActiveModel {
+                id: sea_orm::ActiveValue::Unchanged(annotation.id),
+                ..Default::default()
+            };
+            claim.standard_curve_id = Set(item.standard_curve_id);
+            sea_orm::ActiveModelTrait::update(claim, db).await?;
+        }
+        let withheld = stored.is_some_and(|a| {
+            a.text != item.text || a.standard_curve_id != item.standard_curve_id
+        });
+        let outcome = AnnotationOutcome {
+            source_key: item.source_key.clone(),
+            id: Some(annotation.id),
+            status: if frozen && withheld {
+                "frozen".into()
+            } else if adopts_curve {
+                "updated".into()
+            } else {
+                match status {
+                    UpsertStatus::Created => "created".into(),
+                    UpsertStatus::Updated => "updated".into(),
+                    UpsertStatus::Unchanged => "unchanged".into(),
                 }
-            }
-            None => {
-                let existing = db
-                    .query_one_raw(Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        "SELECT id,
-                                (text IS DISTINCT FROM $3
-                                 OR standard_curve_id IS DISTINCT FROM $4) AS frozen
-                         FROM annotations
-                         WHERE source_system = $1 AND source_key = $2",
-                        [
-                            source_system.clone().into(),
-                            item.source_key.clone().into(),
-                            item.text.clone().into(),
-                            item.standard_curve_id.into(),
-                        ],
-                    ))
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::Internal(format!(
-                            "annotation upsert for {} returned no row and no stored row exists",
-                            item.source_key
-                        ))
-                    })?;
-                let seen = ExistingAnnotation::from_query_result(&existing, "")?;
-                AnnotationOutcome {
-                    source_key: item.source_key.clone(),
-                    id: Some(seen.id),
-                    status: if seen.frozen {
-                        "frozen".into()
-                    } else {
-                        "unchanged".into()
-                    },
-                }
-            }
+            },
         };
         outcomes.push(outcome);
     }

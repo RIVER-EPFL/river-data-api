@@ -1,7 +1,7 @@
 //! Project-scope confinement for a token's READ surface.
 //!
 //! Scenario: a key scoped to project A must not see project B's rows through any CRUD list/get,
-//! the leak `enforce_token_scope_on_crud` left open by skipping GET (closed by `inject_read_scope`,
+//! the leak `enforce_token_scope_on_crud` left open by skipping GET (closed by `inject_project_scope`,
 //! which injects a per-entity CrudCrate `ScopeCondition`). A scoped key sees only its own project;
 //! an unscoped key (the admin/private surface) sees everything. Mutations stay confined too.
 
@@ -318,7 +318,7 @@ async fn a_scoped_token_cannot_reach_another_projects_curve() {
     .await;
     assert_eq!(s, 403, "nor on an instrument no project claims");
 
-    let (s, _) = crate::common::patch_json_with_token(
+    let (s, _) = crate::common::put_json_with_token(
         &app,
         &format!("/api/standard_curves/{CURVE_B_ID}"),
         &serde_json::json!({ "notes": "edited from outside" }),

@@ -9,7 +9,8 @@ use sea_orm::entity::prelude::*;
     api_struct = "Annotation",
     name_singular = "annotation",
     name_plural = "annotations",
-    generate_router
+    generate_router,
+    upsert_key(source_system, source_key)
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]

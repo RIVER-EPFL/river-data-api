@@ -163,6 +163,77 @@ pub struct Config {
 }
 
 impl Config {
+    /// The configuration a router built only to describe itself runs under.
+    ///
+    /// Nothing is served and no query is issued, so every value is a placeholder and none of them
+    /// reaches the document. The Keycloak admin client is declared because the user-management
+    /// routes mount only when one is present, and reading none of this from the environment is
+    /// what lets the guard in `routes` build the same document the dump writes.
+    #[must_use]
+    pub fn for_openapi_document() -> Self {
+        Self {
+            database_url: String::new(),
+            api_host: "127.0.0.1".to_string(),
+            api_port: 0,
+            disable_rate_limiting: true,
+            bulk_concurrent_limit: 10,
+            cache_ttl_seconds: 0,
+            token_cache_ttl_seconds: 0,
+            grants_cache_ttl_seconds: 0,
+            cache_max_bytes: 0,
+            deployment: Deployment::Local,
+            keycloak_url: None,
+            keycloak_realm: None,
+            keycloak_client_id: None,
+            keycloak_admin_client_id: Some("river-data-admin".to_string()),
+            keycloak_admin_client_secret: Some("unused".to_string()),
+            cors_allowed_origins: Vec::new(),
+            trusted_proxy_cidrs: crate::common::rate_limit::default_trusted_proxies(),
+            db_max_connections: 1,
+            db_min_connections: 0,
+            request_timeout_seconds: 60,
+            default_readings_lookback_days: 7,
+            public_rate_limit_burst: 10,
+            public_rate_limit_period_secs: 2,
+            auth_rate_limit_per_second: 100,
+            auth_rate_limit_burst: 200,
+            audit_api_token_use: false,
+            request_summary_seconds: 0,
+            tools_runner_url: None,
+            tools_runner_timeout_seconds: 60,
+            meteoswiss_base_url: String::new(),
+            meteoswiss_interval_seconds: 3600,
+            meteoswiss_timeout_seconds: 30,
+            janitor_interval_seconds: 3600,
+            janitor_full_refresh_seconds: 86_400,
+            janitor_retention_days: 180,
+            job_maintenance_retention_days: 14,
+            job_maintenance_max_rows: 50_000,
+            alarm_sweep_interval_seconds: 60,
+            sync_event_sweep_interval_seconds: 300,
+            sync_event_stale_after_seconds: 3600,
+            sync_event_retention_days: 90,
+            ingest_receipt_retention_days: 365,
+            sync_session_token_ttl_secs: 900,
+            sync_command_expiry_secs: 300,
+            sync_health_healthy_secs: 90,
+            sync_health_warning_secs: 300,
+            sync_client_id_prefix: "svc_".to_string(),
+            job_max_retries: 3,
+            job_retry_backoff_seconds: 60,
+            notify_poll_interval_seconds: 60,
+            identity_reconcile_interval_seconds: 300,
+            notify_health_interval_seconds: 300,
+            battery_cutoff_volts: 10.5,
+            battery_forecast_alert_days: 14,
+            stale_data_threshold_hours: 6,
+            dashboard_base_url: None,
+            vapid_private_key_pem: None,
+            vapid_public_key: None,
+            vapid_subject: None,
+        }
+    }
+
     /// Whether Web Push is configured (a VAPID private key and subject are present).
     #[must_use]
     pub fn web_push_configured(&self) -> bool {

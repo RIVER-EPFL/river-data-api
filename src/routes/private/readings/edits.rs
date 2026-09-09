@@ -420,7 +420,10 @@ pub struct MovedRow {
     pub stream_id: Uuid,
     pub time: chrono::DateTime<chrono::Utc>,
     pub replicate_index: i16,
+    /// The columns this row moves, keyed by column name.
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub before: serde_json::Value,
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub after: serde_json::Value,
 }
 
@@ -428,7 +431,10 @@ pub struct MovedRow {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MovedSample {
     pub sample_id: Uuid,
+    /// The statistics this group moves, keyed by column name.
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub before: serde_json::Value,
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub after: serde_json::Value,
 }
 

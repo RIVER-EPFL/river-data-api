@@ -1242,12 +1242,13 @@ impl Job for JanitorRun {
     // and follow this same pattern when they grow one.
     fn tunables(&self) -> Vec<TunableSpec> {
         vec![TunableSpec {
-            key: "retention_days",
+            key: "retention_days".to_string(),
             kind: TunableKind::Integer,
             min: Some(1),
             max: None,
             default: serde_json::json!(self.operator_retention_days),
-            help: "How long an operator or metadata job row is kept before the prune removes it.",
+            help: "How long an operator or metadata job row is kept before the prune removes it."
+                .to_string(),
         }]
     }
 
@@ -2268,7 +2269,7 @@ mod tunable_validation_tests {
                 if !matches!(spec.kind, TunableKind::Integer | TunableKind::Duration) {
                     continue;
                 }
-                let below = serde_json::json!({ spec.key: min - 1 });
+                let below = serde_json::json!({ &spec.key: min - 1 });
                 assert!(
                     handler.validate(&below).is_err(),
                     "{name} accepts {} below its minimum",

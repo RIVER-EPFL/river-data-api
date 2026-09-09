@@ -73,6 +73,7 @@ pub struct StreamPreviewResponse {
     pub source_key: String,
     /// The divisor the standard deviations below were computed under, resolved the way the write
     /// path resolves it: the stream's spec, then the slot's declaration, else the fallback.
+    #[schema(value_type = crate::routes::private::readings::sd_estimator::SdEstimator)]
     pub sd_estimator: &'static str,
     /// What chose it: 'stream', 'slot', or 'default' for the undeclared fallback.
     pub sd_estimator_source: &'static str,
@@ -561,17 +562,19 @@ pub async fn register_stream(
     crate::routes::private::readings::measurement::validate_measurement_type(
         payload.measurement_type.as_deref(),
     )?;
+    let stored = data_streams::Entity::find()
+        .filter(data_streams::Column::SourceSystem.eq(&payload.source_system))
+        .filter(data_streams::Column::SourceKey.eq(&payload.source_key))
+        .one(&state.db)
+        .await?;
     if let Some(spec) = payload.replicates.as_mut() {
         spec.validate(payload.measurement_type.as_deref())?;
         // The stored column-to-index mapping is authoritative and append-only: readings carry
         // their index for life, so a re-registration keeps every known column's index, appends
         // genuinely new columns, and retires absent ones without reusing their indexes. The
         // caller's own `assignments`, if any, are ignored; only the register path authors them.
-        let prior = data_streams::Entity::find()
-            .filter(data_streams::Column::SourceSystem.eq(&payload.source_system))
-            .filter(data_streams::Column::SourceKey.eq(&payload.source_key))
-            .one(&state.db)
-            .await?
+        let prior = stored
+            .as_ref()
             .and_then(|s| super::replicates::ReplicateSpec::from_metadata(&s.metadata));
         spec.assignments =
             super::replicates::pin_assignments(prior.as_ref(), &spec.source_columns)?;
@@ -591,90 +594,47 @@ pub async fn register_stream(
         }
         payload.metadata[super::service::DECIMAL_PLACES_KEY] = serde_json::json!(places);
     }
-    let now = Utc::now();
+    // Moving an already-attached feed to a different instrument changes the attribution of
+    // everything it has ever written, so it is refused here and left to the explicit swap and
+    // relink paths.
+    if let Some(declared) = payload.sensor_id
+        && let Some(current) = stored.as_ref().and_then(|s| s.sensor_id)
+        && current != declared
+    {
+        return Err(AppError::Conflict(format!(
+            "stream {} already reports instrument {current}; relink it explicitly rather than \
+             on registration",
+            stored.as_ref().map_or_else(Uuid::nil, |s| s.id)
+        )));
+    }
 
-    let model = data_streams::ActiveModel {
-        id: Set(Uuid::new_v4()),
+    // Register on (source_system, source_key). A byte-identical re-registration must be a no-op
+    // write: the sync services re-run discovery every cycle, and rewriting an unchanged row
+    // bumps updated_at and churns WAL for nothing. Only what the source describes is sent, so a
+    // re-registration cannot move the pairing; a declared instrument attaches to a feed that has
+    // none, and an omitted classification never clears an operator-set one.
+    let mut active = data_streams::ActiveModel {
         source_system: Set(payload.source_system.clone()),
         source_key: Set(payload.source_key.clone()),
         source_name: Set(payload.source_name.clone()),
         source_path: Set(payload.source_path.clone()),
         metadata: Set(payload.metadata.clone()),
-        site_parameter_id: Set(None),
-        sensor_id: Set(payload.sensor_id),
-        measurement_type: Set(payload.measurement_type.clone()),
-        is_active: Set(true),
-        discovered_at: Set(now.into()),
-        paired_at: Set(None),
-        last_data_time: Set(None),
-        last_window_digest: Set(None),
-        pairing_plan_id: Set(None),
-        created_at: Set(now.into()),
-        updated_at: Set(now.into()),
+        ..Default::default()
     };
-
-    // Upsert on (source_system, source_key). A byte-identical re-registration must be a no-op
-    // write: the sync services re-run discovery every cycle, and rewriting an unchanged row
-    // bumps updated_at and churns WAL for nothing.
-    let upsert = data_streams::Entity::insert(model)
-        .on_conflict(
-            sea_orm::sea_query::OnConflict::columns([
-                data_streams::Column::SourceSystem,
-                data_streams::Column::SourceKey,
-            ])
-            .update_columns([
-                data_streams::Column::SourceName,
-                data_streams::Column::SourcePath,
-                data_streams::Column::Metadata,
-                data_streams::Column::UpdatedAt,
-            ])
-            .action_and_where(sea_orm::sea_query::Expr::cust(
-                "(data_streams.source_name, data_streams.source_path, data_streams.metadata)                  IS DISTINCT FROM                  (excluded.source_name, excluded.source_path, excluded.metadata)",
-            ))
-            .to_owned(),
-        )
-        .exec(&state.db)
-        .await;
-    match upsert {
-        Ok(_) | Err(sea_orm::DbErr::RecordNotInserted) => {}
-        Err(e) => return Err(e.into()),
+    if stored.is_none() || payload.sensor_id.is_some() {
+        active.sensor_id = Set(payload.sensor_id);
     }
+    if stored.is_none() || payload.measurement_type.is_some() {
+        active.measurement_type = Set(payload.measurement_type.clone());
+    }
+    let registered = crate::common::provenance::register::<DataStream>(&state.db, active)
+        .await?
+        .0;
 
-    // Re-fetch the upserted row
-    let mut stream = data_streams::Entity::find()
-        .filter(data_streams::Column::SourceSystem.eq(&payload.source_system))
-        .filter(data_streams::Column::SourceKey.eq(&payload.source_key))
+    let mut stream = data_streams::Entity::find_by_id(registered.id)
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::Internal("Failed to fetch registered stream".to_string()))?;
-
-    // A declared classification wins on re-registration; an omitted one (None) never clears an
-    // operator-set value, so measurement_type is not in the upsert's update_columns.
-    if payload.measurement_type.is_some() && stream.measurement_type != payload.measurement_type {
-        let mut active: data_streams::ActiveModel = stream.clone().into();
-        active.measurement_type = Set(payload.measurement_type.clone());
-        active.updated_at = Set(now.into());
-        stream = active.update(&state.db).await?;
-    }
-
-    // A declared instrument attaches to a feed that has none, which is the discovery case. Moving
-    // an already-attached feed to a different instrument changes the attribution of everything it
-    // has ever written, so it is refused here and left to the explicit swap and relink paths.
-    if let Some(declared) = payload.sensor_id
-        && stream.sensor_id != Some(declared)
-    {
-        if let Some(current) = stream.sensor_id {
-            return Err(AppError::Conflict(format!(
-                "stream {} already reports instrument {current}; relink it explicitly rather than \
-                 on registration",
-                stream.id
-            )));
-        }
-        let mut active: data_streams::ActiveModel = stream.clone().into();
-        active.sensor_id = Set(Some(declared));
-        active.updated_at = Set(now.into());
-        stream = active.update(&state.db).await?;
-    }
 
     // Every feed carries an instrument from the moment it is discovered: a reading whose
     // instrument is unknown has lost its provenance, and the only point where nothing is missing

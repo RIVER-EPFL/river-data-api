@@ -49,6 +49,7 @@ pub struct PreviewStats {
     #[schema(required)]
     pub sd: Option<f64>,
     /// 'sample' (divisor n-1) or 'population' (divisor n).
+    #[schema(value_type = sd_estimator::SdEstimator)]
     pub sd_estimator: &'static str,
 }
 

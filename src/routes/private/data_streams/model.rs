@@ -13,7 +13,8 @@ use super::operations::DataStreamOperations;
     name_singular = "data_stream",
     name_plural = "data_streams",
     generate_router,
-    operations = DataStreamOperations
+    operations = DataStreamOperations,
+    upsert_key(source_system, source_key)
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
@@ -55,7 +56,7 @@ pub struct Model {
     pub pairing_plan_id: Option<Uuid>,
     #[crudcrate(exclude(create, update))]
     pub created_at: DateTimeWithTimeZone,
-    #[crudcrate(exclude(create, update))]
+    #[crudcrate(exclude(create, update), on_update = DateTimeWithTimeZone::from(chrono::Utc::now()))]
     pub updated_at: DateTimeWithTimeZone,
     /// The authoritative replicate column-to-index mapping, ordered by index, when this stream
     /// declares a replicate family. Sync services assign each value's `replicate_index` from it;

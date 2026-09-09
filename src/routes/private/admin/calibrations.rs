@@ -8,6 +8,12 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::error::AppResult;
 
+/// The job a recalculation enqueued.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct RecalculateResponse {
+    pub job_id: Uuid,
+}
+
 /// Reprocess readings for the sensor owning a specific calibration.
 /// Enqueues a tracked worker job and returns immediately.
 #[utoipa::path(
@@ -15,7 +21,7 @@ use crate::error::AppResult;
     path = "/api/actions/sensor_calibrations/{id}/recalculate",
     params(("id" = Uuid, Path, description = "Calibration UUID")),
     responses(
-        (status = 200, description = "Reprocessing job spawned"),
+        (status = 200, description = "Reprocessing job spawned", body = RecalculateResponse),
         (status = 404, description = "Calibration not found"),
     ),
     tag = "actions"
@@ -23,7 +29,7 @@ use crate::error::AppResult;
 pub async fn recalculate_calibration(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<RecalculateResponse>> {
     let row = crate::routes::private::sensors::calibrations::Entity::find_by_id(id)
         .one(&state.db)
         .await
@@ -48,5 +54,5 @@ pub async fn recalculate_calibration(
     .map_err(|e| crate::error::AppError::Internal(e.to_string()))?
     .ok_or_else(|| crate::error::AppError::Internal("enqueue returned no id".into()))?;
 
-    Ok(Json(serde_json::json!({ "job_id": job_id })))
+    Ok(Json(RecalculateResponse { job_id }))
 }

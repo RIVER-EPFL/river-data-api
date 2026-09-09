@@ -8,6 +8,7 @@ use super::session::SyncServiceContext;
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sync::commands_model;
+use crate::routes::private::sync::control::events::UpdatedResponse;
 use river_data_core::models::{CommandStatus, CommandUpdateRequest};
 
 const VALID_UPDATE_STATUSES: &[&str] = &[
@@ -26,7 +27,7 @@ const VALID_UPDATE_STATUSES: &[&str] = &[
     params(("id" = Uuid, Path, description = "Sync command UUID")),
     request_body = CommandUpdateRequest,
     responses(
-        (status = 200, description = "Command updated"),
+        (status = 200, description = "Command updated", body = UpdatedResponse),
         (status = 400, description = "Invalid status value"),
         (status = 401, description = "Invalid session token"),
         (status = 403, description = "Command belongs to a different service"),
@@ -39,7 +40,7 @@ pub async fn update_command(
     ctx: SyncServiceContext,
     Path(command_id): Path<Uuid>,
     Json(req): Json<CommandUpdateRequest>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<UpdatedResponse>> {
     let cmd = commands_model::Entity::find_by_id(command_id)
         .one(&state.db)
         .await?
@@ -74,5 +75,5 @@ pub async fn update_command(
     }
     active.update(&state.db).await?;
 
-    Ok(Json(serde_json::json!({"updated": true})))
+    Ok(Json(UpdatedResponse { updated: true }))
 }

@@ -112,3 +112,32 @@ impl IntoResponse for AppError {
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+impl From<crudcrate::ApiError> for AppError {
+    fn from(error: crudcrate::ApiError) -> Self {
+        use crudcrate::ApiError;
+        match error {
+            ApiError::NotFound { resource, id } => Self::NotFound(match id {
+                Some(id) => format!("{resource} {id}"),
+                None => resource,
+            }),
+            ApiError::BadRequest { message } => Self::BadRequest(message),
+            ApiError::Unauthorized { message } => Self::Unauthorized(message),
+            ApiError::Forbidden { message } => Self::Forbidden(message),
+            ApiError::Conflict { message } => Self::Conflict(message),
+            ApiError::PayloadTooLarge { message } => Self::BadRequest(message),
+            ApiError::ValidationFailed { errors } => Self::BadRequest(errors.join("; ")),
+            ApiError::Database { internal, .. } => Self::Database(internal),
+            ApiError::Internal { message, internal } => Self::Internal(match internal {
+                Some(internal) => format!("{message}: {internal}"),
+                None => message,
+            }),
+            ApiError::Custom {
+                message, internal, ..
+            } => Self::Internal(match internal {
+                Some(internal) => format!("{message}: {internal}"),
+                None => message,
+            }),
+        }
+    }
+}

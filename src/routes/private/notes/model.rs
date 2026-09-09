@@ -9,7 +9,8 @@ use sea_orm::entity::prelude::*;
     api_struct = "Note",
     name_singular = "note",
     name_plural = "notes",
-    generate_router
+    generate_router,
+    upsert_key(source_system, source_key)
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
@@ -30,7 +31,7 @@ pub struct Model {
     pub source_key: Option<String>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: chrono::DateTime<chrono::Utc>,
-    #[crudcrate(exclude(create, update))]
+    #[crudcrate(exclude(create, update), on_update = chrono::Utc::now())]
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 

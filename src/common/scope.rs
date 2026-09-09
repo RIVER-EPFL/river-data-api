@@ -1,6 +1,6 @@
 //! Project-scope confinement for plain handlers.
 //!
-//! CRUD routes are confined automatically (`enforce_scope_on_crud`, `inject_read_scope`). Every
+//! CRUD routes are confined automatically (`inject_project_scope`). Every
 //! other handler confines itself, and the default when it does not is to serve everything. These are
 //! the three shapes a handler needs, so confining is one call:
 //!

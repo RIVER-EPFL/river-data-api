@@ -406,7 +406,7 @@ pub struct ComputationInfo {
     pub notes: Option<String>,
     /// The server-built tool-run blob stored on the reading, verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
+    #[schema(nullable = false, value_type = Option<HashMap<String, serde_json::Value>>)]
     pub provenance: Option<serde_json::Value>,
     /// The run's minting path: 'interactive' | 'csv_import' | 'chain'.
     #[serde(skip_serializing_if = "Option::is_none")]

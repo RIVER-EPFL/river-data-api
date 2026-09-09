@@ -677,6 +677,22 @@ pub fn openapi_json(spec: &utoipa::openapi::OpenApi) -> Result<String, serde_jso
     serde_json::to_string_pretty(&value)
 }
 
+/// The document as the committed artefact holds it, built from a router that serves nothing.
+///
+/// One producer for the dump binary and for the guard that checks the committed copy, so the two
+/// cannot describe different routers.
+///
+/// # Errors
+/// When the document cannot be serialised, which is a `ToSchema` derive producing invalid JSON.
+pub fn committed_document() -> Result<String, serde_json::Error> {
+    let state = AppState::new(
+        sea_orm::DatabaseConnection::default(),
+        crate::config::Config::for_openapi_document(),
+        None,
+    );
+    openapi_json(&openapi_spec(&state))
+}
+
 /// [`openapi_spec`] over an entity document already built, for the caller that has one.
 fn merged_spec(entity: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
     use utoipa::OpenApi as _;
@@ -950,6 +966,61 @@ pub fn build_router(state: AppState) -> Router {
 
 #[cfg(test)]
 mod tests {
+    /// The committed document is the one the router emits.
+    ///
+    /// The other guards here read `docs/openapi.json` and check it against itself or against the
+    /// source structs, so a stale copy passes all three: a route added, renamed or removed leaves
+    /// the document describing the old surface until somebody regenerates it. The workflow that
+    /// regenerates and diffs runs only on `src/routes/**`, so a dependency bump that renames a
+    /// derived schema never reaches it, which is how three paths and nine schemas drifted.
+    #[test]
+    fn test_the_committed_document_is_the_one_the_router_emits() {
+        let generated = super::committed_document().expect("the document serialises");
+        let committed = include_str!("../../docs/openapi.json");
+        assert!(
+            generated == committed,
+            "docs/openapi.json no longer describes the router: {}. Regenerate it with:\n  \
+             cargo run --bin dump_openapi -- docs/openapi.json",
+            what_moved(&generated, committed)
+        );
+    }
+
+    /// What differs between two documents, in one line: the paths and schemas one carries and the
+    /// other does not, or the first line they disagree on when the two sets match.
+    fn what_moved(generated: &str, committed: &str) -> String {
+        fn keys(doc: &serde_json::Value, section: &str) -> std::collections::BTreeSet<String> {
+            doc.pointer(section)
+                .and_then(serde_json::Value::as_object)
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default()
+        }
+        let (left, right): (serde_json::Value, serde_json::Value) = (
+            serde_json::from_str(generated).expect("the generated document parses"),
+            serde_json::from_str(committed).expect("the committed document parses"),
+        );
+        let mut moved = Vec::new();
+        for (section, label) in [("/paths", "path"), ("/components/schemas", "schema")] {
+            let (l, r) = (keys(&left, section), keys(&right, section));
+            for name in l.difference(&r) {
+                moved.push(format!("{label} {name} is served and not committed"));
+            }
+            for name in r.difference(&l) {
+                moved.push(format!("{label} {name} is committed and not served"));
+            }
+        }
+        if moved.is_empty() {
+            let line = generated
+                .lines()
+                .zip(committed.lines())
+                .position(|(a, b)| a != b)
+                .map_or_else(|| "the two are of different length".to_string(), |i| {
+                    format!("first difference at line {}", i + 1)
+                });
+            return line;
+        }
+        moved.join(", ")
+    }
+
     /// Every `$ref` in the committed document names a schema the document carries.
     ///
     /// A dangling one is not a rendering blemish: a consumer that resolves the document, which is

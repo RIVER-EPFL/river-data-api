@@ -139,10 +139,10 @@ enum Scope {
     /// `deny_scoped_token` is layered: a project-scoped token is refused outright, a granted
     /// member passes (their grants confine them inside the handler).
     DenyScopedToken,
-    /// `enforce_scope_on_crud` over an entity with no project dimension: a scoped token may not
+    /// `inject_project_scope` over an entity with no project dimension: a scoped token may not
     /// mutate the shared catalog, a member's role governs.
     GlobalCatalog,
-    /// `enforce_scope_on_crud` over a project-bound entity whose owning project this row does not
+    /// `inject_project_scope` over a project-bound entity whose owning project this row does not
     /// resolve (a create with no owning FK, a delete of a row that is not there): every restricted
     /// principal fails closed.
     UnresolvedProject,
@@ -152,7 +152,7 @@ enum Scope {
 }
 
 /// Whether the CRUD scope guard finds a project dimension on an entity. Mirrors
-/// `middleware::resolve_scope_project`, which is where the answer is decided.
+/// `middleware::crud_scope_condition`, which is where the answer is decided.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum CrudScope {
     /// The shared catalog and the operational tables: a member's role governs, a scoped token is
@@ -162,7 +162,8 @@ enum CrudScope {
     /// probe below names one, so every restricted principal is refused.
     ProjectBound,
     /// A standard curve belongs to an instrument, and an instrument deployed nowhere has no
-    /// project dimension at all, so removing one reads as a catalog write rather than a denial.
+    /// project dimension at all, so a member's write reaches one. A project-scoped token is
+    /// confined to the projects the instrument stood in, in both directions.
     UnboundIsGlobal,
 }
 
@@ -408,9 +409,12 @@ fn table() -> Table {
             CrudScope::Global => Scope::GlobalCatalog,
             CrudScope::ProjectBound | CrudScope::UnboundIsGlobal => Scope::UnresolvedProject,
         };
+        // Deleting by an id that is not there is refused for every restricted caller, including on
+        // the entities whose unbound rows a member may write: the row filter answers "not there"
+        // for a row it excludes and for a row that does not exist alike.
         let delete = match e.crud {
-            CrudScope::Global | CrudScope::UnboundIsGlobal => Scope::GlobalCatalog,
-            CrudScope::ProjectBound => Scope::UnresolvedProject,
+            CrudScope::Global => Scope::GlobalCatalog,
+            CrudScope::ProjectBound | CrudScope::UnboundIsGlobal => Scope::UnresolvedProject,
         };
         if e.families.contains(&"create") {
             t.add(
@@ -951,6 +955,17 @@ fn check(route: &Route, caller: Caller, actual: u16) {
     let label = format!("{} {} as {}", route.method, route.path, caller.name());
     match want {
         Outcome::Unauthenticated => assert_eq!(actual, 401, "[{label}] expected 401, got {actual}"),
+        // A write naming no project the caller can be checked against is refused, and the row
+        // filter decides how. A create is validated inside the write's own transaction, so an
+        // entity with a required column answers 422 before there is a row to reject, and one that
+        // builds a row outside the scope answers 403. A row the filter excludes is a row that is
+        // not there, so an update or a delete of it answers 404. None of the three writes anything.
+        Outcome::Forbidden if route.scope == Scope::UnresolvedProject => {
+            assert!(
+                matches!(actual, 403 | 404 | 422),
+                "[{label}] expected the write to be refused, got {actual}"
+            );
+        }
         Outcome::Forbidden => assert_eq!(actual, 403, "[{label}] expected 403, got {actual}"),
         // An admitted caller may still fail for a non-auth reason (400 on a junk body, 404 on a
         // missing row). Only the auth boundary is under test.
@@ -1121,10 +1136,10 @@ async fn scope_confinement_denies_another_projects_row() {
 
     // A write into another project's row, through the CRUD scope guard.
     for (label, token) in [("granted member", &member), ("scoped token", &scoped)] {
-        let outside = serde_json::json!({ "site_id": OTHER_SITE_ID, "content": "not mine" });
+        let outside = serde_json::json!({ "site_id": OTHER_SITE_ID, "text": "not mine" });
         let s = status_of(&app, "POST", "/api/notes", Some(&outside), Some(token)).await;
         assert_eq!(s, 403, "[{label}] a note in another project is refused");
-        let inside = serde_json::json!({ "site_id": SITE1_ID, "content": "mine" });
+        let inside = serde_json::json!({ "site_id": SITE1_ID, "text": "mine" });
         let s = status_of(&app, "POST", "/api/notes", Some(&inside), Some(token)).await;
         assert!(
             !(401..=403).contains(&s),

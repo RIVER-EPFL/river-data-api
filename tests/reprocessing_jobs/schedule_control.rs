@@ -671,7 +671,7 @@ async fn run_now_dedupes_within_the_second_snapshots_empty_tunables_and_writes_n
     };
     let manager = manager_jwt().await;
     let river = river_jwt().await;
-    // The job queue is read as an administrator: `inject_read_scope` confines a granted member's
+    // The job queue is read as an administrator: `inject_project_scope` confines a granted member's
     // `/reprocessing_jobs` reads to their own sensors, and these rows carry no sensor.
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 

@@ -59,6 +59,7 @@ pub struct ReplicateSpec {
     /// the samples are recorded undeclared and their audit disagreements are held for a decision.
     /// Nothing infers this from the data.
     #[serde(default)]
+    #[schema(value_type = Option<crate::routes::private::readings::sd_estimator::SdEstimator>)]
     pub sd_estimator: Option<String>,
 }
 

@@ -71,9 +71,9 @@ pub trait Job: Send + Sync {
 
 /// What one operator-settable input a job accepts looks like: enough for a form to build a field
 /// and for the server to refuse a value the job would not read.
-#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct TunableSpec {
-    pub key: &'static str,
+    pub key: String,
     pub kind: TunableKind,
     /// Inclusive bounds for an integer or a duration in seconds.
     #[schema(required)]
@@ -81,10 +81,10 @@ pub struct TunableSpec {
     #[schema(required)]
     pub max: Option<i64>,
     pub default: serde_json::Value,
-    pub help: &'static str,
+    pub help: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum TunableKind {
     Integer,
@@ -92,13 +92,13 @@ pub enum TunableKind {
     /// A count of seconds, rendered as a duration.
     Duration,
     Enum {
-        options: Vec<&'static str>,
+        options: Vec<String>,
     },
 }
 
 /// Whether a value satisfies its spec. The message names the key and what it takes.
 fn check_tunable(spec: &TunableSpec, value: &serde_json::Value) -> Result<(), String> {
-    let key = spec.key;
+    let key = &spec.key;
     match &spec.kind {
         TunableKind::Integer | TunableKind::Duration => {
             let Some(n) = value.as_i64() else {
@@ -122,7 +122,7 @@ fn check_tunable(spec: &TunableSpec, value: &serde_json::Value) -> Result<(), St
             let Some(s) = value.as_str() else {
                 return Err(format!("{key} must be one of: {}", options.join(", ")));
             };
-            if options.contains(&s) {
+            if options.iter().any(|option| option == s) {
                 Ok(())
             } else {
                 Err(format!("{key} must be one of: {}", options.join(", ")))
@@ -138,13 +138,13 @@ pub fn validate_against_specs(
     tunables: &serde_json::Value,
     specs: &[TunableSpec],
 ) -> Result<(), String> {
-    let known: Vec<&str> = specs.iter().map(|s| s.key).collect();
+    let known: Vec<&str> = specs.iter().map(|s| s.key.as_str()).collect();
     reject_unknown_tunables(tunables, &known)?;
     let Some(obj) = tunables.as_object() else {
         return Ok(());
     };
     for spec in specs {
-        if let Some(value) = obj.get(spec.key) {
+        if let Some(value) = obj.get(&spec.key) {
             check_tunable(spec, value)?;
         }
     }

@@ -4,7 +4,7 @@
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::{ConnectionTrait, FromQueryResult, Statement, TransactionTrait};
 
-use super::job::{self, JobRegistry};
+use super::job::{self, JobRegistry, TunableSpec};
 use super::schedule::{CatchupPolicy, OverlapPolicy};
 use super::schedule_model::Schedule;
 
@@ -85,13 +85,11 @@ async fn running_names<C: ConnectionTrait>(
 
 /// The tunables a job declares, as the form reads them. A row whose name the registry does not know
 /// declares none.
-fn tunables_schema(registry: &JobRegistry, job_name: &str) -> serde_json::Value {
+fn tunables_schema(registry: &JobRegistry, job_name: &str) -> Vec<TunableSpec> {
     registry
         .get(job_name)
-        .map(|handler| {
-            serde_json::to_value(handler.tunables()).unwrap_or_else(|_| serde_json::json!([]))
-        })
-        .unwrap_or_else(|| serde_json::json!([]))
+        .map(|handler| handler.tunables())
+        .unwrap_or_default()
 }
 
 impl CRUDOperations for ScheduleOperations {

@@ -1225,7 +1225,11 @@ pub struct ThresholdWithValue {
     get,
     path = "/api/alarms/thresholds",
     params(ThresholdsQuery),
-    responses((status = 200, description = "Resolved thresholds + current value per (site, parameter)")),
+    responses((
+        status = 200,
+        description = "Resolved thresholds + current value per (site, parameter)",
+        body = [ThresholdWithValue]
+    )),
     tag = "alarms"
 )]
 pub async fn get_thresholds(

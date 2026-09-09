@@ -11,8 +11,8 @@ use utoipa_axum::router::OpenApiRouter;
 use crate::common::AppState;
 use crate::common::authz::{Capability, TokenAccess, TokenBit};
 use crate::common::middleware::{
-    bust_token_cache_on_mutation, deny_scoped_token, enforce_scope_on_crud, inject_read_scope,
-    require_admin, require_admin_or_token_write_metadata, require_crud, require_enter_field_data,
+    bust_token_cache_on_mutation, deny_scoped_token, inject_project_scope, require_admin,
+    require_admin_or_token_write_metadata, require_crud, require_enter_field_data,
     require_manage_sensors, require_read_data, require_read_metadata, require_write_data,
 };
 use crate::common::rate_limit::FallbackIpKeyExtractor;
@@ -255,16 +255,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .nest("/sync_commands", admin_only_crud(SyncCommand::router(db)))
         .nest("/sync_events", admin_only_crud(SyncEvent::router(db)))
         .nest("/pairing_plans", admin_only_crud(PairingPlan::router(db)))
-        // Project-scoped API tokens may only mutate project-bound entities within their project
-        // (fails closed on the global catalog). No-op for Keycloak users and unscoped tokens.
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            enforce_scope_on_crud,
-        ))
-        // Read mirror of the above: confine list/get reads for project-bound entities to the
-        // scoped token's project (CrudCrate `ScopeCondition`). No-op for unscoped callers and for
-        // global/operational entities. Disjoint from the write guard above (it handles mutations).
-        .layer(middleware::from_fn(inject_read_scope))
+        // Confine every CRUD read and write for a project-bound entity to the caller's projects
+        // (one CrudCrate `ScopeCondition`), and refuse a project-scoped token the entities that
+        // have no project dimension. No-op for unscoped callers.
+        .layer(middleware::from_fn(inject_project_scope))
         .split_for_parts();
 
     use crate::routes::private::{

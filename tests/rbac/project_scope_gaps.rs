@@ -1,7 +1,7 @@
 //! Project scope on the plain-handler routes, the half of `/api/` that the CRUD scope layers never
 //! reach.
 //!
-//! `enforce_scope_on_crud` and `inject_read_scope` are layered on the entity router only, so every
+//! `inject_project_scope` is layered on the entity router only, so every
 //! hand-written handler has to confine itself and several do not. Each suite drives both kinds of
 //! restricted principal, a Keycloak member granted one project and an API token confined to one
 //! project, because the two are not interchangeable. `deny_scoped_token` and the `DenyScoped`
