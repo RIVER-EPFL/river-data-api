@@ -433,7 +433,7 @@ pub async fn get_pairing_plan(
     Ok(Json(plan.into()))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct UpdatePairingPlanRequest {
     /// The version the client read. The write is refused if the plan has moved on since.
     expected_version: i32,
@@ -447,9 +447,19 @@ pub struct UpdatePairingPlanRequest {
     /// plan is applied, in the transaction that mints the instrument.
     #[serde(default)]
     curves: Vec<PlanCurveUpdate>,
+    /// Objects the review has accepted or taken back, `{kind}:{name}` as the card names them.
+    #[serde(default)]
+    objects: Vec<PlanObjectUpdate>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct PlanObjectUpdate {
+    key: String,
+    accepted: bool,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BulkAction {
     #[serde(default)]
@@ -458,8 +468,8 @@ pub struct BulkAction {
     action: String,
 }
 
-#[derive(Deserialize)]
-struct PlanCurveUpdate {
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct PlanCurveUpdate {
     curve_id: Uuid,
     /// The `source_key` of an instrument the plan proposes creating. Null clears the assignment,
     /// leaving the curve on the instrument it has.
@@ -531,8 +541,8 @@ async fn apply_curve_updates(
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct PlanEntryUpdate {
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct PlanEntryUpdate {
     stream_id: Uuid,
     #[serde(default)]
     action: Option<String>,
@@ -605,6 +615,16 @@ fn instrument_scope(entry: &crate::routes::private::sync::service::PlanEntry) ->
                 .unwrap_or(&entry.parameter.name)
         ),
     }
+}
+
+/// Whether an instrument row was minted by stream registration rather than named by the source or
+/// an operator.
+fn is_minted_default(sensor: &sensors::Model) -> bool {
+    sensor
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("minted_from_stream"))
+        .is_some()
 }
 
 /// The identity an instrument decision belongs to. An entry that already names an instrument
@@ -781,6 +801,7 @@ async fn apply_instrument_updates(
                                 "placeholder".to_string()
                             },
                             create: repointed.is_none(),
+                            defaulted: repointed.as_ref().is_some_and(is_minted_default),
                             confirmed: repointed.is_some(),
                             stamps_readings: false,
                             curves: Vec::new(),
@@ -802,6 +823,7 @@ async fn apply_instrument_updates(
                 instrument.source_key = sensor.source_key.clone().unwrap_or_default();
                 instrument.resolved_by = "manual".to_string();
                 instrument.create = false;
+                instrument.defaulted = is_minted_default(sensor);
                 instrument.confirmed = true;
                 instrument.curves = repointed_curves.clone();
             }
@@ -824,6 +846,7 @@ async fn apply_instrument_updates(
                     instrument.source_key = proposed_source_key.clone();
                     instrument.resolved_by = "placeholder".to_string();
                     instrument.create = true;
+                    instrument.defaulted = false;
                     instrument.confirmed = false;
                     instrument.curves = Vec::new();
                 }
@@ -842,7 +865,7 @@ async fn apply_instrument_updates(
     patch,
     path = "/api/sync/pairing-plans/{id}",
     params(("id" = Uuid, Path, description = "Pairing plan UUID")),
-    request_body(content = Object),
+    request_body = UpdatePairingPlanRequest,
     responses(
         (status = 200, description = "Updated plan", body = crate::routes::private::data_streams::pairing_plans::PairingPlan),
         (status = 404, description = "Plan not found"),
@@ -853,6 +876,7 @@ async fn apply_instrument_updates(
 pub async fn update_pairing_plan(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(req): Json<UpdatePairingPlanRequest>,
 ) -> AppResult<Json<crate::routes::private::data_streams::pairing_plans::PairingPlan>> {
     let plan = crate::routes::private::data_streams::pairing_plans::Entity::find_by_id(id)
@@ -949,6 +973,9 @@ pub async fn update_pairing_plan(
     let mut intents = crate::routes::private::sync::service::plan_curve_intents(&plan)?;
     apply_curve_updates(&state.db, &entries, &mut intents, &req.curves).await?;
 
+    let mut accepted = plan.accepted_objects.0.clone();
+    apply_object_updates(&mut accepted, &req.objects, &crate::common::actor::label(&auth));
+
     let summary = serde_json::to_value(crate::routes::private::sync::service::compute_summary_pub(
         &entries,
     ))
@@ -961,11 +988,12 @@ pub async fn update_pairing_plan(
         .execute_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE pairing_plans SET entries = $1, curve_assignments = $2, summary = $3, \
-             version = version + 1 WHERE id = $4 AND version = $5",
+             accepted_objects = $4, version = version + 1 WHERE id = $5 AND version = $6",
             [
                 serde_json::to_value(&entries).unwrap_or_default().into(),
                 serde_json::to_value(&intents).unwrap_or_default().into(),
                 summary.into(),
+                serde_json::to_value(&accepted).unwrap_or_default().into(),
                 id.into(),
                 req.expected_version.into(),
             ],
@@ -980,6 +1008,33 @@ pub async fn update_pairing_plan(
         .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
     Ok(Json(updated.into()))
+}
+
+/// Fold the review's object decisions into the plan's accepted list. Accepting a key already
+/// accepted leaves the first decision, and its actor, standing; taking one back removes it.
+fn apply_object_updates(
+    accepted: &mut Vec<crate::routes::private::sync::service::PlanAcceptedObject>,
+    updates: &[PlanObjectUpdate],
+    actor: &str,
+) {
+    for update in updates {
+        let at = accepted.iter().position(|a| a.key == update.key);
+        match (update.accepted, at) {
+            (true, None) => {
+                accepted.push(
+                    crate::routes::private::sync::service::PlanAcceptedObject {
+                        key: update.key.clone(),
+                        accepted_by: Some(actor.to_string()),
+                        accepted_at: chrono::Utc::now().into(),
+                    },
+                );
+            }
+            (false, Some(i)) => {
+                accepted.remove(i);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The refusal a writer gets when the draft has moved on: the version it should reload is in the

@@ -160,3 +160,81 @@ async fn renaming_an_entry_does_not_decide_it() {
 
     crate::common::cleanup_test_db(&db).await;
 }
+
+/// Scenario: a project, a site and a parameter the plan would create, each named by rows that also
+/// name the other two.
+///
+/// Expected behaviour: accepting one is recorded on the plan and survives a re-read, and taking it
+/// back removes it. The acceptance is the plan's, not a property read back off the rows it settles.
+#[tokio::test]
+#[serial]
+async fn an_accepted_object_is_recorded_on_the_plan_and_can_be_taken_back() {
+    let (app, token, db) = setup().await;
+
+    let stream = Uuid::new_v4();
+    crate::common::seed_unpaired_stream_with_hierarchy(
+        &db,
+        &stream.to_string(),
+        SOURCE,
+        "obj-a",
+        "Brand New Project",
+        "Brand New Station",
+        "brand_new_parameter",
+        "ppb",
+        None,
+        0,
+    )
+    .await;
+
+    let (status, plan) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/pairing-plans",
+        &serde_json::json!({ "source_system": SOURCE }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "create plan ({status}): {plan}");
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+    assert_eq!(plan["accepted_objects"], serde_json::json!([]));
+
+    let (status, body) = crate::common::patch_plan_with_token(
+        &app,
+        &plan_id,
+        &serde_json::json!({
+            "objects": [{ "key": "site:Brand New Station", "accepted": true }],
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "accept ({status}): {body}");
+    let plan: serde_json::Value = serde_json::from_str(&body).expect("plan json");
+    let accepted = plan["accepted_objects"].as_array().expect("accepted list");
+    assert_eq!(accepted.len(), 1, "{}", plan["accepted_objects"]);
+    assert_eq!(accepted[0]["key"], serde_json::json!("site:Brand New Station"));
+    assert!(accepted[0]["accepted_by"].is_string(), "the actor is stamped from the caller");
+    assert!(accepted[0]["accepted_at"].is_string());
+
+    let (status, reread) =
+        crate::common::get_json_with_token(&app, &format!("/api/sync/pairing-plans/{plan_id}"), &token)
+            .await;
+    assert_eq!(status, 200, "re-read: {reread}");
+    assert_eq!(
+        reread["accepted_objects"], plan["accepted_objects"],
+        "the decision is the plan's, not the session's"
+    );
+
+    let (status, body) = crate::common::patch_plan_with_token(
+        &app,
+        &plan_id,
+        &serde_json::json!({
+            "objects": [{ "key": "site:Brand New Station", "accepted": false }],
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "take back ({status}): {body}");
+    let plan: serde_json::Value = serde_json::from_str(&body).expect("plan json");
+    assert_eq!(plan["accepted_objects"], serde_json::json!([]));
+
+    crate::common::cleanup_test_db(&db).await;
+}

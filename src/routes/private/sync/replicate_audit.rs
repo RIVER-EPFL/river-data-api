@@ -853,6 +853,55 @@ struct ReopenHoldRow {
     parameter_id: Option<Uuid>,
 }
 
+/// One stored value with the replicate index it sits at, which is the source's column position and
+/// the only handle a flag can name. A hold recorded before the index travelled with the value
+/// carries the bare number, and no position in that array stands for an index.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum HoldValue {
+    Indexed { index: i16, value: f64 },
+    Bare(f64),
+}
+
+/// The source's own statistics for the group, as the hold recorded them.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct HoldExpected {
+    #[schema(required)]
+    pub mean: Option<f64>,
+    #[schema(required)]
+    pub sd: Option<f64>,
+    /// The replicate count the source declares, where it declares one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<i64>,
+}
+
+/// What river-data computes over the values it stores, which is what it serves.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct HoldComputed {
+    #[schema(required)]
+    pub mean: Option<f64>,
+    #[schema(required)]
+    pub sd: Option<f64>,
+    pub n: i64,
+    /// The divisor `sd` was computed under. Absent on a hold that predates the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<crate::routes::private::readings::sd_estimator::SdEstimator>)]
+    pub sd_estimator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<HoldValue>>,
+}
+
+/// Source minus computed, per statistic.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct HoldDelta {
+    #[schema(required)]
+    pub mean: Option<f64>,
+    #[schema(required)]
+    pub sd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<i64>,
+}
+
 #[derive(Debug, Serialize, FromQueryResult, ToSchema)]
 pub struct HoldRow {
     pub id: Uuid,
@@ -884,11 +933,11 @@ pub struct HoldRow {
     pub tool: Option<String>,
     pub paired: bool,
     pub group_time: DateTime<Utc>,
-    #[schema(value_type = Object)]
+    #[schema(value_type = HoldExpected)]
     pub expected: serde_json::Value,
-    #[schema(value_type = Object)]
+    #[schema(value_type = HoldComputed)]
     pub computed: serde_json::Value,
-    #[schema(value_type = Object)]
+    #[schema(value_type = HoldDelta)]
     pub delta: serde_json::Value,
     pub status: String,
     /// Signature of the disagreement: `n_mismatch` | `population_sd` | `stale_subset` |

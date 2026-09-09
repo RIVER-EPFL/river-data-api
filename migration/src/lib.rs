@@ -50,6 +50,7 @@ pub mod m20260910_000026_roll_back_live_pins;
 pub mod m20260910_000027_subscribe_by_channel;
 mod m20260910_000028_reprocess_decision;
 mod m20260910_000029_sync_source_system;
+mod m20260910_000030_plan_accepted_objects;
 pub mod portal_seed;
 
 pub struct Migrator;
@@ -108,6 +109,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260910_000027_subscribe_by_channel::Migration),
             Box::new(m20260910_000028_reprocess_decision::Migration),
             Box::new(m20260910_000029_sync_source_system::Migration),
+            Box::new(m20260910_000030_plan_accepted_objects::Migration),
         ]
     }
 }

@@ -10,19 +10,6 @@ use serial_test::serial;
 /// still built with `serde_json::json!` rather than a typed struct. Removing one from this list is
 /// the work; adding one is a regression this test refuses.
 const UNTYPED: &[(&str, &str)] = &[
-    ("POST", "/api/actions/compute_derived"),
-    ("POST", "/api/actions/derived_parameters/{id}/recompute"),
-    ("POST", "/api/actions/invalidate_public_config/{code}"),
-    ("POST", "/api/actions/rebuild_alarm_events"),
-    ("POST", "/api/actions/reconcile_alarms"),
-    ("POST", "/api/actions/refresh_aggregates"),
-    ("POST", "/api/actions/reprocess"),
-    ("POST", "/api/actions/sensor_calibrations/{id}/recalculate"),
-    ("PATCH", "/api/sync/commands/{id}"),
-    ("PATCH", "/api/sync/events/{id}"),
-    ("POST", "/api/sync/events"),
-    ("POST", "/api/sync/credentials/{id}/revoke"),
-    ("POST", "/api/sync/services/{id}/revoke"),
     ("GET", "/api/notifications/me/push"),
     ("POST", "/api/notifications/me/push"),
     ("DELETE", "/api/notifications/me/push"),
@@ -139,4 +126,58 @@ async fn the_untyped_responses_are_the_ones_written_down() {
     );
 
     crate::common::cleanup_test_db(&db).await;
+}
+
+/// Expected behaviour: the blobs a client reads field by field are described field by field. The
+/// audit hold's three statistics blobs and the plan PATCH body are free JSON on the row and in the
+/// handler, and were objects with no properties in the document, so the panel's `computed.n` and
+/// the review's `instrument_clear` were names nothing on either side checked.
+#[tokio::test]
+#[serial]
+async fn the_shapes_a_client_reads_are_described() {
+    let db = crate::common::setup_test_db().await;
+    let state = river_db::common::AppState::new(db.clone(), crate::common::test_config(), None);
+    let spec = river_db::routes::openapi_spec(&state);
+    let doc = serde_json::to_value(&spec).expect("the document serialises");
+    let schemas = &doc["components"]["schemas"];
+
+    for (name, fields) in [
+        ("HoldExpected", &["mean", "sd"][..]),
+        ("HoldComputed", &["mean", "sd", "n", "values"][..]),
+        ("HoldDelta", &["mean", "sd"][..]),
+        (
+            "PlanEntryUpdate",
+            &["stream_id", "instrument_clear", "acknowledged"][..],
+        ),
+        ("PlanCurveUpdate", &["curve_id", "instrument_source_key"][..]),
+    ] {
+        let properties = &schemas[name]["properties"];
+        for field in fields {
+            assert!(
+                properties.get(*field).is_some(),
+                "{name}.{field} is not in the document: {}",
+                schemas[name]
+            );
+        }
+    }
+
+    for (blob, schema) in [
+        ("expected", "HoldExpected"),
+        ("computed", "HoldComputed"),
+        ("delta", "HoldDelta"),
+    ] {
+        assert_eq!(
+            schemas["HoldRow"]["properties"][blob]["$ref"],
+            serde_json::json!(format!("#/components/schemas/{schema}")),
+            "the hold's {blob} names its own shape"
+        );
+    }
+
+    let body = &doc["paths"]["/api/sync/pairing-plans/{id}"]["patch"]["requestBody"]["content"]
+        ["application/json"]["schema"]["$ref"];
+    assert_eq!(
+        body,
+        &serde_json::json!("#/components/schemas/UpdatePairingPlanRequest"),
+        "the plan PATCH names the body it deserializes: {body}"
+    );
 }

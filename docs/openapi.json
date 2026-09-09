@@ -2324,6 +2324,54 @@
         },
         "type": "object"
       },
+      "BulkAction": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "`pair` or `skip`.",
+            "type": "string"
+          },
+          "where": {
+            "$ref": "#/components/schemas/BulkWhere"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      "BulkWhere": {
+        "additionalProperties": false,
+        "description": "Which entries a plan-wide bulk action covers. Every field is a further narrowing, so an empty\n`BulkWhere` selects the whole plan; a plan-wide action is then one predicate on the wire rather\nthan one update per entry (1891 for CNET, 29,400 for NOMIS).",
+        "properties": {
+          "confidence": {
+            "description": "`exact` when the project, site and parameter all resolved, `none` otherwise.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "has_warnings": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "parameter_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "site_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "CalculationFormulaCreate": {
         "properties": {
           "code": {
@@ -7078,6 +7126,118 @@
         ],
         "type": "object"
       },
+      "HoldComputed": {
+        "description": "What river-data computes over the values it stores, which is what it serves.",
+        "properties": {
+          "mean": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "n": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "sd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "sd_estimator": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SdEstimator",
+                "description": "The divisor `sd` was computed under. Absent on a hold that predates the record."
+              }
+            ]
+          },
+          "values": {
+            "items": {
+              "$ref": "#/components/schemas/HoldValue"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "mean",
+          "sd",
+          "n"
+        ],
+        "type": "object"
+      },
+      "HoldDelta": {
+        "description": "Source minus computed, per statistic.",
+        "properties": {
+          "mean": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "n": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "mean",
+          "sd"
+        ],
+        "type": "object"
+      },
+      "HoldExpected": {
+        "description": "The source's own statistics for the group, as the hold recorded them.",
+        "properties": {
+          "mean": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "n": {
+            "description": "The replicate count the source declares, where it declares one.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "mean",
+          "sd"
+        ],
+        "type": "object"
+      },
       "HoldMatch": {
         "properties": {
           "expected_mean": {
@@ -7181,17 +7341,17 @@
             "type": "string"
           },
           "computed": {
-            "type": "object"
+            "$ref": "#/components/schemas/HoldComputed"
           },
           "created_at": {
             "format": "date-time",
             "type": "string"
           },
           "delta": {
-            "type": "object"
+            "$ref": "#/components/schemas/HoldDelta"
           },
           "expected": {
-            "type": "object"
+            "$ref": "#/components/schemas/HoldExpected"
           },
           "group_time": {
             "format": "date-time",
@@ -7331,6 +7491,32 @@
           "sd_relative_delta"
         ],
         "type": "object"
+      },
+      "HoldValue": {
+        "description": "One stored value with the replicate index it sits at, which is the source's column position and\nthe only handle a flag can name. A hold recorded before the index travelled with the value\ncarries the bare number, and no position in that array stands for an index.",
+        "oneOf": [
+          {
+            "properties": {
+              "index": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "value": {
+                "format": "double",
+                "type": "number"
+              }
+            },
+            "required": [
+              "index",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "format": "double",
+            "type": "number"
+          }
+        ]
       },
       "IdentityBand": {
         "properties": {
@@ -10501,6 +10687,10 @@
       },
       "PairingPlan": {
         "properties": {
+          "accepted_objects": {
+            "$ref": "#/components/schemas/PlanAcceptedObjects",
+            "description": "The objects the review has accepted, `[{key, accepted_by, accepted_at}]`. One decision\nbehind however many rows name it, so it is recorded here and not read back off the rows."
+          },
           "applied_at": {
             "format": "date-time",
             "type": [
@@ -10562,6 +10752,7 @@
           "summary",
           "entries",
           "curve_assignments",
+          "accepted_objects",
           "version",
           "created_at",
           "applied_at",
@@ -10602,6 +10793,10 @@
       },
       "PairingPlanList": {
         "properties": {
+          "accepted_objects": {
+            "$ref": "#/components/schemas/PlanAcceptedObjects",
+            "description": "The objects the review has accepted, `[{key, accepted_by, accepted_at}]`. One decision\nbehind however many rows name it, so it is recorded here and not read back off the rows."
+          },
           "applied_at": {
             "format": "date-time",
             "type": [
@@ -10663,6 +10858,7 @@
           "summary",
           "entries",
           "curve_assignments",
+          "accepted_objects",
           "version",
           "created_at",
           "applied_at",
@@ -10672,6 +10868,10 @@
       },
       "PairingPlanResponse": {
         "properties": {
+          "accepted_objects": {
+            "$ref": "#/components/schemas/PlanAcceptedObjects",
+            "description": "The objects the review has accepted, `[{key, accepted_by, accepted_at}]`. One decision\nbehind however many rows name it, so it is recorded here and not read back off the rows."
+          },
           "applied_at": {
             "format": "date-time",
             "type": [
@@ -10733,6 +10933,7 @@
           "summary",
           "entries",
           "curve_assignments",
+          "accepted_objects",
           "version",
           "created_at",
           "applied_at",
@@ -12113,6 +12314,37 @@
         },
         "type": "object"
       },
+      "PlanAcceptedObject": {
+        "description": "A project, site or parameter the review agreed to, keyed `{kind}:{name}` the way the card\nnames it. Recorded because it is one decision behind many rows, and no row can carry it.",
+        "properties": {
+          "accepted_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "accepted_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "accepted_by",
+          "accepted_at"
+        ],
+        "type": "object"
+      },
+      "PlanAcceptedObjects": {
+        "description": "The objects the review has accepted, as the column holds them.",
+        "items": {
+          "$ref": "#/components/schemas/PlanAcceptedObject"
+        },
+        "type": "array"
+      },
       "PlanCurveAssignment": {
         "description": "One standard curve the source has replicated, and the instrument it is currently fitted on.\nRe-homing is a curve-level decision, so the curves are listed in their own right rather than\nonly inside the instrument that happens to own them.",
         "properties": {
@@ -12239,6 +12471,25 @@
           "name",
           "slope",
           "intercept"
+        ],
+        "type": "object"
+      },
+      "PlanCurveUpdate": {
+        "properties": {
+          "curve_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "instrument_source_key": {
+            "description": "The `source_key` of an instrument the plan proposes creating. Null clears the assignment,\nleaving the curve on the instrument it has.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "curve_id"
         ],
         "type": "object"
       },
@@ -12456,6 +12707,120 @@
         ],
         "type": "object"
       },
+      "PlanEntryUpdate": {
+        "properties": {
+          "acknowledged": {
+            "description": "Record that a person looked at this entry and agreed with it, or take that back. Separate\nfrom `action`, so changing what an entry does is not the same as deciding it.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "action": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instrument_clear": {
+            "description": "Detach the instrument from every entry this one groups with. Attaching is `instrument_id`;\nthis is its inverse, since an absent `instrument_id` means \"unchanged\", not \"none\".",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "instrument_confirmed": {
+            "description": "Agree to creating the proposed instrument. Apply refuses while any remain unconfirmed.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "instrument_id": {
+            "description": "Point this entry's curve references at an existing lab instrument instead of the resolved\none. Applies to every entry sharing the same curve column, since one column is one\ninstrument across the source.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instrument_name": {
+            "description": "Rename an instrument the plan will create. Ignored once it resolves to an existing one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parameter_label": {
+            "description": "Human display label for the parameter. Takes effect only when apply creates the\nparameter (`create: true`); a matched existing parameter keeps its own name.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parameter_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parameter_units": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sd_estimator": {
+            "description": "Declare which divisor this slot publishes its replicate standard deviation with,\n`sample` or `population`. Applied to the `site_parameters` row when the plan is applied.\nNever inferred: absent leaves the slot undeclared and the audit gate asks later.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "site_altitude_m": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "site_latitude": {
+            "description": "The coordinates and elevation the apply will create this site with. A site is created once,\nso a value the source recorded wrong (an elevation of 1 m) is corrected here rather than on\nthe site afterwards. Ignored where the entry resolves to a site that already exists: that\nsite's own page owns its attributes. Applied to every entry naming the same site, so the\ntwenty-three feeds at one station do not disagree about where it is.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "site_longitude": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "site_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stream_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stream_id"
+        ],
+        "type": "object"
+      },
       "PlanInstrumentGroup": {
         "description": "One instrument decision in a pairing plan: the instrument, what it covers, and the curves it\nowns. Only instruments the plan actually binds are listed; the rest of the inventory is\nreachable through the picker, so this stays a list of decisions rather than a catalog.",
         "properties": {
@@ -12581,6 +12946,10 @@
             },
             "type": "array"
           },
+          "defaulted": {
+            "description": "The instrument row was minted by stream registration rather than named by the source or an\noperator (`sensors.metadata.minted_from_stream`). It is the one a review may want to\nreplace with the real device.",
+            "type": "boolean"
+          },
           "id": {
             "description": "The resolved instrument, or None when one has to be created.",
             "format": "uuid",
@@ -12623,6 +12992,7 @@
           "source_key",
           "resolved_by",
           "create",
+          "defaulted",
           "confirmed",
           "stamps_readings",
           "curves"
@@ -12682,6 +13052,22 @@
         "required": [
           "job_id",
           "status"
+        ],
+        "type": "object"
+      },
+      "PlanObjectUpdate": {
+        "additionalProperties": false,
+        "properties": {
+          "accepted": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "accepted"
         ],
         "type": "object"
       },
@@ -13096,7 +13482,7 @@
             ]
           },
           "kind": {
-            "description": "`units_mismatch` | `empty_name`.",
+            "description": "`units_mismatch` | `empty_name` | `near_duplicate` | `sd_estimator_undeclared`.",
             "type": "string"
           },
           "message": {
@@ -22678,6 +23064,50 @@
           "sensor_id",
           "set_id",
           "restored"
+        ],
+        "type": "object"
+      },
+      "UpdatePairingPlanRequest": {
+        "properties": {
+          "bulk": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BulkAction",
+                "description": "A plan-wide decision, applied before the per-entry updates so an operator can pair what\nmatched, or skip what did not, in one act rather than one line per entry."
+              }
+            ]
+          },
+          "curves": {
+            "description": "Standard curves to assign to instruments this plan will create. The move happens when the\nplan is applied, in the transaction that mints the instrument.",
+            "items": {
+              "$ref": "#/components/schemas/PlanCurveUpdate"
+            },
+            "type": "array"
+          },
+          "expected_version": {
+            "description": "The version the client read. The write is refused if the plan has moved on since.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "objects": {
+            "description": "Objects the review has accepted or taken back, `{kind}:{name}` as the card names them.",
+            "items": {
+              "$ref": "#/components/schemas/PlanObjectUpdate"
+            },
+            "type": "array"
+          },
+          "updates": {
+            "items": {
+              "$ref": "#/components/schemas/PlanEntryUpdate"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "expected_version"
         ],
         "type": "object"
       },
@@ -41754,7 +42184,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object"
+                "$ref": "#/components/schemas/UpdatePairingPlanRequest"
               }
             }
           },

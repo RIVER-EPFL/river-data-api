@@ -166,4 +166,25 @@ async fn the_inventory_separates_the_kinds() {
         !ids.contains(&stream["sensor_id"].as_str().unwrap()),
         "the minted bookkeeping row is not offered as one: {body}"
     );
+
+    // The inventory opens on what something was measured on, which is one filter over two kinds.
+    let both = crate::common::e2e::percent_encode(r#"{"kind":["device","lab"]}"#);
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sensors?filter={both}&page=1&per_page=100"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "list ({status}): {body}");
+    let kinds: Vec<&str> = body
+        .as_array()
+        .expect("array body")
+        .iter()
+        .map(|s| s["kind"].as_str().unwrap_or_default())
+        .collect();
+    assert!(!kinds.is_empty(), "the pair of kinds returns rows: {body}");
+    assert!(
+        kinds.iter().all(|k| *k == "device" || *k == "lab"),
+        "only the measuring kinds come back: {body}"
+    );
 }

@@ -2,7 +2,9 @@ use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::routes::private::sync::service::{ApplyResult, PlanCurveIntents, PlanEntries, PlanSummary};
+use crate::routes::private::sync::service::{
+    ApplyResult, PlanAcceptedObjects, PlanCurveIntents, PlanEntries, PlanSummary,
+};
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize, EntityToModels)]
 #[sea_orm(table_name = "pairing_plans")]
@@ -30,6 +32,11 @@ pub struct Model {
     #[sea_orm(column_type = "JsonBinary")]
     #[crudcrate(exclude(create, update), on_create = PlanCurveIntents::default())]
     pub curve_assignments: PlanCurveIntents,
+    /// The objects the review has accepted, `[{key, accepted_by, accepted_at}]`. One decision
+    /// behind however many rows name it, so it is recorded here and not read back off the rows.
+    #[sea_orm(column_type = "JsonBinary")]
+    #[crudcrate(exclude(create, update), on_create = PlanAcceptedObjects::default())]
+    pub accepted_objects: PlanAcceptedObjects,
     /// Bumped by every edit. A PATCH or an apply names the version it read, so a second writer
     /// on one draft is refused rather than carrying the first writer's decisions away.
     #[crudcrate(exclude(create, update), on_create = 0)]

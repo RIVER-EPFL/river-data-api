@@ -239,7 +239,7 @@ pub struct ExistingParamRef {
 /// so a warning always reads as something even where the structure is not used.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanWarning {
-    /// `units_mismatch` | `empty_name`.
+    /// `units_mismatch` | `empty_name` | `near_duplicate` | `sd_estimator_undeclared`.
     pub kind: String,
     pub message: String,
     #[serde(default)]
@@ -271,6 +271,21 @@ impl PlanWarning {
                 reading_count: existing.reading_count,
             }),
             source_units: Some(source_units.to_string()),
+        }
+    }
+
+    /// A name this plan would create reads as one the catalog already holds. The catalog matches
+    /// exactly, so `FP-1` beside a stored `FP1` is two entities and no reader would call them two
+    /// places.
+    pub fn near_duplicate(kind: &str, proposed: &str, existing: &str) -> Self {
+        Self {
+            kind: "near_duplicate".to_string(),
+            message: format!(
+                "This plan would create the {kind} '{proposed}', and '{existing}' already exists.                  They differ only in case, spacing or punctuation."
+            ),
+            parameter: None,
+            existing: None,
+            source_units: None,
         }
     }
 
@@ -342,6 +357,12 @@ pub struct PlanInstrumentRef {
     /// labels), `manual` (repointed in the review), or `placeholder` (nothing matched).
     pub resolved_by: String,
     pub create: bool,
+    /// The instrument row was minted by stream registration rather than named by the source or an
+    /// operator (`sensors.metadata.minted_from_stream`). It is the one a review may want to
+    /// replace with the real device.
+    #[serde(default)]
+    #[schema(required)]
+    pub defaulted: bool,
     /// A creation an operator has agreed to. Apply refuses a plan holding an unconfirmed one.
     #[serde(default)]
     #[schema(required)]
@@ -608,6 +629,7 @@ pub fn resolve_instrument(
             source_key: source_key.unwrap_or_default(),
             resolved_by: "stream".to_string(),
             create: false,
+            defaulted,
             confirmed: true,
             stamps_readings,
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
@@ -631,6 +653,7 @@ pub fn resolve_instrument(
             source_key: key.unwrap_or(source_key),
             resolved_by: "source_key".to_string(),
             create: false,
+            defaulted: catalog.defaulted.contains(&id),
             confirmed: true,
             stamps_readings,
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
@@ -648,6 +671,7 @@ pub fn resolve_instrument(
             source_key: source_key.unwrap_or_default(),
             resolved_by: "curve_label".to_string(),
             create: false,
+            defaulted: catalog.defaulted.contains(&id),
             confirmed: true,
             stamps_readings,
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
@@ -668,6 +692,7 @@ pub fn resolve_instrument(
         source_key,
         resolved_by: "placeholder".to_string(),
         create: true,
+        defaulted: false,
         confirmed: false,
         stamps_readings,
         curves: vec![],
@@ -714,6 +739,7 @@ pub fn resolve_parameter_instrument(
             source_key: key.unwrap_or(source_key),
             resolved_by: "source_key".to_string(),
             create: false,
+            defaulted: catalog.defaulted.contains(&id),
             confirmed: true,
             stamps_readings: false,
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
@@ -733,6 +759,7 @@ pub fn resolve_parameter_instrument(
         source_key,
         resolved_by: "parameter".to_string(),
         create: true,
+        defaulted: false,
         // A name an instrument already carries is a decision, not a proposal: the readings would
         // join a row that already holds data, so the operator says which they meant.
         confirmed: conflict.is_none(),
@@ -1118,6 +1145,7 @@ pub async fn create_plan(
         summary: Set(summary),
         entries: Set(PlanEntries(entries)),
         curve_assignments: Set(PlanCurveIntents::default()),
+        accepted_objects: Set(PlanAcceptedObjects::default()),
         version: Set(0),
         created_at: Set(Utc::now().into()),
         applied_at: Set(None),
@@ -1164,6 +1192,24 @@ pub struct PlanEntries(pub Vec<PlanEntry>);
 )]
 #[serde(transparent)]
 pub struct PlanCurveIntents(pub Vec<PlanCurveIntent>);
+
+/// The objects the review has accepted, as the column holds them.
+#[derive(
+    Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema,
+    sea_orm::FromJsonQueryResult,
+)]
+#[serde(transparent)]
+pub struct PlanAcceptedObjects(pub Vec<PlanAcceptedObject>);
+
+/// A project, site or parameter the review agreed to, keyed `{kind}:{name}` the way the card
+/// names it. Recorded because it is one decision behind many rows, and no row can carry it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PlanAcceptedObject {
+    pub key: String,
+    #[schema(required)]
+    pub accepted_by: Option<String>,
+    pub accepted_at: chrono::DateTime<chrono::FixedOffset>,
+}
 
 /// A standard curve the review assigned to an instrument the plan creates, keyed by the
 /// instrument's `source_key` because the row does not exist until the apply mints it.
@@ -2132,6 +2178,50 @@ fn compute_summary(entries: &[PlanEntry]) -> PlanSummary {
     }
 }
 
+/// A name reduced to what a reader would call it the same by: letters and digits only, lowercase,
+/// with the leading zeros of each digit run dropped. `FP-1`, `fp 1` and `FP01` all read as `fp1`.
+fn canonical_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut digits = String::new();
+    let flush = |digits: &mut String, out: &mut String| {
+        if digits.is_empty() {
+            return;
+        }
+        let trimmed = digits.trim_start_matches('0');
+        out.push_str(if trimmed.is_empty() { "0" } else { trimmed });
+        digits.clear();
+    };
+    for c in name.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else {
+            flush(&mut digits, &mut out);
+            if c.is_alphanumeric() {
+                out.extend(c.to_lowercase());
+            }
+        }
+    }
+    flush(&mut digits, &mut out);
+    out
+}
+
+/// An existing name a proposed creation reads as, without being the exact match the catalog needs.
+/// Nothing here guesses at typos: `FP1` and `FP2` are two stations, and an edit distance would
+/// call them one.
+fn near_duplicate_of<'a, I>(proposed: &str, existing: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let canonical = canonical_name(proposed);
+    if canonical.is_empty() {
+        return None;
+    }
+    let lower = proposed.to_lowercase();
+    existing
+        .into_iter()
+        .find(|name| name.to_lowercase() != lower && canonical_name(name) == canonical)
+}
+
 fn match_entity(name: &str, existing: &[(Uuid, String)]) -> (Option<Uuid>, bool) {
     if name.is_empty() {
         return (None, false);
@@ -2300,6 +2390,30 @@ pub fn reclassify_entry(entry: &mut PlanEntry, catalog: &EntityCatalog) {
     entry.parameter.create = param_create;
 
     entry.warnings.clear();
+    if site_create
+        && let Some(existing) =
+            near_duplicate_of(&entry.site.name, catalog.sites.iter().map(|(_, n)| n.as_str()))
+    {
+        entry
+            .warnings
+            .push(PlanWarning::near_duplicate("site", &entry.site.name, existing));
+    }
+    if param_create
+        && let Some(existing) = near_duplicate_of(
+            &entry.parameter.name,
+            catalog.params.iter().flat_map(|p| {
+                std::iter::once(p.code.as_str())
+                    .chain(std::iter::once(p.name.as_str()))
+                    .chain(p.aliases.iter().map(String::as_str))
+            }),
+        )
+    {
+        entry.warnings.push(PlanWarning::near_duplicate(
+            "parameter",
+            &entry.parameter.name,
+            existing,
+        ));
+    }
     if let Some(pid) = param_id
         && let Some(p) = catalog.params.iter().find(|p| p.id == pid)
         && !p.units.is_empty()
@@ -2536,7 +2650,7 @@ fn infer_category(_name: &str) -> String {
 /// Which entries a plan-wide bulk action covers. Every field is a further narrowing, so an empty
 /// `BulkWhere` selects the whole plan; a plan-wide action is then one predicate on the wire rather
 /// than one update per entry (1891 for CNET, 29,400 for NOMIS).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BulkWhere {
     /// `exact` when the project, site and parameter all resolved, `none` otherwise.
@@ -2681,6 +2795,30 @@ mod tests {
             .expect("a stream instrument resolves");
         assert_eq!(quiet.resolved_by, "stream", "{quiet:?}");
         assert_eq!(quiet.id, Some(defaulted));
+        assert!(quiet.defaulted, "{quiet:?}");
+    }
+
+    #[test]
+    fn test_an_attributed_instrument_is_not_reported_as_a_default() {
+        let attributed = Uuid::new_v4();
+        let mut c = catalog(&[]);
+        c.by_id.insert(
+            attributed,
+            ("Hach DR3900".to_string(), Some("cnet:DOC".to_string())),
+        );
+        c.by_source_key.insert("cnet:DOC".to_string(), attributed);
+
+        let by_stream = super::resolve_instrument(Some(attributed), None, "cnet", &c)
+            .expect("a stream instrument resolves");
+        assert!(!by_stream.defaulted, "{by_stream:?}");
+
+        let by_key = super::resolve_parameter_instrument("cnet:DOC".to_string(), "DOC", &c);
+        assert_eq!(by_key.id, Some(attributed));
+        assert!(!by_key.defaulted, "{by_key:?}");
+
+        let proposed = super::resolve_parameter_instrument("cnet:TSS".to_string(), "TSS", &c);
+        assert!(proposed.create, "{proposed:?}");
+        assert!(!proposed.defaulted, "{proposed:?}");
     }
 
     /// A catalog holding one instrument by name and nothing else, for the collision cases.
@@ -3005,6 +3143,32 @@ mod family_suggestion_tests {
             super::slot_name_candidates("Flux", "mg/L", "mg/L"),
             vec!["Flux", "Flux (mg/L)"]
         );
+    }
+
+    #[test]
+    fn a_name_reads_the_same_through_case_spacing_punctuation_and_leading_zeros() {
+        let existing = ["FP1", "DOC_avg_ppb"];
+        for proposed in ["FP-1", "fp 1", "FP01", "f p 1."] {
+            assert_eq!(
+                super::near_duplicate_of(proposed, existing),
+                Some("FP1"),
+                "{proposed} reads as FP1"
+            );
+        }
+        assert_eq!(super::near_duplicate_of("doc.avg.ppb", existing), Some("DOC_avg_ppb"));
+    }
+
+    #[test]
+    fn two_stations_are_not_one_because_a_digit_differs() {
+        let existing = ["FP1", "Depth"];
+        // An edit distance would call these the same; a reader would not.
+        assert_eq!(super::near_duplicate_of("FP2", existing), None);
+        assert_eq!(super::near_duplicate_of("FP10", existing), None);
+        assert_eq!(super::near_duplicate_of("Depths", existing), None);
+        // The exact match is the catalog's own, not a near miss.
+        assert_eq!(super::near_duplicate_of("fp1", ["FP1"]), None);
+        // A name with nothing to canonicalise cannot collide with everything else that has none.
+        assert_eq!(super::near_duplicate_of("---", ["***"]), None);
     }
 }
 
