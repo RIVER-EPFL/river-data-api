@@ -121,7 +121,11 @@ pub struct GrabSampleResponse {
     /// Curated rows on the grab stream that `mode: replace` left in place: flagged, withdrawn, or
     /// carrying a standard curve the request did not supply. Each group with one raises a
     /// `source_modified` hold, and the value entered at that replicate index is not written.
+    ///
+    /// `serde(default)` reads a response body recorded before the field existed; every save
+    /// answers with it, which is what `schema(required)` says.
     #[serde(default)]
+    #[schema(required)]
     pub kept_curated: usize,
     /// What each reading stores: the measured value, the curves that apply and the value they
     /// produce together, computed by the code the write itself uses.

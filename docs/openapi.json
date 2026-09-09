@@ -1031,47 +1031,6 @@
         ],
         "type": "object"
       },
-      "AnnotationItem": {
-        "additionalProperties": false,
-        "properties": {
-          "category": {
-            "type": "string"
-          },
-          "source_key": {
-            "description": "The annotation's identity within the source; the upsert key is\n(source_system, source_key).",
-            "type": "string"
-          },
-          "standard_curve_id": {
-            "description": "The standard curve the source applied to produce the annotated value, when it did.",
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "stream_id": {
-            "description": "The stream whose pairing resolves the annotation's site and parameter.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "text": {
-            "type": "string"
-          },
-          "time": {
-            "description": "The instant the annotation covers, stored as a point (start_time == end_time).",
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "source_key",
-          "stream_id",
-          "time",
-          "category",
-          "text"
-        ],
-        "type": "object"
-      },
       "AnnotationList": {
         "properties": {
           "audit_hold_id": {
@@ -1322,6 +1281,46 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "AnnotationUpsert": {
+        "additionalProperties": false,
+        "description": "One source-authored annotation to register. `source_key` identifies the\nannotation within the source system; registration is idempotent per\n(source_system, source_key), so a full-content pass re-asserting the same\nkey updates in place rather than duplicating.\n\nThe API resolves the site and parameter from the stream's pairing; an\nannotation on an unpaired stream is reported back as `unpaired` and is\nre-asserted on a later cycle once the stream is paired.",
+        "properties": {
+          "category": {
+            "type": "string"
+          },
+          "source_key": {
+            "type": "string"
+          },
+          "standard_curve_id": {
+            "description": "The standard curve the source applied to produce the annotated value. The API freezes an\nannotation's curve and text once stored with one, reporting later edits as `frozen`.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stream_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "time": {
+            "description": "The instant the annotation covers; the API stores it as a point\nannotation (start_time == end_time).",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_key",
+          "stream_id",
+          "time",
+          "category",
+          "text"
+        ],
         "type": "object"
       },
       "ApiToken": {
@@ -1883,6 +1882,68 @@
           "dry_run",
           "created",
           "existing"
+        ],
+        "type": "object"
+      },
+      "ApplyResult": {
+        "properties": {
+          "curves_assigned": {
+            "description": "Standard curves moved onto instruments this apply minted.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "instruments_created": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "parameters_created": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "projects_created": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "readings_backfilled": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "site_parameters_created": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sites_created": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "streams_paired": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "streams_skipped": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "projects_created",
+          "sites_created",
+          "parameters_created",
+          "site_parameters_created",
+          "streams_paired",
+          "streams_skipped",
+          "instruments_created",
+          "curves_assigned",
+          "readings_backfilled"
         ],
         "type": "object"
       },
@@ -3408,7 +3469,7 @@
         "type": "object"
       },
       "ColumnAssignment": {
-        "description": "One source column's permanent replicate index. The mapping is append-only: a column keeps its\nindex for the life of the stream, a new column appends after the highest index ever assigned,\nand a column the source stops sending is retired with its index never reused.",
+        "description": "One source column's pinned replicate index, as the API's register response\nreports it (and as stream metadata persists it under\n`replicates.assignments`). Sync services assign each value's\n`replicate_index` by looking its source column up here.",
         "properties": {
           "column": {
             "type": "string"
@@ -3418,7 +3479,7 @@
             "type": "integer"
           },
           "retired": {
-            "description": "The source no longer sends this column. Its readings keep the index; nothing new lands on it.",
+            "description": "The source no longer sends this column. The index stays reserved and\nremains the column's identity should it reappear.",
             "type": "boolean"
           }
         },
@@ -3810,6 +3871,10 @@
             ]
           },
           "manifest": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
             "type": "object"
           },
           "note": {
@@ -3823,6 +3888,10 @@
             "type": "string"
           },
           "test_cases": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
             "type": "object"
           }
         },
@@ -4140,6 +4209,22 @@
           "sensor_id",
           "slope",
           "intercept"
+        ],
+        "type": "object"
+      },
+      "CurveSnapshot": {
+        "description": "One curve as the stored run records it: the slot it filled, and the curve itself.",
+        "properties": {
+          "curve": {
+            "$ref": "#/components/schemas/ResolvedCurve"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "curve"
         ],
         "type": "object"
       },
@@ -4805,9 +4890,17 @@
             "$ref": "#/components/schemas/Kind"
           },
           "new": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
             "type": "object"
           },
           "old": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
             "type": "object"
           },
           "origin": {
@@ -5065,7 +5158,13 @@
             "format": "uuid",
             "type": "string"
           },
-          "replicates": {},
+          "replicates": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "role": {
             "type": "string"
           },
@@ -5542,8 +5641,18 @@
       "DraftRunRequest": {
         "properties": {
           "constants": {
+            "additionalProperties": {
+              "format": "double",
+              "type": "number"
+            },
             "description": "Constant values in place of the catalog. As in a stored test case, an override must name\nevery constant the manifest declares; omit the field to read the catalog.",
-            "type": "object"
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "entry_function": {
             "type": [
@@ -5552,10 +5661,18 @@
             ]
           },
           "inputs": {
+            "additionalProperties": {},
             "description": "The calculate request body this draft is run with: the manifest's params, plus its curve\nslots given either as a `standard_curve_id` or as literal coefficients.",
+            "propertyNames": {
+              "type": "string"
+            },
             "type": "object"
           },
           "manifest": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
             "type": "object"
           },
           "script": {
@@ -5623,11 +5740,19 @@
         "description": "What the script produced, present only when the run reached the end.",
         "properties": {
           "constants": {
+            "additionalProperties": {
+              "format": "double",
+              "type": "number"
+            },
+            "description": "The constant values the server resolved and passed to the runner, by name.",
+            "propertyNames": {
+              "type": "string"
+            },
             "type": "object"
           },
           "curves": {
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/CurveSnapshot"
             },
             "type": "array"
           },
@@ -5644,6 +5769,10 @@
             "type": "array"
           },
           "results": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
             "type": "object"
           }
         },
@@ -6172,6 +6301,45 @@
           "parameter_id",
           "time",
           "replicates"
+        ],
+        "type": "object"
+      },
+      "ExistingParamRef": {
+        "description": "A catalog parameter a plan entry collides with, and what already depends on it. \"Exists\" on its\nown does not say where or whether anything uses it, which is the question an operator has to\nanswer to resolve a units conflict.",
+        "properties": {
+          "category": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "reading_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "site_parameter_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "units": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "name",
+          "units",
+          "category",
+          "site_parameter_count",
+          "reading_count"
         ],
         "type": "object"
       },
@@ -6720,7 +6888,7 @@
             "type": "integer"
           },
           "kept_curated": {
-            "description": "Curated rows on the grab stream that `mode: replace` left in place: flagged, withdrawn, or\ncarrying a standard curve the request did not supply. Each group with one raises a\n`source_modified` hold, and the value entered at that replicate index is not written.",
+            "description": "Curated rows on the grab stream that `mode: replace` left in place: flagged, withdrawn, or\ncarrying a standard curve the request did not supply. Each group with one raises a\n`source_modified` hold, and the value entered at that replicate index is not written.\n\n`serde(default)` reads a response body recorded before the field existed; every save\nanswers with it, which is what `schema(required)` says.",
             "minimum": 0,
             "type": "integer"
           },
@@ -6746,6 +6914,7 @@
           "samples_created",
           "dry_run",
           "replaced",
+          "kept_curated",
           "preview",
           "existing_groups"
         ],
@@ -6775,10 +6944,9 @@
       },
       "GroupAudit": {
         "additionalProperties": false,
-        "description": "One replicate group's expectation, as the portal stored it.",
+        "description": "Portal-precomputed mean/sd for one replicate group, sent alongside the\ngroup's readings so the API can compare server-side.",
         "properties": {
           "expected_mean": {
-            "description": "The portal's precomputed mean for this instant. NULL portal cell = None: nothing to check.",
             "format": "double",
             "type": [
               "number",
@@ -6786,7 +6954,7 @@
             ]
           },
           "expected_n": {
-            "description": "The count of non-null replicate cells in the portal row. A count mismatch is a hold reason\neven when mean and sd agree: a dropped replicate can leave both inside tolerance.",
+            "description": "Count of non-null replicate cells the portal row carries for this\ninstant; the API re-counts after admission, so a divergence surfaces\nas an n-mismatch hold.",
             "format": "int64",
             "type": [
               "integer",
@@ -6794,7 +6962,6 @@
             ]
           },
           "expected_sd": {
-            "description": "The portal's precomputed standard deviation (sample, n-1).",
             "format": "double",
             "type": [
               "number",
@@ -7664,7 +7831,7 @@
             ]
           },
           "measurement_type": {
-            "description": "Per-reading override ('continuous' | 'spot' | 'derived'). Omit to resolve from the\nstream's measurement_type, then the owning sensor's data_frequency.",
+            "description": "Per-reading override ('continuous' | 'spot' | 'derived'). None resolves server-side from\nthe stream default, then the owning sensor's data_frequency.",
             "type": [
               "string",
               "null"
@@ -7686,7 +7853,7 @@
             ]
           },
           "standard_curve_id": {
-            "description": "The lab standard curve that corrects this reading, for sync services replaying portal\nmeasurements that carried one. Held to the grab rules: the reading must be a spot\nmeasurement on the instrument the curve was fitted on, and the stored value is recomputed\nfrom the curve's coefficients. An inadmissible claim is stripped: the reading is stored\nuncorrected and a `curve_claim_stripped` hold records the claim for review.",
+            "description": "Standard curve the source applied to this reading.",
             "format": "uuid",
             "type": [
               "string",
@@ -7824,6 +7991,7 @@
         "additionalProperties": false,
         "properties": {
           "sensor_id": {
+            "description": "The instrument the status describes, when the source knows it. None leaves the event\nattributed to the stream alone.",
             "format": "uuid",
             "type": [
               "string",
@@ -7931,7 +8099,11 @@
             ]
           },
           "manifest": {
+            "additionalProperties": {},
             "description": "A manifest to set the inspection against. Supplying one adds `reconciliation` to the\nresponse; nothing here reads or writes a stored manifest.",
+            "propertyNames": {
+              "type": "string"
+            },
             "type": "object"
           },
           "script": {
@@ -9373,29 +9545,8 @@
         "type": "object"
       },
       "NoteItem": {
-        "additionalProperties": false,
-        "properties": {
-          "site_name": {
-            "description": "The source's own station name. Resolved case-insensitively against existing sites.",
-            "type": "string"
-          },
-          "source_key": {
-            "description": "The note's identity within the source, e.g. \"notes:1\"; the upsert key is\n(source_system, source_key).",
-            "type": "string"
-          },
-          "text": {
-            "type": "string"
-          },
-          "verified": {
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "source_key",
-          "site_name",
-          "text"
-        ],
-        "type": "object"
+        "$ref": "#/components/schemas/NoteUpsert",
+        "description": "One source-authored site note. The note's fields are `river_data_core::models::NoteUpsert`,\nwhich the sync services build from; `verified` has always been optional on this route and core\ndeclares it required, so an omitted flag is filled in before the body is read."
       },
       "NoteList": {
         "properties": {
@@ -9564,6 +9715,31 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "NoteUpsert": {
+        "additionalProperties": false,
+        "description": "One source-authored site note to register. `source_key` identifies the note\nwithin the source system; registration is idempotent per\n(source_system, source_key).\n\n`site_name` is the source's own station name, which the API resolves against\nsites that already exist. A note mints nothing: one naming a station\nriver-data has never seen is reported `unresolved` and is re-asserted on a\nlater cycle, once pairing has created the site.",
+        "properties": {
+          "site_name": {
+            "type": "string"
+          },
+          "source_key": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "verified": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "source_key",
+          "site_name",
+          "text",
+          "verified"
+        ],
         "type": "object"
       },
       "NotificationHealth": {
@@ -10332,7 +10508,16 @@
               "null"
             ]
           },
-          "apply_result": {},
+          "apply_result": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApplyResult"
+              }
+            ]
+          },
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -10344,9 +10529,12 @@
             ]
           },
           "curve_assignments": {
+            "$ref": "#/components/schemas/PlanCurveIntents",
             "description": "Curves the review assigned to instruments this plan creates, `[{curve_id,\ninstrument_source_key}]`, moved in the apply transaction that mints them."
           },
-          "entries": {},
+          "entries": {
+            "$ref": "#/components/schemas/PlanEntries"
+          },
           "id": {
             "format": "uuid",
             "type": "string"
@@ -10357,7 +10545,9 @@
           "status": {
             "type": "string"
           },
-          "summary": {},
+          "summary": {
+            "$ref": "#/components/schemas/PlanSummary"
+          },
           "version": {
             "description": "Bumped by every edit. A PATCH or an apply names the version it read, so a second writer\non one draft is refused rather than carrying the first writer's decisions away.",
             "format": "int32",
@@ -10387,7 +10577,9 @@
               "null"
             ]
           },
-          "entries": {},
+          "entries": {
+            "$ref": "#/components/schemas/PlanEntries"
+          },
           "source_system": {
             "type": "string"
           },
@@ -10397,7 +10589,9 @@
               "null"
             ]
           },
-          "summary": {}
+          "summary": {
+            "$ref": "#/components/schemas/PlanSummary"
+          }
         },
         "required": [
           "source_system",
@@ -10415,7 +10609,16 @@
               "null"
             ]
           },
-          "apply_result": {},
+          "apply_result": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApplyResult"
+              }
+            ]
+          },
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -10427,9 +10630,12 @@
             ]
           },
           "curve_assignments": {
+            "$ref": "#/components/schemas/PlanCurveIntents",
             "description": "Curves the review assigned to instruments this plan creates, `[{curve_id,\ninstrument_source_key}]`, moved in the apply transaction that mints them."
           },
-          "entries": {},
+          "entries": {
+            "$ref": "#/components/schemas/PlanEntries"
+          },
           "id": {
             "format": "uuid",
             "type": "string"
@@ -10440,7 +10646,9 @@
           "status": {
             "type": "string"
           },
-          "summary": {},
+          "summary": {
+            "$ref": "#/components/schemas/PlanSummary"
+          },
           "version": {
             "description": "Bumped by every edit. A PATCH or an apply names the version it read, so a second writer\non one draft is refused rather than carrying the first writer's decisions away.",
             "format": "int32",
@@ -10471,7 +10679,16 @@
               "null"
             ]
           },
-          "apply_result": {},
+          "apply_result": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApplyResult"
+              }
+            ]
+          },
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -10483,9 +10700,12 @@
             ]
           },
           "curve_assignments": {
+            "$ref": "#/components/schemas/PlanCurveIntents",
             "description": "Curves the review assigned to instruments this plan creates, `[{curve_id,\ninstrument_source_key}]`, moved in the apply transaction that mints them."
           },
-          "entries": {},
+          "entries": {
+            "$ref": "#/components/schemas/PlanEntries"
+          },
           "id": {
             "format": "uuid",
             "type": "string"
@@ -10496,7 +10716,9 @@
           "status": {
             "type": "string"
           },
-          "summary": {},
+          "summary": {
+            "$ref": "#/components/schemas/PlanSummary"
+          },
           "version": {
             "description": "Bumped by every edit. A PATCH or an apply names the version it read, so a second writer\non one draft is refused rather than carrying the first writer's decisions away.",
             "format": "int32",
@@ -10548,7 +10770,9 @@
           "status": {
             "type": "string"
           },
-          "summary": {},
+          "summary": {
+            "$ref": "#/components/schemas/PlanSummary"
+          },
           "uncovered_streams": {
             "description": "Streams of this source that are unpaired now and not in the plan, so a draft built while a\nsync service was still registering says how much of the source it leaves behind. Counted for\na draft only; a plan that has been applied or superseded is history.",
             "format": "int64",
@@ -10575,7 +10799,16 @@
               "null"
             ]
           },
-          "entries": {},
+          "entries": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanEntries"
+              }
+            ]
+          },
           "source_system": {
             "type": [
               "string",
@@ -10588,7 +10821,16 @@
               "null"
             ]
           },
-          "summary": {}
+          "summary": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanSummary"
+              }
+            ]
+          }
         },
         "type": "object"
       },
@@ -11946,6 +12188,30 @@
         ],
         "type": "object"
       },
+      "PlanCurveIntent": {
+        "description": "A standard curve the review assigned to an instrument the plan creates, keyed by the\ninstrument's `source_key` because the row does not exist until the apply mints it.",
+        "properties": {
+          "curve_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "instrument_source_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "curve_id",
+          "instrument_source_key"
+        ],
+        "type": "object"
+      },
+      "PlanCurveIntents": {
+        "description": "The assigned curves as the column holds them.",
+        "items": {
+          "$ref": "#/components/schemas/PlanCurveIntent"
+        },
+        "type": "array"
+      },
       "PlanCurveRef": {
         "description": "One of an instrument's standard curves, carried so the review can show what a save would\ncorrect with.",
         "properties": {
@@ -12029,6 +12295,164 @@
           "parameters",
           "stream_count",
           "anchor_stream_id"
+        ],
+        "type": "object"
+      },
+      "PlanEntityRef": {
+        "properties": {
+          "create": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "create"
+        ],
+        "type": "object"
+      },
+      "PlanEntries": {
+        "description": "The plan's entry list as the column holds it, so the row carries the entries themselves rather\nthan a JSON document nothing describes.",
+        "items": {
+          "$ref": "#/components/schemas/PlanEntry"
+        },
+        "type": "array"
+      },
+      "PlanEntry": {
+        "properties": {
+          "acknowledged": {
+            "description": "A person has looked at this entry and agreed with it. Set explicitly, never inferred from\nan edit: an operator who toggles a parameter group to skip and back has decided nothing.\nOnly [`ReviewState::NeedsChecking`] entries wait on it; a fully matched entry with no\nwarning is self-validated and needs no tick.",
+            "type": "boolean"
+          },
+          "action": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "string"
+          },
+          "decimal_places": {
+            "description": "The decimal places the source declared for this stream, written onto the slot on apply\nwhere the slot declares none. An operator's declaration on the slot is never overwritten.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "device_model": {
+            "description": "The device model, where the source reports one. Naming only.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "device_serial": {
+            "description": "The device serial the source names for this feed, where it names one. Information the plan\ndisplays; never the instrument's identity.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instrument": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanInstrumentRef",
+                "description": "The lab instrument this stream's standard curves belong to. Present when the stream names\nan instrument already, or when its replicate spec names a curve column, and absent\notherwise. A curve is fitted on one instrument, so a reading naming a curve must name that\ninstrument too; a stream that will carry curve references and resolves to no instrument has\nits readings refused (`/readings/batch`) or dropped (`/ingest`), which is what makes this a\ndecision the plan has to settle rather than report."
+              }
+            ]
+          },
+          "is_device": {
+            "description": "Whether the source reports this feed as a device. That, not the presence of a serial, is\nwhat makes a feed field-shaped: its instrument is minted from the feed's own provenance\nwhen the stream is paired, so the plan proposes no lab instrument for it. A source may\ndescribe a device and report no serial for it, which is why the two are separate.",
+            "type": "boolean"
+          },
+          "original_parameter_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parameter": {
+            "$ref": "#/components/schemas/PlanParamRef"
+          },
+          "project": {
+            "$ref": "#/components/schemas/PlanEntityRef"
+          },
+          "replicates": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanReplicates",
+                "description": "Present when the stream is a replicate family: what is being paired is the group of\nmember columns, not the portal's average."
+              }
+            ]
+          },
+          "sd_estimator": {
+            "description": "The divisor this slot will publish its replicate standard deviation with, chosen in the\nreview. Applied to the `site_parameters` row when the plan is applied; left unset, the slot\nstays undeclared and its audit disagreements are held for a decision instead.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sd_holds": {
+            "description": "The evidence for that choice: open replicate-statistics holds on this stream, and how many\nof them match the population signature. Written at plan creation so the review shows what\nthe incoming data reports rather than only that a question exists.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "sd_population_holds": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "site": {
+            "$ref": "#/components/schemas/PlanSiteRef"
+          },
+          "source_key": {
+            "type": "string"
+          },
+          "source_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stream_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/PlanWarning"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "stream_id",
+          "source_key",
+          "source_name",
+          "action",
+          "project",
+          "site",
+          "parameter",
+          "confidence",
+          "warnings",
+          "sd_holds",
+          "sd_population_holds",
+          "acknowledged",
+          "is_device"
         ],
         "type": "object"
       },
@@ -12134,6 +12558,77 @@
         ],
         "type": "object"
       },
+      "PlanInstrumentRef": {
+        "description": "The instrument a plan entry's curve references resolve to, and how that was decided.",
+        "properties": {
+          "confirmed": {
+            "description": "A creation an operator has agreed to. Apply refuses a plan holding an unconfirmed one.",
+            "type": "boolean"
+          },
+          "create": {
+            "type": "boolean"
+          },
+          "curve_column": {
+            "description": "The source column naming a curve per reading, e.g. `doc_std_curve_id`. Absent when the\ninstrument came from the stream and no column names a curve (the chla families, corrected\nupstream).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "curves": {
+            "items": {
+              "$ref": "#/components/schemas/PlanCurveRef"
+            },
+            "type": "array"
+          },
+          "id": {
+            "description": "The resolved instrument, or None when one has to be created.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "name_conflict": {
+            "$ref": "#/components/schemas/InstrumentNameConflict",
+            "description": "An instrument that already carries the proposed name. Creating a second one under it is\nallowed, and so is attaching to this one, but neither may happen by default: readings\njoining an instrument that already holds data is not something a plan decides on its own."
+          },
+          "proposed_name": {
+            "description": "The name this decision proposes creating, kept whatever else the entry resolves to. An\noperator who attaches an existing instrument by mistake has the proposal to go back to;\nwithout it, the only record of what the plan suggested is gone the moment it is overwritten.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolved_by": {
+            "description": "`stream` (already attributed), `curve_label` (matched against the source's own curve\nlabels), `manual` (repointed in the review), or `placeholder` (nothing matched).",
+            "type": "string"
+          },
+          "source_key": {
+            "description": "`(source_system, source_key)` is an instrument's identity, so a later rename cannot break\nthe mapping.",
+            "type": "string"
+          },
+          "stamps_readings": {
+            "description": "True when each reading stores a `standard_curve_id` (the family's own calculation names\nthe curve, members are raw). False when the curve was applied upstream and only the\ninstrument is attributed, where stamping would correct the value a second time.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "curve_column",
+          "id",
+          "name",
+          "source_key",
+          "resolved_by",
+          "create",
+          "confirmed",
+          "stamps_readings",
+          "curves"
+        ],
+        "type": "object"
+      },
       "PlanInstrumentsResponse": {
         "properties": {
           "curves": {
@@ -12187,6 +12682,95 @@
         "required": [
           "job_id",
           "status"
+        ],
+        "type": "object"
+      },
+      "PlanParamRef": {
+        "properties": {
+          "create": {
+            "type": "boolean"
+          },
+          "group_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "description": "Human-readable label carried alongside; becomes `parameters.name` when the apply creates\nthe parameter, while `name` becomes its `code`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "The parameter identity: the source's own column name (matches what the portal DB shows).",
+            "type": "string"
+          },
+          "original_names": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "units": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "create",
+          "units",
+          "original_names"
+        ],
+        "type": "object"
+      },
+      "PlanReplicates": {
+        "description": "Replicate-family summary carried on a plan entry, from the stream's registered spec.",
+        "properties": {
+          "curve_ref_column": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "member_columns": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "n": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "portal_mean_column": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "portal_sd_column": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "n",
+          "member_columns",
+          "curve_ref_column",
+          "portal_mean_column",
+          "portal_sd_column"
         ],
         "type": "object"
       },
@@ -12315,6 +12899,53 @@
         ],
         "type": "object"
       },
+      "PlanSiteRef": {
+        "properties": {
+          "altitude_m": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "create": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latitude": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "longitude": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "create",
+          "latitude",
+          "longitude",
+          "altitude_m"
+        ],
+        "type": "object"
+      },
       "PlanStatusChanged": {
         "description": "A plan whose status this request moved, with no job behind it.",
         "properties": {
@@ -12329,6 +12960,85 @@
         "required": [
           "id",
           "status"
+        ],
+        "type": "object"
+      },
+      "PlanSummary": {
+        "properties": {
+          "acknowledged": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "instruments_to_create": {
+            "description": "Distinct lab instruments the apply would create, and how many of those an operator has\nnot yet agreed to. Apply refuses while the second is non-zero.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "instruments_unconfirmed": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "needs_checking": {
+            "description": "The three review states over the entries the plan would pair, so the review can say what\nshare of the plan waits on a person and what share stands on its own evidence.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "parameters_to_create": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "projects_to_create": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "self_validated": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sites_to_create": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_streams": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unique_parameters": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unique_projects": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unique_sites": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "will_pair": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "will_skip": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_streams",
+          "will_pair",
+          "needs_checking",
+          "self_validated",
+          "acknowledged",
+          "will_skip",
+          "projects_to_create",
+          "sites_to_create",
+          "parameters_to_create",
+          "instruments_to_create",
+          "instruments_unconfirmed",
+          "unique_projects",
+          "unique_sites",
+          "unique_parameters"
         ],
         "type": "object"
       },
@@ -12369,6 +13079,46 @@
           "site_count",
           "anchor_stream_id",
           "suggested_name"
+        ],
+        "type": "object"
+      },
+      "PlanWarning": {
+        "description": "Something the review has to decide about, carried as data rather than a sentence so the UI can\noffer the resolutions instead of only naming the problem. `message` is the rendered form, kept\nso a warning always reads as something even where the structure is not used.",
+        "properties": {
+          "existing": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ExistingParamRef"
+              }
+            ]
+          },
+          "kind": {
+            "description": "`units_mismatch` | `empty_name`.",
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "parameter": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_units": {
+            "description": "The units this source declares, against `existing.units`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "message"
         ],
         "type": "object"
       },
@@ -12538,7 +13288,7 @@
           "calculations": {
             "description": "The calculations the touched parameters feed, in the order the chain would run them.",
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/CalculationImpact"
             },
             "type": "array"
           },
@@ -13631,7 +14381,7 @@
         "properties": {
           "annotations": {
             "items": {
-              "$ref": "#/components/schemas/AnnotationItem"
+              "$ref": "#/components/schemas/AnnotationUpsert"
             },
             "type": "array"
           },
@@ -13720,60 +14470,24 @@
         "type": "object"
       },
       "RegisterSensorRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "data_frequency": {
-            "description": "'high' or 'low'. Read as a cadence declaration when a stream classifies its readings, so\nleave it 'high' unless the source knows the instrument logs at grab cadence.",
-            "type": "string"
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SensorUpsert"
           },
-          "is_lab_instrument": {
-            "description": "False for a field instrument, true for one that corrects a grab in the lab.",
-            "type": "boolean"
-          },
-          "manufacturer": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "metadata": {},
-          "model": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "name": {
-            "type": "string"
-          },
-          "notes": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "serial_number": {
-            "description": "The lab's own serial for the instrument. Claimed only when no other instrument holds it;\nsee [`serial_to_claim`].",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "source_key": {
-            "description": "The instrument's identity within that source, e.g. \"sensor_inventory:62\". Stable across\nre-registration; the upsert key is (source_system, source_key).",
-            "type": "string"
-          },
-          "source_system": {
-            "description": "The sync source the instrument comes from, e.g. \"metalp\".",
-            "type": "string"
+          {
+            "properties": {
+              "source_system": {
+                "description": "The sync source the instrument comes from, e.g. \"metalp\".",
+                "type": "string"
+              }
+            },
+            "required": [
+              "source_system"
+            ],
+            "type": "object"
           }
-        },
-        "required": [
-          "source_system",
-          "source_key",
-          "name"
         ],
-        "type": "object"
+        "description": "One instrument from a source's own register. The instrument's own fields are\n`river_data_core::models::SensorUpsert`, which the sync services build from; the API adds the\nsource the caller is speaking for, and supplies the `is_lab_instrument` default this route has\nalways accepted an omitted flag under."
       },
       "RegisterSensorResponse": {
         "properties": {
@@ -13802,64 +14516,24 @@
         "type": "object"
       },
       "RegisterStandardCurveRequest": {
-        "properties": {
-          "fitted_on": {
-            "description": "The date the source fitted the curve. Absent leaves the row on its creation date.",
-            "format": "date",
-            "type": [
-              "string",
-              "null"
-            ]
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/StandardCurveUpsert"
           },
-          "instrument_label": {
-            "description": "The lab instrument family the curve was fitted for, e.g. \"DOC corr\". A lab-instrument\nsensor is found or created per (source_system, instrument_label) and the curve attaches to\nit; readings claiming the curve must resolve to the same instrument.",
-            "type": "string"
-          },
-          "intercept": {
-            "format": "double",
-            "type": "number"
-          },
-          "name": {
-            "description": "Human label for the curve, e.g. the portal's date + parameter. Falls back to source_key.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "notes": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "r_squared": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "slope": {
-            "format": "double",
-            "type": "number"
-          },
-          "source_key": {
-            "description": "The curve's identity within that source, e.g. \"standard_curves:17\". Stable across\nre-registration; the upsert key is (source_system, source_key).",
-            "type": "string"
-          },
-          "source_system": {
-            "description": "The sync source the curve comes from, e.g. \"cnet\".",
-            "type": "string"
+          {
+            "properties": {
+              "source_system": {
+                "description": "The sync source the curve comes from, e.g. \"cnet\".",
+                "type": "string"
+              }
+            },
+            "required": [
+              "source_system"
+            ],
+            "type": "object"
           }
-        },
-        "required": [
-          "source_system",
-          "source_key",
-          "instrument_label",
-          "slope",
-          "intercept"
         ],
-        "type": "object"
+        "description": "One portal standard curve to register. The curve's own fields are\n`river_data_core::models::StandardCurveUpsert`, which the sync services build from, so a field\nthe sender gains cannot be dropped here; the API adds the source the caller is speaking for."
       },
       "RegisterStandardCurveResponse": {
         "properties": {
@@ -13886,7 +14560,7 @@
       "RegisterStreamRequest": {
         "properties": {
           "decimal_places": {
-            "description": "The decimal places the source stores or presents this channel at (0 to 10). Stored under\n`metadata.decimal_places`; pairing writes it onto the slot where none is declared, and the\npublic API expresses the slot's values at it. Omit to declare nothing.",
+            "description": "The source's decimal places for this channel (0 to 10). None declares nothing.",
             "format": "int32",
             "type": [
               "integer",
@@ -13894,15 +14568,13 @@
             ]
           },
           "measurement_type": {
-            "description": "Stream-level default for readings.measurement_type ('continuous' | 'spot' | 'derived').\nOmit to defer to the owning sensor's data_frequency.",
+            "description": "Stream-level classification declared at discovery. None never clears an operator-set value.",
             "type": [
               "string",
               "null"
             ]
           },
-          "metadata": {
-            "type": "object"
-          },
+          "metadata": {},
           "replicates": {
             "oneOf": [
               {
@@ -13910,12 +14582,12 @@
               },
               {
                 "$ref": "#/components/schemas/ReplicateSpec",
-                "description": "Declares this stream a replicate family: each reading carries the replicate index the\nstored column-to-index mapping assigns to its source column (a group can be sparse and\nneed not include index 0), and groups form `samples` rows. Validated here (two or more\nunique members, spot classification) and stored under `metadata[\"replicates\"]`. The\nmapping is pinned append-only across re-registrations; the response's `replicates` field\nis the authoritative mapping to assign indexes from."
+                "description": "Replicate-family declaration; requires `measurement_type: \"spot\"`."
               }
             ]
           },
           "sensor_id": {
-            "description": "The instrument that produces this feed. Omit when the caller does not know it: the sensor\nis then resolved from the metadata serial at import or pairing time. Declaring it is what\nstops pairing minting a second, serial-less instrument alongside the real one.",
+            "description": "Owning sensor. Required for curve-carrying streams: the API admits a\nreading's curve claim only when reading-sensor == curve-sensor.",
             "format": "uuid",
             "type": [
               "string",
@@ -13943,21 +14615,34 @@
         },
         "required": [
           "source_system",
-          "source_key"
+          "source_key",
+          "metadata"
         ],
         "type": "object"
       },
       "ReloadResponse": {
         "properties": {
           "body": {
+            "additionalProperties": {},
             "description": "The calculate body that reproduces the run: its stored inputs plus the calculation context.",
+            "propertyNames": {
+              "type": "string"
+            },
             "type": "object"
           },
           "constants": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
             "type": "object"
           },
           "curves": {
             "items": {
+              "additionalProperties": {},
+              "propertyNames": {
+                "type": "string"
+              },
               "type": "object"
             },
             "type": "array"
@@ -14079,55 +14764,40 @@
         "type": "object"
       },
       "ReplicateSpec": {
+        "description": "Replicate-family declaration on a stream registration. The API pins each\ncolumn's replicate_index server-side (append-only across re-registrations)\nand returns the authoritative mapping as [`ColumnAssignment`]s on the\nregister response; `source_columns` order is provenance, not the index.\nThe API requires at least two unique columns and `measurement_type: \"spot\"`\non the request.",
         "properties": {
-          "assignments": {
-            "description": "The authoritative column-to-index mapping, authored by the register path (never by the\ncaller) via [`pin_assignments`]. Readings carry these indexes for life, so re-registration\npreserves them: see [`ColumnAssignment`].",
-            "items": {
-              "$ref": "#/components/schemas/ColumnAssignment"
-            },
-            "type": "array"
-          },
           "calc": {
-            "description": "How the portal derives its mean from the members, as declared by its calculation registry\n(e.g. `calcMean`, `calcDOCavg`). Recorded for provenance and for the audit's semantics.",
             "type": [
               "string",
               "null"
             ]
           },
           "curve_ref_column": {
-            "description": "The portal column holding the per-row standard-curve reference, when the family's values\nare corrected through one (e.g. `doc_std_curve_id`).",
             "type": [
               "string",
               "null"
             ]
           },
           "portal_mean_column": {
-            "description": "The portal's precomputed mean column. Audited at sync time, never a stream.",
             "type": [
               "string",
               "null"
             ]
           },
           "portal_sd_column": {
-            "description": "The portal's precomputed standard-deviation column. Audited, never a stream.",
             "type": [
               "string",
               "null"
             ]
           },
           "sd_estimator": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/SdEstimator",
-                "description": "Which divisor this source computes its standard deviation with: `sample` (n-1) or\n`population` (n). Absent means the source has not said, which is the honest answer for the\nportals that used both over the years; the slot's declaration then decides, and absent that\nthe samples are recorded undeclared and their audit disagreements are held for a decision.\nNothing infers this from the data."
-              }
+            "description": "The sd divisor the source's own sd column uses ('sample' | 'population'),\nwhen the source declares one. Never inferred; None leaves the slot's\ndeclaration (or the audit gate) to decide.",
+            "type": [
+              "string",
+              "null"
             ]
           },
           "source_columns": {
-            "description": "Source columns as the source currently declares them. Ordering is provenance only: the\nauthoritative column-to-index mapping is `assignments`, pinned at registration.",
             "items": {
               "type": "string"
             },
@@ -14539,6 +15209,39 @@
           "code"
         ],
         "type": "string"
+      },
+      "ResolvedCurve": {
+        "description": "A curve as the runner receives it: coefficients plus, when it came from the catalog, the\nidentity that resolves them.",
+        "properties": {
+          "intercept": {
+            "format": "double",
+            "type": "number"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "slope": {
+            "format": "double",
+            "type": "number"
+          },
+          "standard_curve_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "slope",
+          "intercept",
+          "standard_curve_id",
+          "label"
+        ],
+        "type": "object"
       },
       "ResolvedParameter": {
         "description": "The catalog parameter an output is saved to, resolved server-side. Serving this is what lets a\ncaller stop matching strings against a page of the catalog it happens to have fetched.",
@@ -17714,6 +18417,64 @@
         },
         "type": "object"
       },
+      "SensorUpsert": {
+        "additionalProperties": false,
+        "description": "One instrument from a source's own register, to introduce into river-data.\n\nFor a source whose instruments do not each have a stream: every other instrument is minted as a\nside effect of registering the stream that names it, and a portal's instrument register has no\nstreams to mint from. Registration is idempotent per (source_system, source_key), and a row the\nAPI already holds under that key is never rewritten.",
+        "properties": {
+          "data_frequency": {
+            "description": "The cadence the instrument logs at ('high' | 'low'), read as a declaration when a stream\nclassifies its readings. None leaves the API's default of 'high'.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_lab_instrument": {
+            "description": "True for an instrument that corrects a grab in the lab rather than standing in a river.",
+            "type": "boolean"
+          },
+          "manufacturer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "description": "Whatever the source knows that river-data has no column for."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "notes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serial_number": {
+            "description": "The lab's own serial. The API claims it only when no other instrument holds it, and says\nwhich one does when it declines.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_key": {
+            "description": "The instrument's identity within the source, e.g. \"sensor_inventory:62\".",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_key",
+          "name",
+          "is_lab_instrument"
+        ],
+        "type": "object"
+      },
       "SensorVsGrabResponse": {
         "properties": {
           "parameter_id": {
@@ -18898,16 +19659,17 @@
       },
       "SourceWindow": {
         "additionalProperties": false,
+        "description": "A completeness claim over one stream: the readings sent alongside are the COMPLETE content of\nthe source for this stream over `[from, to)`, read from `source_rows_read` source rows. The\nserver diffs stored content against the payload and converges (new / changed / withdrawn);\nwithout a window the request is a bare append, exactly the old semantics.",
         "properties": {
           "content_digest": {
-            "description": "The client's digest of this payload's source-asserted content. Opaque: persisted on the\nstream when the pass applies cleanly, echoed on the stream list, and never computed\nserver-side. The client skips its next pass when its content digests to the same value.",
+            "description": "Digest of the canonical payload, stamped by the driver before send. The server persists\nit on a cleanly-applied pass and echoes it on the stream list, so the next cycle can skip\nre-sending unchanged content. Opaque to the server; never computed server-side.",
             "type": [
               "string",
               "null"
             ]
           },
           "dropped_times": {
-            "description": "Instants the backend saw but could not decode; stored rows at these keys are retained.",
+            "description": "Instants the backend saw but could not carry (cell decode failures). The server retains\nstored rows at these keys rather than withdrawing them.",
             "items": {
               "format": "date-time",
               "type": "string"
@@ -18919,7 +19681,7 @@
             "type": "string"
           },
           "source_rows_read": {
-            "description": "Source rows scanned to produce the payload. Guards the honesty checks: an empty payload\nover a window the store holds readings for is refused, never read as a deletion.",
+            "description": "Source rows scanned to produce the payload. An empty payload over a window the store holds\nreadings for is refused server-side, so a decode failure cannot read as a source deletion.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
@@ -19364,6 +20126,61 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "StandardCurveUpsert": {
+        "description": "One portal standard curve to register. `source_key` identifies the curve\nwithin the source system; registration is idempotent per (source_system,\nsource_key).",
+        "properties": {
+          "fitted_on": {
+            "description": "The date the source fitted the curve, which is how the lab identifies one.",
+            "format": "date",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instrument_label": {
+            "description": "The portal curve's parameter label; the API finds-or-creates one lab\ninstrument per (source_system, instrument_label).",
+            "type": "string"
+          },
+          "intercept": {
+            "format": "double",
+            "type": "number"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "notes": {
+            "description": "Whatever the source records about the fit.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "r_squared": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "slope": {
+            "format": "double",
+            "type": "number"
+          },
+          "source_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_key",
+          "instrument_label",
+          "slope",
+          "intercept"
+        ],
         "type": "object"
       },
       "StartReconciliationRequest": {
@@ -19984,10 +20801,25 @@
             "type": "string"
           },
           "payload": {
-            "type": "object"
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "result": {
-            "type": "object"
+            "additionalProperties": {},
+            "description": "What the service reported back, shaped by the command it answers.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "service_id": {
             "format": "uuid",
@@ -20220,7 +21052,14 @@
             ]
           },
           "errors": {
-            "type": "object"
+            "description": "The messages the pass reported, in order.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "event_type": {
             "type": "string"
@@ -20230,7 +21069,14 @@
             "type": "string"
           },
           "log": {
-            "type": "object"
+            "description": "The lines the pass logged, in order.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "readings_skipped": {
             "format": "int64",
@@ -20839,6 +21685,14 @@
         ],
         "type": "object"
       },
+      "ThresholdSource": {
+        "description": "The tiers a resolved threshold can come from: the slot's own `alarm_thresholds` row, else the\nparameter's. Named for the document; the column itself travels as the string the SQL builds.",
+        "enum": [
+          "site",
+          "global"
+        ],
+        "type": "string"
+      },
       "ThresholdWithValue": {
         "description": "One resolved threshold plus the slot's latest reading value, for the UI thresholds table.",
         "properties": {
@@ -20873,7 +21727,7 @@
             "type": "string"
           },
           "source": {
-            "type": "string"
+            "$ref": "#/components/schemas/ThresholdSource"
           },
           "warning_max": {
             "format": "double",
@@ -21063,19 +21917,30 @@
             "type": "array"
           },
           "constants": {
-            "description": "The constant values the server resolved and passed to the runner, by name.",
+            "additionalProperties": {
+              "format": "double",
+              "type": "number"
+            },
+            "description": "The constant values the server resolved and passed to the runner, by name.\nThe constant values the server resolved and passed to the runner, by name.",
+            "propertyNames": {
+              "type": "string"
+            },
             "type": "object"
           },
           "curves": {
             "description": "The curves the server resolved, as the runner received them.",
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/CurveSnapshot"
             },
             "type": "array"
           },
           "event_inputs": {
             "description": "Same-event parameter values resolved at `(site_id, collected_at)`, as\n`{param, parameter_code, parameter_id, value}`.",
             "items": {
+              "additionalProperties": {},
+              "propertyNames": {
+                "type": "string"
+              },
               "type": "object"
             },
             "type": "array"
@@ -21093,6 +21958,10 @@
             "type": "array"
           },
           "results": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
             "type": "object"
           },
           "run_id": {
@@ -21103,6 +21972,10 @@
           "site_inputs": {
             "description": "Station properties resolved from the site named by `site_id`, as `{property, param, value}`.",
             "items": {
+              "additionalProperties": {},
+              "propertyNames": {
+                "type": "string"
+              },
               "type": "object"
             },
             "type": "array"
@@ -21110,6 +21983,10 @@
           "skipped": {
             "description": "Formulas that did not run and why, as `{output, reason}`. An unresolved input costs its\nown output and no other, so the rest of the calculation is in `results`.",
             "items": {
+              "additionalProperties": {},
+              "propertyNames": {
+                "type": "string"
+              },
               "type": "object"
             },
             "type": "array"
@@ -21879,10 +22756,24 @@
             ]
           },
           "errors": {
-            "type": "object"
+            "description": "The messages the pass reported, in order.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "log": {
-            "type": "object"
+            "description": "The lines the pass logged, in order.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "readings_skipped": {
             "description": "Connectors on river-data-core 0.5.0 do not send this; absent leaves the stored count alone.",
@@ -21913,10 +22804,6 @@
             ]
           }
         },
-        "required": [
-          "errors",
-          "log"
-        ],
         "type": "object"
       },
       "UpdatedResponse": {
@@ -39406,7 +40293,7 @@
             "description": "Stream registered (created or updated)"
           }
         },
-        "summary": "Upsert a data stream by (source_system, source_key). Used by sync microservices on\ndiscovery to register streams before pairing. Requires `write_metadata`.",
+        "summary": "Upsert a data stream by (source_system, source_key). Used by sync microservices on\ndiscovery to register streams before pairing. Requires `write_metadata`. `metadata` may be\nomitted and defaults to an empty object, which the schema, taken from the client's own struct,\ndoes not say.",
         "tags": [
           "streams"
         ]

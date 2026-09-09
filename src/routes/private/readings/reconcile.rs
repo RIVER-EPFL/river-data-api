@@ -19,13 +19,16 @@
 
 use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sync::replicate_audit as audit;
+
+/// The completeness claim, as the sync service sends it and as the response echoes it back.
+/// Declared in `river-data-core`: the echo is what tells a client its window was honoured, so
+/// both directions read one type.
+pub use river_data_core::models::SourceWindow;
 
 /// Fraction of a window's stored rows a single pass may change or withdraw before the brake
 /// holds the corrections and withdrawals (new rows always apply).
@@ -37,24 +40,6 @@ pub const RECONCILE_BRAKE_INDEX_FRACTION: f64 = 0.5;
 /// for full-history windows (hundreds of rows); without a floor, one legitimate replicate
 /// removal in a three-row window reads as a 33% reshape and brakes routine lab corrections.
 pub const RECONCILE_BRAKE_MIN_ROWS: usize = 5;
-
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SourceWindow {
-    pub from: DateTime<Utc>,
-    pub to: DateTime<Utc>,
-    /// Source rows scanned to produce the payload. Guards the honesty checks: an empty payload
-    /// over a window the store holds readings for is refused, never read as a deletion.
-    pub source_rows_read: u64,
-    /// Instants the backend saw but could not decode; stored rows at these keys are retained.
-    #[serde(default)]
-    pub dropped_times: Vec<DateTime<Utc>>,
-    /// The client's digest of this payload's source-asserted content. Opaque: persisted on the
-    /// stream when the pass applies cleanly, echoed on the stream list, and never computed
-    /// server-side. The client skips its next pass when its content digests to the same value.
-    #[serde(default)]
-    pub content_digest: Option<String>,
-}
 
 /// One stored row of the window, as the diff reads it.
 #[derive(FromQueryResult)]

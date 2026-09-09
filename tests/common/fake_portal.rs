@@ -248,6 +248,7 @@ impl SourceBackend for FakePortal {
             r_squared: Some(0.999),
             name: Some("DOC June 2026".to_string()),
             fitted_on: river_data_core::chrono::NaiveDate::from_ymd_opt(2026, 5, 30),
+            notes: Some("five standards".to_string()),
         }])
     }
 

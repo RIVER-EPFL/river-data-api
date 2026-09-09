@@ -257,6 +257,7 @@ pub struct PairingPlanSummary {
     source_system: String,
     status: String,
     created_by: Option<String>,
+    #[schema(value_type = crate::routes::private::sync::service::PlanSummary)]
     summary: serde_json::Value,
     created_at: chrono::DateTime<chrono::FixedOffset>,
     applied_at: Option<chrono::DateTime<chrono::FixedOffset>>,
@@ -870,8 +871,7 @@ pub async fn update_pairing_plan(
     }
 
     let mut entries: Vec<crate::routes::private::sync::service::PlanEntry> =
-        serde_json::from_value(plan.entries.clone())
-            .map_err(|e| AppError::Internal(format!("Failed to parse entries: {e}")))?;
+        plan.entries.0.clone();
 
     let catalog = crate::routes::private::sync::service::load_entity_catalog(&state.db).await?;
 
@@ -1049,9 +1049,7 @@ pub async fn apply_pairing_plan(
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
-    let entries: Vec<crate::routes::private::sync::service::PlanEntry> =
-        serde_json::from_value(plan.entries)
-            .map_err(|e| AppError::Internal(format!("Failed to parse entries: {e}")))?;
+    let entries: Vec<crate::routes::private::sync::service::PlanEntry> = plan.entries.0;
     crate::routes::private::sync::service::refuse_unconfirmed_instruments(&entries)?;
 
     let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
@@ -1178,8 +1176,7 @@ pub async fn plan_site_metadata(
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
 
     let entries: Vec<crate::routes::private::sync::service::PlanEntry> =
-        serde_json::from_value(plan.entries.clone())
-            .map_err(|e| AppError::Internal(format!("Failed to parse entries: {e}")))?;
+        plan.entries.0.clone();
 
     let stream_ids: Vec<Uuid> = entries.iter().map(|e| e.stream_id).collect();
     if stream_ids.is_empty() {
@@ -1436,7 +1433,7 @@ pub async fn plan_instruments(
         .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
     let entries: Vec<crate::routes::private::sync::service::PlanEntry> =
-        serde_json::from_value(plan.entries.clone()).unwrap_or_default();
+        plan.entries.0.clone();
     // Read fresh rather than from the stored plan: an instrument created since the plan was drafted
     // is exactly the collision this reports.
     let catalog = crate::routes::private::sync::service::load_instrument_catalog(

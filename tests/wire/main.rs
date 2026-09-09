@@ -1,9 +1,11 @@
 //! The wire contract between `river-data-core` and this crate.
 //!
-//! Nine request and response shapes are declared twice, once in core for the sync clients and once
-//! here for the server. Nothing linked the two, so a field added on one side shipped green: three
-//! had already drifted when this was written. Each test below sends core's struct through serde
-//! into the API's, or the API's response back into core's, and asserts the values arrive.
+//! Nine request and response shapes were declared twice, once in core for the sync clients and
+//! once here for the server, with nothing linking the two: three had drifted when this was
+//! written. The field lists are now core's alone, so what is left to guard is the seam the API
+//! keeps on its own side: the fields only the server knows (`source_system`, the pinned replicate
+//! indexes), the defaults this API accepted an omitted field under before core declared the field,
+//! and the unknown-field refusal that has to survive being reached through a flattened core type.
 //!
 //! These are pure serde: no database, no router. Run: cargo test --test wire
 

@@ -28,6 +28,9 @@ use crate::common::middleware::{AuthContext, ProjectScope, enforce_project_scope
 use crate::common::paging::Window;
 use crate::error::{AppError, AppResult};
 
+/// One replicate group's expectation, as the portal stored it. Declared in `river-data-core`.
+pub use river_data_core::models::GroupAudit;
+
 /// Confine a hold action to the caller's projects, resolved through the stream's paired site,
 /// as the readings flag handlers do. An unpaired stream's hold (deferred) belongs to no project,
 /// so it is actionable only by a caller without project restriction.
@@ -94,23 +97,6 @@ pub fn tolerance_bound(e: f64, c: f64, rel_tol: f64, abs_tol: f64) -> f64 {
 #[must_use]
 pub fn bound_sql(a: &str, b: &str, rel_bind: &str, abs_tol: f64) -> String {
     format!("GREATEST({rel_bind} * GREATEST(abs({a}), abs({b})), {abs_tol}, {QUANTUM_FLOOR})")
-}
-
-/// One replicate group's expectation, as the portal stored it.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct GroupAudit {
-    pub time: DateTime<Utc>,
-    /// The portal's precomputed mean for this instant. NULL portal cell = None: nothing to check.
-    #[serde(default)]
-    pub expected_mean: Option<f64>,
-    /// The portal's precomputed standard deviation (sample, n-1).
-    #[serde(default)]
-    pub expected_sd: Option<f64>,
-    /// The count of non-null replicate cells in the portal row. A count mismatch is a hold reason
-    /// even when mean and sd agree: a dropped replicate can leave both inside tolerance.
-    #[serde(default)]
-    pub expected_n: Option<i64>,
 }
 
 /// The recomputed statistics of a group of would-be-stored values.

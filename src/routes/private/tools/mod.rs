@@ -34,7 +34,7 @@ use engine::{ToolDescriptor, ToolVersionRef};
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ToolResult {
     pub tool: String,
-    #[schema(value_type = Object)]
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub results: serde_json::Value,
     /// Outputs the script computed as NA. The portal blanked such a column rather than leaving
     /// the previous number standing, so these name the stored values a save must clear.
@@ -43,24 +43,24 @@ pub struct ToolResult {
     /// Formulas that did not run and why, as `{output, reason}`. An unresolved input costs its
     /// own output and no other, so the rest of the calculation is in `results`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    #[schema(value_type = Vec<Object>)]
+    #[schema(value_type = Vec<std::collections::HashMap<String, serde_json::Value>>)]
     pub skipped: Vec<serde_json::Value>,
     pub inputs_used: Vec<String>,
     pub inputs_ignored: Vec<String>,
     /// The constant values the server resolved and passed to the runner, by name.
-    #[schema(value_type = Object)]
+    /// The constant values the server resolved and passed to the runner, by name.
+    #[schema(value_type = std::collections::HashMap<String, f64>)]
     pub constants: serde_json::Value,
     /// The curves the server resolved, as the runner received them.
-    #[schema(value_type = Vec<Object>)]
-    pub curves: Vec<serde_json::Value>,
+    pub curves: Vec<crate::routes::private::tools::engine::CurveSnapshot>,
     /// Station properties resolved from the site named by `site_id`, as `{property, param, value}`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    #[schema(value_type = Vec<Object>)]
+    #[schema(value_type = Vec<std::collections::HashMap<String, serde_json::Value>>)]
     pub site_inputs: Vec<serde_json::Value>,
     /// Same-event parameter values resolved at `(site_id, collected_at)`, as
     /// `{param, parameter_code, parameter_id, value}`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    #[schema(value_type = Vec<Object>)]
+    #[schema(value_type = Vec<std::collections::HashMap<String, serde_json::Value>>)]
     pub event_inputs: Vec<serde_json::Value>,
     /// The exact script version and runtime that produced these numbers; goes into the
     /// provenance blob on save.
@@ -210,7 +210,9 @@ async fn store_run(
                     .into(),
                 serde_json::Value::Object(outcome.inputs).into(),
                 constants.clone().into(),
-                serde_json::Value::Array(outcome.curves.clone()).into(),
+                serde_json::to_value(&outcome.curves)
+                    .unwrap_or(serde_json::Value::Null)
+                    .into(),
                 stored_outputs.into(),
                 actor.into(),
                 context.into(),

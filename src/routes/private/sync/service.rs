@@ -151,10 +151,11 @@ pub fn extract_hierarchy(stream: &data_streams::Model) -> StreamHierarchy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanEntry {
     pub stream_id: Uuid,
     pub source_key: String,
+    #[schema(required)]
     pub source_name: Option<String>,
     pub action: String, // "pair" | "skip"
     pub project: PlanEntityRef,
@@ -162,6 +163,7 @@ pub struct PlanEntry {
     pub parameter: PlanParamRef,
     pub confidence: String, // "exact" | "none"
     #[serde(default)]
+    #[schema(required)]
     pub warnings: Vec<PlanWarning>,
     #[serde(default)]
     pub original_parameter_name: Option<String>,
@@ -190,20 +192,24 @@ pub struct PlanEntry {
     /// of them match the population signature. Written at plan creation so the review shows what
     /// the incoming data reports rather than only that a question exists.
     #[serde(default)]
+    #[schema(required)]
     pub sd_holds: i64,
     #[serde(default)]
+    #[schema(required)]
     pub sd_population_holds: i64,
     /// A person has looked at this entry and agreed with it. Set explicitly, never inferred from
     /// an edit: an operator who toggles a parameter group to skip and back has decided nothing.
     /// Only [`ReviewState::NeedsChecking`] entries wait on it; a fully matched entry with no
     /// warning is self-validated and needs no tick.
     #[serde(default)]
+    #[schema(required)]
     pub acknowledged: bool,
     /// Whether the source reports this feed as a device. That, not the presence of a serial, is
     /// what makes a feed field-shaped: its instrument is minted from the feed's own provenance
     /// when the stream is paired, so the plan proposes no lab instrument for it. A source may
     /// describe a device and report no serial for it, which is why the two are separate.
     #[serde(default)]
+    #[schema(required)]
     pub is_device: bool,
     /// The device serial the source names for this feed, where it names one. Information the plan
     /// displays; never the instrument's identity.
@@ -217,7 +223,7 @@ pub struct PlanEntry {
 /// A catalog parameter a plan entry collides with, and what already depends on it. "Exists" on its
 /// own does not say where or whether anything uses it, which is the question an operator has to
 /// answer to resolve a units conflict.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ExistingParamRef {
     pub id: Uuid,
     pub code: String,
@@ -231,7 +237,7 @@ pub struct ExistingParamRef {
 /// Something the review has to decide about, carried as data rather than a sentence so the UI can
 /// offer the resolutions instead of only naming the problem. `message` is the rendered form, kept
 /// so a warning always reads as something even where the structure is not used.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanWarning {
     /// `units_mismatch` | `empty_name`.
     pub kind: String,
@@ -307,7 +313,7 @@ impl PlanWarning {
 
 /// One of an instrument's standard curves, carried so the review can show what a save would
 /// correct with.
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanCurveRef {
     pub id: Uuid,
     #[schema(required)]
@@ -317,14 +323,16 @@ pub struct PlanCurveRef {
 }
 
 /// The instrument a plan entry's curve references resolve to, and how that was decided.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanInstrumentRef {
     /// The source column naming a curve per reading, e.g. `doc_std_curve_id`. Absent when the
     /// instrument came from the stream and no column names a curve (the chla families, corrected
     /// upstream).
     #[serde(default)]
+    #[schema(required)]
     pub curve_column: Option<String>,
     /// The resolved instrument, or None when one has to be created.
+    #[schema(required)]
     pub id: Option<Uuid>,
     pub name: String,
     /// `(source_system, source_key)` is an instrument's identity, so a later rename cannot break
@@ -336,12 +344,14 @@ pub struct PlanInstrumentRef {
     pub create: bool,
     /// A creation an operator has agreed to. Apply refuses a plan holding an unconfirmed one.
     #[serde(default)]
+    #[schema(required)]
     pub confirmed: bool,
     /// True when each reading stores a `standard_curve_id` (the family's own calculation names
     /// the curve, members are raw). False when the curve was applied upstream and only the
     /// instrument is attributed, where stamping would correct the value a second time.
     pub stamps_readings: bool,
     #[serde(default)]
+    #[schema(required)]
     pub curves: Vec<PlanCurveRef>,
     /// The name this decision proposes creating, kept whatever else the entry resolves to. An
     /// operator who attaches an existing instrument by mistake has the proposal to go back to;
@@ -352,6 +362,7 @@ pub struct PlanInstrumentRef {
     /// allowed, and so is attaching to this one, but neither may happen by default: readings
     /// joining an instrument that already holds data is not something a plan decides on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub name_conflict: Option<InstrumentNameConflict>,
 }
 
@@ -368,12 +379,15 @@ pub struct InstrumentNameConflict {
 }
 
 /// Replicate-family summary carried on a plan entry, from the stream's registered spec.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanReplicates {
     pub n: usize,
     pub member_columns: Vec<String>,
+    #[schema(required)]
     pub curve_ref_column: Option<String>,
+    #[schema(required)]
     pub portal_mean_column: Option<String>,
+    #[schema(required)]
     pub portal_sd_column: Option<String>,
 }
 
@@ -733,33 +747,39 @@ fn plan_replicates(metadata: &serde_json::Value) -> Option<PlanReplicates> {
     let spec =
         crate::routes::private::data_streams::replicates::ReplicateSpec::from_metadata(metadata)?;
     Some(PlanReplicates {
-        n: spec.source_columns.len(),
-        member_columns: spec.source_columns,
-        curve_ref_column: spec.curve_ref_column,
-        portal_mean_column: spec.portal_mean_column,
-        portal_sd_column: spec.portal_sd_column,
+        n: spec.declared.source_columns.len(),
+        member_columns: spec.declared.source_columns,
+        curve_ref_column: spec.declared.curve_ref_column,
+        portal_mean_column: spec.declared.portal_mean_column,
+        portal_sd_column: spec.declared.portal_sd_column,
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanEntityRef {
+    #[schema(required)]
     pub id: Option<Uuid>,
     pub name: String,
     pub create: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanSiteRef {
+    #[schema(required)]
     pub id: Option<Uuid>,
     pub name: String,
     pub create: bool,
+    #[schema(required)]
     pub latitude: Option<f64>,
+    #[schema(required)]
     pub longitude: Option<f64>,
+    #[schema(required)]
     pub altitude_m: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanParamRef {
+    #[schema(required)]
     pub id: Option<Uuid>,
     /// The parameter identity: the source's own column name (matches what the portal DB shows).
     pub name: String,
@@ -772,33 +792,63 @@ pub struct PlanParamRef {
     #[serde(default)]
     pub group_key: Option<String>,
     #[serde(default)]
+    #[schema(required)]
     pub original_names: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema,
+    sea_orm::FromJsonQueryResult,
+)]
 pub struct PlanSummary {
+    // Every count defaults, because the column is read back from plans stored before it carried
+    // the field, and a count nobody wrote is zero. Every summary written since carries all of
+    // them, which is what `schema(required)` says.
+    #[serde(default)]
+    #[schema(required)]
     pub total_streams: usize,
+    #[serde(default)]
+    #[schema(required)]
     pub will_pair: usize,
     /// The three review states over the entries the plan would pair, so the review can say what
     /// share of the plan waits on a person and what share stands on its own evidence.
     #[serde(default)]
+    #[schema(required)]
     pub needs_checking: usize,
     #[serde(default)]
+    #[schema(required)]
     pub self_validated: usize,
     #[serde(default)]
+    #[schema(required)]
     pub acknowledged: usize,
+    #[serde(default)]
+    #[schema(required)]
     pub will_skip: usize,
+    #[serde(default)]
+    #[schema(required)]
     pub projects_to_create: usize,
+    #[serde(default)]
+    #[schema(required)]
     pub sites_to_create: usize,
+    #[serde(default)]
+    #[schema(required)]
     pub parameters_to_create: usize,
     /// Distinct lab instruments the apply would create, and how many of those an operator has
     /// not yet agreed to. Apply refuses while the second is non-zero.
     #[serde(default)]
+    #[schema(required)]
     pub instruments_to_create: usize,
     #[serde(default)]
+    #[schema(required)]
     pub instruments_unconfirmed: usize,
+    #[serde(default)]
+    #[schema(required)]
     pub unique_projects: usize,
+    #[serde(default)]
+    #[schema(required)]
     pub unique_sites: usize,
+    #[serde(default)]
+    #[schema(required)]
     pub unique_parameters: usize,
 }
 
@@ -1065,9 +1115,9 @@ pub async fn create_plan(
         source_system: Set(source_system.to_string()),
         status: Set("draft".to_string()),
         created_by: Set(None),
-        summary: Set(serde_json::to_value(&summary).unwrap_or_default()),
-        entries: Set(serde_json::to_value(&entries).unwrap_or_default()),
-        curve_assignments: Set(serde_json::Value::Array(Vec::new())),
+        summary: Set(summary),
+        entries: Set(PlanEntries(entries)),
+        curve_assignments: Set(PlanCurveIntents::default()),
         version: Set(0),
         created_at: Set(Utc::now().into()),
         applied_at: Set(None),
@@ -1078,7 +1128,7 @@ pub async fn create_plan(
     Ok(inserted)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, sea_orm::FromJsonQueryResult)]
 pub struct ApplyResult {
     pub projects_created: u32,
     pub sites_created: u32,
@@ -1086,28 +1136,46 @@ pub struct ApplyResult {
     pub site_parameters_created: u32,
     pub streams_paired: u32,
     #[serde(default)]
+    #[schema(required)]
     pub streams_skipped: u32,
     #[serde(default)]
+    #[schema(required)]
     pub instruments_created: u32,
     /// Standard curves moved onto instruments this apply minted.
     #[serde(default)]
+    #[schema(required)]
     pub curves_assigned: u32,
     pub readings_backfilled: u64,
 }
 
+/// The plan's entry list as the column holds it, so the row carries the entries themselves rather
+/// than a JSON document nothing describes.
+#[derive(
+    Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema,
+    sea_orm::FromJsonQueryResult,
+)]
+#[serde(transparent)]
+pub struct PlanEntries(pub Vec<PlanEntry>);
+
+/// The assigned curves as the column holds them.
+#[derive(
+    Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema,
+    sea_orm::FromJsonQueryResult,
+)]
+#[serde(transparent)]
+pub struct PlanCurveIntents(pub Vec<PlanCurveIntent>);
+
 /// A standard curve the review assigned to an instrument the plan creates, keyed by the
 /// instrument's `source_key` because the row does not exist until the apply mints it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanCurveIntent {
     pub curve_id: Uuid,
     pub instrument_source_key: String,
 }
 
-/// The curve assignments a plan carries. Unreadable JSON is an internal error, not an empty list:
-/// silently dropping an assignment is the failure this column exists to prevent.
+/// The curve assignments a plan carries.
 pub fn plan_curve_intents(plan: &pairing_plans::Model) -> AppResult<Vec<PlanCurveIntent>> {
-    serde_json::from_value(plan.curve_assignments.clone())
-        .map_err(|e| AppError::Internal(format!("Failed to parse plan curve assignments: {e}")))
+    Ok(plan.curve_assignments.0.clone())
 }
 
 /// Move each assigned curve onto the instrument the apply minted for its `source_key`. Runs
@@ -1230,8 +1298,7 @@ pub async fn apply_plan(
         )));
     }
 
-    let entries: Vec<PlanEntry> = serde_json::from_value(plan.entries.clone())
-        .map_err(|e| AppError::Internal(format!("Failed to parse plan entries: {e}")))?;
+    let entries: Vec<PlanEntry> = plan.entries.0.clone();
     let curve_intents = plan_curve_intents(&plan)?;
 
     refuse_unconfirmed_instruments(&entries)?;
@@ -1825,7 +1892,7 @@ async fn finalize_plan<C: ConnectionTrait>(
         .into();
     plan_active.status = Set("applied".to_string());
     plan_active.applied_at = Set(Some(Utc::now().into()));
-    plan_active.apply_result = Set(Some(serde_json::to_value(&result).unwrap_or_default()));
+    plan_active.apply_result = Set(Some(result.clone()));
     plan_active.update(txn).await?;
     Ok(())
 }

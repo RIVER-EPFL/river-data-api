@@ -25,17 +25,29 @@ pub struct RegisterNotesRequest {
     pub notes: Vec<NoteItem>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct NoteItem {
-    /// The note's identity within the source, e.g. "notes:1"; the upsert key is
-    /// (source_system, source_key).
-    pub source_key: String,
-    /// The source's own station name. Resolved case-insensitively against existing sites.
-    pub site_name: String,
-    pub text: String,
-    #[serde(default)]
-    pub verified: bool,
+/// One source-authored site note. The note's fields are `river_data_core::models::NoteUpsert`,
+/// which the sync services build from; `verified` has always been optional on this route and core
+/// declares it required, so an omitted flag is filled in before the body is read.
+#[derive(Debug, ToSchema)]
+#[schema(value_type = river_data_core::models::NoteUpsert)]
+pub struct NoteItem(pub river_data_core::models::NoteUpsert);
+
+impl<'de> Deserialize<'de> for NoteItem {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        crate::routes::private::wire::defaulted(
+            deserializer,
+            &[("verified", serde_json::json!(false))],
+        )
+        .map(Self)
+    }
+}
+
+impl std::ops::Deref for NoteItem {
+    type Target = river_data_core::models::NoteUpsert;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]

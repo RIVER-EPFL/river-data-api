@@ -449,3 +449,77 @@ async fn ingest_overwrite_keeps_a_hand_picked_curve_and_recomposes_through_it() 
         "3 * 42.5 + 0.5: the served value comes back through that curve"
     );
 }
+
+/// Expected behaviour: a device status is attributed to the instrument its stream names, the way
+/// a reading on the same stream is. The Vaisala service cannot name one, since the stream list it
+/// reads carries no instrument.
+#[tokio::test]
+#[serial]
+async fn ingest_status_event_takes_the_stream_instrument() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+    let stream = register_stream(&app, &token, "se-instrument").await;
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/ingest/status_events",
+        &serde_json::json!({"stream_id": stream, "events": [
+            {"time": "2025-02-01T00:00:00Z", "value": "ok"}
+        ]}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "status ingest ({status}): {body}");
+
+    assert_eq!(attributed(&db, &stream).await, 1, "the sync arm");
+
+    // The batch arm mints its own "api" channel per slot, and that channel carries an instrument
+    // too.
+    let project =
+        e2e::create_project(&app, &token, "Status Instrument", "status-instr", false).await;
+    let site = e2e::create_site(&app, &token, &project, "Status Site", "status-site").await;
+    let parameter =
+        e2e::create_parameter(&app, &token, "StatInstr", "Status Instrument", "state").await;
+    e2e::assign_site_parameter_minimal(&app, &token, &site, &parameter).await;
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/status_events/batch",
+        &serde_json::json!({"events": [
+            {"site_id": site, "parameter_id": parameter,
+             "time": "2025-02-01T00:00:00Z", "value": "ok"}
+        ]}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "batch status events ({status}): {body}");
+
+    let api_stream = format!("{site}:{parameter}");
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM status_events e JOIN data_streams s ON s.id = e.stream_id \
+                 WHERE s.source_system = 'api' AND s.source_key = '{api_stream}' \
+                 AND e.sensor_id IS NOT DISTINCT FROM s.sensor_id AND e.sensor_id IS NOT NULL"
+            )
+        )
+        .await,
+        1,
+        "the batch arm"
+    );
+}
+
+/// Status events on a stream that carry exactly the instrument that stream names.
+async fn attributed(db: &DatabaseConnection, stream: &str) -> i64 {
+    count(
+        db,
+        &format!(
+            "SELECT count(*) AS c FROM status_events e JOIN data_streams s ON s.id = e.stream_id \
+             WHERE e.stream_id = '{stream}' AND e.sensor_id IS NOT DISTINCT FROM s.sensor_id \
+             AND e.sensor_id IS NOT NULL"
+        ),
+    )
+    .await
+}

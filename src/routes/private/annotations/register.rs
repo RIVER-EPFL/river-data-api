@@ -29,22 +29,8 @@ pub struct RegisterAnnotationsRequest {
     pub annotations: Vec<AnnotationItem>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AnnotationItem {
-    /// The annotation's identity within the source; the upsert key is
-    /// (source_system, source_key).
-    pub source_key: String,
-    /// The stream whose pairing resolves the annotation's site and parameter.
-    pub stream_id: Uuid,
-    /// The instant the annotation covers, stored as a point (start_time == end_time).
-    pub time: chrono::DateTime<chrono::Utc>,
-    pub category: String,
-    pub text: String,
-    /// The standard curve the source applied to produce the annotated value, when it did.
-    #[serde(default)]
-    pub standard_curve_id: Option<Uuid>,
-}
+/// One source-authored annotation, as the sync service sends it. Declared in `river-data-core`.
+pub use river_data_core::models::AnnotationUpsert as AnnotationItem;
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RegisterAnnotationsResponse {

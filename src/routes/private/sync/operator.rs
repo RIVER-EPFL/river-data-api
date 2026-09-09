@@ -145,11 +145,12 @@ pub struct SyncCommandResponse {
     pub id: Uuid,
     pub service_id: Uuid,
     pub command: String,
-    #[schema(value_type = Object)]
+    #[schema(value_type = Option<std::collections::HashMap<String, serde_json::Value>>)]
     #[schema(required)]
     pub payload: Option<serde_json::Value>,
     pub status: String,
-    #[schema(value_type = Object)]
+    /// What the service reported back, shaped by the command it answers.
+    #[schema(value_type = Option<std::collections::HashMap<String, serde_json::Value>>)]
     #[schema(required)]
     pub result: Option<serde_json::Value>,
     pub created_at: String,
@@ -221,10 +222,12 @@ pub struct SyncEventResponse {
     pub readings_synced: i64,
     pub readings_skipped: i64,
     pub status_events_synced: i64,
-    #[schema(value_type = Object)]
+    /// The messages the pass reported, in order.
+    #[schema(value_type = Option<Vec<String>>)]
     #[schema(required)]
     pub errors: Option<serde_json::Value>,
-    #[schema(value_type = Object)]
+    /// The lines the pass logged, in order.
+    #[schema(value_type = Option<Vec<String>>)]
     #[schema(required)]
     pub log: Option<serde_json::Value>,
     pub started_at: String,

@@ -207,7 +207,7 @@ async fn preview_estimator(
     stream: &data_streams::Model,
 ) -> AppResult<sd_estimator::Resolved> {
     let spec = super::replicates::ReplicateSpec::from_metadata(&stream.metadata)
-        .and_then(|spec| spec.sd_estimator);
+        .and_then(|spec| spec.declared.sd_estimator);
     let spec = sd_estimator::parse_opt(spec.as_deref())?;
     if let Some(estimator) = spec {
         return Ok(sd_estimator::Resolved {
@@ -506,37 +506,19 @@ pub async fn stream_receipts(
     }))
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct RegisterStreamRequest {
-    pub source_system: String,
-    pub source_key: String,
-    pub source_name: Option<String>,
-    pub source_path: Option<String>,
-    #[serde(default = "default_metadata")]
-    #[schema(value_type = Object)]
-    pub metadata: serde_json::Value,
-    /// Stream-level default for readings.measurement_type ('continuous' | 'spot' | 'derived').
-    /// Omit to defer to the owning sensor's data_frequency.
-    #[serde(default)]
-    pub measurement_type: Option<String>,
-    /// The instrument that produces this feed. Omit when the caller does not know it: the sensor
-    /// is then resolved from the metadata serial at import or pairing time. Declaring it is what
-    /// stops pairing minting a second, serial-less instrument alongside the real one.
-    #[serde(default)]
-    pub sensor_id: Option<Uuid>,
-    /// Declares this stream a replicate family: each reading carries the replicate index the
-    /// stored column-to-index mapping assigns to its source column (a group can be sparse and
-    /// need not include index 0), and groups form `samples` rows. Validated here (two or more
-    /// unique members, spot classification) and stored under `metadata["replicates"]`. The
-    /// mapping is pinned append-only across re-registrations; the response's `replicates` field
-    /// is the authoritative mapping to assign indexes from.
-    #[serde(default)]
-    pub replicates: Option<super::replicates::ReplicateSpec>,
-    /// The decimal places the source stores or presents this channel at (0 to 10). Stored under
-    /// `metadata.decimal_places`; pairing writes it onto the slot where none is declared, and the
-    /// public API expresses the slot's values at it. Omit to declare nothing.
-    #[serde(default)]
-    pub decimal_places: Option<i16>,
+/// A stream registration, as a sync service sends it. The field list is
+/// `river_data_core::models::RegisterStreamRequest`, which the clients build from, so a field the
+/// sender gains cannot be dropped here in silence. `metadata` has always been optional on this
+/// route and core declares it required, so an omitted object is filled in before the body is read.
+#[derive(Debug, ToSchema)]
+#[schema(value_type = river_data_core::models::RegisterStreamRequest)]
+pub struct RegisterStreamRequest(pub river_data_core::models::RegisterStreamRequest);
+
+impl<'de> Deserialize<'de> for RegisterStreamRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        crate::routes::private::wire::defaulted(deserializer, &[("metadata", default_metadata())])
+            .map(Self)
+    }
 }
 
 fn default_metadata() -> serde_json::Value {
@@ -544,7 +526,9 @@ fn default_metadata() -> serde_json::Value {
 }
 
 /// Upsert a data stream by (source_system, source_key). Used by sync microservices on
-/// discovery to register streams before pairing. Requires `write_metadata`.
+/// discovery to register streams before pairing. Requires `write_metadata`. `metadata` may be
+/// omitted and defaults to an empty object, which the schema, taken from the client's own struct,
+/// does not say.
 #[utoipa::path(
     post,
     path = "/api/streams/register",
@@ -557,7 +541,7 @@ fn default_metadata() -> serde_json::Value {
 pub async fn register_stream(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
-    Json(mut payload): Json<RegisterStreamRequest>,
+    Json(RegisterStreamRequest(mut payload)): Json<RegisterStreamRequest>,
 ) -> AppResult<Json<DataStream>> {
     crate::routes::private::readings::measurement::validate_measurement_type(
         payload.measurement_type.as_deref(),
@@ -567,18 +551,22 @@ pub async fn register_stream(
         .filter(data_streams::Column::SourceKey.eq(&payload.source_key))
         .one(&state.db)
         .await?;
-    if let Some(spec) = payload.replicates.as_mut() {
-        spec.validate(payload.measurement_type.as_deref())?;
+    if let Some(declared) = payload.replicates.clone() {
+        super::replicates::validate_declaration(&declared, payload.measurement_type.as_deref())?;
         // The stored column-to-index mapping is authoritative and append-only: readings carry
         // their index for life, so a re-registration keeps every known column's index, appends
-        // genuinely new columns, and retires absent ones without reusing their indexes. The
-        // caller's own `assignments`, if any, are ignored; only the register path authors them.
+        // genuinely new columns, and retires absent ones without reusing their indexes. Only the
+        // register path authors it, which is why the caller's declaration cannot carry one.
         let prior = stored
             .as_ref()
             .and_then(|s| super::replicates::ReplicateSpec::from_metadata(&s.metadata));
-        spec.assignments =
-            super::replicates::pin_assignments(prior.as_ref(), &spec.source_columns)?;
-        spec.embed(&mut payload.metadata)?;
+        let assignments =
+            super::replicates::pin_assignments(prior.as_ref(), &declared.source_columns)?;
+        super::replicates::ReplicateSpec {
+            declared,
+            assignments,
+        }
+        .embed(&mut payload.metadata)?;
     }
     if let Some(sensor_id) = payload.sensor_id {
         validate_declared_sensor(&state.db, &scope, sensor_id, &payload.metadata).await?;

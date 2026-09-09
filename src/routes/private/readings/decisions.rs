@@ -411,9 +411,9 @@ pub struct DecisionRow {
     #[schema(required)]
     pub replicate_index: Option<i16>,
     pub kind: Kind,
-    #[schema(value_type = Object)]
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub old: serde_json::Value,
-    #[schema(value_type = Object)]
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub new: serde_json::Value,
     pub actor: String,
     pub at: chrono::DateTime<chrono::Utc>,

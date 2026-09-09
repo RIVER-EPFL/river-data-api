@@ -446,8 +446,7 @@ pub struct PreviewResponse {
     /// The statistics the samples trigger recomputed for the groups the rows belong to.
     pub samples: Vec<MovedSample>,
     /// The calculations the touched parameters feed, in the order the chain would run them.
-    #[schema(value_type = Vec<Object>)]
-    pub calculations: Vec<serde_json::Value>,
+    pub calculations: Vec<crate::routes::private::tools::closure::CalculationImpact>,
     /// Everything the preview does not compute, named rather than left to be assumed.
     pub not_previewed: Vec<String>,
 }
@@ -647,11 +646,7 @@ pub async fn preview(
     .await?;
 
     let calculations =
-        crate::routes::private::tools::closure::calculations_fed_by(&state.db, &parameters)
-            .await?
-            .into_iter()
-            .map(|c| serde_json::to_value(c).unwrap_or(serde_json::Value::Null))
-            .collect();
+        crate::routes::private::tools::closure::calculations_fed_by(&state.db, &parameters).await?;
 
     Ok(Json(PreviewResponse {
         preview_id: preview_id(&req.selection, &req.decision)?,
@@ -896,11 +891,11 @@ struct StoredRun {
 pub struct ReloadResponse {
     pub tool: String,
     /// The calculate body that reproduces the run: its stored inputs plus the calculation context.
-    #[schema(value_type = Object)]
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub body: serde_json::Value,
-    #[schema(value_type = Object)]
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub constants: serde_json::Value,
-    #[schema(value_type = Vec<Object>)]
+    #[schema(value_type = Vec<std::collections::HashMap<String, serde_json::Value>>)]
     pub curves: Vec<serde_json::Value>,
 }
 

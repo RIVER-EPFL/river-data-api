@@ -469,10 +469,10 @@ pub struct CreateVersionRequest {
     pub script: String,
     #[serde(default)]
     pub entry_function: Option<String>,
-    #[schema(value_type = Object)]
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub manifest: serde_json::Value,
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub test_cases: Option<serde_json::Value>,
     /// Short free text: what changed in this version and why.
     #[serde(default)]
@@ -606,31 +606,31 @@ pub struct DraftRunRequest {
     pub script: String,
     #[serde(default)]
     pub entry_function: Option<String>,
-    #[schema(value_type = Object)]
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub manifest: serde_json::Value,
     /// The calculate request body this draft is run with: the manifest's params, plus its curve
     /// slots given either as a `standard_curve_id` or as literal coefficients.
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub inputs: Option<serde_json::Value>,
     /// Constant values in place of the catalog. As in a stored test case, an override must name
     /// every constant the manifest declares; omit the field to read the catalog.
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = Option<std::collections::HashMap<String, f64>>)]
     pub constants: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// What the script produced, present only when the run reached the end.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DraftRunResults {
-    #[schema(value_type = Object)]
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub results: serde_json::Value,
     pub inputs_used: Vec<String>,
     pub inputs_ignored: Vec<String>,
-    #[schema(value_type = Object)]
+    /// The constant values the server resolved and passed to the runner, by name.
+    #[schema(value_type = std::collections::HashMap<String, f64>)]
     pub constants: serde_json::Value,
-    #[schema(value_type = Vec<Object>)]
-    pub curves: Vec<serde_json::Value>,
+    pub curves: Vec<crate::routes::private::tools::engine::CurveSnapshot>,
 }
 
 /// Which of the three things that end a draft run happened, so a caller can render the failure
@@ -819,7 +819,7 @@ pub struct InspectScriptRequest {
     /// A manifest to set the inspection against. Supplying one adds `reconciliation` to the
     /// response; nothing here reads or writes a stored manifest.
     #[serde(default)]
-    #[schema(value_type = Object)]
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub manifest: Option<serde_json::Value>,
 }
 

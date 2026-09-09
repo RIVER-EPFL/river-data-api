@@ -20,3 +20,4 @@ pub mod sensors;
 pub mod sites;
 pub mod sync;
 pub mod tools;
+pub mod wire;

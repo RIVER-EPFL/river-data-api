@@ -25,6 +25,10 @@ use crate::routes::private::sensors::standard_curves;
 use crate::routes::private::sync::replicate_audit as audit;
 use crate::routes::private::{data_streams, readings, readings::status_events};
 
+/// The reading and status-event bodies a sync service sends. Declared in `river-data-core`, which
+/// both sides read, so a field the sender gains cannot go missing here.
+pub use river_data_core::models::{IngestReading, IngestStatusEvent};
+
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IngestReadingsRequest {
@@ -54,29 +58,6 @@ pub struct IngestReadingsRequest {
     /// request is a bare append, exactly the old semantics.
     #[serde(default)]
     pub window: Option<crate::routes::private::readings::reconcile::SourceWindow>,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct IngestReading {
-    pub time: chrono::DateTime<Utc>,
-    pub raw_value: f64,
-    #[serde(default)]
-    pub replicate_index: i16,
-    pub sensor_id: Option<Uuid>,
-    pub calibration_id: Option<Uuid>,
-    pub deployment_id: Option<Uuid>,
-    /// Per-reading override ('continuous' | 'spot' | 'derived'). Omit to resolve from the
-    /// stream's measurement_type, then the owning sensor's data_frequency.
-    #[serde(default)]
-    pub measurement_type: Option<String>,
-    /// The lab standard curve that corrects this reading, for sync services replaying portal
-    /// measurements that carried one. Held to the grab rules: the reading must be a spot
-    /// measurement on the instrument the curve was fitted on, and the stored value is recomputed
-    /// from the curve's coefficients. An inadmissible claim is stripped: the reading is stored
-    /// uncorrected and a `curve_claim_stripped` hold records the claim for review.
-    #[serde(default)]
-    pub standard_curve_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -243,7 +224,7 @@ pub async fn ingest_readings(
     // materialises are recorded undeclared.
     let stream_sd_estimator =
         data_streams::replicates::ReplicateSpec::from_metadata(&stream.metadata)
-            .and_then(|spec| spec.sd_estimator.clone());
+            .and_then(|spec| spec.declared.sd_estimator.clone());
 
     // Withdrawal is confined to spot rows by a database CHECK; the continuous aggregates exclude
     // spot, which is what keeps a retraction structurally unreachable by a rollup. A window on a
@@ -1144,14 +1125,6 @@ pub struct IngestStatusEventsRequest {
     pub events: Vec<IngestStatusEvent>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct IngestStatusEvent {
-    pub time: chrono::DateTime<Utc>,
-    pub value: String,
-    pub sensor_id: Option<Uuid>,
-}
-
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IngestStatusEventsResponse {
     pub inserted: usize,
@@ -1289,7 +1262,9 @@ pub async fn ingest_status_events(
             site_id: Set(site_id),
             parameter_id: Set(parameter_id),
             value: Set(e.value.clone()),
-            sensor_id: Set(e.sensor_id),
+            // The stream's own instrument is what reported the status, as it is for the readings
+            // arm above; a client that names one is naming an instrument the stream does not own.
+            sensor_id: Set(e.sensor_id.or(stream.sensor_id)),
         })
         .collect();
 

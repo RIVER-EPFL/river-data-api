@@ -106,7 +106,7 @@ pub struct DefinitionMember {
     #[schema(nullable = false)]
     pub section: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
+    #[schema(nullable = false, value_type = Option<std::collections::HashMap<String, serde_json::Value>>)]
     pub replicates: Option<serde_json::Value>,
     /// The mean and sd columns a replicated member also shows. Absent on a member entered once.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -14,38 +14,34 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors;
 use crate::routes::private::sensors::identity::{InstrumentKind, upsert_source_instrument};
 
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+/// One instrument from a source's own register. The instrument's own fields are
+/// `river_data_core::models::SensorUpsert`, which the sync services build from; the API adds the
+/// source the caller is speaking for, and supplies the `is_lab_instrument` default this route has
+/// always accepted an omitted flag under.
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RegisterSensorRequest {
     /// The sync source the instrument comes from, e.g. "metalp".
     pub source_system: String,
-    /// The instrument's identity within that source, e.g. "sensor_inventory:62". Stable across
-    /// re-registration; the upsert key is (source_system, source_key).
-    pub source_key: String,
-    pub name: String,
-    /// The lab's own serial for the instrument. Claimed only when no other instrument holds it;
-    /// see [`serial_to_claim`].
-    #[serde(default)]
-    pub serial_number: Option<String>,
-    #[serde(default)]
-    pub manufacturer: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub notes: Option<String>,
-    /// False for a field instrument, true for one that corrects a grab in the lab.
-    #[serde(default)]
-    pub is_lab_instrument: bool,
-    /// 'high' or 'low'. Read as a cadence declaration when a stream classifies its readings, so
-    /// leave it 'high' unless the source knows the instrument logs at grab cadence.
-    #[serde(default = "default_data_frequency")]
-    pub data_frequency: String,
-    #[serde(default)]
-    pub metadata: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub instrument: river_data_core::models::SensorUpsert,
 }
 
-fn default_data_frequency() -> String {
-    "high".to_string()
+impl<'de> Deserialize<'de> for RegisterSensorRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (source_system, instrument) = crate::routes::private::wire::with_source_system(
+            deserializer,
+            &[("is_lab_instrument", serde_json::json!(false))],
+        )?;
+        Ok(Self {
+            source_system,
+            instrument,
+        })
+    }
+}
+
+/// The cadence a registration declares, or the default this route has always applied.
+fn declared_frequency(instrument: &river_data_core::models::SensorUpsert) -> &str {
+    instrument.data_frequency.as_deref().unwrap_or("high")
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -104,21 +100,22 @@ pub async fn register_sensor(
     Json(payload): Json<RegisterSensorRequest>,
 ) -> AppResult<Json<RegisterSensorResponse>> {
     let source_system = crate::common::provenance::source_system(&auth, &payload.source_system)?;
-    if payload.source_key.trim().is_empty() {
+    let instrument = &payload.instrument;
+    if instrument.source_key.trim().is_empty() {
         return Err(AppError::BadRequest(
             "source_key identifies the instrument and cannot be empty".to_string(),
         ));
     }
-    if !matches!(payload.data_frequency.as_str(), "high" | "low") {
+    let data_frequency = declared_frequency(instrument);
+    if !matches!(data_frequency, "high" | "low") {
         return Err(AppError::BadRequest(format!(
-            "data_frequency must be 'high' or 'low', got '{}'",
-            payload.data_frequency
+            "data_frequency must be 'high' or 'low', got '{data_frequency}'"
         )));
     }
 
     let existing = sensors::Entity::find()
         .filter(sensors::Column::SourceSystem.eq(source_system.clone()))
-        .filter(sensors::Column::SourceKey.eq(payload.source_key.clone()))
+        .filter(sensors::Column::SourceKey.eq(instrument.source_key.clone()))
         .one(&state.db)
         .await?;
     if let Some(current) = existing {
@@ -132,32 +129,32 @@ pub async fn register_sensor(
     let id = upsert_source_instrument(
         &state.db,
         &source_system,
-        &payload.source_key,
-        &payload.name,
-        if payload.is_lab_instrument {
+        &instrument.source_key,
+        &instrument.name,
+        if instrument.is_lab_instrument {
             InstrumentKind::Lab
         } else {
             InstrumentKind::Device
         },
-        &payload.data_frequency,
-        payload.metadata.clone(),
+        data_frequency,
+        instrument.metadata.clone(),
     )
     .await?;
 
-    let held_by = match payload.serial_number.as_deref().map(str::trim) {
+    let held_by = match instrument.serial_number.as_deref().map(str::trim) {
         Some(s) if !s.is_empty() => serial_holder(&state.db, s).await?,
         _ => None,
     };
-    let serial = serial_to_claim(payload.serial_number.as_deref(), held_by);
+    let serial = serial_to_claim(instrument.serial_number.as_deref(), held_by);
 
     let mut active = sensors::ActiveModel {
         id: Set(id),
         ..Default::default()
     };
     active.serial_number = Set(serial);
-    active.manufacturer = Set(payload.manufacturer.clone());
-    active.model = Set(payload.model.clone());
-    active.notes = Set(payload.notes.clone());
+    active.manufacturer = Set(instrument.manufacturer.clone());
+    active.model = Set(instrument.model.clone());
+    active.notes = Set(instrument.notes.clone());
     active.update(&state.db).await?;
 
     Ok(Json(RegisterSensorResponse {

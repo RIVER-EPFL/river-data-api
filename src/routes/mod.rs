@@ -467,7 +467,7 @@ pub fn validate_optional_time_range(
             private::data_streams::views::ReceiptsResponse,
             private::data_streams::views::ReceiptRow,
             private::data_streams::views::RegisterStreamRequest,
-            private::data_streams::replicates::ReplicateSpec,
+            river_data_core::models::ReplicateSpec,
             private::data_streams::replicates::ColumnAssignment,
             private::notes::register::RegisterNotesRequest,
             private::notes::register::RegisterNotesResponse,

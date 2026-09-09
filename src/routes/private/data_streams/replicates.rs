@@ -9,7 +9,6 @@
 
 use sea_orm::{ConnectionTrait, Statement};
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
@@ -17,87 +16,68 @@ use crate::error::{AppError, AppResult};
 /// The metadata key the spec is stored under.
 pub const METADATA_KEY: &str = "replicates";
 
-/// One source column's permanent replicate index. The mapping is append-only: a column keeps its
-/// index for the life of the stream, a new column appends after the highest index ever assigned,
-/// and a column the source stops sending is retired with its index never reused.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct ColumnAssignment {
-    pub column: String,
-    pub index: i16,
-    /// The source no longer sends this column. Its readings keep the index; nothing new lands on it.
-    #[serde(default)]
-    pub retired: bool,
-}
+/// One source column's permanent replicate index, and the declaration a sync service registers.
+/// Both are declared in `river-data-core`: the mapping travels back on the register response and
+/// decides which index a reading is stored under, so neither side may author it alone.
+///
+/// The mapping is append-only: a column keeps its index for the life of the stream, a new column
+/// appends after the highest index ever assigned, and a column the source stops sending is retired
+/// with its index never reused.
+pub use river_data_core::models::ColumnAssignment;
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+/// A stream's replicate family as it is stored: the source's declaration, plus the column-to-index
+/// mapping the register path pins. The caller declares columns and never authors indexes, so the
+/// two halves have separate authors and only this stored form carries both. It is not a wire
+/// shape: a registration carries the declaration alone, and this is what stream metadata holds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicateSpec {
-    /// Source columns as the source currently declares them. Ordering is provenance only: the
-    /// authoritative column-to-index mapping is `assignments`, pinned at registration.
-    pub source_columns: Vec<String>,
+    #[serde(flatten)]
+    pub declared: river_data_core::models::ReplicateSpec,
     /// The authoritative column-to-index mapping, authored by the register path (never by the
     /// caller) via [`pin_assignments`]. Readings carry these indexes for life, so re-registration
     /// preserves them: see [`ColumnAssignment`].
     #[serde(default)]
     pub assignments: Vec<ColumnAssignment>,
-    /// The portal's precomputed mean column. Audited at sync time, never a stream.
-    #[serde(default)]
-    pub portal_mean_column: Option<String>,
-    /// The portal's precomputed standard-deviation column. Audited, never a stream.
-    #[serde(default)]
-    pub portal_sd_column: Option<String>,
-    /// The portal column holding the per-row standard-curve reference, when the family's values
-    /// are corrected through one (e.g. `doc_std_curve_id`).
-    #[serde(default)]
-    pub curve_ref_column: Option<String>,
-    /// How the portal derives its mean from the members, as declared by its calculation registry
-    /// (e.g. `calcMean`, `calcDOCavg`). Recorded for provenance and for the audit's semantics.
-    #[serde(default)]
-    pub calc: Option<String>,
-    /// Which divisor this source computes its standard deviation with: `sample` (n-1) or
-    /// `population` (n). Absent means the source has not said, which is the honest answer for the
-    /// portals that used both over the years; the slot's declaration then decides, and absent that
-    /// the samples are recorded undeclared and their audit disagreements are held for a decision.
-    /// Nothing infers this from the data.
-    #[serde(default)]
-    #[schema(value_type = Option<crate::routes::private::readings::sd_estimator::SdEstimator>)]
-    pub sd_estimator: Option<String>,
+}
+
+/// Refuse a declaration that cannot describe a replicate family. Two or more members, no
+/// duplicates, and the stream must be classified spot: sample formation is spot-only, so a
+/// continuous stream declaring replicates would silently never form the samples the spec promises.
+pub fn validate_declaration(
+    declared: &river_data_core::models::ReplicateSpec,
+    stream_measurement_type: Option<&str>,
+) -> AppResult<()> {
+    if declared.source_columns.len() < 2 {
+        return Err(AppError::BadRequest(
+            "a replicate spec needs at least two source columns; a single-column stream \
+             carries no replicates to declare"
+                .to_string(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for col in &declared.source_columns {
+        if col.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "replicate source columns cannot be empty".to_string(),
+            ));
+        }
+        if !seen.insert(col.as_str()) {
+            return Err(AppError::BadRequest(format!(
+                "replicate source column '{col}' is listed twice"
+            )));
+        }
+    }
+    if stream_measurement_type != Some(crate::routes::private::readings::sample_groups::SPOT) {
+        return Err(AppError::BadRequest(
+            "a stream declaring replicates must be classified 'spot': samples only form from \
+             spot readings"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 impl ReplicateSpec {
-    /// Refuse a spec that cannot describe a replicate family. Two or more members, no duplicates,
-    /// and the stream must be classified spot: sample formation is spot-only, so a continuous
-    /// stream declaring replicates would silently never form the samples the spec promises.
-    pub fn validate(&self, stream_measurement_type: Option<&str>) -> AppResult<()> {
-        if self.source_columns.len() < 2 {
-            return Err(AppError::BadRequest(
-                "a replicate spec needs at least two source columns; a single-column stream \
-                 carries no replicates to declare"
-                    .to_string(),
-            ));
-        }
-        let mut seen = std::collections::HashSet::new();
-        for col in &self.source_columns {
-            if col.trim().is_empty() {
-                return Err(AppError::BadRequest(
-                    "replicate source columns cannot be empty".to_string(),
-                ));
-            }
-            if !seen.insert(col.as_str()) {
-                return Err(AppError::BadRequest(format!(
-                    "replicate source column '{col}' is listed twice"
-                )));
-            }
-        }
-        if stream_measurement_type != Some(crate::routes::private::readings::sample_groups::SPOT) {
-            return Err(AppError::BadRequest(
-                "a stream declaring replicates must be classified 'spot': samples only form from \
-                 spot readings"
-                    .to_string(),
-            ));
-        }
-        Ok(())
-    }
-
     /// Store the spec under [`METADATA_KEY`] in a stream's metadata object.
     pub fn embed(&self, metadata: &mut serde_json::Value) -> AppResult<()> {
         let spec = serde_json::to_value(self)
@@ -124,24 +104,11 @@ impl ReplicateSpec {
     }
 
     /// The authoritative mapping, ordered by index. A spec stored before pinning derives it from
-    /// its column positions, which were the indexes at the time.
+    /// its column positions, which were the indexes at the time; core resolves both sides the same
+    /// way, so a sync service never invents an index this would not.
     #[must_use]
     pub fn column_assignments(&self) -> Vec<ColumnAssignment> {
-        let mut assignments = if self.assignments.is_empty() {
-            self.source_columns
-                .iter()
-                .enumerate()
-                .map(|(i, column)| ColumnAssignment {
-                    column: column.clone(),
-                    index: i16::try_from(i).unwrap_or(i16::MAX),
-                    retired: false,
-                })
-                .collect()
-        } else {
-            self.assignments.clone()
-        };
-        assignments.sort_by_key(|a| a.index);
-        assignments
+        ColumnAssignment::resolve(self.assignments.clone(), &self.declared.source_columns)
     }
 }
 
@@ -311,10 +278,9 @@ pub fn refuse_family_retag(keys: &[String], target: &str) -> AppResult<()> {
 mod tests {
     use super::*;
 
-    fn spec(columns: &[&str]) -> ReplicateSpec {
-        ReplicateSpec {
+    fn declaration(columns: &[&str]) -> river_data_core::models::ReplicateSpec {
+        river_data_core::models::ReplicateSpec {
             source_columns: columns.iter().map(ToString::to_string).collect(),
-            assignments: Vec::new(),
             portal_mean_column: Some("DOC_avg_ppb".to_string()),
             portal_sd_column: Some("DOC_sd_ppb".to_string()),
             curve_ref_column: Some("doc_std_curve_id".to_string()),
@@ -323,29 +289,37 @@ mod tests {
         }
     }
 
+    fn spec(columns: &[&str]) -> ReplicateSpec {
+        ReplicateSpec {
+            declared: declaration(columns),
+            assignments: Vec::new(),
+        }
+    }
+
     #[test]
     fn a_valid_spec_roundtrips_through_metadata() {
         let s = spec(&["DOC_rep_1", "DOC_rep_2", "DOC_rep_3"]);
-        s.validate(Some("spot")).unwrap();
+        validate_declaration(&s.declared, Some("spot")).unwrap();
         let mut metadata = serde_json::json!({"hierarchy": {"site": "DGT"}});
         s.embed(&mut metadata).unwrap();
         let parsed = ReplicateSpec::from_metadata(&metadata).unwrap();
-        assert_eq!(parsed.source_columns, s.source_columns);
-        assert_eq!(parsed.portal_mean_column.as_deref(), Some("DOC_avg_ppb"));
+        assert_eq!(parsed.declared.source_columns, s.declared.source_columns);
+        assert_eq!(
+            parsed.declared.portal_mean_column.as_deref(),
+            Some("DOC_avg_ppb")
+        );
         assert_eq!(metadata["hierarchy"]["site"], "DGT");
     }
 
     #[test]
     fn a_single_member_is_refused() {
-        assert!(spec(&["DOC_rep_1"]).validate(Some("spot")).is_err());
+        assert!(validate_declaration(&declaration(&["DOC_rep_1"]), Some("spot")).is_err());
     }
 
     #[test]
     fn duplicate_members_are_refused() {
         assert!(
-            spec(&["DOC_rep_1", "DOC_rep_1"])
-                .validate(Some("spot"))
-                .is_err()
+            validate_declaration(&declaration(&["DOC_rep_1", "DOC_rep_1"]), Some("spot")).is_err()
         );
     }
 
@@ -382,11 +356,13 @@ mod tests {
     #[test]
     fn a_non_spot_stream_cannot_declare_replicates() {
         assert!(
-            spec(&["DOC_rep_1", "DOC_rep_2"])
-                .validate(Some("continuous"))
-                .is_err()
+            validate_declaration(
+                &declaration(&["DOC_rep_1", "DOC_rep_2"]),
+                Some("continuous")
+            )
+            .is_err()
         );
-        assert!(spec(&["DOC_rep_1", "DOC_rep_2"]).validate(None).is_err());
+        assert!(validate_declaration(&declaration(&["DOC_rep_1", "DOC_rep_2"]), None).is_err());
     }
 }
 

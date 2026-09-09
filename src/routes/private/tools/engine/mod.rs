@@ -716,12 +716,21 @@ impl ActiveTool {
 
 /// A curve as the runner receives it: coefficients plus, when it came from the catalog, the
 /// identity that resolves them.
-#[derive(Debug, Serialize)]
-struct ResolvedCurve {
-    slope: f64,
-    intercept: f64,
-    standard_curve_id: Option<Uuid>,
-    label: Option<String>,
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ResolvedCurve {
+    pub slope: f64,
+    pub intercept: f64,
+    #[schema(required)]
+    pub standard_curve_id: Option<Uuid>,
+    #[schema(required)]
+    pub label: Option<String>,
+}
+
+/// One curve as the stored run records it: the slot it filled, and the curve itself.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CurveSnapshot {
+    pub name: String,
+    pub curve: ResolvedCurve,
 }
 
 async fn resolve_curve(
@@ -836,7 +845,7 @@ pub struct RunOutcome {
     pub skipped: Vec<serde_json::Value>,
     pub inputs_used: Vec<String>,
     pub inputs_ignored: Vec<String>,
-    pub curves: Vec<serde_json::Value>,
+    pub curves: Vec<CurveSnapshot>,
     pub constants: serde_json::Map<String, serde_json::Value>,
     /// The inputs exactly as the runner received them: request values, plus defaults and the
     /// resolved site/event inputs, minus the curves. This is what the stored run records, so a
@@ -1076,7 +1085,7 @@ pub struct ResolvedRun {
     /// Curves by slot name, as the runner receives them.
     pub curves: serde_json::Map<String, serde_json::Value>,
     /// The same curves as `{name, curve}` snapshots, the form the stored run records.
-    pub curve_snapshots: Vec<serde_json::Value>,
+    pub curve_snapshots: Vec<CurveSnapshot>,
     curves_consumed: Vec<String>,
     provided: Vec<String>,
     pub site_inputs: Vec<serde_json::Value>,
@@ -1093,7 +1102,7 @@ impl ResolvedRun {
             version_id,
             &serde_json::Value::Object(self.inputs.clone()),
             &serde_json::Value::Object(self.constants.clone()),
-            &serde_json::Value::Array(self.curve_snapshots.clone()),
+            &serde_json::to_value(&self.curve_snapshots).unwrap_or_default(),
         )
     }
 }
@@ -1229,7 +1238,10 @@ pub async fn resolve_run(
                 curves_consumed.push(slot.name.clone());
                 let resolved = resolve_curve(&state.db, slot, &value).await?;
                 let json = serde_json::to_value(&resolved).unwrap_or_default();
-                curve_snapshots.push(serde_json::json!({ "name": slot.name, "curve": json }));
+                curve_snapshots.push(CurveSnapshot {
+                    name: slot.name.clone(),
+                    curve: resolved,
+                });
                 curves.insert(slot.name.clone(), json);
             }
             _ if slot.required => {
@@ -1462,7 +1474,7 @@ async fn apply_manifest_aggregates(
     db: &DatabaseConnection,
     manifest: &Manifest,
     inputs: &serde_json::Map<String, serde_json::Value>,
-    curve_snapshots: &[serde_json::Value],
+    curve_snapshots: &[CurveSnapshot],
     site_id: Option<Uuid>,
     collected_at: Option<chrono::DateTime<chrono::Utc>>,
     results: &mut serde_json::Map<String, serde_json::Value>,
@@ -1487,12 +1499,10 @@ async fn apply_manifest_aggregates(
             .curve
             .as_deref()
             .and_then(|slot| {
-                curve_snapshots.iter().find_map(|s| {
-                    (s.get("name")?.as_str()? == slot).then(|| {
-                        let c = s.get("curve")?;
-                        Some((c.get("slope")?.as_f64()?, c.get("intercept")?.as_f64()?))
-                    })?
-                })
+                curve_snapshots
+                    .iter()
+                    .find(|s| s.name == slot)
+                    .map(|s| (s.curve.slope, s.curve.intercept))
             })
             .unwrap_or((1.0, 0.0));
         let values: Vec<f64> = cells

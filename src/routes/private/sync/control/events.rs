@@ -42,9 +42,11 @@ pub struct UpdateSyncEventRequest {
     #[serde(default)]
     pub readings_skipped: Option<i64>,
     pub status_events_synced: Option<i64>,
-    #[schema(value_type = Object)]
+    /// The messages the pass reported, in order.
+    #[schema(value_type = Option<Vec<String>>)]
     pub errors: Option<serde_json::Value>,
-    #[schema(value_type = Object)]
+    /// The lines the pass logged, in order.
+    #[schema(value_type = Option<Vec<String>>)]
     pub log: Option<serde_json::Value>,
     pub duration_ms: Option<i64>,
 }

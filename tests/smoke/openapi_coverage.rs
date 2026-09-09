@@ -18,7 +18,6 @@ const UNTYPED: &[(&str, &str)] = &[
     ("POST", "/api/actions/refresh_aggregates"),
     ("POST", "/api/actions/reprocess"),
     ("POST", "/api/actions/sensor_calibrations/{id}/recalculate"),
-    ("GET", "/api/alarms/thresholds"),
     ("PATCH", "/api/sync/commands/{id}"),
     ("PATCH", "/api/sync/events/{id}"),
     ("POST", "/api/sync/events"),

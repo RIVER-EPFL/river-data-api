@@ -7,8 +7,9 @@
 use axum::{Json, extract::State};
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
-    Statement, TransactionTrait, FromQueryResult,};
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter,
+    QueryOrder, Set, Statement, TransactionTrait,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -19,29 +20,26 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors;
 use crate::routes::private::sensors::identity::{InstrumentKind, upsert_source_instrument};
 
-#[derive(Debug, Deserialize, ToSchema)]
+/// One portal standard curve to register. The curve's own fields are
+/// `river_data_core::models::StandardCurveUpsert`, which the sync services build from, so a field
+/// the sender gains cannot be dropped here; the API adds the source the caller is speaking for.
+#[derive(Debug, Serialize, ToSchema)]
 pub struct RegisterStandardCurveRequest {
     /// The sync source the curve comes from, e.g. "cnet".
     pub source_system: String,
-    /// The curve's identity within that source, e.g. "standard_curves:17". Stable across
-    /// re-registration; the upsert key is (source_system, source_key).
-    pub source_key: String,
-    /// The lab instrument family the curve was fitted for, e.g. "DOC corr". A lab-instrument
-    /// sensor is found or created per (source_system, instrument_label) and the curve attaches to
-    /// it; readings claiming the curve must resolve to the same instrument.
-    pub instrument_label: String,
-    pub slope: f64,
-    pub intercept: f64,
-    #[serde(default)]
-    pub r_squared: Option<f64>,
-    /// Human label for the curve, e.g. the portal's date + parameter. Falls back to source_key.
-    #[serde(default)]
-    pub name: Option<String>,
-    /// The date the source fitted the curve. Absent leaves the row on its creation date.
-    #[serde(default)]
-    pub fitted_on: Option<chrono::NaiveDate>,
-    #[serde(default)]
-    pub notes: Option<String>,
+    #[serde(flatten)]
+    pub curve: river_data_core::models::StandardCurveUpsert,
+}
+
+impl<'de> Deserialize<'de> for RegisterStandardCurveRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (source_system, curve) =
+            crate::routes::private::wire::with_source_system(deserializer, &[])?;
+        Ok(Self {
+            source_system,
+            curve,
+        })
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -139,28 +137,30 @@ pub async fn register_standard_curve(
     Json(payload): Json<RegisterStandardCurveRequest>,
 ) -> AppResult<Json<RegisterStandardCurveResponse>> {
     let source_system = crate::common::provenance::source_system(&auth, &payload.source_system)?;
-    if payload.slope == 0.0 {
+    if payload.curve.slope == 0.0 {
         return Err(AppError::BadRequest(
             "Slope cannot be zero: all readings would produce a constant value".to_string(),
         ));
     }
-    if payload.source_key.trim().is_empty() {
+    if payload.curve.source_key.trim().is_empty() {
         return Err(AppError::BadRequest(
             "source_key identifies the curve and cannot be empty".to_string(),
         ));
     }
 
     let sensor_id =
-        resolve_lab_instrument(&state, &source_system, &payload.instrument_label).await?;
+        resolve_lab_instrument(&state, &source_system, &payload.curve.instrument_label).await?;
 
     let existing = Entity::find()
         .filter(Column::SourceSystem.eq(source_system.clone()))
-        .filter(Column::SourceKey.eq(payload.source_key.clone()))
+        .filter(Column::SourceKey.eq(payload.curve.source_key.clone()))
         .one(&state.db)
         .await?;
 
     let coefficients_match = |c: &Model| {
-        c.slope == payload.slope && c.intercept == payload.intercept && c.sensor_id == sensor_id
+        c.slope == payload.curve.slope
+            && c.intercept == payload.curve.intercept
+            && c.sensor_id == sensor_id
     };
 
     if let Some(current) = existing {
@@ -174,13 +174,13 @@ pub async fn register_standard_curve(
         if !curve_is_used(&state.db, current.id).await? {
             let mut active: super::ActiveModel = current.into();
             active.sensor_id = Set(sensor_id);
-            active.slope = Set(payload.slope);
-            active.intercept = Set(payload.intercept);
-            active.r_squared = Set(payload.r_squared);
-            if let Some(name) = payload.name.clone() {
+            active.slope = Set(payload.curve.slope);
+            active.intercept = Set(payload.curve.intercept);
+            active.r_squared = Set(payload.curve.r_squared);
+            if let Some(name) = payload.curve.name.clone() {
                 active.name = Set(Some(name));
             }
-            if let Some(fitted_on) = payload.fitted_on {
+            if let Some(fitted_on) = payload.curve.fitted_on {
                 active.fitted_on = Set(Some(fitted_on));
             }
             let updated = active.update(&state.db).await?;
@@ -206,9 +206,11 @@ pub async fn register_standard_curve(
             [old_id.into()],
         ))
         .await?;
-        let minted = insert_curve(&txn, &payload, &source_system, sensor_id).await.map_err(|e| {
-            AppError::Internal(format!("minting successor for edited curve {old_id}: {e}"))
-        })?;
+        let minted = insert_curve(&txn, &payload, &source_system, sensor_id)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("minting successor for edited curve {old_id}: {e}"))
+            })?;
         txn.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE standard_curves                 SET retired_at = NOW(), retired_by = $2, retired_reason = $3               WHERE id = $1 AND retired_at IS NULL",
@@ -217,7 +219,7 @@ pub async fn register_standard_curve(
                 source_system.clone().into(),
                 format!(
                     "Superseded by {minted}: {} re-registered {} with different coefficients",
-                    payload.source_system, payload.source_key
+                    payload.source_system, payload.curve.source_key
                 )
                 .into(),
             ],
@@ -226,7 +228,7 @@ pub async fn register_standard_curve(
         txn.commit().await?;
         tracing::warn!(
             source_system = %payload.source_system,
-            source_key = %payload.source_key,
+            source_key = %payload.curve.source_key,
             %old_id,
             new_id = %minted,
             "Portal edited a standard curve already applied to readings; minted a successor"
@@ -254,37 +256,38 @@ async fn insert_curve<C: ConnectionTrait>(
 ) -> AppResult<Uuid> {
     let id = Uuid::new_v4();
     conn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO standard_curves
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO standard_curves
                  (id, sensor_id, name, fitted_on, slope, intercept, r_squared, notes, created_at,
                   source_system, source_key)
              VALUES ($1, $2, $3, COALESCE($4, CURRENT_DATE), $5, $6, $7, $8, NOW(), $9, $10)
              ON CONFLICT (source_system, source_key)
                  WHERE source_system IS NOT NULL AND source_key IS NOT NULL
                  DO NOTHING",
-            [
-                id.into(),
-                sensor_id.into(),
-                payload
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| payload.source_key.clone())
-                    .into(),
-                payload.fitted_on.into(),
-                payload.slope.into(),
-                payload.intercept.into(),
-                payload.r_squared.into(),
-                payload.notes.clone().into(),
-                source_system.into(),
-                payload.source_key.clone().into(),
-            ],
-        ))
-        .await?;
+        [
+            id.into(),
+            sensor_id.into(),
+            payload
+                .curve
+                .name
+                .clone()
+                .unwrap_or_else(|| payload.curve.source_key.clone())
+                .into(),
+            payload.curve.fitted_on.into(),
+            payload.curve.slope.into(),
+            payload.curve.intercept.into(),
+            payload.curve.r_squared.into(),
+            payload.curve.notes.clone().into(),
+            source_system.into(),
+            payload.curve.source_key.clone().into(),
+        ],
+    ))
+    .await?;
     // A concurrent register of the same provenance wins the insert; resolve to whichever row holds
     // the key now.
     let row = Entity::find()
         .filter(Column::SourceSystem.eq(source_system))
-        .filter(Column::SourceKey.eq(payload.source_key.clone()))
+        .filter(Column::SourceKey.eq(payload.curve.source_key.clone()))
         .one(conn)
         .await?
         .ok_or_else(|| AppError::Internal("registered curve not found after upsert".to_string()))?;

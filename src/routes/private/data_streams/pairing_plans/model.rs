@@ -2,9 +2,9 @@ use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(
-    Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize, EntityToModels,
-)]
+use crate::routes::private::sync::service::{ApplyResult, PlanCurveIntents, PlanEntries, PlanSummary};
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize, EntityToModels)]
 #[sea_orm(table_name = "pairing_plans")]
 #[crudcrate(
     api_struct = "PairingPlan",
@@ -22,14 +22,14 @@ pub struct Model {
     pub status: String,
     pub created_by: Option<String>,
     #[sea_orm(column_type = "JsonBinary")]
-    pub summary: serde_json::Value,
+    pub summary: PlanSummary,
     #[sea_orm(column_type = "JsonBinary")]
-    pub entries: serde_json::Value,
+    pub entries: PlanEntries,
     /// Curves the review assigned to instruments this plan creates, `[{curve_id,
     /// instrument_source_key}]`, moved in the apply transaction that mints them.
     #[sea_orm(column_type = "JsonBinary")]
-    #[crudcrate(exclude(create, update), on_create = serde_json::Value::Array(Vec::new()))]
-    pub curve_assignments: serde_json::Value,
+    #[crudcrate(exclude(create, update), on_create = PlanCurveIntents::default())]
+    pub curve_assignments: PlanCurveIntents,
     /// Bumped by every edit. A PATCH or an apply names the version it read, so a second writer
     /// on one draft is refused rather than carrying the first writer's decisions away.
     #[crudcrate(exclude(create, update), on_create = 0)]
@@ -40,7 +40,7 @@ pub struct Model {
     pub applied_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(column_type = "JsonBinary", nullable)]
     #[crudcrate(exclude(create, update))]
-    pub apply_result: Option<serde_json::Value>,
+    pub apply_result: Option<ApplyResult>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -109,8 +109,18 @@ pub struct ThresholdRow {
     pub alarm_min: Option<f64>,
     #[schema(required)]
     pub alarm_max: Option<f64>,
-    /// `"site"` | `"global"`, which tier supplied this threshold.
+    /// Which tier supplied this threshold.
+    #[schema(value_type = ThresholdSource)]
     pub source: String,
+}
+
+/// The tiers a resolved threshold can come from: the slot's own `alarm_thresholds` row, else the
+/// parameter's. Named for the document; the column itself travels as the string the SQL builds.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ThresholdSource {
+    Site,
+    Global,
 }
 
 fn col(table: &str, c: &str) -> Expr {

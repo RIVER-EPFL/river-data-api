@@ -1,5 +1,5 @@
 use axum::{Json, extract::State};
-use sea_orm::{EntityTrait, Set};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::AppResult;
+use crate::routes::private::data_streams;
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
 use crate::routes::private::readings::status_events;
 
@@ -62,6 +63,15 @@ pub async fn insert_batch_status_events(
         }
     }
 
+    // The instrument each stream names, for an event that names none of its own.
+    let stream_instrument: HashMap<Uuid, Option<Uuid>> = data_streams::Entity::find()
+        .filter(data_streams::Column::Id.is_in(stream_cache.values().copied()))
+        .all(&state.db)
+        .await?
+        .into_iter()
+        .map(|s| (s.id, s.sensor_id))
+        .collect();
+
     let models: Vec<status_events::ActiveModel> = payload
         .events
         .into_iter()
@@ -73,7 +83,9 @@ pub async fn insert_batch_status_events(
                 site_id: Set(Some(e.site_id)),
                 parameter_id: Set(Some(e.parameter_id)),
                 value: Set(e.value),
-                sensor_id: Set(e.sensor_id),
+                sensor_id: Set(e
+                    .sensor_id
+                    .or_else(|| stream_instrument.get(&stream_id).copied().flatten())),
             }
         })
         .collect();

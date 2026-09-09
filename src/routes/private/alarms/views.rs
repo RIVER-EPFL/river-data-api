@@ -1210,6 +1210,7 @@ pub struct ThresholdWithValue {
     pub alarm_min: Option<f64>,
     #[schema(required)]
     pub alarm_max: Option<f64>,
+    #[schema(value_type = super::thresholds::resolution::ThresholdSource)]
     pub source: String,
     /// Latest reading (last 30 days) for this slot, or null if none, display only.
     #[schema(required)]
