@@ -21,6 +21,12 @@ pub struct Model {
     pub client_secret_hash: String,
     #[crudcrate(filterable)]
     pub service_type: String,
+    /// The source system a service enrolled on this credential speaks for, e.g. "metalp". It is
+    /// the provenance its registrations are written under; `service_type` is the kind of service,
+    /// which for the three portals is one value. NULL on a credential minted before it was
+    /// declared.
+    #[crudcrate(filterable)]
+    pub source_system: Option<String>,
     #[crudcrate(filterable)]
     pub service_id: Option<Uuid>,
     #[crudcrate(filterable)]

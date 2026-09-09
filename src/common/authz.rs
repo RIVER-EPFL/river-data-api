@@ -272,6 +272,21 @@ fn default_true() -> bool {
     true
 }
 
+impl TokenPermissions {
+    /// What an enrolled sync service carries: all four bits, unscoped. It is stated here rather
+    /// than at the point the session is accepted so the one place that decides what a service may
+    /// do is the one place that says what a token may do.
+    #[must_use]
+    pub fn sync_service() -> Self {
+        Self {
+            read_metadata: true,
+            read_data: true,
+            write_metadata: true,
+            write_data: true,
+        }
+    }
+}
+
 impl Default for TokenPermissions {
     fn default() -> Self {
         Self {
@@ -334,8 +349,10 @@ pub async fn check(
         Some(AuthContext::Keycloak { roles, .. }) if keycloak_allows(roles, cap) => {
             next.run(request).await
         }
-        Some(AuthContext::ApiToken { permissions, .. })
-            if token_allows(permissions, cap, token_rule) =>
+        Some(ctx)
+            if ctx
+                .token_permissions()
+                .is_some_and(|p| token_allows(&p, cap, token_rule)) =>
         {
             next.run(request).await
         }

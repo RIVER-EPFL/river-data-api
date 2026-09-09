@@ -132,6 +132,7 @@ pub async fn merge_site_parameters(
     db: &DatabaseConnection,
     req: &MergeSiteParametersRequest,
     actor: &str,
+    origin: crate::routes::private::readings::decisions::Origin,
 ) -> AppResult<MergeSiteParametersResponse> {
     let source_id = req.source_site_parameter_id;
     let target_id = req.target_site_parameter_id;
@@ -153,7 +154,7 @@ pub async fn merge_site_parameters(
 
         let scope = MoveScope::Site(source_site_id);
         refuse_on_collision(txn, scope, source_param_id, target_param_id).await?;
-        let moved = move_slot_rows(txn, scope, source_param_id, target_param_id, actor).await?;
+        let moved = move_slot_rows(txn, scope, source_param_id, target_param_id, actor, origin).await?;
         let streams_updated = update_data_streams(txn, source_id, target_id).await?;
         let source_row = row_snapshot(txn, "site_parameters", source_id).await?;
         delete_source(
@@ -406,6 +407,7 @@ pub async fn merge_parameters(
     db: &DatabaseConnection,
     req: &MergeParametersRequest,
     actor: &str,
+    origin: crate::routes::private::readings::decisions::Origin,
 ) -> AppResult<MergeParametersResponse> {
     let source_id = req.source_parameter_id;
     let target_id = req.target_parameter_id;
@@ -422,9 +424,9 @@ pub async fn merge_parameters(
         refuse_derived_cycle(txn, source_id, target_id).await?;
 
         let (sites_merged, sites_reassigned, moved) =
-            merge_site_parameters_per_site(txn, source_id, target_id, actor).await?;
+            merge_site_parameters_per_site(txn, source_id, target_id, actor, origin).await?;
 
-        let swept = reassign_parameter_references(txn, source_id, target_id, actor).await?;
+        let swept = reassign_parameter_references(txn, source_id, target_id, actor, origin).await?;
         let source_row = row_snapshot(txn, "parameters", source_id).await?;
         delete_parameter(txn, source_id).await?;
         record_merge(
@@ -499,6 +501,7 @@ async fn merge_site_parameters_per_site(
     source_id: Uuid,
     target_id: Uuid,
     actor: &str,
+    origin: crate::routes::private::readings::decisions::Origin,
 ) -> AppResult<(u64, u64, MergeTotals)> {
     let pg = sea_orm::DatabaseBackend::Postgres;
 
@@ -531,7 +534,7 @@ async fn merge_site_parameters_per_site(
         if let Some(target_row) = target_sp {
             let target_sp_id: Uuid = target_row.try_get("", "id").map_err(AppError::Database)?;
             let moved =
-                move_slot_rows(txn, MoveScope::Site(site_id), source_id, target_id, actor).await?;
+                move_slot_rows(txn, MoveScope::Site(site_id), source_id, target_id, actor, origin).await?;
             let streams = update_data_streams(txn, sp_id, target_sp_id).await?;
             delete_source(txn, sp_id, site_id, source_id, target_id).await?;
 
@@ -548,7 +551,7 @@ async fn merge_site_parameters_per_site(
             .await
             .map_err(AppError::Database)?;
             let moved =
-                move_slot_rows(txn, MoveScope::Site(site_id), source_id, target_id, actor).await?;
+                move_slot_rows(txn, MoveScope::Site(site_id), source_id, target_id, actor, origin).await?;
 
             totals.readings += moved.readings;
             totals.touched = totals.touched.merge(moved.touched);
@@ -567,6 +570,7 @@ async fn reassign_parameter_references(
     source_id: Uuid,
     target_id: Uuid,
     actor: &str,
+    origin: crate::routes::private::readings::decisions::Origin,
 ) -> AppResult<SlotMove> {
     let pg = sea_orm::DatabaseBackend::Postgres;
 
@@ -627,7 +631,7 @@ async fn reassign_parameter_references(
 
     // The per-site walk covers every site with a source `site_parameter`; this catches rows at
     // sites that never had one, so the source parameter can be deleted.
-    let swept = move_slot_rows(txn, MoveScope::EverySite, source_id, target_id, actor).await?;
+    let swept = move_slot_rows(txn, MoveScope::EverySite, source_id, target_id, actor, origin).await?;
 
     // Merge aliases: target gets source's aliases + source's name as a new alias.
     // `needs_review` clears with it: a merge is the adjudication that flag waits for.

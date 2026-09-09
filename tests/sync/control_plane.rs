@@ -607,6 +607,7 @@ async fn health_state_derived_from_heartbeat_recency() {
             "last_sync_completed_at",
             "paused",
             "service_type",
+            "source_system",
             "status",
             "sync_interval_secs",
             "updated_at",

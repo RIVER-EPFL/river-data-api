@@ -57,6 +57,16 @@ pub(crate) fn required_uuid(params: &serde_json::Value, key: &str) -> Result<Uui
         .ok_or_else(|| DbErr::Custom(format!("job params missing uuid {key}")))
 }
 
+/// The origin the request that enqueued a merge was recorded under. A row queued before the origin
+/// travelled with the actor names none, and a merge is asked for by an operator, so that reads as
+/// manual.
+fn merge_origin(params: &serde_json::Value) -> crate::routes::private::readings::decisions::Origin {
+    params
+        .get("origin")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or(crate::routes::private::readings::decisions::Origin::Manual)
+}
+
 fn optional_uuid(params: &serde_json::Value, key: &str) -> Option<Uuid> {
     params
         .get(key)
@@ -1057,6 +1067,7 @@ impl Job for MergeSiteParameters {
                 .get("actor")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("system"),
+            merge_origin(ctx.params()),
         )
         .await
         .map_err(|e| DbErr::Custom(e.to_string()))?;
@@ -1097,6 +1108,7 @@ impl Job for MergeParameters {
                 .get("actor")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("system"),
+            merge_origin(ctx.params()),
         )
         .await
         .map_err(|e| DbErr::Custom(e.to_string()))?;

@@ -83,13 +83,10 @@ pub struct AnnotationOutcome {
 )]
 pub async fn register_annotations(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(payload): Json<RegisterAnnotationsRequest>,
 ) -> AppResult<Json<RegisterAnnotationsResponse>> {
-    if payload.source_system.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "source_system must not be empty".into(),
-        ));
-    }
+    let source_system = crate::common::provenance::source_system(&auth, &payload.source_system)?;
     let db = &state.db;
 
     // One slot lookup per distinct stream: stream → site_parameter → (site_id, parameter_id).
@@ -174,8 +171,8 @@ pub async fn register_annotations(
                     sea_orm::prelude::DateTimeWithTimeZone::from(item.time).into(),
                     item.text.clone().into(),
                     item.category.clone().into(),
-                    format!("sync:{}", payload.source_system).into(),
-                    payload.source_system.clone().into(),
+                    format!("sync:{source_system}").into(),
+                    source_system.clone().into(),
                     item.source_key.clone().into(),
                     item.standard_curve_id.into(),
                 ],
@@ -206,7 +203,7 @@ pub async fn register_annotations(
                          FROM annotations
                          WHERE source_system = $1 AND source_key = $2",
                         [
-                            payload.source_system.clone().into(),
+                            source_system.clone().into(),
                             item.source_key.clone().into(),
                             item.text.clone().into(),
                             item.standard_curve_id.into(),

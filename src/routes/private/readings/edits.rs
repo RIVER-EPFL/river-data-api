@@ -542,6 +542,7 @@ async fn apply<C: ConnectionTrait>(
     selection: &Selection,
     decision: &EditDecision,
     actor: &str,
+    origin: Origin,
 ) -> AppResult<(Uuid, decisions::Recorded)> {
     let kind = decision.parsed()?;
     let (new, _) = decision.assertion_over(kind, selection)?;
@@ -552,7 +553,7 @@ async fn apply<C: ConnectionTrait>(
         new,
         actor,
         decision.reason.as_deref(),
-        Origin::Manual,
+        origin,
     )
     .await
 }
@@ -610,7 +611,7 @@ pub async fn preview(
     let (rows, samples) = crate::common::bulk_write::guarded_rollback(&state.db, async |txn| {
         let before_rows = row_states(txn, &predicate, binds.clone()).await?;
         let before_samples = sample_states(txn, &predicate, binds.clone()).await?;
-        apply(txn, &req.selection, &req.decision, &actor).await?;
+        apply(txn, &req.selection, &req.decision, &actor, auth.origin()).await?;
         let after_rows = row_states(txn, &predicate, binds.clone()).await?;
         let after_samples = sample_states(txn, &predicate, binds.clone()).await?;
         let rows: Vec<MovedRow> = before_rows
@@ -709,7 +710,7 @@ pub async fn commit(
     refuse_unrouted(&state.db, &req.selection, option).await?;
 
     let (set_id, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
-        apply(txn, &req.selection, &req.decision, &actor).await
+        apply(txn, &req.selection, &req.decision, &actor, auth.origin()).await
     })
     .await?;
 

@@ -40,6 +40,17 @@ pub enum AuthContext {
         /// project-scoped API tokens, generalized from one project to this set.
         grants: Arc<HashSet<Uuid>>,
     },
+    /// Authenticated via an enrolled sync service's session token.
+    ///
+    /// It writes like a full-permission unscoped token, and unlike a token it says which source
+    /// system it speaks for: what a service writes provenance under is a property of the identity
+    /// it enrolled with, never a field in its requests.
+    SyncService {
+        service_id: Uuid,
+        /// Declared on the credential the service enrolled with (M167). `None` on a credential
+        /// minted before it was declared.
+        source_system: Option<String>,
+    },
     /// Authenticated via API token (external scripts, curl).
     ApiToken {
         token_id: Uuid,
@@ -54,7 +65,7 @@ impl AuthContext {
     pub fn has_role(&self, target: &Role) -> bool {
         match self {
             AuthContext::Keycloak { roles, .. } => roles.contains(target),
-            AuthContext::ApiToken { .. } => false,
+            AuthContext::ApiToken { .. } | AuthContext::SyncService { .. } => false,
         }
     }
 
@@ -63,7 +74,7 @@ impl AuthContext {
     pub fn highest_role(&self) -> Option<Role> {
         match self {
             AuthContext::Keycloak { roles, .. } => roles.iter().max_by_key(|r| r.level()).cloned(),
-            AuthContext::ApiToken { .. } => None,
+            AuthContext::ApiToken { .. } | AuthContext::SyncService { .. } => None,
         }
     }
 
@@ -76,7 +87,7 @@ impl AuthContext {
     pub fn keycloak_sub(&self) -> Option<&str> {
         match self {
             AuthContext::Keycloak { sub, .. } => Some(sub.as_str()),
-            AuthContext::ApiToken { .. } => None,
+            AuthContext::ApiToken { .. } | AuthContext::SyncService { .. } => None,
         }
     }
 
@@ -84,7 +95,7 @@ impl AuthContext {
     pub fn email(&self) -> Option<&str> {
         match self {
             AuthContext::Keycloak { email, .. } => email.as_deref(),
-            AuthContext::ApiToken { .. } => None,
+            AuthContext::ApiToken { .. } | AuthContext::SyncService { .. } => None,
         }
     }
 
@@ -112,7 +123,8 @@ impl AuthContext {
             AuthContext::ApiToken {
                 project_scope: None,
                 ..
-            } => AccessScope::Unrestricted,
+            }
+            | AuthContext::SyncService { .. } => AccessScope::Unrestricted,
             AuthContext::Keycloak { roles, grants, .. } => {
                 if roles.contains(&Role::Administrator) {
                     AccessScope::Unrestricted
@@ -120,6 +132,57 @@ impl AuthContext {
                     AccessScope::Projects(grants.clone())
                 }
             }
+        }
+    }
+
+    /// One name for this caller, as every trail records it: the email, else the Keycloak subject,
+    /// else the source system a sync service speaks for, else the token or service it authenticated
+    /// with.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            AuthContext::Keycloak { email: Some(e), .. } => e.clone(),
+            AuthContext::Keycloak { sub, .. } => sub.clone(),
+            AuthContext::SyncService {
+                source_system: Some(system),
+                ..
+            } => format!("sync:{system}"),
+            AuthContext::SyncService { service_id: id, .. } => format!("token:{id}"),
+            AuthContext::ApiToken { token_id, .. } => format!("token:{token_id}"),
+        }
+    }
+
+    /// What machinery this caller's writes are recorded as. A derivation names its own origin
+    /// (janitor, chain, system) because no caller made it; everything a request writes is named
+    /// here.
+    #[must_use]
+    pub fn origin(&self) -> crate::routes::private::readings::decisions::Origin {
+        use crate::routes::private::readings::decisions::Origin;
+        match self {
+            AuthContext::SyncService { .. } => Origin::Sync,
+            AuthContext::Keycloak { .. } | AuthContext::ApiToken { .. } => Origin::Manual,
+        }
+    }
+
+    /// The source system this caller writes provenance under, for the register routes. `None` for
+    /// a person or a token: only an enrolled service speaks for a source.
+    #[must_use]
+    pub fn source_system(&self) -> Option<&str> {
+        match self {
+            AuthContext::SyncService { source_system, .. } => source_system.as_deref(),
+            AuthContext::Keycloak { .. } | AuthContext::ApiToken { .. } => None,
+        }
+    }
+
+    /// The permission bits this identity carries on the token side of a gate, or `None` for a
+    /// person, whose capabilities come from their role instead. An enrolled sync service carries a
+    /// full unscoped set, stated once in [`TokenPermissions::sync_service`].
+    #[must_use]
+    pub fn token_permissions(&self) -> Option<TokenPermissions> {
+        match self {
+            AuthContext::ApiToken { permissions, .. } => Some(permissions.clone()),
+            AuthContext::SyncService { .. } => Some(TokenPermissions::sync_service()),
+            AuthContext::Keycloak { .. } => None,
         }
     }
 
@@ -131,9 +194,9 @@ impl AuthContext {
     pub fn allows(&self, cap: Capability) -> bool {
         match self {
             AuthContext::Keycloak { roles, .. } => authz::keycloak_allows(roles, cap),
-            AuthContext::ApiToken { permissions, .. } => {
-                authz::token_allows(permissions, cap, TokenAccess::Same)
-            }
+            _ => self
+                .token_permissions()
+                .is_some_and(|p| authz::token_allows(&p, cap, TokenAccess::Same)),
         }
     }
 }
@@ -261,27 +324,17 @@ pub async fn service_auth_middleware(
     {
         // Same resolution the control plane extractor uses, so the expiry rule cannot drift
         // between the two surfaces a session token reaches.
-        if let Some(token) =
+        if let Some(session) =
             crate::routes::private::sync::control::session::lookup_sync_session(&state.db, raw)
                 .await
         {
-            request.extensions_mut().insert(AuthContext::ApiToken {
-                token_id: token.service_id,
-                permissions: TokenPermissions {
-                    read_metadata: true,
-                    read_data: true,
-                    write_metadata: true,
-                    write_data: true,
-                },
-                project_scope: None,
-                rate_limit_per_second: None,
-            });
-            request.extensions_mut().insert(SyncServiceMarker);
-            return crate::common::actor::scoped(
-                format!("token:{}", token.service_id),
-                next.run(request),
-            )
-            .await;
+            let auth = AuthContext::SyncService {
+                service_id: session.service_id,
+                source_system: session.source_system,
+            };
+            let actor = auth.label();
+            request.extensions_mut().insert(auth);
+            return crate::common::actor::scoped(actor, next.run(request)).await;
         }
     }
 
@@ -348,12 +401,6 @@ pub fn require_crud(
     move |request, next| Box::pin(authz::check_crud(read, write, write_token, request, next))
 }
 
-/// Marker inserted by the dual-auth middleware when the caller authenticated with a sync
-/// service session token, for handlers whose behavior differs for sync services (ie. the
-/// ingest `overwrite` flag).
-#[derive(Clone, Copy)]
-pub struct SyncServiceMarker;
-
 /// Extractor: true when the caller is an authenticated sync service.
 pub struct IsSyncService(pub bool);
 
@@ -361,9 +408,10 @@ impl<S: Send + Sync> FromRequestParts<S> for IsSyncService {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        Ok(IsSyncService(
-            parts.extensions.get::<SyncServiceMarker>().is_some(),
-        ))
+        Ok(IsSyncService(matches!(
+            parts.extensions.get::<AuthContext>(),
+            Some(AuthContext::SyncService { .. })
+        )))
     }
 }
 
@@ -506,7 +554,9 @@ pub async fn enforce_scope_on_crud(
     next: Next,
 ) -> Response {
     let (scope, is_token) = match request.extensions().get::<AuthContext>() {
-        Some(ctx @ AuthContext::ApiToken { .. }) => (ctx.access_scope(), true),
+        Some(ctx @ (AuthContext::ApiToken { .. } | AuthContext::SyncService { .. })) => {
+            (ctx.access_scope(), true)
+        }
         Some(ctx @ AuthContext::Keycloak { .. }) => (ctx.access_scope(), false),
         None => return next.run(request).await,
     };

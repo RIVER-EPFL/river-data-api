@@ -1364,6 +1364,7 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
     source_param: Uuid,
     target_param: Uuid,
     actor: &str,
+    origin: crate::routes::private::readings::decisions::Origin,
 ) -> AppResult<SlotMove> {
     // $1 is the target parameter, $2 the source, $3 the site when the scope names one.
     let (predicate, site) = match scope {
@@ -1393,7 +1394,7 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
             ),
             actor,
             Some("merged into the target parameter"),
-            crate::routes::private::readings::decisions::Origin::Manual,
+            origin,
             Some(Uuid::new_v4()),
         )
         .await?;

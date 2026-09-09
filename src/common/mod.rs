@@ -11,6 +11,7 @@ pub mod dependency;
 pub mod grants;
 pub mod middleware;
 pub mod paging;
+pub mod provenance;
 pub mod rate_limit;
 pub mod request_metrics;
 pub mod retention;

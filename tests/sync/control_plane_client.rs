@@ -24,6 +24,7 @@ async fn the_shipped_client_enrolls_and_heartbeats_against_the_real_router() {
         State(state.clone()),
         Json(CreateCredentialRequest {
             service_type: "cnet".to_string(),
+            source_system: Some("cnet".to_string()),
         }),
     )
     .await

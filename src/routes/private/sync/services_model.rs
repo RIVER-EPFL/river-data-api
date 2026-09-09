@@ -16,6 +16,10 @@ pub struct Model {
     pub id: Uuid,
     #[crudcrate(filterable)]
     pub service_type: String,
+    /// Copied from the credential at enrolment: the source system this service's registrations are
+    /// written under. Not a CRUD field, it belongs to the credential.
+    #[crudcrate(filterable, exclude(create, update))]
+    pub source_system: Option<String>,
     #[crudcrate(filterable)]
     pub instance_id: String,
     #[crudcrate(filterable)]

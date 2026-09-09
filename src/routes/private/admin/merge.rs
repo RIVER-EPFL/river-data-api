@@ -56,6 +56,7 @@ pub async fn merge_site_parameters_handler(
             "source_site_parameter_id": payload.source_site_parameter_id,
             "target_site_parameter_id": payload.target_site_parameter_id,
             "actor": crate::common::actor::label(&auth),
+            "origin": auth.origin().as_str(),
         }),
         None,
     )
@@ -96,6 +97,7 @@ pub async fn merge_parameters_handler(
             "source_parameter_id": payload.source_parameter_id,
             "target_parameter_id": payload.target_parameter_id,
             "actor": crate::common::actor::label(&auth),
+            "origin": auth.origin().as_str(),
         }),
         None,
     )

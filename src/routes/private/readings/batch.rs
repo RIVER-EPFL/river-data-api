@@ -917,6 +917,9 @@ pub async fn insert_batch_readings(
     // cap refuses that outside a transaction that lifts it. Chunking stays, so the statement size
     // is bounded; the transaction is what makes a part-written correction impossible.
     let actor = crate::common::actor::label(&auth);
+    // A correction is recorded as what made it. A batch is usually a person or a script acting for
+    // one; a sync service reaching the same route is recorded as sync.
+    let origin = auth.origin();
     let touched_events;
     (inserted, overwritten, touched_events) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let mut inserted = 0usize;
@@ -932,7 +935,7 @@ pub async fn insert_batch_readings(
                         txn,
                         chunk,
                         &actor,
-                        crate::routes::private::readings::decisions::Origin::Manual,
+                        origin,
                     )
                     .await?;
                 (
@@ -969,7 +972,7 @@ pub async fn insert_batch_readings(
             txn,
             &models,
             &actor,
-            crate::routes::private::readings::decisions::Origin::Manual,
+            origin,
         )
         .await?;
 

@@ -683,6 +683,7 @@ async fn a_merge_moves_every_reading_as_a_slot_move_and_deletes_none() {
             target_site_parameter_id: crate::common::PARAM_S1_DO_ID.parse().unwrap(),
         },
         "tester",
+        river_db::routes::private::readings::decisions::Origin::Manual,
     )
     .await
     .expect("the merge applies");

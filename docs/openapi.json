@@ -697,7 +697,15 @@
         },
         "required": [
           "id",
-          "parameter_id"
+          "parameter_id",
+          "site_id",
+          "warning_min",
+          "warning_max",
+          "alarm_min",
+          "alarm_max",
+          "description",
+          "created_at",
+          "updated_at"
         ],
         "type": "object"
       },
@@ -769,7 +777,15 @@
         },
         "required": [
           "id",
-          "parameter_id"
+          "parameter_id",
+          "site_id",
+          "warning_min",
+          "warning_max",
+          "alarm_min",
+          "alarm_max",
+          "description",
+          "created_at",
+          "updated_at"
         ],
         "type": "object"
       },
@@ -964,7 +980,13 @@
           "start_time",
           "end_time",
           "text",
-          "category"
+          "category",
+          "created_by",
+          "audit_hold_id",
+          "source_system",
+          "source_key",
+          "standard_curve_id",
+          "created_at"
         ],
         "type": "object"
       },
@@ -1128,7 +1150,13 @@
           "start_time",
           "end_time",
           "text",
-          "category"
+          "category",
+          "created_by",
+          "audit_hold_id",
+          "source_system",
+          "source_key",
+          "standard_curve_id",
+          "created_at"
         ],
         "type": "object"
       },
@@ -1235,7 +1263,13 @@
           "start_time",
           "end_time",
           "text",
-          "category"
+          "category",
+          "created_by",
+          "audit_hold_id",
+          "source_system",
+          "source_key",
+          "standard_curve_id",
+          "created_at"
         ],
         "type": "object"
       },
@@ -1370,10 +1404,17 @@
         "required": [
           "id",
           "name",
+          "description",
           "token_hash",
           "token_prefix",
+          "project_scope",
           "permissions",
-          "is_active"
+          "is_active",
+          "rate_limit_per_second",
+          "created_at",
+          "expires_at",
+          "last_used_at",
+          "created_by"
         ],
         "type": "object"
       },
@@ -1418,6 +1459,7 @@
           "method",
           "path",
           "status_code",
+          "project_scope",
           "created_at"
         ],
         "type": "object"
@@ -1460,6 +1502,7 @@
           "method",
           "path",
           "status_code",
+          "project_scope",
           "created_at"
         ],
         "type": "object"
@@ -1596,9 +1639,16 @@
         "required": [
           "id",
           "name",
+          "description",
           "token_prefix",
+          "project_scope",
           "permissions",
-          "is_active"
+          "is_active",
+          "rate_limit_per_second",
+          "created_at",
+          "expires_at",
+          "last_used_at",
+          "created_by"
         ],
         "type": "object"
       },
@@ -1683,10 +1733,17 @@
         "required": [
           "id",
           "name",
+          "description",
           "token_hash",
           "token_prefix",
+          "project_scope",
           "permissions",
-          "is_active"
+          "is_active",
+          "rate_limit_per_second",
+          "created_at",
+          "expires_at",
+          "last_used_at",
+          "created_by"
         ],
         "type": "object"
       },
@@ -2339,7 +2396,13 @@
           "name",
           "units",
           "formula",
+          "description",
+          "output_parameter_id",
+          "tool_script_id",
           "ordinal",
+          "curve_slot",
+          "per_replicate",
+          "created_at",
           "sources"
         ],
         "type": "object"
@@ -2422,7 +2485,13 @@
           "name",
           "units",
           "formula",
+          "description",
+          "output_parameter_id",
+          "tool_script_id",
           "ordinal",
+          "curve_slot",
+          "per_replicate",
+          "created_at",
           "sources"
         ],
         "type": "object"
@@ -3246,7 +3315,10 @@
           "site_id",
           "collected_at",
           "source",
-          "created_at"
+          "created_by",
+          "notes",
+          "created_at",
+          "updated_at"
         ],
         "type": "object"
       },
@@ -3297,7 +3369,10 @@
           "site_id",
           "collected_at",
           "source",
-          "created_at"
+          "created_by",
+          "notes",
+          "created_at",
+          "updated_at"
         ],
         "type": "object"
       },
@@ -3518,6 +3593,8 @@
           "id",
           "name",
           "value",
+          "units",
+          "description",
           "created_at"
         ],
         "type": "object"
@@ -3556,6 +3633,8 @@
           "id",
           "name",
           "value",
+          "units",
+          "description",
           "created_at"
         ],
         "type": "object"
@@ -3594,6 +3673,13 @@
         "properties": {
           "service_type": {
             "type": "string"
+          },
+          "source_system": {
+            "description": "The source system a service on this credential speaks for, e.g. \"metalp\". Its registrations\nare written under it, so it is declared here rather than sent with each call.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -3757,12 +3843,19 @@
           },
           "service_type": {
             "type": "string"
+          },
+          "source_system": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "id",
           "client_id",
           "service_type",
+          "source_system",
           "service_id",
           "revoked",
           "created_at"
@@ -3776,6 +3869,76 @@
           "corrected"
         ],
         "type": "string"
+      },
+      "CurationDriftResponse": {
+        "properties": {
+          "rows": {
+            "description": "The first `limit` of them, newest first, so a person can open one.",
+            "items": {
+              "$ref": "#/components/schemas/CurationDriftRow"
+            },
+            "type": "array"
+          },
+          "total": {
+            "description": "Every disagreeing reading, not only the ones listed below.",
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "rows"
+        ],
+        "type": "object"
+      },
+      "CurationDriftRow": {
+        "description": "One reading whose curation columns are not the fold of its live decisions.",
+        "properties": {
+          "folded": {
+            "description": "What the reading's live decisions fold to. A column absent from it is one no decision\nasserts, which is not a disagreement.",
+            "type": "object"
+          },
+          "parameter_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replicate_index": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "site_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stored": {
+            "description": "The curation columns the reading holds.",
+            "type": "object"
+          },
+          "stream_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stream_id",
+          "time",
+          "replicate_index",
+          "site_id",
+          "parameter_id",
+          "stored",
+          "folded"
+        ],
+        "type": "object"
       },
       "CurveApplication": {
         "properties": {
@@ -4119,11 +4282,21 @@
           "id",
           "source_system",
           "source_key",
+          "source_name",
+          "source_path",
           "metadata",
+          "site_parameter_id",
+          "sensor_id",
+          "measurement_type",
           "is_active",
           "discovered_at",
+          "paired_at",
+          "last_data_time",
+          "last_window_digest",
+          "pairing_plan_id",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "replicates"
         ],
         "type": "object"
       },
@@ -4300,11 +4473,21 @@
           "id",
           "source_system",
           "source_key",
+          "source_name",
+          "source_path",
           "metadata",
+          "site_parameter_id",
+          "sensor_id",
+          "measurement_type",
           "is_active",
           "discovered_at",
+          "paired_at",
+          "last_data_time",
+          "last_window_digest",
+          "pairing_plan_id",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "replicates"
         ],
         "type": "object"
       },
@@ -4412,11 +4595,21 @@
           "id",
           "source_system",
           "source_key",
+          "source_name",
+          "source_path",
           "metadata",
+          "site_parameter_id",
+          "sensor_id",
+          "measurement_type",
           "is_active",
           "discovered_at",
+          "paired_at",
+          "last_data_time",
+          "last_window_digest",
+          "pairing_plan_id",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "replicates"
         ],
         "type": "object"
       },
@@ -4794,6 +4987,7 @@
             "type": "string"
           },
           "decimal_places": {
+            "description": "The places the slot declares, NULL where it declares none (Q128).",
             "format": "int32",
             "type": [
               "integer",
@@ -5058,7 +5252,10 @@
         "required": [
           "id",
           "derived_definition_id",
-          "variable_name"
+          "parameter_id",
+          "site_property",
+          "variable_name",
+          "created_at"
         ],
         "type": "object"
       },
@@ -5130,7 +5327,10 @@
         "required": [
           "id",
           "derived_definition_id",
-          "variable_name"
+          "parameter_id",
+          "site_property",
+          "variable_name",
+          "created_at"
         ],
         "type": "object"
       },
@@ -5173,7 +5373,10 @@
         "required": [
           "id",
           "derived_definition_id",
-          "variable_name"
+          "parameter_id",
+          "site_property",
+          "variable_name",
+          "created_at"
         ],
         "type": "object"
       },
@@ -8059,6 +8262,7 @@
           "formula_transition",
           "curve_recompose",
           "derived_computed",
+          "reprocess",
           "rollback"
         ],
         "type": "string"
@@ -8774,6 +8978,7 @@
         "description": "The two columns a replicated member also shows: the mean and the sd the `samples` trigger\ncomputes over its replicates. Read-only wherever they render, since nothing writes them.",
         "properties": {
           "decimal_places": {
+            "description": "The places the slot declares, NULL where it declares none. Never inferred: the formatter\nthat renders the number owns the fallback (Q128).",
             "format": "int32",
             "type": [
               "integer",
@@ -9141,6 +9346,9 @@
           "site_id",
           "text",
           "verified",
+          "created_by",
+          "source_system",
+          "source_key",
           "created_at",
           "updated_at"
         ],
@@ -9220,6 +9428,9 @@
           "site_id",
           "text",
           "verified",
+          "created_by",
+          "source_system",
+          "source_key",
           "created_at",
           "updated_at"
         ],
@@ -9359,10 +9570,12 @@
         },
         "required": [
           "id",
+          "alarm_event_id",
           "kind",
           "channel",
           "recipient",
           "status",
+          "error",
           "created_at"
         ],
         "type": "object"
@@ -9405,10 +9618,12 @@
         },
         "required": [
           "id",
+          "alarm_event_id",
           "kind",
           "channel",
           "recipient",
           "status",
+          "error",
           "created_at"
         ],
         "type": "object"
@@ -9521,6 +9736,8 @@
           "id",
           "site_id",
           "parameter_id",
+          "expires_at",
+          "created_by",
           "created_at"
         ],
         "type": "object"
@@ -9561,6 +9778,8 @@
           "id",
           "site_id",
           "parameter_id",
+          "expires_at",
+          "created_by",
           "created_at"
         ],
         "type": "object"
@@ -10049,11 +10268,14 @@
           "id",
           "source_system",
           "status",
+          "created_by",
           "summary",
           "entries",
           "curve_assignments",
           "version",
-          "created_at"
+          "created_at",
+          "applied_at",
+          "apply_result"
         ],
         "type": "object"
       },
@@ -10129,11 +10351,14 @@
           "id",
           "source_system",
           "status",
+          "created_by",
           "summary",
           "entries",
           "curve_assignments",
           "version",
-          "created_at"
+          "created_at",
+          "applied_at",
+          "apply_result"
         ],
         "type": "object"
       },
@@ -10182,11 +10407,14 @@
           "id",
           "source_system",
           "status",
+          "created_by",
           "summary",
           "entries",
           "curve_assignments",
           "version",
-          "created_at"
+          "created_at",
+          "applied_at",
+          "apply_result"
         ],
         "type": "object"
       },
@@ -10344,8 +10572,10 @@
           "name",
           "default_units",
           "category",
+          "description",
           "aliases",
-          "needs_review"
+          "needs_review",
+          "created_at"
         ],
         "type": "object"
       },
@@ -10778,6 +11008,7 @@
           "id",
           "code",
           "label",
+          "description",
           "ordinal",
           "created_at"
         ],
@@ -10885,6 +11116,10 @@
           "parameter_id",
           "ordinal",
           "role",
+          "replicates",
+          "label",
+          "units",
+          "description",
           "created_at"
         ],
         "type": "object"
@@ -10944,6 +11179,10 @@
           "parameter_id",
           "ordinal",
           "role",
+          "replicates",
+          "label",
+          "units",
+          "description",
           "created_at"
         ],
         "type": "object"
@@ -11031,6 +11270,7 @@
           "id",
           "code",
           "label",
+          "description",
           "ordinal",
           "created_at"
         ],
@@ -11114,8 +11354,10 @@
           "name",
           "default_units",
           "category",
+          "description",
           "aliases",
-          "needs_review"
+          "needs_review",
+          "created_at"
         ],
         "type": "object"
       },
@@ -12415,7 +12657,16 @@
         "required": [
           "id",
           "name",
-          "is_public"
+          "data_source",
+          "description",
+          "created_at",
+          "discovered_at",
+          "is_public",
+          "public_code",
+          "public_api_title",
+          "public_api_description",
+          "public_api_version",
+          "public_contact_email"
         ],
         "type": "object"
       },
@@ -13886,13 +14137,22 @@
         },
         "required": [
           "id",
+          "sensor_id",
           "trigger_type",
+          "trigger_id",
           "status",
+          "readings_updated",
+          "progress",
+          "total",
+          "error_message",
           "retry_count",
           "category",
+          "site_id",
+          "parent_job_id",
           "detail",
           "params",
           "created_at",
+          "completed_at",
           "rerunnable",
           "cancellable"
         ],
@@ -14003,13 +14263,22 @@
         },
         "required": [
           "id",
+          "sensor_id",
           "trigger_type",
+          "trigger_id",
           "status",
+          "readings_updated",
+          "progress",
+          "total",
+          "error_message",
           "retry_count",
           "category",
+          "site_id",
+          "parent_job_id",
           "detail",
           "params",
           "created_at",
+          "completed_at",
           "rerunnable",
           "cancellable"
         ],
@@ -14792,7 +15061,16 @@
           "site_id",
           "parameter_id",
           "collected_at",
+          "created_at",
+          "mean",
+          "stdev",
           "n",
+          "stdev_sample",
+          "stdev_population",
+          "median",
+          "min_value",
+          "max_value",
+          "updated_at",
           "sd_estimator",
           "sd_estimator_source"
         ],
@@ -14990,7 +15268,16 @@
           "site_id",
           "parameter_id",
           "collected_at",
+          "created_at",
+          "mean",
+          "stdev",
           "n",
+          "stdev_sample",
+          "stdev_population",
+          "median",
+          "min_value",
+          "max_value",
+          "updated_at",
           "sd_estimator",
           "sd_estimator_source"
         ],
@@ -15062,8 +15349,7 @@
       "SampleUpdate": {
         "type": "object"
       },
-      "ScheduleView": {
-        "description": "One schedule row as the API exposes it. `running` is computed per-request from the live job\nqueue, not stored. Field names/types are the UI contract.",
+      "ScheduleList": {
         "properties": {
           "catchup_policy": {
             "type": [
@@ -15071,8 +15357,16 @@
               "null"
             ]
           },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
           "enabled": {
             "type": "boolean"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
           },
           "interval_seconds": {
             "format": "int64",
@@ -15082,6 +15376,7 @@
             ]
           },
           "job_name": {
+            "description": "The registered job this schedule drives, and the id every route addresses it by.",
             "type": "string"
           },
           "last_enqueued_at": {
@@ -15092,6 +15387,7 @@
             ]
           },
           "next_run_at": {
+            "description": "The next slot the scheduler will fire, maintained by the scheduler and by an edit that\nbrings the grid forward.",
             "format": "date-time",
             "type": [
               "string",
@@ -15105,22 +15401,19 @@
             ]
           },
           "running": {
-            "description": "Whether a non-terminal job of this `job_name` is in flight (queued/pending/running/retrying).",
+            "description": "Whether a job of this name is in flight. Per request, never stored.",
             "type": "boolean"
           },
           "tunables": {},
           "tunables_schema": {
-            "description": "What this job accepts under `tunables`, from its own declaration. Empty means none.",
-            "items": {
-              "$ref": "#/components/schemas/TunableSpec"
-            },
-            "type": "array"
+            "description": "What this job accepts under `tunables`, from its own declaration, as the form reads it.\n`[]` means none. It is the job's `TunableSpec` list serialised, not a stored column."
           },
           "updated_at": {
             "format": "date-time",
             "type": "string"
           },
           "updated_by": {
+            "description": "Who made the last edit, from the request that made it.",
             "type": [
               "string",
               "null"
@@ -15129,18 +15422,140 @@
         },
         "required": [
           "job_name",
+          "id",
           "enabled",
-          "interval_seconds",
           "next_run_at",
-          "last_enqueued_at",
+          "interval_seconds",
           "overlap_policy",
           "catchup_policy",
           "tunables",
-          "tunables_schema",
+          "last_enqueued_at",
           "updated_by",
           "updated_at",
-          "running"
+          "created_at",
+          "running",
+          "tunables_schema"
         ],
+        "type": "object"
+      },
+      "ScheduleResponse": {
+        "properties": {
+          "catchup_policy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "interval_seconds": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "job_name": {
+            "description": "The registered job this schedule drives, and the id every route addresses it by.",
+            "type": "string"
+          },
+          "last_enqueued_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_run_at": {
+            "description": "The next slot the scheduler will fire, maintained by the scheduler and by an edit that\nbrings the grid forward.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "overlap_policy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "running": {
+            "description": "Whether a job of this name is in flight. Per request, never stored.",
+            "type": "boolean"
+          },
+          "tunables": {},
+          "tunables_schema": {
+            "description": "What this job accepts under `tunables`, from its own declaration, as the form reads it.\n`[]` means none. It is the job's `TunableSpec` list serialised, not a stored column."
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "updated_by": {
+            "description": "Who made the last edit, from the request that made it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "job_name",
+          "id",
+          "enabled",
+          "next_run_at",
+          "interval_seconds",
+          "overlap_policy",
+          "catchup_policy",
+          "tunables",
+          "last_enqueued_at",
+          "updated_by",
+          "updated_at",
+          "created_at",
+          "running",
+          "tunables_schema"
+        ],
+        "type": "object"
+      },
+      "ScheduleUpdate": {
+        "properties": {
+          "catchup_policy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "interval_seconds": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "overlap_policy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tunables": {}
+        },
         "type": "object"
       },
       "ScreenedCell": {
@@ -15839,7 +16254,17 @@
           "slope",
           "intercept",
           "valid_from",
-          "valid_until_explicit"
+          "performed_by",
+          "notes",
+          "name",
+          "parameter_id",
+          "r_squared",
+          "valid_until",
+          "valid_until_explicit",
+          "created_at",
+          "retired_at",
+          "retired_by",
+          "retired_reason"
         ],
         "type": "object"
       },
@@ -15945,7 +16370,17 @@
           "slope",
           "intercept",
           "valid_from",
-          "valid_until_explicit"
+          "performed_by",
+          "notes",
+          "name",
+          "parameter_id",
+          "r_squared",
+          "valid_until",
+          "valid_until_explicit",
+          "created_at",
+          "retired_at",
+          "retired_by",
+          "retired_reason"
         ],
         "type": "object"
       },
@@ -16188,7 +16623,10 @@
           "site_id",
           "parameter_id",
           "deployed_from",
-          "deployment_type"
+          "deployed_until",
+          "deployment_type",
+          "notes",
+          "created_at"
         ],
         "type": "object"
       },
@@ -16347,7 +16785,10 @@
           "site_id",
           "parameter_id",
           "deployed_from",
-          "deployment_type"
+          "deployed_until",
+          "deployment_type",
+          "notes",
+          "created_at"
         ],
         "type": "object"
       },
@@ -16404,7 +16845,10 @@
           "site_id",
           "parameter_id",
           "deployed_from",
-          "deployment_type"
+          "deployed_until",
+          "deployment_type",
+          "notes",
+          "created_at"
         ],
         "type": "object"
       },
@@ -16632,8 +17076,27 @@
         },
         "required": [
           "id",
+          "serial_number",
+          "name",
+          "manufacturer",
+          "model",
+          "is_active",
+          "is_lab_instrument",
           "kind",
-          "data_frequency"
+          "source_system",
+          "source_key",
+          "data_frequency",
+          "notes",
+          "metadata",
+          "created_at",
+          "reading_count",
+          "last_reading_at",
+          "last_calibration_at",
+          "current_site_id",
+          "current_site_name",
+          "last_reading_value",
+          "curve_count",
+          "last_curve_use"
         ],
         "type": "object"
       },
@@ -16949,9 +17412,28 @@
         },
         "required": [
           "id",
+          "serial_number",
+          "name",
+          "manufacturer",
+          "model",
+          "is_active",
+          "is_lab_instrument",
           "kind",
+          "source_system",
+          "source_key",
           "data_frequency",
-          "deployments"
+          "notes",
+          "metadata",
+          "created_at",
+          "deployments",
+          "reading_count",
+          "last_reading_at",
+          "last_calibration_at",
+          "current_site_id",
+          "current_site_name",
+          "last_reading_value",
+          "curve_count",
+          "last_curve_use"
         ],
         "type": "object"
       },
@@ -17409,7 +17891,16 @@
         },
         "required": [
           "id",
-          "name"
+          "project_id",
+          "subproject_id",
+          "name",
+          "latitude",
+          "longitude",
+          "altitude_m",
+          "created_at",
+          "discovered_at",
+          "public_code",
+          "meteoswiss_station_abbr"
         ],
         "type": "object"
       },
@@ -17672,8 +18163,23 @@
           "parameter_id",
           "name",
           "sensor_type",
+          "display_units",
+          "units_name",
+          "units_min",
+          "units_max",
+          "decimal_places",
+          "channel_id",
+          "sample_interval_sec",
+          "is_active",
+          "is_public",
           "needs_review",
+          "sd_estimator",
           "entry_mode",
+          "instrument_sensor_id",
+          "variable_mappings",
+          "created_at",
+          "updated_at",
+          "discovered_at",
           "parameter"
         ],
         "type": "object"
@@ -17823,8 +18329,23 @@
           "parameter_id",
           "name",
           "sensor_type",
+          "display_units",
+          "units_name",
+          "units_min",
+          "units_max",
+          "decimal_places",
+          "channel_id",
+          "sample_interval_sec",
+          "is_active",
+          "is_public",
           "needs_review",
+          "sd_estimator",
           "entry_mode",
+          "instrument_sensor_id",
+          "variable_mappings",
+          "created_at",
+          "updated_at",
+          "discovered_at",
           "parameter"
         ],
         "type": "object"
@@ -18458,9 +18979,20 @@
         "required": [
           "id",
           "sensor_id",
+          "name",
+          "fitted_on",
           "slope",
           "intercept",
-          "created_at"
+          "r_squared",
+          "notes",
+          "created_at",
+          "created_by",
+          "source_system",
+          "source_key",
+          "copied_from_id",
+          "retired_at",
+          "retired_by",
+          "retired_reason"
         ],
         "type": "object"
       },
@@ -18568,9 +19100,20 @@
         "required": [
           "id",
           "sensor_id",
+          "name",
+          "fitted_on",
           "slope",
           "intercept",
-          "created_at"
+          "r_squared",
+          "notes",
+          "created_at",
+          "created_by",
+          "source_system",
+          "source_key",
+          "copied_from_id",
+          "retired_at",
+          "retired_by",
+          "retired_reason"
         ],
         "type": "object"
       },
@@ -18923,6 +19466,7 @@
           "id",
           "project_id",
           "name",
+          "description",
           "created_at"
         ],
         "type": "object"
@@ -18955,6 +19499,7 @@
           "id",
           "project_id",
           "name",
+          "description",
           "created_at"
         ],
         "type": "object"
@@ -19210,9 +19755,13 @@
           "id",
           "service_id",
           "command",
+          "payload",
           "status",
+          "result",
           "created_at",
-          "expires_at"
+          "expires_at",
+          "acknowledged_at",
+          "completed_at"
         ],
         "type": "object"
       },
@@ -19443,12 +19992,17 @@
         "required": [
           "id",
           "service_id",
+          "command_id",
           "event_type",
           "status",
           "readings_synced",
           "readings_skipped",
           "status_events_synced",
-          "started_at"
+          "errors",
+          "log",
+          "started_at",
+          "completed_at",
+          "duration_ms"
         ],
         "type": "object"
       },
@@ -19657,6 +20211,12 @@
           },
           "service_type": {
             "type": "string"
+          },
+          "source_system": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -19694,6 +20254,13 @@
           },
           "service_type": {
             "type": "string"
+          },
+          "source_system": {
+            "description": "The source system a service enrolled on this credential speaks for, e.g. \"metalp\". It is\nthe provenance its registrations are written under; `service_type` is the kind of service,\nwhich for the three portals is one value. NULL on a credential minted before it was\ndeclared.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -19701,6 +20268,8 @@
           "client_id",
           "client_secret_hash",
           "service_type",
+          "source_system",
+          "service_id",
           "revoked",
           "created_at"
         ],
@@ -19734,6 +20303,13 @@
           },
           "service_type": {
             "type": "string"
+          },
+          "source_system": {
+            "description": "The source system a service enrolled on this credential speaks for, e.g. \"metalp\". It is\nthe provenance its registrations are written under; `service_type` is the kind of service,\nwhich for the three portals is one value. NULL on a credential minted before it was\ndeclared.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -19741,6 +20317,8 @@
           "client_id",
           "client_secret_hash",
           "service_type",
+          "source_system",
+          "service_id",
           "revoked",
           "created_at"
         ],
@@ -19768,6 +20346,12 @@
             ]
           },
           "service_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_system": {
             "type": [
               "string",
               "null"
@@ -19825,6 +20409,13 @@
           "service_type": {
             "type": "string"
           },
+          "source_system": {
+            "description": "Copied from the credential at enrolment: the source system this service's registrations are\nwritten under. Not a CRUD field, it belongs to the credential.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "status": {
             "type": "string"
           },
@@ -19844,10 +20435,16 @@
         "required": [
           "id",
           "service_type",
+          "source_system",
           "instance_id",
           "status",
           "paused",
+          "current_operation",
+          "sync_interval_secs",
           "full_reassert_enabled",
+          "last_heartbeat",
+          "last_sync_completed_at",
+          "last_error",
           "created_at",
           "updated_at"
         ],
@@ -19903,6 +20500,13 @@
           "service_type": {
             "type": "string"
           },
+          "source_system": {
+            "description": "The source system this service's registrations are written under; null where the credential\nit enrolled on declares none.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "status": {
             "type": "string"
           },
@@ -19921,6 +20525,7 @@
         "required": [
           "id",
           "service_type",
+          "source_system",
           "instance_id",
           "status",
           "paused",
@@ -20354,11 +20959,16 @@
           "id",
           "name",
           "label",
+          "description",
+          "active_version_id",
+          "created_by",
           "created_at",
           "updated_at",
           "enabled",
           "engine",
+          "parameter_group_id",
           "versions",
+          "active_version_no",
           "version_count"
         ],
         "type": "object"
@@ -20437,10 +21047,15 @@
           "id",
           "name",
           "label",
+          "description",
+          "active_version_id",
+          "created_by",
           "created_at",
           "updated_at",
           "enabled",
           "engine",
+          "parameter_group_id",
+          "active_version_no",
           "version_count"
         ],
         "type": "object"
@@ -20509,7 +21124,10 @@
           "manifest",
           "test_cases",
           "content_hash",
+          "created_by",
           "created_at",
+          "validated_at",
+          "note",
           "active"
         ],
         "type": "object"
@@ -20570,7 +21188,10 @@
           "version_no",
           "entry_function",
           "content_hash",
+          "created_by",
           "created_at",
+          "validated_at",
+          "note",
           "active"
         ],
         "type": "object"
@@ -20614,113 +21235,6 @@
           "content_hash",
           "runner_image",
           "r_version"
-        ],
-        "type": "object"
-      },
-      "TunableKind": {
-        "oneOf": [
-          {
-            "properties": {
-              "type": {
-                "enum": [
-                  "integer"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "type"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "type": {
-                "enum": [
-                  "boolean"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "type"
-            ],
-            "type": "object"
-          },
-          {
-            "description": "A count of seconds, rendered as a duration.",
-            "properties": {
-              "type": {
-                "enum": [
-                  "duration"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "type"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "options": {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              "type": {
-                "enum": [
-                  "enum"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "options",
-              "type"
-            ],
-            "type": "object"
-          }
-        ]
-      },
-      "TunableSpec": {
-        "description": "What one operator-settable input a job accepts looks like: enough for a form to build a field\nand for the server to refuse a value the job would not read.",
-        "properties": {
-          "default": {},
-          "help": {
-            "type": "string"
-          },
-          "key": {
-            "type": "string"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/TunableKind"
-          },
-          "max": {
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "min": {
-            "description": "Inclusive bounds for an integer or a duration in seconds.",
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "key",
-          "kind",
-          "min",
-          "max",
-          "default",
-          "help"
         ],
         "type": "object"
       },
@@ -20937,38 +21451,6 @@
               "null"
             ]
           }
-        },
-        "type": "object"
-      },
-      "UpdateScheduleRequest": {
-        "description": "PATCH body, every field optional; absent fields are left unchanged.",
-        "properties": {
-          "catchup_policy": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "enabled": {
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "interval_seconds": {
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "overlap_policy": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "tunables": {}
         },
         "type": "object"
       },
@@ -21548,6 +22030,41 @@
         ]
       }
     },
+    "/api/actions/curation_drift": {
+      "get": {
+        "description": "The columns are the projection of the record, written by the same trigger in the writer's\ntransaction, so a disagreement means something wrote a column without recording the decision,\nor a decision failed to project. Read-only: which side is wrong is itself a decision, a\nrollback or a fresh decision, so nothing here picks one.",
+        "operationId": "curation_drift",
+        "parameters": [
+          {
+            "description": "How many rows to list, default 50, max 500",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CurationDriftResponse"
+                }
+              }
+            },
+            "description": "Readings that disagree with their decision record"
+          }
+        },
+        "summary": "Readings whose curation columns disagree with the decisions recorded against them.",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
     "/api/actions/derived_parameters/{id}/recompute": {
       "post": {
         "operationId": "recompute_derived",
@@ -21898,7 +22415,6 @@
             "description": "The backdate names no target, so a caller confined to a project set is refused"
           }
         },
-        "summary": "Re-derive `sensor_id`/`deployment_id`/`site_id`/`calibrated_value` for ALL historical readings\nfrom the current deployment + calibration timelines, across every `(site, parameter)` slot that\nhas a deployment. Use after correcting deployment/calibration windows in bulk (the backdate of\nhistorical attribution). Each slot is reprocessed via the decompression-safe\n`reprocess_site_parameter_readings`; runs as one tracked job. Requires `write_data`.",
         "tags": [
           "actions"
         ]
@@ -21932,7 +22448,6 @@
             "description": "Unknown estimator, no slot or stream named, a window that ends before it starts, or a slot in scope that does not declare the estimator"
           }
         },
-        "summary": "Bring stored samples into line with their slot's declared sd estimator, with the job's own\noptions exposed: a window, a stream scope, and `override_instants`.",
         "tags": [
           "actions"
         ]
@@ -26665,7 +27180,6 @@
             "description": "Stream not found"
           }
         },
-        "summary": "Stream-based status event ingestion (non-numeric device states like \"low_battery\").\nHypertable inserts keyed by stream_id. Requires `write_data`.",
         "tags": [
           "ingestion"
         ]
@@ -31130,7 +31644,6 @@
             "description": "Body exceeds 10MB limit"
           }
         },
-        "summary": "Batch insert readings keyed by (site_id, parameter_id). Auto-creates \"api\" streams when\na (site, parameter) pair has none. 10MB body limit. Requires `write_data`.",
         "tags": [
           "ingestion"
         ]
@@ -33049,37 +33562,83 @@
     },
     "/api/schedules": {
       "get": {
-        "operationId": "list_schedules",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/ScheduleView"
-                  },
-                  "type": "array"
-                }
-              }
-            },
-            "description": "Every recurring job's schedule"
-          }
-        },
-        "summary": "`GET /api/schedules`, every recurring-Service schedule, ordered by `job_name`. Requires\n`read_metadata`.",
-        "tags": [
-          "schedules"
-        ]
-      }
-    },
-    "/api/schedules/{job_name}": {
-      "get": {
-        "operationId": "get_schedule",
+        "description": "Retrieves all schedules.\n\nThis resource manages schedule items\n\nAdditional sortable columns: \n- job_name\n- enabled\n- next_run_at\n- interval_seconds\n- last_enqueued_at\n- updated_at\n- created_at.\n\nAdditional filterable columns: \n- job_name\n- enabled.",
+        "operationId": "get_all_schedules",
         "parameters": [
           {
-            "description": "Registered job name",
-            "in": "path",
-            "name": "job_name",
-            "required": true,
+            "description": "JSON-encoded filter for querying resources.\n\nThis parameter supports various filtering options:\n- Free text search: `{\"q\": \"search text\"}`\n- Filtering by a single ID: `{\"id\": \"550e8400-e29b-41d4-a716-446655440000\"}`\n- Filtering by multiple IDs: `{\"id\": [\"550e8400-e29b-41d4-a716-446655440000\", \"550e8400-e29b-41d4-a716-446655440001\"]}`\n- Filtering on other columns: `{\"name\": \"example\"}`",
+            "example": {
+              "id": "550e8400-e29b-41d4-a716-446655440000",
+              "name": "example",
+              "q": "search text"
+            },
+            "in": "query",
+            "name": "filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Range for pagination in the format \"[start, end]\".\n\nExample: `[0,9]`",
+            "example": "[0,9]",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number for standard REST pagination (1-based).\n\nExample: `1`",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page for standard REST pagination.\n\nExample: `10`",
+            "example": 10,
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort order for the results in the format `[\"column\", \"order\"]`.\n\nExample: `[\"id\", \"ASC\"]`",
+            "example": "[\"id\", \"ASC\"]",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort column for standard REST format.\n\nExample: `title`",
+            "example": "title",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort order for standard REST format (ASC or DESC).\n\nExample: `ASC`",
+            "example": "ASC",
+            "in": "query",
+            "name": "order",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -33090,31 +33649,35 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ScheduleView"
+                  "items": {
+                    "$ref": "#/components/schemas/ScheduleList"
+                  },
+                  "type": "array"
                 }
               }
             },
-            "description": "The schedule"
+            "description": "List of resources"
           },
-          "404": {
-            "description": "No schedule of that name"
+          "500": {
+            "description": "Internal Server Error"
           }
         },
-        "summary": "`GET /api/schedules/{job_name}`, one schedule. 404 if unknown. Requires `read_metadata`.",
-        "tags": [
-          "schedules"
-        ]
-      },
+        "summary": "Get all schedules"
+      }
+    },
+    "/api/schedules/batch": {
       "patch": {
-        "operationId": "update_schedule",
+        "description": "Updates multiple schedules in a batch. Limited to 100 items per request.\n\nUse `?partial=true` for partial success mode (commits successful items even if some fail).\n\nThis resource manages schedule items",
+        "operationId": "update_many_schedules",
         "parameters": [
           {
-            "description": "Registered job name",
-            "in": "path",
-            "name": "job_name",
-            "required": true,
+            "description": "Enable partial success mode for batch operations.\n\nWhen `true`, the operation processes each item independently instead of\nusing all-or-nothing semantics. Items that succeed are committed even if\nother items fail.\n\nDefault: `false` (all-or-nothing)",
+            "example": false,
+            "in": "query",
+            "name": "partial",
+            "required": false,
             "schema": {
-              "type": "string"
+              "type": "boolean"
             }
           }
         ],
@@ -33122,7 +33685,10 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/UpdateScheduleRequest"
+                "items": {
+                  "$ref": "#/components/schemas/BatchUpdateRequest"
+                },
+                "type": "array"
               }
             }
           },
@@ -33133,23 +33699,143 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ScheduleView"
+                  "items": {
+                    "$ref": "#/components/schemas/ScheduleResponse"
+                  },
+                  "type": "array"
                 }
               }
             },
-            "description": "The updated schedule"
+            "description": "Resources updated successfully"
+          },
+          "207": {
+            "description": "Partial success - some items updated, some failed"
           },
           "400": {
-            "description": "Bad interval, unknown policy, or rejected tunables"
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Bad request - batch size exceeded or validation failed"
           },
           "404": {
-            "description": "No schedule of that name"
+            "description": "One or more resources not found"
+          },
+          "409": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Duplicate record"
+          },
+          "500": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Internal Server Error"
           }
         },
-        "summary": "`PATCH /api/schedules/{job_name}`, edit cadence/policies/tunables. 404 unknown row; 400 on a\nbad interval, unknown policy, or rejected tunables. Applies only provided fields, recomputes\n`next_run_at` when the interval changes or a disabled schedule is enabled, stamps the actor, and\nwrites a `change_audit` row. Requires `write_metadata` (+ non-scoped token). Returns the\nupdated [`ScheduleView`].",
-        "tags": [
-          "schedules"
-        ]
+        "summary": "Update many schedules"
+      }
+    },
+    "/api/schedules/{id}": {
+      "get": {
+        "description": "Retrieves one schedule by its ID.\n\nThis resource manages schedule items",
+        "operationId": "get_one_schedule",
+        "parameters": [
+          {
+            "description": "Resource identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleResponse"
+                }
+              }
+            },
+            "description": "The requested resource"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get one schedule"
+      },
+      "put": {
+        "description": "Updates one schedule by its ID.\n\nThis resource manages schedule items",
+        "operationId": "update_one_schedule",
+        "parameters": [
+          {
+            "description": "Resource identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScheduleUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleResponse"
+                }
+              }
+            },
+            "description": "Resource updated successfully"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Duplicate record"
+          }
+        },
+        "summary": "Update one schedule"
       }
     },
     "/api/schedules/{job_name}/audit": {
@@ -35196,7 +35882,6 @@
             "description": "Suggested dates"
           }
         },
-        "summary": "Suggested deploy dates for a sensor: now, the end of its last deployment, and its first reading.",
         "tags": [
           "sensors"
         ]
@@ -36929,7 +37614,6 @@
             "description": "Site not found"
           }
         },
-        "summary": "What an export of this site and range can carry beyond the plain series: annotation, flagged,\nreplicate and alarm counts, per parameter. The export dialog enables each option from these\nnumbers and shows them beside it.",
         "tags": [
           "sites"
         ]
@@ -41536,7 +42220,7 @@
     },
     "/api/sync_service_credentials": {
       "get": {
-        "description": "Retrieves all sync_service_credentials.\n\nThis resource manages sync_service_credential items\n\nAdditional sortable columns: \n- created_at.\n\nAdditional filterable columns: \n- client_id\n- service_type\n- service_id\n- revoked.",
+        "description": "Retrieves all sync_service_credentials.\n\nThis resource manages sync_service_credential items\n\nAdditional sortable columns: \n- created_at.\n\nAdditional filterable columns: \n- client_id\n- service_type\n- source_system\n- service_id\n- revoked.",
         "operationId": "get_all_sync_service_credentials",
         "parameters": [
           {
@@ -42024,7 +42708,7 @@
     },
     "/api/sync_services": {
       "get": {
-        "description": "Retrieves all sync_services.\n\nThis resource manages sync_service items\n\nAdditional sortable columns: \n- last_heartbeat\n- created_at\n- updated_at.\n\nAdditional filterable columns: \n- service_type\n- instance_id\n- status\n- paused\n- full_reassert_enabled.",
+        "description": "Retrieves all sync_services.\n\nThis resource manages sync_service items\n\nAdditional sortable columns: \n- last_heartbeat\n- created_at\n- updated_at.\n\nAdditional filterable columns: \n- service_type\n- source_system\n- instance_id\n- status\n- paused\n- full_reassert_enabled.",
         "operationId": "get_all_sync_services",
         "parameters": [
           {
@@ -43876,7 +44560,6 @@
             "description": "The projects the user is granted"
           }
         },
-        "summary": "List the projects a user is granted, with names. Administrators are unrestricted (they are never\ngranted rows); this reflects only the stored grant set. Requires `require_admin`.",
         "tags": [
           "users"
         ]

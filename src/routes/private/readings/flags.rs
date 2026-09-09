@@ -132,6 +132,7 @@ async fn apply_flags(
     state: &AppState,
     scope: &AccessScope,
     actor: &str,
+    origin: Origin,
     keys: &[ReadingKey],
     write: FlagWrite,
 ) -> AppResult<u64> {
@@ -180,7 +181,7 @@ async fn apply_flags(
                 decisions::NewValue::Literal(write.new_value()),
                 actor,
                 write.reason(),
-                Origin::Manual,
+                origin,
                 Some(set_id),
             )
             .await?;
@@ -276,6 +277,7 @@ async fn apply_flags_over_range(
     state: &AppState,
     scope: &AccessScope,
     actor: &str,
+    origin: Origin,
     range: SlotRange,
     write: &FlagWrite,
 ) -> AppResult<u64> {
@@ -291,7 +293,7 @@ async fn apply_flags_over_range(
             decisions::NewValue::Literal(write.new_value()),
             actor,
             write.reason(),
-            Origin::Manual,
+            origin,
             Some(Uuid::new_v4()),
         )
         .await
@@ -334,6 +336,7 @@ pub async fn flag_readings(
         &state,
         &scope,
         &label(&auth),
+        auth.origin(),
         &payload.readings,
         FlagWrite::Set(payload.reason.clone()),
     )
@@ -367,6 +370,7 @@ pub async fn unflag_readings(
         &state,
         &scope,
         &label(&auth),
+        auth.origin(),
         &payload.readings,
         FlagWrite::Clear,
     )
@@ -449,6 +453,7 @@ pub async fn flag_range(
         &state,
         &scope,
         &label(&auth),
+        auth.origin(),
         range,
         &FlagWrite::Set(payload.reason.clone()),
     )
@@ -508,6 +513,7 @@ pub async fn unflag_range(
         &state,
         &scope,
         &label(&auth),
+        auth.origin(),
         range,
         &FlagWrite::Clear,
     )

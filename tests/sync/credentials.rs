@@ -54,6 +54,7 @@ async fn minted_credentials_enroll_and_are_stored_hashed() {
         State(state.clone()),
         Json(CreateCredentialRequest {
             service_type: "vaisala".to_string(),
+            source_system: Some("vaisala".to_string()),
         }),
     )
     .await
@@ -125,6 +126,7 @@ async fn minted_credentials_enroll_and_are_stored_hashed() {
         State(state.clone()),
         Json(CreateCredentialRequest {
             service_type: "vaisala".to_string(),
+            source_system: Some("vaisala".to_string()),
         }),
     )
     .await
@@ -230,6 +232,7 @@ async fn revoking_a_credential_kills_enrollment_and_live_sessions() {
         State(state.clone()),
         Json(CreateCredentialRequest {
             service_type: "cnet".to_string(),
+            source_system: Some("cnet".to_string()),
         }),
     )
     .await
@@ -322,4 +325,72 @@ async fn revoking_an_unknown_credential_is_not_found() {
 
     let result = revoke_credential(State(state), Path(Uuid::new_v4())).await;
     assert!(result.is_err(), "an unknown credential id must not succeed");
+}
+
+/// Scenario: two rshiny services enroll on their own credentials, one for CNET and one for METALP.
+///
+/// Expected behaviour: the source system each speaks for is read back from its session token.
+/// `service_type` cannot answer this, it is `rshiny` for both; before the declaration existed the
+/// only statement of the source system was a string in each register call's body, so the server
+/// could not tell the two services apart at all.
+#[tokio::test]
+#[serial]
+async fn a_service_speaks_for_the_source_system_its_credential_declares() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let (app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    let mut sessions = Vec::new();
+    for source in ["cnet", "metalp"] {
+        let Json(minted) = create_credential(
+            State(state.clone()),
+            Json(CreateCredentialRequest {
+                service_type: "rshiny".to_string(),
+                source_system: Some(source.to_string()),
+            }),
+        )
+        .await
+        .expect("mint");
+
+        let (status, body) = crate::common::post_json(
+            &app,
+            "/api/sync/enroll",
+            &serde_json::json!({
+                "client_id": minted.client_id,
+                "client_secret": minted.client_secret,
+                "instance_id": format!("inst-{source}"),
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "enroll {source} ({status}): {body}");
+        let enrolled: serde_json::Value =
+            serde_json::from_str(&body).expect("the enrollment response is JSON");
+        let token = enrolled["session_token"]
+            .as_str()
+            .expect("a session token")
+            .to_string();
+        sessions.push((source, token));
+    }
+
+    for (source, token) in sessions {
+        let session =
+            river_db::routes::private::sync::control::session::lookup_sync_session(&db, &token)
+                .await
+                .expect("a live session");
+        assert_eq!(
+            session.source_system.as_deref(),
+            Some(source),
+            "the session says which source system the service speaks for"
+        );
+    }
+
+    // The kind of service is the same word for both, which is why it cannot carry the source.
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) AS c FROM sync_services WHERE service_type = 'rshiny'"
+        )
+        .await,
+        2
+    );
 }

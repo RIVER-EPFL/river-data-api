@@ -100,11 +100,13 @@ async fn serial_holder<C: ConnectionTrait>(db: &C, serial: &str) -> AppResult<Op
 )]
 pub async fn register_sensor(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(payload): Json<RegisterSensorRequest>,
 ) -> AppResult<Json<RegisterSensorResponse>> {
-    if payload.source_system.trim().is_empty() || payload.source_key.trim().is_empty() {
+    let source_system = crate::common::provenance::source_system(&auth, &payload.source_system)?;
+    if payload.source_key.trim().is_empty() {
         return Err(AppError::BadRequest(
-            "source_system and source_key identify the instrument and cannot be empty".to_string(),
+            "source_key identifies the instrument and cannot be empty".to_string(),
         ));
     }
     if !matches!(payload.data_frequency.as_str(), "high" | "low") {
@@ -115,7 +117,7 @@ pub async fn register_sensor(
     }
 
     let existing = sensors::Entity::find()
-        .filter(sensors::Column::SourceSystem.eq(payload.source_system.clone()))
+        .filter(sensors::Column::SourceSystem.eq(source_system.clone()))
         .filter(sensors::Column::SourceKey.eq(payload.source_key.clone()))
         .one(&state.db)
         .await?;
@@ -129,7 +131,7 @@ pub async fn register_sensor(
 
     let id = upsert_source_instrument(
         &state.db,
-        &payload.source_system,
+        &source_system,
         &payload.source_key,
         &payload.name,
         if payload.is_lab_instrument {

@@ -1,10 +1,9 @@
-//! End-to-end stream management & reconciliation: register source-agnostic streams, view the
-//! discovery report, pair a stream to a site_parameter (with backfill) and unpair it, read stream
+//! End-to-end stream management & reconciliation: register source-agnostic streams, see a new one
+//! reported as unpaired, pair it to a site_parameter (with backfill) and unpair it, read stream
 //! stats, and confirm a sync service surfaces in the sync health view (US-11.1/11.2/11.4).
 //!
-//! Note: the full auto-discover → apply-discovery → batch-create path (US-11.3) is driven by the
-//! sync microservice against real Vaisala source paths; here we exercise the manual pairing path
-//! and confirm the discovery endpoint responds.
+//! Note: the full auto-discover → pairing-plan → apply path (US-11.3) is driven by the sync
+//! microservice against real Vaisala source paths; here we exercise the manual pairing path.
 //!
 //! Run: cargo test --test e2e -- --test-threads=1
 
@@ -39,18 +38,16 @@ async fn register_discover_pair_unpair_and_sync_health() {
     );
     let stream_id = e2e::id_of(&stream);
 
-    // US-11.2: the discovery report responds (suggestions depend on source-path conventions).
-    let (status, discovery) =
-        crate::common::get_json_with_token(&app, "/api/sync/discovery", &token).await;
-    assert_eq!(status, 200, "discovery ({status}): {discovery}");
-    assert!(
-        discovery.is_object() || discovery.is_array(),
-        "discovery returns a structured report"
-    );
-    // The unpaired-summary should reflect our unpaired stream.
+    // US-11.2: the stream just registered is reported as waiting for a pairing.
     let (status, summary) =
         crate::common::get_json_with_token(&app, "/api/sync/unpaired-summary", &token).await;
     assert_eq!(status, 200, "unpaired-summary ({status}): {summary}");
+    let row = summary
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["source_system"] == "e2e"))
+        .unwrap_or_else(|| panic!("the source it registered under is counted: {summary}"));
+    assert_eq!(row["unpaired"], 1, "waiting for a pairing: {summary}");
+    assert_eq!(row["paired"], 0, "and paired to nothing yet: {summary}");
 
     // US-11.1: pair the stream to a site_parameter, then unpair it.
     let (status, paired) = crate::common::post_json_parse_with_token(

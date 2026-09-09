@@ -31,6 +31,10 @@ use crate::routes::private::sync::control::tokens::generate_token;
 pub struct SyncServiceResponse {
     pub id: Uuid,
     pub service_type: String,
+    /// The source system this service's registrations are written under; null where the credential
+    /// it enrolled on declares none.
+    #[schema(required)]
+    pub source_system: Option<String>,
     pub instance_id: String,
     pub status: String,
     pub paused: bool,
@@ -120,6 +124,7 @@ fn service_to_response(
     SyncServiceResponse {
         id: s.id,
         service_type: s.service_type,
+        source_system: s.source_system,
         instance_id: s.instance_id,
         status: s.status,
         paused: s.paused,
@@ -180,6 +185,10 @@ pub struct IssueCommandRequest {
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateCredentialRequest {
     pub service_type: String,
+    /// The source system a service on this credential speaks for, e.g. "metalp". Its registrations
+    /// are written under it, so it is declared here rather than sent with each call.
+    #[serde(default)]
+    pub source_system: Option<String>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -193,6 +202,8 @@ pub struct CredentialResponse {
     pub id: Uuid,
     pub client_id: String,
     pub service_type: String,
+    #[schema(required)]
+    pub source_system: Option<String>,
     #[schema(required)]
     pub service_id: Option<Uuid>,
     pub revoked: bool,
@@ -622,6 +633,7 @@ pub async fn create_credential(
         client_id: Set(client_id.clone()),
         client_secret_hash: Set(secret_hash),
         service_type: Set(req.service_type),
+        source_system: Set(req.source_system.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())),
         service_id: Set(None),
         revoked: Set(false),
         created_at: Set(Utc::now().into()),
@@ -662,6 +674,7 @@ pub async fn list_credentials(
                 id: c.id,
                 client_id: c.client_id,
                 service_type: c.service_type,
+                source_system: c.source_system,
                 service_id: c.service_id,
                 revoked: c.revoked,
                 created_at: c.created_at.to_rfc3339(),

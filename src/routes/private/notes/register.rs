@@ -68,13 +68,10 @@ pub struct NoteOutcome {
 )]
 pub async fn register_notes(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(payload): Json<RegisterNotesRequest>,
 ) -> AppResult<Json<RegisterNotesResponse>> {
-    if payload.source_system.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "source_system must not be empty".into(),
-        ));
-    }
+    let source_system = crate::common::provenance::source_system(&auth, &payload.source_system)?;
     let db = &state.db;
 
     let mut names: Vec<String> = payload
@@ -139,8 +136,8 @@ pub async fn register_notes(
                     site_id.into(),
                     item.text.clone().into(),
                     item.verified.into(),
-                    format!("sync:{}", payload.source_system).into(),
-                    payload.source_system.clone().into(),
+                    format!("sync:{source_system}").into(),
+                    source_system.clone().into(),
                     item.source_key.clone().into(),
                 ],
             ))

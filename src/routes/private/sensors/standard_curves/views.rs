@@ -135,24 +135,26 @@ pub(crate) async fn resolve_lab_instrument(
 )]
 pub async fn register_standard_curve(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(payload): Json<RegisterStandardCurveRequest>,
 ) -> AppResult<Json<RegisterStandardCurveResponse>> {
+    let source_system = crate::common::provenance::source_system(&auth, &payload.source_system)?;
     if payload.slope == 0.0 {
         return Err(AppError::BadRequest(
             "Slope cannot be zero: all readings would produce a constant value".to_string(),
         ));
     }
-    if payload.source_system.trim().is_empty() || payload.source_key.trim().is_empty() {
+    if payload.source_key.trim().is_empty() {
         return Err(AppError::BadRequest(
-            "source_system and source_key identify the curve and cannot be empty".to_string(),
+            "source_key identifies the curve and cannot be empty".to_string(),
         ));
     }
 
     let sensor_id =
-        resolve_lab_instrument(&state, &payload.source_system, &payload.instrument_label).await?;
+        resolve_lab_instrument(&state, &source_system, &payload.instrument_label).await?;
 
     let existing = Entity::find()
-        .filter(Column::SourceSystem.eq(payload.source_system.clone()))
+        .filter(Column::SourceSystem.eq(source_system.clone()))
         .filter(Column::SourceKey.eq(payload.source_key.clone()))
         .one(&state.db)
         .await?;
@@ -204,7 +206,7 @@ pub async fn register_standard_curve(
             [old_id.into()],
         ))
         .await?;
-        let minted = insert_curve(&txn, &payload, sensor_id).await.map_err(|e| {
+        let minted = insert_curve(&txn, &payload, &source_system, sensor_id).await.map_err(|e| {
             AppError::Internal(format!("minting successor for edited curve {old_id}: {e}"))
         })?;
         txn.execute_raw(Statement::from_sql_and_values(
@@ -212,7 +214,7 @@ pub async fn register_standard_curve(
             "UPDATE standard_curves                 SET retired_at = NOW(), retired_by = $2, retired_reason = $3               WHERE id = $1 AND retired_at IS NULL",
             [
                 old_id.into(),
-                payload.source_system.clone().into(),
+                source_system.clone().into(),
                 format!(
                     "Superseded by {minted}: {} re-registered {} with different coefficients",
                     payload.source_system, payload.source_key
@@ -236,7 +238,7 @@ pub async fn register_standard_curve(
         }));
     }
 
-    let id = insert_curve(&state.db, &payload, sensor_id).await?;
+    let id = insert_curve(&state.db, &payload, &source_system, sensor_id).await?;
     Ok(Json(RegisterStandardCurveResponse {
         id,
         sensor_id,
@@ -247,6 +249,7 @@ pub async fn register_standard_curve(
 async fn insert_curve<C: ConnectionTrait>(
     conn: &C,
     payload: &RegisterStandardCurveRequest,
+    source_system: &str,
     sensor_id: Uuid,
 ) -> AppResult<Uuid> {
     let id = Uuid::new_v4();
@@ -272,7 +275,7 @@ async fn insert_curve<C: ConnectionTrait>(
                 payload.intercept.into(),
                 payload.r_squared.into(),
                 payload.notes.clone().into(),
-                payload.source_system.clone().into(),
+                source_system.into(),
                 payload.source_key.clone().into(),
             ],
         ))
@@ -280,7 +283,7 @@ async fn insert_curve<C: ConnectionTrait>(
     // A concurrent register of the same provenance wins the insert; resolve to whichever row holds
     // the key now.
     let row = Entity::find()
-        .filter(Column::SourceSystem.eq(payload.source_system.clone()))
+        .filter(Column::SourceSystem.eq(source_system))
         .filter(Column::SourceKey.eq(payload.source_key.clone()))
         .one(conn)
         .await?

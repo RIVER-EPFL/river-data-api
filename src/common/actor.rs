@@ -15,15 +15,11 @@ tokio::task_local! {
     static ACTOR: String;
 }
 
-/// The caller's label, as `actor_label` writes it elsewhere: the email, else the Keycloak subject,
-/// else the token.
+/// The caller's label. One spelling, [`AuthContext::label`], reached from here because most
+/// writers hold the context rather than the identity.
 #[must_use]
 pub fn label(auth: &AuthContext) -> String {
-    match auth {
-        AuthContext::Keycloak { email: Some(e), .. } => e.clone(),
-        AuthContext::Keycloak { sub, .. } => sub.clone(),
-        AuthContext::ApiToken { token_id, .. } => format!("token:{token_id}"),
-    }
+    auth.label()
 }
 
 /// Run `work` with `actor` as the current one.
@@ -72,7 +68,8 @@ mod tests {
 
     /// One label for one caller, whatever route recorded it: four copies of this used to disagree,
     /// two writing the literal "keycloak" where the other two wrote the subject, so the same person
-    /// appeared under two names depending on which endpoint they used.
+    /// appeared under two names depending on which endpoint they used. A sync service is named for
+    /// the source it speaks for, which is what its registrations already write into `created_by`.
     #[test]
     fn every_caller_has_exactly_one_name() {
         assert_eq!(label(&keycloak(Some("evan@epfl.ch"))), "evan@epfl.ch");
@@ -90,6 +87,62 @@ mod tests {
                 rate_limit_per_second: None,
             }),
             format!("token:{token_id}")
+        );
+        let service_id = Uuid::new_v4();
+        assert_eq!(
+            label(&AuthContext::SyncService {
+                service_id,
+                source_system: Some("metalp".to_string()),
+            }),
+            "sync:metalp"
+        );
+        assert_eq!(
+            label(&AuthContext::SyncService {
+                service_id,
+                source_system: None,
+            }),
+            format!("token:{service_id}"),
+            "an undeclared service is still named by the identity it authenticated with"
+        );
+    }
+
+    /// What a caller writes is answered by the caller, not by the route it reached: a sync service
+    /// correcting a value through the same handler a person uses is recorded as sync.
+    #[test]
+    fn a_caller_says_what_its_writes_are_recorded_as() {
+        use crate::routes::private::readings::decisions::Origin;
+        assert_eq!(keycloak(Some("evan@epfl.ch")).origin(), Origin::Manual);
+        assert_eq!(
+            AuthContext::SyncService {
+                service_id: Uuid::new_v4(),
+                source_system: Some("cnet".to_string()),
+            }
+            .origin(),
+            Origin::Sync
+        );
+    }
+
+    /// Only an enrolled service speaks for a source, and only for the one it enrolled with.
+    #[test]
+    fn the_source_system_belongs_to_the_service_and_to_nobody_else() {
+        assert_eq!(keycloak(Some("evan@epfl.ch")).source_system(), None);
+        assert_eq!(
+            AuthContext::ApiToken {
+                token_id: Uuid::new_v4(),
+                permissions: crate::common::middleware::TokenPermissions::default(),
+                project_scope: None,
+                rate_limit_per_second: None,
+            }
+            .source_system(),
+            None
+        );
+        assert_eq!(
+            AuthContext::SyncService {
+                service_id: Uuid::new_v4(),
+                source_system: Some("metalp".to_string()),
+            }
+            .source_system(),
+            Some("metalp")
         );
     }
 

@@ -20,7 +20,7 @@ use crate::common::AppState;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::decisions::{
-    self, Kind, NewValue, Origin, Selection, not_pinned_sql,
+    self, Kind, NewValue, Selection, not_pinned_sql,
 };
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -133,6 +133,7 @@ pub async fn retire_calibration(
     Json(req): Json<RetireRequest>,
 ) -> AppResult<Json<RetireResponse>> {
     let actor = crate::common::actor::label(&auth);
+    let origin = auth.origin();
     let (sensor_id, retired_at) = load(&state.db, id).await?;
     if retired_at.is_some() {
         return Err(AppError::Conflict(format!(
@@ -176,7 +177,7 @@ pub async fn retire_calibration(
             NewValue::Sql(covering_curve_sql_object()),
             &actor,
             req.reason.as_deref(),
-            Origin::Manual,
+            origin,
             Some(set_id),
         )
         .await?;
