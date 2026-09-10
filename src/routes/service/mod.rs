@@ -722,6 +722,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
                 get(scripts::get_script).patch(scripts::update_script),
             )
             .route("/tool_scripts/draft_run", post(scripts::draft_run))
+            .route(
+                "/tool_scripts/{id}/formulas/draft_run",
+                post(scripts::draft_run_formulas),
+            )
             .route("/tool_scripts/inspect", post(scripts::inspect_script))
             .route("/tool_scripts/{id}/versions", post(scripts::create_version))
             .route(

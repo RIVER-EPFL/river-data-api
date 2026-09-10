@@ -21,20 +21,25 @@ use super::models::version::ToolScriptVersion;
 use super::models::{
     ActivateRequest, ActivateResponse, ActivationRecord, ActiveTool, ClosureQuery, ClosureResponse,
     CreateScriptRequest, CreateVersionRequest, CreateVersionResponse, DraftRunFailure,
-    DraftRunFailureKind, DraftRunRequest, DraftRunResponse, DraftRunResults, InspectScriptRequest,
+    DraftRunFailureKind, DraftRunRequest, DraftRunResponse, DraftRunResults, Engine,
+    FormulaDraftRunRequest, FormulaDraftRunResponse, FormulaDraftRunResults, InspectScriptRequest,
     InspectScriptResponse, LintFinding, MissingConstant, ToolDescriptor, ToolResult,
     UpdateScriptRequest, ValidateResponse, parse_manifest, reconcile_manifest,
 };
 use super::service::{
     LIST_LIMIT, audit_after_activation, calculation_slots, calculations_fed_by_subject,
-    check_engine, check_manifest_against_catalog, check_manifest_codes_resolve, closure_subject,
-    coverage_for, find_active_tool, lint_script, list_active_tools, load_parameter_catalog,
-    load_script, load_version, manifest_finding, normalise_name, run_stored_cases, run_tool_body,
-    runner_runtime, stored_version_content,
+    canonical_hash, check_engine, check_manifest_against_catalog, check_manifest_codes_resolve,
+    closure_subject, coverage_for, find_active_tool, lint_script, list_active_tools,
+    load_parameter_catalog, load_script, load_version, manifest_finding, manifest_json,
+    normalise_name, render, run_stored_cases, run_tool_body, runner_runtime,
+    stored_version_content,
 };
 use crate::common::AppState;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::parameters::derived::operations::{
+    resolve_identifiers, validate_formula,
+};
 
 /// List the active analytical tools with their full input/output manifests.
 ///
@@ -462,6 +467,141 @@ pub async fn draft_run(
         tool_version: tool.version_ref(runtime.as_ref()),
         lint,
     }))
+}
+
+/// Run an unsaved formula set at a visit, in place of the calculation's stored formulas.
+///
+/// Each formula's variables resolve as a save would resolve them (a catalog parameter, a
+/// constant, a column of `sites`), the set is ordered and checked as a version mint would check
+/// it, and the run reads the visit exactly as `/tools/{name}/calculate` does. Nothing is stored:
+/// no version, no run row, no reading. A formula the set refuses (an unknown variable, a cycle,
+/// an unreadable expression) is a 400 naming it; a run that ends without results reports why at
+/// 200, as the script draft run does.
+#[utoipa::path(post, path = "/api/tool_scripts/{id}/formulas/draft_run",
+    params(("id" = Uuid, Path, description = "The formula calculation")),
+    request_body = FormulaDraftRunRequest,
+    responses((status = 200, body = FormulaDraftRunResponse,
+               description = "The results or the reason the run ended, and the manifest the set implies"),
+              (status = 400, description = "A formula the set refuses, or a calculation that is not formula-engined"),
+              (status = 404, description = "No such calculation")),
+    tag = "tool_scripts")]
+pub async fn draft_run_formulas(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<FormulaDraftRunRequest>,
+) -> AppResult<Json<FormulaDraftRunResponse>> {
+    let script = load_script(&state, id).await?;
+    if Engine::parse(&script.engine) != Some(Engine::Formula) {
+        return Err(AppError::BadRequest(format!(
+            "{} is a {} calculation; a formula draft runs on a formula calculation",
+            script.name, script.engine
+        )));
+    }
+    let formulas = pin_draft_formulas(&state.db, &payload.formulas).await?;
+    let manifest_value = manifest_json(&script.label, script.description.as_deref(), &formulas)
+        .map_err(AppError::BadRequest)?;
+    let manifest = parse_manifest(&manifest_value)
+        .map_err(|e| AppError::BadRequest(format!("invalid manifest: {e}")))?;
+    let body = render(&formulas).map_err(AppError::BadRequest)?;
+    let content_hash = canonical_hash(&serde_json::json!({
+        "script": body,
+        "manifest": manifest_value,
+    }));
+    let tool = ActiveTool::draft_formulas(&script, manifest, content_hash, formulas);
+    let inputs = serde_json::to_vec(&payload.inputs.unwrap_or_else(|| serde_json::json!({})))
+        .unwrap_or_default();
+    let outcome = run_tool_body(
+        &state,
+        &tool,
+        &inputs,
+        payload.constants.as_ref(),
+        MissingConstant::Omit,
+    )
+    .await;
+    let (run, failure) = match outcome {
+        Ok(outcome) => (
+            Some(FormulaDraftRunResults {
+                results: serde_json::Value::Object(outcome.results),
+                skipped: outcome.skipped,
+                inputs_used: outcome.inputs_used,
+                inputs_ignored: outcome.inputs_ignored,
+                constants: serde_json::Value::Object(outcome.constants),
+                curves: outcome.curves,
+                site_inputs: outcome.site_inputs,
+                event_inputs: outcome.event_inputs,
+            }),
+            None,
+        ),
+        Err(e) => (None, Some(draft_failure(e)?)),
+    };
+    Ok(Json(FormulaDraftRunResponse {
+        ran: run.is_some(),
+        run,
+        failure,
+        manifest: manifest_value,
+    }))
+}
+
+/// The draft set as the engine reads a stored one: each formula parsed and its variables resolved
+/// against the catalog. A variable naming another draft's code is that formula's output, which a
+/// save would mint as a parameter of the same code, so it is a source of that code without a
+/// catalog row to prove it. A draft's own output is likewise the parameter its code would mint.
+async fn pin_draft_formulas(
+    db: &sea_orm::DatabaseConnection,
+    drafts: &[super::models::DraftFormula],
+) -> AppResult<Vec<super::models::PinnedFormula>> {
+    let codes: Vec<String> = drafts.iter().map(|d| d.code.trim().to_string()).collect();
+    let refused = |code: &str, e: crudcrate::ApiError| {
+        AppError::BadRequest(format!("{code}: {}", api_message(e)))
+    };
+    let mut formulas = Vec::with_capacity(drafts.len());
+    for draft in drafts {
+        let code = draft.code.trim();
+        if code.is_empty() {
+            return Err(AppError::BadRequest("a formula needs a code".to_string()));
+        }
+        validate_formula(&draft.formula).map_err(|e| refused(code, e))?;
+        let (produced, external): (Vec<String>, Vec<String>) =
+            super::service::free_identifiers(&draft.formula)
+                .into_iter()
+                .partition(|v| v != code && codes.contains(v));
+        let resolved = resolve_identifiers(db, &external)
+            .await
+            .map_err(|e| refused(code, e))?;
+        let mut sources: Vec<(String, String)> = resolved
+            .parameters
+            .into_iter()
+            .map(|(variable, _)| (variable.clone(), variable))
+            .chain(produced.into_iter().map(|v| (v.clone(), v)))
+            .collect();
+        sources.sort();
+        formulas.push(super::models::PinnedFormula {
+            code: code.to_string(),
+            label: draft
+                .name
+                .clone()
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| code.to_string()),
+            units: draft.units.clone().filter(|u| !u.trim().is_empty()),
+            formula: draft.formula.clone(),
+            ordinal: draft.ordinal,
+            output_parameter_code: (!draft.intermediate).then(|| code.to_string()),
+            sources,
+            site_sources: resolved.site_properties,
+            curve_slot: draft.curve_slot.clone().filter(|c| !c.trim().is_empty()),
+            per_replicate: draft.per_replicate.clone().filter(|p| !p.trim().is_empty()),
+            intermediate: draft.intermediate,
+        });
+    }
+    Ok(formulas)
+}
+
+/// The message a refused formula carries, without the status prefix the error type adds.
+fn api_message(e: crudcrate::ApiError) -> String {
+    match e {
+        crudcrate::ApiError::BadRequest { message } => message,
+        other => AppError::from(other).to_string(),
+    }
 }
 
 /// Read what a script declares, reads and returns, without running it.

@@ -67,7 +67,7 @@ async fn is_standalone<C: ConnectionTrait>(db: &C, definition_id: Uuid) -> Resul
     Ok(row.is_some_and(|d| d.tool_script_id.is_none()))
 }
 
-fn validate_formula(formula: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_formula(formula: &str) -> Result<(), ApiError> {
     formula
         .parse::<meval::Expr>()
         .map_err(|e| ApiError::bad_request(format!("Invalid formula: {e}")))?;
@@ -76,11 +76,12 @@ fn validate_formula(formula: &str) -> Result<(), ApiError> {
 
 /// What a formula's identifiers resolve to.
 #[derive(Default)]
-struct ResolvedSources {
-    /// `(variable_name, parameter_id)`: read from the event's stored readings.
-    parameters: Vec<(String, Uuid)>,
+pub(crate) struct ResolvedSources {
+    /// `(variable_name, parameter_id)`: read from the event's stored readings. The variable is
+    /// the parameter's code, which is how it resolved.
+    pub(crate) parameters: Vec<(String, Uuid)>,
     /// `(variable_name, site_property)`: read from the site's own row.
-    site_properties: Vec<(String, String)>,
+    pub(crate) site_properties: Vec<(String, String)>,
 }
 
 /// Resolve each formula variable, with strict validation.
@@ -91,15 +92,23 @@ struct ResolvedSources {
 /// constants table, exactly as the script engine binds a declared constant. A column of `sites`
 /// is a property of the station rather than a measurement, so it is recorded as a site source and
 /// resolved from the site row at calculate time, never asked for at the visit.
-async fn resolve_variables<C: ConnectionTrait>(
+pub(crate) async fn resolve_variables<C: ConnectionTrait>(
     db: &C,
     formula: &str,
 ) -> Result<ResolvedSources, ApiError> {
-    let var_names = free_identifiers(formula);
+    resolve_identifiers(db, &free_identifiers(formula)).await
+}
+
+/// [`resolve_variables`] over identifiers already taken from a formula, for a caller that has
+/// set some aside (a draft set's own codes, which no parameter carries yet).
+pub(crate) async fn resolve_identifiers<C: ConnectionTrait>(
+    db: &C,
+    var_names: &[String],
+) -> Result<ResolvedSources, ApiError> {
     let mut resolved = ResolvedSources::default();
     let mut site_columns: Option<Vec<String>> = None;
 
-    for var_name in &var_names {
+    for var_name in var_names {
         let row = parameters::Entity::find()
             .filter(parameters::Column::Code.eq(var_name.as_str()))
             .one(db)

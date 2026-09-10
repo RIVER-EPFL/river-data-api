@@ -1354,6 +1354,32 @@ impl ActiveTool {
         }
     }
 
+    /// A formula calculation assembled from an unsaved formula set. The script row is the stored
+    /// one, so the run resolves against the calculation's own name and group; the version is nil
+    /// because no row carries these formulas.
+    pub fn draft_formulas(
+        script: &ToolScript,
+        manifest: Manifest,
+        content_hash: String,
+        formulas: Vec<PinnedFormula>,
+    ) -> Self {
+        Self {
+            script_id: script.id,
+            name: script.name.clone(),
+            label: script.label.clone(),
+            description: script.description.clone(),
+            version_id: Uuid::nil(),
+            version_no: 0,
+            script: String::new(),
+            entry_function: "formula".to_string(),
+            content_hash,
+            manifest,
+            engine: Engine::Formula,
+            parameter_group_id: script.parameter_group_id,
+            formulas,
+        }
+    }
+
     pub fn descriptor(&self, catalog: &ParameterCatalog) -> ToolDescriptor {
         ToolDescriptor {
             name: self.name.clone(),
@@ -1896,6 +1922,74 @@ pub struct DraftRunResponse {
     /// still refuses to store them. A constant the table does not hold is reported here and left
     /// out of the values the script receives.
     pub lint: Vec<LintFinding>,
+}
+
+/// One formula of a draft set, as the calculation editor holds it: the same fields the stored
+/// formula carries, without an id, because the point is to run what is not saved yet.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct DraftFormula {
+    pub code: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub units: Option<String>,
+    pub formula: String,
+    pub ordinal: i32,
+    #[serde(default)]
+    pub curve_slot: Option<String>,
+    #[serde(default)]
+    pub per_replicate: Option<String>,
+    #[serde(default)]
+    pub intermediate: bool,
+}
+
+/// Run a formula calculation's unsaved formula set at a visit. The formulas replace the stored
+/// set for this run only; nothing is written.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct FormulaDraftRunRequest {
+    pub formulas: Vec<DraftFormula>,
+    /// The calculate request body: `site_id`, `collected_at`, replicate lists and any value
+    /// overriding what the visit holds.
+    #[serde(default)]
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
+    pub inputs: Option<serde_json::Value>,
+    /// Constant values in place of the catalog; omit to read the catalog.
+    #[serde(default)]
+    #[schema(value_type = Option<std::collections::HashMap<String, f64>>)]
+    pub constants: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// What the formula set produced, present only when the run reached the end.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FormulaDraftRunResults {
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
+    pub results: serde_json::Value,
+    /// Outputs the run did not produce, each with its reason.
+    pub skipped: Vec<serde_json::Value>,
+    pub inputs_used: Vec<String>,
+    pub inputs_ignored: Vec<String>,
+    #[schema(value_type = std::collections::HashMap<String, f64>)]
+    pub constants: serde_json::Value,
+    pub curves: Vec<CurveSnapshot>,
+    /// The site properties the run read, as `{property, param, value}`.
+    pub site_inputs: Vec<serde_json::Value>,
+    /// The visit's stored values the run read, as `{param, parameter_code, parameter_id, value}`.
+    pub event_inputs: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FormulaDraftRunResponse {
+    /// True when the run fields are present; false when `failure` is.
+    pub ran: bool,
+    #[serde(flatten)]
+    #[schema(required)]
+    pub run: Option<FormulaDraftRunResults>,
+    #[schema(required)]
+    pub failure: Option<DraftRunFailure>,
+    /// The manifest the formula set implies: its params, outputs, constants, curve slots and the
+    /// site and event inputs, in the shape `GET /tools` serves.
+    #[schema(value_type = Object)]
+    pub manifest: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

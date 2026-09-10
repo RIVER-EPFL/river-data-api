@@ -73,7 +73,17 @@ async fn a_value_landing_at_a_visit_runs_the_calculation_that_reads_it() {
     let site_id = e2e::create_site(&app, &admin, &project_id, "React Site", "reacts").await;
     let pa = e2e::create_parameter(&app, &admin, "ReactA", "React A", "ppb").await;
     let pb = e2e::create_parameter(&app, &admin, "ReactB", "React B", "ppb").await;
-    e2e::assign_site_parameter_minimal(&app, &admin, &site_id, &pa).await;
+    // The site declares the calculation by carrying its output slot (Q98), so the chain has
+    // somewhere to land.
+    e2e::declare_site_slots(
+        &db,
+        &app,
+        &admin,
+        &site_id,
+        "react_group",
+        &[(pa.as_str(), "measured"), (pb.as_str(), "output")],
+    )
+    .await;
     e2e::author_tool(
         &app,
         &admin,
@@ -330,7 +340,17 @@ async fn detach_edit_reengage_and_return_on_an_output_slot() {
     let site_id = e2e::create_site(&app, &admin, &project_id, "Own Site", "owns").await;
     let pa = e2e::create_parameter(&app, &admin, "ReactA", "React A", "ppb").await;
     let pb = e2e::create_parameter(&app, &admin, "ReactB", "React B", "ppb").await;
-    e2e::assign_site_parameter_minimal(&app, &admin, &site_id, &pa).await;
+    // The site declares the calculation by carrying its output slot (Q98), so the chain has
+    // somewhere to land.
+    e2e::declare_site_slots(
+        &db,
+        &app,
+        &admin,
+        &site_id,
+        "own_react_group",
+        &[(pa.as_str(), "measured"), (pb.as_str(), "output")],
+    )
+    .await;
     e2e::author_tool(
         &app,
         &admin,
