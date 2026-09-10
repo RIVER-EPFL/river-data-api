@@ -1595,13 +1595,21 @@ pub fn free_identifiers(formula: &str) -> Vec<String> {
 }
 
 /// The constants a formula set reads: every free identifier that is neither one of the formula's
-/// own source variables nor a curve coefficient. Sorted, so a manifest is the same document
+/// own source variables, a site property it reads, a step of the set, nor a curve coefficient. Sorted, so a manifest is the same document
 /// whichever order the definitions were written in.
 pub fn constants_of(formulas: &[PinnedFormula]) -> Vec<String> {
+    // A step reaches the formulas after it under its own code, so that code is never a constant.
+    let steps: Vec<&str> = formulas
+        .iter()
+        .filter(|f| f.intermediate)
+        .map(|f| f.code.as_str())
+        .collect();
     let mut names: Vec<String> = Vec::new();
     for formula in formulas {
         for identifier in free_identifiers(&formula.formula) {
             if formula.sources.iter().any(|(v, _)| *v == identifier)
+                || formula.site_sources.iter().any(|(v, _)| *v == identifier)
+                || steps.contains(&identifier.as_str())
                 || CURVE_VARIABLES.contains(&identifier.as_str())
                 || names.contains(&identifier)
             {
@@ -1896,6 +1904,20 @@ pub(super) fn evaluate_set(
                 None => {
                     skipped = Some(format!("no value for {variable} ({parameter_code})"));
                     break;
+                }
+            }
+        }
+        // A site property arrives resolved as an input under the variable's name.
+        if skipped.is_none() {
+            for (variable, property) in &formula.site_sources {
+                match inputs.get(variable) {
+                    Some(value) => {
+                        variables.insert(variable.clone(), *value);
+                    }
+                    None => {
+                        skipped = Some(format!("no value for {variable} (site {property})"));
+                        break;
+                    }
                 }
             }
         }
@@ -3624,6 +3646,10 @@ mod calculations_tests;
 #[cfg(test)]
 #[path = "tests/closure.rs"]
 mod closure_tests;
+
+#[cfg(test)]
+#[path = "tests/cnet_formula_sets.rs"]
+mod cnet_formula_sets_tests;
 
 #[cfg(test)]
 #[path = "tests/engine.rs"]
