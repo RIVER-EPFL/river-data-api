@@ -161,13 +161,15 @@ async fn sensor_vs_grab(
 #[tokio::test]
 #[serial]
 async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() {
-    if !crate::common::profile::Service::Keycloak.require("doc_tool_replicates_saved_at_a_station").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("doc_tool_replicates_saved_at_a_station")
+        .await
+    {
         return;
     }
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "doc_tool_replicates_saved_at_a_station",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("doc_tool_replicates_saved_at_a_station")
+        .await
     {
         return;
     }
@@ -295,7 +297,10 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
         status, 200,
         "an intern enters field data ({status}): {entered}"
     );
-    assert_eq!(entered["inserted"], 3, "one reading per replicate: {entered}");
+    assert_eq!(
+        entered["inserted"], 3,
+        "one reading per replicate: {entered}"
+    );
     assert_eq!(
         e2e::count(
             &db,
@@ -481,7 +486,10 @@ async fn doc_tool_replicates_saved_at_a_station_reproduce_the_tool_statistics() 
 #[tokio::test]
 #[serial]
 async fn sensor_vs_grab_window_edges_are_inclusive_and_configurable() {
-    if !crate::common::profile::Service::Keycloak.require("sensor_vs_grab_window_edges").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("sensor_vs_grab_window_edges")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -490,7 +498,15 @@ async fn sensor_vs_grab_window_edges_are_inclusive_and_configurable() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let track = tracks::onboard_grab_track(&app, &admin).await;
-    let cdom = e2e::provision_slot(&app, &admin, &track.site_id, "TrkGrabCdom", "Track Grab CDOM", "ppb").await;
+    let cdom = e2e::provision_slot(
+        &app,
+        &admin,
+        &track.site_id,
+        "TrkGrabCdom",
+        "Track Grab CDOM",
+        "ppb",
+    )
+    .await;
     let intern = e2e::member(&db, &track.project_id, "intern1", "riverdata-intern").await;
     let river = e2e::member(&db, &track.project_id, "river1", "riverdata-river").await;
 
@@ -629,7 +645,10 @@ async fn sensor_vs_grab_window_edges_are_inclusive_and_configurable() {
 #[tokio::test]
 #[serial]
 async fn sensor_vs_grab_orders_grabs_and_reports_an_empty_post_grab_window() {
-    if !crate::common::profile::Service::Keycloak.require("sensor_vs_grab_ordering").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("sensor_vs_grab_ordering")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -638,7 +657,15 @@ async fn sensor_vs_grab_orders_grabs_and_reports_an_empty_post_grab_window() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let track = tracks::onboard_grab_track(&app, &admin).await;
-    let cdom = e2e::provision_slot(&app, &admin, &track.site_id, "TrkGrabCdom", "Track Grab CDOM", "ppb").await;
+    let cdom = e2e::provision_slot(
+        &app,
+        &admin,
+        &track.site_id,
+        "TrkGrabCdom",
+        "Track Grab CDOM",
+        "ppb",
+    )
+    .await;
     let intern = e2e::member(&db, &track.project_id, "intern1", "riverdata-intern").await;
     let river = e2e::member(&db, &track.project_id, "river1", "riverdata-river").await;
 
@@ -829,7 +856,10 @@ async fn sensor_vs_grab_orders_grabs_and_reports_an_empty_post_grab_window() {
 #[tokio::test]
 #[serial]
 async fn sensor_vs_grab_empty_comparisons_and_invalid_windows() {
-    if !crate::common::profile::Service::Keycloak.require("sensor_vs_grab_edges").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("sensor_vs_grab_edges")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -838,9 +868,24 @@ async fn sensor_vs_grab_empty_comparisons_and_invalid_windows() {
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
     let track = tracks::onboard_grab_track(&app, &admin).await;
-    let cdom = e2e::provision_slot(&app, &admin, &track.site_id, "TrkGrabCdom", "Track Grab CDOM", "ppb").await;
-    let ungrabbed =
-        e2e::provision_slot(&app, &admin, &track.site_id, "TrkGrabTurb", "Track Grab Turbidity", "ppb").await;
+    let cdom = e2e::provision_slot(
+        &app,
+        &admin,
+        &track.site_id,
+        "TrkGrabCdom",
+        "Track Grab CDOM",
+        "ppb",
+    )
+    .await;
+    let ungrabbed = e2e::provision_slot(
+        &app,
+        &admin,
+        &track.site_id,
+        "TrkGrabTurb",
+        "Track Grab Turbidity",
+        "ppb",
+    )
+    .await;
     let intern = e2e::member(&db, &track.project_id, "intern1", "riverdata-intern").await;
     let river = e2e::member(&db, &track.project_id, "river1", "riverdata-river").await;
 

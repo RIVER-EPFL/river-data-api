@@ -6,8 +6,8 @@
 
 use river_db::common::AppEvent;
 use river_db::routes::private::reprocessing_jobs::job::{Job, JobRegistry};
-use river_db::routes::private::reprocessing_jobs::jobs::{SyncFullReassert, SyncLedgerRetention};
 use river_db::routes::private::reprocessing_jobs::worker;
+use river_db::routes::private::sync::flows::{SyncFullReassert, SyncLedgerRetention};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use std::sync::Arc;
@@ -16,7 +16,6 @@ use uuid::Uuid;
 fn events() -> river_db::common::EventSender {
     tokio::sync::broadcast::channel::<AppEvent>(16).0
 }
-
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
     db.query_one_raw(Statement::from_string(

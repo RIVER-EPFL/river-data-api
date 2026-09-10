@@ -15,8 +15,8 @@
 //! names a site: the divisor is declared per slot and is never inferred.
 
 pub mod definition;
-pub mod intermediates;
 pub mod group_model;
+pub mod intermediates;
 pub mod member_model;
 pub mod operations;
 pub mod ordering;

@@ -20,7 +20,9 @@ async fn setup() -> (DatabaseConnection, axum::Router, String) {
 }
 
 fn uri(extra: &str) -> String {
-    format!("/api/readings/ledger?site_id={SITE1_ID}&parameter_id={GLOBAL_PARAM_DO_ID}&time={T1}{extra}")
+    format!(
+        "/api/readings/ledger?site_id={SITE1_ID}&parameter_id={GLOBAL_PARAM_DO_ID}&time={T1}{extra}"
+    )
 }
 
 async fn save_grab(app: &axum::Router, token: &str) {
@@ -154,7 +156,8 @@ async fn failures_are_a_filter_rather_than_a_text_match() {
         "a failed job names its message: {body}"
     );
 
-    let (status, body) = crate::common::get_json_with_token(&app, &uri("&severity=loud"), &token).await;
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &uri("&severity=loud"), &token).await;
     assert_eq!(status, 400, "an unknown severity is refused: {body}");
 }
 

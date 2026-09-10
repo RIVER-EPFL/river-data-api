@@ -8,7 +8,6 @@ use sea_orm::DatabaseConnection;
 use serial_test::serial;
 use uuid::Uuid;
 
-
 /// Public project with an exposed parameter and a triplicate grab (replicates 0/1/2 behind one
 /// sample) at a timestamp off the seeded grid.
 async fn setup_with_replicates() -> (DatabaseConnection, axum::Router) {

@@ -227,6 +227,55 @@ async fn test_pair_stream_backfills_readings() {
     );
 }
 
+/// Scenario: a source registers a stream and later pairs it.
+/// Expected behaviour: `/sync/unpaired-summary` counts it as waiting under its own source system,
+/// and the same row moves to paired once the pairing lands.
+#[tokio::test]
+#[serial]
+async fn test_unpaired_summary_counts_a_stream_before_and_after_its_pairing() {
+    let (app, token, _db) = setup().await;
+
+    let (status, stream) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/streams/register",
+        &serde_json::json!({ "source_system": "summary", "source_key": "summary-1" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "register ({status}): {stream}");
+    let stream_id = stream["id"].as_str().expect("id").to_string();
+
+    let counts = |summary: &serde_json::Value| -> (i64, i64) {
+        let row = summary
+            .as_array()
+            .and_then(|rows| rows.iter().find(|r| r["source_system"] == "summary"))
+            .unwrap_or_else(|| panic!("the source it registered under is counted: {summary}"));
+        (
+            row["unpaired"].as_i64().expect("unpaired"),
+            row["paired"].as_i64().expect("paired"),
+        )
+    };
+
+    let (status, summary) =
+        crate::common::get_json_with_token(&app, "/api/sync/unpaired-summary", &token).await;
+    assert_eq!(status, 200, "unpaired-summary ({status}): {summary}");
+    assert_eq!(counts(&summary), (1, 0), "waiting for a pairing: {summary}");
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/streams/{stream_id}/pair"),
+        &serde_json::json!({ "site_parameter_id": crate::common::PARAM_S1_TEMP_ID }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "pair ({status}): {body}");
+
+    let (status, summary) =
+        crate::common::get_json_with_token(&app, "/api/sync/unpaired-summary", &token).await;
+    assert_eq!(status, 200, "unpaired-summary ({status}): {summary}");
+    assert_eq!(counts(&summary), (0, 1), "paired: {summary}");
+}
+
 #[tokio::test]
 #[serial]
 async fn test_pair_already_paired_stream_fails() {

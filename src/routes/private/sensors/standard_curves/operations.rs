@@ -1,8 +1,11 @@
 use crudcrate::{ApiError, CRUDOperations};
-use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Statement,
+    TransactionTrait,
+};
 use uuid::Uuid;
 
-use super::model::StandardCurve;
+use super::model::{Column, Entity, StandardCurve};
 
 pub struct StandardCurveOperations;
 
@@ -31,19 +34,12 @@ async fn curve_is_used<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<bool, Api
 
 /// How many curves were copied from this one. A copy records where its coefficients came from, and
 /// the reference is the only statement that it is a copy at all, so the row it names stays.
-async fn copies_made_from<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<i64, ApiError> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT count(*) AS n FROM standard_curves WHERE copied_from_id = $1",
-            [id.into()],
-        ))
+async fn copies_made_from<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<u64, ApiError> {
+    Entity::find()
+        .filter(Column::CopiedFromId.eq(id))
+        .count(db)
         .await
-        .map_err(ApiError::database)?;
-    row.map(|r| r.try_get::<i64>("", "n"))
-        .transpose()
         .map_err(ApiError::database)
-        .map(Option::unwrap_or_default)
 }
 
 impl CRUDOperations for StandardCurveOperations {

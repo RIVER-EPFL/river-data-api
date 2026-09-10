@@ -219,7 +219,7 @@ async fn scoped_reconcile_leaves_other_slots_untouched() {
     let stream = turb_stream(&db).await;
 
     inject(&db, stream, "2025-02-01T00:00:00Z", BREACH).await;
-    alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     assert_eq!(open_turb_event_count(&db).await, 1);
 
     // Make the open event stale: with the breaching reading gone, any reconcile that considers
@@ -236,7 +236,7 @@ async fn scoped_reconcile_leaves_other_slots_untouched() {
 
     let site: Uuid = crate::common::SITE1_ID.parse().unwrap();
     let temp: Uuid = crate::common::GLOBAL_PARAM_TEMP_ID.parse().unwrap();
-    alarms::sweeper::reconcile_open_alarms(&db, &[(site, temp)])
+    alarms::flows::reconcile_open_alarms(&db, &[(site, temp)])
         .await
         .unwrap();
     assert_eq!(
@@ -245,7 +245,7 @@ async fn scoped_reconcile_leaves_other_slots_untouched() {
         "a reconcile scoped to the temperature slot must not resolve the turbidity event"
     );
 
-    alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     assert_eq!(
         open_turb_event_count(&db).await,
         0,
@@ -409,7 +409,7 @@ async fn site_parameter_deactivation_resolves_open_event() {
     let stream = turb_stream(&db).await;
 
     inject(&db, stream, "2025-02-01T00:00:00Z", BREACH).await;
-    alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     assert_eq!(open_turb_event_count(&db).await, 1);
 
     let (status, body) = crate::common::put_json_with_token(
@@ -451,7 +451,7 @@ async fn replicate_zero_decides_breach_state() {
         .await;
     }
 
-    alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     assert_eq!(
         open_turb_event_count(&db).await,
         0,
@@ -472,7 +472,7 @@ async fn site_parameter_reactivation_reopens_alarm() {
     let stream = turb_stream(&db).await;
 
     inject(&db, stream, "2025-02-01T00:00:00Z", BREACH).await;
-    alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     assert_eq!(open_turb_event_count(&db).await, 1);
 
     let toggle = |active: bool| {
@@ -602,7 +602,7 @@ async fn merge_reconciles_source_and_target_slots() {
     let stream = turb_stream(&db).await;
 
     inject(&db, stream, "2025-02-01T00:00:00Z", BREACH).await;
-    alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     assert_eq!(open_turb_event_count(&db).await, 1);
 
     let (status, body) = crate::common::post_json_with_token(
@@ -652,7 +652,7 @@ async fn tracked_job_completion_reconciles_alarms() {
     let stream = turb_stream(&db).await;
 
     inject(&db, stream, "2025-02-01T00:00:00Z", BREACH).await;
-    alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     assert_eq!(open_turb_event_count(&db).await, 1);
 
     let site = crate::common::SITE1_ID;

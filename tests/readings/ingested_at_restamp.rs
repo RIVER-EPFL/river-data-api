@@ -83,7 +83,10 @@ async fn identical_reassert_keeps_the_original_arrival_stamp() {
     // rather than within the same clock tick as the original insert.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     let reassert = ingest(&app, &token, 1.0, "overwrite").await;
-    assert_eq!(reassert["overwritten"], 0, "identical content changes nothing: {reassert}");
+    assert_eq!(
+        reassert["overwritten"], 0,
+        "identical content changes nothing: {reassert}"
+    );
 
     let after = ingested_at_epoch(&db).await;
     assert_eq!(
@@ -103,7 +106,10 @@ async fn a_correction_leaves_the_first_arrival_where_it_was() {
 
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     let corrected = ingest(&app, &token, 2.0, "overwrite").await;
-    assert_eq!(corrected["overwritten"], 1, "the correction changes the value: {corrected}");
+    assert_eq!(
+        corrected["overwritten"], 1,
+        "the correction changes the value: {corrected}"
+    );
 
     let after = ingested_at_epoch(&db).await;
     assert_eq!(

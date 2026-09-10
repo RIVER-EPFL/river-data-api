@@ -10,10 +10,11 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;
 
-use crate::common::{GLOBAL_PARAM_TEMP_ID, SITE1_ID, cleanup_test_db, seed_test_data, setup_test_db};
+use crate::common::{
+    GLOBAL_PARAM_TEMP_ID, SITE1_ID, cleanup_test_db, seed_test_data, setup_test_db,
+};
 
 const AT: &str = "2025-06-15T10:00:00Z";
-
 
 /// The migration's own SQL, run the way the migrator runs it: several statements in one implicit
 /// transaction, which is what `SET LOCAL` needs.
@@ -108,7 +109,11 @@ async fn every_curated_row_gets_the_decision_it_could_have_been_decided_by() {
 
     let drift_sql = river_db::routes::private::readings::decisions::inconsistent_rows_sql();
     assert_eq!(
-        scalar_i64(&db, &format!("SELECT count(*)::bigint AS n FROM ({drift_sql}) d")).await,
+        scalar_i64(
+            &db,
+            &format!("SELECT count(*)::bigint AS n FROM ({drift_sql}) d")
+        )
+        .await,
         2,
         "the flag and the retraction stand behind no decision before the synthesis"
     );
@@ -160,7 +165,9 @@ async fn every_curated_row_gets_the_decision_it_could_have_been_decided_by() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        row.try_get::<Option<String>>("", "reason").unwrap().as_deref(),
+        row.try_get::<Option<String>>("", "reason")
+            .unwrap()
+            .as_deref(),
         Some("vial cracked")
     );
     assert_eq!(
@@ -182,7 +189,11 @@ async fn every_curated_row_gets_the_decision_it_could_have_been_decided_by() {
     );
 
     assert_eq!(
-        scalar_i64(&db, &format!("SELECT count(*)::bigint AS n FROM ({drift_sql}) d")).await,
+        scalar_i64(
+            &db,
+            &format!("SELECT count(*)::bigint AS n FROM ({drift_sql}) d")
+        )
+        .await,
         0,
         "the record is total, so the sweep reports nothing"
     );

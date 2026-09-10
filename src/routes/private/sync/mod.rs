@@ -1,11 +1,7 @@
-pub mod commands_model;
-pub mod control;
-pub mod credentials_model;
-pub mod events_model;
-pub mod operator;
-pub mod replicate_audit;
-pub mod replicate_reconciliation;
+//! Sync: the control plane a sync service calls, the operator surface a human drives, and the
+//! pairing-plan and replicate-audit machinery between them.
+
+pub mod flows;
+pub mod models;
 pub mod service;
-pub mod services_model;
-pub mod tokens_model;
 pub mod views;

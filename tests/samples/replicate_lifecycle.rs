@@ -378,10 +378,17 @@ async fn a_withdrawn_replicate_is_served_marked_and_outside_n() {
 
     let series = fetch_temp_series(&app, &token, "&include_sample_stats=true").await;
     let stats = &series["parameters"][0]["samples"][0];
-    assert_eq!(stats["n"], 2, "the retracted replicate is outside n: {series}");
+    assert_eq!(
+        stats["n"], 2,
+        "the retracted replicate is outside n: {series}"
+    );
 
     let replicates = stats["replicates"].as_array().expect("replicates");
-    assert_eq!(replicates.len(), 3, "every stored replicate is listed: {stats}");
+    assert_eq!(
+        replicates.len(),
+        3,
+        "every stored replicate is listed: {stats}"
+    );
     let withdrawn: Vec<i64> = replicates
         .iter()
         .filter(|r| r["withdrawn"] == serde_json::json!(true))

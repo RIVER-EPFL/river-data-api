@@ -3845,6 +3845,52 @@
         },
         "type": "object"
       },
+      "ConsumerRef": {
+        "description": "One formula reading the record's parameter, with its output at the instant where one exists.",
+        "properties": {
+          "calculation": {
+            "description": "The calculation the formula belongs to, absent on a standalone derived parameter.",
+            "type": "string"
+          },
+          "definition_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "formula_code": {
+            "type": "string"
+          },
+          "formula_name": {
+            "type": "string"
+          },
+          "output_parameter_code": {
+            "type": "string"
+          },
+          "output_parameter_id": {
+            "description": "The slot key of the output's own record. Absent on an intermediate, which mints none.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "replicate_index": {
+            "description": "Set when the formula evaluates per replicate over this parameter: the output at this index\ncame from the record's value at the same index.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "value": {
+            "format": "double",
+            "type": "number"
+          },
+          "variable_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "definition_id",
+          "formula_code",
+          "formula_name",
+          "variable_name"
+        ],
+        "type": "object"
+      },
       "CreateCredentialRequest": {
         "properties": {
           "service_type": {
@@ -7183,24 +7229,14 @@
             ]
           },
           "sd_estimator": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/SdEstimator",
-                "description": "The divisor `sd` was computed under. Absent on a hold that predates the record."
-              }
-            ]
+            "$ref": "#/components/schemas/SdEstimator",
+            "description": "The divisor `sd` was computed under. Absent on a hold that predates the record."
           },
           "values": {
             "items": {
               "$ref": "#/components/schemas/HoldValue"
             },
-            "type": [
-              "array",
-              "null"
-            ]
+            "type": "array"
           }
         },
         "required": [
@@ -7222,10 +7258,7 @@
           },
           "n": {
             "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
+            "type": "integer"
           },
           "sd": {
             "format": "double",
@@ -7254,10 +7287,7 @@
           "n": {
             "description": "The replicate count the source declares, where it declares one.",
             "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
+            "type": "integer"
           },
           "sd": {
             "format": "double",
@@ -8281,6 +8311,52 @@
           "inserted",
           "stream_id",
           "paired"
+        ],
+        "type": "object"
+      },
+      "InputRef": {
+        "description": "One value a formula read at the record's instant. A parameter input carries the slot key\n(`parameter_id` with the record's site and time) that resolves its own record; a site property\ncarries the column it was read from.",
+        "properties": {
+          "definition_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "formula_code": {
+            "description": "The formula's code, so two formulas producing one parameter stay apart.",
+            "type": "string"
+          },
+          "parameter_code": {
+            "type": "string"
+          },
+          "parameter_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "replicate_index": {
+            "description": "Set when the formula evaluates per replicate and this is the variable it iterates: the\nvalue at this index fed the output at the same index.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "served_as": {
+            "description": "How the value was read: `replicate` (the row at the index), `mean` (the family's sample\nstatistic), `reading` (the single row at the instant), `site` (the site row's column).\n`missing` when nothing at the instant answers.",
+            "type": "string"
+          },
+          "site_property": {
+            "type": "string"
+          },
+          "value": {
+            "format": "double",
+            "type": "number"
+          },
+          "variable_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "definition_id",
+          "formula_code",
+          "variable_name",
+          "served_as"
         ],
         "type": "object"
       },
@@ -14121,7 +14197,27 @@
       },
       "ProjectResponse": {
         "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "data_source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "discovered_at": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
@@ -14131,14 +14227,56 @@
             "format": "uuid",
             "type": "string"
           },
+          "is_public": {
+            "type": "boolean"
+          },
           "name": {
             "type": "string"
+          },
+          "public_api_description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "public_api_title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "public_api_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "public_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "public_contact_email": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "id",
           "name",
-          "description"
+          "data_source",
+          "description",
+          "created_at",
+          "discovered_at",
+          "is_public",
+          "public_code",
+          "public_api_title",
+          "public_api_description",
+          "public_api_version",
+          "public_contact_email"
         ],
         "type": "object"
       },
@@ -14390,12 +14528,26 @@
           "computation": {
             "$ref": "#/components/schemas/ComputationInfo"
           },
+          "consumers": {
+            "description": "Every enabled formula reading this parameter, one hop down the chain, with its output's\nvalue at this instant where one exists.",
+            "items": {
+              "$ref": "#/components/schemas/ConsumerRef"
+            },
+            "type": "array"
+          },
           "event": {
             "$ref": "#/components/schemas/EventRef"
           },
           "holds": {
             "items": {
               "$ref": "#/components/schemas/HoldRef"
+            },
+            "type": "array"
+          },
+          "inputs": {
+            "description": "The values the formula producing this parameter read at this instant, one hop up the\nchain. Each names the key its own record is read by.",
+            "items": {
+              "$ref": "#/components/schemas/InputRef"
             },
             "type": "array"
           },
@@ -19609,7 +19761,7 @@
             ]
           },
           "decimal_places": {
-            "description": "Display precision, carried to the client by [`super::descriptor::SlotDescriptor`]. The API\nserves full precision and the client formats, so a change here never rewrites a value.",
+            "description": "Display precision, carried to the client by [`SlotDescriptor`]. The API\nserves full precision and the client formats, so a change here never rewrites a value.",
             "format": "int32",
             "type": [
               "integer",
@@ -19625,7 +19777,7 @@
             ]
           },
           "display_units": {
-            "description": "Site-level units override. NULL means \"no override\": every endpoint serving this slot\nresolves units through [`super::descriptor::SlotDescriptor`], which falls back to the\ncatalog `default_units`.",
+            "description": "Site-level units override. NULL means \"no override\": every endpoint serving this slot\nresolves units through [`SlotDescriptor`], which falls back to the\ncatalog `default_units`.",
             "type": [
               "string",
               "null"
@@ -19775,7 +19927,7 @@
             ]
           },
           "decimal_places": {
-            "description": "Display precision, carried to the client by [`super::descriptor::SlotDescriptor`]. The API\nserves full precision and the client formats, so a change here never rewrites a value.",
+            "description": "Display precision, carried to the client by [`SlotDescriptor`]. The API\nserves full precision and the client formats, so a change here never rewrites a value.",
             "format": "int32",
             "type": [
               "integer",
@@ -19791,7 +19943,7 @@
             ]
           },
           "display_units": {
-            "description": "Site-level units override. NULL means \"no override\": every endpoint serving this slot\nresolves units through [`super::descriptor::SlotDescriptor`], which falls back to the\ncatalog `default_units`.",
+            "description": "Site-level units override. NULL means \"no override\": every endpoint serving this slot\nresolves units through [`SlotDescriptor`], which falls back to the\ncatalog `default_units`.",
             "type": [
               "string",
               "null"
@@ -24398,6 +24550,7 @@
             "description": "The backdate names no target, so a caller confined to a project set is refused"
           }
         },
+        "summary": "Re-derive `sensor_id`/`deployment_id`/`site_id`/`calibrated_value` for ALL historical readings\nfrom the current deployment + calibration timelines, across every `(site, parameter)` slot that\nhas a deployment. Use after correcting deployment/calibration windows in bulk (the backdate of\nhistorical attribution). Each slot is reprocessed via the decompression-safe\n`reprocess_site_parameter_readings`; runs as one tracked job. Requires `write_data`.",
         "tags": [
           "actions"
         ]
@@ -33644,6 +33797,7 @@
             "description": "Body exceeds 10MB limit"
           }
         },
+        "summary": "Batch insert readings keyed by (site_id, parameter_id). Auto-creates \"api\" streams when\na (site, parameter) pair has none. 10MB body limit. Requires `write_data`.",
         "tags": [
           "ingestion"
         ]

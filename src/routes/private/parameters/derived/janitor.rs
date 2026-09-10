@@ -1,8 +1,17 @@
 use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
-use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
+    QueryOrder, QuerySelect, QueryTrait, Statement,
+};
 use uuid::Uuid;
 
+use crate::routes::private::reprocessing_jobs::model as jobs;
+use crate::routes::private::sites::parameters::models as site_parameters;
+
 const MAX_GAPS_PER_RUN: usize = 50_000;
+
+/// The statuses a prune leaves alone: a job still queued or running is not history yet.
+const IN_FLIGHT: [&str; 4] = ["queued", "pending", "running", "retrying"];
 
 /// Whether a site has any active derived `site_parameter`. The spawn-guard for the ingest/batch
 /// derived-compute jobs: when false, a derived recompute at that site would do nothing, so the job
@@ -12,14 +21,18 @@ pub async fn site_has_active_derived(
     db: &DatabaseConnection,
     site_id: Uuid,
 ) -> Result<bool, sea_orm::DbErr> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT 1 FROM site_parameters \
-             WHERE site_id = $1 AND entry_mode = 'tool' AND COALESCE(is_active, true) = true \
-             LIMIT 1",
-            [site_id.into()],
-        ))
+    let row = site_parameters::Entity::find()
+        .filter(site_parameters::Column::SiteId.eq(site_id))
+        .filter(site_parameters::Column::EntryMode.eq("tool"))
+        .filter(
+            sea_orm::Condition::any()
+                .add(site_parameters::Column::IsActive.eq(true))
+                .add(site_parameters::Column::IsActive.is_null()),
+        )
+        .select_only()
+        .column(site_parameters::Column::Id)
+        .into_tuple::<Uuid>()
+        .one(db)
         .await?;
     Ok(row.is_some())
 }
@@ -181,39 +194,45 @@ pub async fn prune_tracked_jobs(
     let mut deleted = 0u64;
 
     if maintenance_days > 0 {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(maintenance_days));
         deleted += run_delete(
+            jobs::Entity::delete_many()
+                .filter(jobs::Column::Category.eq("maintenance"))
+                .filter(jobs::Column::CreatedAt.lt(cutoff))
+                .filter(jobs::Column::Status.is_not_in(IN_FLIGHT)),
             db,
-            format!(
-                "DELETE FROM reprocessing_jobs \
-                 WHERE category = 'maintenance' AND created_at < NOW() - INTERVAL '{maintenance_days} days' \
-                   AND status NOT IN ('queued', 'pending', 'running', 'retrying')"
-            ),
             "maintenance age",
         )
         .await;
     }
     if operator_days > 0 {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(operator_days));
         deleted += run_delete(
+            jobs::Entity::delete_many()
+                .filter(jobs::Column::Category.is_in(["operator", "metadata"]))
+                .filter(jobs::Column::CreatedAt.lt(cutoff))
+                .filter(jobs::Column::Status.is_not_in(IN_FLIGHT)),
             db,
-            format!(
-                "DELETE FROM reprocessing_jobs \
-                 WHERE category IN ('operator', 'metadata') AND created_at < NOW() - INTERVAL '{operator_days} days' \
-                   AND status NOT IN ('queued', 'pending', 'running', 'retrying')"
-            ),
             "operator/metadata age",
         )
         .await;
     }
     if maintenance_max_rows > 0 {
         // Keep the most-recent N maintenance rows; delete the older overflow.
-        let sql = format!(
-            "DELETE FROM reprocessing_jobs WHERE id IN ( \
-                SELECT id FROM reprocessing_jobs \
-                WHERE category = 'maintenance' AND status NOT IN ('queued', 'pending', 'running', 'retrying') \
-                ORDER BY created_at DESC OFFSET {maintenance_max_rows} \
-            )"
-        );
-        deleted += run_delete(db, sql, "maintenance count cap").await;
+        let overflow = jobs::Entity::find()
+            .select_only()
+            .column(jobs::Column::Id)
+            .filter(jobs::Column::Category.eq("maintenance"))
+            .filter(jobs::Column::Status.is_not_in(IN_FLIGHT))
+            .order_by_desc(jobs::Column::CreatedAt)
+            .offset(maintenance_max_rows)
+            .into_query();
+        deleted += run_delete(
+            jobs::Entity::delete_many().filter(jobs::Column::Id.in_subquery(overflow)),
+            db,
+            "maintenance count cap",
+        )
+        .await;
     }
 
     if deleted > 0 {
@@ -222,15 +241,13 @@ pub async fn prune_tracked_jobs(
     deleted
 }
 
-async fn run_delete(db: &DatabaseConnection, sql: String, label: &str) -> u64 {
-    match db
-        .execute_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-        ))
-        .await
-    {
-        Ok(res) => res.rows_affected(),
+async fn run_delete(
+    delete: sea_orm::DeleteMany<jobs::Entity>,
+    db: &DatabaseConnection,
+    label: &str,
+) -> u64 {
+    match delete.exec(db).await {
+        Ok(res) => res.rows_affected,
         Err(e) => {
             tracing::warn!(error = %e, label, "Tracked-job retention: prune layer failed");
             0
@@ -239,21 +256,5 @@ async fn run_delete(db: &DatabaseConnection, sql: String, label: &str) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::gap_scan;
-
-    #[test]
-    fn test_gap_scan_bounds_the_readings_side_when_given_a_window() {
-        let bounded = gap_scan(Some(chrono::Utc::now())).to_string();
-        assert!(
-            bounded.contains("r.time >= "),
-            "a bounded run must not hash the whole hypertable: {bounded}"
-        );
-
-        let full = gap_scan(None).to_string();
-        assert!(
-            !full.contains("r.time >= "),
-            "the periodic full run is the one that covers older drift: {full}"
-        );
-    }
-}
+#[path = "tests/janitor.rs"]
+mod tests;

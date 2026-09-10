@@ -155,7 +155,11 @@ async fn channels_report_what_was_sent_not_what_was_attempted() {
     let user_sub = keycloak_user_id("user").await;
     grant_project(&db, &user_sub, PROJECT_ID).await;
 
-    for (status, age) in [("sent", "1 hour"), ("failed", "1 hour"), ("sent", "40 days")] {
+    for (status, age) in [
+        ("sent", "1 hour"),
+        ("failed", "1 hour"),
+        ("sent", "40 days"),
+    ] {
         crate::common::exec(
             &db,
             &format!(

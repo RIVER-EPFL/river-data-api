@@ -33,7 +33,6 @@ async fn save_group(app: &axum::Router, token: &str, time: &str, values: &[f64])
     assert_eq!(status, 200, "grab save: {body}");
 }
 
-
 async fn sample_at(db: &sea_orm::DatabaseConnection, time: &str) -> (String, String, f64) {
     use sea_orm::{ConnectionTrait, Statement};
     let row = db
@@ -98,10 +97,17 @@ async fn override_instants_retags_an_instant_decision() {
     let declared = declare(&app, &token, "population").await;
     assert_eq!(declared["samples_affected"], 1, "{declared}");
     let job_id = declared["job_id"].as_str().unwrap();
-    assert_eq!(crate::common::e2e::poll_job(&app, &token, job_id, 30).await, "completed");
+    assert_eq!(
+        crate::common::e2e::poll_job(&app, &token, job_id, 30).await,
+        "completed"
+    );
     assert_eq!(sample_at(&db, T2).await.0, "population");
     let (est, source, sd) = sample_at(&db, T1).await;
-    assert_eq!((est.as_str(), source.as_str()), ("sample", "sample"), "the instant decision stands");
+    assert_eq!(
+        (est.as_str(), source.as_str()),
+        ("sample", "sample"),
+        "the instant decision stands"
+    );
     assert!((sd - 7.071_067_811_865_476).abs() < 1e-9, "{sd}");
 
     let (status, body) = retag(
@@ -118,11 +124,17 @@ async fn override_instants_retags_an_instant_decision() {
     assert_eq!(body["samples_affected"], 1, "{body}");
     assert_eq!(body["instant_decisions"], 1, "{body}");
     let job_id = body["job_id"].as_str().expect("a tracked job");
-    assert_eq!(crate::common::e2e::poll_job(&app, &token, job_id, 30).await, "completed");
+    assert_eq!(
+        crate::common::e2e::poll_job(&app, &token, job_id, 30).await,
+        "completed"
+    );
 
     let (est, source, sd) = sample_at(&db, T1).await;
     assert_eq!((est.as_str(), source.as_str()), ("population", "slot"));
-    assert!((sd - 5.0).abs() < 1e-9, "recomputed under the population divisor: {sd}");
+    assert!(
+        (sd - 5.0).abs() < 1e-9,
+        "recomputed under the population divisor: {sd}"
+    );
 }
 
 /// Scenario: the same instant decision, but the retag names a window that excludes it.
@@ -143,7 +155,10 @@ async fn a_window_confines_the_retag() {
     .await;
     let declared = declare(&app, &token, "population").await;
     let job_id = declared["job_id"].as_str().unwrap();
-    assert_eq!(crate::common::e2e::poll_job(&app, &token, job_id, 30).await, "completed");
+    assert_eq!(
+        crate::common::e2e::poll_job(&app, &token, job_id, 30).await,
+        "completed"
+    );
 
     let (status, body) = retag(
         &app,
@@ -158,7 +173,10 @@ async fn a_window_confines_the_retag() {
     .await;
     assert_eq!(status, 200, "retag ({status}): {body}");
     assert_eq!(body["samples_affected"], 0, "{body}");
-    assert!(body.get("job_id").is_none(), "nothing to do, no job: {body}");
+    assert!(
+        body.get("job_id").is_none(),
+        "nothing to do, no job: {body}"
+    );
     assert_eq!(sample_at(&db, T1).await.0, "sample");
 }
 
@@ -178,7 +196,9 @@ async fn a_target_the_slot_does_not_declare_is_refused() {
     .await;
     assert_eq!(status, 400, "{body}");
     assert!(
-        body["error"].as_str().is_some_and(|e| e.contains("declare")),
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("declare")),
         "the refusal says to declare first: {body}"
     );
 
@@ -194,5 +214,8 @@ async fn a_target_the_slot_does_not_declare_is_refused() {
     .await;
     assert_eq!(status, 200, "dry run: {body}");
     assert_eq!(body["samples_affected"], 1, "{body}");
-    assert!(body.get("job_id").is_none(), "a dry run enqueues nothing: {body}");
+    assert!(
+        body.get("job_id").is_none(),
+        "a dry run enqueues nothing: {body}"
+    );
 }

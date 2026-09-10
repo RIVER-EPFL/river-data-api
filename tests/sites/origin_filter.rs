@@ -76,7 +76,13 @@ async fn site_parameters_separate_the_same_two_origins() {
     )
     .await;
 
-    let synced = list(&app, &token, "site_parameters", r#"{"discovered_at_neq":null}"#).await;
+    let synced = list(
+        &app,
+        &token,
+        "site_parameters",
+        r#"{"discovered_at_neq":null}"#,
+    )
+    .await;
     assert_eq!(synced.len(), 1, "only the stamped slot: {synced:?}");
     let by_hand = list(&app, &token, "site_parameters", r#"{"discovered_at":null}"#).await;
     assert_eq!(by_hand.len(), total - 1, "and the rest are hand-entered");

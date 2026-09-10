@@ -18,7 +18,11 @@ struct Fixture {
 
 async fn setup() -> Fixture {
     let f = crate::common::seeded_app().await;
-    Fixture { db: f.db, app: f.app, token: f.token }
+    Fixture {
+        db: f.db,
+        app: f.app,
+        token: f.token,
+    }
 }
 
 async fn register(fx: &Fixture, slope: f64, intercept: f64) -> serde_json::Value {

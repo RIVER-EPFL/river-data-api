@@ -282,12 +282,7 @@ async fn holds<C: ConnectionTrait>(
         if streams.is_empty() {
             return Ok(Vec::new());
         }
-        return hold_rows(
-            conn,
-            "stream_id = ANY($1)",
-            vec![streams.to_vec().into()],
-        )
-        .await;
+        return hold_rows(conn, "stream_id = ANY($1)", vec![streams.to_vec().into()]).await;
     };
     hold_rows(
         conn,

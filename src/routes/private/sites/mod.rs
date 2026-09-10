@@ -1,14 +1,6 @@
-pub mod aggregates;
-pub mod annotations;
-pub mod model;
+pub mod models;
 pub mod parameters;
-pub mod readings;
-pub mod replicates_export;
-pub mod router;
-pub mod sensor_identity;
-pub mod sensor_vs_grab;
-pub mod statistics;
-pub mod status_events;
-pub mod types;
+pub mod service;
 pub mod views;
-pub use model::*;
+
+pub use models::*;

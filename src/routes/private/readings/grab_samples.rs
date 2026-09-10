@@ -11,13 +11,13 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::collection_events::recompute;
+use crate::routes::private::collection_events::flows;
 use crate::routes::private::readings::batch::{
     CurveClaim, Replace, admission, admit_standard_curves, readings_upsert,
 };
 use crate::routes::private::readings::decisions;
 use crate::routes::private::readings::tail;
-use crate::routes::private::sync::replicate_audit as audit;
+use crate::routes::private::sync::service as audit;
 use crate::routes::private::{
     data_streams, readings, readings::sample_groups, readings::samples, readings::sd_estimator,
     sensors::calibrations, sites, sites::parameters as site_parameters,
@@ -137,7 +137,7 @@ pub struct GrabSampleResponse {
     /// visit, in run order. Reported on `dry_run` too, so the consequence is known before the
     /// write; the save enqueues the visit's recompute when this is not empty.
     #[serde(default)]
-    pub calculations: Vec<crate::routes::private::tools::closure::CalculationImpact>,
+    pub calculations: Vec<crate::routes::private::tools::models::CalculationImpact>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -351,7 +351,7 @@ async fn get_or_create_grab_stream(
             active.updated_at = Set(chrono::Utc::now().into());
             active.update(db).await?;
         }
-        crate::routes::private::sensors::identity::ensure_channel_instrument(
+        crate::routes::private::sensors::service::ensure_channel_instrument(
             db,
             &stream,
             site_id,
@@ -404,7 +404,7 @@ async fn get_or_create_grab_stream(
         .await?
         .ok_or_else(|| AppError::Internal("Failed to create grab sample stream".to_string()))?;
 
-    crate::routes::private::sensors::identity::ensure_channel_instrument(
+    crate::routes::private::sensors::service::ensure_channel_instrument(
         db,
         &stream,
         site_id,
@@ -652,7 +652,7 @@ fn output_carries_value(output: &serde_json::Value, value: f64) -> bool {
 async fn run_pinned_manifest(
     db: &DatabaseConnection,
     run_id: Uuid,
-) -> Result<Option<crate::routes::private::tools::engine::Manifest>, AppError> {
+) -> Result<Option<crate::routes::private::tools::models::Manifest>, AppError> {
     let Some(row) = db
         .query_one_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -667,7 +667,7 @@ async fn run_pinned_manifest(
         return Ok(None);
     };
     let manifest: serde_json::Value = row.try_get("", "manifest").map_err(AppError::Database)?;
-    Ok(crate::routes::private::tools::engine::parse_manifest(&manifest).ok())
+    Ok(crate::routes::private::tools::models::parse_manifest(&manifest).ok())
 }
 
 async fn tool_run_fixed_estimators(
@@ -1134,18 +1134,18 @@ pub async fn insert_grab_samples(
     // is the recompute: it reports nothing and enqueues nothing.
     let run_source = tool_run_source(&state.db, payload.tool_run_id).await?;
     let writer = match run_source.as_deref() {
-        Some("chain") => recompute::Writer::Chain,
-        _ => recompute::Writer::Person,
+        Some("chain") => flows::Writer::Chain,
+        _ => flows::Writer::Person,
     };
     // Where these values come from. A save that names no run is a person typing a number.
     let provenance_kind = super::provenance::provenance_kind_for_run(run_source.as_deref());
-    let calculations = if writer == recompute::Writer::Chain {
+    let calculations = if writer == flows::Writer::Chain {
         Vec::new()
     } else {
         let mut touched: Vec<Uuid> = payload.readings.iter().map(|r| r.parameter_id).collect();
         touched.sort_unstable();
         touched.dedup();
-        crate::routes::private::tools::closure::calculations_fed_by(&state.db, &touched).await?
+        crate::routes::private::tools::service::calculations_fed_by(&state.db, &touched).await?
     };
 
     if payload.dry_run {
@@ -1227,7 +1227,8 @@ pub async fn insert_grab_samples(
     // at the grab time (site-fixed to payload.site_id), instead of writing NULL. Grabs without a
     // sensor_id keep NULL deployment (manual lab values with no instrument).
     let grab_slots = {
-        use crate::routes::private::sensors::identity::{ResolvedSlot, resolve_windows_for_times};
+        use crate::routes::private::sensors::models::{ResolvedSlot};
+use crate::routes::private::sensors::service::{resolve_windows_for_times};
         let mut times_by_channel: HashMap<(Uuid, Uuid), Vec<chrono::DateTime<chrono::Utc>>> =
             HashMap::new();
         for r in &payload.readings {
@@ -1292,12 +1293,12 @@ pub async fn insert_grab_samples(
                     // correction of a stored value, or the chain superseding an output with a
                     // fresh run (ADR 0008). Rows whose value does not change decide nothing.
                     let (kind, origin, reason) = match writer {
-                        recompute::Writer::Chain => (
+                        flows::Writer::Chain => (
                             decisions::Kind::Chain,
                             decisions::Origin::Chain,
                             "superseded by a recompute",
                         ),
-                        recompute::Writer::Person => (
+                        flows::Writer::Person => (
                             decisions::Kind::ValueCorrection,
                             decisions::Origin::Manual,
                             "replaced by a new entry",
@@ -1312,7 +1313,7 @@ pub async fn insert_grab_samples(
                                 .filter(|(r, _)| r.parameter_id == *parameter_id && r.time == *time)
                                 .map(|(_, p)| {
                                     let new = match (writer, payload.tool_run_id) {
-                                        (recompute::Writer::Chain, Some(run_id)) => {
+                                        (flows::Writer::Chain, Some(run_id)) => {
                                             serde_json::json!({ "run_id": run_id })
                                         }
                                         _ => serde_json::json!({ "raw_value": p.raw_value }),
@@ -1573,7 +1574,7 @@ pub async fn insert_grab_samples(
                 groups.iter().map(|(_, t)| *t).min(),
                 groups.iter().map(|(_, t)| *t).max(),
             ) {
-                crate::routes::private::collection_events::attach::attach_collection_events(
+                crate::routes::private::collection_events::service::attach_collection_events(
                     txn,
                     "r.site_id = $1 AND r.time >= $2 AND r.time <= $3",
                     vec![
@@ -1581,7 +1582,7 @@ pub async fn insert_grab_samples(
                         sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
                         sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
                     ],
-                    crate::routes::private::collection_events::attach::EventSource::Manual,
+                    crate::routes::private::collection_events::service::EventSource::Manual,
                 )
                 .await?;
                 let mut instants: Vec<sea_orm::prelude::DateTimeWithTimeZone> = groups
@@ -1590,7 +1591,7 @@ pub async fn insert_grab_samples(
                     .collect();
                 instants.sort_unstable();
                 instants.dedup();
-                touched_events = recompute::touched_events(
+                touched_events = flows::touched_events(
                     txn,
                     "r.site_id = $1 AND r.time = ANY($2)",
                     vec![payload.site_id.into(), instants.into()],
@@ -1742,85 +1743,5 @@ pub fn declared_instrument(explicit: Option<Uuid>, slot: Option<Uuid>) -> Option
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{GrabFacts, StoredFacts, declared_instrument};
-
-    fn stored(label: &str, notes: &str, author: &str) -> StoredFacts {
-        StoredFacts {
-            created_by: Some(author.to_string()),
-            label: Some(label.to_string()),
-            notes: Some(notes.to_string()),
-            provenance: Some(serde_json::json!({ "tool": "doc" })),
-            kind: Some("tool_run".to_string()),
-        }
-    }
-
-    #[test]
-    fn a_row_the_curve_did_not_correct_takes_the_slot_s_declaration() {
-        let curve_instrument = uuid::Uuid::new_v4();
-        let declared = uuid::Uuid::new_v4();
-        assert_eq!(
-            declared_instrument(Some(curve_instrument), Some(declared)),
-            Some(curve_instrument),
-            "the row carrying the curve names the instrument that curve was fitted on"
-        );
-        assert_eq!(
-            declared_instrument(None, Some(declared)),
-            Some(declared),
-            "every other row names what the slot says measures it"
-        );
-        assert_eq!(
-            declared_instrument(None, None),
-            None,
-            "an undeclared slot resolves nothing here; the entry channel's marker is added at the write"
-        );
-    }
-
-    #[test]
-    fn a_silent_field_keeps_what_the_group_carried() {
-        let prior = stored("batch 7", "filtered on site", "lab");
-        let request = GrabFacts {
-            created_by: None,
-            label: None,
-            notes: Some("corrected note"),
-            provenance: None,
-            kind: "manual",
-        };
-        let merged = request.over(Some(&prior));
-        assert_eq!(merged.label.as_deref(), Some("batch 7"));
-        assert_eq!(merged.notes.as_deref(), Some("corrected note"));
-        assert_eq!(merged.created_by.as_deref(), Some("lab"));
-        assert_eq!(
-            merged.provenance,
-            Some(serde_json::json!({ "tool": "doc" })),
-            "a rewrite that names no run keeps the blob behind the value"
-        );
-    }
-
-    #[test]
-    fn a_first_write_carries_only_what_the_request_says() {
-        let request = GrabFacts {
-            created_by: Some("evan"),
-            label: None,
-            notes: None,
-            provenance: None,
-            kind: "manual",
-        };
-        let merged = request.over(None);
-        assert_eq!(merged.created_by.as_deref(), Some("evan"));
-        assert_eq!(merged.label, None);
-        assert!(!merged.is_empty(), "an author alone is worth storing");
-        assert!(
-            GrabFacts {
-                created_by: None,
-                label: None,
-                notes: None,
-                provenance: None,
-                kind: "manual",
-            }
-            .over(None)
-            .is_empty(),
-            "a request that records nothing writes nothing"
-        );
-    }
-}
+#[path = "tests/grab_samples.rs"]
+mod tests;

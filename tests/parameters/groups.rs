@@ -252,8 +252,8 @@ async fn the_definition_document_is_the_group_in_its_own_order() {
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO calculation_formulas (id, code, formula, output_parameter_id, ordinal) \
-             VALUES ('{formula_id}', 'do_from_temp', 'Temperature * 2', \
+            "INSERT INTO calculation_formulas (id, code, name, formula, output_parameter_id, ordinal) \
+             VALUES ('{formula_id}', 'do_from_temp', 'DO from temperature', 'Temperature * 2', \
                      '{}', 0)",
             crate::common::GLOBAL_PARAM_DO_ID
         ),
@@ -690,8 +690,14 @@ async fn declaring_intermediates_mints_the_catalog_rows_once() {
     .await;
     assert_eq!(status, 200, "re-declare ({status}): {text}");
     let again: serde_json::Value = serde_json::from_str(&text).expect("JSON");
-    assert_eq!(again["parameters_created"], 0, "nothing is minted twice: {again}");
-    assert_eq!(again["members_created"], 0, "and nothing joins twice: {again}");
+    assert_eq!(
+        again["parameters_created"], 0,
+        "nothing is minted twice: {again}"
+    );
+    assert_eq!(
+        again["members_created"], 0,
+        "and nothing joins twice: {again}"
+    );
 
     let row = db
         .query_one_raw(Statement::from_sql_and_values(

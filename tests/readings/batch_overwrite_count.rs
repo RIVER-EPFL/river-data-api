@@ -31,7 +31,12 @@ fn rows(values: &[f64]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-async fn post(app: &axum::Router, token: &str, values: &[f64], conflict: &str) -> serde_json::Value {
+async fn post(
+    app: &axum::Router,
+    token: &str,
+    values: &[f64],
+    conflict: &str,
+) -> serde_json::Value {
     let (status, body) = crate::common::post_json_parse_with_token(
         app,
         "/api/readings/batch",
@@ -54,7 +59,10 @@ async fn overwritten_counts_only_rows_whose_value_changed() {
 
     let same = post(&app, &token, &[1.0, 2.0, 3.0], "overwrite").await;
     assert_eq!(same["inserted"], 0, "{same}");
-    assert_eq!(same["overwritten"], 0, "identical values replace nothing: {same}");
+    assert_eq!(
+        same["overwritten"], 0,
+        "identical values replace nothing: {same}"
+    );
 
     let one_changed = post(&app, &token, &[1.0, 2.5, 3.0], "overwrite").await;
     assert_eq!(one_changed["inserted"], 0, "{one_changed}");

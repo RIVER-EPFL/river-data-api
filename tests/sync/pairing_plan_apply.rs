@@ -94,18 +94,17 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
     .await;
 
     // Apply, returns a job id immediately; the backfill runs in the job.
-    let (status, text) = crate::common::post_plan_action_with_token(
-        &app,
-        &plan_id.to_string(),
-        "apply",
-        &token,
-    )
-    .await;
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
+            .await;
     assert!(
         (200..300).contains(&status),
         "apply should be 2xx, got {status}: {text}"
     );
-    assert_eq!(crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await, "completed");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await,
+        "completed"
+    );
 
     // Plan applied, stream paired, readings backfilled with a site_id.
     let plan_status = db
@@ -134,18 +133,17 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
     );
 
     // Revert, also a job; unpairs the stream and clears the readings' site_id.
-    let (status, text) = crate::common::post_plan_action_with_token(
-        &app,
-        &plan_id.to_string(),
-        "revert",
-        &token,
-    )
-    .await;
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "revert", &token)
+            .await;
     assert!(
         (200..300).contains(&status),
         "revert should be 2xx, got {status}: {text}"
     );
-    assert_eq!(crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await, "completed");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await,
+        "completed"
+    );
 
     let plan_status = db
         .query_one_raw(Statement::from_string(
@@ -195,15 +193,18 @@ async fn apply_attaches_collection_events_for_spot_readings() {
         ),
     )
     .await;
-    for ts in ["2025-03-01T09:00:00Z", "2025-03-08T09:00:00Z"] {
-        crate::common::exec(
-            &db,
-            &format!(
-                "INSERT INTO readings (stream_id, time, raw_value, replicate_index) \
-                 VALUES ('{stream_id}', '{ts}', 2.5, 0)"
-            ),
-        )
-        .await;
+    for (ts, replicates) in [("2025-03-01T09:00:00Z", 2), ("2025-03-08T09:00:00Z", 1)] {
+        for index in 0..replicates {
+            crate::common::exec(
+                &db,
+                &format!(
+                    "INSERT INTO readings (stream_id, time, raw_value, replicate_index) \
+                     VALUES ('{stream_id}', '{ts}', {}, {index})",
+                    2.5 + f64::from(index) / 10.0
+                ),
+            )
+            .await;
+        }
     }
 
     let entries = serde_json::json!([{
@@ -236,7 +237,10 @@ async fn apply_attaches_collection_events_for_spot_readings() {
         (200..300).contains(&status),
         "apply should be 2xx, got {status}: {text}"
     );
-    assert_eq!(crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await, "completed");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await,
+        "completed"
+    );
 
     let events = db
         .query_all_raw(Statement::from_string(
@@ -271,6 +275,25 @@ async fn apply_attaches_collection_events_for_spot_readings() {
         .try_get::<i64>("", "v")
         .unwrap();
     assert_eq!(unstamped, 0, "every paired spot reading names its visit");
+
+    let n = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT s.n AS v FROM samples s \
+                 JOIN readings r ON r.sample_id = s.id \
+                 WHERE r.stream_id = '{stream_id}' AND r.time = '2025-03-01T09:00:00Z' \
+                 LIMIT 1"
+            ),
+        ))
+        .await
+        .unwrap()
+        .map(|row| row.try_get::<i32>("", "v").unwrap());
+    assert_eq!(
+        n,
+        Some(2),
+        "the plan apply materialises the replicate group's statistics, as single-stream pairing does"
+    );
 
     crate::common::cleanup_test_db(&db).await;
 }
@@ -325,7 +348,10 @@ async fn a_replayed_apply_reports_a_replay_instead_of_failing() {
         crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
             .await;
     assert!((200..300).contains(&status), "apply ({status}): {text}");
-    assert_eq!(crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await, "completed");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await,
+        "completed"
+    );
 
     let replay = river_db::routes::private::reprocessing_jobs::worker::enqueue(
         &db,
@@ -420,7 +446,10 @@ async fn apply_reports_its_progress_over_the_plan_s_entries() {
         "apply should be 2xx, got {status}: {text}"
     );
     let job_id = job_id_of(&text);
-    assert_eq!(crate::common::jobs::wait_for_job(&db, &job_id).await, "completed");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&db, &job_id).await,
+        "completed"
+    );
 
     let row = db
         .query_one_raw(Statement::from_string(
@@ -619,7 +648,9 @@ async fn the_source_register_becomes_instruments_only_when_a_plan_admits_it() {
     let offered = plan["instrument_proposals"].as_array().expect("proposals");
     assert_eq!(offered.len(), 2, "the plan carries the register: {plan}");
     assert!(
-        offered.iter().all(|p| p["admit"] == serde_json::json!(true)),
+        offered
+            .iter()
+            .all(|p| p["admit"] == serde_json::json!(true)),
         "proposed admitted, since the register is the lab's own record: {plan}"
     );
 
@@ -653,7 +684,11 @@ async fn the_source_register_becomes_instruments_only_when_a_plan_admits_it() {
         ))
         .await
         .unwrap();
-    assert_eq!(admitted.len(), 1, "only the admitted row became an instrument");
+    assert_eq!(
+        admitted.len(),
+        1,
+        "only the admitted row became an instrument"
+    );
     assert_eq!(
         admitted[0].try_get::<String>("", "source_key").unwrap(),
         "sensor_inventory:62"
@@ -668,5 +703,8 @@ async fn the_source_register_becomes_instruments_only_when_a_plan_admits_it() {
     );
 
     let left = count(&db, "instrument_proposals WHERE source_system = 'regsrc'").await;
-    assert_eq!(left, 1, "the declined row stays a proposal for the next plan");
+    assert_eq!(
+        left, 1,
+        "the declined row stays a proposal for the next plan"
+    );
 }

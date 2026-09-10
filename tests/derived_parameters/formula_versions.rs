@@ -82,7 +82,10 @@ async fn a_computed_value_names_the_formula_it_was_made_with_and_an_edit_mints_a
     )
     .await;
     assert!((200..300).contains(&status), "create ({status}): {def}");
-    let output = def["output_parameter_id"].as_str().expect("output").to_string();
+    let output = def["output_parameter_id"]
+        .as_str()
+        .expect("output")
+        .to_string();
     let definition_id = def["id"].as_str().expect("id").to_string();
 
     // Creating the definition mints version 1.
@@ -179,7 +182,10 @@ async fn a_formula_value_resolves_the_calculation_that_produced_it() {
     )
     .await;
     assert!((200..300).contains(&status), "create ({status}): {def}");
-    let output = def["output_parameter_id"].as_str().expect("output").to_string();
+    let output = def["output_parameter_id"]
+        .as_str()
+        .expect("output")
+        .to_string();
 
     let (status, body) = crate::common::post_json_with_token(
         &app,
@@ -229,7 +235,10 @@ async fn a_formula_value_resolves_the_calculation_that_produced_it() {
     let (status, body) = crate::common::get_json_with_token(&app, &uri, &token).await;
     assert_eq!(status, 200, "{body}");
     let calc = &body["records"][0]["calculation"];
-    assert_eq!(calc["code"], code, "the record names the calculation: {body}");
+    assert_eq!(
+        calc["code"], code,
+        "the record names the calculation: {body}"
+    );
     assert_eq!(calc["formula"], "Dissolved_O2 * 0.032");
     assert_eq!(calc["version_no"], 1);
     assert_eq!(calc["active_version_no"], 1);

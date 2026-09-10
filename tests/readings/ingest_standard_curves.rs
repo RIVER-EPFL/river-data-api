@@ -19,7 +19,11 @@ struct Fixture {
 
 async fn setup() -> Fixture {
     let f = crate::common::seeded_app().await;
-    Fixture { db: f.db, app: f.app, token: f.token }
+    Fixture {
+        db: f.db,
+        app: f.app,
+        token: f.token,
+    }
 }
 
 /// Register a portal curve; returns (curve_id, lab_sensor_id).

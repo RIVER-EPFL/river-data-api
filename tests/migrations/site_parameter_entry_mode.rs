@@ -92,8 +92,8 @@ async fn a_second_definition_cannot_claim_an_output() {
     for code in ["one", "two"] {
         let result = db
             .execute_unprepared(&format!(
-                "INSERT INTO calculation_formulas (id, code, formula, output_parameter_id) \
-                 VALUES (gen_random_uuid(), '{code}', 'a * 2', '{param}')",
+                "INSERT INTO calculation_formulas (id, code, name, formula, output_parameter_id) \
+                 VALUES (gen_random_uuid(), '{code}', '{code}', 'a * 2', '{param}')",
                 param = crate::common::GLOBAL_PARAM_DO_ID,
             ))
             .await;

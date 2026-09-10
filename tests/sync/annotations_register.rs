@@ -18,7 +18,11 @@ struct Fixture {
 
 async fn setup() -> Fixture {
     let f = crate::common::seeded_app().await;
-    Fixture { db: f.db, app: f.app, token: f.token }
+    Fixture {
+        db: f.db,
+        app: f.app,
+        token: f.token,
+    }
 }
 
 async fn register_stream(fx: &Fixture, key: &str, pair: bool) -> String {

@@ -32,7 +32,10 @@ async fn count(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
 #[tokio::test]
 #[serial]
 async fn csv_dump_onboarding_from_scratch_to_served_readings() {
-    if !crate::common::profile::Service::Keycloak.require("csv_dump_onboarding").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("csv_dump_onboarding")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -139,7 +142,10 @@ async fn csv_dump_onboarding_from_scratch_to_served_readings() {
 #[tokio::test]
 #[serial]
 async fn sensor_flow_onboarding_across_repeated_ingest_cycles() {
-    if !crate::common::profile::Service::Keycloak.require("sensor_flow_onboarding").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("sensor_flow_onboarding")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -228,7 +234,10 @@ async fn sensor_flow_onboarding_across_repeated_ingest_cycles() {
 #[tokio::test]
 #[serial]
 async fn grab_and_tool_onboarding_produces_spot_series_with_sample_statistics() {
-    if !crate::common::profile::Service::Keycloak.require("grab_onboarding").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("grab_onboarding")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -313,7 +322,10 @@ async fn grab_and_tool_onboarding_produces_spot_series_with_sample_statistics() 
 #[tokio::test]
 #[serial]
 async fn the_three_tracks_share_no_entities_or_readings() {
-    if !crate::common::profile::Service::Keycloak.require("track_disjointness").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("track_disjointness")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;

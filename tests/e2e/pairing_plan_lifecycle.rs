@@ -201,13 +201,9 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     assert_eq!(plan["status"], "applied");
 
     // re-apply rejected
-    let (status, _) = crate::common::post_plan_action_with_token(
-        &app,
-        &plan_id.to_string(),
-        "apply",
-        &token,
-    )
-    .await;
+    let (status, _) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
+            .await;
     assert_eq!(status, 409, "cannot re-apply an applied plan");
 
     // revert (runs as a plan_revert job)
@@ -247,12 +243,8 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     assert_eq!(plan["status"], "reverted");
 
     // re-revert rejected
-    let (status, _) = crate::common::post_plan_action_with_token(
-        &app,
-        &plan_id.to_string(),
-        "revert",
-        &token,
-    )
-    .await;
+    let (status, _) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "revert", &token)
+            .await;
     assert_eq!(status, 409, "cannot revert a non-applied plan");
 }

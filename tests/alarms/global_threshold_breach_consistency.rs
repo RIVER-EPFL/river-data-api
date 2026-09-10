@@ -162,8 +162,11 @@ async fn every_path_agrees_on_a_global_threshold_breach() {
     }
 
     // 6. Sweeper → opens an alarm event at severity 2.
-    let stats = alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
-    assert!(stats.opened >= 1, "sweeper opens from the global threshold: {stats:?}");
+    let stats = alarms::flows::evaluate_alarm_events(&db).await.unwrap();
+    assert!(
+        stats.opened >= 1,
+        "sweeper opens from the global threshold: {stats:?}"
+    );
     let sev: i16 = db
         .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,

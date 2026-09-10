@@ -61,11 +61,7 @@ async fn install_probe_script(db: &DatabaseConnection, manifest: &serde_json::Va
                    content_hash, created_by, validated_at)
               SELECT s.id, 1, $2, 'tool', $3::jsonb, '{}'::jsonb, md5($2), 'test', now()
               FROM tool_scripts s WHERE s.name = $1",
-            [
-                PROBE.into(),
-                script.into(),
-                manifest.to_string().into(),
-            ],
+            [PROBE.into(), script.into(), manifest.to_string().into()],
         ),
         Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -121,10 +117,9 @@ async fn calculate(
 #[tokio::test]
 #[serial]
 async fn a_result_carries_the_constants_and_curves_the_server_resolved() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_result_carries_the_constants_and_curves_the_server_resolved",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_result_carries_the_constants_and_curves_the_server_resolved")
+        .await
     {
         return;
     }
@@ -185,10 +180,9 @@ async fn a_result_carries_the_constants_and_curves_the_server_resolved() {
 #[tokio::test]
 #[serial]
 async fn a_result_pins_the_runner_that_executed_it() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_result_pins_the_runner_that_executed_it",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_result_pins_the_runner_that_executed_it")
+        .await
     {
         return;
     }
@@ -218,10 +212,9 @@ async fn a_result_pins_the_runner_that_executed_it() {
 #[tokio::test]
 #[serial]
 async fn a_script_failure_reports_message_call_and_traceback() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_script_failure_reports_message_call_and_traceback",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_script_failure_reports_message_call_and_traceback")
+        .await
     {
         return;
     }
@@ -251,10 +244,9 @@ async fn a_script_failure_reports_message_call_and_traceback() {
 #[tokio::test]
 #[serial]
 async fn a_structured_when_gates_requiredness_and_a_note_does_not() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_structured_when_gates_requiredness_and_a_note_does_not",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_structured_when_gates_requiredness_and_a_note_does_not")
+        .await
     {
         return;
     }
@@ -295,10 +287,9 @@ async fn a_structured_when_gates_requiredness_and_a_note_does_not() {
 #[tokio::test]
 #[serial]
 async fn boolean_params_validate_default_and_gate() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "boolean_params_validate_default_and_gate",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("boolean_params_validate_default_and_gate")
+        .await
     {
         return;
     }
@@ -337,10 +328,9 @@ async fn boolean_params_validate_default_and_gate() {
 #[tokio::test]
 #[serial]
 async fn a_structured_param_is_checked_against_its_declaration() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_structured_param_is_checked_against_its_declaration",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_structured_param_is_checked_against_its_declaration")
+        .await
     {
         return;
     }
@@ -422,7 +412,10 @@ async fn a_structured_param_is_checked_against_its_declaration() {
 #[tokio::test]
 #[serial]
 async fn an_unknown_kind_is_refused_at_authoring() {
-    if !crate::common::profile::Service::Keycloak.require("an_unknown_kind_is_refused_at_authoring").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("an_unknown_kind_is_refused_at_authoring")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -522,10 +515,9 @@ async fn an_unknown_kind_is_refused_at_authoring() {
 #[tokio::test]
 #[serial]
 async fn an_na_output_is_reported_as_cleared_and_recorded_as_an_explicit_null() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "an_na_output_is_reported_as_cleared_and_recorded_as_an_explicit_null",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("an_na_output_is_reported_as_cleared_and_recorded_as_an_explicit_null")
+        .await
     {
         return;
     }

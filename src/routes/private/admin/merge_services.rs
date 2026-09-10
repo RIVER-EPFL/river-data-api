@@ -1,4 +1,7 @@
-use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    QuerySelect, Statement,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -6,29 +9,14 @@ use uuid::Uuid;
 use crate::common::aggregates::{self, Window};
 use crate::common::bulk_write::{self, TouchedRange};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::data_streams::views::{
-    MoveScope, SlotMove, move_slot_rows, slot_move_collisions,
-};
-
-#[derive(Debug, FromQueryResult)]
-struct SlotRow {
-    id: Uuid,
-    site_id: Uuid,
-    parameter_id: Uuid,
-}
-
-#[derive(Debug, FromQueryResult)]
-struct FormulaEdgeRow {
-    code: String,
-    output_parameter_id: Uuid,
-    parameter_id: Option<Uuid>,
-}
-
-#[derive(Debug, FromQueryResult)]
-struct SourceSlotRow {
-    id: Uuid,
-    site_id: Uuid,
-}
+use crate::routes::private::alarms::models as alarm_thresholds;
+use crate::routes::private::data_streams::models::{MoveScope, SlotMove};
+use crate::routes::private::data_streams::service::{move_slot_rows, slot_move_collisions};
+use crate::routes::private::parameters::derived::{definition_model, source_model};
+use crate::routes::private::parameters::models as parameters;
+use crate::routes::private::sensors::calibrations::model as sensor_calibrations;
+use crate::routes::private::sensors::deployments::model as sensor_deployments;
+use crate::routes::private::sites::parameters::models as site_parameters;
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct MergeSiteParametersRequest {
@@ -154,7 +142,8 @@ pub async fn merge_site_parameters(
 
         let scope = MoveScope::Site(source_site_id);
         refuse_on_collision(txn, scope, source_param_id, target_param_id).await?;
-        let moved = move_slot_rows(txn, scope, source_param_id, target_param_id, actor, origin).await?;
+        let moved =
+            move_slot_rows(txn, scope, source_param_id, target_param_id, actor, origin).await?;
         let streams_updated = update_data_streams(txn, source_id, target_id).await?;
         let source_row = row_snapshot(txn, "site_parameters", source_id).await?;
         delete_source(
@@ -211,14 +200,11 @@ async fn validate_merge_candidates<C: ConnectionTrait>(
     source_id: Uuid,
     target_id: Uuid,
 ) -> AppResult<(Uuid, Uuid, Uuid, Uuid)> {
-    let rows = SlotRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT id, site_id, parameter_id FROM site_parameters WHERE id = ANY($1)",
-        vec![vec![source_id, target_id].into()],
-    ))
-    .all(db)
-    .await
-    .map_err(AppError::Database)?;
+    let rows = site_parameters::Entity::find()
+        .filter(site_parameters::Column::Id.is_in([source_id, target_id]))
+        .all(db)
+        .await
+        .map_err(AppError::Database)?;
 
     let mut source: Option<(Uuid, Uuid)> = None;
     let mut target: Option<(Uuid, Uuid)> = None;
@@ -299,23 +285,17 @@ async fn delete_source<C: ConnectionTrait>(
     .await
     .map_err(AppError::Database)?;
 
-    let sql = "DELETE FROM alarm_thresholds WHERE parameter_id = $1 AND site_id = $2";
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        sql,
-        vec![source_param_id.into(), site_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
+    alarm_thresholds::Entity::delete_many()
+        .filter(alarm_thresholds::Column::ParameterId.eq(source_param_id))
+        .filter(alarm_thresholds::Column::SiteId.eq(site_id))
+        .exec(db)
+        .await
+        .map_err(AppError::Database)?;
 
-    let sql = "DELETE FROM site_parameters WHERE id = $1";
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        sql,
-        vec![source_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
+    site_parameters::Entity::delete_by_id(source_id)
+        .exec(db)
+        .await
+        .map_err(AppError::Database)?;
 
     Ok(())
 }
@@ -350,16 +330,36 @@ async fn refuse_derived_cycle<C: sea_orm::ConnectionTrait>(
     source_id: Uuid,
     target_id: Uuid,
 ) -> AppResult<()> {
-    let rows = FormulaEdgeRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT d.code, d.output_parameter_id, src.parameter_id
-               FROM calculation_formulas d
-               LEFT JOIN derived_parameter_sources src ON src.derived_definition_id = d.id
-              WHERE d.output_parameter_id IS NOT NULL",
-        [],
-    ))
-    .all(conn)
-    .await?;
+    let formulas = definition_model::Entity::find()
+        .filter(definition_model::Column::OutputParameterId.is_not_null())
+        .all(conn)
+        .await?;
+    let sources: Vec<(Uuid, Option<Uuid>)> = source_model::Entity::find()
+        .select_only()
+        .columns([
+            source_model::Column::DerivedDefinitionId,
+            source_model::Column::ParameterId,
+        ])
+        .into_tuple()
+        .all(conn)
+        .await?;
+    // One row per formula, plus one per source it reads: the shape a left join returns.
+    let rows: Vec<(String, Uuid, Option<Uuid>)> = formulas
+        .into_iter()
+        .filter_map(|f| f.output_parameter_id.map(|out| (f.id, f.code, out)))
+        .flat_map(|(id, code, out)| {
+            let read: Vec<Option<Uuid>> = sources
+                .iter()
+                .filter(|(definition_id, _)| *definition_id == id)
+                .map(|(_, parameter_id)| *parameter_id)
+                .collect();
+            if read.is_empty() {
+                vec![(code, out, None)]
+            } else {
+                read.into_iter().map(|p| (code.clone(), out, p)).collect()
+            }
+        })
+        .collect();
 
     // Parameters as indices, with the merge applied: everything the source named is the target.
     let resolve = |id: Uuid| if id == source_id { target_id } else { id };
@@ -375,10 +375,10 @@ async fn refuse_derived_cycle<C: sea_orm::ConnectionTrait>(
     let mut edges: Vec<(usize, usize)> = Vec::new();
     let mut definition_of: std::collections::HashMap<usize, String> =
         std::collections::HashMap::new();
-    for row in rows {
-        let to = slot(resolve(row.output_parameter_id), &mut index, &mut order_of);
-        definition_of.insert(to, row.code);
-        let Some(source) = row.parameter_id else {
+    for (code, output_parameter_id, parameter_id) in rows {
+        let to = slot(resolve(output_parameter_id), &mut index, &mut order_of);
+        definition_of.insert(to, code);
+        let Some(source) = parameter_id else {
             continue;
         };
         let from = slot(resolve(source), &mut index, &mut order_of);
@@ -475,17 +475,10 @@ async fn validate_both_parameters_exist(
     source_id: Uuid,
     target_id: Uuid,
 ) -> AppResult<()> {
-    let pg = sea_orm::DatabaseBackend::Postgres;
-    let count: i64 = txn
-        .query_one_raw(Statement::from_sql_and_values(
-            pg,
-            "SELECT COUNT(*) as c FROM parameters WHERE id = ANY($1)",
-            vec![vec![source_id, target_id].into()],
-        ))
+    let count = parameters::Entity::find()
+        .filter(parameters::Column::Id.is_in([source_id, target_id]))
+        .count(txn)
         .await
-        .map_err(AppError::Database)?
-        .ok_or_else(|| AppError::NotFound("Parameter query failed".into()))?
-        .try_get("", "c")
         .map_err(AppError::Database)?;
     if count < 2 {
         return Err(AppError::NotFound(
@@ -503,16 +496,11 @@ async fn merge_site_parameters_per_site(
     actor: &str,
     origin: crate::routes::private::readings::decisions::Origin,
 ) -> AppResult<(u64, u64, MergeTotals)> {
-    let pg = sea_orm::DatabaseBackend::Postgres;
-
-    let source_sps = SourceSlotRow::find_by_statement(Statement::from_sql_and_values(
-        pg,
-        "SELECT id, site_id FROM site_parameters WHERE parameter_id = $1",
-        vec![source_id.into()],
-    ))
-    .all(txn)
-    .await
-    .map_err(AppError::Database)?;
+    let source_sps = site_parameters::Entity::find()
+        .filter(site_parameters::Column::ParameterId.eq(source_id))
+        .all(txn)
+        .await
+        .map_err(AppError::Database)?;
 
     let mut sites_merged: u64 = 0;
     let mut sites_reassigned: u64 = 0;
@@ -522,19 +510,24 @@ async fn merge_site_parameters_per_site(
         let sp_id = row.id;
         let site_id = row.site_id;
 
-        let target_sp = txn
-            .query_one_raw(Statement::from_sql_and_values(
-                pg,
-                "SELECT id FROM site_parameters WHERE site_id = $1 AND parameter_id = $2",
-                vec![site_id.into(), target_id.into()],
-            ))
+        let target_sp = site_parameters::Entity::find()
+            .filter(site_parameters::Column::SiteId.eq(site_id))
+            .filter(site_parameters::Column::ParameterId.eq(target_id))
+            .one(txn)
             .await
             .map_err(AppError::Database)?;
 
         if let Some(target_row) = target_sp {
-            let target_sp_id: Uuid = target_row.try_get("", "id").map_err(AppError::Database)?;
-            let moved =
-                move_slot_rows(txn, MoveScope::Site(site_id), source_id, target_id, actor, origin).await?;
+            let target_sp_id = target_row.id;
+            let moved = move_slot_rows(
+                txn,
+                MoveScope::Site(site_id),
+                source_id,
+                target_id,
+                actor,
+                origin,
+            )
+            .await?;
             let streams = update_data_streams(txn, sp_id, target_sp_id).await?;
             delete_source(txn, sp_id, site_id, source_id, target_id).await?;
 
@@ -543,15 +536,24 @@ async fn merge_site_parameters_per_site(
             totals.touched = totals.touched.merge(moved.touched);
             sites_merged += 1;
         } else {
-            txn.execute_raw(Statement::from_sql_and_values(
-                pg,
-                "UPDATE site_parameters SET parameter_id = $1 WHERE id = $2",
-                vec![target_id.into(), sp_id.into()],
-            ))
-            .await
-            .map_err(AppError::Database)?;
-            let moved =
-                move_slot_rows(txn, MoveScope::Site(site_id), source_id, target_id, actor, origin).await?;
+            site_parameters::Entity::update_many()
+                .col_expr(
+                    site_parameters::Column::ParameterId,
+                    sea_orm::sea_query::Expr::value(target_id),
+                )
+                .filter(site_parameters::Column::Id.eq(sp_id))
+                .exec(txn)
+                .await
+                .map_err(AppError::Database)?;
+            let moved = move_slot_rows(
+                txn,
+                MoveScope::Site(site_id),
+                source_id,
+                target_id,
+                actor,
+                origin,
+            )
+            .await?;
 
             totals.readings += moved.readings;
             totals.touched = totals.touched.merge(moved.touched);
@@ -572,94 +574,122 @@ async fn reassign_parameter_references(
     actor: &str,
     origin: crate::routes::private::readings::decisions::Origin,
 ) -> AppResult<SlotMove> {
-    let pg = sea_orm::DatabaseBackend::Postgres;
+    let to_target = |id: Uuid| sea_orm::sea_query::Expr::value(id);
 
     // Deployments and calibrations both reference parameters(id); move them to the survivor so the
     // source parameter can be deleted (the deployment FK is RESTRICT).
-    txn.execute_raw(Statement::from_sql_and_values(
-        pg,
-        "UPDATE sensor_deployments SET parameter_id = $1 WHERE parameter_id = $2",
-        vec![target_id.into(), source_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
-    txn.execute_raw(Statement::from_sql_and_values(
-        pg,
-        "UPDATE sensor_calibrations SET parameter_id = $1 WHERE parameter_id = $2",
-        vec![target_id.into(), source_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
+    sensor_deployments::Entity::update_many()
+        .col_expr(
+            sensor_deployments::Column::ParameterId,
+            to_target(target_id),
+        )
+        .filter(sensor_deployments::Column::ParameterId.eq(source_id))
+        .exec(txn)
+        .await
+        .map_err(AppError::Database)?;
+    sensor_calibrations::Entity::update_many()
+        .col_expr(
+            sensor_calibrations::Column::ParameterId,
+            to_target(target_id),
+        )
+        .filter(sensor_calibrations::Column::ParameterId.eq(source_id))
+        .exec(txn)
+        .await
+        .map_err(AppError::Database)?;
 
     // Derived parameter sources: delete conflicts, then reassign
-    txn.execute_raw(Statement::from_sql_and_values(
-        pg,
-        r#"DELETE FROM derived_parameter_sources WHERE parameter_id = $1
-           AND derived_definition_id IN (
-               SELECT derived_definition_id FROM derived_parameter_sources WHERE parameter_id = $2
-           )"#,
-        vec![source_id.into(), target_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
-    txn.execute_raw(Statement::from_sql_and_values(
-        pg,
-        "UPDATE derived_parameter_sources SET parameter_id = $1 WHERE parameter_id = $2",
-        vec![target_id.into(), source_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
+    let already_reading_target: Vec<Uuid> = source_model::Entity::find()
+        .filter(source_model::Column::ParameterId.eq(target_id))
+        .all(txn)
+        .await
+        .map_err(AppError::Database)?
+        .into_iter()
+        .map(|s| s.derived_definition_id)
+        .collect();
+    source_model::Entity::delete_many()
+        .filter(source_model::Column::ParameterId.eq(source_id))
+        .filter(source_model::Column::DerivedDefinitionId.is_in(already_reading_target))
+        .exec(txn)
+        .await
+        .map_err(AppError::Database)?;
+    source_model::Entity::update_many()
+        .col_expr(source_model::Column::ParameterId, to_target(target_id))
+        .filter(source_model::Column::ParameterId.eq(source_id))
+        .exec(txn)
+        .await
+        .map_err(AppError::Database)?;
 
     // What a formula produces moves with what it reads. Without this the delete below raises the
     // output foreign key, and the merge fails on a constraint name rather than doing its job; a
     // formula whose output would close a loop is already refused before any of this runs.
-    txn.execute_raw(Statement::from_sql_and_values(
-        pg,
-        "UPDATE calculation_formulas SET output_parameter_id = $1 WHERE output_parameter_id = $2",
-        vec![target_id.into(), source_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
+    definition_model::Entity::update_many()
+        .col_expr(
+            definition_model::Column::OutputParameterId,
+            to_target(target_id),
+        )
+        .filter(definition_model::Column::OutputParameterId.eq(source_id))
+        .exec(txn)
+        .await
+        .map_err(AppError::Database)?;
 
-    txn.execute_raw(Statement::from_sql_and_values(
-        pg,
-        "DELETE FROM alarm_thresholds WHERE parameter_id = $1",
-        vec![source_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
+    alarm_thresholds::Entity::delete_many()
+        .filter(alarm_thresholds::Column::ParameterId.eq(source_id))
+        .exec(txn)
+        .await
+        .map_err(AppError::Database)?;
 
     // The per-site walk covers every site with a source `site_parameter`; this catches rows at
     // sites that never had one, so the source parameter can be deleted.
-    let swept = move_slot_rows(txn, MoveScope::EverySite, source_id, target_id, actor, origin).await?;
+    let swept = move_slot_rows(
+        txn,
+        MoveScope::EverySite,
+        source_id,
+        target_id,
+        actor,
+        origin,
+    )
+    .await?;
 
     // Merge aliases: target gets source's aliases + source's name as a new alias.
     // `needs_review` clears with it: a merge is the adjudication that flag waits for.
-    txn.execute_raw(Statement::from_sql_and_values(
-        pg,
-        r#"UPDATE parameters SET needs_review = false, aliases = (
-            SELECT array_agg(DISTINCT a)
-            FROM unnest(
-                (SELECT aliases FROM parameters WHERE id = $1)
-                || (SELECT aliases FROM parameters WHERE id = $2)
-                || ARRAY[(SELECT code FROM parameters WHERE id = $2)]
-            ) AS a WHERE a IS NOT NULL AND a != ''
-        ) WHERE id = $1"#,
-        vec![target_id.into(), source_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
+    let both = parameters::Entity::find()
+        .filter(parameters::Column::Id.is_in([target_id, source_id]))
+        .all(txn)
+        .await
+        .map_err(AppError::Database)?;
+    let mut aliases: Vec<String> = both
+        .iter()
+        .flat_map(|p| {
+            p.aliases
+                .iter()
+                .cloned()
+                .chain(std::iter::once(p.code.clone()).filter(|_| p.id == source_id))
+        })
+        .filter(|a| !a.is_empty())
+        .collect();
+    aliases.sort_unstable();
+    aliases.dedup();
+    parameters::Entity::update_many()
+        .col_expr(
+            parameters::Column::NeedsReview,
+            sea_orm::sea_query::Expr::value(false),
+        )
+        .col_expr(
+            parameters::Column::Aliases,
+            sea_orm::sea_query::Expr::value(aliases),
+        )
+        .filter(parameters::Column::Id.eq(target_id))
+        .exec(txn)
+        .await
+        .map_err(AppError::Database)?;
 
     Ok(swept)
 }
 
 async fn delete_parameter(txn: &impl ConnectionTrait, source_id: Uuid) -> AppResult<()> {
-    txn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "DELETE FROM parameters WHERE id = $1",
-        vec![source_id.into()],
-    ))
-    .await
-    .map_err(AppError::Database)?;
+    parameters::Entity::delete_by_id(source_id)
+        .exec(txn)
+        .await
+        .map_err(AppError::Database)?;
     Ok(())
 }

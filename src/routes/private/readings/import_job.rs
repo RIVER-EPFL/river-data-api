@@ -3,18 +3,22 @@
 //! imported window and enqueues the alarm backfill.
 
 use async_trait::async_trait;
-use sea_orm::{ConnectionTrait, DbErr, EntityTrait, FromQueryResult, Set, Statement};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, Set, Statement,
+};
 use uuid::Uuid;
 
 use super::batch::{ConflictMode, readings_on_conflict};
 use super::import::BATCH_SIZE as CSV_BATCH_SIZE;
 use super::{sample_groups, tail};
+use crate::routes::private::data_streams;
 use crate::routes::private::readings;
 use crate::routes::private::reprocessing_jobs::job::Job;
 use crate::routes::private::reprocessing_jobs::jobs::{
     as_db_err, optional_datetime, required_uuid, uuid_pair_array,
 };
 use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
+use crate::routes::private::sensors::calibrations;
 use crate::routes::private::sensors::calibrations::service::{
     Curve, apply_curves, recalculate_derived_at_timestamp,
 };
@@ -43,19 +47,6 @@ struct CuratedRow {
 #[derive(FromQueryResult)]
 struct IdRow {
     id: Uuid,
-}
-
-#[derive(FromQueryResult)]
-struct CurveRow {
-    id: Uuid,
-    slope: f64,
-    intercept: f64,
-}
-
-#[derive(FromQueryResult)]
-struct StreamDefaultRow {
-    id: Uuid,
-    measurement_type: Option<String>,
 }
 
 /// Take a spot group's replicates from `count` onwards out of what the group serves, ahead of an
@@ -266,16 +257,11 @@ impl CsvImport {
             let mut curves: std::collections::HashMap<Uuid, Curve> =
                 std::collections::HashMap::new();
             if !ids.is_empty() {
-                for row in ctx
-                    .db()
-                    .query_all_raw(Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        "SELECT id, slope, intercept FROM sensor_calibrations WHERE id = ANY($1)",
-                        [ids.into()],
-                    ))
+                for curve in calibrations::model::Entity::find()
+                    .filter(calibrations::model::Column::Id.is_in(ids))
+                    .all(ctx.db())
                     .await?
                 {
-                    let curve = CurveRow::from_query_result(&row, "")?;
                     curves.insert(
                         curve.id,
                         Curve {
@@ -305,16 +291,11 @@ impl CsvImport {
 
             let mut defaults: std::collections::HashMap<Uuid, Option<String>> =
                 std::collections::HashMap::new();
-            for row in ctx
-                .db()
-                .query_all_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT id, measurement_type FROM data_streams WHERE id = ANY($1)",
-                    [stream_ids.into()],
-                ))
+            for stream in data_streams::Entity::find()
+                .filter(data_streams::Column::Id.is_in(stream_ids))
+                .all(ctx.db())
                 .await?
             {
-                let stream = StreamDefaultRow::from_query_result(&row, "")?;
                 defaults.insert(stream.id, stream.measurement_type);
             }
             let types =
@@ -518,7 +499,7 @@ impl CsvImport {
         }
 
         let mut touched_visits: Vec<
-            crate::routes::private::collection_events::recompute::TouchedEvent,
+            crate::routes::private::collection_events::flows::TouchedEvent,
         > = Vec::new();
         // Samples are found-or-created and stamped after the insert, by the one materialiser, over
         // the streams and the time span this import touched. Scoping it that way rather than to the
@@ -545,11 +526,11 @@ impl CsvImport {
             .map_err(as_db_err)?;
 
             // A CSV import is a person entering visits after the fact: manual collection events.
-            crate::routes::private::collection_events::attach::attach_collection_events(
+            crate::routes::private::collection_events::service::attach_collection_events(
                 ctx.db(),
                 &row_predicate,
                 vec![stream_ids.into()],
-                crate::routes::private::collection_events::attach::EventSource::Manual,
+                crate::routes::private::collection_events::service::EventSource::Manual,
             )
             .await
             .map_err(as_db_err)?;
@@ -557,7 +538,7 @@ impl CsvImport {
             // The values have landed at their visits; the calculations that read them run without
             // anyone asking (ADR 0007). Read after the attach, which is what gives the rows the
             // events this looks them up by.
-            touched_visits = crate::routes::private::collection_events::recompute::touched_events(
+            touched_visits = crate::routes::private::collection_events::flows::touched_events(
                 ctx.db(),
                 &row_predicate,
                 vec![stream_ids_for_events.into()],
@@ -622,7 +603,7 @@ impl CsvImport {
                     reconcile_alarms: false,
                     episodes: tail::Episodes::Job,
                     recompute_derived: false,
-                    writer: crate::routes::private::collection_events::recompute::Writer::Person,
+                    writer: crate::routes::private::collection_events::flows::Writer::Person,
                 },
                 "csv_import",
             )

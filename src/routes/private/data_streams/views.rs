@@ -5,80 +5,32 @@ use axum::{
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
-    FromQueryResult, QueryFilter, Set, Statement, TransactionTrait,
+    FromQueryResult, QueryFilter, Set, Statement,
 };
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
 use uuid::Uuid;
 
+use super::flows::retire_slot;
+use super::models::{
+    ImportStreamRequest, ImportStreamResponse, PairStreamRequest, PairStreamResponse,
+    PreviewInstant, PreviewReplicate, ReceiptRow, ReceiptsQuery, ReceiptsResponse,
+    RegisterStreamRequest, RetagStreamsRequest, RetagStreamsResponse, SlotScope,
+    StreamPreviewResponse, StreamStatsResponse, UnpairStreamResponse,
+};
+use super::service::{PreviewRow, StoredReceipt, StoredStreamStats, preview_estimator};
 use crate::common::AppState;
-use crate::common::bulk_write::{self, TouchedRange};
+use crate::common::bulk_write;
 use crate::common::middleware::ProjectScope;
 use crate::common::paging::Window;
 use crate::common::scope;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::DataStream;
-use crate::routes::private::readings::sd_estimator;
 use crate::routes::private::sensors;
 use crate::routes::private::sensors::calibrations;
-use crate::routes::private::sensors::identity::{
+use crate::routes::private::sensors::service::{
     close_sensor_deployment, create_sensor_for_stream, extract_vaisala_device_serial,
 };
-use crate::routes::private::sync::replicate_audit;
+use crate::routes::private::sync::service as sync_service;
 use crate::routes::private::{data_streams, sites::parameters as site_parameters};
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct StreamStatsResponse {
-    pub stream_id: Uuid,
-    pub reading_count: i64,
-    /// Rows stamped withdrawn by windowed reconciliation (included in `reading_count`).
-    pub withdrawn_count: i64,
-    #[schema(required)]
-    pub min_time: Option<chrono::DateTime<Utc>>,
-    #[schema(required)]
-    pub max_time: Option<chrono::DateTime<Utc>>,
-    #[schema(required)]
-    pub latest_value: Option<f64>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct PreviewReplicate {
-    pub replicate_index: i16,
-    /// The source column this index is pinned to, when the stream declares a replicate spec.
-    #[schema(required)]
-    pub column: Option<String>,
-    #[schema(required)]
-    pub value: Option<f64>,
-    pub is_flagged: bool,
-    pub withdrawn: bool,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct PreviewInstant {
-    pub time: chrono::DateTime<Utc>,
-    pub replicates: Vec<PreviewReplicate>,
-    /// Recomputed here from the served replicates, which is what `samples` holds for a paired
-    /// stream. Shown so the review can see the statistics the pairing will produce before it
-    /// produces them.
-    #[schema(required)]
-    pub mean: Option<f64>,
-    #[schema(required)]
-    pub sd: Option<f64>,
-    pub n: usize,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct StreamPreviewResponse {
-    pub stream_id: Uuid,
-    pub source_key: String,
-    /// The divisor the standard deviations below were computed under, resolved the way the write
-    /// path resolves it: the stream's spec, then the slot's declaration, else the fallback.
-    #[schema(value_type = crate::routes::private::readings::sd_estimator::SdEstimator)]
-    pub sd_estimator: &'static str,
-    /// What chose it: 'stream', 'slot', or 'default' for the undeclared fallback.
-    pub sd_estimator_source: &'static str,
-    pub instants: Vec<PreviewInstant>,
-}
 
 /// The most recent instants a stream holds, as the replicate rows they will be served as.
 ///
@@ -120,7 +72,7 @@ pub async fn stream_preview(
     // The pinned column-to-index mapping, so an index is labelled with the column it came from
     // rather than left as a bare number.
     let columns: std::collections::HashMap<i16, String> =
-        super::replicates::ReplicateSpec::from_metadata(&stream.metadata)
+        super::models::ReplicateSpec::from_metadata(&stream.metadata)
             .map(|spec| {
                 spec.assignments
                     .into_iter()
@@ -184,7 +136,7 @@ pub async fn stream_preview(
             .filter(|r| !r.is_flagged && !r.withdrawn)
             .filter_map(|r| r.value)
             .collect();
-        let stats = replicate_audit::group_stats(&values).under(estimator.estimator);
+        let stats = sync_service::group_stats(&values).under(estimator.estimator);
         instant.n = stats.n;
         instant.mean = stats.mean;
         instant.sd = stats.sd;
@@ -197,42 +149,6 @@ pub async fn stream_preview(
         sd_estimator_source: estimator.source.as_str(),
         instants,
     }))
-}
-
-/// The divisor the pairing will serve for this stream, resolved as the write path resolves it:
-/// the stream's registered spec, then the slot's declaration once it is paired, else the
-/// undeclared fallback. An unpaired stream has no slot to read, which is the usual case here.
-async fn preview_estimator(
-    db: &DatabaseConnection,
-    stream: &data_streams::Model,
-) -> AppResult<sd_estimator::Resolved> {
-    let spec = super::replicates::ReplicateSpec::from_metadata(&stream.metadata)
-        .and_then(|spec| spec.declared.sd_estimator);
-    let spec = sd_estimator::parse_opt(spec.as_deref())?;
-    if let Some(estimator) = spec {
-        return Ok(sd_estimator::Resolved {
-            estimator,
-            source: sd_estimator::Source::Stream,
-        });
-    }
-    let Some(site_parameter_id) = stream.site_parameter_id else {
-        return Ok(sd_estimator::Resolved::undeclared());
-    };
-    let slot = site_parameters::Entity::find_by_id(site_parameter_id)
-        .one(db)
-        .await?;
-    let Some(slot) = slot else {
-        return Ok(sd_estimator::Resolved::undeclared());
-    };
-    Ok(
-        match sd_estimator::slot_declaration(db, slot.site_id, slot.parameter_id).await? {
-            Some(estimator) => sd_estimator::Resolved {
-                estimator,
-                source: sd_estimator::Source::Slot,
-            },
-            None => sd_estimator::Resolved::undeclared(),
-        },
-    )
 }
 
 /// A project-scoped key may only inspect a stream paired into its own project. An unpaired or
@@ -332,85 +248,6 @@ pub async fn stream_stats(
     }))
 }
 
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-pub struct ReceiptsQuery {
-    /// 1-based page, default 1.
-    #[serde(default)]
-    pub page: Option<u64>,
-    /// Rows per page, default 50, max 200.
-    #[serde(default)]
-    pub page_size: Option<u64>,
-}
-
-/// The stored shapes the hand mappings above read. Derived, so a column added to a query and not
-/// to its reader is a compile error rather than a field left at its default.
-#[derive(FromQueryResult)]
-struct SlotKeyRow {
-    site_id: Uuid,
-    parameter_id: Uuid,
-}
-
-#[derive(FromQueryResult)]
-struct StoredReceipt {
-    id: Uuid,
-    at: chrono::DateTime<chrono::FixedOffset>,
-    window_from: Option<chrono::DateTime<chrono::FixedOffset>>,
-    window_to: Option<chrono::DateTime<chrono::FixedOffset>>,
-    submitted: i32,
-    new_rows: i32,
-    changed: i32,
-    unchanged: i32,
-    retained: i32,
-    rejected_total: i32,
-    dropped: i32,
-    withdrawn: i32,
-    braked: bool,
-}
-
-#[derive(FromQueryResult)]
-struct PreviewRow {
-    time: chrono::DateTime<chrono::FixedOffset>,
-    replicate_index: i16,
-    value: Option<f64>,
-    is_flagged: bool,
-    withdrawn: bool,
-}
-
-/// A stream with no readings at all returns no row, which is zero of everything.
-#[derive(FromQueryResult, Default)]
-struct StoredStreamStats {
-    count: i64,
-    withdrawn: i64,
-    min_time: Option<chrono::DateTime<chrono::FixedOffset>>,
-    max_time: Option<chrono::DateTime<chrono::FixedOffset>>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ReceiptRow {
-    pub id: Uuid,
-    pub at: chrono::DateTime<Utc>,
-    #[schema(required)]
-    pub window_from: Option<chrono::DateTime<Utc>>,
-    #[schema(required)]
-    pub window_to: Option<chrono::DateTime<Utc>>,
-    pub submitted: i32,
-    pub new_rows: i32,
-    pub changed: i32,
-    pub unchanged: i32,
-    pub retained: i32,
-    pub rejected_total: i32,
-    pub dropped: i32,
-    pub withdrawn: i32,
-    pub braked: bool,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ReceiptsResponse {
-    pub stream_id: Uuid,
-    pub total: u64,
-    pub receipts: Vec<ReceiptRow>,
-}
-
 /// The stream's windowed-ingest ledger: one row per reconciliation pass, newest first.
 /// Requires `read_metadata`.
 #[utoipa::path(
@@ -506,25 +343,6 @@ pub async fn stream_receipts(
     }))
 }
 
-/// A stream registration, as a sync service sends it. The field list is
-/// `river_data_core::models::RegisterStreamRequest`, which the clients build from, so a field the
-/// sender gains cannot be dropped here in silence. `metadata` has always been optional on this
-/// route and core declares it required, so an omitted object is filled in before the body is read.
-#[derive(Debug, ToSchema)]
-#[schema(value_type = river_data_core::models::RegisterStreamRequest)]
-pub struct RegisterStreamRequest(pub river_data_core::models::RegisterStreamRequest);
-
-impl<'de> Deserialize<'de> for RegisterStreamRequest {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        crate::routes::private::wire::defaulted(deserializer, &[("metadata", default_metadata())])
-            .map(Self)
-    }
-}
-
-fn default_metadata() -> serde_json::Value {
-    serde_json::json!({})
-}
-
 /// Upsert a data stream by (source_system, source_key). Used by sync microservices on
 /// discovery to register streams before pairing. Requires `write_metadata`. `metadata` may be
 /// omitted and defaults to an empty object, which the schema, taken from the client's own struct,
@@ -552,17 +370,17 @@ pub async fn register_stream(
         .one(&state.db)
         .await?;
     if let Some(declared) = payload.replicates.clone() {
-        super::replicates::validate_declaration(&declared, payload.measurement_type.as_deref())?;
+        super::service::validate_declaration(&declared, payload.measurement_type.as_deref())?;
         // The stored column-to-index mapping is authoritative and append-only: readings carry
         // their index for life, so a re-registration keeps every known column's index, appends
         // genuinely new columns, and retires absent ones without reusing their indexes. Only the
         // register path authors it, which is why the caller's declaration cannot carry one.
         let prior = stored
             .as_ref()
-            .and_then(|s| super::replicates::ReplicateSpec::from_metadata(&s.metadata));
+            .and_then(|s| super::models::ReplicateSpec::from_metadata(&s.metadata));
         let assignments =
-            super::replicates::pin_assignments(prior.as_ref(), &declared.source_columns)?;
-        super::replicates::ReplicateSpec {
+            super::service::pin_assignments(prior.as_ref(), &declared.source_columns)?;
+        super::models::ReplicateSpec {
             declared,
             assignments,
         }
@@ -635,7 +453,7 @@ pub async fn register_stream(
     // attached to was minted with, which is a probe swap. The channel is the identity, so nothing
     // forks: the serials are refreshed and the change goes to the review queue for an operator.
     if let Some(sensor_id) = stream.sensor_id
-        && let Err(e) = crate::routes::private::sensors::identity::reconcile_source_identity(
+        && let Err(e) = crate::routes::private::sensors::service::reconcile_source_identity(
             &state.db,
             sensor_id,
             stream.id,
@@ -648,7 +466,7 @@ pub async fn register_stream(
         tracing::warn!(error = %e, stream = %stream.id, "device identity reconciliation failed");
     }
 
-    Ok(Json(super::replicates::with_assignments(stream)))
+    Ok(Json(super::service::with_assignments(stream)))
 }
 
 /// Confine a caller-declared instrument to one the caller has a relationship to.
@@ -695,24 +513,6 @@ pub async fn validate_declared_sensor(
     Ok(())
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ImportStreamRequest {
-    /// Legacy field, ignored: a sensor is imported parameter-free (parameter is bound at
-    /// deploy/grab time). Retained so existing callers keep deserializing.
-    #[serde(default)]
-    pub parameter_id: Option<Uuid>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ImportStreamResponse {
-    pub stream: DataStream,
-    pub sensor_id: Uuid,
-    /// Readings the import moved: newly owned by the instrument, or re-corrected because the
-    /// window resolved a different curve. Zero where the stream's rows already say what the import
-    /// would say, which is the ordinary case now that registration attaches an instrument.
-    pub attributed: u64,
-}
-
 /// Import a stream's sensor into inventory WITHOUT deploying it to a site. Creates or reuses the
 /// sensor by serial number alone (import is parameter-free; a parameter is bound at deploy or grab
 /// time), links it to the stream, and stamps `sensor_id` plus whichever curve covers each reading
@@ -735,7 +535,7 @@ pub async fn import_stream(
     Path(stream_id): Path<Uuid>,
     Json(_payload): Json<ImportStreamRequest>,
 ) -> AppResult<Json<ImportStreamResponse>> {
-    use crate::routes::private::sensors::identity::import_sensor_for_stream;
+    use crate::routes::private::sensors::service::import_sensor_for_stream;
     let db = &state.db;
 
     let stream = data_streams::Entity::find_by_id(stream_id)
@@ -760,21 +560,10 @@ pub async fn import_stream(
         .ok_or_else(|| AppError::Internal("Failed to fetch updated stream".to_string()))?;
 
     Ok(Json(ImportStreamResponse {
-        stream: super::replicates::with_assignments(updated),
+        stream: super::service::with_assignments(updated),
         sensor_id: ctx.sensor_id,
         attributed,
     }))
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct PairStreamRequest {
-    pub site_parameter_id: Uuid,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct PairStreamResponse {
-    pub stream: DataStream,
-    pub backfilled: u64,
 }
 
 /// A claim that waited out `lock_timeout` is another request pairing the same stream, which is a
@@ -881,9 +670,9 @@ pub async fn pair_stream(
             // replicate groups materialised, spot instants attached as visits, deferred holds
             // promoted. One helper, so a stream paired here and the same stream paired through a
             // plan land in the same state.
-            let done = super::pairing::backfill(
+            let done = super::flows::backfill(
                 txn,
-                crate::routes::private::sync::replicate_audit::HoldScope::Stream(stream_id),
+                crate::routes::private::sync::service::HoldScope::Stream(stream_id),
                 deployment_id,
             )
             .await?;
@@ -905,11 +694,11 @@ pub async fn pair_stream(
 
     // Attribution is what made these readings visit values; the calculations that read them at
     // each manual visit run now (ADR 0007).
-    crate::routes::private::collection_events::recompute::enqueue_for(
+    crate::routes::private::collection_events::flows::enqueue_for(
         db,
         &touched_events,
         &crate::common::actor::label(&auth),
-        crate::routes::private::collection_events::recompute::Writer::Person,
+        crate::routes::private::collection_events::flows::Writer::Person,
     )
     .await?;
 
@@ -948,15 +737,9 @@ pub async fn pair_stream(
         .ok_or_else(|| AppError::Internal("Failed to fetch updated stream".to_string()))?;
 
     Ok(Json(PairStreamResponse {
-        stream: super::replicates::with_assignments(updated),
+        stream: super::service::with_assignments(updated),
         backfilled,
     }))
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct UnpairStreamResponse {
-    pub stream: DataStream,
-    pub cleared: u64,
 }
 
 /// Remove pairing from a stream. Clears `site_parameter_id`/`paired_at` on the stream and
@@ -1010,9 +793,9 @@ pub async fn unpair_stream(
 
     // Open reviews lose their reviewer along with the slot; they wait as deferred until the
     // stream is paired again.
-    crate::routes::private::sync::replicate_audit::repoint_holds(
+    crate::routes::private::sync::service::repoint_holds(
         db,
-        crate::routes::private::sync::replicate_audit::HoldScope::Stream(stream_id),
+        crate::routes::private::sync::service::HoldScope::Stream(stream_id),
         false,
     )
     .await?;
@@ -1023,34 +806,9 @@ pub async fn unpair_stream(
         .ok_or_else(|| AppError::Internal("Failed to fetch updated stream".to_string()))?;
 
     Ok(Json(UnpairStreamResponse {
-        stream: super::replicates::with_assignments(updated),
+        stream: super::service::with_assignments(updated),
         cleared,
     }))
-}
-
-#[derive(Debug, serde::Deserialize, ToSchema)]
-pub struct RetagStreamsRequest {
-    /// Explicit streams to classify. Combined with `source_system` when both are given.
-    #[serde(default)]
-    pub stream_ids: Vec<Uuid>,
-    /// Classify every stream of a source system (e.g. 'metalp', 'nomis').
-    #[serde(default)]
-    pub source_system: Option<String>,
-    /// 'continuous' | 'spot' | 'derived', or 'declared' to keep each stream's own classification
-    /// and align its readings with it (mixed source systems such as cnet).
-    pub measurement_type: String,
-    /// Also retag the streams' existing readings and refresh aggregates (tracked job).
-    #[serde(default)]
-    pub retag_existing: bool,
-}
-
-#[derive(Debug, serde::Serialize, ToSchema)]
-pub struct RetagStreamsResponse {
-    pub streams_updated: u64,
-    pub measurement_type: String,
-    /// The tracked `measurement_retag` job, when `retag_existing` was requested.
-    #[schema(required)]
-    pub job_id: Option<Uuid>,
 }
 
 /// Classify data streams' measurement_type in bulk, the sensorless-stream counterpart of
@@ -1088,13 +846,13 @@ pub async fn retag_streams(
             0
         } else {
             if req.measurement_type != "spot" {
-                let families = super::replicates::family_keys_in_streams(
+                let families = super::service::family_keys_in_streams(
                     &state.db,
                     &req.stream_ids,
                     req.source_system.as_deref(),
                 )
                 .await?;
-                super::replicates::refuse_family_retag(&families, &req.measurement_type)?;
+                super::service::refuse_family_retag(&families, &req.measurement_type)?;
             }
 
             state
@@ -1136,424 +894,4 @@ pub async fn retag_streams(
         measurement_type: req.measurement_type,
         job_id,
     }))
-}
-
-// ============================================================================
-// The (site, parameter) slot: one declaration, two directions
-// ============================================================================
-
-/// What a dying slot does with one table's rows.
-#[derive(Debug, Clone, Copy)]
-pub enum Release {
-    /// The measurement outlives the slot: null these columns and keep the row.
-    Unattribute(&'static [&'static str]),
-    /// The row only describes a group of readings: delete it once none references it.
-    DeleteWhenOrphaned,
-    /// Describes the site and the parameter rather than the slot's data, so it outlives the slot.
-    Retain,
-}
-
-/// A table addressed by the (site, parameter) slot rather than by the stream that wrote its rows.
-#[derive(Debug, Clone, Copy)]
-pub struct SlotTable {
-    pub table: &'static str,
-    pub release: Release,
-    /// Rows carry a `time` column, so a mutation can report the span it touched.
-    pub timed: bool,
-    /// Rows feed the continuous aggregates, so a mutation here decides the refresh window.
-    pub feeds_rollups: bool,
-    /// Column completing a `(site_id, parameter_id, ...)` unique constraint, so moving these rows
-    /// onto a surviving slot can collide.
-    pub unique_with: Option<&'static str>,
-}
-
-/// Every table keyed by `(site_id, parameter_id)`.
-///
-/// A merge re-points all of them onto the survivor ([`move_slot_rows`]); a slot that dies releases
-/// each according to its `release` ([`retire_slot`]). Both directions read this one list, which is
-/// what stops a merge stranding rows on a deleted parameter and a slot delete abandoning them.
-pub const SLOT_TABLES: [SlotTable; 4] = [
-    SlotTable {
-        table: "readings",
-        release: Release::Unattribute(&[
-            "site_id",
-            "parameter_id",
-            "sample_id",
-            "collection_event_id",
-        ]),
-        timed: true,
-        feeds_rollups: true,
-        unique_with: None,
-    },
-    SlotTable {
-        table: "status_events",
-        release: Release::Unattribute(&["site_id", "parameter_id"]),
-        timed: true,
-        feeds_rollups: false,
-        unique_with: None,
-    },
-    SlotTable {
-        table: "samples",
-        release: Release::DeleteWhenOrphaned,
-        timed: false,
-        feeds_rollups: false,
-        unique_with: Some("collected_at"),
-    },
-    SlotTable {
-        table: "annotations",
-        release: Release::Retain,
-        timed: false,
-        feeds_rollups: false,
-        unique_with: None,
-    },
-];
-
-/// Which rows a slot teardown covers.
-#[derive(Debug, Clone, Copy)]
-pub enum SlotScope {
-    /// One stream's rows. The slot itself survives; this stream stops feeding it (unpair).
-    Stream(Uuid),
-    /// Everything the slot owns, whatever wrote it, plus the streams pointing at it. The slot is
-    /// going away (site_parameter delete).
-    SiteParameter(Uuid),
-}
-
-/// Which sites a slot move covers.
-#[derive(Debug, Clone, Copy)]
-pub enum MoveScope {
-    /// One site's rows, for a site-level merge.
-    Site(Uuid),
-    /// Every site carrying the source parameter, for a catalog-level merge.
-    EverySite,
-}
-
-/// Rows a slot move carried, and the span the moved readings cover.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SlotMove {
-    pub readings: u64,
-    pub status_events: u64,
-    /// Feeds the caller's post-commit rollup refresh; the rollups group by `parameter_id`, so both
-    /// the source's and the survivor's buckets are recomputed by the same window.
-    pub touched: TouchedRange,
-}
-
-/// Timestamps at which moving the source's rows onto `target_param` would violate a slot table's
-/// unique constraint, at most `LIMIT` of them. Empty when the move is safe.
-///
-/// Resolving a collision by merging the two rows would rewrite a stored measurement statistic
-/// (`samples.mean`/`sd`/`n` are computed over one collection group), so callers refuse instead.
-pub async fn slot_move_collisions<C: ConnectionTrait>(
-    conn: &C,
-    scope: MoveScope,
-    source_param: Uuid,
-    target_param: Uuid,
-) -> AppResult<Vec<String>> {
-    let mut collisions = Vec::new();
-    for slot in SLOT_TABLES {
-        let Some(unique_with) = slot.unique_with else {
-            continue;
-        };
-        let table = slot.table;
-        let mut values: Vec<sea_orm::Value> = vec![source_param.into(), target_param.into()];
-        let site_filter = match scope {
-            MoveScope::EverySite => String::new(),
-            MoveScope::Site(site_id) => {
-                values.push(site_id.into());
-                " AND src.site_id = $3".to_string()
-            }
-        };
-        let sql = format!(
-            "SELECT DISTINCT src.{unique_with}::text AS value \
-             FROM {table} src JOIN {table} dst \
-               ON dst.site_id = src.site_id AND dst.{unique_with} = src.{unique_with} \
-              AND dst.parameter_id = $2 \
-             WHERE src.parameter_id = $1{site_filter} \
-             ORDER BY 1 LIMIT 20"
-        );
-        for row in conn
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &sql,
-                values,
-            ))
-            .await?
-        {
-            let value: String = row.try_get("", "value")?;
-            collisions.push(format!("{table} {value}"));
-        }
-    }
-    Ok(collisions)
-}
-
-/// Re-point every slot-keyed row from `source_param` onto `target_param`.
-///
-/// Runs inside the caller's guarded transaction. Call [`slot_move_collisions`] first: a table with
-/// a `unique_with` column can refuse the move mid-way otherwise.
-pub async fn move_slot_rows<C: ConnectionTrait>(
-    conn: &C,
-    scope: MoveScope,
-    source_param: Uuid,
-    target_param: Uuid,
-    actor: &str,
-    origin: crate::routes::private::readings::decisions::Origin,
-) -> AppResult<SlotMove> {
-    // $1 is the target parameter, $2 the source, $3 the site when the scope names one.
-    let (predicate, site) = match scope {
-        MoveScope::EverySite => ("parameter_id = $2", None),
-        MoveScope::Site(site_id) => ("parameter_id = $2 AND site_id = $3", Some(site_id)),
-    };
-    let mut moved = SlotMove::default();
-
-    // Every reading re-pointed is a slot-move decision (ADR 0008), recorded before the move so
-    // the record holds the slot it came from.
-    {
-        let mut values: Vec<sea_orm::Value> = vec![target_param.into(), source_param.into()];
-        if let Some(site_id) = site {
-            values.push(site_id.into());
-        }
-        let row_predicate = match scope {
-            MoveScope::EverySite => "r.parameter_id = $2",
-            MoveScope::Site(_) => "r.parameter_id = $2 AND r.site_id = $3",
-        };
-        crate::routes::private::readings::decisions::record_many(
-            conn,
-            crate::routes::private::readings::decisions::Kind::SlotMove,
-            row_predicate,
-            values,
-            crate::routes::private::readings::decisions::NewValue::Literal(
-                serde_json::json!({ "parameter_id": target_param }),
-            ),
-            actor,
-            Some("merged into the target parameter"),
-            origin,
-            Some(Uuid::new_v4()),
-        )
-        .await?;
-    }
-
-    for slot in SLOT_TABLES {
-        let mut values: Vec<sea_orm::Value> = vec![target_param.into(), source_param.into()];
-        if let Some(site_id) = site {
-            values.push(site_id.into());
-        }
-        let sql = format!(
-            "UPDATE {} SET parameter_id = $1 WHERE {predicate}",
-            slot.table
-        );
-        let statement =
-            Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, values);
-
-        let rows = if slot.timed {
-            let touched = bulk_write::mutation(conn, statement).await?;
-            if slot.feeds_rollups {
-                moved.touched = moved.touched.merge(touched);
-            }
-            touched.rows
-        } else {
-            conn.execute_raw(statement).await?.rows_affected()
-        };
-
-        match slot.table {
-            "readings" => moved.readings = rows,
-            "status_events" => moved.status_events = rows,
-            _ => {}
-        }
-    }
-
-    Ok(moved)
-}
-
-/// The rows one [`SlotScope`] addresses.
-struct RetireTarget {
-    /// `WHERE` fragment over the slot tables, binding `$1` (and `$2` for a slot).
-    predicate: &'static str,
-    values: Vec<sea_orm::Value>,
-    /// The slot itself is going away, so the streams pointing at it are unpaired too.
-    site_parameter_id: Option<Uuid>,
-}
-
-async fn resolve_retire_target<C: ConnectionTrait>(
-    conn: &C,
-    scope: SlotScope,
-) -> AppResult<Option<RetireTarget>> {
-    match scope {
-        SlotScope::Stream(stream_id) => Ok(Some(RetireTarget {
-            predicate: "stream_id = $1",
-            values: vec![stream_id.into()],
-            site_parameter_id: None,
-        })),
-        SlotScope::SiteParameter(sp_id) => {
-            let Some(row) = SlotKeyRow::find_by_statement(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT site_id, parameter_id FROM site_parameters WHERE id = $1",
-                [sp_id.into()],
-            ))
-            .one(conn)
-            .await?
-            else {
-                return Ok(None);
-            };
-            Ok(Some(RetireTarget {
-                predicate: "site_id = $1 AND parameter_id = $2",
-                values: vec![row.site_id.into(), row.parameter_id.into()],
-                site_parameter_id: Some(sp_id),
-            }))
-        }
-    }
-}
-
-/// Release everything a slot owns, in one transaction with the decompression cap lifted, and queue
-/// the rollup rebuild that has to follow it.
-///
-/// This is the whole teardown, in the order that keeps it recoverable: the samples a scope
-/// references are collected before the readings lose their `sample_id`, the readings and status
-/// events are unattributed rather than deleted (the measurement outlives the slot), the samples
-/// nothing references any more are deleted, and a slot that is going away releases the streams
-/// pointing at it last. Unpair, and a `site_parameters` delete, are the same operation over
-/// different scopes.
-///
-/// The rollups are rebuilt by a tracked `refresh_aggregates_full` job rather than inline: a
-/// teardown can span a stream's whole history, and a refresh that fails then belongs in `/jobs`,
-/// where it is visible and rerunnable, not as a 500 on an operation that already committed.
-///
-/// A slot the scope cannot resolve reports an empty range rather than an error, so retiring a row
-/// that is already gone is not a failure.
-pub async fn retire_slot<C: ConnectionTrait + TransactionTrait>(
-    db: &C,
-    scope: SlotScope,
-) -> AppResult<TouchedRange> {
-    let touched = bulk_write::guarded(db, async |txn| {
-        let Some(target) = resolve_retire_target(txn, scope).await? else {
-            return Ok(TouchedRange::default());
-        };
-        release_slot_rows(txn, &target).await
-    })
-    .await?;
-
-    if !touched.is_empty() {
-        let trigger_id = match scope {
-            SlotScope::Stream(id) | SlotScope::SiteParameter(id) => id,
-        };
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
-            db,
-            "refresh_aggregates_full",
-            None,
-            Some(trigger_id),
-            &serde_json::json!({ "full": true }),
-            None,
-        )
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    }
-    Ok(touched)
-}
-
-async fn release_slot_rows<C: ConnectionTrait>(
-    conn: &C,
-    target: &RetireTarget,
-) -> AppResult<TouchedRange> {
-    let sample_ids = referenced_ids(conn, target, "sample_id").await?;
-    let event_ids = referenced_ids(conn, target, "collection_event_id").await?;
-    let mut touched = TouchedRange::default();
-
-    for slot in SLOT_TABLES {
-        match slot.release {
-            Release::Retain => {}
-            Release::Unattribute(columns) => {
-                let assignments = columns
-                    .iter()
-                    .map(|c| format!("{c} = NULL"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                // Narrow to rows that still carry something to release: an UPDATE that rewrites
-                // already-null rows maximises what it has to decompress and changes nothing.
-                let already = columns
-                    .iter()
-                    .map(|c| format!("{c} IS NOT NULL"))
-                    .collect::<Vec<_>>()
-                    .join(" OR ");
-                let sql = format!(
-                    "UPDATE {} SET {assignments} WHERE {} AND ({already})",
-                    slot.table, target.predicate
-                );
-                let statement = Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    &sql,
-                    target.values.clone(),
-                );
-                if slot.timed {
-                    let range = bulk_write::mutation(conn, statement).await?;
-                    if slot.feeds_rollups {
-                        touched = touched.merge(range);
-                    }
-                } else {
-                    conn.execute_raw(statement).await?;
-                }
-            }
-            Release::DeleteWhenOrphaned => {
-                if sample_ids.is_empty() {
-                    continue;
-                }
-                conn.execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    format!(
-                        "DELETE FROM {} s WHERE s.id = ANY($1) \
-                         AND NOT EXISTS (SELECT 1 FROM readings r WHERE r.sample_id = s.id)",
-                        slot.table
-                    ),
-                    [sample_ids.clone().into()],
-                ))
-                .await?;
-            }
-        }
-    }
-
-    // A visit describes a group of readings the same way a sample does, but it is keyed on
-    // (site, collected_at) rather than on the slot, so it is released here rather than through
-    // SLOT_TABLES: nothing that walks that list by parameter_id can address it.
-    if !event_ids.is_empty() {
-        conn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "DELETE FROM collection_events ce WHERE ce.id = ANY($1) \
-             AND NOT EXISTS (SELECT 1 FROM readings r WHERE r.collection_event_id = ce.id)",
-            [event_ids.into()],
-        ))
-        .await?;
-    }
-
-    if let Some(sp_id) = target.site_parameter_id {
-        // Load-bearing rather than tidy-up: `data_streams.site_parameter_id` has no ON DELETE
-        // clause, so the row cannot be deleted while a stream points at it.
-        conn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE data_streams SET site_parameter_id = NULL, paired_at = NULL, updated_at = now() \
-             WHERE site_parameter_id = $1",
-            [sp_id.into()],
-        ))
-        .await?;
-    }
-
-    Ok(touched)
-}
-
-/// Rows the scope's readings point at through `column`, read before the readings lose it.
-async fn referenced_ids<C: ConnectionTrait>(
-    conn: &C,
-    target: &RetireTarget,
-    column: &str,
-) -> AppResult<Vec<Uuid>> {
-    let sql = format!(
-        "SELECT DISTINCT {column} AS id FROM readings WHERE {} AND {column} IS NOT NULL",
-        target.predicate
-    );
-    Ok(conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            target.values.clone(),
-        ))
-        .await?
-        .iter()
-        .map(|row| row.try_get::<Uuid>("", "id"))
-        .collect::<Result<Vec<_>, _>>()?)
 }

@@ -10,8 +10,8 @@
 
 use sea_orm::{ConnectionTrait, EntityTrait, Statement};
 use serde_json::json;
-use uuid::Uuid;
 use serial_test::serial;
+use uuid::Uuid;
 
 async fn kind_of(db: &sea_orm::DatabaseConnection, sensor_id: &str) -> String {
     let row = db
@@ -59,22 +59,29 @@ async fn mint_for_feed(
         token,
     )
     .await;
-    assert!((200..300).contains(&status), "register ({status}): {stream}");
+    assert!(
+        (200..300).contains(&status),
+        "register ({status}): {stream}"
+    );
     assert!(
         stream["sensor_id"].is_null(),
         "registration mints nothing: {stream}"
     );
-    let id: Uuid = stream["id"].as_str().expect("stream id").parse().expect("uuid");
+    let id: Uuid = stream["id"]
+        .as_str()
+        .expect("stream id")
+        .parse()
+        .expect("uuid");
     let model = river_db::routes::private::data_streams::Entity::find_by_id(id)
         .one(db)
         .await
         .expect("query stream")
         .expect("the stream exists");
-    river_db::routes::private::sensors::identity::resolve_or_mint_stream_instrument(
+    river_db::routes::private::sensors::service::resolve_or_mint_stream_instrument(
         db,
         &model,
         None,
-        river_db::routes::private::sensors::identity::InstrumentKind::SourceParameter,
+        river_db::routes::private::sensors::models::InstrumentKind::SourceParameter,
     )
     .await
     .expect("mint the instrument")
@@ -197,7 +204,10 @@ async fn the_inventory_separates_the_kinds() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "register ({status}): {stream}");
+    assert!(
+        (200..300).contains(&status),
+        "register ({status}): {stream}"
+    );
 
     let filter = crate::common::e2e::percent_encode(r#"{"kind":"device"}"#);
     let (status, body) = crate::common::get_json_with_token(
@@ -219,7 +229,8 @@ async fn the_inventory_separates_the_kinds() {
     );
     // Registration mints nothing, so there is no bookkeeping row to exclude yet: minting one the
     // way the pairing does is what puts it in the inventory, and the filter still leaves it out.
-    let bookkeeping = mint_for_feed(&db, &app, &token, "cnet", "FP2:NO2_mgL:minted", json!({})).await;
+    let bookkeeping =
+        mint_for_feed(&db, &app, &token, "cnet", "FP2:NO2_mgL:minted", json!({})).await;
     let (status, body) = crate::common::get_json_with_token(
         &app,
         &format!("/api/sensors?filter={filter}&page=1&per_page=100"),

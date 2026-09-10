@@ -1,5 +1,8 @@
 use crudcrate::{ApiError, CRUDOperations, CRUDResource, MergeIntoActiveModel};
-use sea_orm::{ConnectionTrait, EntityTrait, Statement, TransactionTrait};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, Statement,
+    TransactionTrait,
+};
 use uuid::Uuid;
 
 use super::model::SensorCalibration;
@@ -28,22 +31,22 @@ async fn duplicate_instant_exists<C: ConnectionTrait>(
     valid_from: chrono::DateTime<chrono::Utc>,
     exclude: Option<Uuid>,
 ) -> Result<bool, ApiError> {
-    let found = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT 1 AS one FROM sensor_calibrations
-              WHERE sensor_id = $1
-                AND ($2::uuid IS NULL OR parameter_id IS NOT DISTINCT FROM $2::uuid)
-                AND valid_from = $3
-                AND ($4::uuid IS NULL OR id <> $4::uuid)
-              LIMIT 1",
-            [
-                sensor_id.into(),
-                parameter_id.into(),
-                valid_from.into(),
-                exclude.into(),
-            ],
-        ))
+    let mut query = super::model::Entity::find()
+        .filter(super::model::Column::SensorId.eq(sensor_id))
+        .filter(super::model::Column::ValidFrom.eq(valid_from));
+    // An unstated parameter takes the instant as taken whatever channel holds it, since the
+    // BEFORE-INSERT trigger decides that channel and this cannot see its answer.
+    if let Some(parameter_id) = parameter_id {
+        query = query.filter(super::model::Column::ParameterId.eq(parameter_id));
+    }
+    if let Some(exclude) = exclude {
+        query = query.filter(super::model::Column::Id.ne(exclude));
+    }
+    let found = query
+        .select_only()
+        .column(super::model::Column::Id)
+        .into_tuple::<Uuid>()
+        .one(db)
         .await
         .map_err(ApiError::database)?;
     Ok(found.is_some())
@@ -286,13 +289,10 @@ impl CRUDOperations for SensorCalibrationOperations {
             )));
         }
 
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "DELETE FROM sensor_calibrations WHERE id = $1",
-            [id.into()],
-        ))
-        .await
-        .map_err(ApiError::database)?;
+        super::model::Entity::delete_by_id(id)
+            .exec(db)
+            .await
+            .map_err(ApiError::database)?;
 
         reprocess_after_calibration_write(db, "calibration_delete", sensor_id, id).await?;
 

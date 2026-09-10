@@ -16,7 +16,9 @@ async fn a_second_runner_cannot_take_the_database_this_one_holds() {
     let _db = setup_test_db().await;
 
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
-    let other = Database::connect(&url).await.expect("second session connects");
+    let other = Database::connect(&url)
+        .await
+        .expect("second session connects");
     let row = other
         .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -37,7 +39,10 @@ async fn a_second_runner_cannot_take_the_database_this_one_holds() {
 #[serial]
 async fn the_harness_pool_has_the_ceiling_the_deployment_runs_on() {
     let db = setup_test_db().await;
-    let ceiling = db.get_postgres_connection_pool().options().get_max_connections();
+    let ceiling = db
+        .get_postgres_connection_pool()
+        .options()
+        .get_max_connections();
 
     assert_eq!(
         ceiling,

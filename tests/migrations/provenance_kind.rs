@@ -22,7 +22,11 @@ async fn restore_pre_migration_shape(db: &DatabaseConnection) {
 async fn seed_one_row_per_origin(db: &DatabaseConnection) {
     crate::common::seed_test_data(db).await;
     for (id, source, key) in [
-        ("00000000-0000-4000-e900-000000000001", "grab_sample", "k-manual"),
+        (
+            "00000000-0000-4000-e900-000000000001",
+            "grab_sample",
+            "k-manual",
+        ),
         ("00000000-0000-4000-e900-000000000002", "api", "k-batch"),
         ("00000000-0000-4000-e900-000000000003", "cnet", "k-sync"),
     ] {

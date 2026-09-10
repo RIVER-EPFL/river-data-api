@@ -1,14 +1,19 @@
+use axum::middleware;
+use axum::routing::get;
 use axum::{
     Json,
     extract::{Path, State},
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use utoipa_axum::router::OpenApiRouter;
 
 use crate::common::AppState;
-use crate::common::middleware::ProjectScope;
+use crate::common::authz::{Capability, TokenAccess, TokenBit};
+use crate::common::middleware::{ProjectScope, require_crud, require_read_metadata};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::projects::Project;
 use crate::routes::private::sites;
-use crate::routes::private::sites::types::SiteResponse;
+use crate::routes::private::sites::models::SiteProjection;
 use crate::routes::resolve_project;
 
 /// List sites belonging to a project
@@ -19,7 +24,7 @@ use crate::routes::resolve_project;
         ("project_id" = String, Path, description = "Project UUID or name"),
     ),
     responses(
-        (status = 200, description = "Sites retrieved successfully", body = Vec<SiteResponse>),
+        (status = 200, description = "Sites retrieved successfully", body = Vec<SiteProjection>),
         (status = 404, description = "Project not found"),
     ),
     tag = "projects"
@@ -28,7 +33,7 @@ pub async fn list_project_sites(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
     ProjectScope(scope): ProjectScope,
-) -> AppResult<Json<Vec<SiteResponse>>> {
+) -> AppResult<Json<Vec<SiteProjection>>> {
     let project = resolve_project(&state.db, &project_id).await?;
 
     // Enforce project scope
@@ -44,9 +49,9 @@ pub async fn list_project_sites(
         .all(&state.db)
         .await?;
 
-    let response: Vec<SiteResponse> = sites_list
+    let response: Vec<SiteProjection> = sites_list
         .into_iter()
-        .map(|s| SiteResponse {
+        .map(|s| SiteProjection {
             id: s.id,
             project_id: s.project_id,
             subproject_id: s.subproject_id,
@@ -58,4 +63,21 @@ pub async fn list_project_sites(
         .collect();
 
     Ok(Json(response))
+}
+
+pub fn service_router(state: &AppState) -> OpenApiRouter {
+    // Projects are the top-level grant boundary: human management is Administrator-only, but the
+    // historical write_metadata token bit is preserved so discovery/tooling flows keep working.
+    let crud = Project::router(&state.db).layer(middleware::from_fn(require_crud(
+        Capability::ReadMetadata,
+        Capability::Admin,
+        TokenAccess::Bit(TokenBit::WriteMetadata),
+    )));
+
+    let custom = OpenApiRouter::new()
+        .route("/{project_id}/sites", get(list_project_sites))
+        .with_state(state.clone())
+        .layer(middleware::from_fn(require_read_metadata));
+
+    crud.merge(custom)
 }

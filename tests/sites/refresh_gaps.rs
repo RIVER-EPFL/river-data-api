@@ -39,7 +39,10 @@ use crate::common::tracks;
 
 /// A Keycloak-authenticated app on a clean database, or `None` when Keycloak is unreachable.
 async fn keycloak_app(test_name: &str) -> Option<(DatabaseConnection, Router, String)> {
-    if !crate::common::profile::Service::Keycloak.require(test_name).await {
+    if !crate::common::profile::Service::Keycloak
+        .require(test_name)
+        .await
+    {
         return None;
     }
     let db = crate::common::setup_test_db().await;

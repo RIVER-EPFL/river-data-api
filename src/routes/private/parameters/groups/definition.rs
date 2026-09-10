@@ -6,15 +6,19 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
-use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QuerySelect, Statement,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::state::AppState;
 use crate::error::{AppError, AppResult};
 
+use super::group_model;
 use super::ordering::{self, Column};
 use super::rules::Role;
+use crate::routes::private::parameters::derived::{definition_model, source_model};
 
 /// The two columns a replicated member also shows: the mean and the sd the `samples` trigger
 /// computes over its replicates. Read-only wherever they render, since nothing writes them.
@@ -62,18 +66,8 @@ struct MemberRow {
     label: String,
     units: Option<String>,
     description: Option<String>,
-    role: String,
     ordinal: i32,
     replicates: Option<serde_json::Value>,
-}
-
-#[derive(FromQueryResult)]
-struct GroupRow {
-    id: Uuid,
-    code: String,
-    label: String,
-    description: Option<String>,
-    ordinal: i32,
 }
 
 /// What one slot declares for a member: the divisor and the places, both nullable.
@@ -141,13 +135,8 @@ pub async fn group_definition(
     Path(id): Path<Uuid>,
     Query(query): Query<DefinitionQuery>,
 ) -> AppResult<Json<GroupDefinition>> {
-    let group = state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, code, label, description, ordinal FROM parameter_groups WHERE id = $1",
-            [id.into()],
-        ))
+    let header = group_model::Entity::find_by_id(id)
+        .one(&state.db)
         .await
         .map_err(AppError::Database)?
         .ok_or_else(|| AppError::NotFound(format!("parameter group {id}")))?;
@@ -159,7 +148,7 @@ pub async fn group_definition(
             "SELECT m.parameter_id, p.code, COALESCE(m.label, p.name) AS label, \
                     COALESCE(m.units, NULLIF(p.default_units, '')) AS units, \
                     COALESCE(m.description, p.description) AS description, \
-                    m.role, m.ordinal, m.replicates \
+                    m.ordinal, m.replicates \
                FROM parameter_group_members m \
                JOIN parameters p ON p.id = m.parameter_id \
               WHERE m.group_id = $1",
@@ -233,7 +222,6 @@ pub async fn group_definition(
     });
     let sections = ordering::section_order(&columns);
 
-    let header = GroupRow::from_query_result(&group, "").map_err(AppError::Database)?;
     Ok(Json(GroupDefinition {
         id: header.id,
         code: header.code,
@@ -283,30 +271,30 @@ async fn calculation_roles(
     db: &sea_orm::DatabaseConnection,
 ) -> AppResult<std::collections::HashMap<Uuid, Role>> {
     let mut roles = std::collections::HashMap::new();
-    let read = db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT DISTINCT parameter_id FROM derived_parameter_sources".to_string(),
-        ))
+    // A source naming a site property carries no parameter, so its NULL is skipped rather than
+    // decoded.
+    let read = source_model::Entity::find()
+        .select_only()
+        .column(source_model::Column::ParameterId)
+        .distinct()
+        .into_tuple::<Option<Uuid>>()
+        .all(db)
         .await
         .map_err(AppError::Database)?;
-    for row in &read {
-        let id: Uuid = row.try_get("", "parameter_id").map_err(AppError::Database)?;
+    for id in read.into_iter().flatten() {
         roles.insert(id, Role::Measured);
     }
     // Written last: what a formula writes is what the parameter is, even where another reads it.
-    let written = db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT DISTINCT output_parameter_id FROM calculation_formulas               WHERE output_parameter_id IS NOT NULL"
-                .to_string(),
-        ))
+    let written = definition_model::Entity::find()
+        .select_only()
+        .column(definition_model::Column::OutputParameterId)
+        .distinct()
+        .filter(definition_model::Column::OutputParameterId.is_not_null())
+        .into_tuple::<Option<Uuid>>()
+        .all(db)
         .await
         .map_err(AppError::Database)?;
-    for row in &written {
-        let id: Uuid = row
-            .try_get("", "output_parameter_id")
-            .map_err(AppError::Database)?;
+    for id in written.into_iter().flatten() {
         roles.insert(id, Role::Output);
     }
     Ok(roles)
@@ -351,75 +339,5 @@ async fn manifest_sections(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::routes::private::parameters::groups::ordering::{self, Column};
-    use crate::routes::private::parameters::groups::rules::Role;
-
-    fn spec() -> serde_json::Value {
-        serde_json::json!({ "positions": 3 })
-    }
-
-    #[test]
-    fn test_a_replicated_member_shows_a_mean_and_an_sd() {
-        let stats = member_statistics("doc", Some(&spec()), Some(2), Some("sample".into()))
-            .expect("a replicated member carries statistics");
-        assert_eq!(stats.mean_label, "doc mean");
-        assert_eq!(stats.sd_label, "doc sd");
-        assert_eq!(stats.sd_estimator.as_deref(), Some("sample"));
-        assert_eq!(stats.decimal_places, Some(2));
-    }
-
-    /// A slot that declares no places is one no source and no lab has spoken for, so the
-    /// definition says so rather than inventing a precision (Q128).
-    #[test]
-    fn test_an_undeclared_slot_carries_no_places() {
-        assert_eq!(
-            member_statistics("doc", Some(&spec()), None, Some("sample".into()))
-                .expect("a replicated member carries statistics")
-                .decimal_places,
-            None
-        );
-    }
-
-    #[test]
-    fn test_a_member_entered_once_shows_none() {
-        assert_eq!(
-            member_statistics("ph", None, Some(2), Some("sample".into())),
-            None
-        );
-    }
-
-    #[test]
-    fn test_an_undeclared_estimator_stays_undeclared() {
-        let stats = member_statistics("doc", Some(&spec()), None, None).expect("statistics");
-        assert_eq!(stats.sd_estimator, None);
-    }
-
-    // The statistics are the member's own columns, not members of the group, so the order the grid
-    // and the Toolbox share stays the members' own.
-    #[test]
-    fn test_statistics_are_not_columns_of_their_own() {
-        let columns = [
-            Column {
-                parameter_id: Uuid::new_v4(),
-                code: "doc".into(),
-                ordinal: 1,
-                role: Role::Measured,
-                section: None,
-            },
-            Column {
-                parameter_id: Uuid::new_v4(),
-                code: "ph".into(),
-                ordinal: 2,
-                role: Role::Measured,
-                section: None,
-            },
-        ];
-        let order: Vec<&str> = ordering::column_order(&columns)
-            .into_iter()
-            .map(|c| c.code.as_str())
-            .collect();
-        assert_eq!(order, vec!["doc", "ph"]);
-    }
-}
+#[path = "tests/definition.rs"]
+mod tests;

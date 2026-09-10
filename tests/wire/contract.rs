@@ -6,10 +6,11 @@ use river_data_core::models::{
 use serde_json::json;
 use uuid::Uuid;
 
-use river_db::routes::private::data_streams::replicates::{ColumnAssignment, ReplicateSpec};
-use river_db::routes::private::data_streams::views::RegisterStreamRequest;
-use river_db::routes::private::notes::register::NoteItem;
-use river_db::routes::private::sensors::register::RegisterSensorRequest;
+use river_db::routes::private::data_streams::models::{
+    ColumnAssignment, RegisterStreamRequest, ReplicateSpec,
+};
+use river_db::routes::private::notes::models::NoteItem;
+use river_db::routes::private::sensors::models::RegisterSensorRequest;
 use river_db::routes::private::sensors::standard_curves::views::RegisterStandardCurveRequest;
 
 fn at(s: &str) -> DateTime<Utc> {

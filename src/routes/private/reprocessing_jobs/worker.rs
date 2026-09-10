@@ -329,7 +329,7 @@ async fn execute(
                 // it is idempotent, O(active slots), spawns no jobs (no recursion), and is merely
                 // redundant for jobs that don't touch values. Guarded on `owned` so only the winning
                 // worker runs it.
-                crate::routes::private::alarms::sweeper::reconcile_all_and_notify(db, events).await;
+                crate::routes::private::alarms::flows::reconcile_all_and_notify(db, events).await;
                 let _ = events.send(crate::common::AppEvent::JobCompleted {
                     job_id: claimed.id,
                     status: status.to_string(),

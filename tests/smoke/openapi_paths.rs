@@ -125,7 +125,9 @@ async fn the_spec_carries_the_generated_entity_routes() {
         "a generated entity path is documented"
     );
     assert!(
-        spec.paths.paths.contains_key("/api/sites/{site_id}/readings"),
+        spec.paths
+            .paths
+            .contains_key("/api/sites/{site_id}/readings"),
         "a hand-declared path is still documented"
     );
     let components = spec
@@ -165,8 +167,8 @@ fn every_registered_route_is_documented() {
     let sources: [(&str, &str); 5] = [
         ("src/routes/service/mod.rs", "/api"),
         ("src/routes/private/sync/views.rs", "/api/sync"),
-        ("src/routes/private/projects/router.rs", "/api/projects"),
-        ("src/routes/private/sites/router.rs", "/api/sites"),
+        ("src/routes/private/projects/views.rs", "/api/projects"),
+        ("src/routes/private/sites/views.rs", "/api/sites"),
         ("src/routes/private/admin/users.rs", "/api/users"),
     ];
 
@@ -183,9 +185,7 @@ fn every_registered_route_is_documented() {
                 continue;
             }
             let normalised = full.trim_end_matches('/');
-            if !spec.paths.paths.contains_key(&full)
-                && !spec.paths.paths.contains_key(normalised)
-            {
+            if !spec.paths.paths.contains_key(&full) && !spec.paths.paths.contains_key(normalised) {
                 undocumented.push(format!("{file}: {full}"));
             }
         }

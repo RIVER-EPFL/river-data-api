@@ -26,7 +26,10 @@ pub use seed::*;
 /// The workers this process has spawned, so they can be stopped rather than left polling. A
 /// handle whose runtime has already gone resolves immediately, so a stale entry costs nothing.
 static TEST_WORKERS: std::sync::Mutex<
-    Vec<(tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>)>,
+    Vec<(
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    )>,
 > = std::sync::Mutex::new(Vec::new());
 
 /// Stop every worker this process spawned and wait for it to leave the database alone.
@@ -67,13 +70,18 @@ fn spawn_test_worker(state: &AppState) {
         std::sync::Arc::new(river_db::routes::private::reprocessing_jobs::job::build_registry());
     let (shutdown, mut stopped) = tokio::sync::watch::channel(false);
     let handle = tokio::spawn(async move {
-        river_db::routes::private::reprocessing_jobs::worker::run(db, events, registry, async move {
-            while stopped.changed().await.is_ok() {
-                if *stopped.borrow() {
-                    return;
+        river_db::routes::private::reprocessing_jobs::worker::run(
+            db,
+            events,
+            registry,
+            async move {
+                while stopped.changed().await.is_ok() {
+                    if *stopped.borrow() {
+                        return;
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
     });
     if let Ok(mut workers) = TEST_WORKERS.lock() {

@@ -11,12 +11,14 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QuerySelect, Set};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::{group_model, member_model};
 use crate::common::state::AppState;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::parameters;
 
 /// One intermediate, as the group declares it.
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
@@ -81,6 +83,12 @@ pub fn plan_for(code: &str, catalog: &[(String, Uuid)], members: &[Uuid]) -> Pla
     }
 }
 
+/// `LOWER(code) = ANY($1)`, matched against codes the caller already lowered.
+fn lowered_code_in(codes: &[String]) -> sea_orm::sea_query::SimpleExpr {
+    use sea_orm::sea_query::{Expr, ExprTrait, Func};
+    Expr::expr(Func::lower(Expr::col(parameters::Column::Code))).is_in(codes.iter().cloned())
+}
+
 /// `POST /parameter_groups/{id}/intermediates`: declare the intermediates a group's calculation
 /// computes, minting the catalog parameters it names and adding them to the group.
 #[utoipa::path(
@@ -101,12 +109,8 @@ pub async fn declare_intermediates(
     Json(payload): Json<DeclareIntermediatesRequest>,
 ) -> AppResult<Json<DeclareIntermediatesResponse>> {
     let db = &state.db;
-    if db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id FROM parameter_groups WHERE id = $1",
-            [group_id.into()],
-        ))
+    if group_model::Entity::find_by_id(group_id)
+        .one(db)
         .await?
         .is_none()
     {
@@ -124,53 +128,40 @@ pub async fn declare_intermediates(
         ));
     }
 
-    let catalog: Vec<(String, Uuid)> = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT code, id FROM parameters WHERE LOWER(code) = ANY($1)",
-            [codes.into()],
-        ))
+    let catalog: Vec<(String, Uuid)> = parameters::Entity::find()
+        .filter(lowered_code_in(&codes))
+        .all(db)
         .await?
-        .iter()
-        .map(|row| -> AppResult<(String, Uuid)> {
-            Ok((row.try_get("", "code")?, row.try_get("", "id")?))
-        })
-        .collect::<AppResult<Vec<_>>>()?;
+        .into_iter()
+        .map(|parameter| (parameter.code, parameter.id))
+        .collect();
 
-    let members: Vec<Uuid> = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT parameter_id FROM parameter_group_members WHERE group_id = $1",
-            [group_id.into()],
-        ))
-        .await?
-        .iter()
-        .map(|row| row.try_get::<Uuid>("", "parameter_id"))
-        .collect::<Result<Vec<_>, _>>()?;
+    let members: Vec<Uuid> = member_model::Entity::find()
+        .filter(member_model::Column::GroupId.eq(group_id))
+        .select_only()
+        .column(member_model::Column::ParameterId)
+        .into_tuple::<Uuid>()
+        .all(db)
+        .await?;
 
     let mut declared = Vec::with_capacity(payload.intermediates.len());
     let (mut parameters_created, mut members_created) = (0usize, 0usize);
     for item in &payload.intermediates {
         let plan = plan_for(&item.code, &catalog, &members);
         let parameter_id = if plan.mint_parameter {
-            let row = db
-                .query_one_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "INSERT INTO parameters (id, code, name, default_units, category, description) \
-                     VALUES (gen_random_uuid(), $1, $2, $3, 'measurement', $4) RETURNING id",
-                    [
-                        item.code.clone().into(),
-                        item.name.clone().into(),
-                        item.units.clone().unwrap_or_default().into(),
-                        item.description.clone().unwrap_or_default().into(),
-                    ],
-                ))
-                .await?
-                .ok_or_else(|| {
-                    AppError::Internal("No row returned from parameter insert".to_string())
-                })?;
+            let minted = parameters::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                code: Set(item.code.clone()),
+                name: Set(item.name.clone()),
+                default_units: Set(item.units.clone().unwrap_or_default()),
+                category: Set("measurement".to_string()),
+                description: Set(Some(item.description.clone().unwrap_or_default())),
+                ..Default::default()
+            }
+            .insert(db)
+            .await?;
             parameters_created += 1;
-            row.try_get::<Uuid>("", "id")?
+            minted.id
         } else {
             catalog
                 .iter()
@@ -182,22 +173,28 @@ pub async fn declare_intermediates(
         // The membership goes through the same refusals a hand-added member meets: a parameter
         // already grouped elsewhere is refused here rather than moved.
         let member_created = if plan.add_member {
-            db.execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "INSERT INTO parameter_group_members \
-                 (id, group_id, parameter_id, ordinal, role, replicates) \
-                 VALUES (gen_random_uuid(), $1, $2, \
-                         COALESCE((SELECT MAX(ordinal) + 1 FROM parameter_group_members \
-                                   WHERE group_id = $1), 0), \
-                         'output', $3)",
-                [group_id.into(), parameter_id.into(), item.replicates.clone().into()],
-            ))
+            let next_ordinal = member_model::Entity::find()
+                .filter(member_model::Column::GroupId.eq(group_id))
+                .select_only()
+                .column_as(member_model::Column::Ordinal.max(), "ordinal")
+                .into_tuple::<Option<i32>>()
+                .one(db)
+                .await?
+                .flatten()
+                .map_or(0, |highest| highest + 1);
+            member_model::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                group_id: Set(group_id),
+                parameter_id: Set(parameter_id),
+                ordinal: Set(next_ordinal),
+                role: Set("output".to_string()),
+                replicates: Set(item.replicates.clone()),
+                ..Default::default()
+            }
+            .insert(db)
             .await
             .map_err(|e| {
-                AppError::BadRequest(format!(
-                    "{} could not join the group: {e}",
-                    item.code
-                ))
+                AppError::BadRequest(format!("{} could not join the group: {e}", item.code))
             })?;
             members_created += 1;
             true
@@ -222,31 +219,5 @@ pub async fn declare_intermediates(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::plan_for;
-    use uuid::Uuid;
-
-    #[test]
-    fn a_code_the_catalog_holds_is_reused_and_a_member_is_added_once() {
-        let doc = Uuid::new_v4();
-        let catalog = vec![("DOC_A".to_string(), doc)];
-
-        let fresh = super::plan_for("CO2_HS_Um_A", &catalog, &[]);
-        assert!(fresh.mint_parameter, "a code nothing holds is minted");
-        assert!(fresh.add_member);
-
-        let existing = plan_for("doc_a", &catalog, &[]);
-        assert!(
-            !existing.mint_parameter,
-            "the catalog's uniqueness is case-insensitive, so this is the same parameter"
-        );
-        assert!(existing.add_member);
-
-        let already = plan_for("DOC_A", &catalog, &[doc]);
-        assert!(!already.mint_parameter);
-        assert!(
-            !already.add_member,
-            "re-declaring what the group already carries adds nothing"
-        );
-    }
-}
+#[path = "tests/intermediates.rs"]
+mod tests;

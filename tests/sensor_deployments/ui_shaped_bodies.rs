@@ -88,7 +88,10 @@ async fn the_deploy_dialogs_create_body_opens_a_deployment() {
         let stored = reload(&fx, id).await;
         assert_eq!(stored["parameter_id"], GLOBAL_PARAM_TEMP_ID, "{stored}");
         assert_eq!(stored["deployment_type"], deployment_type, "{stored}");
-        assert!(stored["deployed_until"].is_null(), "open on create: {stored}");
+        assert!(
+            stored["deployed_until"].is_null(),
+            "open on create: {stored}"
+        );
     }
 }
 
@@ -112,10 +115,18 @@ async fn the_backdate_body_moves_deployed_from() {
     let fx = setup().await;
     let created = create(&fx, &deploy_dialog_body(&fx, "permanent")).await;
     let id = created["id"].as_str().expect("id");
-    update(&fx, id, &json!({ "deployed_from": "2025-01-01T00:00:00.000Z" })).await;
+    update(
+        &fx,
+        id,
+        &json!({ "deployed_from": "2025-01-01T00:00:00.000Z" }),
+    )
+    .await;
     let stored = reload(&fx, id).await;
     assert!(
-        stored["deployed_from"].as_str().unwrap().starts_with("2025-01-01T00:00:00"),
+        stored["deployed_from"]
+            .as_str()
+            .unwrap()
+            .starts_with("2025-01-01T00:00:00"),
         "{stored}"
     );
 }
@@ -128,7 +139,12 @@ async fn the_edit_dates_body_with_a_null_end_reopens_the_deployment() {
     let fx = setup().await;
     let created = create(&fx, &deploy_dialog_body(&fx, "permanent")).await;
     let id = created["id"].as_str().expect("id");
-    update(&fx, id, &json!({ "deployed_until": "2025-07-01T00:00:00.000Z" })).await;
+    update(
+        &fx,
+        id,
+        &json!({ "deployed_until": "2025-07-01T00:00:00.000Z" }),
+    )
+    .await;
     assert!(reload(&fx, id).await["deployed_until"].is_string());
 
     update(
@@ -139,8 +155,14 @@ async fn the_edit_dates_body_with_a_null_end_reopens_the_deployment() {
     .await;
     let stored = reload(&fx, id).await;
     assert!(
-        stored["deployed_from"].as_str().unwrap().starts_with("2025-05-01T00:00:00"),
+        stored["deployed_from"]
+            .as_str()
+            .unwrap()
+            .starts_with("2025-05-01T00:00:00"),
         "{stored}"
     );
-    assert!(stored["deployed_until"].is_null(), "an explicit null reopens: {stored}");
+    assert!(
+        stored["deployed_until"].is_null(),
+        "an explicit null reopens: {stored}"
+    );
 }

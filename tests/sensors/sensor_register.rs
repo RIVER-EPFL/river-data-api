@@ -16,7 +16,11 @@ struct Fixture {
 
 async fn setup() -> Fixture {
     let f = crate::common::seeded_app().await;
-    Fixture { db: f.db, app: f.app, token: f.token }
+    Fixture {
+        db: f.db,
+        app: f.app,
+        token: f.token,
+    }
 }
 
 async fn register(fx: &Fixture, body: serde_json::Value) -> (u16, serde_json::Value) {
@@ -56,17 +60,32 @@ async fn column(db: &DatabaseConnection, id: &str, column: &str) -> Option<Strin
 async fn mints_once_per_provenance_key_and_never_rewrites_a_claimed_row() {
     let fx = setup().await;
 
-    let (status, first) = register(&fx, metalp("sensor_inventory:62", "ANU TURB", Some("919402"))).await;
+    let (status, first) = register(
+        &fx,
+        metalp("sensor_inventory:62", "ANU TURB", Some("919402")),
+    )
+    .await;
     assert_eq!(status, 200, "register: {first}");
     assert_eq!(first["created"], true);
     assert!(first["serial_claimed_by"].is_null());
 
     let id = first["id"].as_str().expect("id").to_string();
-    assert_eq!(column(&fx.db, &id, "serial_number").await.as_deref(), Some("919402"));
-    assert_eq!(column(&fx.db, &id, "manufacturer").await.as_deref(), Some("PME"));
-    assert_eq!(column(&fx.db, &id, "data_frequency").await.as_deref(), Some("high"));
     assert_eq!(
-        column(&fx.db, &id, "metadata -> 'station'").await.as_deref(),
+        column(&fx.db, &id, "serial_number").await.as_deref(),
+        Some("919402")
+    );
+    assert_eq!(
+        column(&fx.db, &id, "manufacturer").await.as_deref(),
+        Some("PME")
+    );
+    assert_eq!(
+        column(&fx.db, &id, "data_frequency").await.as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        column(&fx.db, &id, "metadata -> 'station'")
+            .await
+            .as_deref(),
         Some("\"ANU\"")
     );
 
@@ -79,11 +98,21 @@ async fn mints_once_per_provenance_key_and_never_rewrites_a_claimed_row() {
         .await
         .expect("rename");
 
-    let (status, again) = register(&fx, metalp("sensor_inventory:62", "ANU TURB", Some("919402"))).await;
+    let (status, again) = register(
+        &fx,
+        metalp("sensor_inventory:62", "ANU TURB", Some("919402")),
+    )
+    .await;
     assert_eq!(status, 200, "re-register: {again}");
-    assert_eq!(again["id"], first["id"], "the provenance key resolves one instrument");
+    assert_eq!(
+        again["id"], first["id"],
+        "the provenance key resolves one instrument"
+    );
     assert_eq!(again["created"], false);
-    assert_eq!(column(&fx.db, &id, "name").await.as_deref(), Some("Bench spare"));
+    assert_eq!(
+        column(&fx.db, &id, "name").await.as_deref(),
+        Some("Bench spare")
+    );
 }
 
 #[tokio::test]
@@ -91,12 +120,19 @@ async fn mints_once_per_provenance_key_and_never_rewrites_a_claimed_row() {
 async fn stores_an_instrument_whose_serial_another_row_already_holds() {
     let fx = setup().await;
 
-    let (_, first) = register(&fx, metalp("sensor_inventory:62", "ANU TURB", Some("919402"))).await;
+    let (_, first) = register(
+        &fx,
+        metalp("sensor_inventory:62", "ANU TURB", Some("919402")),
+    )
+    .await;
     let first_id = first["id"].as_str().expect("id").to_string();
 
     // METALP's register carries 919402 on two stations' turbidity probes.
-    let (status, second) =
-        register(&fx, metalp("sensor_inventory:68", "FEU TURB", Some("919402"))).await;
+    let (status, second) = register(
+        &fx,
+        metalp("sensor_inventory:68", "FEU TURB", Some("919402")),
+    )
+    .await;
     assert_eq!(status, 200, "second register: {second}");
     assert_eq!(second["created"], true, "the instrument is stored anyway");
     assert_eq!(
@@ -107,7 +143,10 @@ async fn stores_an_instrument_whose_serial_another_row_already_holds() {
 
     let second_id = second["id"].as_str().expect("id").to_string();
     assert_eq!(column(&fx.db, &second_id, "serial_number").await, None);
-    assert_eq!(column(&fx.db, &first_id, "serial_number").await.as_deref(), Some("919402"));
+    assert_eq!(
+        column(&fx.db, &first_id, "serial_number").await.as_deref(),
+        Some("919402")
+    );
 }
 
 #[tokio::test]
@@ -136,5 +175,8 @@ async fn refuses_an_empty_key_or_an_unknown_cadence() {
         &fx.token,
     )
     .await;
-    assert_eq!(status, 422, "an unknown field is refused, not dropped: {body}");
+    assert_eq!(
+        status, 422,
+        "an unknown field is refused, not dropped: {body}"
+    );
 }

@@ -21,7 +21,11 @@ use serial_test::serial;
 /// Shortest-round-trip cases: `0.1 + 0.2`, an arithmetic result, and a value widened from f32
 /// (the corrected-value-from-single-precision case the register calls out).
 fn fixture_values() -> [f64; 3] {
-    [0.1_f64 + 0.2, 1683.4228_f64 * 1.3642 + -1.6985, f64::from(100.8_f32)]
+    [
+        0.1_f64 + 0.2,
+        1683.4228_f64 * 1.3642 + -1.6985,
+        f64::from(100.8_f32),
+    ]
 }
 
 const T0: &str = "2025-06-01T00:00:00Z";
@@ -101,7 +105,8 @@ async fn private_readings_json_arm_is_bit_exact() {
         #[serde(borrow)]
         values: Vec<Option<&'a RawValue>>,
     }
-    let resp: Resp = serde_json::from_str(&body).unwrap_or_else(|e| panic!("parse json: {e}: {body}"));
+    let resp: Resp =
+        serde_json::from_str(&body).unwrap_or_else(|e| panic!("parse json: {e}: {body}"));
     let values = &resp.parameters[0].values;
     assert_eq!(values.len(), 3, "three seeded readings: {body}");
     for (cell, stored) in values.iter().zip(fixture_values()) {
@@ -120,10 +125,17 @@ async fn private_readings_csv_arm_is_bit_exact() {
     assert_eq!(status, 200, "csv readings: {body}");
 
     // Rows: time,<value>. The value column is the only non-time column here (no annotations asked).
-    let data: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).skip(1).collect();
+    let data: Vec<&str> = body
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .skip(1)
+        .collect();
     assert_eq!(data.len(), 3, "header + three rows: {body}");
     for (line, stored) in data.iter().zip(fixture_values()) {
-        let cell = line.split(',').nth(1).unwrap_or_else(|| panic!("value cell: {line}"));
+        let cell = line
+            .split(',')
+            .nth(1)
+            .unwrap_or_else(|| panic!("value cell: {line}"));
         assert_bits_eq(parse_std(cell), stored, "CSV arm");
     }
 }
@@ -247,6 +259,14 @@ async fn sensor_vs_grab_export_is_bit_exact() {
         .nth(1)
         .unwrap_or_else(|| panic!("data row: {csv}"));
     let cols: Vec<&str> = data.split(',').collect();
-    assert_bits_eq(parse_std(cols[1]), grab_value, "sensor-vs-grab CSV grab_value");
-    assert_bits_eq(parse_std(cols[4]), sensor_value, "sensor-vs-grab CSV sensor_avg");
+    assert_bits_eq(
+        parse_std(cols[1]),
+        grab_value,
+        "sensor-vs-grab CSV grab_value",
+    );
+    assert_bits_eq(
+        parse_std(cols[4]),
+        sensor_value,
+        "sensor-vs-grab CSV sensor_avg",
+    );
 }

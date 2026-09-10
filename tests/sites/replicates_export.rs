@@ -149,7 +149,10 @@ async fn an_operator_authored_code_does_not_shift_the_columns() {
     let awkward = "DOC, \"filtered\"";
     crate::common::exec(
         &db,
-        &format!("UPDATE parameters SET code = '{}' WHERE id = '{parameter}'", awkward.replace('\'', "''")),
+        &format!(
+            "UPDATE parameters SET code = '{}' WHERE id = '{parameter}'",
+            awkward.replace('\'', "''")
+        ),
     )
     .await;
 

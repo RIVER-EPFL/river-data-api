@@ -6,9 +6,10 @@
 
 use axum::{Json, extract::State};
 use chrono::{DateTime, Utc};
+use sea_orm::sea_query::{Expr, ExprTrait, Func};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter,
-    QueryOrder, Set, Statement, TransactionTrait,
+    QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -17,8 +18,10 @@ use uuid::Uuid;
 use super::{Column, Entity, Model};
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::parameters;
 use crate::routes::private::sensors;
-use crate::routes::private::sensors::identity::{InstrumentKind, upsert_source_instrument};
+use crate::routes::private::sensors::models::InstrumentKind;
+use crate::routes::private::sensors::service::upsert_source_instrument;
 
 /// One portal standard curve to register. The curve's own fields are
 /// `river_data_core::models::StandardCurveUpsert`, which the sync services build from, so a field
@@ -200,31 +203,30 @@ pub async fn register_standard_curve(
         // nothing saying which one the portal now holds.
         let old_id = current.id;
         let txn = state.db.begin().await?;
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE standard_curves SET source_key = NULL WHERE id = $1",
-            [old_id.into()],
-        ))
-        .await?;
+        Entity::update_many()
+            .col_expr(Column::SourceKey, Expr::value(None::<String>))
+            .filter(Column::Id.eq(old_id))
+            .exec(&txn)
+            .await?;
         let minted = insert_curve(&txn, &payload, &source_system, sensor_id)
             .await
             .map_err(|e| {
                 AppError::Internal(format!("minting successor for edited curve {old_id}: {e}"))
             })?;
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE standard_curves                 SET retired_at = NOW(), retired_by = $2, retired_reason = $3               WHERE id = $1 AND retired_at IS NULL",
-            [
-                old_id.into(),
-                source_system.clone().into(),
-                format!(
+        Entity::update_many()
+            .col_expr(Column::RetiredAt, Expr::current_timestamp())
+            .col_expr(Column::RetiredBy, Expr::value(Some(source_system.clone())))
+            .col_expr(
+                Column::RetiredReason,
+                Expr::value(Some(format!(
                     "Superseded by {minted}: {} re-registered {} with different coefficients",
                     payload.source_system, payload.curve.source_key
-                )
-                .into(),
-            ],
-        ))
-        .await?;
+                ))),
+            )
+            .filter(Column::Id.eq(old_id))
+            .filter(Column::RetiredAt.is_null())
+            .exec(&txn)
+            .await?;
         txn.commit().await?;
         tracing::warn!(
             source_system = %payload.source_system,
@@ -366,15 +368,17 @@ pub async fn last_used_curve(
 
     let parameter_id = match (q.parameter_id, q.parameter_code.as_deref()) {
         (Some(id), _) => id,
-        (None, Some(code)) => db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT id FROM parameters WHERE LOWER(code) = LOWER($1)",
-                [code.into()],
-            ))
+        // `lower(code) = lower($1)`, the shape of the catalog's unique index on the code.
+        (None, Some(code)) => parameters::Entity::find()
+            .filter(
+                Expr::expr(Func::lower(Expr::col(parameters::Column::Code)))
+                    .eq(code.to_lowercase()),
+            )
+            .select_only()
+            .column(parameters::Column::Id)
+            .into_tuple::<Uuid>()
+            .one(db)
             .await?
-            .map(|r| r.try_get::<Uuid>("", "id"))
-            .transpose()?
             .ok_or_else(|| AppError::NotFound(format!("Parameter '{code}' not found")))?,
         (None, None) => {
             return Err(AppError::BadRequest(

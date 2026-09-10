@@ -3,7 +3,10 @@
 //! [`RetryPolicy`] the worker pool reschedules a failed run under. Rows are created by
 //! `worker::enqueue` and driven by the worker pool; nothing here spawns work.
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement,
+};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -144,15 +147,23 @@ impl JobContext {
         self.log("info", message, serde_json::json!({})).await;
     }
 
+    /// Set one column on this run's row.
+    async fn update_row(
+        &self,
+        column: super::model::Column,
+        value: Expr,
+    ) -> Result<sea_orm::UpdateResult, sea_orm::DbErr> {
+        super::model::Entity::update_many()
+            .col_expr(column, value)
+            .filter(super::model::Column::Id.eq(self.job_id))
+            .exec(&self.db)
+            .await
+    }
+
     /// Replace the job's structured `detail` with what this run reports. Best-effort.
     pub async fn report(&self, report: JobReport) {
         if let Err(e) = self
-            .db
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE reprocessing_jobs SET detail = $1::jsonb WHERE id = $2",
-                [report.to_value().to_string().into(), self.job_id.into()],
-            ))
+            .update_row(super::model::Column::Detail, Expr::value(report.to_value()))
             .await
         {
             tracing::warn!(error = %e, job_id = %self.job_id, "Failed to set job detail");
@@ -162,12 +173,7 @@ impl JobContext {
     /// Set the job's `site_id` scope column (promoted from `detail` for list filtering).
     pub async fn set_site(&self, site_id: Uuid) {
         if let Err(e) = self
-            .db
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE reprocessing_jobs SET site_id = $1 WHERE id = $2",
-                [site_id.into(), self.job_id.into()],
-            ))
+            .update_row(super::model::Column::SiteId, Expr::value(site_id))
             .await
         {
             tracing::warn!(error = %e, job_id = %self.job_id, "Failed to set job site_id");
@@ -179,19 +185,16 @@ impl JobContext {
     /// crash leaves a truthful last-known checkpoint. Best-effort: a failed write is logged, never
     /// fatal to the job.
     pub async fn set_progress(&self, progress: i32, total: Option<i32>) {
-        let stmt = match total {
-            Some(t) => Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE reprocessing_jobs SET progress = $1, total = $2 WHERE id = $3",
-                [progress.into(), t.into(), self.job_id.into()],
-            ),
-            None => Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE reprocessing_jobs SET progress = $1 WHERE id = $2",
-                [progress.into(), self.job_id.into()],
-            ),
-        };
-        if let Err(e) = self.db.execute_raw(stmt).await {
+        let mut update = super::model::Entity::update_many()
+            .col_expr(super::model::Column::Progress, Expr::value(progress));
+        if let Some(t) = total {
+            update = update.col_expr(super::model::Column::Total, Expr::value(t));
+        }
+        if let Err(e) = update
+            .filter(super::model::Column::Id.eq(self.job_id))
+            .exec(&self.db)
+            .await
+        {
             tracing::warn!(error = %e, job_id = %self.job_id, "Failed to update job progress");
         }
         let _ = self.events.send(crate::common::AppEvent::JobProgress {

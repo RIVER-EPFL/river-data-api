@@ -6,7 +6,6 @@
 
 use serial_test::serial;
 
-
 const WARNING_SEEN_AT: &str = "2025-02-01T10:00:00Z";
 const ALARM_SEEN_AT: &str = "2025-02-02T11:30:00Z";
 

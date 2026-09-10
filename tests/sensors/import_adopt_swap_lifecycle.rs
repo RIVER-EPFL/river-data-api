@@ -9,7 +9,6 @@ use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 use uuid::Uuid;
 
-
 /// Create an UNPAIRED stream (no site_parameter, no sensor) with site-less readings.
 async fn seed_unpaired_stream(db: &sea_orm::DatabaseConnection, source_key: &str) -> Uuid {
     let stream = Uuid::new_v4();

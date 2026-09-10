@@ -86,10 +86,7 @@ async fn insert_untyped_reading(
 
 /// A stream paired to the seeded slot, which is what makes its readings attributed and so subject
 /// to the rule. [`unpaired_stream`] is the other half.
-async fn create_stream(
-    db: &sea_orm::DatabaseConnection,
-    sensor_id: Option<Uuid>,
-) -> Uuid {
+async fn create_stream(db: &sea_orm::DatabaseConnection, sensor_id: Option<Uuid>) -> Uuid {
     let id = Uuid::new_v4();
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,

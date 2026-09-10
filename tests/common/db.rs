@@ -97,7 +97,9 @@ async fn hold_the_database(url: &str) {
     LOCK_SESSION
         .get_or_init(|| async {
             let mut opts = ConnectOptions::new(lock_session_url(url));
-            opts.max_connections(1).min_connections(1).sqlx_logging(false);
+            opts.max_connections(1)
+                .min_connections(1)
+                .sqlx_logging(false);
             let session = Database::connect(opts)
                 .await
                 .expect("Failed to open the harness lock session");
@@ -164,7 +166,9 @@ pub async fn setup_test_db() -> DatabaseConnection {
     // are exercised, not defaulted around.
     db.execute_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
-        format!("ALTER TABLE data_streams ALTER COLUMN sensor_id SET DEFAULT '{FIXTURE_SENSOR_ID}'"),
+        format!(
+            "ALTER TABLE data_streams ALTER COLUMN sensor_id SET DEFAULT '{FIXTURE_SENSOR_ID}'"
+        ),
     ))
     .await
     .expect("default the fixture instrument onto hand-built streams");

@@ -1,8 +1,15 @@
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
+use sea_orm::sea_query::OnConflict;
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
+    QuerySelect, Set, Statement,
+};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::routes::private::data_streams::models as data_streams;
+use crate::routes::private::parameters::derived::definition_model as calculation_formulas;
+use crate::routes::private::parameters::derived::source_model as derived_sources;
 use crate::routes::private::readings::decisions;
 
 /// The reprocess engines are driven by `Job::run`, whose error type is `DbErr`. The shared bulk-write
@@ -504,12 +511,6 @@ struct DerivedWorkRow {
 }
 
 #[derive(FromQueryResult)]
-struct MappingRow {
-    variable_name: String,
-    parameter_id: Uuid,
-}
-
-#[derive(FromQueryResult)]
 struct InputRow {
     val: f64,
     measurement_type: Option<String>,
@@ -617,23 +618,16 @@ async fn get_or_create_derived_stream(
     db: &DatabaseConnection,
     item: &DerivedWork,
 ) -> Result<Uuid, sea_orm::DbErr> {
-    let existing = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id FROM data_streams WHERE site_parameter_id = $1 LIMIT 1",
-            [item.site_param_id.into()],
-        ))
-        .await?;
-    if let Some(row) = existing {
-        return row.try_get::<Uuid>("", "id");
+    let existing = stream_for_slot(db, item.site_param_id).await?;
+    if let Some(id) = existing {
+        return Ok(id);
     }
 
-    let def_row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT name FROM calculation_formulas WHERE id = $1",
-            [item.derived_definition_id.into()],
-        ))
+    let def_name: String = calculation_formulas::Entity::find_by_id(item.derived_definition_id)
+        .select_only()
+        .column(calculation_formulas::Column::Name)
+        .into_tuple::<String>()
+        .one(db)
         .await?
         .ok_or_else(|| {
             sea_orm::DbErr::Custom(format!(
@@ -641,59 +635,70 @@ async fn get_or_create_derived_stream(
                 item.derived_definition_id
             ))
         })?;
-    let def_name: String = def_row.try_get("", "name")?;
 
     let source_key = format!("{}_{}", def_name, item.derived_site_id);
     let stream_id = Uuid::new_v4();
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"INSERT INTO data_streams
-            (id, source_system, source_key, source_name, site_parameter_id, is_active, discovered_at, paired_at, measurement_type)
-          VALUES ($1, 'derived', $2, $3, $4, true, NOW(), NOW(), 'derived')
-          ON CONFLICT (source_system, source_key) DO UPDATE
-            SET site_parameter_id = EXCLUDED.site_parameter_id
-          RETURNING id",
-        [
-            stream_id.into(),
-            source_key.into(),
-            def_name.into(),
-            item.site_param_id.into(),
-        ],
-    ))
+    let now = Utc::now();
+    data_streams::Entity::insert(data_streams::ActiveModel {
+        id: Set(stream_id),
+        source_system: Set("derived".to_string()),
+        source_key: Set(source_key),
+        source_name: Set(Some(def_name)),
+        site_parameter_id: Set(Some(item.site_param_id)),
+        is_active: Set(true),
+        discovered_at: Set(now.into()),
+        paired_at: Set(Some(now.into())),
+        measurement_type: Set(Some("derived".to_string())),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::columns([
+            data_streams::Column::SourceSystem,
+            data_streams::Column::SourceKey,
+        ])
+        .update_column(data_streams::Column::SiteParameterId)
+        .to_owned(),
+    )
+    .exec(db)
     .await?;
 
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id FROM data_streams WHERE site_parameter_id = $1 LIMIT 1",
-            [item.site_param_id.into()],
-        ))
+    stream_for_slot(db, item.site_param_id)
         .await?
         .ok_or_else(|| {
             sea_orm::DbErr::Custom(
                 "Failed to retrieve derived data stream after upsert".to_string(),
             )
-        })?;
-    row.try_get::<Uuid>("", "id")
+        })
+}
+
+/// The stream a slot already has, if any.
+async fn stream_for_slot(
+    db: &DatabaseConnection,
+    site_parameter_id: Uuid,
+) -> Result<Option<Uuid>, sea_orm::DbErr> {
+    data_streams::Entity::find()
+        .filter(data_streams::Column::SiteParameterId.eq(site_parameter_id))
+        .select_only()
+        .column(data_streams::Column::Id)
+        .into_tuple::<Uuid>()
+        .one(db)
+        .await
 }
 
 async fn source_parameter_ids_for_definition(
     db: &DatabaseConnection,
     derived_definition_id: Uuid,
 ) -> Result<Vec<Uuid>, sea_orm::DbErr> {
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT parameter_id FROM derived_parameter_sources
-              WHERE derived_definition_id = $1",
-            [derived_definition_id.into()],
-        ))
-        .await?;
-    let mut ids = Vec::with_capacity(rows.len());
-    for row in &rows {
-        ids.push(row.try_get::<Uuid>("", "parameter_id")?);
-    }
-    Ok(ids)
+    Ok(derived_sources::Entity::find()
+        .filter(derived_sources::Column::DerivedDefinitionId.eq(derived_definition_id))
+        .select_only()
+        .column(derived_sources::Column::ParameterId)
+        .into_tuple::<Option<Uuid>>()
+        .all(db)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 pub async fn recalculate_derived_at_timestamp(
@@ -718,14 +723,13 @@ async fn resolve_variables_for_derived(
     item: &DerivedWork,
     time: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<Option<HashMap<String, f64>>>, sea_orm::DbErr> {
-    let mapping_rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT variable_name, parameter_id
-              FROM derived_parameter_sources
-              WHERE derived_definition_id = $1",
-            [item.derived_definition_id.into()],
-        ))
+    let mapping_rows: Vec<(String, Option<Uuid>)> = derived_sources::Entity::find()
+        .filter(derived_sources::Column::DerivedDefinitionId.eq(item.derived_definition_id))
+        .select_only()
+        .column(derived_sources::Column::VariableName)
+        .column(derived_sources::Column::ParameterId)
+        .into_tuple()
+        .all(db)
         .await?;
 
     // A definition with no declared sources computes nothing at any instant. That is a definition
@@ -735,11 +739,10 @@ async fn resolve_variables_for_derived(
     }
 
     let mut variables = HashMap::new();
-    for row in &mapping_rows {
-        let MappingRow {
-            variable_name: var_name,
-            parameter_id: source_param_id,
-        } = MappingRow::from_query_result(row, "")?;
+    for (var_name, source_param_id) in mapping_rows {
+        let Some(source_param_id) = source_param_id else {
+            continue;
+        };
 
         // Deterministic input pick when a sensor point and a grab share the timestamp:
         // prefer the continuous reading, then tie-break by stream_id (stable across VACUUM).
@@ -1505,7 +1508,10 @@ mod tests {
         assert!(sql.contains("'site_id', to_jsonb(m.was_site_id)"));
         assert!(sql.contains("'site_id', to_jsonb(m.now_site_id)"));
         assert!(sql.contains("'reprocess'"), "the kind is named: {sql}");
-        assert!(sql.contains("$3"), "the job is the statement's last bind: {sql}");
+        assert!(
+            sql.contains("$3"),
+            "the job is the statement's last bind: {sql}"
+        );
     }
 
     #[test]

@@ -18,11 +18,10 @@ use crate::routes::private::sensors::calibrations::{
     self, resolver,
     service::{Curve, apply_curves},
 };
-use crate::routes::private::sensors::identity::{
-    resolve_slot_owner_for_times, resolve_windows_for_times,
-};
+use crate::routes::private::sensors::service::{resolve_slot_owner_for_times, resolve_windows_for_times};
 use crate::routes::private::sensors::standard_curves;
-use crate::routes::private::sync::replicate_audit as audit;
+use crate::routes::private::sites::parameters as site_parameters;
+use crate::routes::private::sync::service as audit;
 use crate::routes::private::{data_streams, readings, readings::status_events};
 
 /// The reading and status-event bodies a sync service sends. Declared in `river-data-core`, which
@@ -50,7 +49,7 @@ pub struct IngestReadingsRequest {
     /// (`pending` when the stream is paired, `deferred` until pairing otherwise). Sync-service
     /// callers only.
     #[serde(default)]
-    pub audit: Option<Vec<crate::routes::private::sync::replicate_audit::GroupAudit>>,
+    pub audit: Option<Vec<crate::routes::private::sync::models::GroupAudit>>,
     /// A completeness claim: these readings are the source's complete content for this stream
     /// over `[from, to)`. The server diffs stored content against the payload and converges —
     /// new rows insert, changed values correct in place, rows absent at source are stamped
@@ -222,9 +221,8 @@ pub async fn ingest_readings(
     // What the source says about its own sd divisor, if anything. Absent is the common answer and
     // is carried through as absent: the slot then decides, and absent that the samples this pass
     // materialises are recorded undeclared.
-    let stream_sd_estimator =
-        data_streams::replicates::ReplicateSpec::from_metadata(&stream.metadata)
-            .and_then(|spec| spec.declared.sd_estimator.clone());
+    let stream_sd_estimator = data_streams::models::ReplicateSpec::from_metadata(&stream.metadata)
+        .and_then(|spec| spec.declared.sd_estimator.clone());
 
     // Withdrawal is confined to spot rows by a database CHECK; the continuous aggregates exclude
     // spot, which is what keeps a retraction structurally unreachable by a rollup. A window on a
@@ -668,9 +666,8 @@ pub async fn ingest_readings(
     // inside one transaction with the decompression cap lifted, like every other back-dated
     // write path. The diff, the writes and the receipt commit together or not at all.
     let mut diff_outcome: Option<crate::routes::private::readings::reconcile::DiffOutcome> = None;
-    let mut touched_visits: Vec<
-        crate::routes::private::collection_events::recompute::TouchedEvent,
-    > = Vec::new();
+    let mut touched_visits: Vec<crate::routes::private::collection_events::flows::TouchedEvent> =
+        Vec::new();
     let audited =
         payload.audit.as_deref().is_some_and(|a| !a.is_empty()) || !stripped_claims.is_empty();
     let inserted = if payload.overwrite
@@ -776,19 +773,19 @@ pub async fn ingest_readings(
                     .await?;
                     // Each source row maps onto one collection event (D7). A sync service replaying
                     // a portal row writes a portal_sync event; any other writer is a person.
-                    crate::routes::private::collection_events::attach::attach_collection_events(
+                    crate::routes::private::collection_events::service::attach_collection_events(
                     txn,
                     "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
                     binds.clone(),
                     if is_sync_service {
-                        crate::routes::private::collection_events::attach::EventSource::PortalSync
+                        crate::routes::private::collection_events::service::EventSource::PortalSync
                     } else {
-                        crate::routes::private::collection_events::attach::EventSource::Manual
+                        crate::routes::private::collection_events::service::EventSource::Manual
                     },
                 )
                 .await?;
                     touched_events =
-                        crate::routes::private::collection_events::recompute::touched_events(
+                        crate::routes::private::collection_events::flows::touched_events(
                             txn,
                             "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
                             binds,
@@ -931,7 +928,7 @@ pub async fn ingest_readings(
             reconcile_alarms: true,
             episodes: tail::Episodes::Inline,
             recompute_derived: false,
-            writer: crate::routes::private::collection_events::recompute::Writer::Person,
+            writer: crate::routes::private::collection_events::flows::Writer::Person,
         },
         &crate::common::actor::label(&auth),
     )
@@ -1241,7 +1238,9 @@ pub async fn ingest_status_events(
         .await?;
     // The tip decides which events are new and which are a repeat of the stored value, so a row
     // that will not decode is an error: reading it as "no tip" would re-admit everything.
-    let tip = tip.map(|r| StatusTip::from_query_result(&r, "")).transpose()?;
+    let tip = tip
+        .map(|r| StatusTip::from_query_result(&r, ""))
+        .transpose()?;
     let tip_time: Option<chrono::DateTime<Utc>> = tip.as_ref().map(|t| t.time.with_timezone(&Utc));
     let mut last_value: Option<String> = tip.and_then(|t| t.value);
     payload.events.sort_by_key(|e| e.time);
@@ -1323,13 +1322,6 @@ pub async fn ingest_status_events(
 
 /// The (site_id, parameter_id) a stream's pairing resolves to. Both are `None` when the stream is
 /// unpaired, ie. its readings land unattributed and stay out of the rollups until it is paired.
-/// The slot a paired stream resolves to.
-#[derive(FromQueryResult)]
-struct PairedSlot {
-    site_id: Uuid,
-    parameter_id: Uuid,
-}
-
 async fn resolve_stream_slot(
     db: &sea_orm::DatabaseConnection,
     site_parameter_id: Option<Uuid>,
@@ -1337,18 +1329,9 @@ async fn resolve_stream_slot(
     let Some(sp_id) = site_parameter_id else {
         return Ok((None, None));
     };
-    let Some(row) = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT site_id, parameter_id FROM site_parameters WHERE id = $1",
-            [sp_id.into()],
-        ))
-        .await?
-    else {
+    let Some(slot) = site_parameters::Entity::find_by_id(sp_id).one(db).await? else {
         return Ok((None, None));
     };
-    let slot = PairedSlot::from_query_result(&row, "")
-        .map_err(|e| AppError::Internal(format!("Failed to read the paired slot: {e}")))?;
     Ok((Some(slot.site_id), Some(slot.parameter_id)))
 }
 
@@ -1393,11 +1376,11 @@ struct StoredReplicate {
 async fn run_replicate_audit(
     txn: &sea_orm::DatabaseTransaction,
     stream_id: Uuid,
-    audits: &[crate::routes::private::sync::replicate_audit::GroupAudit],
+    audits: &[crate::routes::private::sync::models::GroupAudit],
     estimator: Option<&str>,
     paired: bool,
 ) -> AppResult<()> {
-    use crate::routes::private::sync::replicate_audit as audit;
+    use crate::routes::private::sync::service as audit;
 
     let audit_times: Vec<chrono::DateTime<Utc>> = audits.iter().map(|a| a.time).collect();
     let (Some(lo), Some(hi)) = (

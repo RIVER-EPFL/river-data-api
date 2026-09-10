@@ -2,7 +2,7 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
+use sea_orm::{ConnectionTrait, EntityTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -36,19 +36,6 @@ pub struct JobLogsQuery {
     /// Max lines to return (default 1000, capped at 5000).
     #[serde(default)]
     pub limit: Option<u64>,
-}
-
-#[derive(Debug, FromQueryResult)]
-struct CancelTargetRow {
-    trigger_type: String,
-}
-
-#[derive(Debug, FromQueryResult)]
-struct RerunTargetRow {
-    trigger_type: String,
-    sensor_id: Option<Uuid>,
-    trigger_id: Option<Uuid>,
-    params: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema, FromQueryResult)]
@@ -122,14 +109,10 @@ pub async fn cancel_job(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<CancelResponse>> {
     confine_job(&state, &scope, id).await?;
-    let row = CancelTargetRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT trigger_type FROM reprocessing_jobs WHERE id = $1",
-        [id.into()],
-    ))
-    .one(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound(format!("job {id} not found")))?;
+    let row = super::model::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("job {id} not found")))?;
 
     let trigger_type = row.trigger_type;
     if !super::registry::is_cancellable(&trigger_type) {
@@ -192,20 +175,17 @@ pub async fn rerun_job(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<RerunResponse>> {
     confine_job(&state, &scope, id).await?;
-    let row = RerunTargetRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT trigger_type, sensor_id, trigger_id, params FROM reprocessing_jobs WHERE id = $1",
-        [id.into()],
-    ))
-    .one(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound(format!("job {id} not found")))?;
+    let row = super::model::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("job {id} not found")))?;
 
-    let RerunTargetRow {
+    let super::model::Model {
         trigger_type,
         sensor_id,
         trigger_id,
         params,
+        ..
     } = row;
 
     if !super::registry::is_rerunnable(&trigger_type) {

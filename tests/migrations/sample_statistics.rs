@@ -43,7 +43,10 @@ async fn stats_of(db: &DatabaseConnection, sample_id: Uuid) -> Stats {
 
 /// A group of replicates, with the three columns cleared afterwards: the trigger fills them on
 /// insert, and a row that predates the migration is one that never had them.
-async fn seed_group_without_the_new_columns(db: &DatabaseConnection, values: &[(i16, f64, bool)]) -> Uuid {
+async fn seed_group_without_the_new_columns(
+    db: &DatabaseConnection,
+    values: &[(i16, f64, bool)],
+) -> Uuid {
     crate::common::seed_test_data(db).await;
     crate::common::seed_data_stream(db, STREAM_ID, "grab_sample", "grab_sample:stats").await;
     let sample_id = Uuid::new_v4();
@@ -88,8 +91,11 @@ async fn seed_group_without_the_new_columns(db: &DatabaseConnection, values: &[(
 async fn the_backfill_fills_the_three_columns_from_the_replicates() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
-    let sample_id =
-        seed_group_without_the_new_columns(&db, &[(0, 10.0), (1, 20.0), (2, 60.0)].map(|(i, v)| (i, v, false))).await;
+    let sample_id = seed_group_without_the_new_columns(
+        &db,
+        &[(0, 10.0), (1, 20.0), (2, 60.0)].map(|(i, v)| (i, v, false)),
+    )
+    .await;
 
     let before = stats_of(&db, sample_id).await;
     assert!(
@@ -122,8 +128,11 @@ async fn the_backfill_fills_the_three_columns_from_the_replicates() {
 async fn the_backfill_excludes_a_flagged_replicate() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
-    let sample_id =
-        seed_group_without_the_new_columns(&db, &[(0, 10.0, false), (1, 20.0, false), (2, 900.0, true)]).await;
+    let sample_id = seed_group_without_the_new_columns(
+        &db,
+        &[(0, 10.0, false), (1, 20.0, false), (2, 900.0, true)],
+    )
+    .await;
 
     crate::common::exec_unprepared(&db, BACKFILL).await;
 

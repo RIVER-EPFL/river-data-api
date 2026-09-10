@@ -6,9 +6,10 @@
 use std::sync::{Arc, Mutex};
 
 use river_db::common::AppState;
-use river_db::routes::private::notifications::{
-    DeliveryResult, NotificationChannel, OutgoingMessage, triggers,
+use river_db::routes::private::notifications::models::{
+    DeliveryResult, NotificationChannel, OutgoingMessage,
 };
+use river_db::routes::private::notifications::flows;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 
@@ -96,7 +97,7 @@ async fn stale_data_fires_then_recovers() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let channels: Vec<Box<dyn NotificationChannel>> =
         vec![Box::new(MockChannel { sent: sent.clone() })];
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
 
     {
         let msgs = sent.lock().unwrap();
@@ -108,7 +109,7 @@ async fn stale_data_fires_then_recovers() {
 
     // A second run while still stale must not re-notify.
     sent.lock().unwrap().clear();
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
     assert!(
         kinds(&sent.lock().unwrap(), "stale_data").is_empty(),
         "no re-notify while still stale"
@@ -117,7 +118,7 @@ async fn stale_data_fires_then_recovers() {
     // Data resumes → recovery notice, state cleared.
     insert_reading(&db, &stream, "NOW()").await;
     sent.lock().unwrap().clear();
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
     {
         let msgs = sent.lock().unwrap();
         let recovered: Vec<_> = kinds(&msgs, "stale_data")
@@ -165,7 +166,7 @@ async fn spot_series_alerts_independently_of_continuous() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let channels: Vec<Box<dyn NotificationChannel>> =
         vec![Box::new(MockChannel { sent: sent.clone() })];
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
 
     {
         let msgs = sent.lock().unwrap();
@@ -180,7 +181,7 @@ async fn spot_series_alerts_independently_of_continuous() {
 
     insert_reading(&db, &stream, "NOW()").await;
     sent.lock().unwrap().clear();
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
     assert!(
         kinds(&sent.lock().unwrap(), "stale_data").is_empty(),
         "a live continuous series neither resolves nor re-raises the spot alert"
@@ -220,7 +221,7 @@ async fn sync_digest_covers_partial_cycles() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let channels: Vec<Box<dyn NotificationChannel>> =
         vec![Box::new(MockChannel { sent: sent.clone() })];
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
 
     {
         let msgs = sent.lock().unwrap();
@@ -245,7 +246,7 @@ async fn sync_digest_covers_partial_cycles() {
     )
     .await;
     sent.lock().unwrap().clear();
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
     assert!(
         kinds(&sent.lock().unwrap(), "sync_failure").is_empty(),
         "a repeating partial is suppressed within the window"
@@ -287,13 +288,17 @@ async fn unpaired_streams_and_open_holds_are_announced() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let channels: Vec<Box<dyn NotificationChannel>> =
         vec![Box::new(MockChannel { sent: sent.clone() })];
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
 
     {
         let msgs = sent.lock().unwrap();
         let unpaired = kinds(&msgs, "streams_unpaired");
         assert_eq!(unpaired.len(), 1, "one digest for the one source system");
-        assert!(unpaired[0].body.contains("S99 DOC"), "body: {}", unpaired[0].body);
+        assert!(
+            unpaired[0].body.contains("S99 DOC"),
+            "body: {}",
+            unpaired[0].body
+        );
         let holds = kinds(&msgs, "holds_open");
         assert_eq!(holds.len(), 1, "the review queue is announced");
         assert!(
@@ -305,11 +310,17 @@ async fn unpaired_streams_and_open_holds_are_announced() {
 
     // Both conditions still stand, so neither repeats.
     sent.lock().unwrap().clear();
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
     {
         let msgs = sent.lock().unwrap();
-        assert!(kinds(&msgs, "streams_unpaired").is_empty(), "no re-announcement");
-        assert!(kinds(&msgs, "holds_open").is_empty(), "within the suppression window");
+        assert!(
+            kinds(&msgs, "streams_unpaired").is_empty(),
+            "no re-announcement"
+        );
+        assert!(
+            kinds(&msgs, "holds_open").is_empty(),
+            "within the suppression window"
+        );
     }
 
     // Pairing is the operator's own action: it clears the state silently, and an unpairing later
@@ -323,7 +334,7 @@ async fn unpaired_streams_and_open_holds_are_announced() {
     )
     .await;
     sent.lock().unwrap().clear();
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
     assert!(
         kinds(&sent.lock().unwrap(), "streams_unpaired").is_empty(),
         "a paired stream sends nothing"
@@ -335,7 +346,7 @@ async fn unpaired_streams_and_open_holds_are_announced() {
     )
     .await;
     sent.lock().unwrap().clear();
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
     assert_eq!(
         kinds(&sent.lock().unwrap(), "streams_unpaired").len(),
         1,
@@ -371,7 +382,7 @@ async fn a_failed_job_is_announced_once_per_kind() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let channels: Vec<Box<dyn NotificationChannel>> =
         vec![Box::new(MockChannel { sent: sent.clone() })];
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
     {
         let msgs = sent.lock().unwrap();
         let failed = kinds(&msgs, "job_failed");
@@ -401,7 +412,7 @@ async fn a_failed_job_is_announced_once_per_kind() {
     )
     .await;
     sent.lock().unwrap().clear();
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
     assert!(
         kinds(&sent.lock().unwrap(), "job_failed").is_empty(),
         "within the suppression window"
@@ -415,12 +426,16 @@ async fn a_failed_job_is_announced_once_per_kind() {
     )
     .await;
     sent.lock().unwrap().clear();
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
     {
         let msgs = sent.lock().unwrap();
         let failed = kinds(&msgs, "job_failed");
         assert_eq!(failed.len(), 1, "the new kind alone");
-        assert!(failed[0].subject.contains("measurement_retag"), "{}", failed[0].subject);
+        assert!(
+            failed[0].subject.contains("measurement_retag"),
+            "{}",
+            failed[0].subject
+        );
     }
 }
 
@@ -453,7 +468,7 @@ async fn a_cycle_that_added_readings_says_so_even_with_nothing_held() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let channels: Vec<Box<dyn NotificationChannel>> =
         vec![Box::new(MockChannel { sent: sent.clone() })];
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
 
     {
         let msgs = sent.lock().unwrap();
@@ -472,7 +487,7 @@ async fn a_cycle_that_added_readings_says_so_even_with_nothing_held() {
     }
 
     sent.lock().unwrap().clear();
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
     assert!(
         kinds(&sent.lock().unwrap(), "changes_pending").is_empty(),
         "the same arrivals are not announced twice inside the window"
@@ -509,7 +524,7 @@ async fn recomposed_values_are_announced_once_from_the_ledger() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let channels: Vec<Box<dyn NotificationChannel>> =
         vec![Box::new(MockChannel { sent: sent.clone() })];
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
 
     {
         let msgs = sent.lock().unwrap();
@@ -528,7 +543,7 @@ async fn recomposed_values_are_announced_once_from_the_ledger() {
     }
 
     sent.lock().unwrap().clear();
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
     assert!(
         kinds(&sent.lock().unwrap(), "curve_drift").is_empty(),
         "the same moves are not announced twice"
@@ -563,12 +578,15 @@ async fn the_upkeep_arms_each_report_what_they_did() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let channels: Vec<Box<dyn NotificationChannel>> =
         vec![Box::new(MockChannel { sent: sent.clone() })];
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
 
     {
         let msgs = sent.lock().unwrap();
-        for (kind, count) in [("jobs_pruned", "7"), ("sync_events_swept", "3"), ("access_revoked", "2")]
-        {
+        for (kind, count) in [
+            ("jobs_pruned", "7"),
+            ("sync_events_swept", "3"),
+            ("access_revoked", "2"),
+        ] {
             let sent = kinds(&msgs, kind);
             assert_eq!(sent.len(), 1, "{kind} is announced once: {msgs:?}");
             assert!(
@@ -588,7 +606,7 @@ async fn the_upkeep_arms_each_report_what_they_did() {
     }
 
     sent.lock().unwrap().clear();
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
     assert!(
         kinds(&sent.lock().unwrap(), "jobs_pruned").is_empty(),
         "the same work is not announced twice"

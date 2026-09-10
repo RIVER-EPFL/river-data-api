@@ -148,7 +148,8 @@ pub fn attribute_existing_readings() -> String {
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
-        db.execute_unprepared(&attribute_existing_readings()).await?;
+        db.execute_unprepared(&attribute_existing_readings())
+            .await?;
         Ok(())
     }
 

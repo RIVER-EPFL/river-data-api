@@ -53,11 +53,7 @@ async fn seed_continuous(db: &sea_orm::DatabaseConnection) {
     }
 }
 
-async fn statistics(
-    app: &axum::Router,
-    token: &str,
-    extra: &str,
-) -> serde_json::Value {
+async fn statistics(app: &axum::Router, token: &str, extra: &str) -> serde_json::Value {
     let (status, body) = crate::common::get_json_with_token(
         app,
         &format!(
@@ -67,7 +63,10 @@ async fn statistics(
         token,
     )
     .await;
-    assert!((200..300).contains(&status), "statistics ({status}): {body}");
+    assert!(
+        (200..300).contains(&status),
+        "statistics ({status}): {body}"
+    );
     body
 }
 
@@ -134,12 +133,13 @@ async fn a_spot_period_summarises_instants_not_replicates() {
 
     let body = statistics(&app, &token, "&measurement_type=spot").await;
     let row = &body["parameters"][0];
-    assert_eq!(
-        row["n"], 2,
-        "two visits, not three replicates: {row}"
-    );
+    assert_eq!(row["n"], 2, "two visits, not three replicates: {row}");
     close(row["mean"].as_f64(), 5.0, "the mean of the served instants");
-    close(row["min"].as_f64(), 2.0, "the triplicate's own mean is the low value");
+    close(
+        row["min"].as_f64(),
+        2.0,
+        "the triplicate's own mean is the low value",
+    );
 }
 
 /// Expected behaviour: an unknown cadence is refused rather than quietly summarising the other one.
@@ -158,7 +158,10 @@ async fn an_unknown_cadence_is_refused() {
         &token,
     )
     .await;
-    assert_eq!(status, 400, "a cadence that does not exist is a bad request");
+    assert_eq!(
+        status, 400,
+        "a cadence that does not exist is a bad request"
+    );
 }
 
 /// Expected behaviour: an exported standard deviation names the divisor that produced it, in the

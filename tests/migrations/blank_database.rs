@@ -39,7 +39,10 @@ async fn count(db: &DatabaseConnection, table: &str) -> i64 {
 /// The URL with its database name replaced, so the scratch database is made on the same server.
 fn url_for(base: &str, database: &str) -> String {
     let cut = base.rfind('/').expect("a database name in DATABASE_URL");
-    let query = base[cut..].find('?').map(|q| &base[cut + q..]).unwrap_or("");
+    let query = base[cut..]
+        .find('?')
+        .map(|q| &base[cut + q..])
+        .unwrap_or("");
     format!("{}/{database}{query}", &base[..cut])
 }
 

@@ -296,7 +296,10 @@ fn assert_bucket(actual: (f64, i64), mean: f64, count: i64, why: &str) {
 #[tokio::test]
 #[serial]
 async fn editing_a_historical_calibrations_coefficients_rewrites_only_its_own_window() {
-    if !crate::common::profile::Service::Keycloak.require("calibration_coefficient_edit").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("calibration_coefficient_edit")
+        .await
+    {
         return;
     }
     let fx = onboard().await;
@@ -466,7 +469,10 @@ async fn editing_a_historical_calibrations_coefficients_rewrites_only_its_own_wi
 #[tokio::test]
 #[serial]
 async fn moving_valid_from_earlier_reclaims_readings_from_the_previous_window() {
-    if !crate::common::profile::Service::Keycloak.require("calibration_valid_from_earlier").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("calibration_valid_from_earlier")
+        .await
+    {
         return;
     }
     let fx = onboard().await;
@@ -560,7 +566,10 @@ async fn moving_valid_from_earlier_reclaims_readings_from_the_previous_window() 
 #[tokio::test]
 #[serial]
 async fn moving_valid_from_later_returns_the_uncovered_readings_to_the_previous_window() {
-    if !crate::common::profile::Service::Keycloak.require("calibration_valid_from_later").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("calibration_valid_from_later")
+        .await
+    {
         return;
     }
     let fx = onboard().await;
@@ -649,7 +658,10 @@ async fn moving_valid_from_later_returns_the_uncovered_readings_to_the_previous_
 #[tokio::test]
 #[serial]
 async fn inserting_a_calibration_mid_window_splits_it_on_half_open_boundaries() {
-    if !crate::common::profile::Service::Keycloak.require("calibration_mid_window_insert").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("calibration_mid_window_insert")
+        .await
+    {
         return;
     }
     let fx = onboard().await;
@@ -754,7 +766,10 @@ async fn inserting_a_calibration_mid_window_splits_it_on_half_open_boundaries() 
 #[tokio::test]
 #[serial]
 async fn editing_a_calibration_spanning_two_deployments_updates_both_sites_aggregates() {
-    if !crate::common::profile::Service::Keycloak.require("calibration_spanning_two_sites").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("calibration_spanning_two_sites")
+        .await
+    {
         return;
     }
     let fx = onboard().await;

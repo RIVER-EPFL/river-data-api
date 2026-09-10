@@ -374,7 +374,6 @@ async fn kind_of(db: &DatabaseConnection, sql: &str) -> String {
     .expect("provenance_kind")
 }
 
-
 /// Scenario: `ingested_at` is the row's first arrival and nothing moves it (Q86), so the panel
 /// needs a second instant to answer when the number it displays appeared.
 ///
@@ -396,7 +395,11 @@ async fn the_arrival_of_the_current_value_is_the_correction_that_wrote_it() {
         "with no correction the current value arrived when the row did: {rec}"
     );
 
-    let stream_id: uuid::Uuid = rec["origin"]["stream_id"].as_str().unwrap().parse().unwrap();
+    let stream_id: uuid::Uuid = rec["origin"]["stream_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     let correction = decisions::Decision {
         key: decisions::DecisionKey {
             stream_id,
@@ -434,7 +437,10 @@ async fn the_arrival_of_the_current_value_is_the_correction_that_wrote_it() {
         .iter()
         .find(|r| r["replicate_index"] == 0)
         .unwrap();
-    assert_eq!(corrected_row["value_arrived_at"].as_str().unwrap(), corrected);
+    assert_eq!(
+        corrected_row["value_arrived_at"].as_str().unwrap(),
+        corrected
+    );
     let other = rec["readings"]
         .as_array()
         .unwrap()

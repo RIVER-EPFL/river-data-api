@@ -171,23 +171,23 @@ pub fn validate_optional_time_range(
         private::admin::actions::backfill_attribution,
         private::alarms::views::get_active_alarms,
         private::alarms::views::get_alarm_summary,
-        private::api_tokens::audit_log::views::distinct_status_codes,
+        private::api_tokens::views::distinct_status_codes,
         private::api_tokens::views::revoke_token,
         private::api_tokens::views::rotate_token,
         private::api_tokens::views::token_usage,
-        private::notifications::me::get_my_notifications,
-        private::notifications::me::list_channels,
-        private::notifications::me::update_my_notifications,
-        private::notifications::me::set_my_subscriptions,
-        private::notifications::me::register_push_subscription,
-        private::notifications::me::list_push_subscriptions,
-        private::notifications::me::delete_push_subscription,
-        private::notifications::me::test_push,
-        private::notifications::me::schedule_ping,
+        private::notifications::views::get_my_notifications,
+        private::notifications::views::list_channels,
+        private::notifications::views::update_my_notifications,
+        private::notifications::views::set_my_subscriptions,
+        private::notifications::views::register_push_subscription,
+        private::notifications::views::list_push_subscriptions,
+        private::notifications::views::delete_push_subscription,
+        private::notifications::views::test_push,
+        private::notifications::views::schedule_ping,
         private::notifications::views::test_send,
         private::notifications::views::list_subscribers,
-        private::notifications::health::get_health,
-        private::notifications::health::refresh_health,
+        private::notifications::views::get_health,
+        private::notifications::views::refresh_health,
         private::events::event_stream,
         private::change_audit::list_change_audit,
         private::me::get_me,
@@ -201,23 +201,23 @@ pub fn validate_optional_time_range(
         private::reprocessing_jobs::routes::cancel_job,
         private::reprocessing_jobs::schedule_routes::run_now,
         private::reprocessing_jobs::schedule_routes::get_schedule_audit,
-        private::notifications::deliveries::list_delivery_log,
-        private::sync::replicate_reconciliation::duplicate_slots,
-        private::sites::annotations::get_site_export_summary,
+        private::notifications::views::list_delivery_log,
+        private::sync::views::duplicate_slots,
+        private::sites::views::get_site_export_summary,
         version::get_version,
         private::projects::views::list_project_sites,
         private::sites::views::list_site_parameters,
         private::sites::views::get_site_detail,
-        private::sites::readings::get_site_readings,
-        private::sites::aggregates::get_site_aggregates,
-        private::sites::status_events::get_site_status_events,
+        private::sites::views::get_site_readings,
+        private::sites::views::get_site_aggregates,
+        private::sites::views::get_site_status_events,
         private::alarms::views::get_site_alarms,
         private::alarms::views::get_alarm_events,
         private::alarms::views::get_thresholds,
         private::alarms::views::acknowledge_alarm,
         private::alarms::views::unacknowledge_alarm,
-        private::sites::annotations::get_site_annotations,
-        private::search::search,
+        private::sites::views::get_site_annotations,
+        private::search::views::search,
         private::readings::flags::flag_readings,
         private::readings::flags::unflag_readings,
         private::readings::flags::flag_range,
@@ -227,13 +227,13 @@ pub fn validate_optional_time_range(
         private::readings::batch::insert_batch_readings,
         private::readings::grab_samples::insert_grab_samples,
         private::readings::checks::seasonal_check,
-        private::collection_events::stage_collection_event,
-        private::collection_events::recompute_collection_event,
-        private::collection_events::run_event_audit,
-        private::collection_events::run_event_recompute,
-        private::collection_events::visits::list_site_visits,
-        private::collection_events::visits::list_visits,
-        private::collection_events::visits::get_event_detail,
+        private::collection_events::views::stage_collection_event,
+        private::collection_events::views::recompute_collection_event,
+        private::collection_events::views::run_event_audit,
+        private::collection_events::views::run_event_recompute,
+        private::collection_events::views::list_site_visits,
+        private::collection_events::views::list_visits,
+        private::collection_events::views::get_event_detail,
         private::readings::provenance::get_reading_provenance,
         private::readings::ledger::get_reading_ledger,
         private::readings::sample_preview::sample_preview,
@@ -255,53 +255,53 @@ pub fn validate_optional_time_range(
         private::data_streams::views::stream_preview,
         private::data_streams::views::stream_receipts,
         private::data_streams::views::register_stream,
-        private::sensors::register::register_sensor,
-        private::sensors::register::propose_instruments,
+        private::sensors::views::register_sensor,
+        private::sensors::views::propose_instruments,
         private::sensors::standard_curves::views::register_standard_curve,
         private::sensors::standard_curves::views::last_used_curve,
-        private::sensors::instruments::get_instruments_overview,
-        private::sensors::instruments::get_curve_usage,
-        private::sensors::instruments::get_sensor_curve_usage,
-        private::annotations::register::register_annotations,
-        private::notes::register::register_notes,
-        private::sync::replicate_audit::list_holds,
-        private::sync::replicate_audit::acknowledge_hold,
-        private::sync::replicate_audit::acknowledge_holds_bulk,
-        private::sync::replicate_audit::resolve_hold,
-        private::sync::replicate_audit::reopen_hold,
-        private::sync::replicate_reconciliation::reconciliation_candidates,
-        private::sync::replicate_reconciliation::start_reconciliation,
-        private::sync::replicate_reconciliation::start_reconciliation_delete,
+        private::sensors::views::get_instruments_overview,
+        private::sensors::views::get_curve_usage,
+        private::sensors::views::get_sensor_curve_usage,
+        private::annotations::views::register_annotations,
+        private::notes::views::register_notes,
+        private::sync::views::list_holds,
+        private::sync::views::acknowledge_hold,
+        private::sync::views::acknowledge_holds_bulk,
+        private::sync::views::resolve_hold,
+        private::sync::views::reopen_hold,
+        private::sync::views::reconciliation_candidates,
+        private::sync::views::start_reconciliation,
+        private::sync::views::start_reconciliation_delete,
         private::data_streams::views::retag_streams,
         private::data_streams::views::pair_stream,
         private::data_streams::views::unpair_stream,
         private::data_streams::views::import_stream,
         private::readings::import::import_csv,
-        private::sensors::readings::get_sensor_readings,
-        private::sensors::readings::get_sensor_deployment_bands,
-        private::sensors::adopt::adopt_sensor,
-        private::sensors::adopt::adopt_suggestions,
-        private::sensors::adopt::swap_sensors,
-        private::sensors::retag::retag_frequency,
+        private::sensors::views::get_sensor_readings,
+        private::sensors::views::get_sensor_deployment_bands,
+        private::sensors::views::adopt_sensor,
+        private::sensors::views::adopt_suggestions,
+        private::sensors::views::swap_sensors,
+        private::sensors::views::retag_frequency,
         private::sensors::calibrations::window::get_calibration_window,
-        private::sites::sensor_identity::get_site_sensor_identity,
-        private::sites::replicates_export::get_site_replicates,
-        private::sites::sensor_vs_grab::get_sensor_vs_grab,
-        private::sites::statistics::get_site_statistics,
-        private::tools::calculations::get_calculation_closure,
-        private::tools::list_tools,
-        private::tools::calculate_tool,
-        private::tools::scripts::list_scripts,
-        private::tools::scripts::get_script,
-        private::tools::scripts::create_script,
-        private::tools::scripts::update_script,
-        private::tools::scripts::create_version,
-        private::tools::scripts::draft_run,
-        private::tools::scripts::inspect_script,
-        private::tools::scripts::get_version,
-        private::tools::scripts::validate_version,
-        private::tools::scripts::activate_version,
-        private::tools::scripts::list_activations,
+        private::sites::views::get_site_sensor_identity,
+        private::sites::views::get_site_replicates,
+        private::sites::views::get_sensor_vs_grab,
+        private::sites::views::get_site_statistics,
+        private::tools::views::get_calculation_closure,
+        private::tools::views::list_tools,
+        private::tools::views::calculate_tool,
+        private::tools::views::list_scripts,
+        private::tools::views::get_script,
+        private::tools::views::create_script,
+        private::tools::views::update_script,
+        private::tools::views::create_version,
+        private::tools::views::draft_run,
+        private::tools::views::inspect_script,
+        private::tools::views::get_version,
+        private::tools::views::validate_version,
+        private::tools::views::activate_version,
+        private::tools::views::list_activations,
         private::admin::actions::refresh_aggregates,
         private::admin::actions::compute_derived,
         private::admin::actions::reprocess_sensor,
@@ -319,9 +319,9 @@ pub fn validate_optional_time_range(
         private::admin::merge::merge_site_parameters_handler,
         private::parameters::groups::definition::group_definition,
         private::parameters::groups::intermediates::declare_intermediates,
-        private::sites::parameters::apply_group::apply_group,
-        private::sites::parameters::declare::declare_sd_estimator,
-        private::sites::parameters::declare::retag_sd_estimator,
+        private::sites::parameters::views::apply_group,
+        private::sites::parameters::views::declare_sd_estimator,
+        private::sites::parameters::views::retag_sd_estimator,
         private::admin::merge::merge_parameters_handler,
         private::admin::public_config::invalidate_public_config,
         private::sync::views::create_pairing_plan,
@@ -341,34 +341,34 @@ pub fn validate_optional_time_range(
         private::admin::users::delete_user,
         private::admin::users::assign_roles,
         private::admin::users::list_roles,
-        private::sync::control::enroll::enroll,
-        private::sync::control::heartbeat::heartbeat,
-        private::sync::control::commands::update_command,
-        private::sync::control::events::create_sync_event,
-        private::sync::control::events::update_sync_event,
-        private::sync::operator::list_services,
-        private::sync::operator::get_service,
-        private::sync::operator::issue_command,
-        private::sync::operator::update_service,
-        private::sync::operator::list_commands,
-        private::sync::operator::get_command,
-        private::sync::operator::list_credentials,
-        private::sync::operator::create_credential,
-        private::sync::operator::revoke_credential,
-        private::sync::operator::list_sync_events,
-        private::sync::operator::revoke_service,
+        private::sync::views::enroll,
+        private::sync::views::heartbeat,
+        private::sync::views::update_command,
+        private::sync::views::create_sync_event,
+        private::sync::views::update_sync_event,
+        private::sync::views::list_services,
+        private::sync::views::get_service,
+        private::sync::views::issue_command,
+        private::sync::views::update_service,
+        private::sync::views::list_commands,
+        private::sync::views::get_command,
+        private::sync::views::list_credentials,
+        private::sync::views::create_credential,
+        private::sync::views::revoke_credential,
+        private::sync::views::list_sync_events,
+        private::sync::views::revoke_service,
     ),
     components(
         schemas(
-            private::notifications::deliveries::DeliveryMessage,
-            private::notifications::deliveries::DeliveryRecipient,
-            private::notifications::deliveries::DeliveryCounts,
-            private::projects::types::ProjectResponse,
-            private::sites::types::SiteResponse,
-            private::sites::types::SiteDetailResponse,
-            private::sites::types::SiteRef,
-            private::sites::types::ProjectRef,
-            private::sites::types::ParameterResponse,
+            private::notifications::models::DeliveryMessage,
+            private::notifications::models::DeliveryRecipient,
+            private::notifications::models::DeliveryCounts,
+            private::projects::models::ProjectResponse,
+            private::sites::models::SiteProjection,
+            private::sites::models::SiteDetailResponse,
+            private::sites::models::SiteRef,
+            private::sites::models::ProjectRef,
+            private::sites::models::ParameterResponse,
             // The three types a crudcrate `join` field is declared as. The joined rows travel as
             // the entity's own api_struct rather than its `*Response`, so these are what the
             // `$ref`s on `SiteParameterResponse.parameter`, `SensorResponse.deployments` and
@@ -376,19 +376,19 @@ pub fn validate_optional_time_range(
             private::parameters::Parameter,
             private::parameters::derived::source_model::DerivedParameterSource,
             private::sensors::deployments::SensorDeployment,
-            private::sites::readings::ReadingsResponse,
-            private::sites::readings::ParameterData,
-            private::sites::readings::OriginRef,
-            private::sites::readings::SampleStatOut,
-            private::sites::readings::ReplicateOut,
-            private::sites::aggregates::AggregatesResponse,
-            private::sites::aggregates::ParameterAggregateData,
-            private::sites::status_events::StatusEventsResponse,
+            private::sites::models::ReadingsResponse,
+            private::sites::models::ParameterData,
+            private::sites::models::OriginRef,
+            private::sites::models::SampleStatOut,
+            private::sites::models::ReplicateOut,
+            private::sites::models::AggregatesResponse,
+            private::sites::models::ParameterAggregateData,
+            private::sites::models::StatusEventsResponse,
             private::annotations::Annotation,
-            private::alarms::types::AlarmViolationsResponse,
-            private::alarms::types::ParameterViolationData,
-            private::alarms::types::AlarmEventResponse,
-            private::alarms::types::AlarmEventsResponse,
+            private::alarms::models::AlarmViolationsResponse,
+            private::alarms::models::ParameterViolationData,
+            private::alarms::models::AlarmEventResponse,
+            private::alarms::models::AlarmEventsResponse,
             private::search::SearchResponse,
             private::search::SearchResults,
             private::search::SiteResult,
@@ -421,17 +421,17 @@ pub fn validate_optional_time_range(
             private::collection_events::EventAuditRequest,
             private::collection_events::EventRecomputeRequest,
             private::collection_events::EnqueuedJobResponse,
-            private::collection_events::visits::VisitsResponse,
-            private::collection_events::visits::VisitListRow,
-            private::collection_events::visits::VisitListRow,
-            private::collection_events::visits::VisitRow,
-            private::collection_events::visits::VisitCell,
-            private::collection_events::visits::ExpectedParameter,
-            private::collection_events::visits::EventDetailResponse,
-            private::collection_events::visits::EventCell,
-            private::collection_events::visits::CellSample,
-            private::collection_events::visits::CellReplicate,
-            private::collection_events::visits::CellFinding,
+            private::collection_events::models::VisitsResponse,
+            private::collection_events::models::VisitListRow,
+            private::collection_events::models::VisitListRow,
+            private::collection_events::models::VisitRow,
+            private::collection_events::models::VisitCell,
+            private::collection_events::models::ExpectedParameter,
+            private::collection_events::models::EventDetailResponse,
+            private::collection_events::models::EventCell,
+            private::collection_events::models::CellSample,
+            private::collection_events::models::CellReplicate,
+            private::collection_events::models::CellFinding,
             private::readings::decisions::DecisionRow,
             private::sensors::calibrations::retire::RetireRequest,
             private::sensors::calibrations::retire::RetireResponse,
@@ -464,114 +464,114 @@ pub fn validate_optional_time_range(
             private::readings::status_events::batch::BatchStatusEventsRequest,
             private::readings::status_events::batch::StatusEventInput,
             private::readings::status_events::batch::BatchStatusEventsResponse,
-            private::data_streams::views::StreamStatsResponse,
-            private::data_streams::views::ReceiptsResponse,
-            private::data_streams::views::ReceiptRow,
-            private::data_streams::views::RegisterStreamRequest,
+            private::data_streams::models::StreamStatsResponse,
+            private::data_streams::models::ReceiptsResponse,
+            private::data_streams::models::ReceiptRow,
+            private::data_streams::models::RegisterStreamRequest,
             river_data_core::models::ReplicateSpec,
-            private::data_streams::replicates::ColumnAssignment,
-            private::notes::register::RegisterNotesRequest,
-            private::notes::register::RegisterNotesResponse,
-            private::sensors::register::RegisterSensorRequest,
-            private::sensors::register::RegisterSensorResponse,
+            private::data_streams::models::ColumnAssignment,
+            private::notes::models::RegisterNotesRequest,
+            private::notes::models::RegisterNotesResponse,
+            private::sensors::models::RegisterSensorRequest,
+            private::sensors::models::RegisterSensorResponse,
             private::sensors::standard_curves::views::RegisterStandardCurveRequest,
             private::sensors::standard_curves::views::RegisterStandardCurveResponse,
-            private::annotations::register::RegisterAnnotationsRequest,
-            private::annotations::register::AnnotationItem,
-            private::annotations::register::RegisterAnnotationsResponse,
-            private::annotations::register::AnnotationOutcome,
-            private::sync::replicate_audit::GroupAudit,
-            private::sync::replicate_audit::HoldRow,
-            private::sync::replicate_audit::HoldExpected,
-            private::sync::replicate_audit::HoldComputed,
-            private::sync::replicate_audit::HoldDelta,
-            private::sync::replicate_audit::HoldValue,
-            private::sync::views::UpdatePairingPlanRequest,
-            private::sync::views::PlanEntryUpdate,
-            private::sync::views::PlanCurveUpdate,
-            private::sync::views::BulkAction,
+            private::annotations::models::RegisterAnnotationsRequest,
+            private::annotations::models::AnnotationItem,
+            private::annotations::models::RegisterAnnotationsResponse,
+            private::annotations::models::AnnotationOutcome,
+            private::sync::models::GroupAudit,
+            private::sync::models::HoldRow,
+            private::sync::models::HoldExpected,
+            private::sync::models::HoldComputed,
+            private::sync::models::HoldDelta,
+            private::sync::models::HoldValue,
+            private::sync::models::UpdatePairingPlanRequest,
+            private::sync::models::PlanEntryUpdate,
+            private::sync::models::PlanCurveUpdate,
+            private::sync::models::BulkAction,
             private::sync::service::BulkWhere,
-            private::sync::replicate_audit::ListHoldsResponse,
-            private::sync::replicate_audit::AcknowledgeResponse,
-            private::sync::replicate_audit::BulkAcknowledgeRequest,
-            private::sync::replicate_audit::ResolveHoldRequest,
-            private::sync::replicate_audit::ResolveHoldResponse,
-            private::sync::replicate_reconciliation::CandidatesResponse,
-            private::sync::replicate_reconciliation::DuplicateSlotsResponse,
-            private::sync::replicate_reconciliation::DuplicateSlot,
-            private::sync::replicate_reconciliation::DuplicateSlotStream,
-            private::sync::replicate_reconciliation::FamilyCandidate,
-            private::sync::replicate_reconciliation::StartReconciliationRequest,
-            private::sync::replicate_reconciliation::StartReconciliationResponse,
+            private::sync::models::ListHoldsResponse,
+            private::sync::models::AcknowledgeResponse,
+            private::sync::models::BulkAcknowledgeRequest,
+            private::sync::models::ResolveHoldRequest,
+            private::sync::models::ResolveHoldResponse,
+            private::sync::models::CandidatesResponse,
+            private::sync::models::DuplicateSlotsResponse,
+            private::sync::models::DuplicateSlot,
+            private::sync::models::DuplicateSlotStream,
+            private::sync::models::FamilyCandidate,
+            private::sync::models::StartReconciliationRequest,
+            private::sync::models::StartReconciliationResponse,
             private::data_streams::DataStream,
-            private::data_streams::views::PairStreamRequest,
-            private::data_streams::views::PairStreamResponse,
-            private::data_streams::views::UnpairStreamResponse,
-            private::data_streams::views::ImportStreamRequest,
-            private::data_streams::views::ImportStreamResponse,
+            private::data_streams::models::PairStreamRequest,
+            private::data_streams::models::PairStreamResponse,
+            private::data_streams::models::UnpairStreamResponse,
+            private::data_streams::models::ImportStreamRequest,
+            private::data_streams::models::ImportStreamResponse,
             private::readings::import::ImportCsvRequest,
             private::readings::import::ImportCsvResponse,
             private::readings::import::ImportCheck,
             private::readings::checks::ScreenedCell,
             private::readings::import::OverlapDiff,
             private::readings::import::RowError,
-            private::sensors::readings::SensorReadingsResponse,
-            private::sensors::readings::SensorDeploymentBand,
-            private::sensors::readings::SensorDeploymentBandsResponse,
-            private::sensors::adopt::AdoptRequest,
-            private::sensors::adopt::AdoptResponse,
-            private::sensors::adopt::AdoptSuggestion,
-            private::sensors::adopt::SwapRequest,
-            private::sensors::adopt::SwapResponse,
+            private::sensors::models::SensorReadingsResponse,
+            private::sensors::models::SensorDeploymentBand,
+            private::sensors::models::SensorDeploymentBandsResponse,
+            private::sensors::models::AdoptRequest,
+            private::sensors::models::AdoptResponse,
+            private::sensors::models::AdoptSuggestion,
+            private::sensors::models::SwapRequest,
+            private::sensors::models::SwapResponse,
             private::sensors::calibrations::window::CalibrationWindowPoint,
             private::sensors::calibrations::window::CalibrationWindowResponse,
-            private::sites::sensor_identity::IdentityBand,
-            private::sites::sensor_identity::CalibrationMarker,
-            private::sites::sensor_identity::SensorIdentityResponse,
-            private::sites::sensor_vs_grab::SensorVsGrabRow,
-            private::sites::sensor_vs_grab::SensorVsGrabResponse,
-            private::tools::ToolResult,
-            private::tools::engine::Manifest,
-            private::tools::engine::ManifestParam,
-            private::tools::engine::ParamWhen,
-            private::tools::engine::ParamCondition,
-            private::tools::engine::ManifestStructure,
-            private::tools::engine::ManifestField,
-            private::tools::engine::FieldFormula,
-            private::tools::engine::StructLayout,
-            private::tools::engine::RowLabels,
-            private::tools::engine::ManifestOutput,
-            private::tools::engine::ManifestCurve,
-            private::tools::engine::ToolOutput,
-            private::tools::engine::ResolvedParameter,
-            private::tools::engine::ResolvedBy,
-            private::tools::engine::ToolDescriptor,
-            private::tools::engine::ToolVersionRef,
-            private::tools::script_model::ToolScript,
-            private::tools::script_model::ToolScriptList,
-            private::tools::scripts::CreateScriptRequest,
-            private::tools::scripts::UpdateScriptRequest,
-            private::tools::version_model::ToolScriptVersion,
-            private::tools::version_model::ToolScriptVersionList,
-            private::tools::scripts::CreateVersionRequest,
-            private::tools::scripts::CreateVersionResponse,
-            private::tools::scripts::DraftRunRequest,
-            private::tools::scripts::DraftRunResponse,
-            private::tools::scripts::DraftRunResults,
-            private::tools::scripts::DraftRunFailure,
-            private::tools::scripts::DraftRunFailureKind,
-            private::tools::scripts::InspectScriptRequest,
-            private::tools::scripts::InspectScriptResponse,
-            private::tools::engine::ScriptInspection,
-            private::tools::engine::ParseError,
-            private::tools::engine::DynamicFlag,
-            private::tools::engine::ManifestReconciliation,
-            private::tools::scripts::LintFinding,
-            private::tools::scripts::CaseResult,
-            private::tools::scripts::ValidateResponse,
-            private::tools::scripts::ActivateRequest,
-            private::tools::scripts::ActivateResponse,
-            private::tools::scripts::ActivationRecord,
+            private::sites::models::IdentityBand,
+            private::sites::models::CalibrationMarker,
+            private::sites::models::SensorIdentityResponse,
+            private::sites::models::SensorVsGrabRow,
+            private::sites::models::SensorVsGrabResponse,
+            private::tools::models::ToolResult,
+            private::tools::models::Manifest,
+            private::tools::models::ManifestParam,
+            private::tools::models::ParamWhen,
+            private::tools::models::ParamCondition,
+            private::tools::models::ManifestStructure,
+            private::tools::models::ManifestField,
+            private::tools::models::FieldFormula,
+            private::tools::models::StructLayout,
+            private::tools::models::RowLabels,
+            private::tools::models::ManifestOutput,
+            private::tools::models::ManifestCurve,
+            private::tools::models::ToolOutput,
+            private::tools::models::ResolvedParameter,
+            private::tools::models::ResolvedBy,
+            private::tools::models::ToolDescriptor,
+            private::tools::models::ToolVersionRef,
+            private::tools::models::script::ToolScript,
+            private::tools::models::script::ToolScriptList,
+            private::tools::models::CreateScriptRequest,
+            private::tools::models::UpdateScriptRequest,
+            private::tools::models::version::ToolScriptVersion,
+            private::tools::models::version::ToolScriptVersionList,
+            private::tools::models::CreateVersionRequest,
+            private::tools::models::CreateVersionResponse,
+            private::tools::models::DraftRunRequest,
+            private::tools::models::DraftRunResponse,
+            private::tools::models::DraftRunResults,
+            private::tools::models::DraftRunFailure,
+            private::tools::models::DraftRunFailureKind,
+            private::tools::models::InspectScriptRequest,
+            private::tools::models::InspectScriptResponse,
+            private::tools::models::ScriptInspection,
+            private::tools::models::ParseError,
+            private::tools::models::DynamicFlag,
+            private::tools::models::ManifestReconciliation,
+            private::tools::models::LintFinding,
+            private::tools::models::CaseResult,
+            private::tools::models::ValidateResponse,
+            private::tools::models::ActivateRequest,
+            private::tools::models::ActivateResponse,
+            private::tools::models::ActivationRecord,
             private::admin::actions::RefreshAggregatesRequest,
             private::admin::actions::ComputeDerivedRequest,
             private::admin::actions::ReprocessSensorRequest,
@@ -601,16 +601,16 @@ pub fn validate_optional_time_range(
             river_data_core::models::HeartbeatResponse,
             river_data_core::models::PendingCommand,
             river_data_core::models::CommandUpdateRequest,
-            private::sync::control::events::CreateSyncEventRequest,
-            private::sync::control::events::UpdateSyncEventRequest,
-            private::sync::operator::SyncServiceResponse,
-            private::sync::operator::UpdateServiceRequest,
-            private::sync::operator::SyncCommandResponse,
-            private::sync::operator::IssueCommandRequest,
-            private::sync::operator::CreateCredentialRequest,
-            private::sync::operator::CreateCredentialResponse,
-            private::sync::operator::CredentialResponse,
-            private::sync::operator::SyncEventResponse,
+            private::sync::models::CreateSyncEventRequest,
+            private::sync::models::UpdateSyncEventRequest,
+            private::sync::models::SyncServiceResponse,
+            private::sync::models::UpdateServiceRequest,
+            private::sync::models::SyncCommandResponse,
+            private::sync::models::IssueCommandRequest,
+            private::sync::models::CreateCredentialRequest,
+            private::sync::models::CreateCredentialResponse,
+            private::sync::models::CredentialResponse,
+            private::sync::models::SyncEventResponse,
         )
     ),
     tags(
@@ -681,7 +681,10 @@ pub fn openapi_spec(state: &AppState) -> utoipa::openapi::OpenApi {
 /// When the document cannot be serialised, which is a `ToSchema` derive producing invalid JSON.
 pub fn openapi_json(spec: &utoipa::openapi::OpenApi) -> Result<String, serde_json::Error> {
     let mut value = serde_json::to_value(spec)?;
-    if let Some(info) = value.get_mut("info").and_then(serde_json::Value::as_object_mut) {
+    if let Some(info) = value
+        .get_mut("info")
+        .and_then(serde_json::Value::as_object_mut)
+    {
         info.insert("version".to_string(), serde_json::json!("{crate}"));
     }
     serde_json::to_string_pretty(&value)
@@ -975,326 +978,5 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 #[cfg(test)]
-mod tests {
-    /// The committed document is the one the router emits.
-    ///
-    /// The other guards here read `docs/openapi.json` and check it against itself or against the
-    /// source structs, so a stale copy passes all three: a route added, renamed or removed leaves
-    /// the document describing the old surface until somebody regenerates it. The workflow that
-    /// regenerates and diffs runs only on `src/routes/**`, so a dependency bump that renames a
-    /// derived schema never reaches it, which is how three paths and nine schemas drifted.
-    #[test]
-    fn test_the_committed_document_is_the_one_the_router_emits() {
-        let generated = super::committed_document().expect("the document serialises");
-        let committed = include_str!("../../docs/openapi.json");
-        assert!(
-            generated == committed,
-            "docs/openapi.json no longer describes the router: {}. Regenerate it with:\n  \
-             cargo run --bin dump_openapi -- docs/openapi.json",
-            what_moved(&generated, committed)
-        );
-    }
-
-    /// What differs between two documents, in one line: the paths and schemas one carries and the
-    /// other does not, or the first line they disagree on when the two sets match.
-    fn what_moved(generated: &str, committed: &str) -> String {
-        fn keys(doc: &serde_json::Value, section: &str) -> std::collections::BTreeSet<String> {
-            doc.pointer(section)
-                .and_then(serde_json::Value::as_object)
-                .map(|o| o.keys().cloned().collect())
-                .unwrap_or_default()
-        }
-        let (left, right): (serde_json::Value, serde_json::Value) = (
-            serde_json::from_str(generated).expect("the generated document parses"),
-            serde_json::from_str(committed).expect("the committed document parses"),
-        );
-        let mut moved = Vec::new();
-        for (section, label) in [("/paths", "path"), ("/components/schemas", "schema")] {
-            let (l, r) = (keys(&left, section), keys(&right, section));
-            for name in l.difference(&r) {
-                moved.push(format!("{label} {name} is served and not committed"));
-            }
-            for name in r.difference(&l) {
-                moved.push(format!("{label} {name} is committed and not served"));
-            }
-        }
-        if moved.is_empty() {
-            let line = generated
-                .lines()
-                .zip(committed.lines())
-                .position(|(a, b)| a != b)
-                .map_or_else(|| "the two are of different length".to_string(), |i| {
-                    format!("first difference at line {}", i + 1)
-                });
-            return line;
-        }
-        moved.join(", ")
-    }
-
-    /// Every `$ref` in the committed document names a schema the document carries.
-    ///
-    /// A dangling one is not a rendering blemish: a consumer that resolves the document, which is
-    /// what generating a client from it means, fails on the whole file rather than on that one
-    /// property. The document is the artefact `.github/workflows/openapi.yml` regenerates and
-    /// diffs, so asserting it here asserts what the router emits.
-    #[test]
-    fn test_every_schema_ref_in_the_committed_document_resolves() {
-        const DOCUMENT: &str = include_str!("../../docs/openapi.json");
-        let doc: serde_json::Value = serde_json::from_str(DOCUMENT).expect("the document parses");
-        let names: std::collections::BTreeSet<&str> = doc["components"]["schemas"]
-            .as_object()
-            .expect("the document declares schemas")
-            .keys()
-            .map(String::as_str)
-            .collect();
-
-        let mut dangling = std::collections::BTreeSet::new();
-        collect_refs(&doc, &mut |r| {
-            if let Some(name) = r.strip_prefix("#/components/schemas/") {
-                if !names.contains(name) {
-                    dangling.insert(name.to_string());
-                }
-            }
-        });
-        assert!(
-            dangling.is_empty(),
-            "referenced and not declared: {dangling:?}"
-        );
-    }
-
-    /// The document says which `Option` fields are sent and which are omitted.
-    ///
-    /// utoipa marks every `Option<T>` not-required and nullable whatever serde does with it, so
-    /// both halves of the truth are lost. A field with no `skip_serializing_if` is always on the
-    /// wire and may be null: `#[schema(required)]`. A field with one is omitted when it is `None`
-    /// and is never null: `#[schema(nullable = false)]`. A struct that deserializes as well may be
-    /// read as a request, where an `Option` is genuinely optional; `#[serde(default)]` is how such
-    /// a field says so, and is what excuses it from the first rule. All three are derivable, so
-    /// they are asserted rather than trusted; a generated client that has to handle an absence or a
-    /// null that cannot happen is what stopped C114 replacing its hand-written types.
-    #[test]
-    fn test_the_document_says_which_optional_fields_are_sent_and_which_are_omitted() {
-        let (checked, wrong) = optional_fields_the_document_misdescribes();
-        assert!(
-            checked > 0,
-            "the scan found no schema struct at all, so it is asserting nothing"
-        );
-        assert!(
-            wrong.is_empty(),
-            "each is described as the opposite of what the wire does; \
-             an always-sent field takes #[schema(required)] and an omitted one \
-             #[schema(nullable = false)]: {wrong:?}"
-        );
-    }
-
-    /// The scan the test above asserts on, and the one below proves can fail: how many schema
-    /// structs were examined, and which of their fields the document misdescribes.
-    fn optional_fields_the_document_misdescribes() -> (usize, Vec<String>) {
-        let mut checked = 0;
-        let mut wrong = Vec::new();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        for path in rust_sources(root) {
-            let src = std::fs::read_to_string(&path).expect("a source file reads");
-            let (c, m) = scan(&src);
-            checked += c;
-            wrong.extend(m);
-        }
-        (checked, wrong)
-    }
-
-    /// The attributes are what keep the test above green, so the same scan over a source missing
-    /// them must report both kinds. Without this, a scan that matched nothing would pass just as
-    /// quietly, which is what the first version of it did.
-    #[test]
-    fn test_the_scan_reports_a_field_that_lost_its_attribute() {
-        let source = "\
-#[derive(Serialize, ToSchema)]
-pub struct Answer {
-    pub id: Uuid,
-    #[schema(required)]
-    pub note: Option<String>,
-    #[serde(skip_serializing_if = \"Option::is_none\")]
-    #[schema(nullable = false)]
-    pub omitted: Option<String>,
-    #[serde(skip_serializing_if = \"Option::is_none\")]
-    pub omitted_unmarked: Option<String>,
-    pub bare: Option<String>,
-}
-
-#[derive(Deserialize, ToSchema)]
-pub struct Ask {
-    #[serde(skip_serializing_if = \"Option::is_none\")]
-    pub also_omitted: Option<String>,
-    pub filter: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, ToSchema)]
-pub struct Both {
-    #[serde(default)]
-    pub asked: Option<String>,
-    pub answered: Option<String>,
-}
-";
-        let (checked, wrong) = scan(source);
-        assert_eq!(checked, 3, "every schema struct is scanned; only the rules differ");
-        assert_eq!(
-            wrong,
-            vec![
-                "Answer.omitted_unmarked".to_string(),
-                "Answer.bare".to_string(),
-                "Ask.also_omitted".to_string(),
-                "Both.answered".to_string(),
-            ],
-            "a request's plain Option is genuinely optional, and on a struct that travels both ways \
-             `#[serde(default)]` is what says so"
-        );
-    }
-
-    fn rust_sources(root: std::path::PathBuf) -> Vec<std::path::PathBuf> {
-        let mut out = Vec::new();
-        let mut stack = vec![root];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "rs")
-                    // This file declares no schema of its own, and the fixture below is source
-                    // text the scan would otherwise read as one.
-                    && !path.ends_with("routes/mod.rs")
-                {
-                    out.push(path);
-                }
-            }
-        }
-        out
-    }
-
-    /// Walk one source line by line: attributes accumulate, a `pub struct` line consumes them, and
-    /// a struct ends at a closing brace on its own indent. Returns the schema structs examined and
-    /// the fields the document describes as the opposite of what the wire does.
-    fn scan(src: &str) -> (usize, Vec<String>) {
-        let mut checked = 0;
-        let mut missing = Vec::new();
-        let mut attrs = String::new();
-        // struct name, its indent, and which way it travels
-        let mut open: Option<(String, String, Travels)> = None;
-        for line in src.lines() {
-            let trimmed = line.trim_start();
-            let indent = &line[..line.len() - trimmed.len()];
-            if let Some((name, struct_indent, kind)) = &open {
-                if trimmed == "}" && indent == struct_indent {
-                    open = None;
-                    attrs.clear();
-                    continue;
-                }
-                if trimmed.starts_with("#[") {
-                    attrs.push_str(trimmed);
-                    continue;
-                }
-                if let Some(field) = trimmed.strip_prefix("pub ")
-                    && let Some((field_name, ty)) = field.split_once(british_colon())
-                    && ty.trim_start().starts_with("Option<")
-                {
-                    let omitted = attrs.contains("skip_serializing_if");
-                    // A struct that also deserializes may be read as a request, where an `Option`
-                    // is genuinely optional. `#[serde(default)]` is how such a field says so, so a
-                    // field without one is answering, not asking, whichever traits the struct has.
-                    let answered = match kind {
-                        Travels::Response => true,
-                        Travels::Request => false,
-                        Travels::Both => !attrs.contains("serde(default"),
-                    };
-                    let misdescribed = if omitted {
-                        !attrs.contains("nullable = false")
-                    } else {
-                        answered && !attrs.contains("schema(required")
-                    };
-                    if misdescribed {
-                        missing.push(format!("{name}.{field_name}"));
-                    }
-                }
-                if !trimmed.starts_with("///") && !trimmed.starts_with("//") {
-                    attrs.clear();
-                }
-                continue;
-            }
-            if trimmed.starts_with("#[") || trimmed.starts_with("///") || trimmed.starts_with("//")
-            {
-                attrs.push_str(trimmed);
-                continue;
-            }
-            if let Some(rest) = trimmed.strip_prefix("pub struct ")
-                && rest.ends_with('{')
-                && attrs.contains("ToSchema")
-            {
-                checked += 1;
-                let name = rest.trim_end_matches('{').trim();
-                let name = name.split(['<', ' ']).next().unwrap_or(name);
-                open = Some((name.to_string(), indent.to_string(), travels(&attrs)));
-                attrs.clear();
-                continue;
-            }
-            if !trimmed.is_empty() {
-                attrs.clear();
-            }
-        }
-        (checked, missing)
-    }
-
-    const fn british_colon() -> char {
-        ':'
-    }
-
-    /// Which way a schema struct travels, which is what decides whether an `Option` is a value the
-    /// API always sends or one a client may omit.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Travels {
-        /// Serializes only: every `Option` is on the wire, null when empty.
-        Response,
-        /// Deserializes only: every `Option` is the client's to omit.
-        Request,
-        /// Both, so the field itself says which, through `#[serde(default)]`.
-        Both,
-    }
-
-    fn travels(attrs: &str) -> Travels {
-        let Some(open) = attrs.find("#[derive(") else {
-            return Travels::Request;
-        };
-        let derives = &attrs[open + "#[derive(".len()..];
-        let Some(close) = derives.find(')') else {
-            return Travels::Request;
-        };
-        let derives = &derives[..close];
-        match (derives.contains("Serialize"), derives.contains("Deserialize")) {
-            (true, false) => Travels::Response,
-            (true, true) => Travels::Both,
-            _ => Travels::Request,
-        }
-    }
-
-    fn collect_refs(value: &serde_json::Value, found: &mut impl FnMut(&str)) {
-        match value {
-            serde_json::Value::Object(map) => {
-                for (key, child) in map {
-                    if key == "$ref" {
-                        if let Some(r) = child.as_str() {
-                            found(r);
-                        }
-                    }
-                    collect_refs(child, found);
-                }
-            }
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    collect_refs(item, found);
-                }
-            }
-            _ => {}
-        }
-    }
-}
+#[path = "tests/mod.rs"]
+mod tests;

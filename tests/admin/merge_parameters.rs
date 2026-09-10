@@ -522,8 +522,8 @@ async fn a_merge_that_would_make_a_calculation_read_its_own_output_is_refused() 
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO calculation_formulas (id, code, formula, output_parameter_id) \
-             VALUES ('{definition}', 'loop_check', 'a * 2', '{}')",
+            "INSERT INTO calculation_formulas (id, code, name, formula, output_parameter_id) \
+             VALUES ('{definition}', 'loop_check', 'Loop check', 'a * 2', '{}')",
             crate::common::GLOBAL_PARAM_TEMP_ID
         ),
     )
@@ -581,8 +581,8 @@ async fn a_merge_that_closes_no_loop_still_merges() {
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO calculation_formulas (id, code, formula, output_parameter_id) \
-             VALUES ('{definition}', 'no_loop', 'a * 2', '{}')",
+            "INSERT INTO calculation_formulas (id, code, name, formula, output_parameter_id) \
+             VALUES ('{definition}', 'no_loop', 'No loop', 'a * 2', '{}')",
             crate::common::GLOBAL_PARAM_TEMP_ID
         ),
     )
@@ -623,8 +623,8 @@ async fn a_formula_producing_the_merged_away_parameter_produces_the_survivor() {
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO calculation_formulas (id, code, formula, output_parameter_id) \
-             VALUES ('{definition}', 'produces_source', 'a * 2', '{}')",
+            "INSERT INTO calculation_formulas (id, code, name, formula, output_parameter_id) \
+             VALUES ('{definition}', 'produces_source', 'Produces source', 'a * 2', '{}')",
             crate::common::GLOBAL_PARAM_DO_ID
         ),
     )

@@ -8,7 +8,6 @@ use serial_test::serial;
 
 use migration::m20260908_000008_channel_health_into_state::UP;
 
-
 /// The shape the table had before the migration, with one probed row in it.
 async fn restore_pre_migration_shape(db: &DatabaseConnection) {
     crate::common::exec_unprepared(

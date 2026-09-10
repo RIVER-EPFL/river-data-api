@@ -36,7 +36,11 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
     (db, app, token)
 }
 
-async fn preview(app: &axum::Router, token: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
+async fn preview(
+    app: &axum::Router,
+    token: &str,
+    body: serde_json::Value,
+) -> (u16, serde_json::Value) {
     crate::common::post_json_parse_with_token(app, "/api/readings/sample_preview", &body, token)
         .await
 }
@@ -82,7 +86,10 @@ async fn excluding_the_highest_replicate_previews_the_mean_of_the_other_two() {
         "a preview records no decision"
     );
     let stored_mean = db_mean(&db).await;
-    assert!((stored_mean - 20.0).abs() < 1e-9, "the sample is untouched: {stored_mean}");
+    assert!(
+        (stored_mean - 20.0).abs() < 1e-9,
+        "the sample is untouched: {stored_mean}"
+    );
 }
 
 #[tokio::test]
@@ -106,7 +113,10 @@ async fn the_other_divisor_previews_the_sd_under_it_and_names_both() {
     assert!(near(&body["current"]["sd"], 10.0), "{body}");
     assert_eq!(body["proposed"]["sd_estimator"], "population");
     // 10 * sqrt(2/3)
-    assert!(near(&body["proposed"]["sd"], 8.164_965_809_277_26), "{body}");
+    assert!(
+        near(&body["proposed"]["sd"], 8.164_965_809_277_26),
+        "{body}"
+    );
     assert!(near(&body["delta"]["mean"], 0.0), "{body}");
 
     // The declaration is what the current side reads.
@@ -145,7 +155,10 @@ async fn an_index_the_group_does_not_hold_is_refused() {
     )
     .await;
     assert_eq!(status, 400, "{body}");
-    assert!(body["error"].as_str().is_some_and(|e| e.contains('7')), "{body}");
+    assert!(
+        body["error"].as_str().is_some_and(|e| e.contains('7')),
+        "{body}"
+    );
 }
 
 async fn db_mean(db: &sea_orm::DatabaseConnection) -> f64 {

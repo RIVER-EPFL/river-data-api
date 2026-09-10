@@ -160,7 +160,9 @@ async fn slot_samples(db: &DatabaseConnection) -> i64 {
 }
 
 fn family_status(detail: &serde_json::Value) -> &str {
-    detail["scope"]["families"][0]["status"].as_str().unwrap_or("")
+    detail["scope"]["families"][0]["status"]
+        .as_str()
+        .unwrap_or("")
 }
 
 #[tokio::test]

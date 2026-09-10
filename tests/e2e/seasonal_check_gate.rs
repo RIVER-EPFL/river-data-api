@@ -21,7 +21,10 @@ use crate::common::tracks;
 #[tokio::test]
 #[serial]
 async fn an_outlier_warns_and_the_save_is_held_to_its_check() {
-    if !crate::common::profile::Service::Keycloak.require("an_outlier_warns_and_the_save_is_held_to_its_check").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("an_outlier_warns_and_the_save_is_held_to_its_check")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;

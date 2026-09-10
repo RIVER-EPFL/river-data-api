@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     // The session-token cache window follows the configured token lifetime, so a short lifetime
     // cannot leave the heartbeat handing out tokens the database has already dropped.
-    crate::routes::private::sync::control::heartbeat::init_session_token_cache_ttl(
+    crate::routes::private::sync::service::init_session_token_cache_ttl(
         config.sync_session_token_ttl_secs,
     );
     tracing::info!(

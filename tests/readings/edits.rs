@@ -273,7 +273,10 @@ async fn a_value_a_tool_run_produced_is_reopened_rather_than_corrected() {
     .await;
     assert_eq!(status, 200, "{inspected}");
     let options = inspected["rows"][0]["options"].as_array().unwrap();
-    assert!(options.iter().any(|o| o == "value_correction"), "{inspected}");
+    assert!(
+        options.iter().any(|o| o == "value_correction"),
+        "{inspected}"
+    );
     assert!(options.iter().any(|o| o == "return"), "{inspected}");
     assert!(!options.iter().any(|o| o == "reopen_run"), "{inspected}");
     assert!(

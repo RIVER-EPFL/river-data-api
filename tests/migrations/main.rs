@@ -12,6 +12,7 @@ mod blank_database;
 mod change_audit;
 mod channel_health_into_state;
 mod derived_definition_versions;
+mod formula_name_units_not_null;
 mod instrument_kind;
 mod provenance_kind;
 mod roll_back_live_pins;

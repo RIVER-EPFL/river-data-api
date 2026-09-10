@@ -169,7 +169,13 @@ pub async fn patch_plan_with_token(
     assert_eq!(status, 200, "reading the plan's version: {plan}");
     let mut body = body.clone();
     body["expected_version"] = plan["version"].clone();
-    patch_json_with_token(app, &format!("/api/sync/pairing-plans/{plan_id}"), &body, token).await
+    patch_json_with_token(
+        app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &body,
+        token,
+    )
+    .await
 }
 
 /// POST a pairing plan action (`apply`, `revert`, `supersede`), naming the version it carries.

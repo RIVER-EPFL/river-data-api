@@ -6,7 +6,6 @@
 
 use serial_test::serial;
 
-
 /// Scenario: the parameter carries a global threshold row and the site carries none.
 /// Expected behaviour: alarms fire against the global row.
 #[tokio::test]

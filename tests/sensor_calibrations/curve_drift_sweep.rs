@@ -461,7 +461,7 @@ async fn the_sweep_reports_the_visits_whose_inputs_it_moved() {
     );
 
     let events =
-        river_db::routes::private::collection_events::recompute::events_from_pairs(&db, &drift.touched)
+        river_db::routes::private::collection_events::flows::events_from_pairs(&db, &drift.touched)
             .await
             .expect("the visits resolve");
     assert_eq!(events.len(), 1);
@@ -531,7 +531,8 @@ async fn a_recomposed_value_records_the_move_against_the_run_that_made_it() {
     let count: i64 = db
         .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT count(*) AS n FROM reading_decisions WHERE kind = 'curve_recompose'".to_string(),
+            "SELECT count(*) AS n FROM reading_decisions WHERE kind = 'curve_recompose'"
+                .to_string(),
         ))
         .await
         .unwrap()

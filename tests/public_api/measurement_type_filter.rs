@@ -9,7 +9,6 @@ use sea_orm::DatabaseConnection;
 use serial_test::serial;
 use uuid::Uuid;
 
-
 /// Public project + exposed DO_Temperature (continuous seed data), plus one spot grab reading
 /// injected into the same parameter so both cadences coexist in the window.
 async fn setup_with_spot() -> (DatabaseConnection, axum::Router) {

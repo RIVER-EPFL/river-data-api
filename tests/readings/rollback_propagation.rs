@@ -67,9 +67,12 @@ async fn rolling_back_a_flag_puts_the_reading_back_in_the_rollup() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let stream =
-        crate::common::sensor_lifecycle::create_paired_stream(&db, "rollback-temp", PARAM_S1_TEMP_ID)
-            .await;
+    let stream = crate::common::sensor_lifecycle::create_paired_stream(
+        &db,
+        "rollback-temp",
+        PARAM_S1_TEMP_ID,
+    )
+    .await;
     for (i, v) in [10.0, 20.0, 30.0, 40.0, 50.0].iter().enumerate() {
         crate::common::exec(
             &db,

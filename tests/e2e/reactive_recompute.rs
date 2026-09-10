@@ -20,7 +20,7 @@ async fn served(
     site_id: &str,
     parameter_id: &str,
 ) -> Option<f64> {
-    river_db::routes::private::tools::chain::served_spot_value(
+    river_db::routes::private::tools::flows::served_spot_value(
         db,
         site_id.parse().expect("site uuid"),
         parameter_id.parse().expect("parameter uuid"),
@@ -34,17 +34,15 @@ async fn served(
 #[serial]
 async fn a_value_landing_at_a_visit_runs_the_calculation_that_reads_it() {
     use sea_orm::ConnectionTrait;
-    if !crate::common::profile::Service::Keycloak.require(
-        "a_value_landing_at_a_visit_runs_the_calculation_that_reads_it",
-    )
-    .await
+    if !crate::common::profile::Service::Keycloak
+        .require("a_value_landing_at_a_visit_runs_the_calculation_that_reads_it")
+        .await
     {
         return;
     }
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_value_landing_at_a_visit_runs_the_calculation_that_reads_it",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_value_landing_at_a_visit_runs_the_calculation_that_reads_it")
+        .await
     {
         return;
     }
@@ -293,13 +291,15 @@ async fn a_value_landing_at_a_visit_runs_the_calculation_that_reads_it() {
 #[serial]
 async fn detach_edit_reengage_and_return_on_an_output_slot() {
     use sea_orm::ConnectionTrait;
-    if !crate::common::profile::Service::Keycloak.require("detach_edit_reengage_and_return_on_an_output_slot").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("detach_edit_reengage_and_return_on_an_output_slot")
+        .await
+    {
         return;
     }
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "detach_edit_reengage_and_return_on_an_output_slot",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("detach_edit_reengage_and_return_on_an_output_slot")
+        .await
     {
         return;
     }

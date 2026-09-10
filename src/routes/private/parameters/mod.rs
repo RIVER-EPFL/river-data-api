@@ -1,5 +1,5 @@
 pub mod derived;
 pub mod groups;
-pub mod model;
-pub mod operations;
-pub use model::*;
+pub mod models;
+pub mod service;
+pub use models::*;

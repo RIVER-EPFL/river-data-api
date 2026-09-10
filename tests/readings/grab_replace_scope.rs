@@ -19,7 +19,11 @@ struct Fixture {
 
 async fn setup() -> Fixture {
     let f = crate::common::seeded_app().await;
-    Fixture { db: f.db, app: f.app, token: f.token }
+    Fixture {
+        db: f.db,
+        app: f.app,
+        token: f.token,
+    }
 }
 
 async fn scalar_i64(db: &DatabaseConnection, sql: &str) -> i64 {
@@ -33,7 +37,6 @@ async fn scalar_i64(db: &DatabaseConnection, sql: &str) -> i64 {
     .try_get::<i64>("", "n")
     .unwrap()
 }
-
 
 fn grab(values: &[f64], mode: Option<&str>) -> serde_json::Value {
     let readings: Vec<serde_json::Value> = values

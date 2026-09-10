@@ -64,7 +64,8 @@ async fn tracked_job_records_category_detail_and_timeline() {
                     .count("readings_updated", 7i64),
             )
             .await;
-            ctx.log("warn", "one slot skipped", serde_json::json!({ "slot": 3 })).await;
+            ctx.log("warn", "one slot skipped", serde_json::json!({ "slot": 3 }))
+                .await;
             Ok(7)
         }),
     )

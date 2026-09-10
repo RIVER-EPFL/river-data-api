@@ -83,7 +83,10 @@ async fn seed_visit(db: &DatabaseConnection, temperature: f64) -> Uuid {
             db,
             "INSERT INTO data_streams (id, source_system, source_key, is_active)
              VALUES ($1, 'grab_sample', $2, true)",
-            vec![stream_id.into(), format!("{SITE1_ID}:{parameter_id}").into()],
+            vec![
+                stream_id.into(),
+                format!("{SITE1_ID}:{parameter_id}").into(),
+            ],
         )
         .await;
         exec(
@@ -122,7 +125,11 @@ async fn stored_output(db: &DatabaseConnection) -> Stored {
              FROM readings r
              WHERE r.site_id = $1::uuid AND r.parameter_id = $2::uuid
                AND r.time = $3::timestamptz",
-            [SITE1_ID.into(), GLOBAL_PARAM_DO_ID.into(), EVENT_TIME.into()],
+            [
+                SITE1_ID.into(),
+                GLOBAL_PARAM_DO_ID.into(),
+                EVENT_TIME.into(),
+            ],
         ))
         .await
         .unwrap()
@@ -147,18 +154,18 @@ async fn setup(temperature: f64) -> (DatabaseConnection, river_db::common::AppSt
 #[tokio::test]
 #[serial]
 async fn a_recompute_that_yields_na_withdraws_the_stored_output() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_recompute_that_yields_na_withdraws_the_stored_output",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_recompute_that_yields_na_withdraws_the_stored_output")
+        .await
     {
         return;
     }
     let (db, state, event_id) = setup(-4.0).await;
 
-    let outcome = river_db::routes::private::tools::chain::recompute_event(&state, event_id, "test")
-        .await
-        .expect("the recompute runs");
+    let outcome =
+        river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
+            .await
+            .expect("the recompute runs");
     assert_eq!(outcome.readings_withdrawn, 1, "the NA blanks the column");
     assert_eq!(
         outcome.readings_written, 0,
@@ -181,18 +188,18 @@ async fn a_recompute_that_yields_na_withdraws_the_stored_output() {
 #[tokio::test]
 #[serial]
 async fn a_computed_value_replaces_the_stored_one_and_withdraws_nothing() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_computed_value_replaces_the_stored_one_and_withdraws_nothing",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_computed_value_replaces_the_stored_one_and_withdraws_nothing")
+        .await
     {
         return;
     }
     let (db, state, event_id) = setup(3.0).await;
 
-    let outcome = river_db::routes::private::tools::chain::recompute_event(&state, event_id, "test")
-        .await
-        .expect("the recompute runs");
+    let outcome =
+        river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
+            .await
+            .expect("the recompute runs");
     assert_eq!(outcome.readings_withdrawn, 0, "a number clears nothing");
 
     let stored = stored_output(&db).await;
@@ -203,10 +210,9 @@ async fn a_computed_value_replaces_the_stored_one_and_withdraws_nothing() {
 #[tokio::test]
 #[serial]
 async fn a_judged_output_keeps_its_value_when_the_recompute_yields_na() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_judged_output_keeps_its_value_when_the_recompute_yields_na",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_judged_output_keeps_its_value_when_the_recompute_yields_na")
+        .await
     {
         return;
     }
@@ -225,9 +231,10 @@ async fn a_judged_output_keeps_its_value_when_the_recompute_yields_na() {
     )
     .await;
 
-    let outcome = river_db::routes::private::tools::chain::recompute_event(&state, event_id, "test")
-        .await
-        .expect("the recompute runs");
+    let outcome =
+        river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
+            .await
+            .expect("the recompute runs");
     assert_eq!(
         outcome.readings_withdrawn, 0,
         "a ruling on the row is not overridden by a calculation"

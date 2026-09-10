@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, State},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
+use sea_orm::{ConnectionTrait, EntityTrait, FromQueryResult, Statement};
 use serde::Serialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -41,16 +41,6 @@ pub struct CalibrationWindowResponse {
 
 const MAX_POINTS: i64 = 2000;
 
-/// The curve whose window the readings are counted against.
-#[derive(sea_orm::FromQueryResult)]
-struct CurveRow {
-    parameter_id: Option<Uuid>,
-    slope: f64,
-    intercept: f64,
-    valid_from: DateTime<chrono::FixedOffset>,
-    valid_until: Option<DateTime<chrono::FixedOffset>>,
-}
-
 /// `GET /sensor_calibrations/{id}/window`, the readings a calibration window resolves. `read_data`.
 #[utoipa::path(
     get,
@@ -69,18 +59,12 @@ pub async fn get_calibration_window(
 ) -> AppResult<Json<CalibrationWindowResponse>> {
     let db = &state.db;
 
-    let cal = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT c.sensor_id, c.slope, c.intercept, c.valid_from, c.valid_until, c.parameter_id
-              FROM sensor_calibrations c
-              WHERE c.id = $1",
-            [calibration_id.into()],
-        ))
+    let cal = super::model::Entity::find_by_id(calibration_id)
+        .one(db)
         .await?
         .ok_or_else(|| AppError::NotFound("Calibration not found".to_string()))?;
 
-    let sensor_id: Uuid = cal.try_get("", "sensor_id")?;
+    let sensor_id = cal.sensor_id;
 
     // A project-scoped key may only inspect a calibration whose sensor is deployed within its
     // project, and only sees the window's in-project readings.
@@ -100,13 +84,14 @@ pub async fn get_calibration_window(
             None => String::new(),
         }
     };
-    let CurveRow {
+    let super::model::Model {
         parameter_id,
         slope,
         intercept,
         valid_from,
         valid_until,
-    } = CurveRow::from_query_result(&cal, "")?;
+        ..
+    } = cal;
 
     let vf: sea_orm::Value = valid_from.into();
     let vu: sea_orm::Value = match valid_until {
@@ -141,7 +126,10 @@ pub async fn get_calibration_window(
         .await?;
     // The count query is an aggregate over a subquery, so it always returns a row; no row means no
     // calibration window, which is zero points rather than a number to guess at.
-    let point_count: i64 = count_row.map(|r| r.try_get("", "c")).transpose()?.unwrap_or(0);
+    let point_count: i64 = count_row
+        .map(|r| r.try_get("", "c"))
+        .transpose()?
+        .unwrap_or(0);
 
     // Each arm carries its own LIMIT so the continuous arm keeps the index-backed early stop; the
     // outer sort then orders at most twice the cap. The spot arm collapses a replicate group to

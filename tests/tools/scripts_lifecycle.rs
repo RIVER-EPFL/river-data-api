@@ -36,14 +36,16 @@ async fn no_api_token_reaches_the_authoring_surface() {
 #[tokio::test]
 #[serial]
 async fn a_version_lives_through_lint_validate_activate_and_rollback() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_version_lives_through_lint_validate_activate_and_rollback",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_version_lives_through_lint_validate_activate_and_rollback")
+        .await
     {
         return;
     }
-    if !crate::common::profile::Service::Keycloak.require("tool_script_lifecycle").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("tool_script_lifecycle")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;

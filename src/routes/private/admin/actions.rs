@@ -2,7 +2,8 @@ use axum::{
     Json,
     extract::{Query, State},
 };
-use sea_orm::FromQueryResult;
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, QuerySelect};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use utoipa::{IntoParams, ToSchema};
@@ -16,9 +17,12 @@ use crate::common::scope::{
     require_sites_in_scope, require_target_in_scope,
 };
 use crate::error::{AppError, AppResult};
+use crate::routes::private::data_streams;
+use crate::routes::private::sensors::calibrations;
 use crate::routes::private::sensors::calibrations::service::{
     evaluate_formula, recompute_deployed_until,
 };
+use crate::routes::private::sensors::deployments;
 use crate::routes::private::sensors::deployments::slots;
 
 /// The rows this file's raw queries return. Derived rather than hand-decoded so a column added to
@@ -103,22 +107,18 @@ async fn deployment_sites(
     db: &sea_orm::DatabaseConnection,
     deployment_ids: &[Uuid],
 ) -> AppResult<Vec<Uuid>> {
-    use sea_orm::{ConnectionTrait, Statement};
     if deployment_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT DISTINCT site_id FROM sensor_deployments WHERE id = ANY($1)",
-            [deployment_ids.to_vec().into()],
-        ))
+    deployments::Entity::find()
+        .select_only()
+        .column(deployments::Column::SiteId)
+        .distinct()
+        .filter(deployments::Column::Id.is_in(deployment_ids.to_vec()))
+        .into_tuple::<Uuid>()
+        .all(db)
         .await
-        .map_err(AppError::Database)?;
-    // A dropped row is a site the caller never hears about, so a decode failure is an error.
-    rows.iter()
-        .map(|r| Ok(r.try_get::<Uuid>("", "site_id")?))
-        .collect()
+        .map_err(AppError::Database)
 }
 
 /// Refuse an untargeted run to a restricted caller: with nothing named, the action reaches every
@@ -351,15 +351,6 @@ pub struct ReprocessAllResponse {
 /// has a deployment. Use after correcting deployment/calibration windows in bulk (the backdate of
 /// historical attribution). Each slot is reprocessed via the decompression-safe
 /// `reprocess_site_parameter_readings`; runs as one tracked job. Requires `write_data`.
-/// One (site, parameter) slot a backdate pass will cover.
-#[derive(FromQueryResult)]
-struct BackdateSlot {
-    #[allow(dead_code)]
-    site_id: Uuid,
-    #[allow(dead_code)]
-    parameter_id: Uuid,
-}
-
 #[utoipa::path(
     post,
     path = "/api/actions/reprocess_all",
@@ -373,25 +364,23 @@ pub async fn reprocess_all(
     State(app_state): State<AppState>,
     ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<ReprocessAllResponse>> {
-    use sea_orm::{ConnectionTrait, Statement};
+    use sea_orm::ConnectionTrait;
 
     // The backdate has no target field at all: it re-derives every slot in the installation.
     require_named_target(&scope, false, "sensor (POST /actions/reprocess)")?;
 
     let db = &app_state.db;
-    let slot_rows = db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT DISTINCT site_id, parameter_id FROM sensor_deployments".to_owned(),
-        ))
-        .await
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
     // Count the slots only to report it back synchronously; the job re-reads `sensor_deployments`
     // itself, so a rerun reflects the current topology.
-    let slot_count = slot_rows
-        .iter()
-        .map(|r| BackdateSlot::from_query_result(r, ""))
-        .collect::<Result<Vec<_>, _>>()?
+    let slot_count = deployments::Entity::find()
+        .select_only()
+        .column(deployments::Column::SiteId)
+        .column(deployments::Column::ParameterId)
+        .distinct()
+        .into_tuple::<(Uuid, Uuid)>()
+        .all(db)
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
         .len();
 
     // One backdate at a time: a second request while one is queued joins it rather than starting a
@@ -410,8 +399,10 @@ pub async fn reprocess_all(
 
     let job_id = match queued {
         Some(id) => id,
+        // `dedupe_key` is a worker-pool column the `reprocessing_jobs` entity does not carry, so
+        // this lookup stays raw until the entity does.
         None => db
-            .query_one_raw(Statement::from_sql_and_values(
+            .query_one_raw(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "SELECT id FROM reprocessing_jobs WHERE dedupe_key = $1",
                 [REPROCESS_ALL_DEDUPE_KEY.into()],
@@ -518,8 +509,7 @@ pub async fn rebuild_alarm_events(
 pub async fn reconcile_alarms(
     State(app_state): State<AppState>,
 ) -> AppResult<Json<ReconcileAlarmsResponse>> {
-    let stats =
-        crate::routes::private::alarms::sweeper::evaluate_alarm_events(&app_state.db).await?;
+    let stats = crate::routes::private::alarms::flows::evaluate_alarm_events(&app_state.db).await?;
 
     if stats.opened > 0 || stats.resolved > 0 {
         let _ = app_state
@@ -576,23 +566,16 @@ pub async fn rollback_deployment(
     let db = &app_state.db;
 
     // 1. Load the target deployment
-    let target = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id, sensor_id, site_id, parameter_id, deployed_from, deployed_until
-              FROM sensor_deployments WHERE id = $1",
-            [payload.deployment_id.into()],
-        ))
-        .await
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
-        .ok_or_else(|| AppError::NotFound("Deployment not found".into()))?;
-
+    //
     // A deployment is always at a site, so its project is the site's. This deletes the row, the
     // same destruction `DELETE /sensor_deployments/{id}` performs under `inject_project_scope`.
     // `deployed_until` is the boundary the rolled-back deployment vacates; the previous one
     // re-extends to it (NULL = the target was open-ended, so the previous reopens open-ended too).
-    let target = RollbackTargetRow::from_query_result(&target, "")
-        .map_err(|e| AppError::Internal(format!("{e}")))?;
+    let target = deployments::Entity::find_by_id(payload.deployment_id)
+        .one(db)
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
+        .ok_or_else(|| AppError::NotFound("Deployment not found".into()))?;
     let owner = project_of_site(db, target.site_id).await?;
     confine_target(&scope, &owner, Unowned::Deny, "deployment")?;
 
@@ -604,27 +587,15 @@ pub async fn rollback_deployment(
     // 2. Find the previous deployment for the same sensor AND THE SAME PARAMETER, on a multi-channel
     //    instrument the immediately-prior deployment by time could belong to a different channel;
     //    reopening that one would extend the wrong channel's window.
-    let previous = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id, site_id, deployed_from FROM sensor_deployments
-              WHERE sensor_id = $1 AND parameter_id = $4 AND deployed_from < $2 AND id != $3
-              ORDER BY deployed_from DESC LIMIT 1",
-            [
-                sensor_id.into(),
-                target_deployed_from.into(),
-                payload.deployment_id.into(),
-                parameter_id.into(),
-            ],
-        ))
+    let previous = deployments::Entity::find()
+        .filter(deployments::Column::SensorId.eq(sensor_id))
+        .filter(deployments::Column::ParameterId.eq(parameter_id))
+        .filter(deployments::Column::DeployedFrom.lt(target_deployed_from))
+        .filter(deployments::Column::Id.ne(payload.deployment_id))
+        .order_by_desc(deployments::Column::DeployedFrom)
+        .one(db)
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-
-    let previous = previous
-        .as_ref()
-        .map(|r| PreviousDeploymentRow::from_query_result(r, ""))
-        .transpose()
-        .map_err(|e| AppError::Internal(format!("{e}")))?;
     let previous_deployment_id: Option<Uuid> = previous.as_ref().map(|p| p.id);
 
     // 3-4. Clear readings' FK to the rolled-back deployment, delete it, and reopen the previous
@@ -647,13 +618,10 @@ pub async fn rollback_deployment(
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
     let readings_reassigned = cleared.rows_affected();
 
-    txn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"DELETE FROM sensor_deployments WHERE id = $1",
-        [payload.deployment_id.into()],
-    ))
-    .await
-    .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    deployments::Entity::delete_by_id(payload.deployment_id)
+        .exec(&txn)
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
     // Reopen the previous deployment to absorb the vacated window. `recompute_deployed_until` only ever
     //    SHORTENS (LEAST), so without this the previous deployment, auto-closed when the rolled-back
@@ -688,22 +656,24 @@ pub async fn rollback_deployment(
             )));
         }
 
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE sensor_deployments SET deployed_until = $1 WHERE id = $2",
-            [target_deployed_until.into(), prev_id.into()],
-        ))
-        .await
-        .map_err(|e| {
-            if slots::is_slot_conflict(&e) {
-                AppError::Conflict(format!(
-                    "Rolling back would extend deployment {prev_id} into a period another \
+        deployments::Entity::update_many()
+            .col_expr(
+                deployments::Column::DeployedUntil,
+                Expr::value(target_deployed_until),
+            )
+            .filter(deployments::Column::Id.eq(prev_id))
+            .exec(&txn)
+            .await
+            .map_err(|e| {
+                if slots::is_slot_conflict(&e) {
+                    AppError::Conflict(format!(
+                        "Rolling back would extend deployment {prev_id} into a period another \
                      instrument now holds at this site and parameter."
-                ))
-            } else {
-                AppError::Internal(format!("DB error: {e}"))
-            }
-        })?;
+                    ))
+                } else {
+                    AppError::Internal(format!("DB error: {e}"))
+                }
+            })?;
     }
     txn.commit()
         .await
@@ -819,22 +789,15 @@ pub async fn preview_derived(
     let db = &app_state.db;
 
     // Get site name
-    let site_row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT name FROM sites WHERE id = $1",
-            [payload.site_id.into()],
-        ))
+    let site_name = crate::routes::private::sites::Entity::find_by_id(payload.site_id)
+        .one(db)
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
-        .ok_or_else(|| AppError::NotFound("Site not found".into()))?;
-
-    let site_name: String = site_row
-        .try_get("", "name")
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+        .ok_or_else(|| AppError::NotFound("Site not found".into()))?
+        .name;
 
     // Extract variable names from formula
-    let var_names = crate::routes::private::tools::formula::free_identifiers(&payload.formula);
+    let var_names = crate::routes::private::tools::service::free_identifiers(&payload.formula);
 
     if var_names.is_empty() {
         return Ok(Json(PreviewDerivedResponse {
@@ -1195,7 +1158,6 @@ pub async fn backfill_attribution(
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<BackfillAttributionRequest>,
 ) -> AppResult<Json<BackfillAttributionResponse>> {
-    use sea_orm::{ConnectionTrait, Statement};
     let db = &app_state.db;
 
     // `all` with no site and no deployments is the whole installation; a request that names nothing
@@ -1241,13 +1203,16 @@ pub async fn backfill_attribution(
         // Idempotent backdate: only move `deployed_from` earlier. After the first apply the row sits
         // at `target_from`, so a client retry replayed against another replica matches no rows
         // (`deployed_from > target_from` is false) and can't double-apply or re-widen the window.
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE sensor_deployments SET deployed_from = $1 WHERE id = $2 AND deployed_from > $1",
-            [c.target_from.into(), c.deployment_id.into()],
-        ))
-        .await
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+        deployments::Entity::update_many()
+            .col_expr(
+                deployments::Column::DeployedFrom,
+                Expr::value(c.target_from),
+            )
+            .filter(deployments::Column::Id.eq(c.deployment_id))
+            .filter(deployments::Column::DeployedFrom.gt(c.target_from))
+            .exec(db)
+            .await
+            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
         slots.insert((c.site_id, c.parameter_id));
         sensors.insert(c.sensor_id);
     }
@@ -1317,18 +1282,15 @@ async fn default_scan_floor(
     // A batch-written reading newer than every cursor at most shifts the floor slightly later,
     // which the `since` parameter can always widen past. The unbounded probe remains only as
     // the fallback for a database with readings but no cursors at all.
-    let row = db
-        .query_one_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT MAX(last_data_time) AS newest FROM data_streams".to_string(),
-        ))
-        .await
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-
-    let mut newest: Option<chrono::DateTime<chrono::FixedOffset>> = match row {
-        Some(r) => r.try_get("", "newest")?,
-        None => None,
-    };
+    let mut newest: Option<chrono::DateTime<chrono::FixedOffset>> =
+        crate::routes::private::data_streams::Entity::find()
+            .select_only()
+            .column_as(data_streams::Column::LastDataTime.max(), "newest")
+            .into_tuple::<Option<chrono::DateTime<chrono::FixedOffset>>>()
+            .one(db)
+            .await
+            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
+            .flatten();
     if newest.is_none() {
         let row = db
             .query_one_raw(Statement::from_string(
@@ -1503,26 +1465,16 @@ async fn fetch_calibration_candidates(
             target_from,
         } = CandidateRow::from_query_result(row, "")?;
 
-        let cal_row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"SELECT valid_from
-                  FROM sensor_calibrations
-                  WHERE sensor_id = $1
-                  ORDER BY valid_from ASC
-                  LIMIT 1",
-                [sensor_id.into()],
-            ))
+        let earliest_calibration_from = calibrations::Entity::find()
+            .select_only()
+            .column(calibrations::Column::ValidFrom)
+            .filter(calibrations::Column::SensorId.eq(sensor_id))
+            .order_by_asc(calibrations::Column::ValidFrom)
+            .into_tuple::<chrono::DateTime<chrono::FixedOffset>>()
+            .one(db)
             .await
-            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-
-        let earliest_calibration_from = match cal_row {
-            Some(cr) => {
-                let vf: chrono::DateTime<chrono::FixedOffset> = cr.try_get("", "valid_from")?;
-                Some(vf.with_timezone(&chrono::Utc))
-            }
-            None => None,
-        };
+            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
+            .map(|vf| vf.with_timezone(&chrono::Utc));
 
         candidates.push(CalibrationBackfillCandidate {
             sensor_id,
@@ -1838,22 +1790,6 @@ struct OrphanedCorrectionRow {
     last_time: chrono::DateTime<chrono::FixedOffset>,
 }
 
-#[derive(FromQueryResult)]
-struct RollbackTargetRow {
-    site_id: Uuid,
-    sensor_id: Uuid,
-    parameter_id: Uuid,
-    deployed_from: chrono::DateTime<chrono::FixedOffset>,
-    deployed_until: Option<chrono::DateTime<chrono::FixedOffset>>,
-}
-
-#[derive(FromQueryResult)]
-struct PreviousDeploymentRow {
-    id: Uuid,
-    site_id: Uuid,
-    deployed_from: chrono::DateTime<chrono::FixedOffset>,
-}
-
 #[derive(Debug, Serialize, ToSchema, sea_orm::FromQueryResult)]
 pub struct UndeclaredEstimatorSlot {
     pub site_id: Uuid,
@@ -1912,7 +1848,7 @@ pub async fn undeclared_sd_estimators(
     let project_filter = project_filter_sql(&scope, "st.project_id", &mut values)
         .map(|predicate| format!(" AND {predicate}"))
         .unwrap_or_default();
-    let population_sd = &*crate::routes::private::sync::replicate_audit::POPULATION_SD_SQL;
+    let population_sd = &*crate::routes::private::sync::service::POPULATION_SD_SQL;
 
     let sql = format!(
         r"SELECT sp.site_id, sp.parameter_id, sp.id AS site_parameter_id,

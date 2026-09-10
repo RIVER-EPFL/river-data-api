@@ -512,6 +512,7 @@ fn table() -> Table {
             ("POST", "/api/streams/register"),
             ("POST", "/api/standard_curves/register"),
             ("POST", "/api/sensors/register"),
+            ("POST", "/api/sensors/proposals"),
             ("POST", "/api/notes/register"),
             ("POST", "/api/annotations/register"),
             ("POST", "/api/streams/retag"),
@@ -1197,8 +1198,8 @@ fn every_registered_route_has_a_row() {
     let sources: [(&str, &str); 5] = [
         ("src/routes/service/mod.rs", "/api"),
         ("src/routes/private/sync/views.rs", "/api/sync"),
-        ("src/routes/private/projects/router.rs", "/api/projects"),
-        ("src/routes/private/sites/router.rs", "/api/sites"),
+        ("src/routes/private/projects/views.rs", "/api/projects"),
+        ("src/routes/private/sites/views.rs", "/api/sites"),
         ("src/routes/private/admin/users.rs", "/api/users"),
     ];
     // Routes whose absence from the table is deliberate, with the reason.
@@ -1220,7 +1221,12 @@ fn every_registered_route_has_a_row() {
         table().0.iter().map(|r| r.declared.to_string()).collect();
     let mut missing = Vec::new();
     for (file, prefix) in sources {
-        let text = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        let text = std::fs::read_to_string(file).unwrap_or_else(|e| {
+            panic!(
+                "read {file}: {e}\nThis file holds the `.route` literals for {prefix}. A component \
+                 collapse that moves them moves this entry too."
+            )
+        });
         for path in route_literals(&text) {
             let full = if path == "/" {
                 prefix.to_string()
@@ -1275,13 +1281,18 @@ fn every_row_names_a_route_that_still_exists() {
     let sources: [(&str, &str); 5] = [
         ("src/routes/service/mod.rs", "/api"),
         ("src/routes/private/sync/views.rs", "/api/sync"),
-        ("src/routes/private/projects/router.rs", "/api/projects"),
-        ("src/routes/private/sites/router.rs", "/api/sites"),
+        ("src/routes/private/projects/views.rs", "/api/projects"),
+        ("src/routes/private/sites/views.rs", "/api/sites"),
         ("src/routes/private/admin/users.rs", "/api/users"),
     ];
     let mut registered: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (file, prefix) in sources {
-        let text = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        let text = std::fs::read_to_string(file).unwrap_or_else(|e| {
+            panic!(
+                "read {file}: {e}\nThis file holds the `.route` literals for {prefix}. A component \
+                 collapse that moves them moves this entry too."
+            )
+        });
         for path in route_literals(&text) {
             registered.insert(if path == "/" {
                 prefix.to_string()

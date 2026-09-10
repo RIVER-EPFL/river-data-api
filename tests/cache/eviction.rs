@@ -130,7 +130,10 @@ async fn what_survives_the_ceiling_is_served_whole() {
             "{k} is served another entry's body"
         );
     }
-    assert!(served > 0, "the cache evicted everything rather than the excess");
+    assert!(
+        served > 0,
+        "the cache evicted everything rather than the excess"
+    );
 
     cleanup_test_db(&db).await;
 }

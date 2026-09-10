@@ -10,12 +10,11 @@ use serial_test::serial;
 use uuid::Uuid;
 
 use crate::common::{
-    cleanup_test_db, seed_test_data, setup_test_db, GLOBAL_PARAM_DEPTH_ID, GLOBAL_PARAM_TEMP_ID,
-    SITE1_ID, SITE2_ID,
+    GLOBAL_PARAM_DEPTH_ID, GLOBAL_PARAM_TEMP_ID, SITE1_ID, SITE2_ID, cleanup_test_db,
+    seed_test_data, setup_test_db,
 };
 
 const AUTO_NOTE: &str = "Auto-created during stream pairing";
-
 
 async fn sensor(db: &DatabaseConnection, serial: &str) -> Uuid {
     let id = Uuid::new_v4();

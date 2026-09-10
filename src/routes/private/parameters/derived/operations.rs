@@ -1,10 +1,16 @@
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::{ConnectionTrait, FromQueryResult, Statement, TransactionTrait};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, Statement,
+    TransactionTrait,
+};
 use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::definition_model::CalculationFormula;
-use crate::routes::private::tools::formula::free_identifiers;
+use super::source_model;
+use crate::routes::private::constants;
+use crate::routes::private::parameters;
+use crate::routes::private::tools::service::free_identifiers;
 
 /// Maximum allowed derived-from-derived chain depth.
 
@@ -53,23 +59,12 @@ async fn mint_derived_version<C: ConnectionTrait>(
 
 /// Whether this definition is the standalone kind, ie. not attached to a calculation.
 async fn is_standalone<C: ConnectionTrait>(db: &C, definition_id: Uuid) -> Result<bool, ApiError> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT tool_script_id IS NULL AS standalone \
-               FROM calculation_formulas WHERE id = $1",
-            [definition_id.into()],
-        ))
+    // No row is a definition that does not exist.
+    let row = super::definition_model::Entity::find_by_id(definition_id)
+        .one(db)
         .await
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-    // No row is a definition that does not exist; a row that does not decode is an error, because
-    // `tool_script_id IS NULL` is never null.
-    row.map(|r| {
-        r.try_get::<bool>("", "standalone")
-            .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))
-    })
-    .transpose()
-    .map(|standalone| standalone.unwrap_or(false))
+    Ok(row.is_some_and(|d| d.tool_script_id.is_none()))
 }
 
 fn validate_formula(formula: &str) -> Result<(), ApiError> {
@@ -105,20 +100,14 @@ async fn resolve_variables<C: ConnectionTrait>(
     let mut site_columns: Option<Vec<String>> = None;
 
     for var_name in &var_names {
-        let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"SELECT id FROM parameters WHERE code = $1 LIMIT 1",
-                [var_name.clone().into()],
-            ))
+        let row = parameters::Entity::find()
+            .filter(parameters::Column::Code.eq(var_name.as_str()))
+            .one(db)
             .await
             .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
 
-        if let Some(row) = row {
-            let id: Uuid = row
-                .try_get("", "id")
-                .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-            resolved.parameters.push((var_name.clone(), id));
+        if let Some(parameter) = row {
+            resolved.parameters.push((var_name.clone(), parameter.id));
         } else if !names_a_constant(db, var_name).await? {
             let columns = match &site_columns {
                 Some(columns) => columns,
@@ -163,12 +152,9 @@ async fn site_columns_of<C: ConnectionTrait>(db: &C) -> Result<Vec<String>, ApiE
 
 /// Whether the constants table holds this name.
 async fn names_a_constant<C: ConnectionTrait>(db: &C, name: &str) -> Result<bool, ApiError> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT 1 FROM constants WHERE name = $1 LIMIT 1",
-            [name.into()],
-        ))
+    let row = constants::models::Entity::find()
+        .filter(constants::models::Column::Name.eq(name))
+        .one(db)
         .await
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
     Ok(row.is_some())
@@ -180,18 +166,6 @@ async fn names_a_constant<C: ConnectionTrait>(db: &C, name: &str) -> Result<bool
 /// A definition is found by `output_parameter_id`, the column that says what it produces. Its own
 /// `code` names the formula, and the two are routinely spelled differently: `ensure_output_parameter`
 /// creates the output parameter rather than requiring them to agree.
-#[derive(FromQueryResult)]
-struct DefinitionRow {
-    id: Uuid,
-    output_parameter_id: Uuid,
-}
-
-#[derive(FromQueryResult)]
-struct SourceRow {
-    derived_definition_id: Uuid,
-    parameter_id: Uuid,
-}
-
 #[derive(Default)]
 struct DerivedGraph {
     /// Output parameter id to the definition producing it.
@@ -203,44 +177,34 @@ struct DerivedGraph {
 impl DerivedGraph {
     async fn load<C: ConnectionTrait>(db: &C) -> Result<Self, ApiError> {
         let mut graph = Self::default();
-        let definitions = db
-            .query_all_raw(Statement::from_string(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT id, output_parameter_id FROM calculation_formulas \
-                 WHERE output_parameter_id IS NOT NULL"
-                    .to_string(),
-            ))
+        let definitions = super::definition_model::Entity::find()
+            .filter(super::definition_model::Column::OutputParameterId.is_not_null())
+            .all(db)
             .await
             .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-        for row in &definitions {
-            let definition = DefinitionRow::from_query_result(row, "")
-                .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-            graph
-                .definition_of
-                .insert(definition.output_parameter_id, definition.id);
+        for definition in definitions {
+            if let Some(output_parameter_id) = definition.output_parameter_id {
+                graph
+                    .definition_of
+                    .insert(output_parameter_id, definition.id);
+            }
         }
 
-        let sources = db
-            .query_all_raw(Statement::from_string(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT derived_definition_id, parameter_id FROM derived_parameter_sources"
-                    .to_string(),
-            ))
+        let sources = source_model::Entity::find()
+            .all(db)
             .await
             .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-        for row in &sources {
-            let source = SourceRow::from_query_result(row, "")
-                .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-            graph
-                .sources_of
-                .entry(source.derived_definition_id)
-                .or_default()
-                .push(source.parameter_id);
+        for source in sources {
+            if let Some(parameter_id) = source.parameter_id {
+                graph
+                    .sources_of
+                    .entry(source.derived_definition_id)
+                    .or_default()
+                    .push(parameter_id);
+            }
         }
         Ok(graph)
     }
-
-
 }
 
 /// Refuse a set of formula variables that would make the definition producing `output_parameter_id`
@@ -333,25 +297,18 @@ async fn existing_parameter_id<C: ConnectionTrait>(
     db: &C,
     code: &str,
 ) -> Result<Option<Uuid>, ApiError> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id FROM parameters WHERE LOWER(code) = LOWER($1) LIMIT 1",
-            [code.into()],
-        ))
+    let row = parameters::Entity::find()
+        .filter(code_matches(code))
+        .one(db)
         .await
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-    row.map(|r| {
-        r.try_get::<Uuid>("", "id")
-            .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))
-    })
-    .transpose()
+    Ok(row.map(|parameter| parameter.id))
 }
 
-#[derive(FromQueryResult)]
-struct StoredDefinition {
-    output_parameter_id: Option<Uuid>,
-    formula: String,
+/// `LOWER(code) = LOWER($1)`, the shape of the catalog's unique index on the code.
+fn code_matches(code: &str) -> sea_orm::sea_query::SimpleExpr {
+    use sea_orm::sea_query::{Expr, ExprTrait, Func};
+    Expr::expr(Func::lower(Expr::col(parameters::Column::Code))).eq(code.to_lowercase())
 }
 
 /// The parameter a stored definition produces, and its formula.
@@ -359,17 +316,11 @@ async fn stored_definition<C: ConnectionTrait>(
     db: &C,
     id: Uuid,
 ) -> Result<(Option<Uuid>, String), ApiError> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT output_parameter_id, formula FROM calculation_formulas WHERE id = $1",
-            [id.into()],
-        ))
+    let stored = super::definition_model::Entity::find_by_id(id)
+        .one(db)
         .await
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?
         .ok_or_else(|| ApiError::not_found("Derived parameter definition", None))?;
-    let stored = StoredDefinition::from_query_result(&row, "")
-        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
     Ok((stored.output_parameter_id, stored.formula))
 }
 
@@ -381,22 +332,20 @@ async fn sync_sources<C: ConnectionTrait>(
 ) -> Result<(), ApiError> {
     let resolved_params = &resolved.parameters;
     // Delete existing rows
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"DELETE FROM derived_parameter_sources WHERE derived_definition_id = $1",
-        [definition_id.into()],
-    ))
-    .await
-    .map_err(|e| ApiError::internal(format!("Failed to clear old sources: {e}"), None))?;
+    delete_sources(db, definition_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to clear old sources: {e}"), None))?;
 
     // Insert new rows
     for (var_name, param_id) in resolved_params {
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"INSERT INTO derived_parameter_sources (derived_definition_id, parameter_id, variable_name)
-              VALUES ($1, $2, $3)",
-            [definition_id.into(), (*param_id).into(), var_name.clone().into()],
-        ))
+        source_model::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            derived_definition_id: Set(definition_id),
+            parameter_id: Set(Some(*param_id)),
+            variable_name: Set(var_name.clone()),
+            ..Default::default()
+        }
+        .insert(db)
         .await
         .map_err(|e| {
             ApiError::internal(format!("Failed to insert source '{var_name}': {e}"), None)
@@ -404,16 +353,14 @@ async fn sync_sources<C: ConnectionTrait>(
     }
 
     for (var_name, property) in &resolved.site_properties {
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"INSERT INTO derived_parameter_sources (derived_definition_id, site_property, variable_name)
-              VALUES ($1, $2, $3)",
-            [
-                definition_id.into(),
-                property.clone().into(),
-                var_name.clone().into(),
-            ],
-        ))
+        source_model::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            derived_definition_id: Set(definition_id),
+            site_property: Set(Some(property.clone())),
+            variable_name: Set(var_name.clone()),
+            ..Default::default()
+        }
+        .insert(db)
         .await
         .map_err(|e| {
             ApiError::internal(
@@ -423,6 +370,43 @@ async fn sync_sources<C: ConnectionTrait>(
         })?;
     }
 
+    Ok(())
+}
+
+/// Every source row a definition owns, cleared.
+async fn delete_sources<C: ConnectionTrait>(
+    db: &C,
+    definition_id: Uuid,
+) -> Result<(), sea_orm::DbErr> {
+    source_model::Entity::delete_many()
+        .filter(source_model::Column::DerivedDefinitionId.eq(definition_id))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
+/// The catalog row a definition's output owns, kept in step with the definition.
+async fn update_output_parameter<C: ConnectionTrait>(
+    db: &C,
+    parameter_id: Uuid,
+    entity: &CalculationFormula,
+) -> Result<(), sea_orm::DbErr> {
+    parameters::Entity::update_many()
+        .col_expr(
+            parameters::Column::Name,
+            sea_orm::sea_query::Expr::value(entity.name.clone()),
+        )
+        .col_expr(
+            parameters::Column::DefaultUnits,
+            sea_orm::sea_query::Expr::value(entity.units.clone()),
+        )
+        .col_expr(
+            parameters::Column::Description,
+            sea_orm::sea_query::Expr::value(entity.description.clone().unwrap_or_default()),
+        )
+        .filter(parameters::Column::Id.eq(parameter_id))
+        .exec(db)
+        .await?;
     Ok(())
 }
 
@@ -441,83 +425,54 @@ async fn ensure_output_parameter<C: ConnectionTrait>(
     // Reuse existing link if present
     if let Some(existing_id) = entity.output_parameter_id {
         // Keep the parameter row in sync
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE parameters SET name = $2, default_units = $3, description = $4
-              WHERE id = $1",
-            [
-                existing_id.into(),
-                entity.name.clone().into(),
-                entity.units.clone().into(),
-                entity.description.clone().unwrap_or_default().into(),
-            ],
-        ))
-        .await
-        .map_err(|e| ApiError::internal(format!("Failed to update output parameter: {e}"), None))?;
+        update_output_parameter(db, existing_id, entity)
+            .await
+            .map_err(|e| {
+                ApiError::internal(format!("Failed to update output parameter: {e}"), None)
+            })?;
         return Ok(Some(existing_id));
     }
 
     // Create or find the output parameter
-    let existing = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id FROM parameters WHERE LOWER(code) = LOWER($1) LIMIT 1",
-            [entity.code.clone().into()],
-        ))
+    let existing = parameters::Entity::find()
+        .filter(code_matches(&entity.code))
+        .one(db)
         .await
         .map_err(|e| ApiError::internal(format!("Failed to lookup output parameter: {e}"), None))?;
 
-    let param_id = if let Some(row) = existing {
-        let id: Uuid = row
-            .try_get("", "id")
-            .map_err(|e| ApiError::internal(format!("Failed to read parameter id: {e}"), None))?;
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE parameters SET name = $2, default_units = $3, description = $4
-              WHERE id = $1",
-            [
-                id.into(),
-                entity.name.clone().into(),
-                entity.units.clone().into(),
-                entity.description.clone().unwrap_or_default().into(),
-            ],
-        ))
-        .await
-        .map_err(|e| ApiError::internal(format!("Failed to update output parameter: {e}"), None))?;
-        id
-    } else {
-        let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"INSERT INTO parameters (id, code, name, default_units, category, description)
-                  VALUES (gen_random_uuid(), $1, $2, $3, 'measurement', $4)
-                  RETURNING id",
-                [
-                    entity.code.clone().into(),
-                    entity.name.clone().into(),
-                    entity.units.clone().into(),
-                    entity.description.clone().unwrap_or_default().into(),
-                ],
-            ))
+    let param_id = if let Some(parameter) = existing {
+        update_output_parameter(db, parameter.id, entity)
             .await
             .map_err(|e| {
-                ApiError::internal(format!("Failed to insert output parameter: {e}"), None)
-            })?
-            .ok_or_else(|| {
-                ApiError::internal("No row returned from parameter insert".to_string(), None)
+                ApiError::internal(format!("Failed to update output parameter: {e}"), None)
             })?;
-        row.try_get::<Uuid>("", "id")
-            .map_err(|e| ApiError::internal(format!("Failed to read parameter id: {e}"), None))?
+        parameter.id
+    } else {
+        parameters::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            code: Set(entity.code.clone()),
+            name: Set(entity.name.clone()),
+            default_units: Set(entity.units.clone()),
+            category: Set("measurement".to_string()),
+            description: Set(Some(entity.description.clone().unwrap_or_default())),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to insert output parameter: {e}"), None))?
+        .id
     };
 
     // Store the link on the definition
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE calculation_formulas SET output_parameter_id = $1 WHERE id = $2",
-        [param_id.into(), entity.id.into()],
-    ))
-    .await
-    .map_err(|e| ApiError::internal(format!("Failed to link output parameter: {e}"), None))?;
+    super::definition_model::Entity::update_many()
+        .col_expr(
+            super::definition_model::Column::OutputParameterId,
+            sea_orm::sea_query::Expr::value(param_id),
+        )
+        .filter(super::definition_model::Column::Id.eq(entity.id))
+        .exec(db)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to link output parameter: {e}"), None))?;
 
     entity.output_parameter_id = Some(param_id);
     Ok(Some(param_id))
@@ -535,13 +490,9 @@ impl CRUDOperations for CalculationFormulaOperations {
         db: &C,
         id: Uuid,
     ) -> Result<(), ApiError> {
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "DELETE FROM derived_parameter_sources WHERE derived_definition_id = $1",
-            [id.into()],
-        ))
-        .await
-        .map_err(|e| ApiError::internal(format!("Failed to delete sources: {e}"), None))?;
+        delete_sources(db, id)
+            .await
+            .map_err(|e| ApiError::internal(format!("Failed to delete sources: {e}"), None))?;
 
         Ok(())
     }
@@ -574,7 +525,7 @@ impl CRUDOperations for CalculationFormulaOperations {
         ensure_output_parameter(db, entity).await?;
 
         // A formula of a calculation is part of its version, so the calculation is re-minted.
-        crate::routes::private::tools::calculation_versions::mint_stale_formula_versions(db, None)
+        crate::routes::private::tools::service::mint_stale_formula_versions(db, None)
             .await
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
         if is_standalone(db, entity.id).await? {
@@ -628,7 +579,7 @@ impl CRUDOperations for CalculationFormulaOperations {
         // Keep the output parameter in sync; an intermediate has none to keep.
         ensure_output_parameter(db, entity).await?;
 
-        crate::routes::private::tools::calculation_versions::mint_stale_formula_versions(db, None)
+        crate::routes::private::tools::service::mint_stale_formula_versions(db, None)
             .await
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
         if is_standalone(db, entity.id).await? {
@@ -659,90 +610,12 @@ impl CRUDOperations for CalculationFormulaOperations {
         db: &C,
         _id: Uuid,
     ) -> Result<(), ApiError> {
-        crate::routes::private::tools::calculation_versions::mint_stale_formula_versions(db, None)
+        crate::routes::private::tools::service::mint_stale_formula_versions(db, None)
             .await
             .map_err(|e| ApiError::bad_request(e.to_string()))
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{DerivedGraph, validate_dependency_chain};
-    use std::collections::HashMap;
-    use uuid::Uuid;
-
-    /// A definition producing `output`, reading `sources`. Its own code never enters the graph:
-    /// what it produces is `output_parameter_id`, and the two are routinely spelled differently.
-    fn graph(definitions: &[(Uuid, Uuid, Vec<Uuid>)]) -> DerivedGraph {
-        let mut definition_of = HashMap::new();
-        let mut sources_of = HashMap::new();
-        for (id, output, sources) in definitions {
-            definition_of.insert(*output, *id);
-            sources_of.insert(*id, sources.clone());
-        }
-        DerivedGraph {
-            definition_of,
-            sources_of,
-        }
-    }
-
-    /// A definition is found by what it produces, not by its own code: the walk has to reach a
-    /// definition whose code and output parameter are spelled differently, which is what B158 was.
-    #[test]
-    fn a_definition_is_found_by_what_it_produces() {
-        let (definition, output, input) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let g = graph(&[(definition, output, vec![input])]);
-        validate_dependency_chain(&g, Some(input), &[("x".to_string(), output)])
-            .expect_err("input feeds output, so producing input from output closes the loop");
-        validate_dependency_chain(&g, Some(Uuid::new_v4()), &[("x".to_string(), output)])
-            .expect("reading a derived parameter is not a cycle");
-    }
-
-    #[test]
-    fn a_two_definition_cycle_is_refused() {
-        let (a, a_out, b, b_out) = (
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-        );
-        // A reads B's output; the formula under test produces B's output and reads A's.
-        let g = graph(&[(a, a_out, vec![b_out]), (b, b_out, vec![a_out])]);
-        let err =
-            validate_dependency_chain(&g, Some(b_out), &[("a".to_string(), a_out)]).unwrap_err();
-        assert!(err.contains("Circular dependency"), "{err}");
-    }
-
-    #[test]
-    fn a_formula_reading_its_own_output_is_refused() {
-        let output = Uuid::new_v4();
-        let err =
-            validate_dependency_chain(&graph(&[]), Some(output), &[("self".to_string(), output)])
-                .unwrap_err();
-        assert!(err.contains("its own output parameter"), "{err}");
-    }
-
-    /// Depth is not a limit (Q96): a chain that orders is runnable however deep it runs. Four
-    /// stages is past the cap this used to enforce.
-    #[test]
-    fn a_deep_chain_is_allowed() {
-        let outputs: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
-        let base = Uuid::new_v4();
-        let mut definitions = Vec::new();
-        let mut below = base;
-        for output in &outputs {
-            definitions.push((Uuid::new_v4(), *output, vec![below]));
-            below = *output;
-        }
-        let g = graph(&definitions);
-        let deepest = *outputs.last().unwrap();
-        validate_dependency_chain(&g, Some(Uuid::new_v4()), &[("x".to_string(), deepest)])
-            .expect("a five-deep chain orders, so nothing refuses it");
-    }
-
-    #[test]
-    fn a_definition_with_no_output_parameter_yet_closes_no_cycle() {
-        let input = Uuid::new_v4();
-        validate_dependency_chain(&graph(&[]), None, &[("x".to_string(), input)]).unwrap();
-    }
-}
+#[path = "tests/operations.rs"]
+mod tests;

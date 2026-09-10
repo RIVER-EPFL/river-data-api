@@ -10,7 +10,8 @@ use axum::Json;
 use axum::extract::State;
 use river_data_core::client::ControlPlaneClient;
 use river_data_core::models::ServiceStatus;
-use river_db::routes::private::sync::operator::{CreateCredentialRequest, create_credential};
+use river_db::routes::private::sync::models::CreateCredentialRequest;
+use river_db::routes::private::sync::views::create_credential;
 use serial_test::serial;
 
 #[tokio::test]

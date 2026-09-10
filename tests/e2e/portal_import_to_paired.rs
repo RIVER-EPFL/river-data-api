@@ -25,11 +25,7 @@ const MEAN_COLUMN: &str = "DOC_avg_ppb";
 /// The two stations, by the names the seeded sites carry.
 const STATIONS: [&str; 2] = ["Upstream Station", "Downstream Station"];
 
-async fn register_family(
-    app: &axum::Router,
-    token: &str,
-    station: &str,
-) -> Uuid {
+async fn register_family(app: &axum::Router, token: &str, station: &str) -> Uuid {
     let (status, stream) = crate::common::post_json_parse_with_token(
         app,
         "/api/streams/register",
@@ -59,7 +55,11 @@ async fn register_family(
         (200..300).contains(&status),
         "register {station} ({status}): {stream}"
     );
-    stream["id"].as_str().expect("stream id").parse().expect("uuid")
+    stream["id"]
+        .as_str()
+        .expect("stream id")
+        .parse()
+        .expect("uuid")
 }
 
 async fn instruments_of_source(db: &DatabaseConnection) -> Vec<(Uuid, String, String)> {

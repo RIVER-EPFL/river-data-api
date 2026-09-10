@@ -10,9 +10,10 @@
 use std::sync::{Arc, Mutex};
 
 use river_db::common::AppState;
-use river_db::routes::private::notifications::{
-    DeliveryResult, NotificationChannel, OutgoingMessage, dispatcher,
+use river_db::routes::private::notifications::models::{
+    DeliveryResult, NotificationChannel, OutgoingMessage,
 };
+use river_db::routes::private::notifications::flows;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 
@@ -108,7 +109,7 @@ async fn opened_alarm_is_notified_and_stamped() {
     );
 
     let sent = Arc::new(Mutex::new(Vec::new()));
-    dispatcher::dispatch_once(&state, &channels(&sent, false)).await;
+    flows::dispatch_once(&state, &channels(&sent, false)).await;
 
     let opened = sent
         .lock()
@@ -146,7 +147,7 @@ async fn muted_alarm_is_suppressed_but_stamped() {
     .await;
 
     let sent = Arc::new(Mutex::new(Vec::new()));
-    dispatcher::dispatch_once(&state, &channels(&sent, false)).await;
+    flows::dispatch_once(&state, &channels(&sent, false)).await;
 
     assert!(
         sent.lock()
@@ -173,7 +174,7 @@ async fn failed_delivery_is_not_stamped_and_retries() {
     insert_open_event(&db).await;
 
     let sent = Arc::new(Mutex::new(Vec::new()));
-    dispatcher::dispatch_once(&state, &channels(&sent, true)).await;
+    flows::dispatch_once(&state, &channels(&sent, true)).await;
 
     let attempted = sent
         .lock()
@@ -211,7 +212,7 @@ async fn resolved_alarm_sends_resolution_notice() {
     .await;
 
     let sent = Arc::new(Mutex::new(Vec::new()));
-    dispatcher::dispatch_once(&state, &channels(&sent, false)).await;
+    flows::dispatch_once(&state, &channels(&sent, false)).await;
 
     let resolved = sent
         .lock()
@@ -247,8 +248,8 @@ async fn concurrent_dispatchers_send_each_event_once() {
     let ch_a = channels(&sent, false);
     let ch_b = channels(&sent, false);
     tokio::join!(
-        dispatcher::dispatch_once(&state, &ch_a),
-        dispatcher::dispatch_once(&state, &ch_b),
+        flows::dispatch_once(&state, &ch_a),
+        flows::dispatch_once(&state, &ch_b),
     );
 
     let opened = sent
@@ -295,7 +296,7 @@ async fn an_alarm_with_no_channel_configured_is_stamped_undeliverable() {
     )
     .await;
 
-    dispatcher::dispatch_once(&state, &[]).await;
+    flows::dispatch_once(&state, &[]).await;
 
     assert_eq!(
         count(&db, "notified_at IS NULL").await,

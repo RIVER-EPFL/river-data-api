@@ -50,7 +50,13 @@ async fn the_current_text_becomes_version_one_and_stored_readings_name_none() {
     crate::common::exec_unprepared(&db, RENAME_DOWN).await;
     crate::common::exec_unprepared(&db, DOWN).await;
 
-    seed_definition(&db, "derived_parameter_definitions", "DerivedVersioned", "a + b").await;
+    seed_definition(
+        &db,
+        "derived_parameter_definitions",
+        "DerivedVersioned",
+        "a + b",
+    )
+    .await;
     crate::common::exec_unprepared(
         &db,
         &format!(

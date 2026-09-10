@@ -155,10 +155,7 @@ pub fn validate_against_specs(
 /// audited and never acted on, so it is refused naming both what arrived and what is accepted.
 ///
 /// A null or empty object is no tunables at all, which every job accepts.
-pub fn reject_unknown_tunables(
-    tunables: &serde_json::Value,
-    known: &[&str],
-) -> Result<(), String> {
+pub fn reject_unknown_tunables(tunables: &serde_json::Value, known: &[&str]) -> Result<(), String> {
     if tunables.is_null() {
         return Ok(());
     }
@@ -286,11 +283,15 @@ pub fn build_registry() -> JobRegistry {
     }
     registry.register(Arc::new(super::jobs::ReprocessAll));
     registry.register(Arc::new(super::jobs::MeasurementRetag));
-    registry.register(Arc::new(super::jobs::SdEstimatorRetag));
+    registry.register(Arc::new(
+        crate::routes::private::sites::parameters::flows::SdEstimatorRetag,
+    ));
     registry.register(Arc::new(
         crate::routes::private::readings::import_job::CsvImport,
     ));
-    registry.register(Arc::new(super::jobs::AlarmBackfill));
+    registry.register(Arc::new(
+        crate::routes::private::alarms::flows::AlarmBackfill,
+    ));
     registry.register(Arc::new(super::jobs::BackfillAttribution));
     registry.register(Arc::new(super::jobs::BackfillCalibrations));
     registry.register(Arc::new(super::jobs::MergeSiteParameters));
@@ -300,9 +301,9 @@ pub fn build_registry() -> JobRegistry {
     registry.register(Arc::new(super::reconcile::ReplicateReconciliation));
     registry.register(Arc::new(super::reconcile::ReplicateReconciliationDelete));
     registry.register(Arc::new(
-        crate::routes::private::tools::chain::EventRecompute,
+        crate::routes::private::tools::models::EventRecompute,
     ));
-    registry.register(Arc::new(crate::routes::private::tools::chain::EventAudit));
+    registry.register(Arc::new(crate::routes::private::tools::models::EventAudit));
     registry
 }
 
@@ -312,21 +313,31 @@ pub fn build_registry() -> JobRegistry {
 /// from `registry.default_schedules()`.
 pub fn register_scheduled_services(registry: &mut JobRegistry, config: &crate::config::Config) {
     registry.register(Arc::new(super::jobs::JanitorRun::from_config(config)));
-    registry.register(Arc::new(super::jobs::AlarmSweep::from_config(config)));
-    registry.register(Arc::new(super::jobs::SyncEventSweep::from_config(config)));
-    registry.register(Arc::new(super::jobs::SyncLedgerRetention::from_config(
-        config,
-    )));
-    registry.register(Arc::new(super::jobs::SyncFullReassert::from_config(config)));
     registry.register(Arc::new(
-        super::jobs::PushSubscriptionReconcile::from_config(config),
+        crate::routes::private::alarms::flows::AlarmSweep::from_config(config),
     ));
-    registry.register(Arc::new(super::jobs::NotifyHealth::from_config(config)));
-    registry.register(Arc::new(super::jobs::DispatchNotifications::from_config(
-        config,
-    )));
     registry.register(Arc::new(
-        crate::routes::private::meteoswiss::sync::MeteoswissSync::from_config(config),
+        crate::routes::private::sync::flows::SyncEventSweep::from_config(config),
+    ));
+    registry.register(Arc::new(
+        crate::routes::private::sync::flows::SyncLedgerRetention::from_config(config),
+    ));
+    registry.register(Arc::new(
+        crate::routes::private::sync::flows::SyncFullReassert::from_config(config),
+    ));
+    registry.register(Arc::new(
+        crate::routes::private::notifications::flows::PushSubscriptionReconcile::from_config(
+            config,
+        ),
+    ));
+    registry.register(Arc::new(
+        crate::routes::private::notifications::flows::NotifyHealth::from_config(config),
+    ));
+    registry.register(Arc::new(
+        crate::routes::private::notifications::flows::DispatchNotifications::from_config(config),
+    ));
+    registry.register(Arc::new(
+        crate::routes::private::meteoswiss::flows::MeteoswissSync::from_config(config),
     ));
 
     // The policy tables in `registry` are keyed by trigger_type and cannot construct these, so the

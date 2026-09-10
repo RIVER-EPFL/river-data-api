@@ -4,7 +4,8 @@
 //!
 //! Run: cargo test --test notifications delivery_log -- --test-threads=1
 
-use river_db::routes::private::notifications::deliveries::{DeliveryQuery, list_deliveries};
+use river_db::routes::private::notifications::models::DeliveryQuery;
+use river_db::routes::private::notifications::service::list_deliveries;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 

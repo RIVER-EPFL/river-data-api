@@ -157,17 +157,15 @@ async fn set_enabled(app: &axum::Router, admin: &str, name: &str, enabled: bool)
 #[tokio::test]
 #[serial]
 async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
-    if !crate::common::profile::Service::Keycloak.require(
-        "two_tools_share_an_event_and_the_audit_and_executor_close_the_gap",
-    )
-    .await
+    if !crate::common::profile::Service::Keycloak
+        .require("two_tools_share_an_event_and_the_audit_and_executor_close_the_gap")
+        .await
     {
         return;
     }
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "two_tools_share_an_event_and_the_audit_and_executor_close_the_gap",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("two_tools_share_an_event_and_the_audit_and_executor_close_the_gap")
+        .await
     {
         return;
     }
@@ -526,17 +524,15 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
 #[serial]
 async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
     use sea_orm::ConnectionTrait;
-    if !crate::common::profile::Service::Keycloak.require(
-        "an_upstream_correction_surfaces_as_stale_and_recompute_converges",
-    )
-    .await
+    if !crate::common::profile::Service::Keycloak
+        .require("an_upstream_correction_surfaces_as_stale_and_recompute_converges")
+        .await
     {
         return;
     }
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "an_upstream_correction_surfaces_as_stale_and_recompute_converges",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("an_upstream_correction_surfaces_as_stale_and_recompute_converges")
+        .await
     {
         return;
     }
@@ -765,17 +761,15 @@ async fn an_upstream_correction_surfaces_as_stale_and_recompute_converges() {
 #[serial]
 async fn an_unchanged_visit_recomputes_nothing_and_a_changed_input_reruns_once() {
     use sea_orm::ConnectionTrait;
-    if !crate::common::profile::Service::Keycloak.require(
-        "an_unchanged_visit_recomputes_nothing_and_a_changed_input_reruns_once",
-    )
-    .await
+    if !crate::common::profile::Service::Keycloak
+        .require("an_unchanged_visit_recomputes_nothing_and_a_changed_input_reruns_once")
+        .await
     {
         return;
     }
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "an_unchanged_visit_recomputes_nothing_and_a_changed_input_reruns_once",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("an_unchanged_visit_recomputes_nothing_and_a_changed_input_reruns_once")
+        .await
     {
         return;
     }
@@ -1039,15 +1033,15 @@ async fn author_chain_with_failing_b(app: &axum::Router, admin: &str) {
 #[serial]
 async fn a_script_error_midway_skips_its_step_and_everything_downstream() {
     use sea_orm::ConnectionTrait;
-    if !crate::common::profile::Service::Keycloak.require("a_script_error_midway_skips_its_step_and_everything_downstream")
+    if !crate::common::profile::Service::Keycloak
+        .require("a_script_error_midway_skips_its_step_and_everything_downstream")
         .await
     {
         return;
     }
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_script_error_midway_skips_its_step_and_everything_downstream",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_script_error_midway_skips_its_step_and_everything_downstream")
+        .await
     {
         return;
     }
@@ -1158,9 +1152,12 @@ async fn a_script_error_midway_skips_its_step_and_everything_downstream() {
     assert_eq!(served(pc).await, None, "a step downstream of the raise ran");
 
     // What the job reports: both steps skipped, with the script's message on the one that raised.
-    let (status, job) =
-        crate::common::get_json_with_token(&app, &format!("/api/reprocessing_jobs/{job_id}"), &admin)
-            .await;
+    let (status, job) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/reprocessing_jobs/{job_id}"),
+        &admin,
+    )
+    .await;
     assert_eq!(status, 200, "{job}");
     assert_eq!(job["detail"]["counts"]["tools_skipped"], 2, "{job}");
     assert_eq!(job["detail"]["counts"]["readings_written"], 0, "{job}");
@@ -1238,9 +1235,11 @@ async fn a_script_error_midway_skips_its_step_and_everything_downstream() {
     .await;
     assert_eq!(status, 200, "audit enqueue: {audit}");
     let audit_job = audit["job_id"].as_str().expect("job id").to_string();
-    assert_eq!(e2e::poll_job(&app, &admin, &audit_job, 60).await, "completed");
-    let after =
-        serde_json::Value::Array(e2e::pending_event_findings(&app, &admin, &site_id).await);
+    assert_eq!(
+        e2e::poll_job(&app, &admin, &audit_job, 60).await,
+        "completed"
+    );
+    let after = serde_json::Value::Array(e2e::pending_event_findings(&app, &admin, &site_id).await);
     assert_eq!(
         after.as_array().unwrap().len(),
         2,

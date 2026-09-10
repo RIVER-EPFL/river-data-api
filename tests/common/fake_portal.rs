@@ -69,17 +69,41 @@ impl FakePortal {
         visits.insert(
             "S01".to_string(),
             vec![
-                Visit { at: at(1), single: Some(7.4), replicates: [Some(310.0), Some(316.0), Some(313.0)] },
-                Visit { at: at(8), single: Some(8.1), replicates: [Some(402.0), Some(398.0), None] },
-                Visit { at: at(15), single: Some(9.6), replicates: [Some(451.0), Some(449.0), Some(450.0)] },
+                Visit {
+                    at: at(1),
+                    single: Some(7.4),
+                    replicates: [Some(310.0), Some(316.0), Some(313.0)],
+                },
+                Visit {
+                    at: at(8),
+                    single: Some(8.1),
+                    replicates: [Some(402.0), Some(398.0), None],
+                },
+                Visit {
+                    at: at(15),
+                    single: Some(9.6),
+                    replicates: [Some(451.0), Some(449.0), Some(450.0)],
+                },
             ],
         );
         visits.insert(
             "S02".to_string(),
             vec![
-                Visit { at: at(1), single: Some(5.2), replicates: [Some(120.0), Some(124.0), Some(122.0)] },
-                Visit { at: at(8), single: None, replicates: [Some(133.0), Some(131.0), None] },
-                Visit { at: at(15), single: Some(6.9), replicates: [Some(140.0), Some(142.0), Some(141.0)] },
+                Visit {
+                    at: at(1),
+                    single: Some(5.2),
+                    replicates: [Some(120.0), Some(124.0), Some(122.0)],
+                },
+                Visit {
+                    at: at(8),
+                    single: None,
+                    replicates: [Some(133.0), Some(131.0), None],
+                },
+                Visit {
+                    at: at(15),
+                    single: Some(6.9),
+                    replicates: [Some(140.0), Some(142.0), Some(141.0)],
+                },
             ],
         );
         Self {
@@ -307,10 +331,7 @@ impl SourceBackend for FakePortal {
                             .and_then(|a| a.iter().find(|c| &c.column == member))
                             .map(|c| c.index)
                             .or_else(|| {
-                                i16::try_from(
-                                    FAMILY_MEMBERS.iter().position(|m| m == member)?,
-                                )
-                                .ok()
+                                i16::try_from(FAMILY_MEMBERS.iter().position(|m| m == member)?).ok()
                             })
                             .ok_or_else(|| format!("no index for {member}"))?;
                         let mut reading = IngestReading::new(visit.at, value);
@@ -367,7 +388,8 @@ pub async fn enrolled_service(
     use axum::extract::State;
     use river_data_core::client::{ControlPlaneClient, RiverDataClient, SyncDriver};
     use river_data_core::models::RunnerConfig;
-    use river_db::routes::private::sync::operator::{CreateCredentialRequest, create_credential};
+    use river_db::routes::private::sync::models::CreateCredentialRequest;
+    use river_db::routes::private::sync::views::create_credential;
 
     let Json(minted) = create_credential(
         State(state.clone()),

@@ -7,7 +7,6 @@ use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 use uuid::Uuid;
 
-
 async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
     let f = crate::common::seeded_app().await;
     (f.db, f.app, f.token)
@@ -79,7 +78,10 @@ async fn rerun_replays_a_sensor_reprocess_as_a_new_job() {
     );
     assert_eq!(row.try_get::<Uuid>("", "sensor_id").unwrap(), sensor_id);
 
-    assert_eq!(crate::common::jobs::wait_for_job(&db, &rerun).await, "completed");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&db, &rerun).await,
+        "completed"
+    );
     crate::common::cleanup_test_db(&db).await;
 }
 
@@ -135,7 +137,10 @@ async fn rerun_replays_a_backdate_from_its_stored_params() {
     let rerun = job_id_of(&text);
     assert_ne!(rerun, job_id.to_string(), "the rerun is a new row");
 
-    assert_eq!(crate::common::jobs::wait_for_job(&db, &rerun).await, "completed");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&db, &rerun).await,
+        "completed"
+    );
     crate::common::cleanup_test_db(&db).await;
 }
 
@@ -214,9 +219,12 @@ async fn a_job_row_states_whether_it_can_be_rerun_and_cancelled() {
     assert_eq!(body["rerunnable"], serde_json::json!(true));
     assert_eq!(body["cancellable"], serde_json::json!(true));
 
-    let (status, body) =
-        crate::common::get_json_with_token(&app, &format!("/api/reprocessing_jobs/{import}"), &token)
-            .await;
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/reprocessing_jobs/{import}"),
+        &token,
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["rerunnable"], serde_json::json!(false));
     assert_eq!(body["cancellable"], serde_json::json!(true));

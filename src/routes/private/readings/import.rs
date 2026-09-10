@@ -12,9 +12,7 @@
 //! align this file" before the operator confirms.
 
 use axum::{Json, extract::State};
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Statement,
-};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -24,10 +22,13 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::data_streams;
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
+use crate::routes::private::parameters;
 use crate::routes::private::readings::batch::{ConflictMode, admission};
 use crate::routes::private::readings::checks;
-use crate::routes::private::sensors::identity::{ResolvedOwner, resolve_slot_owner_for_times};
+use crate::routes::private::sensors::models::{ResolvedOwner};
+use crate::routes::private::sensors::service::{resolve_slot_owner_for_times};
 use crate::routes::private::sensors::standard_curves;
 use crate::routes::resolve_site_with_project;
 
@@ -463,19 +464,10 @@ pub async fn import_csv(
         .collect::<AppResult<HashSet<Uuid>>>()?;
 
     // Global catalog fallback: lower(name) -> id, lower(alias) -> id.
-    let catalog_rows = state
-        .db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, code, aliases FROM parameters".to_owned(),
-        ))
-        .await?;
+    let catalog_rows = parameters::Entity::find().all(&state.db).await?;
     let mut catalog: HashMap<String, Uuid> = HashMap::new();
-    for row in &catalog_rows {
-        let Ok(row) = CatalogColumnRow::from_query_result(row, "") else {
-            continue;
-        };
-        let (pid, name, aliases) = (row.id, row.code.unwrap_or_default(), row.aliases.unwrap_or_default());
+    for row in catalog_rows {
+        let (pid, name, aliases) = (row.id, row.code, row.aliases);
         catalog.insert(name.to_lowercase(), pid);
         for alias in &aliases {
             catalog.insert(alias.to_lowercase(), pid);
@@ -781,16 +773,11 @@ pub async fn import_csv(
         stream_ids.dedup();
         let mut stream_default: HashMap<Uuid, Option<String>> = HashMap::new();
         if !stream_ids.is_empty() {
-            for row in state
-                .db
-                .query_all_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT id, measurement_type FROM data_streams WHERE id = ANY($1)",
-                    [stream_ids.into()],
-                ))
+            for row in data_streams::Entity::find()
+                .filter(data_streams::Column::Id.is_in(stream_ids))
+                .all(&state.db)
                 .await?
             {
-                let row = StreamDefaultRow::from_query_result(&row, "")?;
                 stream_default.insert(row.id, row.measurement_type);
             }
         }
@@ -953,17 +940,15 @@ pub async fn import_csv(
         ids.sort_unstable();
         ids.dedup();
         let mut map = HashMap::new();
-        for row in state
-            .db
-            .query_all_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT id, sensor_id FROM data_streams WHERE id = ANY($1) AND sensor_id IS NOT NULL",
-                [ids.into()],
-            ))
+        for row in data_streams::Entity::find()
+            .filter(data_streams::Column::Id.is_in(ids))
+            .filter(data_streams::Column::SensorId.is_not_null())
+            .all(&state.db)
             .await?
         {
-            let row = StreamSensorRow::from_query_result(&row, "")?;
-            map.insert(row.id, row.sensor_id);
+            if let Some(sensor_id) = row.sensor_id {
+                map.insert(row.id, sensor_id);
+            }
         }
         map
     };
@@ -1285,7 +1270,7 @@ const TOOL_IMPORT_ROW_CAP: usize = 500;
 /// A header of the form `{name}_rep_{k}` or `{name}_{k}` (k from 1) naming position k-1 of a
 /// `replicates` param.
 fn replicate_column(
-    params: &[crate::routes::private::tools::engine::ManifestParam],
+    params: &[crate::routes::private::tools::models::ManifestParam],
     header: &str,
 ) -> Option<(String, Option<usize>)> {
     let lower = header.to_ascii_lowercase();
@@ -1303,7 +1288,7 @@ fn replicate_column(
 /// A header naming one of the tool's curve slots (case-insensitive): its cells are standard curve
 /// ids, one per row.
 fn curve_column(
-    curves: &[crate::routes::private::tools::engine::ManifestCurve],
+    curves: &[crate::routes::private::tools::models::ManifestCurve],
     header: &str,
 ) -> Option<String> {
     curves
@@ -1336,7 +1321,7 @@ fn row_curves(
 /// param declares. The run applied it to what it computed; the stored replicate is raw, so the
 /// reference is what makes the database apply it there too.
 fn replicate_curve(
-    params: &[crate::routes::private::tools::engine::ManifestParam],
+    params: &[crate::routes::private::tools::models::ManifestParam],
     param: &str,
     curves: &HashMap<String, Uuid>,
 ) -> Option<Uuid> {
@@ -1375,7 +1360,8 @@ async fn import_tool_csv(
     use crate::routes::private::readings::grab_samples::{
         GrabSampleReading, GrabSampleRequest, GrabWriteMode, insert_grab_samples,
     };
-    use crate::routes::private::tools::{engine, execute_and_store_run};
+    use crate::routes::private::tools::flows::execute_and_store_run;
+    use crate::routes::private::tools::service as engine;
 
     let tool = engine::find_active_tool(&state.db, tool_name).await?;
 
@@ -1661,7 +1647,11 @@ async fn import_tool_csv(
                 Some(v) => v.as_f64().into_iter().collect(),
                 None => Vec::new(),
             };
-            cells.extend(values.into_iter().map(|v| (row.line, *parameter_id, row.time, v)));
+            cells.extend(
+                values
+                    .into_iter()
+                    .map(|v| (row.line, *parameter_id, row.time, v)),
+            );
         }
     }
     let check = Some(screen_import(state, auth, req, site.id, &cells).await?);
@@ -1829,13 +1819,6 @@ struct SlotColumnRow {
 }
 
 #[derive(FromQueryResult)]
-struct CatalogColumnRow {
-    id: Uuid,
-    code: Option<String>,
-    aliases: Option<Vec<String>>,
-}
-
-#[derive(FromQueryResult)]
 struct FamilyKeyRow {
     id: Uuid,
     source_key: String,
@@ -1848,18 +1831,6 @@ struct SlotStreamRow {
 }
 
 #[derive(FromQueryResult)]
-struct StreamDefaultRow {
-    id: Uuid,
-    measurement_type: Option<String>,
-}
-
-#[derive(FromQueryResult)]
-struct StreamSensorRow {
-    id: Uuid,
-    sensor_id: Uuid,
-}
-
-#[derive(FromQueryResult)]
 struct StoredValueRow {
     parameter_id: Uuid,
     time: sea_orm::prelude::DateTimeWithTimeZone,
@@ -1868,78 +1839,5 @@ struct StoredValueRow {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::routes::private::tools::engine::{ManifestCurve, ManifestParam};
-
-    fn slots() -> Vec<ManifestCurve> {
-        vec![ManifestCurve {
-            name: "std_curve".into(),
-            label: "Standard curve".into(),
-            required: false,
-            description: None,
-        }]
-    }
-
-    fn doc_params() -> Vec<ManifestParam> {
-        serde_json::from_value(serde_json::json!([
-            { "name": "DOC", "label": "DOC", "kind": "replicates",
-              "parameter_code": "DOC", "curve": "std_curve" },
-            { "name": "volume", "label": "Volume", "kind": "number" }
-        ]))
-        .unwrap()
-    }
-
-    const CURVE_A: Uuid = Uuid::from_u128(0xa);
-    const CURVE_B: Uuid = Uuid::from_u128(0xb);
-
-    #[test]
-    fn test_curve_column_matches_a_slot_name_case_insensitively() {
-        assert_eq!(
-            curve_column(&slots(), "STD_Curve").as_deref(),
-            Some("std_curve")
-        );
-        assert_eq!(curve_column(&slots(), "DOC_rep_1"), None);
-    }
-
-    #[test]
-    fn test_row_curves_cell_overrides_the_request_default() {
-        let defaults = HashMap::from([("std_curve".to_string(), CURVE_A)]);
-        let curves = row_curves(&defaults, &[("std_curve", &CURVE_B.to_string())]).unwrap();
-        assert_eq!(curves["std_curve"], CURVE_B);
-    }
-
-    #[test]
-    fn test_row_curves_blank_cell_keeps_the_request_default() {
-        let defaults = HashMap::from([("std_curve".to_string(), CURVE_A)]);
-        let curves = row_curves(&defaults, &[("std_curve", "  ")]).unwrap();
-        assert_eq!(curves["std_curve"], CURVE_A);
-    }
-
-    #[test]
-    fn test_row_curves_without_a_column_or_default_names_nothing() {
-        assert!(row_curves(&HashMap::new(), &[]).unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_row_curves_rejects_a_cell_that_is_not_an_id() {
-        let err = row_curves(&HashMap::new(), &[("std_curve", "plate 3")]).unwrap_err();
-        assert!(
-            err.contains("std_curve") && err.contains("plate 3"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn test_replicate_curve_is_the_slot_the_param_declares() {
-        let curves = HashMap::from([("std_curve".to_string(), CURVE_A)]);
-        assert_eq!(
-            replicate_curve(&doc_params(), "DOC", &curves),
-            Some(CURVE_A)
-        );
-        // A param declaring no slot carries nothing, whatever the row resolved.
-        assert_eq!(replicate_curve(&doc_params(), "volume", &curves), None);
-        // A declared slot the row left empty carries nothing.
-        assert_eq!(replicate_curve(&doc_params(), "DOC", &HashMap::new()), None);
-    }
-}
+#[path = "tests/import.rs"]
+mod tests;

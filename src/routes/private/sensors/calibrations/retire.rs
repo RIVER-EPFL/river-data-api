@@ -11,7 +11,10 @@ use axum::{
     extract::{Path, State},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QuerySelect, Statement,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -103,7 +106,9 @@ async fn counts<C: ConnectionTrait>(
             [id.into(), sensor_id.into()],
         ))
         .await?
-        .ok_or_else(|| AppError::Internal("counting the curve's readings returned no row".into()))?;
+        .ok_or_else(|| {
+            AppError::Internal("counting the curve's readings returned no row".into())
+        })?;
     let counts = RetireCounts::from_query_result(&row, "")?;
     Ok((
         counts.readings,
@@ -185,14 +190,22 @@ pub async fn retire_calibration(
         // The projection moved `calibration_id`; the value each reading serves is whatever the
         // curves it now names produce, including none at all.
         super::service::recompose_decided_rows(txn, set_id).await?;
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE sensor_calibrations
-                SET retired_at = now(), retired_by = $2, retired_reason = $3
-              WHERE id = $1",
-            [id.into(), actor.clone().into(), req.reason.clone().into()],
-        ))
-        .await?;
+        super::model::Entity::update_many()
+            .col_expr(
+                super::model::Column::RetiredAt,
+                Expr::current_timestamp().into(),
+            )
+            .col_expr(
+                super::model::Column::RetiredBy,
+                Expr::value(Some(actor.clone())),
+            )
+            .col_expr(
+                super::model::Column::RetiredReason,
+                Expr::value(req.reason.clone()),
+            )
+            .filter(super::model::Column::Id.eq(id))
+            .exec(txn)
+            .await?;
         Ok(set_id)
     })
     .await?;
@@ -271,20 +284,26 @@ pub async fn unretire_calibration(
     let set = latest_set(&state.db, id).await?;
     let restored = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let restored = if let Some(set_id) = set {
-            let (n, _) = decisions::rollback_set(txn, set_id, &actor, Some("curve unretired")).await?;
+            let (n, _) =
+                decisions::rollback_set(txn, set_id, &actor, Some("curve unretired")).await?;
             super::service::recompose_decided_rows(txn, set_id).await?;
             n
         } else {
             0
         };
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE sensor_calibrations
-                SET retired_at = NULL, retired_by = NULL, retired_reason = NULL
-              WHERE id = $1",
-            [id.into()],
-        ))
-        .await?;
+        super::model::Entity::update_many()
+            .col_expr(
+                super::model::Column::RetiredAt,
+                Expr::value(None::<chrono::DateTime<Utc>>),
+            )
+            .col_expr(super::model::Column::RetiredBy, Expr::value(None::<String>))
+            .col_expr(
+                super::model::Column::RetiredReason,
+                Expr::value(None::<String>),
+            )
+            .filter(super::model::Column::Id.eq(id))
+            .exec(txn)
+            .await?;
         Ok(restored)
     })
     .await?;
@@ -309,26 +328,15 @@ pub async fn unretire_calibration(
 }
 
 /// A curve's instrument and whether it has been retired.
-#[derive(FromQueryResult)]
-struct CurveState {
-    sensor_id: Uuid,
-    retired_at: Option<sea_orm::prelude::DateTimeWithTimeZone>,
-}
-
 async fn load<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<(Uuid, Option<DateTime<Utc>>)> {
-    let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT sensor_id, retired_at FROM sensor_calibrations WHERE id = $1",
-            [id.into()],
-        ))
+    super::model::Entity::find_by_id(id)
+        .select_only()
+        .column(super::model::Column::SensorId)
+        .column(super::model::Column::RetiredAt)
+        .into_tuple::<(Uuid, Option<DateTime<Utc>>)>()
+        .one(conn)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("Calibration {id} not found")))?;
-    let curve = CurveState::from_query_result(&row, "")?;
-    Ok((
-        curve.sensor_id,
-        curve.retired_at.map(|t| t.with_timezone(&Utc)),
-    ))
+        .ok_or_else(|| AppError::NotFound(format!("Calibration {id} not found")))
 }
 
 /// The retirement's own decision set: the newest one this curve opened that has not been rolled

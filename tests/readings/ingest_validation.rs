@@ -167,7 +167,10 @@ async fn bucket(
 #[tokio::test]
 #[serial]
 async fn batch_overwrite_keeps_the_sample_link_of_the_reading_it_corrects() {
-    if !crate::common::profile::Service::Keycloak.require("batch_overwrite_keeps_the_sample_link").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("batch_overwrite_keeps_the_sample_link")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -332,7 +335,10 @@ async fn batch_overwrite_keeps_the_sample_link_of_the_reading_it_corrects() {
 #[tokio::test]
 #[serial]
 async fn csv_overwrite_replaces_a_synced_reading_instead_of_duplicating_the_slot() {
-    if !crate::common::profile::Service::Keycloak.require("csv_overwrite_replaces_a_synced_reading").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("csv_overwrite_replaces_a_synced_reading")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -436,7 +442,10 @@ async fn csv_overwrite_replaces_a_synced_reading_instead_of_duplicating_the_slot
 #[tokio::test]
 #[serial]
 async fn ingest_refuses_timestamps_outside_the_window_batch_already_enforces() {
-    if !crate::common::profile::Service::Keycloak.require("ingest_refuses_timestamps_outside_the_window").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("ingest_refuses_timestamps_outside_the_window")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -556,7 +565,10 @@ async fn ingest_refuses_timestamps_outside_the_window_batch_already_enforces() {
 #[tokio::test]
 #[serial]
 async fn csv_import_refuses_a_non_finite_cell_and_leaves_the_bucket_computable() {
-    if !crate::common::profile::Service::Keycloak.require("csv_import_refuses_a_non_finite_cell").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("csv_import_refuses_a_non_finite_cell")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -652,7 +664,10 @@ async fn csv_import_refuses_a_non_finite_cell_and_leaves_the_bucket_computable()
 #[tokio::test]
 #[serial]
 async fn csv_import_treats_every_spelling_of_the_sentinel_as_missing() {
-    if !crate::common::profile::Service::Keycloak.require("csv_import_treats_every_spelling_of_the_sentinel").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("csv_import_treats_every_spelling_of_the_sentinel")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -743,7 +758,10 @@ async fn csv_import_treats_every_spelling_of_the_sentinel_as_missing() {
 #[tokio::test]
 #[serial]
 async fn csv_import_refuses_a_duplicated_timestamp_in_a_continuous_file() {
-    if !crate::common::profile::Service::Keycloak.require("csv_import_refuses_a_duplicated_timestamp").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("csv_import_refuses_a_duplicated_timestamp")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -930,7 +948,10 @@ async fn csv_import_refuses_a_duplicated_timestamp_in_a_continuous_file() {
 #[tokio::test]
 #[serial]
 async fn a_single_replicate_grab_reaches_the_sensor_vs_grab_export() {
-    if !crate::common::profile::Service::Keycloak.require("a_single_replicate_grab_reaches_the_export").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("a_single_replicate_grab_reaches_the_export")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -1087,7 +1108,10 @@ async fn a_single_replicate_grab_reaches_the_sensor_vs_grab_export() {
 #[tokio::test]
 #[serial]
 async fn csv_import_does_not_shift_a_timestamp_that_carries_its_own_offset() {
-    if !crate::common::profile::Service::Keycloak.require("csv_import_does_not_shift_an_offset_timestamp").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("csv_import_does_not_shift_an_offset_timestamp")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;

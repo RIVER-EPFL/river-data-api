@@ -220,7 +220,8 @@ async fn seed_claimable_history(
 #[tokio::test]
 #[serial]
 async fn alarm_thresholds_confines_slots_to_the_callers_projects() {
-    if !crate::common::profile::Service::Keycloak.require("alarm_thresholds_confines_slots_to_the_callers_projects")
+    if !crate::common::profile::Service::Keycloak
+        .require("alarm_thresholds_confines_slots_to_the_callers_projects")
         .await
     {
         return;
@@ -296,7 +297,8 @@ async fn alarm_thresholds_confines_slots_to_the_callers_projects() {
 #[tokio::test]
 #[serial]
 async fn parameter_merges_hold_the_administrator_and_project_gates() {
-    if !crate::common::profile::Service::Keycloak.require("parameter_merges_hold_the_administrator_and_project_gates")
+    if !crate::common::profile::Service::Keycloak
+        .require("parameter_merges_hold_the_administrator_and_project_gates")
         .await
     {
         return;
@@ -470,10 +472,9 @@ async fn parameter_merges_hold_the_administrator_and_project_gates() {
 #[tokio::test]
 #[serial]
 async fn slot_merge_holds_the_administrator_gate_inside_a_granted_project() {
-    if !crate::common::profile::Service::Keycloak.require(
-        "slot_merge_holds_the_administrator_gate_inside_a_granted_project",
-    )
-    .await
+    if !crate::common::profile::Service::Keycloak
+        .require("slot_merge_holds_the_administrator_gate_inside_a_granted_project")
+        .await
     {
         return;
     }
@@ -580,10 +581,9 @@ async fn slot_merge_holds_the_administrator_gate_inside_a_granted_project() {
 #[tokio::test]
 #[serial]
 async fn rollback_deployment_needs_the_same_capability_as_deleting_the_deployment() {
-    if !crate::common::profile::Service::Keycloak.require(
-        "rollback_deployment_needs_the_same_capability_as_deleting_the_deployment",
-    )
-    .await
+    if !crate::common::profile::Service::Keycloak
+        .require("rollback_deployment_needs_the_same_capability_as_deleting_the_deployment")
+        .await
     {
         return;
     }
@@ -750,10 +750,9 @@ async fn rollback_deployment_needs_the_same_capability_as_deleting_the_deploymen
 #[tokio::test]
 #[serial]
 async fn sensor_lifecycle_actions_refuse_another_projects_site_and_sensors() {
-    if !crate::common::profile::Service::Keycloak.require(
-        "sensor_lifecycle_actions_refuse_another_projects_site_and_sensors",
-    )
-    .await
+    if !crate::common::profile::Service::Keycloak
+        .require("sensor_lifecycle_actions_refuse_another_projects_site_and_sensors")
+        .await
     {
         return;
     }
@@ -953,10 +952,9 @@ async fn sensor_lifecycle_actions_refuse_another_projects_site_and_sensors() {
 #[tokio::test]
 #[serial]
 async fn backfill_and_calibration_candidates_confine_to_the_callers_projects() {
-    if !crate::common::profile::Service::Keycloak.require(
-        "backfill_and_calibration_candidates_confine_to_the_callers_projects",
-    )
-    .await
+    if !crate::common::profile::Service::Keycloak
+        .require("backfill_and_calibration_candidates_confine_to_the_callers_projects")
+        .await
     {
         return;
     }
@@ -974,10 +972,24 @@ async fn backfill_and_calibration_candidates_confine_to_the_callers_projects() {
     )
     .await;
 
-    let (sensor_a, deployment_a) =
-        seed_claimable_history(&db, &app, &admin, &scene.site_a, &scene.parameter, "RD005-A").await;
-    let (sensor_b, deployment_b) =
-        seed_claimable_history(&db, &app, &admin, &scene.site_b, &scene.parameter, "RD005-B").await;
+    let (sensor_a, deployment_a) = seed_claimable_history(
+        &db,
+        &app,
+        &admin,
+        &scene.site_a,
+        &scene.parameter,
+        "RD005-A",
+    )
+    .await;
+    let (sensor_b, deployment_b) = seed_claimable_history(
+        &db,
+        &app,
+        &admin,
+        &scene.site_b,
+        &scene.parameter,
+        "RD005-B",
+    )
+    .await;
 
     // Controls: the CRUD reads of the same inventory already confine.
     let (status, body) =
@@ -1083,10 +1095,9 @@ async fn backfill_and_calibration_candidates_confine_to_the_callers_projects() {
 #[tokio::test]
 #[serial]
 async fn site_targeted_actions_refuse_a_site_outside_the_callers_grants() {
-    if !crate::common::profile::Service::Keycloak.require(
-        "site_targeted_actions_refuse_a_site_outside_the_callers_grants",
-    )
-    .await
+    if !crate::common::profile::Service::Keycloak
+        .require("site_targeted_actions_refuse_a_site_outside_the_callers_grants")
+        .await
     {
         return;
     }
@@ -1111,8 +1122,24 @@ async fn site_targeted_actions_refuse_a_site_outside_the_callers_grants() {
 
     // `backfill_attribution` 400s when nothing is claimable, so both sites get a claimable slot and
     // the current behaviour on the out-of-scope call is a clean success rather than a bad request.
-    seed_claimable_history(&db, &app, &admin, &scene.site_a, &scene.parameter, "RD006-A").await;
-    seed_claimable_history(&db, &app, &admin, &scene.site_b, &scene.parameter, "RD006-B").await;
+    seed_claimable_history(
+        &db,
+        &app,
+        &admin,
+        &scene.site_a,
+        &scene.parameter,
+        "RD006-A",
+    )
+    .await;
+    seed_claimable_history(
+        &db,
+        &app,
+        &admin,
+        &scene.site_b,
+        &scene.parameter,
+        "RD006-B",
+    )
+    .await;
 
     let window_start = days_ago(30);
     let window_end = days_ago(0);
@@ -1258,7 +1285,9 @@ async fn frames_until(
 #[tokio::test]
 #[serial]
 async fn granted_members_receive_job_frames_on_the_event_stream() {
-    if !crate::common::profile::Service::Keycloak.require("granted_members_receive_job_frames_on_the_event_stream").await
+    if !crate::common::profile::Service::Keycloak
+        .require("granted_members_receive_job_frames_on_the_event_stream")
+        .await
     {
         return;
     }
@@ -1317,7 +1346,10 @@ async fn granted_members_receive_job_frames_on_the_event_stream() {
 #[tokio::test]
 #[serial]
 async fn listing_sync_credentials_is_administrator_only() {
-    if !crate::common::profile::Service::Keycloak.require("listing_sync_credentials_is_administrator_only").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("listing_sync_credentials_is_administrator_only")
+        .await
+    {
         return;
     }
     let db = fresh_db().await;
@@ -1384,7 +1416,8 @@ async fn listing_sync_credentials_is_administrator_only() {
 #[tokio::test]
 #[serial]
 async fn alarm_acknowledgement_and_job_logs_are_confined_by_project() {
-    if !crate::common::profile::Service::Keycloak.require("alarm_acknowledgement_and_job_logs_are_confined_by_project")
+    if !crate::common::profile::Service::Keycloak
+        .require("alarm_acknowledgement_and_job_logs_are_confined_by_project")
         .await
     {
         return;

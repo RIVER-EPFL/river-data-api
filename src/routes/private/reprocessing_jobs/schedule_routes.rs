@@ -7,7 +7,7 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -59,20 +59,11 @@ pub async fn run_now(
     }
 
     // Snapshot the schedule's tunables so a manual run mirrors a scheduled one; no row → `{}`.
-    let tunables: serde_json::Value = state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT tunables FROM schedules WHERE job_name = $1",
-            [job_name.clone().into()],
-        ))
+    let tunables = super::schedule_model::Entity::find()
+        .filter(super::schedule_model::Column::JobName.eq(job_name.clone()))
+        .one(&state.db)
         .await?
-        .and_then(|r| {
-            r.try_get::<Option<serde_json::Value>>("", "tunables")
-                .ok()
-                .flatten()
-        })
-        .unwrap_or_else(|| serde_json::json!({}));
+        .map_or_else(|| serde_json::json!({}), |row| row.tunables);
 
     // Per-second dedupe key so an accidental double-click collapses to one run; a deliberate second
     // run in a later second is allowed.

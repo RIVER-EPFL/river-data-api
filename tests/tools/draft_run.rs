@@ -72,14 +72,16 @@ async fn authoring_rows(db: &DatabaseConnection) -> Vec<i64> {
 #[tokio::test]
 #[serial]
 async fn a_draft_runs_against_the_catalog_and_stores_nothing() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_draft_runs_against_the_catalog_and_stores_nothing",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_draft_runs_against_the_catalog_and_stores_nothing")
+        .await
     {
         return;
     }
-    if !crate::common::profile::Service::Keycloak.require("tool_script_draft_run").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("tool_script_draft_run")
+        .await
+    {
         return;
     }
     let (db, app, admin) = setup().await;
@@ -143,14 +145,16 @@ async fn a_draft_runs_against_the_catalog_and_stores_nothing() {
 #[tokio::test]
 #[serial]
 async fn a_draft_body_the_manifest_refuses_is_reported_with_the_findings() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_draft_body_the_manifest_refuses_is_reported_with_the_findings",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_draft_body_the_manifest_refuses_is_reported_with_the_findings")
+        .await
     {
         return;
     }
-    if !crate::common::profile::Service::Keycloak.require("tool_script_draft_run_manifest").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("tool_script_draft_run_manifest")
+        .await
+    {
         return;
     }
     let (_db, app, admin) = setup().await;
@@ -205,7 +209,10 @@ async fn a_draft_body_the_manifest_refuses_is_reported_with_the_findings() {
 #[tokio::test]
 #[serial]
 async fn an_unreadable_draft_manifest_is_refused_by_path() {
-    if !crate::common::profile::Service::Keycloak.require("tool_script_draft_run_bad_manifest").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("tool_script_draft_run_bad_manifest")
+        .await
+    {
         return;
     }
     let (_db, app, admin) = setup().await;
@@ -234,14 +241,16 @@ async fn an_unreadable_draft_manifest_is_refused_by_path() {
 #[tokio::test]
 #[serial]
 async fn a_draft_whose_script_raises_reports_the_failure_and_the_findings_together() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_draft_whose_script_raises_reports_the_failure_and_the_findings_together",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_draft_whose_script_raises_reports_the_failure_and_the_findings_together")
+        .await
     {
         return;
     }
-    if !crate::common::profile::Service::Keycloak.require("tool_script_draft_run_script_error").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("tool_script_draft_run_script_error")
+        .await
+    {
         return;
     }
     let (_db, app, admin) = setup().await;
@@ -294,7 +303,10 @@ async fn a_draft_whose_script_raises_reports_the_failure_and_the_findings_togeth
 #[tokio::test]
 #[serial]
 async fn a_draft_against_an_absent_runner_reports_it_with_the_findings() {
-    if !crate::common::profile::Service::Keycloak.require("tool_script_draft_run_absent_runner").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("tool_script_draft_run_absent_runner")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -354,14 +366,16 @@ async fn a_draft_against_an_absent_runner_reports_it_with_the_findings() {
 #[tokio::test]
 #[serial]
 async fn a_draft_reports_its_lint_findings_alongside_the_result() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_draft_reports_its_lint_findings_alongside_the_result",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_draft_reports_its_lint_findings_alongside_the_result")
+        .await
     {
         return;
     }
-    if !crate::common::profile::Service::Keycloak.require("tool_script_draft_run_lint").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("tool_script_draft_run_lint")
+        .await
+    {
         return;
     }
     let (_db, app, admin) = setup().await;
@@ -401,14 +415,16 @@ async fn a_draft_reports_its_lint_findings_alongside_the_result() {
 #[tokio::test]
 #[serial]
 async fn a_draft_naming_an_unknown_constant_runs_and_reports_it() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_draft_naming_an_unknown_constant_runs_and_reports_it",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_draft_naming_an_unknown_constant_runs_and_reports_it")
+        .await
     {
         return;
     }
-    if !crate::common::profile::Service::Keycloak.require("tool_script_draft_run_unknown_constant").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("tool_script_draft_run_unknown_constant")
+        .await
+    {
         return;
     }
     let (_db, app, admin) = setup().await;

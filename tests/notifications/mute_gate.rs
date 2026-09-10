@@ -8,9 +8,10 @@
 use std::sync::{Arc, Mutex};
 
 use river_db::common::AppState;
-use river_db::routes::private::notifications::{
-    DeliveryResult, NotificationChannel, OutgoingMessage, dispatcher, triggers,
+use river_db::routes::private::notifications::models::{
+    DeliveryResult, NotificationChannel, OutgoingMessage,
 };
+use river_db::routes::private::notifications::flows;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 
@@ -110,7 +111,7 @@ async fn a_muted_slot_raises_no_stale_data_alert() {
     mute(&db, crate::common::GLOBAL_PARAM_TURB_ID, "NULL").await;
 
     let sent = Arc::new(Mutex::new(Vec::new()));
-    triggers::run(&state, &channels(&sent)).await;
+    flows::run(&state, &channels(&sent)).await;
 
     assert!(
         of_kind(&sent.lock().unwrap(), "stale_data").is_empty(),
@@ -164,7 +165,7 @@ async fn an_expired_mute_does_not_suppress() {
     .await;
 
     let sent = Arc::new(Mutex::new(Vec::new()));
-    triggers::run(&state, &channels(&sent)).await;
+    flows::run(&state, &channels(&sent)).await;
 
     assert_eq!(
         of_kind(&sent.lock().unwrap(), "stale_data").len(),
@@ -185,7 +186,7 @@ async fn a_mute_on_a_neighbouring_slot_does_not_suppress() {
     mute(&db, crate::common::GLOBAL_PARAM_TEMP_ID, "NULL").await;
 
     let sent = Arc::new(Mutex::new(Vec::new()));
-    triggers::run(&state, &channels(&sent)).await;
+    flows::run(&state, &channels(&sent)).await;
 
     let stale = of_kind(&sent.lock().unwrap(), "stale_data").len();
     assert_eq!(
@@ -226,7 +227,7 @@ async fn a_message_without_a_slot_is_never_muted() {
     .await;
 
     let sent = Arc::new(Mutex::new(Vec::new()));
-    triggers::run(&state, &channels(&sent)).await;
+    flows::run(&state, &channels(&sent)).await;
 
     assert_eq!(
         of_kind(&sent.lock().unwrap(), "sync_failure").len(),
@@ -258,7 +259,7 @@ async fn a_mute_added_after_the_open_alert_suppresses_the_resolution_notice() {
     mute(&db, crate::common::GLOBAL_PARAM_TURB_ID, "NULL").await;
 
     let sent = Arc::new(Mutex::new(Vec::new()));
-    dispatcher::dispatch_once(&state, &channels(&sent)).await;
+    flows::dispatch_once(&state, &channels(&sent)).await;
 
     assert!(
         of_kind(&sent.lock().unwrap(), "alarm_resolved").is_empty(),

@@ -11,7 +11,6 @@ use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 use uuid::Uuid;
 
-
 async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
     let f = crate::common::seeded_app().await;
     (f.db, f.app, f.token)

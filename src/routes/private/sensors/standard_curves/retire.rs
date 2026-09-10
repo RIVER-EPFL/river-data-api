@@ -10,11 +10,13 @@ use axum::{
     extract::{Path, State},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Statement};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use super::model::{Column, Entity};
 use crate::common::AppState;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
@@ -61,15 +63,12 @@ pub async fn retire_standard_curve(
             "Standard curve {id} is already retired"
         )));
     }
-    state
-        .db
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE standard_curves
-                SET retired_at = now(), retired_by = $2, retired_reason = $3
-              WHERE id = $1",
-            [id.into(), actor.into(), req.reason.into()],
-        ))
+    Entity::update_many()
+        .col_expr(Column::RetiredAt, Expr::current_timestamp())
+        .col_expr(Column::RetiredBy, Expr::value(Some(actor)))
+        .col_expr(Column::RetiredReason, Expr::value(req.reason))
+        .filter(Column::Id.eq(id))
+        .exec(&state.db)
         .await?;
     Ok(Json(RetireCurveResponse {
         standard_curve_id: id,
@@ -99,15 +98,12 @@ pub async fn unretire_standard_curve(
             "Standard curve {id} is not retired"
         )));
     }
-    state
-        .db
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE standard_curves
-                SET retired_at = NULL, retired_by = NULL, retired_reason = NULL
-              WHERE id = $1",
-            [id.into()],
-        ))
+    Entity::update_many()
+        .col_expr(Column::RetiredAt, Expr::value(None::<DateTime<Utc>>))
+        .col_expr(Column::RetiredBy, Expr::value(None::<String>))
+        .col_expr(Column::RetiredReason, Expr::value(None::<String>))
+        .filter(Column::Id.eq(id))
+        .exec(&state.db)
         .await?;
     Ok(Json(RetireCurveResponse {
         standard_curve_id: id,
@@ -117,17 +113,11 @@ pub async fn unretire_standard_curve(
 }
 
 async fn retired_at<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<Option<DateTime<Utc>>> {
-    let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT retired_at FROM standard_curves WHERE id = $1",
-            [id.into()],
-        ))
+    let curve = Entity::find_by_id(id)
+        .one(conn)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Standard curve {id} not found")))?;
-    Ok(row
-        .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "retired_at")?
-        .map(|t| t.with_timezone(&Utc)))
+    Ok(curve.retired_at)
 }
 
 async fn readings_using<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<i64> {

@@ -52,11 +52,7 @@ async fn seed_spot_groups(db: &sea_orm::DatabaseConnection) -> Uuid {
     stream_id
 }
 
-async fn read(
-    app: &axum::Router,
-    token: &str,
-    extra: &str,
-) -> serde_json::Value {
+async fn read(app: &axum::Router, token: &str, extra: &str) -> serde_json::Value {
     let url = format!(
         "/api/sites/{}/readings?start=2025-03-01T00:00:00Z&end=2025-03-10T00:00:00Z\
          &measurement_type=spot{extra}",
@@ -100,7 +96,8 @@ async fn a_fully_retracted_instant_is_counted_but_not_served() {
         "the instant with a live replicate still is: {served:?}"
     );
     assert_eq!(
-        series(&body)["withdrawn_count"], 1,
+        series(&body)["withdrawn_count"],
+        1,
         "one instant in the window is retracted in full: {body}"
     );
 }
@@ -141,5 +138,8 @@ async fn include_withdrawn_serves_the_instant_and_says_which_one_it_is() {
         withdrawn[partial], false,
         "a live replicate means the visit stands: {body}"
     );
-    assert_eq!(param["values"][partial], 6.0, "served at the live replicate");
+    assert_eq!(
+        param["values"][partial], 6.0,
+        "served at the live replicate"
+    );
 }

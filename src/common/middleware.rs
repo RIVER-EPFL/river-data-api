@@ -325,8 +325,7 @@ pub async fn service_auth_middleware(
         // Same resolution the control plane extractor uses, so the expiry rule cannot drift
         // between the two surfaces a session token reaches.
         if let Some(session) =
-            crate::routes::private::sync::control::session::lookup_sync_session(&state.db, raw)
-                .await
+            crate::routes::private::sync::service::lookup_sync_session(&state.db, raw).await
         {
             let auth = AuthContext::SyncService {
                 service_id: session.service_id,
@@ -546,7 +545,8 @@ pub async fn enforce_project_scope_for_sites(
     scope: &AccessScope,
     site_ids: &[Uuid],
 ) -> Result<(), AppError> {
-    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    use crate::routes::private::sites;
+    use sea_orm::EntityTrait;
     let AccessScope::Projects(_) = scope else {
         return Ok(());
     };
@@ -555,22 +555,12 @@ pub async fn enforce_project_scope_for_sites(
         if !seen.insert(*site_id) {
             continue;
         }
-        let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT project_id FROM sites WHERE id = $1",
-                [(*site_id).into()],
-            ))
+        let site = sites::Entity::find_by_id(*site_id)
+            .one(db)
             .await
             .map_err(AppError::Database)?;
-        let in_scope = match row {
-            Some(r) => r
-                .try_get::<Option<Uuid>>("", "project_id")
-                .ok()
-                .flatten()
-                .is_some_and(|pid| scope.allows_project(pid)),
-            None => false,
-        };
+        let in_scope =
+            site.is_some_and(|s| s.project_id.is_some_and(|pid| scope.allows_project(pid)));
         if !in_scope {
             return Err(AppError::Forbidden(
                 "Site is outside your project access".to_string(),
@@ -709,9 +699,9 @@ fn crud_scope_condition(
     direction: Direction,
 ) -> Option<sea_orm::Condition> {
     use crate::routes::private::{
-        alarms::thresholds, annotations, data_streams, notes, projects as projects_entity,
-        projects::subprojects, readings::samples, reprocessing_jobs, sensors,
-        sensors::calibrations, sensors::deployments, sensors::standard_curves, sites,
+        alarms::models as alarm_thresholds, annotations, data_streams, notes,
+        projects as projects_entity, projects::subprojects, readings::samples, reprocessing_jobs,
+        sensors, sensors::calibrations, sensors::deployments, sensors::standard_curves, sites,
         sites::parameters as site_parameters,
     };
     use sea_orm::{ColumnTrait, Condition};
@@ -733,7 +723,7 @@ fn crud_scope_condition(
             deployments::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
         }
         "alarm_thresholds" => {
-            thresholds::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
+            alarm_thresholds::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
         }
         "samples" => samples::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
         "data_streams" => data_streams::Column::SiteParameterId
@@ -832,10 +822,10 @@ pub async fn inject_project_scope(request: Request, next: Next) -> Response {
                 .insert(crudcrate::ScopeCondition::new(condition));
             next.run(request).await
         }
-        None if writing && is_token => AppError::Forbidden(format!(
-            "Project-scoped token cannot modify '{entity}'"
-        ))
-        .into_response(),
+        None if writing && is_token => {
+            AppError::Forbidden(format!("Project-scoped token cannot modify '{entity}'"))
+                .into_response()
+        }
         None => next.run(request).await,
     }
 }
@@ -849,95 +839,5 @@ fn crud_entity(path: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{Direction, crud_entity, crud_scope_condition};
-    use uuid::Uuid;
-
-    #[test]
-    fn test_crud_entity_reads_the_entity_and_ignores_what_follows_it() {
-        assert_eq!(crud_entity("/api/site_parameters"), Some("site_parameters"));
-        assert_eq!(
-            crud_entity("/api/site_parameters/batch"),
-            Some("site_parameters"),
-            "`batch` is a sub-route of the entity, not another entity"
-        );
-        assert_eq!(
-            crud_entity("/api/site_parameters/0189d3f0-0000-4000-8000-000000000000"),
-            Some("site_parameters")
-        );
-        assert_eq!(crud_entity("/"), None);
-    }
-
-    /// An entity answering `None` has no project dimension, which is what makes
-    /// `inject_project_scope` refuse a scoped token's write to it. The refusal is the one rule no
-    /// row filter can state, so the set it applies to is asserted here.
-    #[test]
-    fn test_the_entities_with_no_project_dimension_are_the_ones_a_scoped_token_is_refused() {
-        let projects = [Uuid::nil()];
-        let none_for = |direction| {
-            let mut names: Vec<&str> = Vec::new();
-            for entity in [
-                "projects", "sites", "site_parameters", "notes", "annotations", "samples",
-                "subprojects", "data_streams", "alarm_thresholds", "sensor_deployments",
-                "sensor_calibrations", "standard_curves", "sensors", "reprocessing_jobs",
-                "parameters", "constants", "schedules", "collection_events",
-            ] {
-                if crud_scope_condition(entity, &projects, direction).is_none() {
-                    names.push(entity);
-                }
-            }
-            names
-        };
-        assert_eq!(
-            none_for(Direction::Read),
-            ["parameters", "constants", "schedules", "collection_events"],
-            "a read is confined for every entity whose rows carry a project"
-        );
-        let expected = [
-            "projects",
-            "sensors",
-            "reprocessing_jobs",
-            "parameters",
-            "constants",
-            "schedules",
-            "collection_events",
-        ];
-        for direction in [Direction::MemberWrite, Direction::TokenWrite] {
-            let mut got = none_for(direction);
-            got.sort_unstable();
-            let mut want = expected;
-            want.sort_unstable();
-            assert_eq!(got, want, "the shared inventory is written as catalog, not as a project's");
-        }
-    }
-
-    /// The bench instrument is the one row a member may write and may not read, so the asymmetry is
-    /// asserted rather than described.
-    #[test]
-    fn test_only_a_members_write_reaches_a_curve_on_an_instrument_deployed_nowhere() {
-        let projects = [Uuid::nil()];
-        let sql = |entity: &str, direction| {
-            format!(
-                "{:?}",
-                crud_scope_condition(entity, &projects, direction).expect("a project-bound entity")
-            )
-        };
-        assert_ne!(
-            sql("standard_curves", Direction::Read),
-            sql("standard_curves", Direction::MemberWrite),
-            "a member's write must reach a curve on an instrument deployed nowhere"
-        );
-        assert_eq!(
-            sql("standard_curves", Direction::Read),
-            sql("standard_curves", Direction::TokenWrite),
-            "a project-scoped token is confined to where the instrument stood, in both directions"
-        );
-        for entity in ["sites", "notes", "sensor_calibrations", "data_streams"] {
-            assert_eq!(
-                sql(entity, Direction::Read),
-                sql(entity, Direction::MemberWrite),
-                "{entity} has one rule in every direction"
-            );
-        }
-    }
-}
+#[path = "tests/middleware.rs"]
+mod tests;

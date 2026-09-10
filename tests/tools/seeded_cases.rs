@@ -12,7 +12,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;
 
-use river_db::routes::private::tools::scripts;
+use river_db::routes::private::tools::views as scripts;
 
 struct ActiveVersion {
     name: String,
@@ -49,10 +49,9 @@ async fn active_versions(db: &DatabaseConnection) -> Vec<ActiveVersion> {
 #[tokio::test]
 #[serial]
 async fn every_active_tool_version_passes_its_stored_cases() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "every_active_tool_version_passes_its_stored_cases",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("every_active_tool_version_passes_its_stored_cases")
+        .await
     {
         return;
     }

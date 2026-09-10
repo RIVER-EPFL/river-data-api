@@ -37,7 +37,6 @@ async fn fetch_aggregate(db: &DatabaseConnection, sample_id: Uuid) -> SampleAggr
     }
 }
 
-
 /// Ensure a "grab_sample" data stream exists and return its id for a
 /// (site, parameter) pair. Mirrors the helper used by the grab_samples handler.
 async fn ensure_stream(db: &DatabaseConnection, site_id: &str, parameter_id: &str) -> Uuid {

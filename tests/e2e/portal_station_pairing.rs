@@ -65,12 +65,7 @@ fn parse_groups() -> Vec<PortalGroup> {
         }
         let replicates: Vec<(String, f64)> = columns
             .iter()
-            .filter_map(|c| {
-                column(&row, c)
-                    .parse::<f64>()
-                    .ok()
-                    .map(|v| (c.clone(), v))
-            })
+            .filter_map(|c| column(&row, c).parse::<f64>().ok().map(|v| (c.clone(), v)))
             .collect();
         let (Ok(portal_mean), Ok(portal_sd)) = (
             column(&row, MEAN_COLUMN).parse::<f64>(),
@@ -212,8 +207,14 @@ async fn a_real_cnet_station_pairs_through_to_samples_and_visits() {
     });
     let (status, body) =
         crate::common::post_json_parse_with_token(&app, "/api/ingest", &ingest, &sync_token).await;
-    assert_eq!(status, 200, "ingest the station's groups ({status}): {body}");
-    assert_eq!(body["inserted"], submitted as u64, "every cell lands: {body}");
+    assert_eq!(
+        status, 200,
+        "ingest the station's groups ({status}): {body}"
+    );
+    assert_eq!(
+        body["inserted"], submitted as u64,
+        "every cell lands: {body}"
+    );
 
     let (status, body) = crate::common::post_json_with_token(
         &app,
@@ -242,7 +243,9 @@ async fn a_real_cnet_station_pairs_through_to_samples_and_visits() {
     assert_eq!(
         e2e::count(
             &db,
-            &format!("SELECT count(*) FROM samples WHERE site_id = '{site}' AND parameter_id = '{param}'")
+            &format!(
+                "SELECT count(*) FROM samples WHERE site_id = '{site}' AND parameter_id = '{param}'"
+            )
         )
         .await,
         groups.len() as i64,

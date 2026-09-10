@@ -158,12 +158,18 @@ async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, s
     let interval = chrono::Duration::seconds(interval_seconds);
     let missed = scheduled_at + interval <= now;
     let next = schedule::next_run_after(scheduled_at, interval, now);
-    txn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "UPDATE schedules SET next_run_at = $1, last_enqueued_at = now() WHERE id = $2",
-        [next.into(), id.into()],
-    ))
-    .await?;
+    super::schedule_model::Entity::update_many()
+        .col_expr(
+            super::schedule_model::Column::NextRunAt,
+            sea_orm::sea_query::Expr::value(next),
+        )
+        .col_expr(
+            super::schedule_model::Column::LastEnqueuedAt,
+            sea_orm::sea_query::Expr::current_timestamp().into(),
+        )
+        .filter(super::schedule_model::Column::Id.eq(id))
+        .exec(&txn)
+        .await?;
     txn.commit().await?;
 
     Ok(Some(DueSchedule {

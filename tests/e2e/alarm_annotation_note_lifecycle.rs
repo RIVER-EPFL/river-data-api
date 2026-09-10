@@ -153,7 +153,7 @@ async fn alarm_acknowledge_and_autoresolve() {
     // Out-of-range turbidity (> alarm_max 500) at the latest time → a breach.
     inject("2025-02-01T00:00:00Z", 9999.0).await.unwrap();
 
-    let stats = alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    let stats = alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     assert!(
         stats.opened >= 1,
         "the breach should open an alarm event: {stats:?}"
@@ -225,7 +225,7 @@ async fn alarm_acknowledge_and_autoresolve() {
 
     // A later in-range reading clears the breach; the next sweep auto-resolves the event.
     inject("2025-02-01T01:00:00Z", 50.0).await.unwrap();
-    let stats = alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    let stats = alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     assert!(
         stats.resolved >= 1,
         "returning in-range should resolve the event: {stats:?}"

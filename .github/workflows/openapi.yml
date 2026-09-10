@@ -5,18 +5,23 @@ name: OpenAPI document
 # fails on a diff, so a route change either brings the document with it or does not merge. The dump
 # serves nothing and issues no query, so it needs neither a database nor any configuration. The
 # same comparison runs in the test suite, which is what covers a change outside the paths below.
+# The paths span the whole crate and its manifest, not the router alone: two schemas are declared
+# `value_type = river_data_core::models::*` and the CRUD paths come from crudcrate's derive, so a
+# dependency bump moves the document with nothing under `src/routes/` touched.
 on:
   push:
     branches: [main]
     paths:
-      - "src/routes/**"
-      - "src/bin/dump_openapi.rs"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "docs/openapi.json"
       - ".github/workflows/openapi.yml"
   pull_request:
     paths:
-      - "src/routes/**"
-      - "src/bin/dump_openapi.rs"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "docs/openapi.json"
       - ".github/workflows/openapi.yml"
   workflow_dispatch:

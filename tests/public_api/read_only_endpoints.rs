@@ -9,7 +9,6 @@ use serial_test::serial;
 // Helper
 // ============================================================================
 
-
 /// Set up a public project with one exposed parameter (DO_Temperature) for public API testing.
 async fn setup_public() -> (sea_orm::DatabaseConnection, axum::Router) {
     let db = crate::common::setup_test_db().await;

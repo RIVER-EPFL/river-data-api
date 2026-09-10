@@ -10,9 +10,9 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
-use river_db::routes::private::sync::operator::{
-    CreateCredentialRequest, create_credential, revoke_credential,
-};
+use river_db::routes::private::sync::models::CreateCredentialRequest;
+use river_db::routes::private::sync::views::create_credential;
+use river_db::routes::private::sync::views::revoke_credential;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;
@@ -215,10 +215,16 @@ async fn a_credential_stored_as_a_bare_digest_enrolls_and_is_rehashed() {
     );
 
     let (status, body) = enroll(&app, client_id, &secret, "inst-legacy-2").await;
-    assert_eq!(status, 200, "the same secret enrolls against the new hash: {body}");
+    assert_eq!(
+        status, 200,
+        "the same secret enrolls against the new hash: {body}"
+    );
 
     let (status, _) = enroll(&app, client_id, &"b".repeat(64), "inst-legacy-3").await;
-    assert_eq!(status, 401, "a wrong secret is still refused after the rehash");
+    assert_eq!(
+        status, 401,
+        "a wrong secret is still refused after the rehash"
+    );
 }
 
 #[tokio::test]
@@ -373,10 +379,9 @@ async fn a_service_speaks_for_the_source_system_its_credential_declares() {
     }
 
     for (source, token) in sessions {
-        let session =
-            river_db::routes::private::sync::control::session::lookup_sync_session(&db, &token)
-                .await
-                .expect("a live session");
+        let session = river_db::routes::private::sync::service::lookup_sync_session(&db, &token)
+            .await
+            .expect("a live session");
         assert_eq!(
             session.source_system.as_deref(),
             Some(source),

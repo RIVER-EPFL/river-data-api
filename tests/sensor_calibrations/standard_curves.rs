@@ -876,7 +876,10 @@ async fn a_copied_curve_names_its_origin_and_leaves_the_portal_identity_on_the_o
         &format!("SELECT count(*) AS c FROM standard_curves WHERE id = '{copy}' AND slope = 2.0"),
     )
     .await;
-    assert_eq!(copy_slope, 1, "the copy keeps the coefficients it was made with");
+    assert_eq!(
+        copy_slope, 1,
+        "the copy keeps the coefficients it was made with"
+    );
 
     let (status, body) = delete_with_token(
         &fx.app,

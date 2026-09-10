@@ -80,7 +80,7 @@ async fn reset_to_defaults_re_enables_alarms() {
     .unwrap();
 
     inject(&db, stream, "2025-02-01T00:00:00Z", 600.0).await;
-    alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     assert_eq!(
         open_turb_event_count(&db).await,
         0,
@@ -99,7 +99,7 @@ async fn reset_to_defaults_re_enables_alarms() {
     .await
     .unwrap();
 
-    let stats = alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    let stats = alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     assert!(
         stats.opened >= 1,
         "fallback re-enables the alarm: {stats:?}"
@@ -118,7 +118,7 @@ async fn disable_alarms_null_row_suppresses_and_resolves() {
     let stream = turb_stream(&db).await;
 
     inject(&db, stream, "2025-02-01T00:00:00Z", 600.0).await;
-    let stats = alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    let stats = alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     assert!(stats.opened >= 1, "breach opens an event: {stats:?}");
     assert_eq!(open_turb_event_count(&db).await, 1);
 
@@ -135,7 +135,7 @@ async fn disable_alarms_null_row_suppresses_and_resolves() {
     .await
     .unwrap();
 
-    let stats = alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    let stats = alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     assert!(
         stats.resolved >= 1,
         "disabling resolves the open event: {stats:?}"
@@ -174,15 +174,15 @@ async fn rebreach_opens_fresh_event() {
     };
 
     inject(&db, stream, "2025-02-01T00:00:00Z", 600.0).await;
-    alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     let first = event_ids().await;
     assert_eq!(first.len(), 1, "first breach opens one event");
 
     inject(&db, stream, "2025-02-01T01:00:00Z", 50.0).await;
-    alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    alarms::flows::evaluate_alarm_events(&db).await.unwrap();
 
     inject(&db, stream, "2025-02-01T02:00:00Z", 700.0).await;
-    alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    alarms::flows::evaluate_alarm_events(&db).await.unwrap();
     let after = event_ids().await;
 
     assert_eq!(
@@ -206,7 +206,7 @@ async fn unacknowledge_clears_acknowledgement() {
     let stream = turb_stream(&db).await;
 
     inject(&db, stream, "2025-02-01T00:00:00Z", 600.0).await;
-    alarms::sweeper::evaluate_alarm_events(&db).await.unwrap();
+    alarms::flows::evaluate_alarm_events(&db).await.unwrap();
 
     let find_turb = |active: &serde_json::Value| -> Option<serde_json::Value> {
         active["alarms"]

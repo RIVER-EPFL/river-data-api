@@ -45,7 +45,10 @@ async fn a_full_sync_command_re_asserts_what_a_scheduled_cycle_will_not() {
     let landed = readings_at(&db, &family).await;
     assert!(landed > 0, "the first cycle landed the family's replicates");
     let second = driver.sync(false).await.expect("the second cycle");
-    assert_eq!(second.readings_synced, 0, "unchanged content is not re-sent");
+    assert_eq!(
+        second.readings_synced, 0,
+        "unchanged content is not re-sent"
+    );
 
     // Drift the server holds and the source cannot see: the stream and its readings are gone.
     // This is the shape the button exists for, and it is invisible to the digest, which is a

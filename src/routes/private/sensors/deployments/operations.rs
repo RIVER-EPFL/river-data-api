@@ -60,7 +60,7 @@ impl CRUDOperations for SensorDeploymentOperations {
         reject_inverted_window(data.deployed_from, data.deployed_until)?;
         // A deployment says this instrument measures at this site, which a bookkeeping row cannot
         // say. `adopt` and `swap` refuse one too; this is the same guard on the CRUD door.
-        crate::routes::private::sensors::identity::require_measuring_instrument(
+        crate::routes::private::sensors::service::require_measuring_instrument(
             db,
             data.sensor_id,
             "deployed to a site",
@@ -344,13 +344,10 @@ impl CRUDOperations for SensorDeploymentOperations {
             )
         })?;
 
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "DELETE FROM sensor_deployments WHERE id = $1",
-            [id.into()],
-        ))
-        .await
-        .map_err(ApiError::database)?;
+        super::model::Entity::delete_by_id(id)
+            .exec(db)
+            .await
+            .map_err(ApiError::database)?;
 
         recompute_deployed_until(db, sensor_id)
             .await

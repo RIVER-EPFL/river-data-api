@@ -26,8 +26,12 @@ async fn provisioned_slot(db: &sea_orm::DatabaseConnection) -> String {
          VALUES ($1, $2, $3, 'Depth', '', TRUE, FALSE, TRUE, NOW())",
         [
             id.into(),
-            uuid::Uuid::parse_str(crate::common::SITE2_ID).unwrap().into(),
-            uuid::Uuid::parse_str(crate::common::GLOBAL_PARAM_DEPTH_ID).unwrap().into(),
+            uuid::Uuid::parse_str(crate::common::SITE2_ID)
+                .unwrap()
+                .into(),
+            uuid::Uuid::parse_str(crate::common::GLOBAL_PARAM_DEPTH_ID)
+                .unwrap()
+                .into(),
         ],
     ))
     .await
@@ -84,7 +88,10 @@ async fn the_review_flag_is_filterable() {
     let id = provisioned_slot(&db).await;
     let (status, text) = crate::common::get_with_token(
         &app,
-        &format!("/api/site_parameters?filter={}", crate::common::e2e::percent_encode(r#"{"needs_review":true}"#)),
+        &format!(
+            "/api/site_parameters?filter={}",
+            crate::common::e2e::percent_encode(r#"{"needs_review":true}"#)
+        ),
         &token,
     )
     .await;

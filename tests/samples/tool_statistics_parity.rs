@@ -160,10 +160,9 @@ fn number(results: &serde_json::Value, key: &str) -> f64 {
 #[tokio::test]
 #[serial]
 async fn stored_sample_statistics_equal_the_tools_own_summaries() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "stored_sample_statistics_equal_the_tools_own_summaries",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("stored_sample_statistics_equal_the_tools_own_summaries")
+        .await
     {
         return;
     }
@@ -251,10 +250,9 @@ async fn stored_sample_statistics_equal_the_tools_own_summaries() {
 #[tokio::test]
 #[serial]
 async fn flagging_a_replicate_moves_the_statistics_off_the_original_run() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "flagging_a_replicate_moves_the_statistics_off_the_original_run",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("flagging_a_replicate_moves_the_statistics_off_the_original_run")
+        .await
     {
         return;
     }
@@ -315,10 +313,11 @@ async fn flagging_a_replicate_moves_the_statistics_off_the_original_run() {
 #[tokio::test]
 #[serial]
 async fn a_gapped_replicate_set_saves_and_keeps_its_letters_only_when_indices_are_explicit() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_gapped_replicate_set_saves_and_keeps_its_letters_only_when_indices_are_explicit",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require(
+            "a_gapped_replicate_set_saves_and_keeps_its_letters_only_when_indices_are_explicit",
+        )
+        .await
     {
         return;
     }

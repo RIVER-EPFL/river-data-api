@@ -111,7 +111,10 @@ async fn test_removed_tools_return_404() {
 #[tokio::test]
 #[serial]
 async fn test_doc_with_std_curve() {
-    if !crate::common::profile::Service::ToolsRunner.require("test_doc_with_std_curve").await {
+    if !crate::common::profile::Service::ToolsRunner
+        .require("test_doc_with_std_curve")
+        .await
+    {
         return;
     }
     let (app, token) = setup().await;
@@ -134,7 +137,8 @@ async fn test_doc_with_std_curve() {
 #[tokio::test]
 #[serial]
 async fn test_doc_single_replicate_omits_sd() {
-    if !crate::common::profile::Service::ToolsRunner.require("test_doc_single_replicate_omits_sd")
+    if !crate::common::profile::Service::ToolsRunner
+        .require("test_doc_single_replicate_omits_sd")
         .await
     {
         return;

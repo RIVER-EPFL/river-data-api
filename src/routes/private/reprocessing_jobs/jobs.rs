@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sea_orm::{ConnectionTrait, DbErr, EntityTrait, FromQueryResult, Statement};
+use sea_orm::{ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QuerySelect, Statement};
 use uuid::Uuid;
 
 use super::job::{Job, TunableKind, TunableSpec};
@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::routes::private::sensors::calibrations::service::{
     recalculate_derived_at_timestamp, reprocess_sensor_readings, reprocess_site_parameter_readings,
 };
+use crate::routes::private::sensors::deployments;
 
 /// One instant of one site's derived work.
 #[derive(FromQueryResult)]
@@ -27,13 +28,6 @@ struct DerivedInstant {
 #[derive(FromQueryResult)]
 struct InstantRow {
     time: chrono::DateTime<chrono::FixedOffset>,
-}
-
-/// A (site, parameter) slot.
-#[derive(FromQueryResult)]
-struct SlotRow {
-    site_id: Uuid,
-    parameter_id: Uuid,
 }
 
 /// A stream named by its source pair.
@@ -67,7 +61,7 @@ fn merge_origin(params: &serde_json::Value) -> crate::routes::private::readings:
         .unwrap_or(crate::routes::private::readings::decisions::Origin::Manual)
 }
 
-fn optional_uuid(params: &serde_json::Value, key: &str) -> Option<Uuid> {
+pub(crate) fn optional_uuid(params: &serde_json::Value, key: &str) -> Option<Uuid> {
     params
         .get(key)
         .and_then(serde_json::Value::as_str)
@@ -93,7 +87,7 @@ fn parse_timestamps(value: Option<&serde_json::Value>) -> Vec<chrono::DateTime<c
 
 /// Parse an array of UUID strings under `key` (missing/empty → empty vec). Non-UUID elements are
 /// skipped; the persisted params are produced by our own handlers, so this is defensive only.
-fn uuid_array(params: &serde_json::Value, key: &str) -> Vec<Uuid> {
+pub(crate) fn uuid_array(params: &serde_json::Value, key: &str) -> Vec<Uuid> {
     params
         .get(key)
         .and_then(serde_json::Value::as_array)
@@ -143,7 +137,7 @@ impl SlotOutcome {
     }
 
     /// One timeline line per failed slot, then the counts and the failed set on the report.
-    async fn record(&self, ctx: &JobContext, report: JobReport) -> JobReport {
+    pub(crate) async fn record(&self, ctx: &JobContext, report: JobReport) -> JobReport {
         for (slot, error) in &self.failed {
             ctx.log(
                 "warn",
@@ -163,7 +157,7 @@ impl SlotOutcome {
             .count("slots_failed", self.failed.len())
     }
 
-    fn error(&self) -> DbErr {
+    pub(crate) fn error(&self) -> DbErr {
         DbErr::Custom(format!("every one of {} slots failed", self.failed.len()))
     }
 }
@@ -814,9 +808,6 @@ impl Job for IngestDerived {
     }
 }
 
-/// Backdate every `(site, parameter)` slot that has a deployment, re-deriving its readings from the
-/// current deployment + calibration timelines. The slot set is recomputed inside the job from
-/// `sensor_deployments`, so a rerun always reflects the current deployment topology. Backs the
 /// `reprocess_all` operator action. A failed slot logs and continues, a partial backdate is more
 /// useful than aborting the whole batch on one bad slot.
 pub struct ReprocessAll;
@@ -828,19 +819,14 @@ impl Job for ReprocessAll {
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        let slot_rows = ctx
-            .db()
-            .query_all_raw(Statement::from_string(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT DISTINCT site_id, parameter_id FROM sensor_deployments".to_owned(),
-            ))
+        let slots: Vec<(Uuid, Uuid)> = deployments::model::Entity::find()
+            .select_only()
+            .column(deployments::model::Column::SiteId)
+            .column(deployments::model::Column::ParameterId)
+            .distinct()
+            .into_tuple()
+            .all(ctx.db())
             .await?;
-        // Both columns are NOT NULL on `sensor_deployments`, so a row that does not decode is a
-        // slot silently left unbackdated rather than a deployment without one.
-        let slots: Vec<(Uuid, Uuid)> = slot_rows
-            .iter()
-            .map(|r| SlotRow::from_query_result(r, "").map(|s| (s.site_id, s.parameter_id)))
-            .collect::<Result<_, _>>()?;
         let slot_count = slots.len();
         ctx.info(&format!("Backdating {slot_count} slot(s)")).await;
 
@@ -875,94 +861,6 @@ impl Job for ReprocessAll {
         }
         tracing::info!(readings_updated = total, "reprocess_all complete");
         Ok(total)
-    }
-}
-
-/// Reconstruct persisted alarm events from the actual readings. Two scoping shapes:
-///
-/// - `slots` present (array of `[site_id, parameter_id]`): loop `evaluate_alarm_episodes` over each
-///   pair with the shared `start`/`end` window, the per-slot shape the inline batch/CSV ingest
-///   spawns used.
-/// - `slots` absent: the single/widened `rebuild_alarm_events` path scoped by the optional
-///   `site_id`/`parameter_id`/`start`/`end` (the `rebuild_alarm_events` operator action).
-///
-/// Idempotent either way, re-derives the same episodes.
-pub struct AlarmBackfill;
-
-#[async_trait]
-impl Job for AlarmBackfill {
-    fn name(&self) -> &'static str {
-        "alarm_backfill"
-    }
-
-    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        let params = ctx.params();
-        let start = optional_datetime(params, "start");
-        let end = optional_datetime(params, "end");
-        let slots = uuid_pair_array(params, "slots");
-
-        if !slots.is_empty() {
-            let (Some(start), Some(end)) = (start, end) else {
-                return Err(DbErr::Custom(
-                    "alarm_backfill with slots requires start and end".into(),
-                ));
-            };
-            let mut results = Vec::with_capacity(slots.len());
-            for (site_id, parameter_id) in &slots {
-                let written = crate::routes::private::alarms::episodes::evaluate_alarm_episodes(
-                    ctx.db(),
-                    *site_id,
-                    *parameter_id,
-                    start,
-                    end,
-                )
-                .await;
-                results.push((
-                    serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
-                    written,
-                ));
-            }
-            if let Some((site_id, _)) = slots.first() {
-                ctx.set_site(*site_id).await;
-            }
-            let outcome = SlotOutcome::from(results);
-            let total = outcome.readings;
-            let report = outcome
-                .record(
-                    &ctx,
-                    JobReport::new()
-                        .count("events_written", total)
-                        .count("slots", slots.len()),
-                )
-                .await;
-            ctx.report(report).await;
-            if outcome.all_failed() {
-                return Err(outcome.error());
-            }
-            return Ok(total);
-        }
-
-        let site_id = optional_uuid(params, "site_id");
-        let parameter_id = optional_uuid(params, "parameter_id");
-        let count = crate::routes::private::alarms::episodes::rebuild_alarm_events(
-            ctx.db(),
-            site_id,
-            parameter_id,
-            start,
-            end,
-        )
-        .await?;
-        if let Some(site_id) = site_id {
-            ctx.set_site(site_id).await;
-        }
-        ctx.report(
-            JobReport::new()
-                .scope_opt("site_id", site_id.map(|id| id.to_string()))
-                .scope_opt("parameter_id", parameter_id.map(|id| id.to_string()))
-                .count("events_written", count),
-        )
-        .await;
-        Ok(count)
     }
 }
 
@@ -1335,7 +1233,7 @@ impl Job for JanitorRun {
                 }
                 // A rewritten spot value is an input somebody's calculation read, so the visits it
                 // moved recompute in dependency order rather than being left stale (Q108).
-                match crate::routes::private::collection_events::recompute::events_from_pairs(
+                match crate::routes::private::collection_events::flows::events_from_pairs(
                     db,
                     &drift.touched,
                 )
@@ -1343,11 +1241,11 @@ impl Job for JanitorRun {
                 {
                     Ok(events) => {
                         if let Err(e) =
-                            crate::routes::private::collection_events::recompute::enqueue_for(
+                            crate::routes::private::collection_events::flows::enqueue_for(
                                 db,
                                 &events,
                                 "janitor",
-                                crate::routes::private::collection_events::recompute::Writer::Person,
+                                crate::routes::private::collection_events::flows::Writer::Person,
                             )
                             .await
                         {
@@ -1405,398 +1303,6 @@ impl Job for JanitorRun {
     }
 }
 
-/// Reconcile persisted `alarm_events` against the current breach set (open/update/resolve), then
-/// emit an `AlarmStateChanged` SSE on change, the alarm-sweeper backstop. Wraps
-/// [`sweeper::evaluate_alarm_events`] + the same SSE the old `sweeper::periodic` emitted.
-pub struct AlarmSweep {
-    interval_seconds: u64,
-}
-
-impl AlarmSweep {
-    #[must_use]
-    pub fn from_config(config: &Config) -> Self {
-        Self {
-            interval_seconds: config.alarm_sweep_interval_seconds,
-        }
-    }
-}
-
-#[async_trait]
-impl Job for AlarmSweep {
-    fn name(&self) -> &'static str {
-        "alarm_sweep"
-    }
-
-    fn default_schedule(&self) -> Option<Schedule> {
-        Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
-    }
-
-    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        use crate::routes::private::alarms::sweeper;
-        match sweeper::evaluate_alarm_events(ctx.db()).await {
-            Ok(stats) => {
-                if (stats.opened > 0 || stats.resolved > 0)
-                    && let Some(events) = crate::common::global_event_sender()
-                {
-                    let _ = events.send(crate::common::AppEvent::AlarmStateChanged {
-                        opened: stats.opened,
-                        resolved: stats.resolved,
-                    });
-                }
-                ctx.report(
-                    JobReport::new()
-                        .count("opened", stats.opened)
-                        .count("resolved", stats.resolved),
-                )
-                .await;
-                Ok((stats.opened + stats.resolved) as i64)
-            }
-            Err(e) => Err(DbErr::Custom(format!("alarm sweep failed: {e}"))),
-        }
-    }
-}
-
-/// Close sync_events rows left 'running' past a staleness threshold. A sync service killed
-/// mid-cycle (SIGKILL, node loss) can never terminate its own event; without this sweep the
-/// row reads as "sync in progress" forever.
-pub struct SyncEventSweep {
-    interval_seconds: u64,
-    stale_after_seconds: u64,
-}
-
-impl SyncEventSweep {
-    #[must_use]
-    pub fn from_config(config: &Config) -> Self {
-        Self {
-            interval_seconds: config.sync_event_sweep_interval_seconds,
-            stale_after_seconds: config.sync_event_stale_after_seconds,
-        }
-    }
-}
-
-#[async_trait]
-impl Job for SyncEventSweep {
-    fn name(&self) -> &'static str {
-        "sync_event_sweep"
-    }
-
-    fn default_schedule(&self) -> Option<Schedule> {
-        Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
-    }
-
-    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        let closed = sweep_stale_sync_events(ctx.db(), self.stale_after_seconds).await?;
-        ctx.report(
-            JobReport::new()
-                .scope("stale_after_seconds", self.stale_after_seconds)
-                .count("sync_events_closed", closed),
-        )
-        .await;
-        Ok(closed as i64)
-    }
-}
-
-/// Close 'running' sync_events older than the staleness threshold; returns the row count.
-pub async fn sweep_stale_sync_events(
-    db: &sea_orm::DatabaseConnection,
-    stale_after_seconds: u64,
-) -> Result<u64, DbErr> {
-    let res = db
-        .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE sync_events
-             SET status = 'failed',
-                 completed_at = NOW(),
-                 errors = COALESCE(errors, '[]'::jsonb) || '[\"Closed by sweeper: service stopped reporting\"]'::jsonb
-             WHERE status = 'running' AND started_at < NOW() - ($1 || ' seconds')::interval",
-            [stale_after_seconds.to_string().into()],
-        ))
-        .await?;
-    Ok(res.rows_affected())
-}
-
-/// Age-based retention for the sync ledgers. sync_events accretes one row per cycle and
-/// ingest_receipts one per windowed pass; without pruning both grow forever. Running
-/// sync_events rows are never touched (the staleness sweep owns those). A receipt is the record
-/// of how a stored value arrived, so age alone does not release one: a receipt whose window still
-/// covers a stored reading is kept whatever its age, and only receipts nothing resolves to are
-/// pruned.
-pub struct SyncLedgerRetention {
-    sync_event_retention_days: u32,
-    ingest_receipt_retention_days: u32,
-}
-
-impl SyncLedgerRetention {
-    #[must_use]
-    pub fn from_config(config: &Config) -> Self {
-        let retention = crate::common::retention::Retention::from_config(config);
-        Self {
-            sync_event_retention_days: retention.sync_events.horizon_days().unwrap_or(0),
-            ingest_receipt_retention_days: retention.ingest_receipts.horizon_days().unwrap_or(0),
-        }
-    }
-}
-
-#[async_trait]
-impl Job for SyncLedgerRetention {
-    fn name(&self) -> &'static str {
-        "sync_ledger_retention"
-    }
-
-    fn default_schedule(&self) -> Option<Schedule> {
-        Some(Schedule::every_secs(86_400))
-    }
-
-    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        let db = ctx.db();
-        let mut events_pruned = 0u64;
-        if self.sync_event_retention_days > 0 {
-            events_pruned = db
-                .execute_raw(sea_orm::Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "DELETE FROM sync_events
-                     WHERE status <> 'running'
-                       AND started_at < NOW() - ($1 || ' days')::interval",
-                    [self.sync_event_retention_days.to_string().into()],
-                ))
-                .await?
-                .rows_affected();
-        }
-        let mut receipts_pruned = 0u64;
-        if self.ingest_receipt_retention_days > 0 {
-            receipts_pruned = db
-                .execute_raw(sea_orm::Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "DELETE FROM ingest_receipts
-                     WHERE at < NOW() - ($1 || ' days')::interval
-                       AND NOT EXISTS (
-                             SELECT 1 FROM readings r
-                              WHERE r.stream_id = ingest_receipts.stream_id
-                                AND r.time >= ingest_receipts.window_from
-                                AND r.time < ingest_receipts.window_to)",
-                    [self.ingest_receipt_retention_days.to_string().into()],
-                ))
-                .await?
-                .rows_affected();
-        }
-        ctx.report(
-            JobReport::new()
-                .scope("sync_event_retention_days", self.sync_event_retention_days)
-                .scope(
-                    "ingest_receipt_retention_days",
-                    self.ingest_receipt_retention_days,
-                )
-                .count("sync_events_pruned", events_pruned)
-                .count("ingest_receipts_pruned", receipts_pruned),
-        )
-        .await;
-        Ok((events_pruned + receipts_pruned) as i64)
-    }
-}
-
-/// Queue a trigger_full_sync for every live, unpaused service with `full_reassert_enabled`. The
-/// digest handshake stops a service re-sending unchanged content, which also means routine passes
-/// can no longer repair server-side drift (rows changed outside the sync path); the full pass
-/// ignores digests and re-asserts everything the source holds.
-///
-/// What that repairs depends on the source. A reconciled backend declares the window it
-/// re-asserts, so its diff applies the corrections. An append-only one (Vaisala, NOMIS) sends no
-/// window and the driver ingests with `overwrite` false, so the pass inserts rows missing here and
-/// leaves every stored value as it is; correcting those is `resync_streams`, not this.
-///
-/// Delivery is the normal heartbeat pickup; a service already holding a pending command is not
-/// queued twice.
-pub struct SyncFullReassert {
-    command_expiry_secs: u64,
-}
-
-impl SyncFullReassert {
-    #[must_use]
-    pub fn from_config(config: &Config) -> Self {
-        Self {
-            command_expiry_secs: config.sync_command_expiry_secs,
-        }
-    }
-}
-
-#[async_trait]
-impl Job for SyncFullReassert {
-    fn name(&self) -> &'static str {
-        "sync_full_reassert"
-    }
-
-    fn default_schedule(&self) -> Option<Schedule> {
-        Some(Schedule::every_secs(604_800))
-    }
-
-    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        let rows = ctx
-            .db()
-            .query_all_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "INSERT INTO sync_commands
-                     (id, service_id, command, status, created_at, expires_at)
-                 SELECT gen_random_uuid(), s.id, 'trigger_full_sync', 'pending', NOW(),
-                        NOW() + ($1 || ' seconds')::interval
-                 FROM sync_services s
-                 WHERE s.paused IS NOT TRUE
-                   AND s.full_reassert_enabled
-                   AND s.last_heartbeat > NOW() - INTERVAL '1 hour'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM sync_commands c
-                       WHERE c.service_id = s.id
-                         AND c.command = 'trigger_full_sync'
-                         AND c.status = 'pending'
-                         AND c.expires_at > NOW()
-                   )
-                 RETURNING service_id",
-                [self.command_expiry_secs.to_string().into()],
-            ))
-            .await?;
-        let services: Vec<String> = rows
-            .iter()
-            .map(|r| r.try_get::<Uuid>("", "service_id"))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|id| id.to_string())
-            .collect();
-        let queued = services.len();
-        ctx.report(
-            JobReport::new()
-                .scope("service_ids", services)
-                .count("commands_queued", queued),
-        )
-        .await;
-        Ok(i64::try_from(queued).unwrap_or(i64::MAX))
-    }
-}
-
-/// Prune Web Push subscriptions for users whose Keycloak account is revoked or disabled.
-pub struct PushSubscriptionReconcile {
-    interval_seconds: u64,
-}
-
-impl PushSubscriptionReconcile {
-    #[must_use]
-    pub fn from_config(config: &Config) -> Self {
-        Self {
-            interval_seconds: config.identity_reconcile_interval_seconds,
-        }
-    }
-}
-
-#[async_trait]
-impl Job for PushSubscriptionReconcile {
-    fn name(&self) -> &'static str {
-        "identity_reconcile"
-    }
-
-    fn default_schedule(&self) -> Option<Schedule> {
-        Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
-    }
-
-    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        let Some(state) = crate::common::global_app_state() else {
-            tracing::debug!("push_subscription_reconcile: no AppState in process; skipping");
-            return Ok(0);
-        };
-        match crate::routes::private::notifications::reconcile::sweep(&state).await {
-            Ok(o) => {
-                if o.total() > 0 {
-                    tracing::info!(
-                        revoked = o.revoked,
-                        "Push subscription reconciliation: users pruned"
-                    );
-                }
-                ctx.report(JobReport::new().count("revoked", o.revoked))
-                    .await;
-                Ok(o.total() as i64)
-            }
-            Err(e) => Err(e),
-        }
-    }
-}
-
-/// Probe each configured notification channel and upsert
-/// The channel health heartbeat. Wraps [`health::probe_once`].
-pub struct NotifyHealth {
-    interval_seconds: u64,
-}
-
-impl NotifyHealth {
-    #[must_use]
-    pub fn from_config(config: &Config) -> Self {
-        Self {
-            interval_seconds: config.notify_health_interval_seconds.max(30),
-        }
-    }
-}
-
-#[async_trait]
-impl Job for NotifyHealth {
-    fn name(&self) -> &'static str {
-        "notify_health"
-    }
-
-    fn default_schedule(&self) -> Option<Schedule> {
-        Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
-    }
-
-    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        let Some(state) = crate::common::global_app_state() else {
-            tracing::debug!("notify_health: no AppState in process; skipping");
-            return Ok(0);
-        };
-        let probed =
-            crate::routes::private::notifications::health::probe_once(ctx.db(), &state.config)
-                .await;
-        ctx.report(JobReport::new().count("channels_probed", probed))
-            .await;
-        Ok(0)
-    }
-}
-
-/// Drain the `alarm_events` notification outbox (open + resolve passes) and run the signal triggers,
-/// the notification dispatcher. Wraps [`dispatcher::dispatch_once`]. The `AlarmStateChanged`
-/// broadcast still wakes an immediate enqueue in `main.rs` for low latency; this schedule is the
-/// fallback cadence.
-pub struct DispatchNotifications {
-    interval_seconds: u64,
-}
-
-impl DispatchNotifications {
-    #[must_use]
-    pub fn from_config(config: &Config) -> Self {
-        Self {
-            interval_seconds: config.notify_poll_interval_seconds,
-        }
-    }
-}
-
-#[async_trait]
-impl Job for DispatchNotifications {
-    fn name(&self) -> &'static str {
-        "dispatch_notifications"
-    }
-
-    fn default_schedule(&self) -> Option<Schedule> {
-        Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
-    }
-
-    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        use crate::routes::private::notifications::dispatcher;
-        let Some(state) = crate::common::global_app_state() else {
-            tracing::debug!("dispatch_notifications: no AppState in process; skipping");
-            return Ok(0);
-        };
-        let channels = dispatcher::build_channels(&state.config);
-        ctx.report(JobReport::new().count("channels", channels.len()))
-            .await;
-        dispatcher::dispatch_once(&state, &channels).await;
-        Ok(0)
-    }
-}
-
 /// Retag readings.measurement_type for a sensor/stream scope, then refresh continuous aggregates
 /// over the affected window. Backs the bulk reclassification actions (mark sensors low/high
 /// frequency, classify sensorless streams): the classification columns (`sensors.data_frequency`,
@@ -1842,7 +1348,7 @@ impl Job for MeasurementRetag {
         // with the stream's own declaration, which every write path holds at 'spot'.
         if matches!(target.as_str(), "continuous" | "derived") {
             let families =
-                crate::routes::private::data_streams::replicates::family_keys_in_retag_scope(
+                crate::routes::private::data_streams::service::family_keys_in_retag_scope(
                     ctx.db(),
                     &sensor_ids,
                     &stream_ids,
@@ -1850,10 +1356,8 @@ impl Job for MeasurementRetag {
                 )
                 .await
                 .map_err(|e| DbErr::Custom(e.to_string()))?;
-            crate::routes::private::data_streams::replicates::refuse_family_retag(
-                &families, &target,
-            )
-            .map_err(|e| DbErr::Custom(e.to_string()))?;
+            crate::routes::private::data_streams::service::refuse_family_retag(&families, &target)
+                .map_err(|e| DbErr::Custom(e.to_string()))?;
         }
 
         // 'declared' joins each reading to its stream in the rewrite and drops the target
@@ -1976,178 +1480,6 @@ impl Job for MeasurementRetag {
     }
 }
 
-/// Bring existing samples into line with a slot's declared sd estimator, then recompute their
-/// statistics.
-///
-/// The estimator only reaches `samples.stdev`; the mean is unchanged and grabs are excluded from
-/// the continuous aggregates, so this refreshes no aggregate. Rerunnable: the UPDATE skips rows
-/// already at the target.
-///
-/// A sample whose estimator was chosen for that one instant (`sd_estimator_source = 'sample'`) is
-/// left alone. A slot-level declaration is a statement about the parameter, not a licence to
-/// overwrite a decision someone made about a single collection group; `override_instants` says
-/// otherwise, explicitly.
-pub struct SdEstimatorRetag;
-
-#[async_trait]
-impl Job for SdEstimatorRetag {
-    fn name(&self) -> &'static str {
-        "sd_estimator_retag"
-    }
-
-    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        let params = ctx.params();
-        let target = params
-            .get("estimator")
-            .and_then(serde_json::Value::as_str)
-            .filter(|e| matches!(*e, "sample" | "population"))
-            .ok_or_else(|| {
-                DbErr::Custom("sd_estimator_retag needs estimator 'sample' or 'population'".into())
-            })?
-            .to_string();
-        let site_parameter_ids = uuid_array(params, "site_parameter_ids");
-        let stream_ids = uuid_array(params, "stream_ids");
-        if site_parameter_ids.is_empty() && stream_ids.is_empty() {
-            return Err(DbErr::Custom(
-                "sd_estimator_retag needs site_parameter_ids or stream_ids".into(),
-            ));
-        }
-        let override_instants = params
-            .get("override_instants")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let start = params.get("start").and_then(serde_json::Value::as_str);
-        let end = params.get("end").and_then(serde_json::Value::as_str);
-
-        // The scope names slots, so it resolves through `site_parameters` either way: a stream
-        // reaches its slot by its pairing, and an unpaired stream reaches none.
-        let mut binds: Vec<sea_orm::Value> = vec![
-            target.clone().into(),
-            site_parameter_ids.clone().into(),
-            stream_ids.clone().into(),
-        ];
-        let mut window = String::new();
-        if let Some(start) = start {
-            let parsed = chrono::DateTime::parse_from_rfc3339(start)
-                .map_err(|e| DbErr::Custom(format!("invalid start: {e}")))?;
-            binds.push(sea_orm::Value::from(parsed));
-            window.push_str(&format!(" AND s.collected_at >= ${}", binds.len()));
-        }
-        if let Some(end) = end {
-            let parsed = chrono::DateTime::parse_from_rfc3339(end)
-                .map_err(|e| DbErr::Custom(format!("invalid end: {e}")))?;
-            binds.push(sea_orm::Value::from(parsed));
-            window.push_str(&format!(" AND s.collected_at <= ${}", binds.len()));
-        }
-        let instant_guard = if override_instants {
-            ""
-        } else {
-            " AND s.sd_estimator_source <> 'sample'"
-        };
-        let scope = "EXISTS (SELECT 1 FROM site_parameters sp \
-                     WHERE sp.site_id = s.site_id AND sp.parameter_id = s.parameter_id \
-                       AND (sp.id = ANY($2) \
-                            OR EXISTS (SELECT 1 FROM data_streams ds \
-                                       WHERE ds.id = ANY($3) AND ds.site_parameter_id = sp.id)))";
-
-        let skipped = if override_instants {
-            0
-        } else {
-            ctx.db()
-                .query_one_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    format!(
-                        "SELECT COUNT(*)::bigint AS n FROM samples s \
-                         WHERE {scope} AND s.sd_estimator_source = 'sample' \
-                           AND s.sd_estimator IS DISTINCT FROM $1{window}"
-                    ),
-                    binds.clone(),
-                ))
-                .await?
-                .map_or(Ok(0_i64), |row| row.try_get::<i64>("", "n"))?
-        };
-
-        ctx.info(&format!(
-            "Setting the sd estimator of the samples in scope to '{target}'"
-        ))
-        .await;
-
-        // The UPDATE fires the samples trigger per row, which recomputes `stdev` from the
-        // replicates under the new divisor. Nothing here writes a statistic.
-        let retagged = ctx
-            .db()
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    "UPDATE samples s SET sd_estimator = $1, sd_estimator_source = 'slot' \
-                     WHERE {scope} AND s.sd_estimator IS DISTINCT FROM $1{instant_guard}{window}"
-                ),
-                binds,
-            ))
-            .await?
-            .rows_affected();
-
-        // The samples trigger fires on readings, not on the samples row itself, so the UPDATE
-        // above changes the declaration without recomputing. Refresh each touched row explicitly.
-        ctx.db()
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    "SELECT refresh_sample_aggregate(s.id) FROM samples s \
-                     WHERE {scope} AND s.sd_estimator = $1{instant_guard}"
-                ),
-                vec![
-                    target.clone().into(),
-                    site_parameter_ids.clone().into(),
-                    stream_ids.clone().into(),
-                ],
-            ))
-            .await?;
-
-        if skipped > 0 {
-            ctx.log(
-                "info",
-                &format!(
-                    "{skipped} sample(s) keep an estimator chosen for that instant; \
-                     rerun with override_instants to change them too"
-                ),
-                serde_json::json!({ "skipped_instant_decisions": skipped }),
-            )
-            .await;
-        }
-
-        if retagged > 0
-            && let Some(state) = crate::common::global_app_state()
-        {
-            state.response_cache.invalidate_all();
-        }
-
-        ctx.report(
-            JobReport::new()
-                .scope(
-                    "site_parameter_ids",
-                    site_parameter_ids
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>(),
-                )
-                .scope(
-                    "stream_ids",
-                    stream_ids
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>(),
-                )
-                .scope("override_instants", override_instants)
-                .scope("estimator", target)
-                .count("samples_retagged", retagged)
-                .count("instant_decisions_skipped", skipped),
-        )
-        .await;
-        Ok(retagged.try_into().unwrap_or(i64::MAX))
-    }
-}
-
 #[cfg(test)]
 mod slot_outcome_tests {
     use super::SlotOutcome;
@@ -2197,7 +1529,8 @@ mod slot_outcome_tests {
 
 #[cfg(test)]
 mod tunable_validation_tests {
-    use super::{AlarmSweep, JanitorRun};
+    use super::JanitorRun;
+    use crate::routes::private::alarms::flows::AlarmSweep;
     use crate::routes::private::reprocessing_jobs::job::{Job, TunableKind};
 
     fn janitor() -> JanitorRun {

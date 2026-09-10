@@ -8,7 +8,7 @@
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 
-use crate::common::{cleanup_test_db, seed_test_data, setup_test_db, FIXTURE_SENSOR_ID, SITE1_ID};
+use crate::common::{FIXTURE_SENSOR_ID, SITE1_ID, cleanup_test_db, seed_test_data, setup_test_db};
 
 /// Undo the rule the baseline creates with the table, leaving the shape a chain-carried database
 /// has: no CHECK, no inheriting trigger, and no fixture instrument defaulted onto new streams.
@@ -62,7 +62,6 @@ async fn run_migration(db: &DatabaseConnection) {
     .await
     .expect("the repair applies");
 }
-
 
 async fn scalar(db: &DatabaseConnection, sql: &str) -> Option<String> {
     let row = db
@@ -180,7 +179,9 @@ async fn attributes_every_reading_before_adding_the_constraint() {
     assert_eq!(
         scalar(
             &db,
-            &format!("SELECT sensor_id::text AS v FROM readings WHERE stream_id = '{DERIVED_STREAM}'")
+            &format!(
+                "SELECT sensor_id::text AS v FROM readings WHERE stream_id = '{DERIVED_STREAM}'"
+            )
         )
         .await,
         None

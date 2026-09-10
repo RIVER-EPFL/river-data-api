@@ -4,7 +4,10 @@
 //! the portal may show. Administrators are unrestricted, so their `grants` lists every project.
 
 use axum::{Extension, Json, extract::State};
-use sea_orm::{ConnectionTrait, DatabaseBackend, FromQueryResult, Statement};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult, QueryFilter,
+    QueryOrder, Statement,
+};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -12,6 +15,7 @@ use crate::common::AppState;
 use crate::common::authz::Role;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::projects;
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct GrantedProject {
@@ -125,13 +129,6 @@ struct TreeRow {
     site_name: String,
 }
 
-/// A project by id and name.
-#[derive(FromQueryResult)]
-struct NamedProject {
-    id: Uuid,
-    name: String,
-}
-
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct NavigatorProject {
     pub project_id: Uuid,
@@ -196,7 +193,8 @@ pub async fn get_my_sites(
     for row in &rows {
         // A row that does not decode is a site missing from the caller's own navigator, so it is
         // an error rather than a shorter tree.
-        let row = TreeRow::from_query_result(row, "").map_err(|e| AppError::Internal(e.to_string()))?;
+        let row =
+            TreeRow::from_query_result(row, "").map_err(|e| AppError::Internal(e.to_string()))?;
 
         if projects
             .last()
@@ -232,35 +230,21 @@ pub async fn get_my_sites(
 /// Resolve `(id, name)` for a set of project ids, or every project when `ids` is `None` (admin).
 /// An empty `ids` slice returns no rows (a member with no grants).
 async fn named_projects(state: &AppState, ids: Option<&[Uuid]>) -> AppResult<Vec<GrantedProject>> {
-    let stmt = match ids {
-        None => Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            "SELECT id, name FROM projects ORDER BY name",
-            [],
-        ),
+    let mut query = projects::Entity::find().order_by_asc(projects::Column::Name);
+    match ids {
+        None => {}
         Some([]) => return Ok(Vec::new()),
-        Some(ids) => Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            "SELECT id, name FROM projects WHERE id = ANY($1) ORDER BY name",
-            [sea_orm::Value::Array(
-                sea_orm::sea_query::ArrayType::Uuid,
-                Some(Box::new(ids.iter().map(|id| (*id).into()).collect())),
-            )],
-        ),
-    };
-    let rows = state
-        .db
-        .query_all_raw(stmt)
+        Some(ids) => query = query.filter(projects::Column::Id.is_in(ids.iter().copied())),
+    }
+    let rows = query
+        .all(&state.db)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    rows.iter()
-        .map(|r| {
-            let named = NamedProject::from_query_result(r, "")
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            Ok(GrantedProject {
-                project_id: named.id,
-                name: named.name,
-            })
+    Ok(rows
+        .into_iter()
+        .map(|p| GrantedProject {
+            project_id: p.id,
+            name: p.name,
         })
-        .collect()
+        .collect())
 }

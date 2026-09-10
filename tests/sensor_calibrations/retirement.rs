@@ -239,7 +239,10 @@ async fn a_curve_that_corrected_a_reading_is_not_deleted() {
     )
     .await;
     assert_eq!(status, 400, "a used curve is retired, not deleted: {body}");
-    assert!(body.contains("retire"), "the refusal says what to do: {body}");
+    assert!(
+        body.contains("retire"),
+        "the refusal says what to do: {body}"
+    );
     assert_eq!(
         count(
             &db,

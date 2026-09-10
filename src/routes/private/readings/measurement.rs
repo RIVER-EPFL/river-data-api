@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
 use river_data_core::models::MeasurementType;
-use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::routes::private::sensors;
 
 /// `POST /streams/retag` and the `measurement_retag` job take this alongside the vocabulary: it
 /// writes nothing to `data_streams` and aligns each reading with its own stream's declaration.
@@ -54,13 +55,6 @@ pub fn retag_target_rejection(value: &str) -> Option<String> {
 
 /// Map each sensor to the measurement_type its `data_frequency` implies: 'low' → 'spot'
 /// (lab/campaign cadence), 'high' → 'continuous'. One query for the whole batch.
-/// An instrument's declared cadence, as the classification chain reads it.
-#[derive(FromQueryResult)]
-struct SensorFrequency {
-    id: Uuid,
-    data_frequency: String,
-}
-
 pub async fn measurement_types_for_sensors<C: ConnectionTrait>(
     db: &C,
     sensor_ids: &[Uuid],
@@ -68,16 +62,12 @@ pub async fn measurement_types_for_sensors<C: ConnectionTrait>(
     if sensor_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, data_frequency FROM sensors WHERE id = ANY($1)",
-            [sensor_ids.to_vec().into()],
-        ))
+    let rows = sensors::Entity::find()
+        .filter(sensors::Column::Id.is_in(sensor_ids.to_vec()))
+        .all(db)
         .await?;
     let mut map = HashMap::with_capacity(rows.len());
-    for row in &rows {
-        let sensor = SensorFrequency::from_query_result(row, "")?;
+    for sensor in rows {
         map.insert(
             sensor.id,
             if sensor.data_frequency == "low" {
@@ -111,31 +101,5 @@ pub fn resolve_measurement_type(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_measurement_type_rejection_admits_every_member() {
-        for v in MeasurementType::ALL {
-            assert_eq!(measurement_type_rejection(Some(v.as_str())), None);
-        }
-        assert_eq!(measurement_type_rejection(None), None);
-    }
-
-    #[test]
-    fn test_measurement_type_rejection_names_the_whole_vocabulary() {
-        let reason = measurement_type_rejection(Some("spott")).expect("a typo is refused");
-        for v in MeasurementType::ALL {
-            assert!(reason.contains(v.as_str()), "{reason} omits {v}");
-        }
-    }
-
-    #[test]
-    fn test_retag_target_rejection_admits_the_vocabulary_and_declared() {
-        for v in MeasurementType::ALL {
-            assert_eq!(retag_target_rejection(v.as_str()), None);
-        }
-        assert_eq!(retag_target_rejection(RETAG_DECLARED), None);
-        assert!(retag_target_rejection("hourly").is_some());
-    }
-}
+#[path = "tests/measurement.rs"]
+mod tests;

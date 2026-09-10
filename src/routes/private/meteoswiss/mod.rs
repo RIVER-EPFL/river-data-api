@@ -9,5 +9,6 @@
 //! deploy alongside the API. Which station serves a site is a property of the site
 //! (`sites.meteoswiss_station_abbr`), so the mapping is filled in by an operator and never coded.
 
-pub mod parse;
-pub mod sync;
+pub mod flows;
+pub mod models;
+pub mod service;

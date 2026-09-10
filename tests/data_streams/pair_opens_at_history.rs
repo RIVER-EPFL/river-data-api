@@ -106,7 +106,8 @@ async fn a_pairing_opens_the_deployment_at_the_stream_s_first_reading() {
 async fn a_recalled_instrument_keeps_the_history_it_covered() {
     let (app, token, db) = setup().await;
 
-    let earlier = crate::common::sensor_lifecycle::create_sensor(&db, "earlier", GLOBAL_PARAM_TEMP_ID).await;
+    let earlier =
+        crate::common::sensor_lifecycle::create_sensor(&db, "earlier", GLOBAL_PARAM_TEMP_ID).await;
     crate::common::exec(
         &db,
         &format!(

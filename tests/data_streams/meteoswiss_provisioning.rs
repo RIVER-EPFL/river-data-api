@@ -5,9 +5,9 @@
 //! Run with: cargo test --test data_streams meteoswiss
 
 use chrono::{DateTime, TimeZone, Utc};
-use river_db::routes::private::meteoswiss::parse::Point;
-use river_db::routes::private::meteoswiss::sync::{
-    Subscriber, advance_cursor, cursor, instrument, parameter_id, provision, subscribers,
+use river_db::routes::private::meteoswiss::models::{Point, Subscriber};
+use river_db::routes::private::meteoswiss::service::{
+    advance_cursor, cursor, instrument, parameter_id, provision, subscribers,
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
@@ -91,7 +91,10 @@ async fn meteoswiss_declaration_provisions_a_paired_pressure_stream() {
         ),
     )
     .await;
-    assert_eq!(paired, 1, "the stream is paired to the site's pressure slot");
+    assert_eq!(
+        paired, 1,
+        "the stream is paired to the site's pressure slot"
+    );
 
     // Provisioning is what every tick runs, so it has to converge rather than accumulate.
     let again = provision(&db, &declared[0], parameter).await.unwrap();
@@ -108,7 +111,6 @@ async fn meteoswiss_declaration_provisions_a_paired_pressure_stream() {
         .await,
         1
     );
-
 }
 
 #[tokio::test]
@@ -134,8 +136,13 @@ async fn meteoswiss_readings_land_attributed_and_a_replay_inserts_nothing() {
     let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
     let series = points(start, &[922.0, 921.7, 921.4]);
     let refs: Vec<&Point> = series.iter().collect();
-    let written = river_db::routes::private::meteoswiss::sync::insert(
-        &db, stream_id, site.site_id, parameter, sensor_id, &refs,
+    let written = river_db::routes::private::meteoswiss::service::insert(
+        &db,
+        stream_id,
+        site.site_id,
+        parameter,
+        sensor_id,
+        &refs,
     )
     .await
     .unwrap();
@@ -155,8 +162,13 @@ async fn meteoswiss_readings_land_attributed_and_a_replay_inserts_nothing() {
     assert_eq!(attributed, 3, "every reading carries its slot and station");
 
     // The SMN file re-publishes what it already held; the same instant is not a correction.
-    let replayed = river_db::routes::private::meteoswiss::sync::insert(
-        &db, stream_id, site.site_id, parameter, sensor_id, &refs,
+    let replayed = river_db::routes::private::meteoswiss::service::insert(
+        &db,
+        stream_id,
+        site.site_id,
+        parameter,
+        sensor_id,
+        &refs,
     )
     .await
     .unwrap();
@@ -179,7 +191,6 @@ async fn meteoswiss_readings_land_attributed_and_a_replay_inserts_nothing() {
 
     // One station serves every site that named it.
     assert_eq!(instrument(&db, STATION).await.unwrap(), sensor_id);
-
 }
 
 #[tokio::test]
@@ -195,5 +206,4 @@ async fn a_site_with_no_station_is_not_a_subscriber() {
         subscribers(&db).await.unwrap().is_empty(),
         "a blank declaration is not a declaration"
     );
-
 }

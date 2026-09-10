@@ -455,16 +455,9 @@ const ACCEPT_TAIL: super::tail::Axes = super::tail::Axes {
     reconcile_alarms: false,
     episodes: super::tail::Episodes::None,
     recompute_derived: true,
-    writer: crate::routes::private::collection_events::recompute::Writer::Person,
+    writer: crate::routes::private::collection_events::flows::Writer::Person,
 };
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn only_accept_and_reject_are_decisions() {
-        assert!(super::parse_decision("accept").unwrap());
-        assert!(!super::parse_decision("reject").unwrap());
-        assert!(super::parse_decision("apply").is_err());
-        assert!(super::parse_decision("").is_err());
-    }
-}
+#[path = "tests/proposals.rs"]
+mod tests;

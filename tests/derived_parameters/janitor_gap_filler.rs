@@ -78,7 +78,11 @@ async fn test_janitor_fills_derived_gaps() {
         r"INSERT INTO site_parameters
             (id, site_id, parameter_id, name, sensor_type, display_units, is_active, entry_mode)
           VALUES (gen_random_uuid(), $1, $2, $3, 'derived', 'mg/L', true, 'tool')",
-        [site_id.into(), derived_param_uuid.into(), derived_name.into()],
+        [
+            site_id.into(),
+            derived_param_uuid.into(),
+            derived_name.into(),
+        ],
     ))
     .await
     .unwrap();
@@ -130,9 +134,10 @@ async fn test_janitor_fills_derived_gaps() {
         "derived reading should not exist before second janitor run"
     );
 
-    let filled_again = river_db::routes::private::parameters::derived::janitor::run_once(&db, None, None)
-        .await
-        .unwrap();
+    let filled_again =
+        river_db::routes::private::parameters::derived::janitor::run_once(&db, None, None)
+            .await
+            .unwrap();
     assert!(filled_again >= 1, "second janitor run should heal new gap");
 
     let v = derived_value_at(&db, site_id, derived_param_uuid, new_source_time).await;
@@ -203,4 +208,3 @@ async fn arrivals_at(
     })
     .collect()
 }
-

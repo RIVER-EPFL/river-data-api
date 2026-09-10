@@ -9,7 +9,6 @@ use serial_test::serial;
 // Helper
 // ============================================================================
 
-
 async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
     let f = crate::common::seeded_app().await;
     (f.db, f.app, f.token)

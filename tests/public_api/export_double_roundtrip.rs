@@ -18,7 +18,11 @@ use serde_json::value::RawValue;
 use serial_test::serial;
 
 fn fixture_values() -> [f64; 3] {
-    [0.1_f64 + 0.2, 1683.4228_f64 * 1.3642 + -1.6985, f64::from(100.8_f32)]
+    [
+        0.1_f64 + 0.2,
+        1683.4228_f64 * 1.3642 + -1.6985,
+        f64::from(100.8_f32),
+    ]
 }
 
 const T0: &str = "2025-06-01T00:00:00Z";
@@ -127,10 +131,17 @@ async fn public_readings_csv_arm_is_bit_exact_for_undeclared_slot() {
         crate::common::get(&app, &format!("{READINGS_URI}?{WINDOW}&format=csv")).await;
     assert_eq!(status, 200, "public csv: {body}");
 
-    let data: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).skip(1).collect();
+    let data: Vec<&str> = body
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .skip(1)
+        .collect();
     assert_eq!(data.len(), 3, "header + three rows: {body}");
     for (line, stored) in data.iter().zip(fixture_values()) {
-        let cell = line.split(',').nth(1).unwrap_or_else(|| panic!("value cell: {line}"));
+        let cell = line
+            .split(',')
+            .nth(1)
+            .unwrap_or_else(|| panic!("value cell: {line}"));
         assert_bits_eq(parse_std(cell), stored, "public CSV arm");
     }
 }

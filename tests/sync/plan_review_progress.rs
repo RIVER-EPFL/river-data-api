@@ -210,13 +210,22 @@ async fn an_accepted_object_is_recorded_on_the_plan_and_can_be_taken_back() {
     let plan: serde_json::Value = serde_json::from_str(&body).expect("plan json");
     let accepted = plan["accepted_objects"].as_array().expect("accepted list");
     assert_eq!(accepted.len(), 1, "{}", plan["accepted_objects"]);
-    assert_eq!(accepted[0]["key"], serde_json::json!("site:Brand New Station"));
-    assert!(accepted[0]["accepted_by"].is_string(), "the actor is stamped from the caller");
+    assert_eq!(
+        accepted[0]["key"],
+        serde_json::json!("site:Brand New Station")
+    );
+    assert!(
+        accepted[0]["accepted_by"].is_string(),
+        "the actor is stamped from the caller"
+    );
     assert!(accepted[0]["accepted_at"].is_string());
 
-    let (status, reread) =
-        crate::common::get_json_with_token(&app, &format!("/api/sync/pairing-plans/{plan_id}"), &token)
-            .await;
+    let (status, reread) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &token,
+    )
+    .await;
     assert_eq!(status, 200, "re-read: {reread}");
     assert_eq!(
         reread["accepted_objects"], plan["accepted_objects"],

@@ -403,8 +403,7 @@ async fn a_registered_feed_reaches_the_plan_as_a_proposal() {
     );
     assert_eq!(entry["instrument"]["create"], serde_json::json!(true));
     assert!(
-        entry["instrument"]["id"].is_null()
-            && entry["instrument"]["proposed_name"].is_string(),
+        entry["instrument"]["id"].is_null() && entry["instrument"]["proposed_name"].is_string(),
         "it names no existing row and carries the name it proposes: {entry}"
     );
 

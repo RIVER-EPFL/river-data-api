@@ -335,7 +335,10 @@ async fn jobs_settled(db: &DatabaseConnection, timeout_secs: u64) -> bool {
 /// Track B onboarded from nothing by an administrator: project, site, parameter, site parameter,
 /// sensor, deployment and a registered stream, all through HTTP.
 async fn onboard(test_name: &str) -> Option<(DatabaseConnection, Router, String, tracks::Track)> {
-    if !crate::common::profile::Service::Keycloak.require(test_name).await {
+    if !crate::common::profile::Service::Keycloak
+        .require(test_name)
+        .await
+    {
         return None;
     }
     let db = crate::common::setup_test_db().await;
@@ -1346,7 +1349,6 @@ async fn continuous_aggregates_apply_their_filter_algebra_exactly() {
     // The aggregates' `replicate_index = 0` predicate has no probe here any more: no write path
     // admits a non-zero index on a non-spot reading and a table CHECK refuses one, so the predicate
     // now covers only rows that predate both.
-
 }
 
 // ============================================================================

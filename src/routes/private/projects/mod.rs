@@ -1,6 +1,4 @@
-pub mod model;
-pub mod router;
-pub mod subprojects;
-pub mod types;
+pub mod models;
 pub mod views;
-pub use model::*;
+pub use models::subprojects;
+pub use models::*;

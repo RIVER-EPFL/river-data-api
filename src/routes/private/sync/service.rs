@@ -1,23 +1,1522 @@
-use chrono::Utc;
+//! Sync queries and the machinery they share: the session lookup, the pairing-plan engine, and
+//! the replicate audit's classification and holds.
+
+use axum::Json;
+use axum::extract::FromRequestParts;
+use axum::http::request::Parts;
+use chrono::{DateTime, Utc};
+use moka::future::Cache;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
-    QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
+    FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{LazyLock, OnceLock};
+use std::time::Duration;
+use subtle::ConstantTimeEq;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
+use river_data_core::commands as core_commands;
+
+use crate::common::AppState;
+use crate::common::authz::AccessScope;
+use crate::common::middleware::enforce_project_scope_for_sites;
+use crate::config::Config;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::sensors::identity::{
-    InstrumentKind, create_sensor_for_stream, upsert_source_instrument,
+use crate::routes::private::api_tokens::service::hash_token;
+use crate::routes::private::parameters::groups::group_model as parameter_groups;
+use crate::routes::private::sensors;
+use crate::routes::private::sensors::models::InstrumentKind;
+use crate::routes::private::sensors::service::{
+    create_sensor_for_stream, upsert_source_instrument,
 };
 use crate::routes::private::{
-    data_streams, data_streams::pairing_plans, parameters, projects, sensors,
+    annotations, data_streams, data_streams::pairing_plans, parameters, projects,
     sensors::standard_curves, sites, sites::parameters as site_parameters,
 };
+use crate::routes::private::{collection_events, readings};
+
+use super::models::*;
+
+/// An authenticated sync service: who it is, and what it writes provenance under.
+#[derive(Debug, Clone)]
+pub struct SyncSession {
+    pub service_id: Uuid,
+    /// The source system the service enrolled for, from its credential. `None` on a service whose
+    /// credential declares none.
+    pub source_system: Option<String>,
+}
+
+/// Resolve a raw bearer token to a live sync session. Returns `None` for an unknown, malformed
+/// or expired token; the caller decides whether that is a 401 or a fall-through to another
+/// auth method.
+pub async fn lookup_sync_session(db: &DatabaseConnection, raw_token: &str) -> Option<SyncSession> {
+    if raw_token.is_empty() {
+        return None;
+    }
+
+    let token_hash = hash_token(raw_token);
+    // The service comes back with the token: the source system it speaks for is read on every
+    // authenticated request, so it is one round trip rather than a second lookup below.
+    let (token, service) = tokens::Entity::find()
+        .filter(tokens::Column::TokenHash.eq(&token_hash))
+        .find_also_related(services::Entity)
+        .one(db)
+        .await
+        .inspect_err(|e| tracing::warn!(error = %e, "DB error looking up sync token"))
+        .ok()
+        .flatten()?;
+
+    if token.expires_at.with_timezone(&chrono::Utc) < chrono::Utc::now() {
+        tracing::debug!(service_id = %token.service_id, "Sync token expired");
+        return None;
+    }
+
+    Some(SyncSession {
+        service_id: token.service_id,
+        source_system: service.and_then(|s| s.source_system),
+    })
+}
+
+/// Extract the raw bearer token from an `Authorization` header value.
+pub fn bearer(value: Option<&str>) -> Option<&str> {
+    value.and_then(|v| v.strip_prefix("Bearer ")).map(str::trim)
+}
+
+/// The authenticated sync service behind a control plane request.
+#[derive(Debug, Clone)]
+pub struct SyncServiceContext {
+    pub service_id: Uuid,
+    pub source_system: Option<String>,
+}
+
+impl FromRequestParts<AppState> for SyncServiceContext {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let raw_token = bearer(
+            parts
+                .headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+        )
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| AppError::Unauthorized("Bearer token required".to_string()))?;
+
+        let session = lookup_sync_session(&state.db, raw_token)
+            .await
+            .ok_or_else(|| AppError::Unauthorized("Invalid session token".to_string()))?;
+
+        Ok(Self {
+            service_id: session.service_id,
+            source_system: session.source_system,
+        })
+    }
+}
+
+/// 32 random bytes as lowercase hex. Used for sync session tokens and for the two halves of an
+/// enrollment credential.
+///
+/// This must not be replaced by `api_tokens::service`'s minting, which prefixes `rvd_`. The dual
+/// auth middleware routes any `rvd_`-prefixed bearer down the argon2 API-token path before the
+/// sync session fallback runs, so an `rvd_`-prefixed session token would be rejected.
+#[must_use]
+pub fn generate_token() -> String {
+    use rand::Rng;
+    let bytes: [u8; 32] = rand::rng().random();
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The default `SYNC_SESSION_TOKEN_TTL_SECS`, so the cache has a sane window when nothing has
+/// declared one (the test harness builds the router without going through `main`).
+pub(super) const DEFAULT_SESSION_TOKEN_TTL_SECS: u64 = 900;
+
+/// A cached token must expire before the row backing it does, or the heartbeat hands out a token
+/// the database has already dropped and the service churns through re-enrollment. Four fifths of
+/// the configured lifetime leaves a margin no operator has to know about.
+pub(super) const CACHE_FRACTION_OF_TTL: f64 = 0.8;
+
+pub(super) static SESSION_TOKEN_CACHE_TTL: OnceLock<Duration> = OnceLock::new();
+
+/// Fix the session-token cache window from the configured token lifetime. Called once at startup,
+/// before the cache is first touched; without it the default lifetime applies.
+pub fn init_session_token_cache_ttl(token_ttl_secs: u64) {
+    let window = (token_ttl_secs as f64 * CACHE_FRACTION_OF_TTL) as u64;
+    let _ = SESSION_TOKEN_CACHE_TTL.set(Duration::from_secs(window.max(1)));
+}
+
+pub(crate) static SESSION_TOKEN_CACHE: LazyLock<Cache<Uuid, String>> = LazyLock::new(|| {
+    let ttl = *SESSION_TOKEN_CACHE_TTL.get_or_init(|| {
+        Duration::from_secs((DEFAULT_SESSION_TOKEN_TTL_SECS as f64 * CACHE_FRACTION_OF_TTL) as u64)
+    });
+    Cache::builder().max_capacity(100).time_to_live(ttl).build()
+});
+
+/// A stored hash is argon2 when it is a PHC string; anything else is read as the old hex digest.
+pub(super) fn secret_format(stored: &str) -> SecretFormat {
+    if stored.starts_with("$argon2") {
+        SecretFormat::Argon2
+    } else {
+        SecretFormat::LegacyDigest
+    }
+}
+
+/// Whether a submitted secret enrolls against a stored credential, and under which hash it did.
+/// Both comparisons are constant time: argon2's verifier is, and the legacy digest is compared
+/// with `ct_eq` rather than `!=`, which would return at the first differing byte and time the
+/// answer.
+pub(super) fn check_credential(
+    cred: Option<&credentials::Model>,
+    client_secret: &str,
+) -> Result<SecretFormat, EnrollDenial> {
+    use crate::routes::private::api_tokens::service::{hash_token, verify_api_secret};
+
+    let Some(cred) = cred else {
+        return Err(EnrollDenial::UnknownClient);
+    };
+    if cred.revoked {
+        return Err(EnrollDenial::Revoked);
+    }
+    match secret_format(&cred.client_secret_hash) {
+        SecretFormat::Argon2 => {
+            if verify_api_secret(client_secret, &cred.client_secret_hash) {
+                Ok(SecretFormat::Argon2)
+            } else {
+                Err(EnrollDenial::BadSecret)
+            }
+        }
+        SecretFormat::LegacyDigest => {
+            let submitted = hash_token(client_secret);
+            if submitted
+                .as_bytes()
+                .ct_eq(cred.client_secret_hash.as_bytes())
+                .into()
+            {
+                Ok(SecretFormat::LegacyDigest)
+            } else {
+                Err(EnrollDenial::BadSecret)
+            }
+        }
+    }
+}
+
+pub(crate) async fn create_session_token(state: &AppState, service_id: Uuid) -> AppResult<String> {
+    let raw_token = generate_token();
+    let token_hash = crate::routes::private::api_tokens::service::hash_token(&raw_token);
+    let ttl_secs = state.config.sync_session_token_ttl_secs as i64;
+
+    let token = tokens::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        service_id: Set(service_id),
+        token_hash: Set(token_hash.clone()),
+        expires_at: Set((Utc::now() + chrono::Duration::seconds(ttl_secs)).into()),
+        created_at: Set(Utc::now().into()),
+    };
+    token.insert(&state.db).await?;
+    tracing::debug!(%service_id, token_hash_prefix = %&token_hash[..8], "Session token created");
+
+    let db_clone = state.db.clone();
+    tokio::spawn(async move {
+        let _ = tokens::Entity::delete_many()
+            .filter(tokens::Column::ServiceId.eq(service_id))
+            .filter(tokens::Column::ExpiresAt.lt(Utc::now()))
+            .exec(&db_clone)
+            .await;
+    });
+
+    Ok(raw_token)
+}
+
+pub(super) fn compute_health(
+    last_heartbeat: Option<chrono::DateTime<chrono::FixedOffset>>,
+    config: &Config,
+) -> String {
+    match last_heartbeat {
+        None => "unknown".to_string(),
+        Some(hb) => {
+            let age = Utc::now() - hb.with_timezone(&Utc);
+            if age.num_seconds() < config.sync_health_healthy_secs {
+                "healthy".to_string()
+            } else if age.num_seconds() < config.sync_health_warning_secs {
+                "warning".to_string()
+            } else {
+                "stale".to_string()
+            }
+        }
+    }
+}
+
+/// The first error of a service's most recent cycle that reported one, or None when its recent
+/// cycles were clean. One query for every service on the page.
+/// The last error a sync service recorded, if it recorded one.
+#[derive(FromQueryResult)]
+pub(super) struct LastFailure {
+    pub(super) service_id: Uuid,
+    pub(super) error: Option<String>,
+}
+
+pub(super) async fn recent_errors<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    service_ids: &[Uuid],
+) -> AppResult<std::collections::HashMap<Uuid, String>> {
+    if service_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows = conn
+        .query_all_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT DISTINCT ON (service_id) service_id, errors->>0 AS error
+             FROM sync_events
+             WHERE service_id = ANY($1)
+               AND jsonb_typeof(errors) = 'array' AND jsonb_array_length(errors) > 0
+             ORDER BY service_id, started_at DESC",
+            [service_ids.to_vec().into()],
+        ))
+        .await?;
+    let mut out = std::collections::HashMap::new();
+    for row in &rows {
+        let failure = LastFailure::from_query_result(row, "")?;
+        if let Some(error) = failure.error {
+            out.insert(failure.service_id, error);
+        }
+    }
+    Ok(out)
+}
+
+pub(super) fn service_to_response(
+    s: services::Model,
+    config: &Config,
+    last_error: Option<String>,
+) -> SyncServiceResponse {
+    let health = compute_health(s.last_heartbeat, config);
+    SyncServiceResponse {
+        id: s.id,
+        service_type: s.service_type,
+        source_system: s.source_system,
+        instance_id: s.instance_id,
+        status: s.status,
+        paused: s.paused,
+        sync_interval_secs: s.sync_interval_secs,
+        full_reassert_enabled: s.full_reassert_enabled,
+        current_operation: s.current_operation,
+        last_heartbeat: s.last_heartbeat.map(|t| t.to_rfc3339()),
+        last_sync_completed_at: s.last_sync_completed_at.map(|t| t.to_rfc3339()),
+        last_error,
+        health,
+        created_at: s.created_at.to_rfc3339(),
+        updated_at: s.updated_at.to_rfc3339(),
+    }
+}
+
+pub(super) fn command_to_response(c: commands::Model) -> SyncCommandResponse {
+    SyncCommandResponse {
+        id: c.id,
+        service_id: c.service_id,
+        command: c.command,
+        payload: c.payload,
+        status: c.status,
+        result: c.result,
+        created_at: c.created_at.to_rfc3339(),
+        expires_at: c.expires_at.to_rfc3339(),
+        acknowledged_at: c.acknowledged_at.map(|t| t.to_rfc3339()),
+        completed_at: c.completed_at.map(|t| t.to_rfc3339()),
+    }
+}
+
+pub(super) fn sync_event_to_response(e: events::Model) -> SyncEventResponse {
+    SyncEventResponse {
+        id: e.id,
+        service_id: e.service_id,
+        command_id: e.command_id,
+        event_type: e.event_type,
+        status: e.status,
+        readings_synced: e.readings_synced,
+        readings_skipped: e.readings_skipped,
+        status_events_synced: e.status_events_synced,
+        errors: e.errors,
+        log: e.log,
+        started_at: e.started_at.to_rfc3339(),
+        completed_at: e.completed_at.map(|t| t.to_rfc3339()),
+        duration_ms: e.duration_ms,
+    }
+}
+
+/// Command names an operator may queue, and the payload each accepts.
+pub(super) const VALID_COMMANDS: [&str; 6] = [
+    core_commands::TRIGGER_SYNC,
+    core_commands::TRIGGER_FULL_SYNC,
+    core_commands::PAUSE,
+    core_commands::RESUME,
+    core_commands::RESYNC_STREAMS,
+    core_commands::SOURCE_AUDIT,
+];
+
+/// Refuse a command the driver would not run: an unknown name, or `resync_streams` without a
+/// non-empty `source_keys` list of strings.
+pub fn validate_command(command: &str, payload: Option<&serde_json::Value>) -> Result<(), String> {
+    if !VALID_COMMANDS.contains(&command) {
+        return Err(format!(
+            "Invalid command '{command}'. Valid commands: {}",
+            VALID_COMMANDS.join(", ")
+        ));
+    }
+    if command != core_commands::RESYNC_STREAMS {
+        return Ok(());
+    }
+    let keys = payload
+        .and_then(|p| p.get("source_keys"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "resync_streams needs a payload with a source_keys list".to_string())?;
+    if keys.is_empty() {
+        return Err("resync_streams: source_keys is empty".to_string());
+    }
+    if let Some(bad) = keys.iter().find(|k| !k.is_string()) {
+        return Err(format!(
+            "resync_streams: source_keys entry {bad} is not a string"
+        ));
+    }
+    Ok(())
+}
+
+/// Shortest cadence an operator may set. Matches the floor the sync runner applies, so the
+/// portal refuses a number the service would silently override.
+pub(super) const MIN_SYNC_INTERVAL_SECS: i32 = 30;
+
+/// The rows this file's raw queries return. Derived rather than hand-decoded so a column added to
+/// a query and not to its reader is a compile error rather than a field silently left behind.
+#[derive(FromQueryResult)]
+pub(super) struct ProbeCounts {
+    pub(super) old_readings: i64,
+    pub(super) missing: i64,
+}
+
+#[derive(FromQueryResult)]
+pub(super) struct ReconciliationSlotRow {
+    pub(super) site_parameter_id: Uuid,
+    pub(super) stream_id: Uuid,
+    pub(super) source_system: String,
+    pub(super) source_key: String,
+    pub(super) site_id: Uuid,
+    pub(super) site_name: String,
+    pub(super) parameter_id: Uuid,
+    pub(super) parameter_name: String,
+}
+
+#[derive(FromQueryResult)]
+pub(super) struct StreamExtent {
+    pub(super) readings: i64,
+    pub(super) first: Option<chrono::DateTime<chrono::Utc>>,
+    pub(super) last: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Confine a hold action to the caller's projects, resolved through the stream's paired site,
+/// as the readings flag handlers do. An unpaired stream's hold (deferred) belongs to no project,
+/// so it is actionable only by a caller without project restriction.
+pub(super) async fn enforce_hold_scope(
+    db: &sea_orm::DatabaseConnection,
+    scope: &AccessScope,
+    hold_id: Uuid,
+) -> AppResult<()> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COALESCE(sp.site_id, h.site_id) AS site_id FROM replicate_audit_holds h
+             LEFT JOIN data_streams ds ON ds.id = h.stream_id
+             LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id
+             WHERE h.id = $1",
+            [hold_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("no replicate audit hold {hold_id}")))?;
+    match row.try_get::<Option<Uuid>>("", "site_id")? {
+        Some(site_id) => enforce_project_scope_for_sites(db, scope, &[site_id]).await,
+        None => {
+            if scope.is_restricted() {
+                return Err(AppError::Forbidden(
+                    "This hold's stream is unpaired, so it belongs to no project; only a caller \
+                     without project restriction can act on it"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Relative tolerance for the mean comparison. The portals store aggregates in MySQL FLOAT
+/// columns, so bit-exact equality is not on the table.
+pub const DEFAULT_REL_TOL: f64 = 1e-5;
+
+/// Absolute floor, for values near zero where a relative bound collapses.
+pub const DEFAULT_ABS_TOL: f64 = 1e-4;
+
+/// The standard deviation gets a looser bound than the mean: against real portal data the stored
+/// sd routinely disagrees with a recompute from its own replicate cells at the 1e-5 relative
+/// level (FLOAT storage, historical R rounding chains), and a hold per micro-mismatch would bury
+/// the real findings. A genuinely wrong sd (population-vs-sample, stale after an edit) sits at
+/// percent level and still trips this.
+pub const SD_REL_TOL: f64 = 1e-3;
+
+pub const SD_ABS_TOL: f64 = 1e-3;
+
+/// The portals round aggregate cells to 2 decimals before storing, so a disagreement below half
+/// the stored quantum is not auditable: the portal's own cell cannot represent it.
+pub const PORTAL_QUANTUM: f64 = 0.005;
+
+/// The floor under every tolerance bound, [`PORTAL_QUANTUM`] plus an epsilon so a delta of
+/// exactly half the quantum stays inside. Shared by [`stats_agree_with`] and [`bound_sql`] so the
+/// in-process comparison and the SQL one cannot drift apart.
+pub const QUANTUM_FLOOR: f64 = PORTAL_QUANTUM + 1e-9;
+
+/// The tolerance bound between two statistics: relative to the larger magnitude, with an absolute
+/// floor, never below [`QUANTUM_FLOOR`].
+#[must_use]
+pub fn tolerance_bound(e: f64, c: f64, rel_tol: f64, abs_tol: f64) -> f64 {
+    f64::max(rel_tol * f64::max(e.abs(), c.abs()), abs_tol).max(QUANTUM_FLOOR)
+}
+
+/// SQL for the same bound between two value expressions, with the relative tolerance bound as
+/// `rel_bind`. The one producer of the tolerance in SQL form; the reconciliation verifier uses it.
+#[must_use]
+pub fn bound_sql(a: &str, b: &str, rel_bind: &str, abs_tol: f64) -> String {
+    format!("GREATEST({rel_bind} * GREATEST(abs({a}), abs({b})), {abs_tol}, {QUANTUM_FLOOR})")
+}
+
+/// The recomputed statistics of a group of would-be-stored values.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroupStats {
+    pub n: usize,
+    pub mean: Option<f64>,
+    /// The standard deviation under the slot's declared divisor, sample (n-1) by default. None
+    /// below n=2 under either.
+    pub sd: Option<f64>,
+}
+
+impl GroupStats {
+    /// The same group under the population divisor: `s * sqrt((n-1)/n)`.
+    ///
+    /// The audit compares against whichever divisor the slot declares, so a slot that has declared
+    /// `population` stops holding these groups instead of holding every one of them forever.
+    #[must_use]
+    pub fn under(self, estimator: &str) -> Self {
+        if estimator != "population" || self.n < 2 {
+            return self;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let factor = (((self.n - 1) as f64) / self.n as f64).sqrt();
+        Self {
+            sd: self.sd.map(|sd| sd * factor),
+            ..self
+        }
+    }
+}
+
+#[must_use]
+pub fn group_stats(values: &[f64]) -> GroupStats {
+    let n = values.len();
+    if n == 0 {
+        return GroupStats {
+            n,
+            mean: None,
+            sd: None,
+        };
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let sd = if n >= 2 {
+        #[allow(clippy::cast_precision_loss)]
+        let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0);
+        Some(var.sqrt())
+    } else {
+        None
+    };
+    GroupStats {
+        n,
+        mean: Some(mean),
+        sd,
+    }
+}
+
+/// Whether two statistics agree within tolerance. A missing side is not a mismatch: a portal
+/// stores no sd for two of three nutrient families, and n=1 groups have no sd to compare.
+#[must_use]
+pub fn stats_agree(expected: Option<f64>, computed: Option<f64>, rel_tol: f64) -> bool {
+    stats_agree_with(expected, computed, rel_tol, DEFAULT_ABS_TOL)
+}
+
+#[must_use]
+pub fn stats_agree_with(
+    expected: Option<f64>,
+    computed: Option<f64>,
+    rel_tol: f64,
+    abs_tol: f64,
+) -> bool {
+    match (expected, computed) {
+        (Some(e), Some(c)) => (e - c).abs() <= tolerance_bound(e, c, rel_tol, abs_tol),
+        _ => true,
+    }
+}
+
+/// Whether a group's recomputed statistics meet the source's claim: mean and sd within their
+/// tolerances, and the count equal when the source stated one. The one comparison the audit,
+/// the review queue and the preview all make.
+#[must_use]
+pub fn agrees(expected: &GroupAudit, stats: &GroupStats) -> bool {
+    stats_agree(expected.expected_mean, stats.mean, DEFAULT_REL_TOL)
+        && stats_agree_with(expected.expected_sd, stats.sd, SD_REL_TOL, SD_ABS_TOL)
+        && expected
+            .expected_n
+            .is_none_or(|n| i64::try_from(stats.n) == Ok(n))
+}
+
+/// One stored value with the replicate index it is stored at. The index is the source's column
+/// position and nothing renumbers it, so it is the only handle a resolution can flag by.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ReplicateValue {
+    pub index: i16,
+    pub value: f64,
+}
+
+/// The values a hold was recorded over, in the order the source sent them. Holds written before
+/// the index travelled with the value hold bare numbers; their index is unrecoverable, because no
+/// position in the array stands for one, so it reads as `None` rather than as the position.
+#[must_use]
+pub fn stored_values(computed: &serde_json::Value) -> Vec<(Option<i16>, f64)> {
+    computed
+        .get("values")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| match v {
+                    serde_json::Value::Object(_) => Some((
+                        v.get("index")
+                            .and_then(serde_json::Value::as_i64)
+                            .and_then(|i| i16::try_from(i).ok()),
+                        f64_at(v, "value")?,
+                    )),
+                    _ => Some((None, v.as_f64()?)),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The audit verdict for one group.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupMismatch {
+    pub time: DateTime<Utc>,
+    pub expected_mean: Option<f64>,
+    pub expected_sd: Option<f64>,
+    pub expected_n: Option<i64>,
+    pub computed_mean: Option<f64>,
+    pub computed_sd: Option<f64>,
+    pub n: usize,
+    /// The divisor `computed_sd` was computed under, 'sample' or 'population'.
+    pub sd_estimator: String,
+    /// The stored values the statistics were computed over, each at its replicate index.
+    pub values: Vec<ReplicateValue>,
+}
+
+/// Open holds: the ones still awaiting review, unique per (stream, group_time). Must match the
+/// partial index predicate in m20260821_000002 exactly, since the upsert names it as its
+/// conflict target. Everything else is a decision or an outcome and is never rewritten by the
+/// gate.
+pub(crate) const OPEN: &str = "('pending', 'deferred')";
+
+/// Everything past review. `use_portal`, `use_manual` and `consumed` are legacy statuses kept
+/// for history; nothing produces them.
+pub(super) const RESOLVED: &str =
+    "('acknowledged', 'remediated', 'superseded', 'use_portal', 'use_manual', 'consumed')";
+
+/// The most recent hold for a group, as the ingest gate reads it. Terminal decisions matter to
+/// the gate as much as open holds: a re-detected disagreement must not reopen a group an
+/// operator already ruled on.
+pub struct LatestHold {
+    pub time: DateTime<Utc>,
+    pub status: String,
+    pub id: Uuid,
+    /// The portal expectation the hold was recorded against, for [`expected_changed`].
+    pub expected: serde_json::Value,
+}
+
+/// Whether an incoming audit claim differs from the expectation a hold recorded, under the same
+/// tolerances detection uses. A terminal decision stands against re-detection of the SAME
+/// disagreement; a cycle whose expected statistics have moved is new evidence and opens a fresh
+/// hold.
+#[must_use]
+pub fn expected_changed(recorded: &serde_json::Value, audit: &GroupAudit) -> bool {
+    fn side_changed(a: Option<f64>, b: Option<f64>, rel_tol: f64, abs_tol: f64) -> bool {
+        match (a, b) {
+            (Some(_), Some(_)) => !stats_agree_with(a, b, rel_tol, abs_tol),
+            (None, None) => false,
+            _ => true,
+        }
+    }
+    side_changed(
+        f64_at(recorded, "mean"),
+        audit.expected_mean,
+        DEFAULT_REL_TOL,
+        DEFAULT_ABS_TOL,
+    ) || side_changed(
+        f64_at(recorded, "sd"),
+        audit.expected_sd,
+        SD_REL_TOL,
+        SD_ABS_TOL,
+    ) || recorded.get("n").and_then(serde_json::Value::as_i64) != audit.expected_n
+}
+
+/// The most recent statistics hold per group for a stream at the given instants, any status.
+///
+/// Scoped to `replicate_stats`: the caller is the statistics audit deciding whether a group's
+/// recorded expectation changed at source, and a `source_modified` or `brake_fired` row at the same
+/// instant answers a different question.
+pub async fn latest_holds<C: ConnectionTrait>(
+    conn: &C,
+    stream_id: Uuid,
+    times: &[DateTime<Utc>],
+) -> AppResult<Vec<LatestHold>> {
+    let (Some(lo), Some(hi)) = (times.iter().min(), times.iter().max()) else {
+        return Ok(Vec::new());
+    };
+    // Range bind + exact-match filter here: a timestamptz array bind panics in the driver, and
+    // one batch's audit instants are contiguous anyway.
+    let wanted: std::collections::HashSet<DateTime<Utc>> = times.iter().copied().collect();
+    let rows = conn
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT DISTINCT ON (group_time) id, group_time, status, expected
+             FROM replicate_audit_holds
+             WHERE stream_id = $1 AND group_time >= $2 AND group_time <= $3
+               AND kind = 'replicate_stats'
+             ORDER BY group_time, created_at DESC, id DESC",
+            [
+                stream_id.into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(*lo).into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(*hi).into(),
+            ],
+        ))
+        .await?;
+    rows.iter()
+        .filter_map(|r| {
+            let entry = LatestHoldRow::from_query_result(r, "").map(|row| LatestHold {
+                time: row.group_time.with_timezone(&Utc),
+                status: row.status,
+                id: row.id,
+                expected: row.expected,
+            });
+            match entry {
+                Ok(e) if wanted.contains(&e.time) => Some(Ok(e)),
+                Ok(_) => None,
+                Err(e) => Some(Err(e.into())),
+            }
+        })
+        .collect()
+}
+
+/// The status a detection asks for: `pending` on a paired stream (the review queue), `deferred` on
+/// an unpaired one, promoted to pending when the stream is paired.
+#[must_use]
+pub fn status_for(paired: bool) -> &'static str {
+    if paired { "pending" } else { "deferred" }
+}
+
+/// What a hold is keyed by, which is also which open-unique index the upsert conflicts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldKey {
+    /// A stream's replicate group at one instant.
+    Stream {
+        stream_id: Uuid,
+        group_time: DateTime<Utc>,
+    },
+    /// A slot's instant, for a finding no stream produced (the event audit, an unverified entry).
+    Slot {
+        site_id: Uuid,
+        parameter_id: Uuid,
+        group_time: DateTime<Utc>,
+    },
+    /// One standing hold per stream whatever the instant: the device behind the feed changed, and
+    /// a second detection updates the standing row rather than adding one per sync cycle.
+    StreamStanding { stream_id: Uuid },
+}
+
+/// A detection, in the shape every writer states it.
+pub struct Hold<'a> {
+    pub key: HoldKey,
+    pub kind: &'a str,
+    pub expected: serde_json::Value,
+    pub computed: serde_json::Value,
+    pub delta: serde_json::Value,
+    /// `pending` or `deferred`; see [`status_for`].
+    pub status: &'a str,
+    /// The calculation a finding is about, where one produced it.
+    pub tool: Option<&'a str>,
+}
+
+impl Hold<'_> {
+    /// The columns the key fills, and the conflict target that makes a re-detection an update of
+    /// the same row rather than a duplicate. Each target is an open-only partial index, so a
+    /// decision already taken is never rewritten: a detection beside a terminal hold inserts a
+    /// fresh open row.
+    pub(super) fn target(&self) -> (&'static str, String, Vec<sea_orm::Value>) {
+        match self.key {
+            HoldKey::Stream {
+                stream_id,
+                group_time,
+            } => (
+                "stream_id, group_time",
+                format!("(stream_id, group_time, kind) WHERE status IN {OPEN}"),
+                vec![
+                    stream_id.into(),
+                    sea_orm::prelude::DateTimeWithTimeZone::from(group_time).into(),
+                ],
+            ),
+            HoldKey::Slot {
+                site_id,
+                parameter_id,
+                group_time,
+            } => (
+                "site_id, parameter_id, group_time",
+                "(kind, site_id, parameter_id, group_time) WHERE stream_id IS NULL AND status = 'pending'"
+                    .to_string(),
+                vec![
+                    site_id.into(),
+                    parameter_id.into(),
+                    sea_orm::prelude::DateTimeWithTimeZone::from(group_time).into(),
+                ],
+            ),
+            HoldKey::StreamStanding { stream_id } => (
+                "stream_id, group_time",
+                format!("(stream_id) WHERE kind = 'source_identity_changed' AND status IN {OPEN}"),
+                vec![stream_id.into(), "NOW()".into()],
+            ),
+        }
+    }
+}
+
+/// The one statement every hold is written by. Read it back in a test rather than a database.
+#[must_use]
+pub fn hold_statement(hold: &Hold) -> Statement {
+    let (key_columns, conflict, mut values) = hold.target();
+    let key_placeholders: String = match hold.key {
+        HoldKey::StreamStanding { .. } => {
+            values.pop();
+            "$1, NOW()".to_string()
+        }
+        _ => (1..=values.len())
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    let n = values.len();
+    values.push(hold.kind.into());
+    values.push(hold.expected.clone().into());
+    values.push(hold.computed.clone().into());
+    values.push(hold.delta.clone().into());
+    values.push(hold.status.into());
+    values.push(hold.tool.into());
+    Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO replicate_audit_holds
+                 ({key_columns}, kind, expected, computed, delta, status, tool)
+             VALUES ({key_placeholders}, ${kind}, ${expected}, ${computed}, ${delta}, ${status}, ${tool})
+             ON CONFLICT {conflict}
+             DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed,
+                           delta = EXCLUDED.delta, tool = EXCLUDED.tool, created_at = NOW(),
+                           status = CASE WHEN replicate_audit_holds.status = 'deferred'
+                                              AND EXCLUDED.status = 'pending'
+                                         THEN 'pending' ELSE replicate_audit_holds.status END",
+            kind = n + 1,
+            expected = n + 2,
+            computed = n + 3,
+            delta = n + 4,
+            status = n + 5,
+            tool = n + 6,
+        ),
+        values,
+    )
+}
+
+/// Which streams' holds a pairing change moves.
+#[derive(Debug, Clone, Copy)]
+pub enum HoldScope {
+    /// One stream.
+    Stream(Uuid),
+    /// Every stream a pairing plan owns.
+    Plan(Uuid),
+}
+
+/// Pairing promotes a stream's deferred holds into the review queue; unpairing defers them again.
+/// A slot-keyed hold names no stream and is never moved by either.
+pub async fn repoint_holds<C: ConnectionTrait>(
+    conn: &C,
+    scope: HoldScope,
+    paired: bool,
+) -> AppResult<()> {
+    let (to, from) = if paired {
+        ("pending", "deferred")
+    } else {
+        ("deferred", "pending")
+    };
+    // `replicate_audit_holds` has no entity, so the hold update stays a statement; the streams a
+    // plan owns are read through the `data_streams` entity rather than joined by name.
+    let stream_ids: Vec<Uuid> = match scope {
+        HoldScope::Stream(stream_id) => vec![stream_id],
+        HoldScope::Plan(plan_id) => {
+            data_streams::models::Entity::find()
+                .filter(data_streams::models::Column::PairingPlanId.eq(plan_id))
+                .select_only()
+                .column(data_streams::models::Column::Id)
+                .into_tuple()
+                .all(conn)
+                .await?
+        }
+    };
+    if stream_ids.is_empty() {
+        return Ok(());
+    }
+    conn.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "UPDATE replicate_audit_holds SET status = '{to}'
+             WHERE stream_id = ANY($1) AND status = '{from}'"
+        ),
+        [stream_ids.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Record (or refresh) a hold. The open unique index makes a re-detection on every sync cycle an
+/// update of the same row, never a duplicate; a deferred row found by a paired-stream detection is
+/// promoted to pending.
+pub async fn upsert_hold<C: ConnectionTrait>(conn: &C, hold: &Hold<'_>) -> AppResult<()> {
+    conn.execute_raw(hold_statement(hold)).await?;
+    Ok(())
+}
+
+/// Record (or refresh) a hold for a group whose statistics disagree with the source's own.
+pub async fn upsert_stats_hold<C: ConnectionTrait>(
+    conn: &C,
+    stream_id: Uuid,
+    mismatch: &GroupMismatch,
+    status: &str,
+) -> AppResult<()> {
+    let mut expected = serde_json::json!({
+        "mean": mismatch.expected_mean,
+        "sd": mismatch.expected_sd,
+    });
+    let computed = serde_json::json!({
+        "mean": mismatch.computed_mean,
+        "sd": mismatch.computed_sd,
+        "n": mismatch.n,
+        "sd_estimator": mismatch.sd_estimator,
+        "values": mismatch.values,
+    });
+    let mut delta = serde_json::json!({
+        "mean": delta_of(mismatch.expected_mean, mismatch.computed_mean),
+        "sd": delta_of(mismatch.expected_sd, mismatch.computed_sd),
+    });
+    if let Some(expected_n) = mismatch.expected_n {
+        expected["n"] = expected_n.into();
+        delta["n"] =
+            i64::try_from(mismatch.n).map_or(serde_json::Value::Null, |n| (expected_n - n).into());
+    }
+    upsert_hold(
+        conn,
+        &Hold {
+            key: HoldKey::Stream {
+                stream_id,
+                group_time: mismatch.time,
+            },
+            kind: "replicate_stats",
+            expected,
+            computed,
+            delta,
+            status,
+            tool: None,
+        },
+    )
+    .await
+}
+
+pub(super) fn delta_of(expected: Option<f64>, computed: Option<f64>) -> Option<f64> {
+    Some(expected? - computed?)
+}
+
+/// Close a hold whose group now matches at source.
+pub async fn close_hold<C: ConnectionTrait>(
+    conn: &C,
+    hold_id: Uuid,
+    terminal_status: &str,
+) -> AppResult<()> {
+    conn.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "UPDATE replicate_audit_holds SET status = $2 WHERE id = $1",
+        [hold_id.into(), terminal_status.to_string().into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+pub(super) fn f64_at(v: &serde_json::Value, key: &str) -> Option<f64> {
+    v.get(key).and_then(serde_json::Value::as_f64)
+}
+
+/// Signature classification of a disagreement, first match wins. The signatures cover the
+/// failure classes observed in the real portal data, so the review queue reads as a triage
+/// list rather than columns of deltas.
+#[must_use]
+pub fn classify(expected: &serde_json::Value, computed: &serde_json::Value) -> &'static str {
+    let expected_n = expected.get("n").and_then(serde_json::Value::as_i64);
+    let computed_n = computed.get("n").and_then(serde_json::Value::as_i64);
+    if let Some(en) = expected_n
+        && computed_n != Some(en)
+    {
+        return "n_mismatch";
+    }
+    let expected_mean = f64_at(expected, "mean");
+    let expected_sd = f64_at(expected, "sd");
+    let computed_mean = f64_at(computed, "mean");
+    let computed_sd = f64_at(computed, "sd");
+    // A population-divisor sd relates to the sample one by sqrt((n-1)/n). The signature claims
+    // the sd is the ONLY disagreement, so it requires the means to agree: a wrong mean with a
+    // coincidentally population-shaped sd is not explained by the divisor.
+    if let (Some(esd), Some(csd), Some(n)) = (expected_sd, computed_sd, computed_n)
+        && n >= 2
+        && stats_agree(expected_mean, computed_mean, DEFAULT_REL_TOL)
+    {
+        #[allow(clippy::cast_precision_loss)]
+        let population = csd * (((n - 1) as f64) / n as f64).sqrt();
+        if stats_agree_with(Some(esd), Some(population), SD_REL_TOL, SD_ABS_TOL) {
+            return "population_sd";
+        }
+    }
+    // A stale cell frozen over the first k replicates before later ones were entered.
+    let values: Vec<f64> = stored_values(computed)
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect();
+    if let Some(em) = expected_mean
+        && values.len() >= 2
+    {
+        for k in 1..values.len() {
+            #[allow(clippy::cast_precision_loss)]
+            let prefix_mean = values[..k].iter().sum::<f64>() / k as f64;
+            if (prefix_mean - em).abs() <= PORTAL_QUANTUM + 1e-9 {
+                return "stale_subset";
+            }
+        }
+    }
+    "unexplained"
+}
+
+/// The next resolution object, stamped with the acting identity and time, with the previous one
+/// appended under `history` so the decision trail survives reopen and re-resolve cycles.
+pub(super) fn merged_resolution(
+    prev: Option<serde_json::Value>,
+    mut next: serde_json::Value,
+    by: &str,
+) -> serde_json::Value {
+    next["by"] = by.into();
+    next["at"] = Utc::now().to_rfc3339().into();
+    if let Some(prev) = prev {
+        let mut history = prev
+            .get("history")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut stripped = prev;
+        if let Some(obj) = stripped.as_object_mut() {
+            obj.remove("history");
+        }
+        history.push(stripped);
+        next["history"] = serde_json::Value::Array(history);
+    }
+    next
+}
+
+/// The one denominator every relative delta is normalised by: the MEAN magnitude, not each
+/// statistic's own, because that is the scale an operator judges significance on (an sd off by 2
+/// on a value of 150 is noise; a mean off by 2 is not).
+macro_rules! scale_sql {
+    () => {
+        "GREATEST(
+        abs(COALESCE((h.expected->>'mean')::float8, 0)),
+        abs(COALESCE((h.computed->>'mean')::float8, 0)),
+        1e-9
+    )"
+    };
+}
+
+pub(super) const MEAN_RELATIVE_DELTA_SQL: &str = concat!(
+    "COALESCE(abs((h.delta->>'mean')::float8), 0) / ",
+    scale_sql!()
+);
+
+pub(super) const SD_RELATIVE_DELTA_SQL: &str = concat!(
+    "COALESCE(abs((h.delta->>'sd')::float8), 0) / ",
+    scale_sql!()
+);
+
+/// One scalar per hold saying how large the disagreement is against the measurement's own scale:
+/// `max(|Δmean|, |Δsd|) / max(|portal mean|, |computed mean|)`, i.e. the greater of
+/// [`MEAN_RELATIVE_DELTA_SQL`] and [`SD_RELATIVE_DELTA_SQL`]. The same expression drives the
+/// list's per-row value, the sort, and the threshold bulk acknowledge, so what the UI shows and
+/// what the slider acknowledges can never disagree.
+pub(super) const RELATIVE_DELTA_SQL: &str = concat!(
+    "GREATEST(
+        COALESCE(abs((h.delta->>'mean')::float8), 0),
+        COALESCE(abs((h.delta->>'sd')::float8), 0)
+    ) / ",
+    scale_sql!()
+);
+
+/// The population-divisor signature, in SQL, over the alias `h` (`replicate_audit_holds`).
+///
+/// It reproduces exactly the arm [`classify`] returns `population_sd` from: the replicate counts
+/// agree (so `n_mismatch` cannot preempt it), the means agree, and the source's sd is our sd under
+/// the other divisor, `s * sqrt((n-1)/n)`. The prefix search behind `stale_subset` has no SQL
+/// spelling, but it is tested after this arm, so a row matching here is `population_sd` in both.
+/// `the_sql_signature_and_classify_agree` pins that.
+///
+/// Built from [`bound_sql`] and the same tolerance constants the in-process comparison uses, so
+/// the two spellings cannot drift. One producer: the list filter, the resolution gate, the bulk
+/// skip and the declaration counts all read this, so what the UI counts and what the gate blocks
+/// can never disagree.
+pub static POPULATION_SD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let expected_mean = "(h.expected->>'mean')::float8";
+    let computed_mean = "(h.computed->>'mean')::float8";
+    let expected_sd = "(h.expected->>'sd')::float8";
+    let population_sd = "((h.computed->>'sd')::float8 \
+                         * sqrt(((h.computed->>'n')::float8 - 1) / (h.computed->>'n')::float8))";
+    let mean_bound = bound_sql(
+        expected_mean,
+        computed_mean,
+        &DEFAULT_REL_TOL.to_string(),
+        DEFAULT_ABS_TOL,
+    );
+    let sd_bound = bound_sql(
+        expected_sd,
+        population_sd,
+        &SD_REL_TOL.to_string(),
+        SD_ABS_TOL,
+    );
+    format!(
+        "((h.expected->>'n') IS NULL \
+           OR (h.expected->>'n')::int = (h.computed->>'n')::int) \
+         AND (h.computed->>'n')::int >= 2 \
+         AND (h.expected->>'mean') IS NOT NULL AND (h.computed->>'mean') IS NOT NULL \
+         AND abs({expected_mean} - {computed_mean}) <= {mean_bound} \
+         AND (h.expected->>'sd') IS NOT NULL AND (h.computed->>'sd') IS NOT NULL \
+         AND abs({expected_sd} - {population_sd}) <= {sd_bound}"
+    )
+});
+
+/// The row shapes the raw hold queries return. A derived decoder is checked against the SELECT it
+/// fills, so a column renamed in one query and not in its mapper fails where the query is written.
+#[derive(FromQueryResult)]
+pub(super) struct LatestHoldRow {
+    pub(super) group_time: sea_orm::prelude::DateTimeWithTimeZone,
+    pub(super) status: String,
+    pub(super) id: Uuid,
+    pub(super) expected: serde_json::Value,
+}
+
+#[derive(FromQueryResult)]
+pub(super) struct KindCountRow {
+    pub(super) kind: String,
+    pub(super) n: i64,
+}
+
+/// The payload the last audit recorded at one slot. Both columns are `NOT NULL`, so a row that
+/// does not decode is a corrupt hold rather than an absent one.
+#[derive(FromQueryResult)]
+pub(super) struct PayloadRow {
+    pub(super) expected: serde_json::Value,
+    pub(super) computed: serde_json::Value,
+}
+
+#[derive(FromQueryResult)]
+pub(super) struct ReplicateStateRow {
+    pub(super) replicate_index: i16,
+    pub(super) flagged: bool,
+}
+
+#[derive(FromQueryResult)]
+pub(super) struct HoldSlotRow {
+    pub(super) site_id: Option<Uuid>,
+    pub(super) parameter_id: Option<Uuid>,
+    pub(super) group_time: sea_orm::prelude::DateTimeWithTimeZone,
+}
+
+#[derive(FromQueryResult)]
+pub(super) struct HoldCountsRow {
+    pub(super) total: i64,
+    pub(super) pending: i64,
+    pub(super) deferred: i64,
+}
+
+#[derive(FromQueryResult)]
+pub(super) struct EstimatorGateRow {
+    pub(super) expected_sd: Option<f64>,
+    pub(super) computed_sd: Option<f64>,
+    pub(super) site_name: Option<String>,
+    pub(super) parameter_name: Option<String>,
+}
+
+#[derive(FromQueryResult)]
+pub(super) struct FlagHoldRow {
+    pub(super) stream_id: Uuid,
+    pub(super) group_time: sea_orm::prelude::DateTimeWithTimeZone,
+    pub(super) resolution: Option<serde_json::Value>,
+    pub(super) computed: serde_json::Value,
+}
+
+#[derive(FromQueryResult)]
+pub(super) struct EstimatorHoldRow {
+    pub(super) group_time: sea_orm::prelude::DateTimeWithTimeZone,
+    pub(super) site_parameter_id: Uuid,
+    pub(super) site_id: Uuid,
+    pub(super) parameter_id: Uuid,
+    pub(super) previous: Option<String>,
+    pub(super) resolution: Option<serde_json::Value>,
+}
+
+#[derive(FromQueryResult)]
+pub(super) struct ReopenHoldRow {
+    pub(super) stream_id: Uuid,
+    pub(super) group_time: sea_orm::prelude::DateTimeWithTimeZone,
+    pub(super) status: String,
+    pub(super) paired: bool,
+    pub(super) resolution: Option<serde_json::Value>,
+    pub(super) site_parameter_id: Option<Uuid>,
+    pub(super) site_id: Option<Uuid>,
+    pub(super) parameter_id: Option<Uuid>,
+}
+
+/// SQL fragment producing the accept-ours resolution object (actor and time stamped on the
+/// entry) while preserving any prior actions under `history` (a reopened hold can be
+/// re-resolved). Shared by single and bulk acknowledge; `by_bind` is the placeholder carrying
+/// the actor label.
+pub(super) fn accept_ours_resolution_sql(by_bind: &str) -> String {
+    format!(
+        "CASE
+    WHEN h.resolution IS NULL
+        THEN jsonb_build_object('action', 'accept_ours', 'by', {by_bind}::text, 'at', NOW())
+    ELSE jsonb_build_object('action', 'accept_ours', 'by', {by_bind}::text, 'at', NOW(),
+         'history',
+         COALESCE(h.resolution->'history', '[]'::jsonb)
+             || jsonb_build_array(h.resolution - 'history'))
+    END"
+    )
+}
+
+/// The audit annotation category. Minted server-side only; the annotate dialog does not offer it.
+pub(super) const AUDIT_ANNOTATION_CATEGORY: &str = "audit";
+
+/// Put an audit decision on the charts for the instant it concerns.
+///
+/// A hold lives in a queue nobody reads while looking at a plot, so a decision about a value is
+/// invisible exactly where the value is. This mints a point annotation at the group's instant on
+/// the slot the hold sits on, carrying both numbers and what was decided, and the existing chart
+/// band, tooltip and chip machinery renders it with no further wiring.
+///
+/// Best-effort by design: an unpaired stream resolves to no slot, and a decision must not fail
+/// because it could not also be drawn. Failures are logged, never returned.
+pub(super) async fn mint_audit_annotation<C: ConnectionTrait>(
+    conn: &C,
+    hold_id: Uuid,
+    text: &str,
+    by: &str,
+) {
+    let result = conn
+        .execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "INSERT INTO annotations
+                 (site_id, parameter_id, start_time, end_time, text, category,
+                  created_by, audit_hold_id)
+             SELECT COALESCE(sp.site_id, h.site_id), COALESCE(sp.parameter_id, h.parameter_id),
+                    h.group_time, h.group_time, $2, $3, $4, h.id
+             FROM replicate_audit_holds h
+             LEFT JOIN data_streams ds ON ds.id = h.stream_id
+             LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id
+             WHERE h.id = $1
+               AND COALESCE(sp.site_id, h.site_id) IS NOT NULL
+               AND COALESCE(sp.parameter_id, h.parameter_id) IS NOT NULL",
+            [
+                hold_id.into(),
+                text.to_string().into(),
+                AUDIT_ANNOTATION_CATEGORY.into(),
+                by.to_string().into(),
+            ],
+        ))
+        .await;
+    if let Err(e) = result {
+        tracing::warn!("could not annotate audit hold {hold_id}: {e}");
+    }
+}
+
+/// Remove the annotations a hold's decisions minted. Runs on reopen, inside its transaction: the
+/// note said a decision had been taken, and it has not any more.
+pub(super) async fn delete_audit_annotations<C: ConnectionTrait>(
+    conn: &C,
+    hold_id: Uuid,
+) -> AppResult<()> {
+    annotations::models::Entity::delete_many()
+        .filter(annotations::models::Column::AuditHoldId.eq(hold_id))
+        .exec(conn)
+        .await?;
+    Ok(())
+}
+
+/// Declare a slot's sd estimator, or clear it back to undeclared when a reopened hold restores
+/// what was there before the declaration.
+pub(super) async fn set_slot_estimator<C: ConnectionTrait>(
+    conn: &C,
+    site_parameter_id: Uuid,
+    estimator: Option<String>,
+) -> AppResult<()> {
+    site_parameters::models::Entity::update_many()
+        .col_expr(
+            site_parameters::models::Column::SdEstimator,
+            Expr::value(estimator),
+        )
+        .filter(site_parameters::models::Column::Id.eq(site_parameter_id))
+        .exec(conn)
+        .await?;
+    Ok(())
+}
+
+/// The numbers a hold disagrees over, phrased for an annotation: what the source stored against
+/// what the replicates produce.
+pub(super) fn disagreement_phrase(
+    expected: &serde_json::Value,
+    computed: &serde_json::Value,
+) -> String {
+    let fmt = |v: Option<f64>| v.map_or_else(|| "none".to_string(), |v| format!("{v:.4}"));
+    format!(
+        "source mean {} sd {}, recomputed mean {} sd {} over {} replicates",
+        fmt(f64_at(expected, "mean")),
+        fmt(f64_at(expected, "sd")),
+        fmt(f64_at(computed, "mean")),
+        fmt(f64_at(computed, "sd")),
+        computed
+            .get("n")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0),
+    )
+}
+
+/// The `expected`/`computed` blobs of one hold, for the annotation text.
+pub(super) async fn hold_numbers<C: ConnectionTrait>(
+    conn: &C,
+    hold_id: Uuid,
+) -> (serde_json::Value, serde_json::Value) {
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT expected, computed FROM replicate_audit_holds WHERE id = $1",
+            [hold_id.into()],
+        ))
+        .await
+        .ok()
+        .flatten();
+    row.and_then(|row| PayloadRow::from_query_result(&row, "").ok())
+        .map_or_else(
+            || (serde_json::Value::Null, serde_json::Value::Null),
+            |row| (row.expected, row.computed),
+        )
+}
+
+/// Refuse to let a population-divisor disagreement be accepted on a slot that has not declared
+/// which divisor it publishes.
+///
+/// The classification is evidence about the source, not a decision: the sources used both formulas
+/// over the years, so "their sd is ours under the other divisor" says the convention is unstated
+/// here, not which one is right. Accepting would file that under "our number stands" and lose the
+/// question. `flag` is not gated (a bad replicate is a separate judgement), nor is any hold on a
+/// slot that has declared (a remaining disagreement there is a genuine finding).
+pub(super) async fn refuse_undeclared_estimator(
+    db: &sea_orm::DatabaseConnection,
+    hold_id: Uuid,
+) -> AppResult<()> {
+    let population_sd = &*POPULATION_SD_SQL;
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT (h.expected->>'sd')::float8 AS expected_sd,
+                        (h.computed->>'sd')::float8 AS computed_sd,
+                        st.name AS site_name, p.name AS parameter_name
+                 FROM replicate_audit_holds h
+                 JOIN data_streams ds ON ds.id = h.stream_id
+                 JOIN site_parameters sp ON sp.id = ds.site_parameter_id
+                 JOIN sites st ON st.id = sp.site_id
+                 JOIN parameters p ON p.id = sp.parameter_id
+                 WHERE h.id = $1 AND h.kind = 'replicate_stats'
+                   AND sp.sd_estimator IS NULL AND ({population_sd})"
+            ),
+            [hold_id.into()],
+        ))
+        .await?;
+    let Some(row) = row else { return Ok(()) };
+    let EstimatorGateRow {
+        expected_sd,
+        computed_sd,
+        site_name,
+        parameter_name,
+    } = EstimatorGateRow::from_query_result(&row, "")?;
+    let slot = format!(
+        "{} / {}",
+        site_name.as_deref().unwrap_or("this site"),
+        parameter_name.as_deref().unwrap_or("this parameter"),
+    );
+    Err(AppError::Conflict(format!(
+        "This disagreement cannot be accepted yet. The source's sd ({}) is this group's sd under \
+         the population formula (divisor n); ours ({}) uses the sample formula (divisor n-1). \
+         {slot} has not declared which one it publishes, so accepting would leave that unrecorded. \
+         Resolve with mode 'estimator' naming 'sample' or 'population', scoped to the parameter or \
+         to this instant, or flag the replicates instead.",
+        expected_sd.map_or_else(|| "none".to_string(), |v| format!("{v:.4}")),
+        computed_sd.map_or_else(|| "none".to_string(), |v| format!("{v:.4}")),
+    )))
+}
+
+/// Accept the statistics recomputed from the stored replicates: the hold goes terminal, the
+/// decision is recorded on it, and the annotation that draws it on the chart is minted. Both the
+/// acknowledge route and `resolve {mode: "ours"}` are this and nothing else; only the response
+/// they build differs.
+pub(super) async fn accept_ours(state: &AppState, id: Uuid, by: &str) -> AppResult<()> {
+    refuse_undeclared_estimator(&state.db, id).await?;
+    let resolution_sql = accept_ours_resolution_sql("$2");
+    let updated = state
+        .db
+        .execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "UPDATE replicate_audit_holds AS h
+                 SET status = 'acknowledged', resolution = {resolution_sql},
+                     acknowledged_by = $2, acknowledged_at = NOW()
+                 WHERE id = $1 AND status = 'pending'"
+            ),
+            [id.into(), by.into()],
+        ))
+        .await?
+        .rows_affected();
+    if updated == 0 {
+        return Err(AppError::NotFound(format!(
+            "no pending replicate audit hold {id}"
+        )));
+    }
+    let (expected, computed) = hold_numbers(&state.db, id).await;
+    mint_audit_annotation(
+        &state.db,
+        id,
+        &format!(
+            "Audit accepted: the statistics computed here stand ({}). Accepted by {by}.",
+            disagreement_phrase(&expected, &computed)
+        ),
+        by,
+    )
+    .await;
+    Ok(())
+}
+
+/// Rule on an intern's entry (Q21, M44): `verify` accepts it as it stands, `reject` withdraws it.
+/// Both are decisions on the record, so both are reversible: a rejected entry is re-asserted, and
+/// reopen returns the hold to review.
+pub(super) async fn rule_on_entry(
+    state: &AppState,
+    id: Uuid,
+    mode: &str,
+    reason: Option<&str>,
+    by: &str,
+) -> AppResult<Json<ResolveHoldResponse>> {
+    use crate::routes::private::readings::decisions::{Kind, NewValue, Origin, record_many};
+    let hold = state
+        .db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT site_id, parameter_id, group_time FROM replicate_audit_holds
+             WHERE id = $1 AND kind = 'unverified_entry' AND status IN ('pending', 'deferred')",
+            [id.into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("no pending unverified entry hold {id}")))?;
+    let hold = HoldSlotRow::from_query_result(&hold, "")?;
+    let group_time = hold.group_time;
+    let (Some(site_id), Some(parameter_id)) = (hold.site_id, hold.parameter_id) else {
+        return Err(AppError::BadRequest(format!(
+            "unverified entry hold {id} names no slot"
+        )));
+    };
+    let reason = reason
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map_or_else(|| format!("unverified entry hold {id}"), String::from);
+    let (kind, new, status) = if mode == "verify" {
+        (
+            Kind::Verify,
+            serde_json::json!({ "unverified": false }),
+            "acknowledged",
+        )
+    } else {
+        (
+            Kind::Reject,
+            serde_json::json!({ "reason": reason.clone() }),
+            "remediated",
+        )
+    };
+    let decided = crate::common::bulk_write::guarded(&state.db, async |txn| {
+        let recorded = record_many(
+            txn,
+            kind,
+            "r.site_id = $1 AND r.parameter_id = $2 AND r.time = $3 AND r.unverified IS TRUE",
+            vec![site_id.into(), parameter_id.into(), group_time.into()],
+            NewValue::Literal(new),
+            by,
+            Some(&reason),
+            Origin::Audit,
+            None,
+        )
+        .await?;
+        txn.execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "UPDATE replicate_audit_holds
+                 SET status = '{status}', acknowledged_by = $2, acknowledged_at = NOW(),
+                     resolution = jsonb_build_object('mode', $3::text, 'by', $2::text,
+                                                     'at', to_jsonb(NOW()), 'rows', $4::bigint)
+                 WHERE id = $1"
+            ),
+            [
+                id.into(),
+                by.into(),
+                mode.into(),
+                i64::try_from(recorded.rows).unwrap_or(i64::MAX).into(),
+            ],
+        ))
+        .await?;
+        Ok(recorded.rows)
+    })
+    .await?;
+    Ok(Json(ResolveHoldResponse {
+        status: status.to_string(),
+        job_id: None,
+        samples_affected: Some(i64::try_from(decided).unwrap_or(i64::MAX)),
+    }))
+}
 
 /// How many plan entries an apply pairs between progress reports.
-const PROGRESS_BATCH: usize = 25;
+pub(super) const PROGRESS_BATCH: usize = 25;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamHierarchy {
@@ -447,7 +1946,7 @@ impl InstrumentCatalog {
 
 /// A curve column's stem, normalised for comparison against an instrument label:
 /// `doc_std_curve_id` -> `doc`, `chla_acid_std_curve_id` -> `chla acid`.
-fn curve_column_stem(column: &str) -> String {
+pub(super) fn curve_column_stem(column: &str) -> String {
     column
         .to_lowercase()
         .trim_end_matches("_std_curve_id")
@@ -458,7 +1957,7 @@ fn curve_column_stem(column: &str) -> String {
 
 /// An instrument's label, normalised the same way. The source prefix is dropped because it is
 /// already the thing being matched within.
-fn instrument_label(source_key: &str, source_system: &str) -> String {
+pub(super) fn instrument_label(source_key: &str, source_system: &str) -> String {
     source_key
         .strip_prefix(&format!("{source_system}:"))
         .unwrap_or(source_key)
@@ -584,7 +2083,7 @@ pub async fn load_instrument_catalog(
 /// `DOC` would tie with the analyser labelled `DOC corr` and make every stem ambiguous. The
 /// question a curve column asks is which instrument the source says produced the correction, and a
 /// default is the absence of that answer.
-fn label_match(curve_column: &str, catalog: &InstrumentCatalog) -> Option<Uuid> {
+pub(super) fn label_match(curve_column: &str, catalog: &InstrumentCatalog) -> Option<Uuid> {
     let stem = curve_column_stem(curve_column);
     let matches: Vec<Uuid> = catalog
         .labels
@@ -765,9 +2264,9 @@ pub fn resolve_parameter_instrument(
     }
 }
 
-fn plan_replicates(metadata: &serde_json::Value) -> Option<PlanReplicates> {
+pub(super) fn plan_replicates(metadata: &serde_json::Value) -> Option<PlanReplicates> {
     let spec =
-        crate::routes::private::data_streams::replicates::ReplicateSpec::from_metadata(metadata)?;
+        crate::routes::private::data_streams::models::ReplicateSpec::from_metadata(metadata)?;
     Some(PlanReplicates {
         n: spec.declared.source_columns.len(),
         member_columns: spec.declared.source_columns,
@@ -898,7 +2397,14 @@ pub fn plan_group(metadata: &serde_json::Value) -> Option<PlanGroupRef> {
 }
 
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
     sea_orm::FromJsonQueryResult,
 )]
 pub struct PlanSummary {
@@ -957,14 +2463,16 @@ pub struct PlanSummary {
     pub unique_parameters: usize,
 }
 
-struct ParamGroupProposal {
-    proposed_name: String,
-    units: String,
-    original_names: Vec<String>,
-    entry_indices: Vec<usize>,
+pub(super) struct ParamGroupProposal {
+    pub(super) proposed_name: String,
+    pub(super) units: String,
+    pub(super) original_names: Vec<String>,
+    pub(super) entry_indices: Vec<usize>,
 }
 
-fn group_streams_by_parameter(entries: &[(usize, String, String)]) -> Vec<ParamGroupProposal> {
+pub(super) fn group_streams_by_parameter(
+    entries: &[(usize, String, String)],
+) -> Vec<ParamGroupProposal> {
     // Distinct quantities can share a units suffix (e.g. "Nitrate [µg/L]" vs
     // "Ammonia [µg/L]"), so only entries whose names are identical group together.
     let mut by_key: HashMap<(String, String), Vec<(usize, String)>> = HashMap::new();
@@ -1006,20 +2514,20 @@ pub async fn create_plan(
     // A stream superseded by a replicate family (another stream at `source_key || ':reps'`) is a
     // retired legacy single whose stale metadata still carries the old label identity; planning it
     // would seed duplicate parameter rows. One query for the whole superseded set.
-    let superseded: std::collections::HashSet<String> = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT ds.source_key FROM data_streams ds
-             WHERE ds.source_system = $1
-               AND EXISTS (SELECT 1 FROM data_streams fam
-                           WHERE fam.source_system = ds.source_system
-                             AND fam.source_key = ds.source_key || ':reps')",
-            [source_system.to_string().into()],
-        ))
+    let keys: std::collections::HashSet<String> = data_streams::models::Entity::find()
+        .filter(data_streams::models::Column::SourceSystem.eq(source_system))
+        .select_only()
+        .column(data_streams::models::Column::SourceKey)
+        .into_tuple::<String>()
+        .all(db)
         .await?
+        .into_iter()
+        .collect();
+    let superseded: std::collections::HashSet<String> = keys
         .iter()
-        .map(|r| r.try_get::<String>("", "source_key"))
-        .collect::<Result<_, _>>()?;
+        .filter(|key| keys.contains(&format!("{key}:reps")))
+        .cloned()
+        .collect();
     let streams: Vec<data_streams::Model> = streams
         .into_iter()
         .filter(|s| !superseded.contains(&s.source_key))
@@ -1050,7 +2558,7 @@ pub async fn create_plan(
                    AND h.status IN ('pending', 'deferred') \
                    AND h.stream_id = ANY($1) \
                  GROUP BY h.stream_id",
-                *super::replicate_audit::POPULATION_SD_SQL
+                *POPULATION_SD_SQL
             ),
             [stream_ids.into()],
         ))
@@ -1157,8 +2665,8 @@ pub async fn create_plan(
             sd_holds,
             sd_population_holds,
             acknowledged: false,
-            is_device: crate::routes::private::sensors::identity::is_device_feed(&stream.metadata),
-            device_serial: crate::routes::private::sensors::identity::extract_vaisala_device_serial(
+            is_device: crate::routes::private::sensors::service::is_device_feed(&stream.metadata),
+            device_serial: crate::routes::private::sensors::service::extract_vaisala_device_serial(
                 &stream.metadata,
             ),
             device_model: stream
@@ -1239,7 +2747,16 @@ pub async fn create_plan(
     Ok(inserted)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, sea_orm::FromJsonQueryResult)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+    sea_orm::FromJsonQueryResult,
+)]
 pub struct ApplyResult {
     pub projects_created: u32,
     pub sites_created: u32,
@@ -1270,7 +2787,13 @@ pub struct ApplyResult {
 /// The plan's entry list as the column holds it, so the row carries the entries themselves rather
 /// than a JSON document nothing describes.
 #[derive(
-    Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
     sea_orm::FromJsonQueryResult,
 )]
 #[serde(transparent)]
@@ -1278,7 +2801,13 @@ pub struct PlanEntries(pub Vec<PlanEntry>);
 
 /// The assigned curves as the column holds them.
 #[derive(
-    Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
     sea_orm::FromJsonQueryResult,
 )]
 #[serde(transparent)]
@@ -1286,7 +2815,13 @@ pub struct PlanCurveIntents(pub Vec<PlanCurveIntent>);
 
 /// The objects the review has accepted, as the column holds them.
 #[derive(
-    Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
     sea_orm::FromJsonQueryResult,
 )]
 #[serde(transparent)]
@@ -1319,7 +2854,7 @@ pub fn plan_curve_intents(plan: &pairing_plans::Model) -> AppResult<Vec<PlanCurv
 /// inside the apply transaction, after `mint_plan_instruments`. An assignment naming an
 /// instrument the plan no longer creates, or a curve readings already name, fails the apply
 /// rather than being dropped: the review chose it, so nothing here may quietly not do it.
-async fn assign_plan_curves<C: ConnectionTrait>(
+pub(super) async fn assign_plan_curves<C: ConnectionTrait>(
     txn: &C,
     intents: &[PlanCurveIntent],
     minted: &HashMap<String, Uuid>,
@@ -1345,14 +2880,15 @@ async fn assign_plan_curves<C: ConnectionTrait>(
                 intent.curve_id
             )));
         }
-        let result = txn
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE standard_curves SET sensor_id = $1 WHERE id = $2",
-                [sensor_id.into(), intent.curve_id.into()],
-            ))
+        let result = standard_curves::model::Entity::update_many()
+            .col_expr(
+                standard_curves::model::Column::SensorId,
+                Expr::value(sensor_id),
+            )
+            .filter(standard_curves::model::Column::Id.eq(intent.curve_id))
+            .exec(txn)
             .await?;
-        if result.rows_affected() == 0 {
+        if result.rows_affected == 0 {
             return Err(AppError::BadRequest(format!(
                 "curve {} no longer exists; clear the assignment before applying",
                 intent.curve_id
@@ -1363,26 +2899,26 @@ async fn assign_plan_curves<C: ConnectionTrait>(
     Ok(moved)
 }
 
-struct EntityCaches {
-    projects: HashMap<String, Uuid>,
-    groups: HashMap<String, Uuid>,
-    sites: HashMap<String, Uuid>,
-    params: HashMap<String, Uuid>,
-    site_params: HashMap<(Uuid, Uuid), Uuid>,
-    param_names: HashMap<Uuid, String>,
+pub(super) struct EntityCaches {
+    pub(super) projects: HashMap<String, Uuid>,
+    pub(super) groups: HashMap<String, Uuid>,
+    pub(super) sites: HashMap<String, Uuid>,
+    pub(super) params: HashMap<String, Uuid>,
+    pub(super) site_params: HashMap<(Uuid, Uuid), Uuid>,
+    pub(super) param_names: HashMap<Uuid, String>,
 }
 
-struct ApplyCounters {
-    projects_created: u32,
-    groups_created: u32,
-    group_members_created: u32,
-    sites_created: u32,
-    params_created: u32,
-    sp_created: u32,
-    streams_paired: u32,
-    streams_skipped: u32,
-    instruments_created: u32,
-    curves_assigned: u32,
+pub(super) struct ApplyCounters {
+    pub(super) projects_created: u32,
+    pub(super) groups_created: u32,
+    pub(super) group_members_created: u32,
+    pub(super) sites_created: u32,
+    pub(super) params_created: u32,
+    pub(super) sp_created: u32,
+    pub(super) streams_paired: u32,
+    pub(super) streams_skipped: u32,
+    pub(super) instruments_created: u32,
+    pub(super) curves_assigned: u32,
 }
 
 /// The streams whose curve references resolve to an instrument nobody has agreed to create.
@@ -1452,14 +2988,7 @@ pub async fn apply_plan(
 
     // Atomic status claim: a concurrent apply of the same plan matches zero rows and bails.
     // A rollback restores 'draft'.
-    let claimed = txn
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE pairing_plans SET status = 'applying' WHERE id = $1 AND status = 'draft'",
-            [plan_id.into()],
-        ))
-        .await?;
-    if claimed.rows_affected() == 0 {
+    if !claim_plan_status(&txn, plan_id, "draft", "applying").await? {
         return Err(AppError::BadRequest(
             "Plan is no longer in draft status".to_string(),
         ));
@@ -1578,11 +3107,11 @@ pub async fn apply_plan(
     // Attribution is what made these readings visit values; the calculations that read them at
     // each manual visit run now (ADR 0007). The plan runs as a job, so the writer it records is
     // the system rather than a person.
-    crate::routes::private::collection_events::recompute::enqueue_for(
+    crate::routes::private::collection_events::flows::enqueue_for(
         db,
         &backfilled.touched_events,
         "system",
-        crate::routes::private::collection_events::recompute::Writer::Person,
+        crate::routes::private::collection_events::flows::Writer::Person,
     )
     .await?;
 
@@ -1661,7 +3190,7 @@ pub async fn apply_plan(
 }
 
 /// Resolve or create all entities for one plan entry. Returns (site_parameter_id, parameter_id).
-async fn resolve_plan_entry<C: ConnectionTrait>(
+pub(super) async fn resolve_plan_entry<C: ConnectionTrait>(
     txn: &C,
     entry: &PlanEntry,
     source_system: &str,
@@ -1722,7 +3251,7 @@ async fn resolve_plan_entry<C: ConnectionTrait>(
 /// a parameter someone has already placed keeps the placement it has: the apply fills a gap, it
 /// does not move what an operator decided. The group's own ordinal is its first member's, which is
 /// the order the registry lists the categories in.
-async fn place_in_group<C: ConnectionTrait>(
+pub(super) async fn place_in_group<C: ConnectionTrait>(
     txn: &C,
     parameter_id: Uuid,
     group: &PlanGroupRef,
@@ -1734,38 +3263,39 @@ async fn place_in_group<C: ConnectionTrait>(
         Some(&id) => id,
         None => {
             let id = group.id.unwrap_or_else(Uuid::new_v4);
-            let written = txn
-                .execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "INSERT INTO parameter_groups (id, code, label, ordinal) \
-                     VALUES ($1, $2, $3, $4) ON CONFLICT (code) DO NOTHING",
-                    [
-                        id.into(),
-                        group.code.clone().into(),
-                        group.label.clone().into(),
-                        group.ordinal.into(),
-                    ],
-                ))
-                .await?;
-            if written.rows_affected() > 0 {
+            let written = parameter_groups::Entity::insert(parameter_groups::ActiveModel {
+                id: Set(id),
+                code: Set(group.code.clone()),
+                label: Set(group.label.clone()),
+                ordinal: Set(group.ordinal),
+                ..Default::default()
+            })
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::column(parameter_groups::Column::Code)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .try_insert()
+            .exec(txn)
+            .await?;
+            if matches!(written, sea_orm::TryInsertResult::Inserted(_)) {
                 *groups_created += 1;
             }
             // The insert may have lost the race with another entry of this same pass, so the id is
             // read back rather than assumed.
-            let resolved = txn
-                .query_one_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT id FROM parameter_groups WHERE code = $1",
-                    [group.code.clone().into()],
-                ))
+            let resolved = parameter_groups::Entity::find()
+                .filter(parameter_groups::Column::Code.eq(group.code.as_str()))
+                .select_only()
+                .column(parameter_groups::Column::Id)
+                .into_tuple::<Uuid>()
+                .one(txn)
                 .await?
                 .ok_or_else(|| {
                     AppError::Internal(format!(
                         "parameter group '{}' was neither found nor created",
                         group.code
                     ))
-                })?
-                .try_get::<Uuid>("", "id")?;
+                })?;
             cache.insert(group.code.clone(), resolved);
             resolved
         }
@@ -1795,7 +3325,7 @@ async fn place_in_group<C: ConnectionTrait>(
 /// The names a new slot may take, most preferred first: the parameter's label, then the label
 /// qualified by units, then by the parameter's code. Beyond those a counter is appended, because
 /// two parameters can share a label, its units and nothing else.
-fn slot_name_candidates(base: &str, units: &str, code: &str) -> Vec<String> {
+pub(super) fn slot_name_candidates(base: &str, units: &str, code: &str) -> Vec<String> {
     let mut names = vec![base.to_string()];
     let units = units.trim();
     if !units.is_empty() {
@@ -1809,7 +3339,7 @@ fn slot_name_candidates(base: &str, units: &str, code: &str) -> Vec<String> {
 
 /// The first candidate the site does not already hold. `(site_id, name)` is unique and the apply is
 /// one transaction, so the query sees the slots this same pass has created.
-async fn free_slot_name<C: ConnectionTrait>(
+pub(super) async fn free_slot_name<C: ConnectionTrait>(
     txn: &C,
     site_id: Uuid,
     base: &str,
@@ -1846,7 +3376,7 @@ async fn free_slot_name<C: ConnectionTrait>(
 
 /// The slot an entry pairs into, created when the site has none. The entry's review choices (sd
 /// estimator, decimal places) reach an existing slot too, each under its own rule.
-async fn resolve_or_create_site_param<C: ConnectionTrait>(
+pub(super) async fn resolve_or_create_site_param<C: ConnectionTrait>(
     txn: &C,
     site_id: Uuid,
     parameter_id: Uuid,
@@ -1974,7 +3504,13 @@ pub struct PlanInstrumentProposal {
 
 /// The register rows waiting for this source, as the plan carries them.
 #[derive(
-    Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
     sea_orm::FromJsonQueryResult,
 )]
 #[serde(transparent)]
@@ -2013,7 +3549,7 @@ pub async fn pending_instrument_proposals<C: ConnectionTrait>(
 
 /// Create the register rows the review admitted, in the apply's transaction, and clear them from
 /// the queue. A row left unadmitted stays a proposal: the next plan offers it again.
-async fn admit_instrument_proposals<C: ConnectionTrait>(
+pub(super) async fn admit_instrument_proposals<C: ConnectionTrait>(
     txn: &C,
     source_system: &str,
     proposals: &[PlanInstrumentProposal],
@@ -2037,7 +3573,12 @@ async fn admit_instrument_proposals<C: ConnectionTrait>(
         // The serial is claimed only where no other instrument holds it: METALP's register carries
         // one serial on two probes, and losing the instrument over that would be worse than storing
         // it without one.
-        if let Some(serial) = proposal.serial_number.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(serial) = proposal
+            .serial_number
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             txn.execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 "UPDATE sensors SET serial_number = $2, manufacturer = $3, model = $4 \
@@ -2063,7 +3604,7 @@ async fn admit_instrument_proposals<C: ConnectionTrait>(
     Ok(created)
 }
 
-async fn mint_plan_instruments<C: ConnectionTrait>(
+pub(super) async fn mint_plan_instruments<C: ConnectionTrait>(
     txn: &C,
     source_system: &str,
     entries: &[PlanEntry],
@@ -2111,7 +3652,7 @@ async fn mint_plan_instruments<C: ConnectionTrait>(
     Ok(minted)
 }
 
-async fn pair_entry_stream<C: ConnectionTrait>(
+pub(super) async fn pair_entry_stream<C: ConnectionTrait>(
     txn: &C,
     stream: data_streams::Model,
     plan_id: Uuid,
@@ -2128,7 +3669,7 @@ async fn pair_entry_stream<C: ConnectionTrait>(
     let from_plan = instrument_id.filter(|id| stream.sensor_id != Some(*id));
     let needs_sensor = stream.sensor_id.is_none() && from_plan.is_none();
     let device =
-        crate::routes::private::sensors::identity::extract_vaisala_device_serial(&stream.metadata)
+        crate::routes::private::sensors::service::extract_vaisala_device_serial(&stream.metadata)
             .is_some();
     // Read once, and only for the entries that will use it: an apply runs this per stream.
     let site_id = if needs_sensor || device {
@@ -2151,8 +3692,8 @@ async fn pair_entry_stream<C: ConnectionTrait>(
         // opened here too. Without this the plan's own instrument choice silently costs the
         // deployment that pairing the same stream by hand would have opened.
         let opens_at =
-            crate::routes::private::sensors::identity::stream_history_start(txn, stream.id).await?;
-        if let Err(e) = crate::routes::private::sensors::identity::find_or_create_deployment(
+            crate::routes::private::sensors::service::stream_history_start(txn, stream.id).await?;
+        if let Err(e) = crate::routes::private::sensors::service::find_or_create_deployment(
             txn,
             sensor_id,
             site_id,
@@ -2186,7 +3727,7 @@ async fn pair_entry_stream<C: ConnectionTrait>(
 }
 
 /// Rows the plan's readings point at through `column`, read before the readings lose it.
-async fn plan_reading_references<C: ConnectionTrait>(
+pub(super) async fn plan_reading_references<C: ConnectionTrait>(
     conn: &C,
     plan_id: Uuid,
     column: &str,
@@ -2210,19 +3751,14 @@ async fn plan_reading_references<C: ConnectionTrait>(
 /// Attribute everything the plan's newly paired streams already hold, through the helper every
 /// pairing path runs. Deployment attribution is left to the slot reprocess the caller enqueues:
 /// a plan pairs many streams, and each reading's deployment is the one covering its own time.
-async fn backfill_plan_readings<C: ConnectionTrait>(
+pub(super) async fn backfill_plan_readings<C: ConnectionTrait>(
     txn: &C,
     plan_id: Uuid,
-) -> AppResult<crate::routes::private::data_streams::pairing::Backfilled> {
-    crate::routes::private::data_streams::pairing::backfill(
-        txn,
-        crate::routes::private::sync::replicate_audit::HoldScope::Plan(plan_id),
-        None,
-    )
-    .await
+) -> AppResult<crate::routes::private::data_streams::models::Backfilled> {
+    crate::routes::private::data_streams::flows::backfill(txn, HoldScope::Plan(plan_id), None).await
 }
 
-async fn finalize_plan<C: ConnectionTrait>(
+pub(super) async fn finalize_plan<C: ConnectionTrait>(
     txn: &C,
     plan_id: Uuid,
     counters: &ApplyCounters,
@@ -2271,14 +3807,7 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
     let txn = db.begin().await?;
 
     // Atomic status claim: a concurrent revert of the same plan matches zero rows and bails.
-    let claimed = txn
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE pairing_plans SET status = 'reverting' WHERE id = $1 AND status = 'applied'",
-            [plan_id.into()],
-        ))
-        .await?;
-    if claimed.rows_affected() == 0 {
+    if !claim_plan_status(&txn, plan_id, "applied", "reverting").await? {
         return Err(AppError::BadRequest(
             "Plan is no longer in applied status".to_string(),
         ));
@@ -2306,12 +3835,7 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
     .await?;
 
     // Reverting the pairing takes the reviewer away again; open reviews wait as deferred.
-    crate::routes::private::sync::replicate_audit::repoint_holds(
-        &txn,
-        crate::routes::private::sync::replicate_audit::HoldScope::Plan(plan_id),
-        false,
-    )
-    .await?;
+    repoint_holds(&txn, HoldScope::Plan(plan_id), false).await?;
 
     if !sample_ids.is_empty() {
         txn.execute_raw(Statement::from_sql_and_values(
@@ -2325,14 +3849,23 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
     }
 
     if !event_ids.is_empty() {
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"DELETE FROM collection_events ce
-              WHERE ce.id = ANY($1)
-                AND NOT EXISTS (SELECT 1 FROM readings r WHERE r.collection_event_id = ce.id)",
-            [event_ids.into()],
-        ))
-        .await?;
+        // A visit that still has readings on it is not this plan's to delete. The subquery is
+        // bounded to the same ids, so it stays the anti-join the correlated form was.
+        collection_events::models::Entity::delete_many()
+            .filter(collection_events::models::Column::Id.is_in(event_ids.clone()))
+            .filter(
+                collection_events::models::Column::Id.not_in_subquery(
+                    sea_orm::sea_query::Query::select()
+                        .column(readings::model::Column::CollectionEventId)
+                        .from(readings::model::Entity)
+                        .and_where(
+                            readings::model::Column::CollectionEventId.is_in(event_ids.clone()),
+                        )
+                        .to_owned(),
+                ),
+            )
+            .exec(&txn)
+            .await?;
     }
 
     txn.execute_raw(Statement::from_sql_and_values(
@@ -2345,15 +3878,19 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
     .await?;
 
     // Unpair the streams; pairing_plan_id stays as the audit link back to this plan
-    let result = txn
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE data_streams SET site_parameter_id = NULL, paired_at = NULL
-          WHERE pairing_plan_id = $1",
-            [plan_id.into()],
-        ))
+    let result = data_streams::models::Entity::update_many()
+        .col_expr(
+            data_streams::models::Column::SiteParameterId,
+            Expr::value(Option::<Uuid>::None),
+        )
+        .col_expr(
+            data_streams::models::Column::PairedAt,
+            Expr::value(Option::<sea_orm::prelude::DateTimeWithTimeZone>::None),
+        )
+        .filter(data_streams::models::Column::PairingPlanId.eq(plan_id))
+        .exec(&txn)
         .await?;
-    let reverted = result.rows_affected() as u32;
+    let reverted = result.rows_affected as u32;
 
     // Update plan status
     let mut plan_active: pairing_plans::ActiveModel = pairing_plans::Entity::find_by_id(plan_id)
@@ -2401,7 +3938,7 @@ pub fn compute_summary_pub(entries: &[PlanEntry]) -> PlanSummary {
     compute_summary(entries)
 }
 
-fn compute_summary(entries: &[PlanEntry]) -> PlanSummary {
+pub(super) fn compute_summary(entries: &[PlanEntry]) -> PlanSummary {
     let will_pair = entries.iter().filter(|e| e.action == "pair").count();
     let will_skip = entries.iter().filter(|e| e.action == "skip").count();
 
@@ -2502,7 +4039,7 @@ fn compute_summary(entries: &[PlanEntry]) -> PlanSummary {
 
 /// A name reduced to what a reader would call it the same by: letters and digits only, lowercase,
 /// with the leading zeros of each digit run dropped. `FP-1`, `fp 1` and `FP01` all read as `fp1`.
-fn canonical_name(name: &str) -> String {
+pub(super) fn canonical_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut digits = String::new();
     let flush = |digits: &mut String, out: &mut String| {
@@ -2530,7 +4067,7 @@ fn canonical_name(name: &str) -> String {
 /// An existing name a proposed creation reads as, without being the exact match the catalog needs.
 /// Nothing here guesses at typos: `FP1` and `FP2` are two stations, and an edit distance would
 /// call them one.
-fn near_duplicate_of<'a, I>(proposed: &str, existing: I) -> Option<&'a str>
+pub(super) fn near_duplicate_of<'a, I>(proposed: &str, existing: I) -> Option<&'a str>
 where
     I: IntoIterator<Item = &'a str>,
 {
@@ -2544,7 +4081,7 @@ where
         .find(|name| name.to_lowercase() != lower && canonical_name(name) == canonical)
 }
 
-fn match_entity(name: &str, existing: &[(Uuid, String)]) -> (Option<Uuid>, bool) {
+pub(super) fn match_entity(name: &str, existing: &[(Uuid, String)]) -> (Option<Uuid>, bool) {
     if name.is_empty() {
         return (None, false);
     }
@@ -2591,7 +4128,7 @@ pub fn lookup_parameter_by_code_name_or_alias(
 /// what is being paired. `DOC_avg_ppb` is `DOC_ppb`, units and all; a units-bearing column never
 /// resolves onto a shorter code, so a catalog that happens to hold `DOC` does not pull `DOC_ppb`
 /// onto it and give two portals different export headers for the same measurand.
-fn family_parameter_suggestion(name: &str) -> String {
+pub(super) fn family_parameter_suggestion(name: &str) -> String {
     let stripped: String = name
         .split('_')
         .filter(|seg| !seg.eq_ignore_ascii_case("avg"))
@@ -2603,7 +4140,7 @@ fn family_parameter_suggestion(name: &str) -> String {
     stripped
 }
 
-fn match_entity_display(name: &str, existing: &[CatalogParam]) -> (Option<Uuid>, bool) {
+pub(super) fn match_entity_display(name: &str, existing: &[CatalogParam]) -> (Option<Uuid>, bool) {
     if name.is_empty() {
         return (None, false);
     }
@@ -2649,20 +4186,13 @@ pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityC
         .into_iter()
         .map(|s| (s.id, s.name))
         .collect();
-    let groups = db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, code FROM parameter_groups".to_string(),
-        ))
-        .await?
-        .into_iter()
-        .map(|row| {
-            Ok((
-                row.try_get::<Uuid>("", "id")?,
-                row.try_get::<String>("", "code")?,
-            ))
-        })
-        .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
+    let groups: Vec<(Uuid, String)> = parameter_groups::Entity::find()
+        .select_only()
+        .column(parameter_groups::Column::Id)
+        .column(parameter_groups::Column::Code)
+        .into_tuple()
+        .all(db)
+        .await?;
     // Usage per parameter in one pass. `readings.parameter_id` is indexed and the group-by is over
     // the slots, not the hypertable's rows, so this stays a catalog-sized query.
     let mut usage: HashMap<Uuid, (i64, i64)> = HashMap::new();
@@ -2740,12 +4270,16 @@ pub fn reclassify_entry(entry: &mut PlanEntry, catalog: &EntityCatalog) {
 
     entry.warnings.clear();
     if site_create
-        && let Some(existing) =
-            near_duplicate_of(&entry.site.name, catalog.sites.iter().map(|(_, n)| n.as_str()))
+        && let Some(existing) = near_duplicate_of(
+            &entry.site.name,
+            catalog.sites.iter().map(|(_, n)| n.as_str()),
+        )
     {
-        entry
-            .warnings
-            .push(PlanWarning::near_duplicate("site", &entry.site.name, existing));
+        entry.warnings.push(PlanWarning::near_duplicate(
+            "site",
+            &entry.site.name,
+            existing,
+        ));
     }
     if param_create
         && let Some(existing) = near_duplicate_of(
@@ -2798,9 +4332,7 @@ pub fn reclassify_entry(entry: &mut PlanEntry, catalog: &EntityCatalog) {
     .to_string();
 }
 
-use sea_orm::sea_query::Expr;
-
-async fn resolve_or_create_project<C: ConnectionTrait>(
+pub(super) async fn resolve_or_create_project<C: ConnectionTrait>(
     txn: &C,
     entity_ref: &PlanEntityRef,
     cache: &mut HashMap<String, Uuid>,
@@ -2844,7 +4376,7 @@ async fn resolve_or_create_project<C: ConnectionTrait>(
     Ok(id)
 }
 
-async fn resolve_or_create_site(
+pub(super) async fn resolve_or_create_site(
     txn: &impl ConnectionTrait,
     site_ref: &PlanSiteRef,
     cache: &mut HashMap<String, Uuid>,
@@ -2907,7 +4439,7 @@ async fn resolve_or_create_site(
     Ok(id)
 }
 
-async fn resolve_or_create_param(
+pub(super) async fn resolve_or_create_param(
     txn: &impl ConnectionTrait,
     param_ref: &PlanParamRef,
     original_parameter_name: Option<&str>,
@@ -2992,7 +4524,7 @@ async fn resolve_or_create_param(
     Ok(id)
 }
 
-fn infer_category(_name: &str) -> String {
+pub(super) fn infer_category(_name: &str) -> String {
     "measurement".to_string()
 }
 
@@ -3062,492 +4594,529 @@ pub fn apply_bulk_action(entries: &mut [PlanEntry], filter: &BulkWhere, action: 
     changed
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        BulkWhere, InstrumentCatalog, PlanEntry, apply_bulk_action, family_parameter_suggestion,
-        resolve_parameter_instrument, select_entries, stream_instrument_key,
-    };
-    use std::collections::HashMap;
-    use uuid::Uuid;
-
-    fn catalog(entries: &[(&str, Uuid)]) -> InstrumentCatalog {
-        InstrumentCatalog {
-            by_id: entries
-                .iter()
-                .map(|(key, id)| (*id, ((*key).to_string(), Some((*key).to_string()))))
-                .collect(),
-            labels: vec![],
-            by_source_key: entries
-                .iter()
-                .map(|(key, id)| ((*key).to_string(), *id))
-                .collect(),
-            by_name: HashMap::new(),
-            curves: HashMap::new(),
-            defaulted: std::collections::HashSet::new(),
-        }
-    }
-
-    /// Scenario: a stream carries the per-parameter instrument registration mints for every feed,
-    /// and the source's own curve catalog holds an instrument whose label matches the stream's
-    /// curve column.
-    /// Expected behaviour: the curve label wins. A minted instrument is what the registration had
-    /// to write to keep a reading from naming nothing, not a statement about which analyser
-    /// produced the correction.
-    #[test]
-    fn test_a_defaulted_instrument_loses_to_a_matching_curve_label() {
-        let defaulted = Uuid::new_v4();
-        let analyser = Uuid::new_v4();
-        let mut c = catalog(&[]);
-        c.by_id
-            .insert(defaulted, ("cnet DOC_avg_ppb".to_string(), None));
-        c.by_id
-            .insert(analyser, ("DOC corr".to_string(), Some("DOC corr".to_string())));
-        c.labels.push(("doc".to_string(), analyser));
-        c.defaulted.insert(defaulted);
-
-        let resolved =
-            super::resolve_instrument(Some(defaulted), Some("doc_std_curve_id"), "cnet", &c)
-                .expect("a curve column resolves");
-        assert_eq!(resolved.resolved_by, "curve_label", "{resolved:?}");
-        assert_eq!(resolved.id, Some(analyser));
-
-        // An instrument that is a real attribution still wins: it is what measured the value.
-        let attributed =
-            super::resolve_instrument(Some(analyser), Some("doc_std_curve_id"), "cnet", &c)
-                .expect("a curve column resolves");
-        assert_eq!(attributed.resolved_by, "stream", "{attributed:?}");
-        assert_eq!(attributed.id, Some(analyser));
-
-        // The default's own label is the parameter name, so without excluding it every stem would
-        // tie with the analyser's and resolve to nothing. This is the case that bit.
-        let mut tied = c.clone();
-        tied.labels.push(("doc".to_string(), defaulted));
-        let still =
-            super::resolve_instrument(Some(defaulted), Some("doc_std_curve_id"), "cnet", &tied)
-                .expect("a curve column resolves");
-        assert_eq!(still.resolved_by, "curve_label", "{still:?}");
-        assert_eq!(still.id, Some(analyser));
-
-        // With nothing to match, the question stands unanswered and the plan proposes one rather
-        // than reporting the default as though it were the source's answer.
-        let alone = super::resolve_instrument(Some(defaulted), Some("tss_std_curve_id"), "cnet", &c)
-            .expect("a curve column resolves");
-        assert_eq!(alone.resolved_by, "placeholder", "{alone:?}");
-        assert!(alone.create, "{alone:?}");
-        // Unconfirmed: the apply refuses until an operator agrees to the name (Q123).
-        assert!(!alone.confirmed, "{alone:?}");
-
-        // A default on a stream whose source names no curve column is left alone: nothing is being
-        // asked, and the instrument it carries is the one its readings name.
-        let quiet = super::resolve_instrument(Some(defaulted), None, "cnet", &c)
-            .expect("a stream instrument resolves");
-        assert_eq!(quiet.resolved_by, "stream", "{quiet:?}");
-        assert_eq!(quiet.id, Some(defaulted));
-        assert!(quiet.defaulted, "{quiet:?}");
-    }
-
-    #[test]
-    fn test_an_attributed_instrument_is_not_reported_as_a_default() {
-        let attributed = Uuid::new_v4();
-        let mut c = catalog(&[]);
-        c.by_id.insert(
-            attributed,
-            ("Hach DR3900".to_string(), Some("cnet:DOC".to_string())),
-        );
-        c.by_source_key.insert("cnet:DOC".to_string(), attributed);
-
-        let by_stream = super::resolve_instrument(Some(attributed), None, "cnet", &c)
-            .expect("a stream instrument resolves");
-        assert!(!by_stream.defaulted, "{by_stream:?}");
-
-        let by_key = super::resolve_parameter_instrument("cnet:DOC".to_string(), "DOC", &c);
-        assert_eq!(by_key.id, Some(attributed));
-        assert!(!by_key.defaulted, "{by_key:?}");
-
-        let proposed = super::resolve_parameter_instrument("cnet:TSS".to_string(), "TSS", &c);
-        assert!(proposed.create, "{proposed:?}");
-        assert!(!proposed.defaulted, "{proposed:?}");
-    }
-
-    /// A catalog holding one instrument by name and nothing else, for the collision cases.
-    fn catalog_named(name: &str, id: Uuid, has_readings: bool) -> InstrumentCatalog {
-        let mut c = catalog(&[]);
-        c.by_name.insert(
-            name.to_lowercase(),
-            super::InstrumentNameConflict {
-                id,
-                name: name.to_string(),
-                source_system: Some("metalp".to_string()),
-                has_readings,
-            },
-        );
-        c
-    }
-
-    fn family_stream() -> super::data_streams::Model {
-        let now = chrono::Utc::now().into();
-        super::data_streams::Model {
-            id: Uuid::new_v4(),
-            source_system: "cnet".to_string(),
-            source_key: "FP3:DOC_avg_ppb:reps".to_string(),
-            source_name: None,
-            source_path: None,
-            metadata: serde_json::json!({
-                "hierarchy": { "project": "CNET", "site": "FP3", "parameter": "DOC_avg_ppb" }
-            }),
-            site_parameter_id: None,
-            sensor_id: None,
-            measurement_type: None,
-            is_active: true,
-            discovered_at: now,
-            paired_at: None,
-            last_data_time: None,
-            last_window_digest: None,
-            pairing_plan_id: None,
-            created_at: now,
-            updated_at: now,
-            replicates: None,
-        }
-    }
-
-    /// The plan proposes the instrument the pairing mints, for a replicate family too: the
-    /// suggested parameter is a label, and keying the proposal on it mints a second row for the
-    /// same analyte.
-    #[test]
-    fn test_the_plan_proposes_the_key_the_pairing_mints() {
-        let stream = family_stream();
-        let suggestion = family_parameter_suggestion("DOC_avg_ppb");
-        assert_ne!(suggestion, "DOC_avg_ppb", "the suggestion is a label");
-
-        let proposed = resolve_parameter_instrument(
-            stream_instrument_key(&stream),
-            &suggestion,
-            &catalog(&[]),
-        );
-
-        assert_eq!(proposed.source_key, "cnet:DOC_avg_ppb");
-    }
-
-    #[test]
-    fn test_resolve_parameter_instrument_takes_the_source_s_own() {
-        let id = Uuid::new_v4();
-        let resolved = resolve_parameter_instrument(
-            "cnet:NO2_mgL".to_string(),
-            "NO2_mgL",
-            &catalog(&[("cnet:NO2_mgL", id)]),
-        );
-        assert_eq!(resolved.id, Some(id));
-        assert!(
-            !resolved.create,
-            "an instrument that exists is not created again"
-        );
-        assert!(resolved.confirmed);
-    }
-
-    /// Expected behaviour: a parameter with no instrument is proposed, already agreed. The review
-    /// changes it by attaching another; leaving it alone creates the suggestion.
-    #[test]
-    fn test_resolve_parameter_instrument_proposes_one_already_agreed() {
-        let proposed =
-            resolve_parameter_instrument("cnet:NO2_mgL".to_string(), "NO2_mgL", &catalog(&[]));
-        assert_eq!(proposed.id, None);
-        assert_eq!(proposed.source_key, "cnet:NO2_mgL");
-        assert!(proposed.create && proposed.confirmed);
-        assert_eq!(
-            proposed.proposed_name.as_deref(),
-            Some("NO2_mgL"),
-            "the name is the analyte; the source is provenance and lives in source_key"
-        );
-        assert_eq!(proposed.name, "NO2_mgL");
-        assert!(proposed.name_conflict.is_none());
-    }
-
-    /// Expected behaviour: the lab's DOC analyser is one machine carried to every station, so a
-    /// proposal that would create a second instrument called `DOC` is a decision, not a
-    /// suggestion. It is reported unconfirmed with the row it collides with, and apply refuses an
-    /// unconfirmed proposal, so the operator has to say which they meant.
-    #[test]
-    fn test_a_proposed_name_an_instrument_already_carries_is_put_to_the_operator() {
-        let existing = Uuid::new_v4();
-        let proposed = resolve_parameter_instrument(
-            "cnet:DOC".to_string(),
-            "DOC",
-            &catalog_named("DOC", existing, true),
-        );
-        assert!(
-            proposed.create,
-            "attaching is one of the two answers, not the default"
-        );
-        assert!(
-            !proposed.confirmed,
-            "a collision is never agreed to on the operator's behalf"
-        );
-        let conflict = proposed.name_conflict.expect("the collision is reported");
-        assert_eq!(conflict.id, existing);
-        assert_eq!(conflict.name, "DOC");
-        assert!(
-            conflict.has_readings,
-            "attaching would add to readings it already holds, which is what must be said"
-        );
-    }
-
-    /// The comparison is on the name a person reads, so case and surrounding space are not a
-    /// second instrument.
-    #[test]
-    fn test_a_collision_ignores_case_and_padding() {
-        let existing = Uuid::new_v4();
-        let proposed = resolve_parameter_instrument(
-            "cnet:doc".to_string(),
-            "  doc  ",
-            &catalog_named("DOC", existing, false),
-        );
-        assert_eq!(
-            proposed.name_conflict.map(|c| c.id),
-            Some(existing),
-            "`doc` and `DOC` are one instrument to the person choosing"
-        );
-    }
-
-    pub fn plan_entry(site: &str, parameter: &str, confidence: &str, warnings: usize) -> PlanEntry {
-        let entry = serde_json::json!({
-            "stream_id": Uuid::new_v4(),
-            "source_key": format!("{site}:{parameter}"),
-            "source_name": null,
-            "action": "pair",
-            "project": { "id": null, "name": "CNET", "create": true },
-            "site": { "id": null, "name": site, "create": true,
-                      "latitude": null, "longitude": null, "altitude_m": null },
-            "parameter": { "id": null, "name": parameter, "label": null, "create": true,
-                           "units": "mm", "group_key": null, "original_names": [] },
-            "confidence": confidence,
-            "warnings": (0..warnings)
-                .map(|i| serde_json::json!({ "kind": "units_mismatch", "message": i.to_string() }))
-                .collect::<Vec<_>>(),
-        });
-        serde_json::from_value(entry).expect("a plan entry")
-    }
-
-    #[test]
-    fn test_select_entries_picks_exactly_each_predicate_s_set() {
-        let entries = vec![
-            plan_entry("FP1", "Depth", "exact", 0),
-            plan_entry("FP1", "CDOM", "none", 1),
-            plan_entry("FP2", "Depth", "none", 0),
-        ];
-
-        assert_eq!(
-            select_entries(&entries, &BulkWhere::default()),
-            vec![0, 1, 2]
-        );
-        assert_eq!(
-            select_entries(
-                &entries,
-                &BulkWhere {
-                    confidence: Some("none".into()),
-                    ..Default::default()
-                }
-            ),
-            vec![1, 2]
-        );
-        assert_eq!(
-            select_entries(
-                &entries,
-                &BulkWhere {
-                    has_warnings: Some(true),
-                    ..Default::default()
-                }
-            ),
-            vec![1]
-        );
-        assert_eq!(
-            select_entries(
-                &entries,
-                &BulkWhere {
-                    site_name: Some("fp1".into()),
-                    ..Default::default()
-                }
-            ),
-            vec![0, 1],
-            "the site is matched case-insensitively, as the review renders it"
-        );
-        assert_eq!(
-            select_entries(
-                &entries,
-                &BulkWhere {
-                    confidence: Some("none".into()),
-                    parameter_name: Some("Depth".into()),
-                    ..Default::default()
-                }
-            ),
-            vec![2],
-            "predicates narrow together"
-        );
-    }
-
-    #[test]
-    fn test_apply_bulk_action_never_pairs_an_entry_with_no_slot() {
-        let mut entries = vec![
-            plan_entry("", "Depth", "none", 0),
-            plan_entry("FP1", "", "none", 0),
-            plan_entry("FP1", "Depth", "none", 0),
-        ];
-        for entry in &mut entries {
-            entry.action = "skip".to_string();
-        }
-
-        let changed = apply_bulk_action(&mut entries, &BulkWhere::default(), "pair");
-        assert_eq!(changed, 1, "only the entry that names a slot moves");
-        assert_eq!(entries[0].action, "skip");
-        assert_eq!(entries[1].action, "skip");
-        assert_eq!(entries[2].action, "pair");
-
-        let changed = apply_bulk_action(&mut entries, &BulkWhere::default(), "skip");
-        assert_eq!(changed, 1, "and skipping is its inverse");
-        assert!(entries.iter().all(|e| e.action == "skip"));
-    }
-}
-
-#[cfg(test)]
-mod review_state_tests {
-    use super::tests::plan_entry;
-    use super::{ReviewState, compute_summary, review_state};
-
-    #[test]
-    fn test_review_state_asks_only_where_the_evidence_is_short() {
-        let matched = plan_entry("FP1", "Depth", "exact", 0);
-        assert_eq!(review_state(&matched), ReviewState::SelfValidated);
-
-        let warned = plan_entry("FP1", "CDOM", "exact", 1);
-        assert_eq!(review_state(&warned), ReviewState::NeedsChecking);
-
-        let unmatched = plan_entry("FP2", "Depth", "none", 0);
-        assert_eq!(review_state(&unmatched), ReviewState::NeedsChecking);
-
-        // A tick settles the entry whatever its evidence said.
-        let mut acknowledged = plan_entry("FP2", "CDOM", "none", 2);
-        acknowledged.acknowledged = true;
-        assert_eq!(review_state(&acknowledged), ReviewState::Acknowledged);
-    }
-
-    #[test]
-    fn test_compute_summary_counts_the_three_states_over_pairing_entries_only() {
-        let mut skipped = plan_entry("FP3", "Depth", "none", 1);
-        skipped.action = "skip".to_string();
-        let mut acknowledged = plan_entry("FP2", "CDOM", "none", 1);
-        acknowledged.acknowledged = true;
-
-        let summary = compute_summary(&[
-            plan_entry("FP1", "Depth", "exact", 0),
-            plan_entry("FP1", "CDOM", "exact", 0),
-            plan_entry("FP2", "Depth", "none", 0),
-            acknowledged,
-            skipped,
-        ]);
-
-        assert_eq!(summary.will_pair, 4);
-        assert_eq!(summary.self_validated, 2);
-        assert_eq!(summary.needs_checking, 1);
-        assert_eq!(summary.acknowledged, 1);
-        assert_eq!(
-            summary.self_validated + summary.needs_checking + summary.acknowledged,
-            summary.will_pair,
-            "every pairing entry is in exactly one state"
-        );
-    }
-}
-
-#[cfg(test)]
-mod family_suggestion_tests {
-    use super::family_parameter_suggestion;
-
-    #[test]
-    fn test_family_suggestion_strips_only_the_structural_avg_segment() {
-        assert_eq!(family_parameter_suggestion("DOC_avg_ppb"), "DOC_ppb");
-        assert_eq!(family_parameter_suggestion("NO2_avg_mgL"), "NO2_mgL");
-        assert_eq!(family_parameter_suggestion("avg"), "avg");
-    }
-
-    #[test]
-    fn test_a_units_bearing_column_never_resolves_onto_a_shorter_code() {
-        // The suggestion no longer reads the catalog at all: a catalog holding `DOC` is not a
-        // reason to export a `DOC` header where the portal wrote `DOC_avg_ppb`.
-        assert_eq!(family_parameter_suggestion("DOC_ppb"), "DOC_ppb");
-        assert_eq!(family_parameter_suggestion("DOC"), "DOC");
-    }
-
-    #[test]
-    fn slot_name_candidates_qualify_by_units_then_code() {
-        assert_eq!(
-            super::slot_name_candidates("Flux", "mg/L", "FluxA"),
-            vec!["Flux", "Flux (mg/L)", "Flux (FluxA)"]
-        );
-        // A blank unit contributes no candidate of its own.
-        assert_eq!(
-            super::slot_name_candidates("Flux", "  ", "FluxA"),
-            vec!["Flux", "Flux (FluxA)"]
-        );
-        // A code equal to the units would repeat the same name.
-        assert_eq!(
-            super::slot_name_candidates("Flux", "mg/L", "mg/L"),
-            vec!["Flux", "Flux (mg/L)"]
-        );
-    }
-
-    #[test]
-    fn a_name_reads_the_same_through_case_spacing_punctuation_and_leading_zeros() {
-        let existing = ["FP1", "DOC_avg_ppb"];
-        for proposed in ["FP-1", "fp 1", "FP01", "f p 1."] {
-            assert_eq!(
-                super::near_duplicate_of(proposed, existing),
-                Some("FP1"),
-                "{proposed} reads as FP1"
-            );
-        }
-        assert_eq!(super::near_duplicate_of("doc.avg.ppb", existing), Some("DOC_avg_ppb"));
-    }
-
-    #[test]
-    fn two_stations_are_not_one_because_a_digit_differs() {
-        let existing = ["FP1", "Depth"];
-        // An edit distance would call these the same; a reader would not.
-        assert_eq!(super::near_duplicate_of("FP2", existing), None);
-        assert_eq!(super::near_duplicate_of("FP10", existing), None);
-        assert_eq!(super::near_duplicate_of("Depths", existing), None);
-        // The exact match is the catalog's own, not a near miss.
-        assert_eq!(super::near_duplicate_of("fp1", ["FP1"]), None);
-        // A name with nothing to canonicalise cannot collide with everything else that has none.
-        assert_eq!(super::near_duplicate_of("---", ["***"]), None);
-    }
-}
-
 /// The four aggregate queries this module makes that fill a shape of their own.
 #[derive(FromQueryResult)]
-struct HoldCountRow {
-    stream_id: Uuid,
-    holds: i64,
-    population: i64,
+pub(super) struct HoldCountRow {
+    pub(super) stream_id: Uuid,
+    pub(super) holds: i64,
+    pub(super) population: i64,
 }
 
 #[derive(FromQueryResult)]
-struct DeclaredSlotRow {
-    site_id: Uuid,
-    parameter_id: Uuid,
-    sd_estimator: String,
+pub(super) struct DeclaredSlotRow {
+    pub(super) site_id: Uuid,
+    pub(super) parameter_id: Uuid,
+    pub(super) sd_estimator: String,
 }
 
 #[derive(FromQueryResult)]
-struct SlotRow {
-    site_id: Uuid,
-    parameter_id: Uuid,
+pub(super) struct SlotRow {
+    pub(super) site_id: Uuid,
+    pub(super) parameter_id: Uuid,
 }
 
 /// A catalog parameter's usage. `SUM` over a bigint is NUMERIC in Postgres, so the sum is cast in
 /// the query: decoded as an integer it fails, which the hand mapping's `unwrap_or(0)` was
 /// swallowing, and every parameter reported no readings.
 #[derive(FromQueryResult)]
-struct UsageRow {
-    parameter_id: Uuid,
-    slots: i64,
-    readings: i64,
+pub(super) struct UsageRow {
+    pub(super) parameter_id: Uuid,
+    pub(super) slots: i64,
+    pub(super) readings: i64,
 }
+
+/// How much of one source system is paired, the dashboard's "needs attention" count.
+#[derive(Serialize, ToSchema, sea_orm::FromQueryResult)]
+pub struct UnpairedSummaryRow {
+    pub source_system: String,
+    pub unpaired: i64,
+    pub paired: i64,
+}
+
+/// One site's metadata as the plan's streams carry it: every field is text in `metadata`, so the
+/// row reads them as text and the parses below turn them into what the response holds.
+#[derive(sea_orm::FromQueryResult)]
+pub(super) struct PlanSiteMetadataRow {
+    pub(super) site_name: Option<String>,
+    pub(super) latitude: Option<String>,
+    pub(super) longitude: Option<String>,
+    pub(super) altitude_m: Option<String>,
+    pub(super) glacier_name: Option<String>,
+    pub(super) glacier_rgi: Option<String>,
+    pub(super) location_type: Option<String>,
+    pub(super) catchment: Option<String>,
+    pub(super) full_name: Option<String>,
+    pub(super) elevation: Option<String>,
+    pub(super) channel_id: Option<String>,
+    pub(super) sample_interval_sec: Option<String>,
+}
+
+#[derive(sea_orm::FromQueryResult)]
+pub(super) struct PlanSiteDeviceRow {
+    pub(super) site_name: Option<String>,
+    pub(super) serial: Option<String>,
+    pub(super) model: Option<String>,
+    pub(super) streams: i64,
+}
+
+/// Streams a draft does not cover: unpaired now, plannable (`create_plan` skips a legacy single
+/// superseded by its `:reps` family), and named by no entry. The plan's own entries decide it, so
+/// the count is exact where comparing entry totals with a stream total is not: a replicate family
+/// is one entry over several source columns.
+pub(super) async fn uncovered_stream_count(
+    db: &sea_orm::DatabaseConnection,
+    plan_id: Uuid,
+    source_system: &str,
+) -> AppResult<Option<i64>> {
+    use sea_orm::{ConnectionTrait, Statement};
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r"SELECT count(*) AS n
+              FROM data_streams ds
+             WHERE ds.source_system = $2
+               AND ds.site_parameter_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM data_streams fam
+                                WHERE fam.source_system = ds.source_system
+                                  AND fam.source_key = ds.source_key || ':reps')
+               AND ds.id NOT IN (SELECT (e ->> 'stream_id')::uuid
+                                   FROM pairing_plans p, jsonb_array_elements(p.entries) e
+                                  WHERE p.id = $1)",
+            [plan_id.into(), source_system.into()],
+        ))
+        .await?;
+    Ok(row.map(|r| r.try_get::<i64>("", "n")).transpose()?)
+}
+
+/// Fold the review's curve assignments into the plan's list. An assignment must name a curve that
+/// exists and that no reading names yet (the curve's own update route refuses a used curve the
+/// same way), and an instrument some paired entry proposes creating; anything else is a 400 now
+/// rather than a failed apply later.
+pub(super) async fn apply_curve_updates(
+    db: &sea_orm::DatabaseConnection,
+    entries: &[crate::routes::private::sync::service::PlanEntry],
+    intents: &mut Vec<crate::routes::private::sync::service::PlanCurveIntent>,
+    updates: &[PlanCurveUpdate],
+) -> AppResult<()> {
+    for update in updates {
+        intents.retain(|i| i.curve_id != update.curve_id);
+        let Some(source_key) = update
+            .instrument_source_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        else {
+            continue;
+        };
+        let proposed = entries.iter().any(|e| {
+            e.action == "pair"
+                && e.instrument
+                    .as_ref()
+                    .is_some_and(|i| i.create && i.source_key == source_key)
+        });
+        if !proposed {
+            return Err(AppError::BadRequest(format!(
+                "this plan does not create an instrument with source key '{source_key}'; a \
+                 curve can only be assigned here to an instrument the plan will create, an \
+                 existing instrument takes it through the curve itself"
+            )));
+        }
+        if crate::routes::private::sensors::standard_curves::Entity::find_by_id(update.curve_id)
+            .one(db)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::BadRequest(format!(
+                "standard curve {} does not exist",
+                update.curve_id
+            )));
+        }
+        if crate::routes::private::sensors::standard_curves::views::curve_is_used(
+            db,
+            update.curve_id,
+        )
+        .await?
+        {
+            return Err(AppError::BadRequest(format!(
+                "standard curve {} has already been applied to readings, so its instrument is \
+                 fixed. Create a new curve on the new instrument and re-enter the affected \
+                 measurements against it.",
+                update.curve_id
+            )));
+        }
+        intents.push(crate::routes::private::sync::service::PlanCurveIntent {
+            curve_id: update.curve_id,
+            instrument_source_key: source_key.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// What an instrument decision covers where the entry names no instrument yet. A curve column is
+/// one instrument across the whole source, so settling it on any one entry settles every entry
+/// sharing the column; where no column names a curve, the source parameter plays that role, so
+/// choosing the fluorometer for `chla_acid` covers all 31 stations rather than one.
+pub(super) fn instrument_scope(entry: &crate::routes::private::sync::service::PlanEntry) -> String {
+    match entry
+        .instrument
+        .as_ref()
+        .and_then(|i| i.curve_column.as_deref())
+    {
+        Some(column) => format!("column:{column}"),
+        None => format!(
+            "parameter:{}",
+            entry
+                .parameter
+                .group_key
+                .as_deref()
+                .unwrap_or(&entry.parameter.name)
+        ),
+    }
+}
+
+/// Whether an instrument row was minted by stream registration rather than named by the source or
+/// an operator.
+pub(super) fn is_minted_default(sensor: &sensors::Model) -> bool {
+    sensor
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("minted_from_stream"))
+        .is_some()
+}
+
+/// The identity an instrument decision belongs to. An entry that already names an instrument
+/// belongs to that instrument, however many source columns share it: the portal's `chla acid`
+/// curve corrects both `Chla_acid_ugL` and `Chla_acid_ugm2` from one lab instrument, and keying
+/// those by parameter would report one instrument as two rows and move only half of it when the
+/// operator repointed it. An entry with no instrument has only its scope to be keyed by.
+pub(super) fn instrument_key(entry: &crate::routes::private::sync::service::PlanEntry) -> String {
+    match entry.instrument.as_ref() {
+        Some(instrument) if !instrument.source_key.is_empty() => {
+            format!("instrument:{}", instrument.source_key)
+        }
+        _ => instrument_scope(entry),
+    }
+}
+
+/// Apply a site's coordinate edits.
+///
+/// Kept apart from the per-entry loop for the reason the instrument half is: where a site is
+/// concerned, every entry naming it is one row to the operator. Editing the elevation on one of a
+/// station's twenty-three feeds and leaving the other twenty-two at the source's value would make
+/// the created site's attributes depend on which entry the apply read first.
+///
+/// A site the plan resolved to an existing row is left alone: its attributes are its own page's,
+/// and the apply only ever backfills a coordinate such a site is missing.
+pub(super) fn apply_site_attribute_updates(
+    entries: &mut [crate::routes::private::sync::service::PlanEntry],
+    updates: &[PlanEntryUpdate],
+) {
+    for update in updates {
+        if update.site_latitude.is_none()
+            && update.site_longitude.is_none()
+            && update.site_altitude_m.is_none()
+        {
+            continue;
+        }
+        let Some(target) = entries.iter().find(|e| e.stream_id == update.stream_id) else {
+            continue;
+        };
+        if target.site.id.is_some() {
+            continue;
+        }
+        let name = target.site.name.to_lowercase();
+        for entry in entries
+            .iter_mut()
+            .filter(|e| e.site.id.is_none() && e.site.name.to_lowercase() == name)
+        {
+            if let Some(lat) = update.site_latitude {
+                entry.site.latitude = Some(lat);
+            }
+            if let Some(lon) = update.site_longitude {
+                entry.site.longitude = Some(lon);
+            }
+            if let Some(alt) = update.site_altitude_m {
+                entry.site.altitude_m = Some(alt);
+            }
+        }
+    }
+}
+
+/// Apply the instrument half of a plan edit.
+///
+/// Kept apart from the per-entry loop because an instrument decision is per instrument, not per
+/// stream: one instrument serves the whole source, so confirming or repointing it on any one entry
+/// settles every entry that shares it. Doing it per entry would leave 30 of 31 DOC streams still
+/// asking.
+pub(super) async fn apply_instrument_updates(
+    state: &AppState,
+    source_system: &str,
+    entries: &mut [crate::routes::private::sync::service::PlanEntry],
+    updates: &[PlanEntryUpdate],
+) -> AppResult<()> {
+    for update in updates {
+        if update.instrument_id.is_none()
+            && update.instrument_name.is_none()
+            && update.instrument_confirmed.is_none()
+            && update.instrument_clear != Some(true)
+        {
+            continue;
+        }
+        let Some(target) = entries.iter().find(|e| e.stream_id == update.stream_id) else {
+            continue;
+        };
+        let key = instrument_key(target);
+        // One key in, one key out: the proposal a rename mints is derived from the entry the
+        // operator edited, so a row covering several source columns stays one row.
+        let proposed_source_key = match target
+            .instrument
+            .as_ref()
+            .and_then(|i| i.curve_column.as_deref())
+        {
+            Some(column) => format!("{source_system}:{column}"),
+            None => format!("{source_system}:{}", target.parameter.name),
+        };
+
+        // A feed the source reports as a device has its instrument already: one minted for the
+        // slot it serves when the stream is paired, with that slot's deployment opened. Minting a
+        // lab instrument for it instead would take both.
+        if update.instrument_name.is_some() && update.instrument_id.is_none() && target.is_device {
+            let named = match &target.device_serial {
+                Some(serial) => format!(" (the source names device serial {serial})"),
+                None => String::new(),
+            };
+            return Err(AppError::BadRequest(format!(
+                "stream {} is reported as a device{named}, so its instrument is minted for the \
+                 slot it serves when the stream is paired. Attach an existing instrument to \
+                 override that, or leave it unset.",
+                update.stream_id
+            )));
+        }
+
+        // A repoint has to name an instrument that exists; otherwise the plan would carry an id
+        // the apply cannot resolve.
+        let repointed = match update.instrument_id {
+            Some(id) => Some(
+                sensors::Entity::find_by_id(id)
+                    .one(&state.db)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::BadRequest(format!("Instrument {id} does not exist"))
+                    })?,
+            ),
+            None => None,
+        };
+        // The chosen instrument's curves travel with the entry, so the review shows what it
+        // corrects with rather than only its name.
+        let repointed_curves = match &repointed {
+            Some(sensor) => crate::routes::private::sensors::standard_curves::Entity::find()
+                .filter(
+                    crate::routes::private::sensors::standard_curves::Column::SensorId
+                        .eq(sensor.id),
+                )
+                .all(&state.db)
+                .await?
+                .into_iter()
+                .map(|c| crate::routes::private::sync::service::PlanCurveRef {
+                    id: c.id,
+                    name: c.name,
+                    slope: c.slope,
+                    intercept: c.intercept,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
+        for entry in entries.iter_mut().filter(|e| instrument_key(e) == key) {
+            if update.instrument_clear == Some(true) {
+                entry.instrument = None;
+                continue;
+            }
+            // A stream whose source names no curve per reading has no instrument until someone
+            // says which one corrected it upstream. Attaching an existing one records that, and
+            // naming a new one proposes it; neither stamps, because the value already carries the
+            // correction. The identity is the parameter, so every station moves together.
+            if entry.instrument.is_none() {
+                let proposed = update
+                    .instrument_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty());
+                if repointed.is_some() || proposed.is_some() {
+                    let name = proposed
+                        .map(str::to_string)
+                        .unwrap_or_else(|| entry.parameter.name.clone());
+                    entry.instrument =
+                        Some(crate::routes::private::sync::service::PlanInstrumentRef {
+                            curve_column: None,
+                            id: None,
+                            name: name.clone(),
+                            source_key: proposed_source_key.clone(),
+                            resolved_by: if repointed.is_some() {
+                                "manual".to_string()
+                            } else {
+                                "placeholder".to_string()
+                            },
+                            create: repointed.is_none(),
+                            defaulted: repointed.as_ref().is_some_and(is_minted_default),
+                            confirmed: repointed.is_some(),
+                            stamps_readings: false,
+                            curves: Vec::new(),
+                            proposed_name: Some(name),
+                            name_conflict: None,
+                        });
+                }
+            }
+            let Some(instrument) = entry.instrument.as_mut() else {
+                continue;
+            };
+            if let Some(sensor) = &repointed {
+                instrument.id = Some(sensor.id);
+                instrument.name = sensor
+                    .name
+                    .clone()
+                    .or_else(|| sensor.serial_number.clone())
+                    .unwrap_or_else(|| sensor.id.to_string());
+                instrument.source_key = sensor.source_key.clone().unwrap_or_default();
+                instrument.resolved_by = "manual".to_string();
+                instrument.create = false;
+                instrument.defaulted = is_minted_default(sensor);
+                instrument.confirmed = true;
+                instrument.curves = repointed_curves.clone();
+            }
+            // Naming an instrument proposes one; picking from the inventory attaches one. So a
+            // name arriving at an entry that holds an existing instrument returns it to a
+            // proposal, rather than doing nothing (which is what an operator undoing a mis-click
+            // used to get) or renaming the inventory row (which this route never does).
+            if let Some(name) = &update.instrument_name
+                && repointed.is_none()
+                && !name.trim().is_empty()
+            {
+                let name = name.trim().to_string();
+                if instrument.create {
+                    instrument.name = name.clone();
+                    instrument.proposed_name = Some(name);
+                } else {
+                    instrument.id = None;
+                    instrument.name = name.clone();
+                    instrument.proposed_name = Some(name);
+                    instrument.source_key = proposed_source_key.clone();
+                    instrument.resolved_by = "placeholder".to_string();
+                    instrument.create = true;
+                    instrument.defaulted = false;
+                    instrument.confirmed = false;
+                    instrument.curves = Vec::new();
+                }
+            }
+
+            if let Some(confirmed) = update.instrument_confirmed {
+                instrument.confirmed = confirmed;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fold the review's object decisions into the plan's accepted list. Accepting a key already
+/// accepted leaves the first decision, and its actor, standing; taking one back removes it.
+pub(super) fn apply_object_updates(
+    accepted: &mut Vec<crate::routes::private::sync::service::PlanAcceptedObject>,
+    updates: &[PlanObjectUpdate],
+    actor: &str,
+) {
+    for update in updates {
+        let at = accepted.iter().position(|a| a.key == update.key);
+        match (update.accepted, at) {
+            (true, None) => {
+                accepted.push(crate::routes::private::sync::service::PlanAcceptedObject {
+                    key: update.key.clone(),
+                    accepted_by: Some(actor.to_string()),
+                    accepted_at: chrono::Utc::now().into(),
+                });
+            }
+            (false, Some(i)) => {
+                accepted.remove(i);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The refusal a writer gets when the draft has moved on: the version it should reload is in the
+/// detail, so the client re-reads and re-applies rather than guessing.
+pub(super) fn stale_plan(current_version: i32) -> AppError {
+    AppError::ConflictDetail {
+        message: "The plan changed since you read it; reload it and reapply your edits".to_string(),
+        detail: serde_json::json!({ "current_version": current_version }),
+    }
+}
+
+/// Move a plan from one status to the next, atomically. `false` means a concurrent writer got
+/// there first and the row is no longer in `from`, which is what every caller checks before
+/// doing the work the new status claims.
+pub(super) async fn claim_plan_status<C: ConnectionTrait>(
+    db: &C,
+    plan_id: Uuid,
+    from: &str,
+    to: &str,
+) -> AppResult<bool> {
+    let claimed = pairing_plans::model::Entity::update_many()
+        .col_expr(pairing_plans::model::Column::Status, Expr::value(to))
+        .filter(pairing_plans::model::Column::Id.eq(plan_id))
+        .filter(pairing_plans::model::Column::Status.eq(from))
+        .exec(db)
+        .await?;
+    Ok(claimed.rows_affected > 0)
+}
+
+/// Fetch a pairing plan's version, or 404 if unknown.
+pub(super) async fn plan_version(db: &sea_orm::DatabaseConnection, id: Uuid) -> AppResult<i32> {
+    let plan = pairing_plans::model::Entity::find_by_id(id)
+        .select_only()
+        .column(pairing_plans::model::Column::Version)
+        .into_tuple::<i32>()
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
+    Ok(plan)
+}
+
+/// Fetch a pairing plan's status, or 404 if unknown.
+pub(super) async fn plan_status(db: &sea_orm::DatabaseConnection, id: Uuid) -> AppResult<String> {
+    let plan = pairing_plans::model::Entity::find_by_id(id)
+        .select_only()
+        .column(pairing_plans::model::Column::Status)
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
+    Ok(plan)
+}
+
+#[cfg(test)]
+#[path = "tests/service.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "tests/review_state.rs"]
+mod review_state_tests;
+
+#[cfg(test)]
+#[path = "tests/family_suggestion.rs"]
+mod family_suggestion_tests;
+
+#[cfg(test)]
+#[path = "tests/control_tokens.rs"]
+mod control_tokens_tests;
+
+#[cfg(test)]
+#[path = "tests/enroll.rs"]
+mod enroll_tests;
+
+#[cfg(test)]
+#[path = "tests/heartbeat.rs"]
+mod heartbeat_tests;
+
+#[cfg(test)]
+#[path = "tests/replicate_audit.rs"]
+mod replicate_audit_tests;

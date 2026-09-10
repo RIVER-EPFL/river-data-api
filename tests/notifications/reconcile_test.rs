@@ -1,4 +1,4 @@
-//! `reconcile::sweep` prunes the push subscriptions of anyone whose Keycloak account resolves as
+//! `flows::sweep` prunes the push subscriptions of anyone whose Keycloak account resolves as
 //! `Revoked`, and leaves their preferences row alone. An active member is left alone, and an
 //! unresolvable account (`None`, e.g. Keycloak unreachable) is retained rather than swept, so a
 //! transient outage cannot cut off a live user.
@@ -6,8 +6,8 @@
 //! Run: cargo test --test notifications reconcile -- --test-threads=1
 
 use river_db::common::authz::Role;
-use river_db::routes::private::notifications::access::RoleResolution;
-use river_db::routes::private::notifications::reconcile;
+use river_db::routes::private::notifications::models::RoleResolution;
+use river_db::routes::private::notifications::flows;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 
@@ -65,7 +65,7 @@ async fn sweep_prunes_revoked_keeps_active_and_unresolvable() {
     // sub-none is left unprimed: with no Keycloak backend `resolve` returns None (fail open on an
     // unreachable authority), so the sweep must retain it.
 
-    let outcome = reconcile::sweep(&state).await.unwrap();
+    let outcome = flows::sweep(&state).await.unwrap();
 
     assert_eq!(outcome.revoked, 1, "one push subscription pruned");
 

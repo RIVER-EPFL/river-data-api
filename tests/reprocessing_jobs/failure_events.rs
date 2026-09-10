@@ -93,10 +93,17 @@ async fn unregistered_trigger_type_announces_failed() {
     let events = tokio::sync::broadcast::channel::<AppEvent>(64).0;
     let mut rx = events.subscribe();
     let wid = worker::worker_id();
-    let job_id = worker::enqueue(&db, "test_unknown", None, None, &serde_json::json!({}), None)
-        .await
-        .unwrap()
-        .expect("a fresh enqueue inserts a row");
+    let job_id = worker::enqueue(
+        &db,
+        "test_unknown",
+        None,
+        None,
+        &serde_json::json!({}),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("a fresh enqueue inserts a row");
 
     worker::run_one_with_policy(&db, &events, &registry, &wid, IMMEDIATE)
         .await
@@ -104,8 +111,10 @@ async fn unregistered_trigger_type_announces_failed() {
 
     let seen = drain(&mut rx);
     assert!(
-        seen.iter().any(|e| matches!(e, AppEvent::JobCompleted { job_id: id, status, .. }
-            if *id == job_id && status == "failed")),
+        seen.iter().any(
+            |e| matches!(e, AppEvent::JobCompleted { job_id: id, status, .. }
+            if *id == job_id && status == "failed")
+        ),
         "a job with no handler is announced failed, saw {seen:?}"
     );
 }

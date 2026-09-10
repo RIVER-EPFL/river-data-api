@@ -27,7 +27,6 @@ use crate::common::keycloak as kc;
 use crate::common::sensor_lifecycle::{ReadingRow, dt, get_readings};
 use crate::common::tracks;
 
-
 /// C1 opens on the day Track B's deployment opens.
 const T0: &str = "2025-06-02T00:00:00Z";
 /// C2 opens after every reading the fixture holds.
@@ -266,8 +265,7 @@ async fn arrange(db: &DatabaseConnection, app: &Router, admin: &str) -> Fixture 
     let c1_uuid = Uuid::parse_str(&c1_id).expect("calibration id is a uuid");
 
     assert_eq!(
-        crate::common::jobs::wait_for_triggered_job(db, "calibration_create", Some(&c1_id))
-            .await,
+        crate::common::jobs::wait_for_triggered_job(db, "calibration_create", Some(&c1_id)).await,
         "completed",
         "recording a calibration enqueues a tracked reprocess for that calibration"
     );
@@ -316,7 +314,10 @@ async fn arrange(db: &DatabaseConnection, app: &Router, admin: &str) -> Fixture 
 #[tokio::test]
 #[serial]
 async fn forward_calibration_closes_the_previous_window_and_leaves_history_alone() {
-    if !crate::common::profile::Service::Keycloak.require("forward_calibration_closes_the_previous_window").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("forward_calibration_closes_the_previous_window")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -360,8 +361,7 @@ async fn forward_calibration_closes_the_previous_window_and_leaves_history_alone
     assert_eq!(status, 201, "record C2 on top of C1: {c2}");
     let c2_id = e2e::id_of(&c2);
     assert_eq!(
-        crate::common::jobs::wait_for_triggered_job(&db, "calibration_create", Some(&c2_id))
-            .await,
+        crate::common::jobs::wait_for_triggered_job(&db, "calibration_create", Some(&c2_id)).await,
         "completed",
         "recording C2 enqueues a tracked reprocess for C2"
     );
@@ -454,7 +454,10 @@ async fn forward_calibration_closes_the_previous_window_and_leaves_history_alone
 #[tokio::test]
 #[serial]
 async fn readings_ingested_after_the_new_calibration_carry_it_and_take_its_curve_on_reprocess() {
-    if !crate::common::profile::Service::Keycloak.require("readings_ingested_after_the_new_calibration").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("readings_ingested_after_the_new_calibration")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -469,8 +472,7 @@ async fn readings_ingested_after_the_new_calibration_carry_it_and_take_its_curve
     let c2_id = e2e::id_of(&c2);
     let c2_uuid = Uuid::parse_str(&c2_id).expect("calibration id is a uuid");
     assert_eq!(
-        crate::common::jobs::wait_for_triggered_job(&db, "calibration_create", Some(&c2_id))
-            .await,
+        crate::common::jobs::wait_for_triggered_job(&db, "calibration_create", Some(&c2_id)).await,
         "completed",
         "recording C2 enqueues a tracked reprocess for C2"
     );
@@ -615,7 +617,10 @@ async fn readings_ingested_after_the_new_calibration_carry_it_and_take_its_curve
 #[tokio::test]
 #[serial]
 async fn a_backdated_reading_resolves_to_the_older_window_not_the_latest_calibration() {
-    if !crate::common::profile::Service::Keycloak.require("backdated_reading_resolves_to_the_older_window").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("backdated_reading_resolves_to_the_older_window")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -637,8 +642,7 @@ async fn a_backdated_reading_resolves_to_the_older_window_not_the_latest_calibra
     let c2_id = e2e::id_of(&c2);
     let c2_uuid = Uuid::parse_str(&c2_id).expect("calibration id is a uuid");
     assert_eq!(
-        crate::common::jobs::wait_for_triggered_job(&db, "calibration_create", Some(&c2_id))
-            .await,
+        crate::common::jobs::wait_for_triggered_job(&db, "calibration_create", Some(&c2_id)).await,
         "completed",
         "recording C2 enqueues a tracked reprocess for C2"
     );
@@ -753,7 +757,10 @@ async fn a_backdated_reading_resolves_to_the_older_window_not_the_latest_calibra
 #[tokio::test]
 #[serial]
 async fn aggregates_report_the_new_curve_for_the_new_bucket_and_leave_the_old_bucket_alone() {
-    if !crate::common::profile::Service::Keycloak.require("aggregates_report_the_new_curve").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("aggregates_report_the_new_curve")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -792,8 +799,7 @@ async fn aggregates_report_the_new_curve_for_the_new_bucket_and_leave_the_old_bu
     assert_eq!(status, 201, "record C2 on top of C1: {c2}");
     let c2_id = e2e::id_of(&c2);
     assert_eq!(
-        crate::common::jobs::wait_for_triggered_job(&db, "calibration_create", Some(&c2_id))
-            .await,
+        crate::common::jobs::wait_for_triggered_job(&db, "calibration_create", Some(&c2_id)).await,
         "completed",
         "recording C2 enqueues a tracked reprocess for C2"
     );

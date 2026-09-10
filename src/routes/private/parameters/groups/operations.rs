@@ -1,5 +1,5 @@
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::{ConnectionTrait, EntityTrait, FromQueryResult, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, EntityTrait, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use super::group_model::ParameterGroup;
@@ -27,33 +27,21 @@ async fn member_row<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<Option<Membe
     }))
 }
 
-/// One `parameter_group_members` row as stored, with the role still text.
-#[derive(FromQueryResult)]
-struct MembershipRow {
-    group_id: Uuid,
-    parameter_id: Uuid,
-    role: String,
-}
-
 /// Every membership row, reduced to what the reshape rules read.
 async fn all_members<C: ConnectionTrait>(db: &C) -> Result<Vec<Member>, ApiError> {
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT group_id, parameter_id, role FROM parameter_group_members".to_string(),
-        ))
+    let rows = super::member_model::Entity::find()
+        .all(db)
         .await
         .map_err(ApiError::database)?;
     let mut members = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let membership = MembershipRow::from_query_result(row, "").map_err(ApiError::database)?;
+    for row in rows {
         // A role outside the vocabulary is a corrupt row, not a decode failure.
-        let Some(role) = Role::parse(&membership.role) else {
+        let Some(role) = Role::parse(&row.role) else {
             continue;
         };
         members.push(Member {
-            group_id: membership.group_id,
-            parameter_id: membership.parameter_id,
+            group_id: row.group_id,
+            parameter_id: row.parameter_id,
             role,
         });
     }
@@ -180,12 +168,9 @@ impl CRUDOperations for ParameterGroupMemberOperations {
             return Ok(());
         };
         let calculations =
-            crate::routes::private::tools::calculation_versions::calculations_of_group(
-                db,
-                member.group_id,
-            )
-            .await
-            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            crate::routes::private::tools::service::calculations_of_group(db, member.group_id)
+                .await
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
         rules::may_move(member, to_group, &calculations)
             .map_err(|refusal| ApiError::bad_request(refusal.to_string()))
     }

@@ -7,7 +7,7 @@
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 
-use river_db::routes::private::tools::hash::stored_version_content;
+use river_db::routes::private::tools::service::stored_version_content;
 
 #[tokio::test]
 #[serial]

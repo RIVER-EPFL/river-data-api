@@ -90,7 +90,10 @@ async fn a_spot_import_is_screened_in_dry_run_and_the_commit_is_held_to_the_chec
     )
     .await;
     assert_eq!(status, 409, "{body}");
-    assert!(body["error"].as_str().unwrap().contains("fresh check"), "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("fresh check"),
+        "{body}"
+    );
 
     // The screened file commits under its check.
     let (status, body) = import(

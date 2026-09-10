@@ -175,7 +175,10 @@ async fn a_bookkeeping_instrument_cannot_be_declared_as_what_measures_a_slot() {
         &token,
     )
     .await;
-    assert_eq!(status, 400, "the declaration refuses an entry channel: {body}");
+    assert_eq!(
+        status, 400,
+        "the declaration refuses an entry channel: {body}"
+    );
     assert!(
         body.contains("entry_channel"),
         "the refusal says what the row is: {body}"

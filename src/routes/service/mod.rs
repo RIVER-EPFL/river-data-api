@@ -17,7 +17,7 @@ use crate::common::middleware::{
 };
 use crate::common::rate_limit::FallbackIpKeyExtractor;
 use crate::routes::private::{
-    alarms::thresholds::AlarmThreshold,
+    alarms::models::AlarmThreshold,
     annotations::Annotation,
     api_tokens::ApiToken,
     api_tokens::audit_log::ApiTokenAuditLog,
@@ -41,10 +41,10 @@ use crate::routes::private::{
     sensors::deployments::SensorDeployment,
     sensors::standard_curves::StandardCurve,
     sites::parameters::SiteParameter,
-    sync::commands_model::SyncCommand,
-    sync::credentials_model::SyncServiceCredential,
-    sync::events_model::SyncEvent,
-    sync::services_model::SyncService,
+    sync::models::commands::SyncCommand,
+    sync::models::credentials::SyncServiceCredential,
+    sync::models::events::SyncEvent,
+    sync::models::services::SyncService,
 };
 
 const ACTION_BODY_LIMIT: usize = 1024 * 1024; // 1 MB, preserved from the former admin tier
@@ -161,13 +161,13 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     let (entity_router, entity_api): (Router<()>, utoipa::openapi::OpenApi) = OpenApiRouter::new()
         .nest(
             "/projects",
-            invalidate_public_config(crate::routes::private::projects::router::service_router(
+            invalidate_public_config(crate::routes::private::projects::views::service_router(
                 state,
             )),
         )
         .nest(
             "/sites",
-            invalidate_public_config(crate::routes::private::sites::router::service_router(state)),
+            invalidate_public_config(crate::routes::private::sites::views::service_router(state)),
         )
         .nest("/parameters", catalog_inventory_crud(Parameter::router(db)))
         .nest(
@@ -285,11 +285,11 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     let sensor_view_read_routes = Router::new()
         .route(
             "/sensors/{id}/readings",
-            get(crate::routes::private::sensors::readings::get_sensor_readings),
+            get(crate::routes::private::sensors::views::get_sensor_readings),
         )
         .route(
             "/sensors/{id}/deployment_bands",
-            get(crate::routes::private::sensors::readings::get_sensor_deployment_bands),
+            get(crate::routes::private::sensors::views::get_sensor_deployment_bands),
         )
         .route(
             "/sensor_calibrations/{id}/window",
@@ -297,15 +297,15 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         .route(
             "/sensors/{id}/curve_usage",
-            get(crate::routes::private::sensors::instruments::get_sensor_curve_usage),
+            get(crate::routes::private::sensors::views::get_sensor_curve_usage),
         )
         .route(
             "/instruments/overview",
-            get(crate::routes::private::sensors::instruments::get_instruments_overview),
+            get(crate::routes::private::sensors::views::get_instruments_overview),
         )
         .route(
             "/standard_curves/{id}/usage",
-            get(crate::routes::private::sensors::instruments::get_curve_usage),
+            get(crate::routes::private::sensors::views::get_curve_usage),
         )
         .layer(middleware::from_fn(require_read_data))
         .with_state(state.clone());
@@ -318,19 +318,19 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         .route(
             "/sensors/register",
-            post(crate::routes::private::sensors::register::register_sensor),
+            post(crate::routes::private::sensors::views::register_sensor),
         )
         .route(
             "/sensors/proposals",
-            post(crate::routes::private::sensors::register::propose_instruments),
+            post(crate::routes::private::sensors::views::propose_instruments),
         )
         .route(
             "/notes/register",
-            post(crate::routes::private::notes::register::register_notes),
+            post(crate::routes::private::notes::views::register_notes),
         )
         .route(
             "/annotations/register",
-            post(crate::routes::private::annotations::register::register_annotations),
+            post(crate::routes::private::annotations::views::register_annotations),
         )
         .route("/streams/retag", post(stream_views::retag_streams))
         .route("/streams/{id}/import", post(stream_views::import_stream))
@@ -342,7 +342,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .layer(middleware::from_fn(require_admin_or_token_write_metadata))
         .with_state(state.clone());
 
-    use crate::routes::private::sensors::adopt as sensor_adopt;
+    use crate::routes::private::sensors::views as sensor_adopt;
     let sensor_adopt_read = Router::new()
         .route(
             "/sensors/{sensor_id}/adopt_suggestions",
@@ -357,7 +357,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         .route(
             "/sensors/retag_frequency",
-            post(crate::routes::private::sensors::retag::retag_frequency),
+            post(crate::routes::private::sensors::views::retag_frequency),
         )
         .route("/actions/swap", post(sensor_adopt::swap_sensors))
         // Rolling a deployment back undoes one, so it takes the capability deleting a deployment
@@ -389,19 +389,19 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT))
         .route(
             "/collection_events/stage",
-            post(crate::routes::private::collection_events::stage_collection_event),
+            post(crate::routes::private::collection_events::views::stage_collection_event),
         )
         .route(
             "/collection_events/{id}/recompute",
-            post(crate::routes::private::collection_events::recompute_collection_event),
+            post(crate::routes::private::collection_events::views::recompute_collection_event),
         )
         .route(
             "/actions/event_audit",
-            post(crate::routes::private::collection_events::run_event_audit),
+            post(crate::routes::private::collection_events::views::run_event_audit),
         )
         .route(
             "/actions/event_recompute",
-            post(crate::routes::private::collection_events::run_event_recompute),
+            post(crate::routes::private::collection_events::views::run_event_recompute),
         )
         .route(
             "/readings/edits/preview",
@@ -478,12 +478,15 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/reprocessing_jobs/{id}/logs",
             get(crate::routes::private::reprocessing_jobs::routes::get_job_logs),
         )
-        .route("/tools", get(tools::list_tools))
+        .route("/tools", get(tools::views::list_tools))
         .route(
             "/calculations/closure",
-            get(crate::routes::private::tools::calculations::get_calculation_closure),
+            get(crate::routes::private::tools::views::get_calculation_closure),
         )
-        .route("/tools/{tool_name}/calculate", post(tools::calculate_tool))
+        .route(
+            "/tools/{tool_name}/calculate",
+            post(tools::views::calculate_tool),
+        )
         .route(
             "/readings/seasonal_check",
             post(crate::routes::private::readings::checks::seasonal_check),
@@ -510,15 +513,15 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         .route(
             "/sites/{id}/visits",
-            get(crate::routes::private::collection_events::visits::list_site_visits),
+            get(crate::routes::private::collection_events::views::list_site_visits),
         )
         .route(
             "/visits",
-            get(crate::routes::private::collection_events::visits::list_visits),
+            get(crate::routes::private::collection_events::views::list_visits),
         )
         .route(
             "/collection_events/{id}/detail",
-            get(crate::routes::private::collection_events::visits::get_event_detail),
+            get(crate::routes::private::collection_events::views::get_event_detail),
         )
         // The rows carry a reading's stored value, so this is data rather than metadata.
         .route("/actions/curation_drift", get(actions::curation_drift))
@@ -526,7 +529,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .with_state(state.clone());
 
     let metadata_read_routes = Router::new()
-        .route("/search", get(search::search))
+        .route("/search", get(search::views::search))
         .route("/version", get(crate::routes::version::get_version))
         .route(
             "/actions/backfill_candidates",
@@ -611,15 +614,15 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         // MANAGER gate the other slot-shaping actions do.
         .route(
             "/sites/{site_id}/parameter_groups",
-            post(crate::routes::private::sites::parameters::apply_group::apply_group),
+            post(crate::routes::private::sites::parameters::views::apply_group),
         )
         .route(
             "/site_parameters/{id}/declare_sd_estimator",
-            post(crate::routes::private::sites::parameters::declare::declare_sd_estimator),
+            post(crate::routes::private::sites::parameters::views::declare_sd_estimator),
         )
         .route(
             "/actions/retag_sd_estimator",
-            post(crate::routes::private::sites::parameters::declare::retag_sd_estimator),
+            post(crate::routes::private::sites::parameters::views::retag_sd_estimator),
         )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))
@@ -708,7 +711,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     // Tool script authoring: versioned R code executed by the runner. Administrator only, it is
     // remote code authorship; execution of the ACTIVE version stays open via /tools.
     let tool_script_routes = {
-        use crate::routes::private::tools::scripts;
+        use crate::routes::private::tools::views as scripts;
         Router::new()
             .route(
                 "/tool_scripts",
@@ -743,16 +746,16 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
 
     // Admin notification oversight: per-channel health probe, one-off test send, subscriber roster.
     let notifications_admin_routes = {
-        use crate::routes::private::notifications::{deliveries, health, views as notif_views};
+        use crate::routes::private::notifications::views as notif_views;
         Router::new()
-            .route("/notifications/health", get(health::get_health))
+            .route("/notifications/health", get(notif_views::get_health))
             .route(
                 "/notifications/deliveries",
-                get(deliveries::list_delivery_log),
+                get(notif_views::list_delivery_log),
             )
             .route(
                 "/notifications/health/refresh",
-                post(health::refresh_health),
+                post(notif_views::refresh_health),
             )
             .route("/notifications/test-send", post(notif_views::test_send))
             .route(
@@ -766,7 +769,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     // Self-service notification preferences. Any Keycloak user manages their OWN settings (the handler
     // binds to the caller's JWT sub; API tokens are refused in-handler since they have no user sub).
     let notifications_me_routes = {
-        use crate::routes::private::notifications::me;
+        use crate::routes::private::notifications::views as me;
         Router::new()
             .route(
                 "/notifications/me",
@@ -813,7 +816,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         .route(
             "/api_token_audit_logs/distinct/status_codes",
-            get(crate::routes::private::api_tokens::audit_log::views::distinct_status_codes),
+            get(crate::routes::private::api_tokens::views::distinct_status_codes),
         )
         .layer(middleware::from_fn(require_admin))
         .with_state(state.clone());
@@ -851,7 +854,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     // for is owed once per request rather than once per row.
     let router = router.layer(middleware::from_fn_with_state(
         state.clone(),
-        crate::routes::private::alarms::sweeper::coalesce_reconcile,
+        crate::routes::private::alarms::views::coalesce_reconcile,
     ));
 
     (router, under_api(entity_api))
@@ -886,10 +889,11 @@ pub fn sync_control_router(state: &AppState) -> Router<AppState> {
     // Only enrollment is throttled (credential brute force). The session-token routes carry the
     // services' own observability records and four services booting at once behind one ingress
     // IP were observed to 429 a cycle-record write, so they bypass the limiter entirely.
-    let enroll = crate::routes::private::sync::control::enroll_routes().layer(GovernorLayer {
-        config: Arc::new(enroll_limiter),
-    });
-    let session = crate::routes::private::sync::control::session_routes();
+    let enroll =
+        crate::routes::private::sync::views::control_enroll_routes().layer(GovernorLayer {
+            config: Arc::new(enroll_limiter),
+        });
+    let session = crate::routes::private::sync::views::control_session_routes();
 
     Router::new().nest("/sync", enroll.merge(session))
 }

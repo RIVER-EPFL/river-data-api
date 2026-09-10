@@ -104,7 +104,10 @@ async fn a_slot_two_streams_feed_is_listed_with_both_and_the_instants_they_share
     let slot = &slots[0];
     assert_eq!(slot["site_parameter_id"], crate::common::PARAM_S1_TEMP_ID);
     assert_eq!(slot["site_name"], "Upstream Station");
-    assert_eq!(slot["duplicated_instants"], 1, "one instant carries both streams");
+    assert_eq!(
+        slot["duplicated_instants"], 1,
+        "one instant carries both streams"
+    );
 
     // Every feed of the slot is named, the seeded sensor stream included: the operator is deciding
     // which of them keeps the slot.
@@ -114,7 +117,10 @@ async fn a_slot_two_streams_feed_is_listed_with_both_and_the_instants_they_share
         .iter()
         .map(|s| s["stream_id"].as_str().expect("stream id"))
         .collect();
-    assert!(ids.contains(&legacy.as_str()) && ids.contains(&family.as_str()), "both feeds named");
+    assert!(
+        ids.contains(&legacy.as_str()) && ids.contains(&family.as_str()),
+        "both feeds named"
+    );
     let fam = streams
         .iter()
         .find(|s| s["stream_id"] == family.as_str())

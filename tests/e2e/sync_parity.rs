@@ -366,7 +366,10 @@ async fn sync_parity_family_lifecycle() {
         "the served mean follows the corrected value: {converged}"
     );
 
-    if crate::common::profile::Service::Keycloak.require("sync_parity_family_lifecycle authorization sweep").await {
+    if crate::common::profile::Service::Keycloak
+        .require("sync_parity_family_lifecycle authorization sweep")
+        .await
+    {
         let kc_app = kc::build_test_app_with_keycloak(db.clone()).await;
         kc::ensure_realm_user("river1", "river1", &["riverdata-river"]).await;
         kc::grant_project(&db, &kc::keycloak_user_id("river1").await, &project).await;

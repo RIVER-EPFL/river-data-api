@@ -643,7 +643,10 @@ async fn a_hand_entered_triplicate_carries_its_curve_into_the_statistics() {
         let curve: Uuid = row.try_get("", "standard_curve_id").unwrap();
         let mtype: String = row.try_get("", "measurement_type").unwrap();
         assert_eq!(stored_index, index as i16, "positions are the entry order");
-        assert!((raw - measured[index]).abs() < 1e-9, "raw is what was typed");
+        assert!(
+            (raw - measured[index]).abs() < 1e-9,
+            "raw is what was typed"
+        );
         assert!(
             (calibrated - (3.0 * measured[index] - 1.5)).abs() < 1e-9,
             "3.0 * {} - 1.5",
@@ -669,12 +672,24 @@ async fn a_hand_entered_triplicate_carries_its_curve_into_the_statistics() {
     let n: i32 = row.try_get("", "n").unwrap();
     let mean: f64 = row.try_get::<Option<f64>>("", "mean").unwrap().unwrap();
     let stdev: f64 = row.try_get::<Option<f64>>("", "stdev").unwrap().unwrap();
-    let min_value: f64 = row.try_get::<Option<f64>>("", "min_value").unwrap().unwrap();
-    let max_value: f64 = row.try_get::<Option<f64>>("", "max_value").unwrap().unwrap();
+    let min_value: f64 = row
+        .try_get::<Option<f64>>("", "min_value")
+        .unwrap()
+        .unwrap();
+    let max_value: f64 = row
+        .try_get::<Option<f64>>("", "max_value")
+        .unwrap()
+        .unwrap();
     assert_eq!(n, 3);
     // Corrected values 10.5, 13.5, 16.5
-    assert!((mean - 13.5).abs() < 1e-9, "statistics read the corrected values, not the measured ones: {mean}");
-    assert!((stdev - 3.0).abs() < 1e-9, "sample sd of 10.5, 13.5, 16.5: {stdev}");
+    assert!(
+        (mean - 13.5).abs() < 1e-9,
+        "statistics read the corrected values, not the measured ones: {mean}"
+    );
+    assert!(
+        (stdev - 3.0).abs() < 1e-9,
+        "sample sd of 10.5, 13.5, 16.5: {stdev}"
+    );
     assert!((min_value - 10.5).abs() < 1e-9);
     assert!((max_value - 16.5).abs() < 1e-9);
 }

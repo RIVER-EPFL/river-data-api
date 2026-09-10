@@ -149,7 +149,10 @@ async fn the_shapes_a_client_reads_are_described() {
             "PlanEntryUpdate",
             &["stream_id", "instrument_clear", "acknowledged"][..],
         ),
-        ("PlanCurveUpdate", &["curve_id", "instrument_source_key"][..]),
+        (
+            "PlanCurveUpdate",
+            &["curve_id", "instrument_source_key"][..],
+        ),
     ] {
         let properties = &schemas[name]["properties"];
         for field in fields {
@@ -173,8 +176,8 @@ async fn the_shapes_a_client_reads_are_described() {
         );
     }
 
-    let body = &doc["paths"]["/api/sync/pairing-plans/{id}"]["patch"]["requestBody"]["content"]
-        ["application/json"]["schema"]["$ref"];
+    let body = &doc["paths"]["/api/sync/pairing-plans/{id}"]["patch"]["requestBody"]["content"]["application/json"]
+        ["schema"]["$ref"];
     assert_eq!(
         body,
         &serde_json::json!("#/components/schemas/UpdatePairingPlanRequest"),

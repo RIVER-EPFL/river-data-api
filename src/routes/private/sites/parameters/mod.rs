@@ -1,7 +1,7 @@
-pub mod apply_group;
-pub mod declare;
-pub mod descriptor;
-pub mod model;
-pub mod operations;
-pub use descriptor::{CatalogParameter, SlotDescriptor, catalog_map};
-pub use model::*;
+pub mod flows;
+pub mod models;
+pub mod service;
+pub mod views;
+
+pub use models::*;
+pub use service::catalog_map;

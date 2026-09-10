@@ -300,7 +300,10 @@ async fn command_lifecycle_issue_deliver_acknowledge_complete() {
         &admin,
     )
     .await;
-    assert_eq!(status, 200, "resync_streams with source_keys ({status}): {resync}");
+    assert_eq!(
+        status, 200,
+        "resync_streams with source_keys ({status}): {resync}"
+    );
     assert_eq!(resync["payload"]["source_keys"][0], "FP3:DOC_avg_ppb:reps");
 
     let (status, _) = crate::common::post_json_with_token(
@@ -730,10 +733,9 @@ async fn stale_running_sync_events_are_swept() {
         .unwrap_or_else(|e| panic!("insert {label} event: {e}"));
     }
 
-    let closed =
-        river_db::routes::private::reprocessing_jobs::jobs::sweep_stale_sync_events(&db, 3600)
-            .await
-            .expect("sweep");
+    let closed = river_db::routes::private::sync::flows::sweep_stale_sync_events(&db, 3600)
+        .await
+        .expect("sweep");
     assert_eq!(closed, 1, "only the stale event is closed");
 
     assert_eq!(

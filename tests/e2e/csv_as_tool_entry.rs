@@ -178,10 +178,9 @@ async fn an_unknown_import_field_is_refused_not_dropped() {
 #[tokio::test]
 #[serial]
 async fn an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance")
+        .await
     {
         return;
     }
@@ -304,10 +303,9 @@ async fn an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance() {
 #[tokio::test]
 #[serial]
 async fn an_import_naming_a_curve_saves_the_replicates_it_corrected_with_it() {
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "an_import_naming_a_curve_saves_the_replicates_it_corrected_with_it",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("an_import_naming_a_curve_saves_the_replicates_it_corrected_with_it")
+        .await
     {
         return;
     }

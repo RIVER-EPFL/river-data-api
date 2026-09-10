@@ -36,17 +36,15 @@ async fn set_enabled(app: &axum::Router, admin: &str, name: &str, enabled: bool)
 #[serial]
 async fn a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findings() {
     use sea_orm::ConnectionTrait;
-    if !crate::common::profile::Service::Keycloak.require(
-        "a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findings",
-    )
-    .await
+    if !crate::common::profile::Service::Keycloak
+        .require("a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findings")
+        .await
     {
         return;
     }
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findings",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findings")
+        .await
     {
         return;
     }
@@ -317,13 +315,15 @@ async fn a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findin
 #[serial]
 async fn a_correction_cascades_is_recorded_and_is_reversible() {
     const AT: &str = "2025-07-08T09:00:00Z";
-    if !crate::common::profile::Service::Keycloak.require("a_correction_cascades_is_recorded_and_is_reversible").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("a_correction_cascades_is_recorded_and_is_reversible")
+        .await
+    {
         return;
     }
-    if !crate::common::profile::Service::ToolsRunner.require(
-        "a_correction_cascades_is_recorded_and_is_reversible",
-    )
-    .await
+    if !crate::common::profile::Service::ToolsRunner
+        .require("a_correction_cascades_is_recorded_and_is_reversible")
+        .await
     {
         return;
     }
@@ -512,10 +512,7 @@ async fn a_correction_cascades_is_recorded_and_is_reversible() {
         decisions[0]["kind"], "rollback",
         "the record keeps both the correction and its undo: {decisions}"
     );
-    assert_eq!(
-        decisions[1]["kind"], "value_correction",
-        "{decisions}"
-    );
+    assert_eq!(decisions[1]["kind"], "value_correction", "{decisions}");
     assert!(
         decisions[1]["rolled_back_by"].is_string(),
         "the correction is stamped with what undid it: {decisions}"

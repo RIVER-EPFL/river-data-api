@@ -7,7 +7,8 @@
 //!
 //! Run: cargo test --test data_streams slot_retirement -- --test-threads=1
 
-use river_db::routes::private::data_streams::views::{SlotScope, retire_slot};
+use river_db::routes::private::data_streams::flows::retire_slot;
+use river_db::routes::private::data_streams::models::SlotScope;
 use serial_test::serial;
 use uuid::Uuid;
 

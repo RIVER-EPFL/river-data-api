@@ -316,7 +316,10 @@ async fn a_save_to_a_slot_the_site_does_not_hold_is_refused_however_it_is_verifi
     let (status, resp) =
         crate::common::post_json_with_token(&app, "/api/grab_samples", &tool_save, &token).await;
     assert_eq!(status, 400, "nor does a verified one: {resp}");
-    assert!(resp.contains(fresh), "the refusal names the parameter: {resp}");
+    assert!(
+        resp.contains(fresh),
+        "the refusal names the parameter: {resp}"
+    );
     assert!(
         resp.contains("parameter_groups"),
         "and how to add it: {resp}"

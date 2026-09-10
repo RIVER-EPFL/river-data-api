@@ -2,7 +2,7 @@
 //! its versions are minted from them, and it runs through the same calculate route a script
 //! calculation does.
 //!
-//! The evaluation itself is unit-tested in `routes::private::tools::formula`; what only real SQL
+//! The evaluation itself is unit-tested in `routes::private::tools::service`; what only real SQL
 //! can show is the version a formula edit mints, the manifest the formulas present, and the
 //! group check refusing a calculation that writes outside its group.
 
@@ -463,7 +463,11 @@ async fn cleanup_removes_a_formula_calculation_with_its_sources() {
     crate::common::cleanup_test_db(&db).await;
 
     assert_eq!(
-        count(&db, "SELECT count(*) FROM tool_scripts WHERE created_by = 'test'").await,
+        count(
+            &db,
+            "SELECT count(*) FROM tool_scripts WHERE created_by = 'test'"
+        )
+        .await,
         0,
         "the calculation is gone"
     );

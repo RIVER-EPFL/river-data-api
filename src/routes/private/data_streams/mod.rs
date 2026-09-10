@@ -1,8 +1,6 @@
-pub mod model;
-pub mod operations;
-pub mod pairing;
+pub mod flows;
+pub mod models;
 pub mod pairing_plans;
-pub mod replicates;
 pub mod service;
 pub mod views;
-pub use model::*;
+pub use models::*;

@@ -181,9 +181,7 @@ async fn coverage_says_where_a_calculation_s_data_lives() {
     assert_eq!(status, 200, "{body}");
 
     let coverage = body["coverage"].as_array().expect("coverage");
-    let unconfigured = coverage
-        .iter()
-        .find(|c| c["parameter_code"] == "ClosureO2");
+    let unconfigured = coverage.iter().find(|c| c["parameter_code"] == "ClosureO2");
     assert!(
         unconfigured.is_none() || unconfigured.unwrap()["sites_configured"] == 0,
         "an output no site configures reports zero rather than being omitted: {body}"
@@ -231,12 +229,9 @@ async fn the_visit_detail_marks_each_cell_s_role() {
     .await;
     assert_eq!(status, 200, "{saved}");
 
-    let (status, visits) = crate::common::get_json_with_token(
-        &app,
-        &format!("/api/sites/{SITE1_ID}/visits"),
-        &token,
-    )
-    .await;
+    let (status, visits) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
     assert_eq!(status, 200, "{visits}");
     let event_id = visits["visits"][0]["id"].as_str().expect("visit id");
 
@@ -343,11 +338,16 @@ async fn every_subject_naming_the_same_parameter_answers_the_same_set() {
         ),
     )
     .await;
-    assert_eq!(names(&format!("site_parameter_id={slot}")).await, by_parameter);
+    assert_eq!(
+        names(&format!("site_parameter_id={slot}")).await,
+        by_parameter
+    );
 
     let stream: String = crate::common::e2e::scalar(
         &db,
-        &format!("SELECT id::text AS v FROM data_streams WHERE site_parameter_id = '{slot}' LIMIT 1"),
+        &format!(
+            "SELECT id::text AS v FROM data_streams WHERE site_parameter_id = '{slot}' LIMIT 1"
+        ),
     )
     .await;
     assert_eq!(names(&format!("stream_id={stream}")).await, by_parameter);

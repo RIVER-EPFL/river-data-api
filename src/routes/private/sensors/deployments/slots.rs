@@ -12,7 +12,10 @@
 //! is why the exclusion here is by pending recall rather than by sensor.
 
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DbErr, FromQueryResult, Statement};
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, Statement,
+};
 use uuid::Uuid;
 
 /// The window a caller is about to claim, and what the write will do to the slot before claiming it.
@@ -134,25 +137,16 @@ pub async fn recall_open_deployments<C: ConnectionTrait>(
     at: DateTime<Utc>,
     except: Option<Uuid>,
 ) -> Result<u64, DbErr> {
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE sensor_deployments
-              SET deployed_until = $1
-              WHERE sensor_id = $2
-                AND parameter_id = $3
-                AND deployed_until IS NULL
-                AND deployed_from <= $1
-                AND ($4::uuid IS NULL OR id <> $4::uuid)",
-            [
-                at.into(),
-                sensor_id.into(),
-                parameter_id.into(),
-                except.into(),
-            ],
-        ))
-        .await?;
-    Ok(result.rows_affected())
+    let mut update = super::model::Entity::update_many()
+        .col_expr(super::model::Column::DeployedUntil, Expr::value(at))
+        .filter(super::model::Column::SensorId.eq(sensor_id))
+        .filter(super::model::Column::ParameterId.eq(parameter_id))
+        .filter(super::model::Column::DeployedUntil.is_null())
+        .filter(super::model::Column::DeployedFrom.lte(at));
+    if let Some(id) = except {
+        update = update.filter(super::model::Column::Id.ne(id));
+    }
+    Ok(update.exec(db).await?.rows_affected)
 }
 
 /// Carry an adjacent predecessor's end date with a deployment whose start moves forward, and report

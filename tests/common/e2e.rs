@@ -553,7 +553,11 @@ pub async fn revise_tool(
 }
 
 /// The open event-audit findings at a site, read from the review queue the dashboard reads.
-pub async fn pending_event_findings(app: &Router, token: &str, site_id: &str) -> Vec<serde_json::Value> {
+pub async fn pending_event_findings(
+    app: &Router,
+    token: &str,
+    site_id: &str,
+) -> Vec<serde_json::Value> {
     let (status, body) = super::get_json_with_token(
         app,
         "/api/sync/replicate_audit_holds?status=pending&page_size=500",

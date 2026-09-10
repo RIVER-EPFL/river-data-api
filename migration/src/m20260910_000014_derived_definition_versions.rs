@@ -86,7 +86,11 @@ impl MigrationTrait for Migration {
                 "INSERT INTO public.derived_parameter_definition_versions
                      (definition_id, version_no, formula, content_hash, created_by)
                  VALUES ($1::uuid, 1, $2, $3, 'migration')",
-                [id.into(), formula.clone().into(), formula_hash(&formula).into()],
+                [
+                    id.into(),
+                    formula.clone().into(),
+                    formula_hash(&formula).into(),
+                ],
             ))
             .await?;
         }

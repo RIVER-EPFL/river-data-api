@@ -5,14 +5,14 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
+use crate::common::actor::label;
 use crate::common::authz::AccessScope;
 use crate::common::bulk_write;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::collection_events::recompute;
+use crate::routes::private::collection_events::flows;
 use crate::routes::private::readings::decisions::{self, Kind, Origin};
 use crate::routes::private::readings::tail;
-use crate::common::actor::label;
 
 /// Keys per statement. A statement is one OR-chain, and each term carries `time = $n` equality, so
 /// chunk exclusion prunes; the bound is on statement size, not on correctness.
@@ -30,7 +30,7 @@ const CURATION_TAIL: tail::Axes = tail::Axes {
     reconcile_alarms: false,
     episodes: tail::Episodes::None,
     recompute_derived: true,
-    writer: recompute::Writer::Person,
+    writer: flows::Writer::Person,
 };
 
 /// What a recorded curation left behind, in the shape the shared tail reads. The keys carry the
@@ -80,7 +80,7 @@ pub struct FlagReadingsResponse {
     /// rewrite. Flagging changes the served value, so it changes what a calculation reads; the
     /// consequence is reported before the write, not discovered after it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub calculations: Vec<crate::routes::private::tools::closure::CalculationImpact>,
+    pub calculations: Vec<crate::routes::private::tools::models::CalculationImpact>,
 }
 
 /// `SET` clause of the flag write, and the values it binds ahead of the keys.
@@ -436,7 +436,7 @@ pub async fn flag_range(
     if payload.dry_run {
         let updated =
             count_flags_over_range(&state, &scope, range, &FlagWrite::Set(String::new())).await?;
-        let calculations = crate::routes::private::tools::closure::calculations_fed_by(
+        let calculations = crate::routes::private::tools::service::calculations_fed_by(
             &state.db,
             &[payload.parameter_id],
         )
@@ -499,7 +499,7 @@ pub async fn unflag_range(
     };
     if payload.dry_run {
         let updated = count_flags_over_range(&state, &scope, range, &FlagWrite::Clear).await?;
-        let calculations = crate::routes::private::tools::closure::calculations_fed_by(
+        let calculations = crate::routes::private::tools::service::calculations_fed_by(
             &state.db,
             &[payload.parameter_id],
         )

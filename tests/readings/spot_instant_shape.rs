@@ -57,12 +57,9 @@ async fn the_visits_grid_carries_the_group_s_statistics_and_its_column_a_unit() 
     let (_db, app, token) = setup().await;
     save_group(&app, &token).await;
 
-    let (status, body) = crate::common::get_json_with_token(
-        &app,
-        &format!("/api/sites/{SITE1_ID}/visits"),
-        &token,
-    )
-    .await;
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
     assert_eq!(status, 200, "{body}");
 
     let column = body["expected_parameters"]
@@ -109,12 +106,9 @@ async fn the_visit_detail_carries_both_divisors_and_each_replicate_s_provenance(
     )
     .await;
 
-    let (status, list) = crate::common::get_json_with_token(
-        &app,
-        &format!("/api/sites/{SITE1_ID}/visits"),
-        &token,
-    )
-    .await;
+    let (status, list) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
     assert_eq!(status, 200, "{list}");
     let event_id = list["visits"][0]["id"].as_str().expect("visit id");
 
@@ -134,7 +128,10 @@ async fn the_visit_detail_carries_both_divisors_and_each_replicate_s_provenance(
         .expect("the group has a cell");
     let sample = &cell["sample"];
     // The retraction leaves 1 and 2 behind the mean.
-    assert_eq!(sample["n"], 2, "the retracted replicate is out of n: {cell}");
+    assert_eq!(
+        sample["n"], 2,
+        "the retracted replicate is out of n: {cell}"
+    );
     close(sample["median"].as_f64(), 1.5, "median");
     close(sample["min"].as_f64(), 1.0, "min");
     close(sample["max"].as_f64(), 2.0, "max");

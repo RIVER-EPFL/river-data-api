@@ -1,15 +1,20 @@
+use std::time::Duration;
+
 use argon2::password_hash::{
     PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
 use chrono::Utc;
+use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use moka::future::Cache;
 use rand::Rng;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    Set, TransactionTrait,
+};
 use sha2::{Digest, Sha256};
-use std::time::Duration;
 
-use super::model;
+use super::models::{self as model, ApiToken};
 
 /// Cache of validated API tokens. Key: SHA-256 of the raw bearer token (in-memory only, never
 /// stored), Value: token model. Short TTL so expirations take effect quickly; revocation/rotation
@@ -272,46 +277,30 @@ fn touch_last_used(db: &DatabaseConnection, token_id: uuid::Uuid) {
     });
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub struct ApiTokenOperations;
 
-    fn token(expires_at: Option<chrono::DateTime<Utc>>) -> model::Model {
-        model::Model {
-            id: uuid::Uuid::nil(),
-            name: "test".to_string(),
-            description: None,
-            token_hash: String::new(),
-            token_prefix: "abcdefgh".to_string(),
-            project_scope: None,
-            permissions: serde_json::json!({}),
-            is_active: true,
-            rate_limit_per_second: None,
-            created_at: None,
-            expires_at,
-            last_used_at: None,
-            created_by: None,
-            token: None,
-        }
-    }
+impl CRUDOperations for ApiTokenOperations {
+    type Resource = ApiToken;
 
-    #[test]
-    fn test_is_expired_rejects_a_past_expiry() {
-        assert!(is_expired(&token(Some(
-            Utc::now() - chrono::Duration::seconds(1)
-        ))));
-    }
+    async fn perform_create<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        data: <ApiToken as CRUDResource>::CreateModel,
+    ) -> Result<ApiToken, ApiError> {
+        let minted = mint_api_token();
 
-    #[test]
-    fn test_is_expired_admits_a_future_expiry() {
-        assert!(!is_expired(&token(Some(
-            Utc::now() + chrono::Duration::hours(1)
-        ))));
-    }
+        let mut active_model: model::ActiveModel = data.into();
+        active_model.token_hash = Set(minted.token_hash);
+        active_model.token_prefix = Set(minted.token_prefix);
 
-    /// No expiry is not an expiry that has passed: a token without one never ages out.
-    #[test]
-    fn test_a_token_with_no_expiry_never_expires() {
-        assert!(!is_expired(&token(None)));
+        let model = active_model.insert(db).await.map_err(ApiError::database)?;
+        let mut token = ApiToken::from(model);
+        // The raw secret is returned exactly once, here, and never persisted.
+        token.token = Some(minted.raw_token);
+        Ok(token)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/service.rs"]
+mod tests;

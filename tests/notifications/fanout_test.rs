@@ -3,7 +3,8 @@
 //! to enabled + subscribed. A site-level "off" override suppresses that site only; a system-wide
 //! alert (no slot) ignores per-slot overrides.
 
-use river_db::routes::private::notifications::{Slot, web_push::slot_subscriptions};
+use river_db::routes::private::notifications::models::Slot;
+use river_db::routes::private::notifications::service::slot_subscriptions;
 use sea_orm::DatabaseConnection;
 use serial_test::serial;
 
@@ -42,7 +43,7 @@ async fn mute_site(db: &DatabaseConnection, sub: &str) {
 }
 
 fn endpoints(
-    subs: &[river_db::routes::private::notifications::web_push::Subscription],
+    subs: &[river_db::routes::private::notifications::service::Subscription],
 ) -> Vec<String> {
     let mut eps: Vec<String> = subs.iter().map(|s| s.endpoint.clone()).collect();
     eps.sort();
@@ -142,9 +143,7 @@ async fn channels_default_alarms_on_and_the_rest_off() {
         "a sync channel reaches only who asked for it, and the alarm mute does not apply"
     );
 
-    let sync_wide = slot_subscriptions(&db, &None, "sync_stale")
-        .await
-        .unwrap();
+    let sync_wide = slot_subscriptions(&db, &None, "sync_stale").await.unwrap();
     assert_eq!(
         endpoints(&sync_wide),
         vec!["https://push.example.com/loud"],

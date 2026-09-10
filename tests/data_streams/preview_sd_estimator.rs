@@ -12,9 +12,16 @@ const INSTANT: &str = "2025-03-04T09:00:00Z";
 async fn seed_stream(db: &DatabaseConnection, paired: bool) -> Uuid {
     let stream_id = Uuid::new_v4();
     let pairing = if paired {
-        format!(", site_parameter_id, paired_at) VALUES ('{stream_id}', 'metalp', '{}', 'Portal lab column', true, '{}', NOW()", Uuid::new_v4(), crate::common::PARAM_S1_TEMP_ID)
+        format!(
+            ", site_parameter_id, paired_at) VALUES ('{stream_id}', 'metalp', '{}', 'Portal lab column', true, '{}', NOW()",
+            Uuid::new_v4(),
+            crate::common::PARAM_S1_TEMP_ID
+        )
     } else {
-        format!(") VALUES ('{stream_id}', 'metalp', '{}', 'Portal lab column', true", Uuid::new_v4())
+        format!(
+            ") VALUES ('{stream_id}', 'metalp', '{}', 'Portal lab column', true",
+            Uuid::new_v4()
+        )
     };
     crate::common::exec(
         db,

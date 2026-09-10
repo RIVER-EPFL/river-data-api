@@ -1,12 +1,7 @@
-pub mod adopt;
 pub mod calibrations;
 pub mod deployments;
-pub mod identity;
-pub mod instruments;
-pub mod model;
-pub mod operations;
-pub mod readings;
-pub mod register;
-pub mod retag;
+pub mod models;
+pub mod service;
 pub mod standard_curves;
-pub use model::*;
+pub mod views;
+pub use models::*;

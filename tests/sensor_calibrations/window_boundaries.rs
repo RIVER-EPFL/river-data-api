@@ -160,7 +160,8 @@ async fn stream_carrying(fx: &Fixture, sensor_id: &str) -> Uuid {
         .await
         .expect("query the uploaded reading's stream")
         .expect("the upload landed a reading");
-    row.try_get("", "stream_id").expect("the reading names a stream")
+    row.try_get("", "stream_id")
+        .expect("the reading names a stream")
 }
 
 /// Every calibration a sensor carries, oldest window first.
@@ -284,7 +285,10 @@ async fn series(fx: &Fixture, sensor_id: &str, start: &str, end: &str) -> Series
 #[tokio::test]
 #[serial]
 async fn backfill_calibrations_resolves_covered_readings_and_creates_no_curve() {
-    if !crate::common::profile::Service::Keycloak.require("backfill_calibrations_window_boundaries").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("backfill_calibrations_window_boundaries")
+        .await
+    {
         return;
     }
     let fx = onboard().await;
@@ -429,7 +433,10 @@ async fn backfill_calibrations_resolves_covered_readings_and_creates_no_curve() 
 #[tokio::test]
 #[serial]
 async fn a_refused_deployment_create_leaves_the_current_deployment_open() {
-    if !crate::common::profile::Service::Keycloak.require("refused_deployment_create_boundaries").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("refused_deployment_create_boundaries")
+        .await
+    {
         return;
     }
     let fx = onboard().await;
@@ -520,7 +527,10 @@ async fn a_refused_deployment_create_leaves_the_current_deployment_open() {
 #[tokio::test]
 #[serial]
 async fn curves_sharing_a_valid_from_never_collapse_into_an_empty_window() {
-    if !crate::common::profile::Service::Keycloak.require("duplicate_valid_from_boundaries").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("duplicate_valid_from_boundaries")
+        .await
+    {
         return;
     }
     let fx = onboard().await;
@@ -576,7 +586,10 @@ async fn curves_sharing_a_valid_from_never_collapse_into_an_empty_window() {
 #[tokio::test]
 #[serial]
 async fn rolling_back_into_a_refilled_slot_reports_a_conflict() {
-    if !crate::common::profile::Service::Keycloak.require("rollback_into_refilled_slot").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("rollback_into_refilled_slot")
+        .await
+    {
         return;
     }
     let fx = onboard().await;
@@ -709,7 +722,10 @@ async fn rolling_back_into_a_refilled_slot_reports_a_conflict() {
 #[tokio::test]
 #[serial]
 async fn deleting_a_curve_a_reading_is_pinned_to_reports_the_pin() {
-    if !crate::common::profile::Service::Keycloak.require("delete_pinned_calibration").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("delete_pinned_calibration")
+        .await
+    {
         return;
     }
     let fx = onboard().await;
@@ -759,5 +775,8 @@ async fn deleting_a_curve_a_reading_is_pinned_to_reports_the_pin() {
         &fx.admin,
     )
     .await;
-    assert_eq!(status, 200, "a refused delete leaves the curve standing: {body}");
+    assert_eq!(
+        status, 200,
+        "a refused delete leaves the curve standing: {body}"
+    );
 }

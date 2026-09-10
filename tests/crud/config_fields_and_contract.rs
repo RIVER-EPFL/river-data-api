@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, Utc};
 use river_db::common::AppState;
-use river_db::routes::private::notifications::{
-    DeliveryResult, NotificationChannel, OutgoingMessage, triggers,
+use river_db::routes::private::notifications::flows;
+use river_db::routes::private::notifications::models::{
+    DeliveryResult, NotificationChannel, OutgoingMessage,
 };
 use serde_json::json;
 use serial_test::serial;
@@ -64,7 +65,10 @@ fn csv_cell(body: &str, column: &str) -> String {
 #[tokio::test]
 #[serial]
 async fn site_parameter_create_honours_is_public() {
-    if !crate::common::profile::Service::Keycloak.require("site_parameter_create_honours_is_public").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("site_parameter_create_honours_is_public")
+        .await
+    {
         return;
     }
     let db = setup_test_db().await;
@@ -180,7 +184,10 @@ async fn site_parameter_create_honours_is_public() {
 #[tokio::test]
 #[serial]
 async fn adopted_slot_reports_the_same_units_on_both_site_endpoints() {
-    if !crate::common::profile::Service::Keycloak.require("adopted_slot_reports_the_same_units").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("adopted_slot_reports_the_same_units")
+        .await
+    {
         return;
     }
     let db = setup_test_db().await;
@@ -293,7 +300,10 @@ async fn adopted_slot_reports_the_same_units_on_both_site_endpoints() {
 #[tokio::test]
 #[serial]
 async fn site_parameter_display_config_reaches_a_reader() {
-    if !crate::common::profile::Service::Keycloak.require("site_parameter_display_config_reaches_a_reader").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("site_parameter_display_config_reaches_a_reader")
+        .await
+    {
         return;
     }
     let db = setup_test_db().await;
@@ -653,7 +663,10 @@ impl NotificationChannel for RecordingChannel {
 #[tokio::test]
 #[serial]
 async fn muted_slot_receives_no_stale_data_notification() {
-    if !crate::common::profile::Service::Keycloak.require("muted_slot_receives_no_stale_data_notification").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("muted_slot_receives_no_stale_data_notification")
+        .await
+    {
         return;
     }
     let db = setup_test_db().await;
@@ -702,7 +715,7 @@ async fn muted_slot_receives_no_stale_data_notification() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let channels: Vec<Box<dyn NotificationChannel>> =
         vec![Box::new(RecordingChannel { sent: sent.clone() })];
-    triggers::run(&state, &channels).await;
+    flows::run(&state, &channels).await;
 
     let muted_id = Uuid::parse_str(&muted_param).expect("muted parameter id");
     let audible_id = Uuid::parse_str(&audible_param).expect("audible parameter id");
@@ -759,7 +772,9 @@ async fn muted_slot_receives_no_stale_data_notification() {
 #[tokio::test]
 #[serial]
 async fn telegram_thresholds_reports_the_global_tier() {
-    if !crate::common::profile::Service::Keycloak.require("telegram_thresholds_reports_the_global_tier").await
+    if !crate::common::profile::Service::Keycloak
+        .require("telegram_thresholds_reports_the_global_tier")
+        .await
     {
         return;
     }

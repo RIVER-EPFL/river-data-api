@@ -17,7 +17,10 @@ async fn register(app: &axum::Router, token: &str, source_system: &str, key: &st
         token,
     )
     .await;
-    assert!((200..300).contains(&status), "register ({status}): {stream}");
+    assert!(
+        (200..300).contains(&status),
+        "register ({status}): {stream}"
+    );
     crate::common::e2e::id_of(&stream)
 }
 

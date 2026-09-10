@@ -112,9 +112,14 @@ async fn a_merge_carries_every_slot_keyed_table_to_the_survivor() {
     .await;
     add_annotation(&db, GLOBAL_PARAM_TEMP_ID).await;
 
-    let result = merge_site_parameters(&db, &request(), "tester", river_db::routes::private::readings::decisions::Origin::Manual)
-        .await
-        .expect("the merge applies");
+    let result = merge_site_parameters(
+        &db,
+        &request(),
+        "tester",
+        river_db::routes::private::readings::decisions::Origin::Manual,
+    )
+    .await
+    .expect("the merge applies");
     assert!(result.source_deleted);
     assert_eq!(result.merged_readings, 2, "the grab replicate moves too");
     assert_eq!(result.merged_status_events, 1);
@@ -147,7 +152,13 @@ async fn a_merge_that_would_collide_two_samples_is_refused_and_changes_nothing()
     add_sample(&db, GLOBAL_PARAM_TEMP_ID, &at, source_stream, 310.0).await;
     add_sample(&db, GLOBAL_PARAM_DO_ID, &at, target_stream, 410.0).await;
 
-    let outcome = merge_site_parameters(&db, &request(), "tester", river_db::routes::private::readings::decisions::Origin::Manual).await;
+    let outcome = merge_site_parameters(
+        &db,
+        &request(),
+        "tester",
+        river_db::routes::private::readings::decisions::Origin::Manual,
+    )
+    .await;
     let Err(AppError::Conflict(message)) = outcome else {
         panic!("two groups collected at one instant cannot be combined: {outcome:?}");
     };
@@ -184,9 +195,14 @@ async fn merging_an_empty_slot_reports_no_rows_and_still_deletes_it() {
     cleanup_test_db(&db).await;
     seed_base_entities(&db).await;
 
-    let result = merge_site_parameters(&db, &request(), "tester", river_db::routes::private::readings::decisions::Origin::Manual)
-        .await
-        .expect("a slot with no data merges");
+    let result = merge_site_parameters(
+        &db,
+        &request(),
+        "tester",
+        river_db::routes::private::readings::decisions::Origin::Manual,
+    )
+    .await
+    .expect("a slot with no data merges");
     assert_eq!(result.merged_readings, 0);
     assert_eq!(result.merged_status_events, 0);
     assert!(result.source_deleted);
@@ -216,7 +232,13 @@ async fn a_merge_onto_itself_is_refused() {
         target_site_parameter_id: PARAM_S1_TEMP_ID.parse().unwrap(),
     };
     assert!(matches!(
-        merge_site_parameters(&db, &same, "tester", river_db::routes::private::readings::decisions::Origin::Manual).await,
+        merge_site_parameters(
+            &db,
+            &same,
+            "tester",
+            river_db::routes::private::readings::decisions::Origin::Manual
+        )
+        .await,
         Err(AppError::BadRequest(_))
     ));
 

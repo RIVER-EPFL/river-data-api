@@ -564,7 +564,10 @@ async fn edit_span_calibration(span: &Span) {
 #[tokio::test]
 #[serial]
 async fn calibration_edit_recalculates_readings_at_both_sites() {
-    if !crate::common::profile::Service::Keycloak.require("calibration_edit_both_sites").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("calibration_edit_both_sites")
+        .await
+    {
         return;
     }
     let span = seed_two_site_span(D1_FROM, &SPAN_READINGS).await;
@@ -715,7 +718,10 @@ async fn calibration_edit_recalculates_readings_at_both_sites() {
 #[tokio::test]
 #[serial]
 async fn both_sites_aggregates_reflect_the_new_calibration() {
-    if !crate::common::profile::Service::Keycloak.require("both_sites_aggregates").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("both_sites_aggregates")
+        .await
+    {
         return;
     }
     let span = seed_two_site_span(D1_FROM, &SPAN_READINGS).await;
@@ -926,7 +932,10 @@ async fn both_sites_aggregates_reflect_the_new_calibration() {
 #[tokio::test]
 #[serial]
 async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
-    if !crate::common::profile::Service::Keycloak.require("deployment_boundary_move").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("deployment_boundary_move")
+        .await
+    {
         return;
     }
     let span = seed_two_site_span(D1_FROM, &SPAN_READINGS).await;
@@ -1189,7 +1198,10 @@ async fn deployment_boundary_move_rebalances_sites_without_changing_values() {
 #[tokio::test]
 #[serial]
 async fn partial_calibration_window_splits_by_time_not_by_site() {
-    if !crate::common::profile::Service::Keycloak.require("partial_calibration_window").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("partial_calibration_window")
+        .await
+    {
         return;
     }
     // The span calibration starts mid-morning, so the upstream site holds one reading inside its

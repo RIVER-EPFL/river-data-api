@@ -267,9 +267,7 @@ async fn delete_stream_with_readings_is_refused() {
     let sensor_id = uuid::Uuid::new_v4();
     crate::common::exec(
         &db,
-        &format!(
-            "INSERT INTO sensors (id, serial_number) VALUES ('{sensor_id}', 'DEL-TEST-003')"
-        ),
+        &format!("INSERT INTO sensors (id, serial_number) VALUES ('{sensor_id}', 'DEL-TEST-003')"),
     )
     .await;
     crate::common::exec(
@@ -296,9 +294,8 @@ async fn delete_stream_with_readings_is_refused() {
             format!("DELETE FROM data_streams WHERE id = '{stream_id}'"),
         ))
         .await;
-    let refusal = deleted.expect_err(
-        "deleting a stream that carries readings must be refused, not cascade",
-    );
+    let refusal =
+        deleted.expect_err("deleting a stream that carries readings must be refused, not cascade");
     assert!(
         refusal.to_string().contains("readings_stream_id_fkey"),
         "the refusal must come from the readings FK, got: {refusal}"

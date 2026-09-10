@@ -54,6 +54,7 @@ mod m20260910_000030_plan_accepted_objects;
 pub mod m20260910_000031_stage_unpaired_readings;
 mod m20260910_000032_formula_intermediate;
 mod m20260910_000033_instrument_proposals;
+pub mod m20260910_000034_formula_name_units_not_null;
 
 pub struct Migrator;
 
@@ -115,6 +116,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260910_000031_stage_unpaired_readings::Migration),
             Box::new(m20260910_000032_formula_intermediate::Migration),
             Box::new(m20260910_000033_instrument_proposals::Migration),
+            Box::new(m20260910_000034_formula_name_units_not_null::Migration),
         ]
     }
 }

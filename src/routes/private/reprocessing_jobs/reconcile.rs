@@ -22,7 +22,7 @@ use super::lifecycle::{JobContext, JobReport};
 use crate::common::bulk_write;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::sample_groups;
-use crate::routes::private::sync::replicate_audit::{DEFAULT_ABS_TOL, DEFAULT_REL_TOL};
+use crate::routes::private::sync::service::{DEFAULT_ABS_TOL, DEFAULT_REL_TOL};
 
 /// A family stream and the legacy avg stream it supersedes. The pairing is exact, not guessed:
 /// the family's source_key is the old key plus the `:reps` suffix the sync service appends.
@@ -86,7 +86,7 @@ struct PairRow {
 /// The tolerance bound between two value expressions, shared with the sync-time audit's
 /// `stats_agree` (same relative form, absolute floor, and portal quantum floor).
 fn bound_sql(a: &str, b: &str, rel_bind: &str) -> String {
-    crate::routes::private::sync::replicate_audit::bound_sql(a, b, rel_bind, DEFAULT_ABS_TOL)
+    crate::routes::private::sync::service::bound_sql(a, b, rel_bind, DEFAULT_ABS_TOL)
 }
 
 #[derive(Debug, Clone, Copy, Default, FromQueryResult)]

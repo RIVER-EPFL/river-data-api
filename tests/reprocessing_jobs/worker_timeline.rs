@@ -85,7 +85,9 @@ async fn a_failed_run_closes_its_timeline_with_what_went_wrong() {
     .await;
 
     let lines = timeline(&db).await;
-    let last = lines.last().expect("a failed run still closes its timeline");
+    let last = lines
+        .last()
+        .expect("a failed run still closes its timeline");
     assert_eq!(last.0, "error", "{lines:?}");
     assert_eq!(last.2["status"], "failed");
     assert!(

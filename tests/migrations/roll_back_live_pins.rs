@@ -9,7 +9,9 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;
 
-use crate::common::{GLOBAL_PARAM_TEMP_ID, SITE1_ID, cleanup_test_db, seed_test_data, setup_test_db};
+use crate::common::{
+    GLOBAL_PARAM_TEMP_ID, SITE1_ID, cleanup_test_db, seed_test_data, setup_test_db,
+};
 
 const AT: &str = "2025-06-15T10:00:00Z";
 

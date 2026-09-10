@@ -180,7 +180,6 @@ async fn test_derived_parameter_skips_infinity() {
     crate::common::cleanup_test_db(&db).await;
 }
 
-
 // Calibration application formula (calibrated = slope * raw + intercept) and slope=0 rejection.
 
 #[tokio::test]

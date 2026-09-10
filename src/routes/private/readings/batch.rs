@@ -7,8 +7,7 @@
 
 use axum::{Json, extract::State};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, ExprTrait, FromQueryResult,
-    QueryFilter, Set,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, ExprTrait, QueryFilter, Set,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -18,11 +17,13 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::data_streams;
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
 use crate::routes::private::readings;
 use crate::routes::private::readings::tail;
 use crate::routes::private::sensors::calibrations;
-use crate::routes::private::sensors::identity::{ResolvedOwner, resolve_slot_owner_for_times};
+use crate::routes::private::sensors::models::{ResolvedOwner};
+use crate::routes::private::sensors::service::{resolve_slot_owner_for_times};
 use crate::routes::private::sensors::standard_curves;
 
 /// What a reading must satisfy to be stored, whichever path it arrived on.
@@ -511,7 +512,7 @@ pub struct BatchReadingsResponse {
     /// The calculations the spot parameters this batch landed feed, and what each rewrites at
     /// the visits touched. Their recompute is enqueued when this is not empty.
     #[serde(default)]
-    pub calculations: Vec<crate::routes::private::tools::closure::CalculationImpact>,
+    pub calculations: Vec<crate::routes::private::tools::models::CalculationImpact>,
 }
 
 const BATCH_SIZE: usize = 1000;
@@ -608,14 +609,6 @@ pub(crate) fn readings_on_conflict(mode: ConflictMode) -> sea_orm::sea_query::On
 
 /// Batch insert readings keyed by (site_id, parameter_id). Auto-creates "api" streams when
 /// a (site, parameter) pair has none. 10MB body limit. Requires `write_data`.
-/// A stream's own classification and instrument, as a batch write reads them.
-#[derive(FromQueryResult)]
-struct StreamDefaults {
-    id: Uuid,
-    measurement_type: Option<String>,
-    sensor_id: Option<Uuid>,
-}
-
 #[utoipa::path(
     post,
     path = "/api/readings/batch",
@@ -713,16 +706,11 @@ pub async fn insert_batch_readings(
     let stream_defaults: HashMap<Uuid, Option<String>> = {
         let stream_ids: Vec<Uuid> = stream_cache.values().copied().collect();
         let mut map = HashMap::with_capacity(stream_ids.len());
-        for row in state
-            .db
-            .query_all_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT id, measurement_type, sensor_id FROM data_streams WHERE id = ANY($1)",
-                [stream_ids.into()],
-            ))
+        for stream in data_streams::Entity::find()
+            .filter(data_streams::Column::Id.is_in(stream_ids))
+            .all(&state.db)
             .await?
         {
-            let stream = StreamDefaults::from_query_result(&row, "")?;
             if let Some(sensor_id) = stream.sensor_id {
                 stream_sensors.insert(stream.id, sensor_id);
             }
@@ -998,11 +986,11 @@ pub async fn insert_batch_readings(
             let row_predicate = "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3";
             let binds: Vec<sea_orm::Value> =
                 vec![stream_ids.clone().into(), first.into(), last.into()];
-            crate::routes::private::collection_events::attach::attach_collection_events(
+            crate::routes::private::collection_events::service::attach_collection_events(
                 txn,
                 row_predicate,
                 binds.clone(),
-                crate::routes::private::collection_events::attach::EventSource::Manual,
+                crate::routes::private::collection_events::service::EventSource::Manual,
             )
             .await?;
             // A replicate landing beside one already stored makes the instant a group, whichever
@@ -1012,7 +1000,7 @@ pub async fn insert_batch_readings(
             instants.sort_unstable();
             instants.dedup();
             touched_events =
-                crate::routes::private::collection_events::recompute::touched_events(
+                crate::routes::private::collection_events::flows::touched_events(
                     txn,
                     "r.stream_id = ANY($1) AND r.time = ANY($2)",
                     vec![stream_ids.into(), instants.into()],
@@ -1034,7 +1022,7 @@ pub async fn insert_batch_readings(
             .collect();
         touched.sort_unstable();
         touched.dedup();
-        crate::routes::private::tools::closure::calculations_fed_by(&state.db, &touched).await?
+        crate::routes::private::tools::service::calculations_fed_by(&state.db, &touched).await?
     };
 
     // An overwrite replaces the measurement, not the correction: the write keeps the stored curve
@@ -1136,7 +1124,7 @@ pub async fn insert_batch_readings(
             reconcile_alarms: true,
             episodes: tail::Episodes::Job,
             recompute_derived: false,
-            writer: crate::routes::private::collection_events::recompute::Writer::Person,
+            writer: crate::routes::private::collection_events::flows::Writer::Person,
         },
         &crate::common::actor::label(&auth),
     )
@@ -1196,92 +1184,5 @@ async fn count_existing<C: ConnectionTrait>(
 }
 
 #[cfg(test)]
-mod upsert_rules {
-    use super::{Replace, readings, readings_upsert};
-    use sea_orm::{EntityTrait, QueryTrait, Set};
-
-    /// The `ON CONFLICT` tail of the statement each mode builds.
-    fn on_conflict_sql(replace: Replace) -> String {
-        let model = readings::ActiveModel {
-            stream_id: Set(uuid::Uuid::nil()),
-            time: Set(chrono::Utc::now().into()),
-            replicate_index: Set(0),
-            raw_value: Set(1.0),
-            ..Default::default()
-        };
-        let sql = readings::Entity::insert(model)
-            .on_conflict(readings_upsert(replace))
-            .build(sea_orm::DatabaseBackend::Postgres)
-            .to_string();
-        sql.split_once("ON CONFLICT")
-            .map(|(_, tail)| tail.to_string())
-            .unwrap_or_default()
-    }
-
-    /// A curve chosen by hand cannot be recovered by any query, so no upsert may clear it. Every
-    /// mode either leaves the column alone or preserves the stored one when the incoming row names
-    /// none.
-    #[test]
-    fn no_upsert_clears_a_hand_picked_curve() {
-        for replace in [
-            Replace::Nothing,
-            Replace::Values,
-            Replace::ValuesAndAttribution,
-        ] {
-            let tail = on_conflict_sql(replace);
-            let assigns_directly =
-                tail.contains(r#""standard_curve_id" = "excluded"."standard_curve_id""#);
-            assert!(
-                !assigns_directly,
-                "{replace:?} would overwrite a hand-picked curve with the incoming row's: {tail}"
-            );
-        }
-    }
-
-    /// The sample link survives a correction that carries none, or the samples trigger deletes the
-    /// row's group along with its label and notes.
-    #[test]
-    fn a_correction_keeps_the_sample_it_belongs_to() {
-        for replace in [Replace::Values, Replace::ValuesAndAttribution] {
-            let tail = on_conflict_sql(replace);
-            assert!(
-                tail.contains("COALESCE") && tail.contains("sample_id"),
-                "{replace:?} must preserve the stored sample link: {tail}"
-            );
-        }
-    }
-
-    /// Arrival time moves only with the value: an unchanged re-assert keeps the stored stamp,
-    /// a changed value takes a fresh one.
-    #[test]
-    fn arrival_stamp_follows_a_value_change() {
-        for replace in [Replace::Values, Replace::ValuesAndAttribution] {
-            let tail = on_conflict_sql(replace);
-            assert!(
-                tail.contains("ingested_at") && tail.contains("IS DISTINCT FROM"),
-                "{replace:?} must re-stamp ingested_at only on a value change: {tail}"
-            );
-        }
-        let tail = on_conflict_sql(Replace::Nothing);
-        assert!(
-            !tail.contains("ingested_at"),
-            "Replace::Nothing must not touch ingested_at: {tail}"
-        );
-    }
-
-    /// Operator state is never a source's to overwrite.
-    #[test]
-    fn no_upsert_touches_flag_state() {
-        for replace in [
-            Replace::Nothing,
-            Replace::Values,
-            Replace::ValuesAndAttribution,
-        ] {
-            let tail = on_conflict_sql(replace);
-            assert!(
-                !tail.contains("is_flagged") && !tail.contains("flag_reason"),
-                "{replace:?} must leave flag state alone: {tail}"
-            );
-        }
-    }
-}
+#[path = "tests/batch.rs"]
+mod upsert_rules;

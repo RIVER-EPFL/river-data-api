@@ -330,7 +330,8 @@ async fn a_changed_probe_serial_refreshes_the_instrument_and_raises_a_hold() {
                 "device": { "logger_serial": "SWAP-0001", "probe_serial": probe },
             },
         });
-        crate::common::post_json_parse_with_token(&app, "/api/streams/register", &body, &token).await
+        crate::common::post_json_parse_with_token(&app, "/api/streams/register", &body, &token)
+            .await
     };
 
     let (status, stream) = register("PROBE-A").await;
@@ -353,7 +354,9 @@ async fn a_changed_probe_serial_refreshes_the_instrument_and_raises_a_hold() {
     let sensors = sensor_count(&db).await;
     let stored = scalar_text(
         &db,
-        &format!("SELECT metadata ->> 'source_probe_serial' AS v FROM sensors WHERE id = '{sensor_id}'"),
+        &format!(
+            "SELECT metadata ->> 'source_probe_serial' AS v FROM sensors WHERE id = '{sensor_id}'"
+        ),
     )
     .await;
     assert_eq!(
@@ -410,7 +413,7 @@ async fn concurrent_identity_changes_converge_on_one_hold() {
 
     let stored = json!({ "probe_serial": "PROBE-A" });
     let first = db.begin().await.expect("begin");
-    river_db::routes::private::sensors::identity::raise_source_identity_hold(
+    river_db::routes::private::sensors::service::raise_source_identity_hold(
         &first,
         stream_id,
         &["probe_serial"],
@@ -426,7 +429,7 @@ async fn concurrent_identity_changes_converge_on_one_hold() {
         .await
         .expect("second connection");
     let raise = tokio::spawn(async move {
-        river_db::routes::private::sensors::identity::raise_source_identity_hold(
+        river_db::routes::private::sensors::service::raise_source_identity_hold(
             &second,
             stream_id,
             &["probe_serial"],
@@ -437,7 +440,10 @@ async fn concurrent_identity_changes_converge_on_one_hold() {
     });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     first.commit().await.expect("commit");
-    raise.await.expect("join").expect("the second raise waits for the first, then updates it");
+    raise
+        .await
+        .expect("join")
+        .expect("the second raise waits for the first, then updates it");
 
     let open = scalar_i64(
         &db,
@@ -463,4 +469,3 @@ async fn scalar_i64(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
     .try_get::<i64>("", "v")
     .expect("value")
 }
-

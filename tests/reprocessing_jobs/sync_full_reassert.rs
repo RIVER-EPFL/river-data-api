@@ -36,10 +36,17 @@ async fn only_the_enabled_service_is_queued() {
     let enabled = live_service(&db, "cnet-1", true).await;
     let _disabled = live_service(&db, "metalp-1", false).await;
 
-    let job_id = worker::enqueue(&db, "sync_full_reassert", None, None, &serde_json::json!({}), None)
-        .await
-        .unwrap()
-        .expect("the re-assert is enqueued");
+    let job_id = worker::enqueue(
+        &db,
+        "sync_full_reassert",
+        None,
+        None,
+        &serde_json::json!({}),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("the re-assert is enqueued");
     let registry = {
         let mut registry = job::build_registry();
         job::register_scheduled_services(&mut registry, &crate::common::test_config());
@@ -104,10 +111,17 @@ async fn a_paused_service_is_not_queued() {
     )
     .await;
 
-    worker::enqueue(&db, "sync_full_reassert", None, None, &serde_json::json!({}), None)
-        .await
-        .unwrap()
-        .expect("the re-assert is enqueued");
+    worker::enqueue(
+        &db,
+        "sync_full_reassert",
+        None,
+        None,
+        &serde_json::json!({}),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("the re-assert is enqueued");
     let registry = {
         let mut registry = job::build_registry();
         job::register_scheduled_services(&mut registry, &crate::common::test_config());

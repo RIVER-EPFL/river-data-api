@@ -11,7 +11,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 
 use crate::common::{
-    cleanup_test_db, seed_test_data, setup_test_db, FIXTURE_SENSOR_ID, PARAM_S1_TEMP_ID, SITE1_ID,
+    FIXTURE_SENSOR_ID, PARAM_S1_TEMP_ID, SITE1_ID, cleanup_test_db, seed_test_data, setup_test_db,
 };
 
 const UNPAIRED: &str = "00000000-0000-4000-c000-0000000b2231";
@@ -97,11 +97,8 @@ async fn the_unpaired_rows_are_unstamped_and_the_attributed_ones_are_left_alone(
         "the pre-staging trigger stamps an unpaired row"
     );
 
-    crate::common::exec_unprepared(
-        &db,
-        migration::m20260910_000031_stage_unpaired_readings::UP,
-    )
-    .await;
+    crate::common::exec_unprepared(&db, migration::m20260910_000031_stage_unpaired_readings::UP)
+        .await;
 
     assert_eq!(
         stored(&db, UNPAIRED).await,

@@ -120,13 +120,9 @@ async fn register_stream(
 
 /// Apply runs as a tracked job; the counts live on the finished job, not the response.
 async fn apply_plan(app: &Router, jwt: &str, plan_id: &str) -> serde_json::Value {
-    let (status, res) = crate::common::post_plan_action_parse_with_token(
-        app,
-        &plan_id.to_string(),
-        "apply",
-        jwt,
-    )
-    .await;
+    let (status, res) =
+        crate::common::post_plan_action_parse_with_token(app, &plan_id.to_string(), "apply", jwt)
+            .await;
     assert_eq!(status, 200, "apply ({status}): {res}");
     let job_id = res["job_id"]
         .as_str()
@@ -157,7 +153,10 @@ async fn create_plan(app: &Router, jwt: &str) -> serde_json::Value {
 #[tokio::test]
 #[serial]
 async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
-    if !crate::common::profile::Service::Keycloak.require("portal_curve_instrument").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("portal_curve_instrument")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -169,7 +168,10 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
     // The harness seeds one instrument of its own, so the question is what the registration added.
     let sensors_after_curve = count(
         &db,
-        &format!("SELECT COUNT(*) FROM sensors WHERE id <> '{}'", crate::common::FIXTURE_SENSOR_ID),
+        &format!(
+            "SELECT COUNT(*) FROM sensors WHERE id <> '{}'",
+            crate::common::FIXTURE_SENSOR_ID
+        ),
     )
     .await;
     assert_eq!(
@@ -236,13 +238,9 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
         plan["summary"],
     );
 
-    let (status, refused) = crate::common::post_plan_action_with_token(
-        &app,
-        &plan_id.to_string(),
-        "apply",
-        &admin,
-    )
-    .await;
+    let (status, refused) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &admin)
+            .await;
     assert_eq!(
         status, 400,
         "apply is refused while an instrument is unconfirmed: {refused}",
@@ -397,7 +395,10 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
 #[tokio::test]
 #[serial]
 async fn an_instrument_is_attached_to_streams_whose_source_names_no_curve() {
-    if !crate::common::profile::Service::Keycloak.require("portal_curve_instrument").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("portal_curve_instrument")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -440,8 +441,8 @@ async fn an_instrument_is_attached_to_streams_whose_source_names_no_curve() {
 
     for stream in [&acid, &noacid] {
         let (status, patched) = crate::common::patch_plan_with_token(
-        &app,
-        &plan_id.to_string(),
+            &app,
+            &plan_id.to_string(),
             &json!({ "updates": [{ "stream_id": stream, "instrument_id": instrument_id }] }),
             &admin,
         )

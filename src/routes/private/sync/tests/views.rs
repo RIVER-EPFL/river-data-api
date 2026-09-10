@@ -1,0 +1,53 @@
+use super::instrument_key;
+use serde_json::json;
+
+fn entry(
+    parameter: &str,
+    instrument_source_key: Option<&str>,
+) -> crate::routes::private::sync::service::PlanEntry {
+    serde_json::from_value(json!({
+        "stream_id": uuid::Uuid::new_v4(),
+        "source_key": format!("FP1:{parameter}"),
+        "source_name": null,
+        "action": "pair",
+        "confidence": "none",
+        "project": { "id": null, "name": "METALP", "create": true },
+        "site": { "id": null, "name": "FP1", "create": true, "latitude": null, "longitude": null, "altitude_m": null },
+        "parameter": { "id": null, "name": parameter, "create": false, "units": "-" },
+        "instrument": instrument_source_key.map(|key| json!({
+            "id": null,
+            "name": "chla acid (metalp)",
+            "source_key": key,
+            "resolved_by": "stream",
+            "create": false,
+            "stamps_readings": false,
+        })),
+    }))
+    .expect("plan entry fixture deserializes")
+}
+
+/// One lab instrument corrects several source columns, so the review reports it once and an
+/// edit on it moves every column it serves.
+#[test]
+fn columns_sharing_an_instrument_share_one_key() {
+    let ugl = entry("Chla_acid_ugL", Some("metalp:chla acid"));
+    let ugm2 = entry("Chla_acid_ugm2", Some("metalp:chla acid"));
+    assert_eq!(instrument_key(&ugl), instrument_key(&ugm2));
+}
+
+#[test]
+fn different_instruments_stay_apart() {
+    let acid = entry("Chla_acid_ugL", Some("metalp:chla acid"));
+    let noacid = entry("Chla_noacid_ugL", Some("metalp:chla noacid"));
+    assert_ne!(instrument_key(&acid), instrument_key(&noacid));
+}
+
+/// With no instrument to key on, the parameter is what the decision covers, so every station
+/// reporting it is still one row.
+#[test]
+fn an_entry_with_no_instrument_keys_on_its_parameter() {
+    let a = entry("DOC_ppb", None);
+    let b = entry("DOC_ppb", None);
+    assert_eq!(instrument_key(&a), instrument_key(&b));
+    assert_ne!(instrument_key(&a), instrument_key(&entry("NUT_P", None)));
+}

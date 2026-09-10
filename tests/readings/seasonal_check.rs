@@ -272,5 +272,10 @@ async fn the_response_describes_its_method() {
     assert_eq!(by_class("normal")["warning"], false);
     assert_eq!(by_class("no_history")["warning"], false);
     assert_eq!(by_class("above_max")["warning"], true);
-    assert!(by_class("above_max")["meaning"].as_str().unwrap().contains("highest"));
+    assert!(
+        by_class("above_max")["meaning"]
+            .as_str()
+            .unwrap()
+            .contains("highest")
+    );
 }

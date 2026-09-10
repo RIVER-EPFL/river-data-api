@@ -481,7 +481,10 @@ async fn split_series(
 #[tokio::test]
 #[serial]
 async fn moving_a_sensor_moves_its_readings_and_both_sites_aggregates() {
-    if !crate::common::profile::Service::Keycloak.require("deployment_move_two_sites").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("deployment_move_two_sites")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -595,7 +598,10 @@ async fn moving_a_sensor_moves_its_readings_and_both_sites_aggregates() {
 #[tokio::test]
 #[serial]
 async fn backdating_the_move_pulls_the_earlier_reading_downstream() {
-    if !crate::common::profile::Service::Keycloak.require("deployment_backdate_two_sites").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("deployment_backdate_two_sites")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -680,7 +686,10 @@ async fn backdating_the_move_pulls_the_earlier_reading_downstream() {
 #[tokio::test]
 #[serial]
 async fn moving_the_move_date_forward_returns_readings_to_the_previous_site() {
-    if !crate::common::profile::Service::Keycloak.require("deployment_forward_correction").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("deployment_forward_correction")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;
@@ -761,7 +770,10 @@ async fn moving_the_move_date_forward_returns_readings_to_the_previous_site() {
 #[tokio::test]
 #[serial]
 async fn deleting_the_downstream_deployment_unattributes_its_readings() {
-    if !crate::common::profile::Service::Keycloak.require("deployment_delete_two_sites").await {
+    if !crate::common::profile::Service::Keycloak
+        .require("deployment_delete_two_sites")
+        .await
+    {
         return;
     }
     let db = crate::common::setup_test_db().await;

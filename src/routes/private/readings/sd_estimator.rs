@@ -11,10 +11,11 @@
 //! had to be served, and that row is what [the undeclared report](super::super::admin) lists and
 //! what arms the audit gate.
 
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Statement};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+use crate::routes::private::sites::parameters as site_parameters;
 
 pub const SAMPLE: &str = "sample";
 pub const POPULATION: &str = "population";
@@ -106,17 +107,14 @@ pub async fn slot_declaration<C: ConnectionTrait>(
     site_id: Uuid,
     parameter_id: Uuid,
 ) -> AppResult<Option<&'static str>> {
-    let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT sd_estimator FROM site_parameters
-             WHERE site_id = $1 AND parameter_id = $2 AND sd_estimator IS NOT NULL
-             LIMIT 1",
-            [site_id.into(), parameter_id.into()],
-        ))
+    let row = site_parameters::Entity::find()
+        .filter(site_parameters::Column::SiteId.eq(site_id))
+        .filter(site_parameters::Column::ParameterId.eq(parameter_id))
+        .filter(site_parameters::Column::SdEstimator.is_not_null())
+        .one(conn)
         .await?;
     let Some(row) = row else { return Ok(None) };
-    let stored: Option<String> = row.try_get("", "sd_estimator")?;
+    let stored = row.sd_estimator;
     // A value outside the two is not reachable through the CHECK constraint; treat it as
     // undeclared rather than failing a read.
     Ok(stored.as_deref().and_then(|v| match v {
@@ -188,22 +186,5 @@ pub async fn resolve<C: ConnectionTrait>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_unknown_estimator_is_refused_rather_than_defaulted() {
-        assert!(parse("populaton").is_err());
-        assert!(parse("").is_err());
-        assert_eq!(parse(POPULATION).unwrap(), POPULATION);
-        assert_eq!(parse_opt(None).unwrap(), None);
-    }
-
-    #[test]
-    fn the_fallback_is_a_sample_sd_that_reads_as_undeclared() {
-        let r = Resolved::undeclared();
-        assert_eq!(r.estimator, SAMPLE);
-        assert_eq!(r.source.as_str(), "default");
-        assert!(!r.is_declared());
-    }
-}
+#[path = "tests/sd_estimator.rs"]
+mod tests;

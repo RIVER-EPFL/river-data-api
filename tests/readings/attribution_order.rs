@@ -268,7 +268,10 @@ async fn an_unpaired_stream_stages_its_readings_rather_than_attributing_them() {
         &fx.token,
     )
     .await;
-    assert_eq!(status, 200, "ingest on an unpaired stream ({status}): {body}");
+    assert_eq!(
+        status, 200,
+        "ingest on an unpaired stream ({status}): {body}"
+    );
 
     let row = fx
         .db
