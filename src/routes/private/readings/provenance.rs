@@ -75,6 +75,14 @@ pub struct ProvenanceRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub calculation: Option<CalculationInfo>,
+    /// The values the formula producing this parameter read at this instant, one hop up the
+    /// chain. Each names the key its own record is read by.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub inputs: Vec<InputRef>,
+    /// Every enabled formula reading this parameter, one hop down the chain, with its output's
+    /// value at this instant where one exists.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub consumers: Vec<ConsumerRef>,
     pub holds: Vec<HoldRef>,
 }
 
@@ -458,6 +466,66 @@ pub struct HoldRef {
     pub created_at: DateTime<Utc>,
 }
 
+/// One value a formula read at the record's instant. A parameter input carries the slot key
+/// (`parameter_id` with the record's site and time) that resolves its own record; a site property
+/// carries the column it was read from.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct InputRef {
+    pub definition_id: Uuid,
+    /// The formula's code, so two formulas producing one parameter stay apart.
+    pub formula_code: String,
+    pub variable_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub parameter_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub parameter_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub site_property: Option<String>,
+    /// Set when the formula evaluates per replicate and this is the variable it iterates: the
+    /// value at this index fed the output at the same index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub replicate_index: Option<i16>,
+    /// How the value was read: `replicate` (the row at the index), `mean` (the family's sample
+    /// statistic), `reading` (the single row at the instant), `site` (the site row's column).
+    /// `missing` when nothing at the instant answers.
+    pub served_as: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub value: Option<f64>,
+}
+
+/// One formula reading the record's parameter, with its output at the instant where one exists.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ConsumerRef {
+    pub definition_id: Uuid,
+    pub formula_code: String,
+    pub formula_name: String,
+    /// The calculation the formula belongs to, absent on a standalone derived parameter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub calculation: Option<String>,
+    pub variable_name: String,
+    /// The slot key of the output's own record. Absent on an intermediate, which mints none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub output_parameter_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub output_parameter_code: Option<String>,
+    /// Set when the formula evaluates per replicate over this parameter: the output at this index
+    /// came from the record's value at the same index.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub replicate_index: Option<i16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub value: Option<f64>,
+}
+
 /// The stream's origin class, from the writer-side source-system set in
 /// `collection_events::attach`.
 /// How a reading reached the store, from the stream it arrived on: `manual`, `csv`, `api`,
@@ -764,6 +832,8 @@ pub async fn assemble_records(
     let value_arrivals = load_value_arrivals(db, &stream_ids, time).await?;
     let run_sources = fetch_run_sources(db, rows).await?;
     let (calculations, formula_versions) = fetch_calculations(db, rows).await?;
+    let links = fetch_formula_links(db, rows).await?;
+    let served = fetch_served_values(db, rows, &links, time).await?;
 
     let mut records = Vec::with_capacity(groups.len());
     for (stream_id, group) in &groups {
@@ -907,6 +977,15 @@ pub async fn assemble_records(
                 calc
             });
 
+        let indexes: Vec<i16> = group.iter().map(|r| r.replicate_index).collect();
+        let (inputs, consumers) = match (group[0].site_id, group[0].parameter_id) {
+            (Some(site_id), Some(parameter_id)) => (
+                links.inputs_of(parameter_id, &indexes, &served, site_id),
+                links.consumers_of(parameter_id, &indexes, &served, site_id),
+            ),
+            _ => (Vec::new(), Vec::new()),
+        };
+
         records.push(ProvenanceRecord {
             origin: OriginInfo {
                 stream_id: *stream_id,
@@ -936,6 +1015,8 @@ pub async fn assemble_records(
             event,
             computation,
             calculation,
+            inputs,
+            consumers,
             holds,
         });
     }
@@ -1268,6 +1349,394 @@ struct VersionRow {
     version_no: i32,
     formula: String,
     content_hash: String,
+}
+
+/// A formula and what it reads, as the sources table records it today. Sources are not versioned,
+/// so a value made by an older version is joined to the definition's current inputs.
+#[derive(Debug, Clone)]
+struct FormulaLink {
+    definition_id: Uuid,
+    code: String,
+    name: String,
+    per_replicate: Option<String>,
+    output_parameter_id: Option<Uuid>,
+    output_parameter_code: Option<String>,
+    calculation: Option<String>,
+    enabled: bool,
+    sources: Vec<SourceLink>,
+}
+
+#[derive(Debug, Clone)]
+struct SourceLink {
+    variable_name: String,
+    parameter_id: Option<Uuid>,
+    parameter_code: Option<String>,
+    site_property: Option<String>,
+}
+
+/// The formulas one hop from the rows' parameters: those producing one, and those reading one.
+#[derive(Debug, Default)]
+struct FormulaLinks {
+    formulas: Vec<FormulaLink>,
+}
+
+/// What a parameter's slot serves at one instant: each replicate's value, the family's mean where
+/// the trigger derived one, and the value a scalar read of the slot receives.
+#[derive(Debug, Default)]
+struct ServedSlot {
+    by_index: BTreeMap<i16, f64>,
+    mean: Option<f64>,
+    scalar: Option<f64>,
+}
+
+/// Served values keyed by `(site_id, parameter_id)`, plus the site rows' numeric columns.
+#[derive(Debug, Default)]
+struct ServedValues {
+    slots: HashMap<(Uuid, Uuid), ServedSlot>,
+    site_properties: HashMap<Uuid, HashMap<String, f64>>,
+}
+
+impl ServedValues {
+    fn scalar(&self, site_id: Uuid, parameter_id: Uuid) -> (Option<f64>, &'static str) {
+        match self.slots.get(&(site_id, parameter_id)) {
+            Some(slot) if slot.mean.is_some() => (slot.mean, "mean"),
+            Some(slot) if slot.scalar.is_some() => (slot.scalar, "reading"),
+            _ => (None, "missing"),
+        }
+    }
+
+    fn at_index(
+        &self,
+        site_id: Uuid,
+        parameter_id: Uuid,
+        index: i16,
+    ) -> (Option<f64>, &'static str) {
+        match self
+            .slots
+            .get(&(site_id, parameter_id))
+            .and_then(|slot| slot.by_index.get(&index).copied())
+        {
+            Some(value) => (Some(value), "replicate"),
+            None => (None, "missing"),
+        }
+    }
+
+    fn site_property(&self, site_id: Uuid, column: &str) -> (Option<f64>, &'static str) {
+        match self
+            .site_properties
+            .get(&site_id)
+            .and_then(|row| row.get(column).copied())
+        {
+            Some(value) => (Some(value), "site"),
+            None => (None, "missing"),
+        }
+    }
+}
+
+impl FormulaLinks {
+    /// Every parameter a lookup at the instant has to serve: the sources of the producers and the
+    /// outputs of the consumers.
+    fn parameters_to_serve(&self) -> Vec<Uuid> {
+        self.formulas
+            .iter()
+            .flat_map(|f| {
+                f.sources
+                    .iter()
+                    .filter_map(|s| s.parameter_id)
+                    .chain(f.output_parameter_id)
+            })
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn site_properties_to_serve(&self) -> Vec<String> {
+        self.formulas
+            .iter()
+            .flat_map(|f| f.sources.iter().filter_map(|s| s.site_property.clone()))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// The inputs of every formula producing `parameter_id`, read at the record's indexes.
+    fn inputs_of(
+        &self,
+        parameter_id: Uuid,
+        indexes: &[i16],
+        served: &ServedValues,
+        site_id: Uuid,
+    ) -> Vec<InputRef> {
+        let mut out = Vec::new();
+        for formula in self
+            .formulas
+            .iter()
+            .filter(|f| f.output_parameter_id == Some(parameter_id))
+        {
+            for source in &formula.sources {
+                let make = |replicate_index, (value, served_as): (Option<f64>, &str)| InputRef {
+                    definition_id: formula.definition_id,
+                    formula_code: formula.code.clone(),
+                    variable_name: source.variable_name.clone(),
+                    parameter_id: source.parameter_id,
+                    parameter_code: source.parameter_code.clone(),
+                    site_property: source.site_property.clone(),
+                    replicate_index,
+                    served_as: served_as.to_string(),
+                    value,
+                };
+                match (source.parameter_id, &source.site_property) {
+                    (Some(input), _)
+                        if formula.per_replicate.as_deref() == Some(&source.variable_name) =>
+                    {
+                        for &index in indexes {
+                            out.push(make(Some(index), served.at_index(site_id, input, index)));
+                        }
+                    }
+                    (Some(input), _) => out.push(make(None, served.scalar(site_id, input))),
+                    (None, Some(column)) => {
+                        out.push(make(None, served.site_property(site_id, column)));
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// Every enabled formula reading `parameter_id`, with its output at the record's indexes.
+    fn consumers_of(
+        &self,
+        parameter_id: Uuid,
+        indexes: &[i16],
+        served: &ServedValues,
+        site_id: Uuid,
+    ) -> Vec<ConsumerRef> {
+        let mut out = Vec::new();
+        for formula in self.formulas.iter().filter(|f| f.enabled) {
+            for source in formula
+                .sources
+                .iter()
+                .filter(|s| s.parameter_id == Some(parameter_id))
+            {
+                let make = |replicate_index, value| ConsumerRef {
+                    definition_id: formula.definition_id,
+                    formula_code: formula.code.clone(),
+                    formula_name: formula.name.clone(),
+                    calculation: formula.calculation.clone(),
+                    variable_name: source.variable_name.clone(),
+                    output_parameter_id: formula.output_parameter_id,
+                    output_parameter_code: formula.output_parameter_code.clone(),
+                    replicate_index,
+                    value,
+                };
+                let per_replicate = formula.per_replicate.as_deref() == Some(&source.variable_name);
+                match (formula.output_parameter_id, per_replicate) {
+                    (Some(output), true) => {
+                        for &index in indexes {
+                            out.push(make(Some(index), served.at_index(site_id, output, index).0));
+                        }
+                    }
+                    (Some(output), false) => out.push(make(None, served.scalar(site_id, output).0)),
+                    (None, _) => out.push(make(None, None)),
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The formulas one hop from the rows' parameters, with their sources. A formula under a disabled
+/// calculation is kept as a producer (the value it made is still its) and dropped as a consumer.
+async fn fetch_formula_links(
+    db: &sea_orm::DatabaseConnection,
+    rows: &[RawRow],
+) -> AppResult<FormulaLinks> {
+    let parameter_ids: Vec<Uuid> = rows
+        .iter()
+        .filter_map(|r| r.parameter_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    if parameter_ids.is_empty() {
+        return Ok(FormulaLinks::default());
+    }
+    let found = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT d.id, d.code, d.name, d.per_replicate, d.output_parameter_id, \
+                    p.code AS output_parameter_code, s.name AS calculation, \
+                    COALESCE(s.enabled, true) AS enabled \
+               FROM calculation_formulas d \
+               LEFT JOIN tool_scripts s ON s.id = d.tool_script_id \
+               LEFT JOIN parameters p ON p.id = d.output_parameter_id \
+              WHERE d.output_parameter_id = ANY($1) \
+                 OR d.id IN (SELECT derived_definition_id FROM derived_parameter_sources \
+                              WHERE parameter_id = ANY($1)) \
+              ORDER BY d.ordinal, d.code",
+            [parameter_ids.into()],
+        ))
+        .await?;
+    let mut formulas: Vec<FormulaLink> = Vec::with_capacity(found.len());
+    for row in found.iter().map(|r| LinkRow::from_query_result(r, "")) {
+        let row = row?;
+        formulas.push(FormulaLink {
+            definition_id: row.id,
+            code: row.code,
+            name: row.name,
+            per_replicate: row.per_replicate,
+            output_parameter_id: row.output_parameter_id,
+            output_parameter_code: row.output_parameter_code,
+            calculation: row.calculation,
+            enabled: row.enabled,
+            sources: Vec::new(),
+        });
+    }
+    if formulas.is_empty() {
+        return Ok(FormulaLinks::default());
+    }
+    let definition_ids: Vec<Uuid> = formulas.iter().map(|f| f.definition_id).collect();
+    let sources = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT ds.derived_definition_id, ds.variable_name, ds.parameter_id, \
+                    ds.site_property, p.code AS parameter_code \
+               FROM derived_parameter_sources ds \
+               LEFT JOIN parameters p ON p.id = ds.parameter_id \
+              WHERE ds.derived_definition_id = ANY($1) \
+              ORDER BY ds.variable_name",
+            [definition_ids.into()],
+        ))
+        .await?;
+    let mut by_definition: HashMap<Uuid, Vec<SourceLink>> = HashMap::new();
+    for row in sources.iter().map(|r| SourceRow::from_query_result(r, "")) {
+        let row = row?;
+        by_definition
+            .entry(row.derived_definition_id)
+            .or_default()
+            .push(SourceLink {
+                variable_name: row.variable_name,
+                parameter_id: row.parameter_id,
+                parameter_code: row.parameter_code,
+                site_property: row.site_property,
+            });
+    }
+    for formula in &mut formulas {
+        formula.sources = by_definition
+            .remove(&formula.definition_id)
+            .unwrap_or_default();
+    }
+    Ok(FormulaLinks { formulas })
+}
+
+#[derive(FromQueryResult)]
+struct LinkRow {
+    id: Uuid,
+    code: String,
+    name: String,
+    per_replicate: Option<String>,
+    output_parameter_id: Option<Uuid>,
+    output_parameter_code: Option<String>,
+    calculation: Option<String>,
+    enabled: bool,
+}
+
+#[derive(FromQueryResult)]
+struct SourceRow {
+    derived_definition_id: Uuid,
+    variable_name: String,
+    parameter_id: Option<Uuid>,
+    site_property: Option<String>,
+    parameter_code: Option<String>,
+}
+
+/// What the linked parameters serve at the instant, at every site the rows name. A scalar read
+/// of a slot receives the family's mean where the trigger derived one, else the lowest live
+/// replicate's value, which is the serving contract's spot arm.
+async fn fetch_served_values(
+    db: &sea_orm::DatabaseConnection,
+    rows: &[RawRow],
+    links: &FormulaLinks,
+    time: DateTime<Utc>,
+) -> AppResult<ServedValues> {
+    let mut served = ServedValues::default();
+    let site_ids: Vec<Uuid> = rows
+        .iter()
+        .filter_map(|r| r.site_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let parameter_ids = links.parameters_to_serve();
+    if site_ids.is_empty() || parameter_ids.is_empty() {
+        return Ok(served);
+    }
+    let found = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT r.site_id, r.parameter_id, r.replicate_index, \
+                    COALESCE(r.calibrated_value, r.raw_value) AS value, s.mean, \
+                    (r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL) AS live \
+               FROM readings r \
+               LEFT JOIN samples s ON s.id = r.sample_id \
+              WHERE r.site_id = ANY($1) AND r.parameter_id = ANY($2) AND r.time = $3 \
+              ORDER BY r.site_id, r.parameter_id, r.replicate_index",
+            [site_ids.clone().into(), parameter_ids.into(), time.into()],
+        ))
+        .await?;
+    for row in found.iter().map(|r| ServedRow::from_query_result(r, "")) {
+        let row = row?;
+        let slot = served
+            .slots
+            .entry((row.site_id, row.parameter_id))
+            .or_default();
+        slot.by_index.insert(row.replicate_index, row.value);
+        slot.mean = slot.mean.or(row.mean);
+        if row.live && slot.scalar.is_none() {
+            slot.scalar = Some(row.value);
+        }
+    }
+
+    let columns = links.site_properties_to_serve();
+    if columns.is_empty() {
+        return Ok(served);
+    }
+    let sites = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id, to_jsonb(sites) AS row FROM sites WHERE id = ANY($1)",
+            [site_ids.into()],
+        ))
+        .await?;
+    for row in sites.iter().map(|r| SiteRow::from_query_result(r, "")) {
+        let row = row?;
+        let values: HashMap<String, f64> = columns
+            .iter()
+            .filter_map(|c| {
+                row.row
+                    .get(c)
+                    .and_then(serde_json::Value::as_f64)
+                    .map(|v| (c.clone(), v))
+            })
+            .collect();
+        served.site_properties.insert(row.id, values);
+    }
+    Ok(served)
+}
+
+#[derive(FromQueryResult)]
+struct ServedRow {
+    site_id: Uuid,
+    parameter_id: Uuid,
+    replicate_index: i16,
+    value: f64,
+    mean: Option<f64>,
+    live: bool,
+}
+
+#[derive(FromQueryResult)]
+struct SiteRow {
+    id: Uuid,
+    row: serde_json::Value,
 }
 
 /// The slot's code, name, unit and declared precision. The site's own configuration wins over the

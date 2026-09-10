@@ -458,3 +458,244 @@ async fn the_arrival_of_the_current_value_is_the_correction_that_wrote_it() {
         "a rolled-back correction is not the arrival of anything: {body}"
     );
 }
+
+const CHAIN_AT: &str = "2025-07-02T09:00:00Z";
+const CHAIN_GROUP_ID: &str = "00000000-0000-4000-c000-000000000202";
+
+/// A two-stage, three-replicate calculation over a measured family: `S1 = Peak * 2` per
+/// replicate, `S2 = S1 + 1` over the family's mean. Returns the three parameter ids.
+async fn seed_chain(
+    db: &DatabaseConnection,
+    app: &axum::Router,
+    token: &str,
+) -> (String, String, String) {
+    for sql in [
+        "UPDATE tool_scripts SET active_version_id = NULL WHERE name = 'chain'".to_string(),
+        "DELETE FROM tool_scripts WHERE name = 'chain'".to_string(),
+        format!(
+            "INSERT INTO parameter_groups (id, code, label, ordinal) \
+             VALUES ('{CHAIN_GROUP_ID}', 'chain', 'Chain', 1)"
+        ),
+    ] {
+        crate::common::exec(db, &sql).await;
+    }
+    let mut ids = Vec::new();
+    for (code, role, ordinal) in [
+        ("Peak", "measured", 1),
+        ("S1", "output", 2),
+        ("S2", "output", 3),
+    ] {
+        let id = uuid::Uuid::new_v4().to_string();
+        for sql in [
+            format!(
+                "INSERT INTO parameters (id, code, name, default_units, category) \
+                 VALUES ('{id}', '{code}', '{code}', 'ppb', 'measurement')"
+            ),
+            format!(
+                "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
+                 VALUES (gen_random_uuid(), '{CHAIN_GROUP_ID}', '{id}', '{role}', {ordinal})"
+            ),
+            format!(
+                "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active) \
+                 VALUES (gen_random_uuid(), '{SITE1_ID}', '{id}', '{code}', 'lab', true)"
+            ),
+        ] {
+            crate::common::exec(db, &sql).await;
+        }
+        ids.push(id);
+    }
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO tool_scripts (name, label, engine, parameter_group_id, created_by) \
+             VALUES ('chain', 'Chain', 'formula', '{CHAIN_GROUP_ID}', 'test')"
+        ),
+    )
+    .await;
+    let script_id = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM tool_scripts WHERE name = 'chain'".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("the calculation")
+        .try_get::<uuid::Uuid>("", "id")
+        .expect("id")
+        .to_string();
+    for body in [
+        json!({
+            "code": "S1", "name": "S1", "units": "ppb", "formula": "Peak * 2",
+            "ordinal": 1, "per_replicate": "Peak", "tool_script_id": script_id,
+        }),
+        json!({
+            "code": "S2", "name": "S2", "units": "ppb", "formula": "S1 + 1",
+            "ordinal": 2, "tool_script_id": script_id,
+        }),
+    ] {
+        let (status, text) =
+            crate::common::post_json_with_token(app, "/api/derived_parameters", &body, token).await;
+        assert!((200..300).contains(&status), "formula ({status}): {text}");
+    }
+    (ids[0].clone(), ids[1].clone(), ids[2].clone())
+}
+
+async fn save_at_chain_instant(
+    app: &axum::Router,
+    token: &str,
+    run_id: Option<&serde_json::Value>,
+    readings: serde_json::Value,
+) {
+    let mut body = json!({ "site_id": SITE1_ID, "readings": readings });
+    if let Some(run_id) = run_id {
+        body["tool_run_id"] = run_id.clone();
+    }
+    let (status, text) =
+        crate::common::post_json_with_token(app, "/api/grab_samples", &body, token).await;
+    assert_eq!(status, 200, "save ({status}): {text}");
+}
+
+async fn calculate_chain(app: &axum::Router, token: &str) -> serde_json::Value {
+    let (status, text) = crate::common::post_json_with_token(
+        app,
+        "/api/tools/chain/calculate",
+        &json!({ "Peak": [1.0, 2.0, 3.0], "site_id": SITE1_ID, "collected_at": CHAIN_AT }),
+        token,
+    )
+    .await;
+    assert_eq!(status, 200, "calculate ({status}): {text}");
+    serde_json::from_str(&text).expect("JSON")
+}
+
+async fn record_of(app: &axum::Router, token: &str, parameter_id: &str) -> serde_json::Value {
+    let (status, body) = crate::common::get_json_with_token(
+        app,
+        &format!(
+            "/api/readings/provenance?site_id={SITE1_ID}&parameter_id={parameter_id}&time={CHAIN_AT}"
+        ),
+        token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    body["records"][0].clone()
+}
+
+fn values(
+    section: &serde_json::Value,
+    code_field: &str,
+    code: &str,
+) -> Vec<(Option<i64>, Option<f64>)> {
+    section
+        .as_array()
+        .expect("a section")
+        .iter()
+        .filter(|entry| entry[code_field] == json!(code))
+        .map(|entry| (entry["replicate_index"].as_i64(), entry["value"].as_f64()))
+        .collect()
+}
+
+/// Scenario: a two-stage chain over two letters, computed and saved at one visit.
+///
+/// Expected behaviour: standing on any link, the record names the values one hop above it and
+/// the formulas one hop below it, each with the key that resolves its own record, so the chain
+/// from raw replicate to published statistic is walkable in both directions.
+#[tokio::test]
+#[serial]
+async fn a_per_replicate_chain_is_walkable_in_both_directions() {
+    let (db, app, token) = setup().await;
+    let (peak_id, s1_id, s2_id) = seed_chain(&db, &app, &token).await;
+
+    save_at_chain_instant(
+        &app,
+        &token,
+        None,
+        json!([
+            { "parameter_id": peak_id, "value": 1.0, "time": CHAIN_AT, "replicate_index": 0 },
+            { "parameter_id": peak_id, "value": 2.0, "time": CHAIN_AT, "replicate_index": 1 },
+            { "parameter_id": peak_id, "value": 3.0, "time": CHAIN_AT, "replicate_index": 2 },
+        ]),
+    )
+    .await;
+    let run = calculate_chain(&app, &token).await;
+    save_at_chain_instant(
+        &app,
+        &token,
+        Some(&run["run_id"]),
+        json!([
+            { "parameter_id": s1_id, "value": 2.0, "time": CHAIN_AT, "replicate_index": 0, "output": "S1" },
+            { "parameter_id": s1_id, "value": 4.0, "time": CHAIN_AT, "replicate_index": 1, "output": "S1" },
+            { "parameter_id": s1_id, "value": 6.0, "time": CHAIN_AT, "replicate_index": 2, "output": "S1" },
+        ]),
+    )
+    .await;
+    let run = calculate_chain(&app, &token).await;
+    assert_eq!(run["results"]["S2"].as_f64(), Some(5.0), "{run}");
+    save_at_chain_instant(
+        &app,
+        &token,
+        Some(&run["run_id"]),
+        json!([
+            { "parameter_id": s2_id, "value": 5.0, "time": CHAIN_AT, "replicate_index": 0, "output": "S2" },
+        ]),
+    )
+    .await;
+
+    // The raw family: nothing above it, S1 below it at each index.
+    let peak = record_of(&app, &token, &peak_id).await;
+    assert!(
+        peak.get("inputs").is_none(),
+        "a measured value has no inputs: {peak}"
+    );
+    assert_eq!(
+        values(&peak["consumers"], "formula_code", "S1"),
+        vec![
+            (Some(0), Some(2.0)),
+            (Some(1), Some(4.0)),
+            (Some(2), Some(6.0))
+        ],
+        "{peak}"
+    );
+    assert_eq!(peak["consumers"][0]["output_parameter_id"], json!(s1_id));
+    assert_eq!(peak["consumers"][0]["calculation"], json!("chain"));
+
+    // The per-replicate stage: Peak above it index by index, S2 below it over the mean.
+    let s1 = record_of(&app, &token, &s1_id).await;
+    assert_eq!(
+        values(&s1["inputs"], "variable_name", "Peak"),
+        vec![
+            (Some(0), Some(1.0)),
+            (Some(1), Some(2.0)),
+            (Some(2), Some(3.0))
+        ],
+        "{s1}"
+    );
+    assert_eq!(s1["inputs"][0]["parameter_id"], json!(peak_id));
+    assert_eq!(s1["inputs"][0]["served_as"], json!("replicate"));
+    assert_eq!(
+        values(&s1["consumers"], "formula_code", "S2"),
+        vec![(None, Some(5.0))],
+        "{s1}"
+    );
+
+    // The published statistic: S1's mean above it, nothing below it.
+    let s2 = record_of(&app, &token, &s2_id).await;
+    assert_eq!(
+        values(&s2["inputs"], "variable_name", "S1"),
+        vec![(None, Some(4.0))],
+        "the mean of 2, 4 and 6: {s2}"
+    );
+    assert_eq!(s2["inputs"][0]["served_as"], json!("mean"));
+    assert_eq!(s2["inputs"][0]["parameter_id"], json!(s1_id));
+    assert!(s2.get("consumers").is_none(), "{s2}");
+
+    // A disabled calculation is no longer a consumer; what it produced keeps its inputs.
+    crate::common::exec(
+        &db,
+        "UPDATE tool_scripts SET enabled = false WHERE name = 'chain'",
+    )
+    .await;
+    let peak = record_of(&app, &token, &peak_id).await;
+    assert!(peak.get("consumers").is_none(), "{peak}");
+    let s1 = record_of(&app, &token, &s1_id).await;
+    assert_eq!(s1["inputs"].as_array().map(Vec::len), Some(3), "{s1}");
+}
