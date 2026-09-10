@@ -58,7 +58,7 @@ fn every_caller_has_exactly_one_name() {
 /// correcting a value through the same handler a person uses is recorded as sync.
 #[test]
 fn a_caller_says_what_its_writes_are_recorded_as() {
-    use crate::routes::private::readings::decisions::Origin;
+    use crate::routes::private::readings::models::Origin;
     assert_eq!(keycloak(Some("evan@epfl.ch")).origin(), Origin::Manual);
     assert_eq!(
         AuthContext::SyncService {

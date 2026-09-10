@@ -17,7 +17,7 @@ fn axes() -> Axes {
         reconcile_alarms: true,
         episodes: Episodes::Inline,
         recompute_derived: false,
-        writer: Writer::Person,
+        writer: crate::routes::private::collection_events::flows::Writer::Person,
     }
 }
 
@@ -146,7 +146,7 @@ fn the_chain_never_asks_for_its_own_recompute() {
         &write,
         &Axes {
             recompute_derived: false,
-            writer: Writer::Chain,
+            writer: crate::routes::private::collection_events::flows::Writer::Chain,
             ..axes()
         },
     );

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 /// neither the inline modules nor the sibling `tests/` directories they live in; only live
 /// code counts.
 const ALLOWED: &[(&str, usize)] = &[
-    ("src/routes/private/readings/grab_samples.rs", 1),
+    ("src/routes/private/readings/views.rs", 1),
     ("src/routes/private/reprocessing_jobs/reconcile.rs", 1),
 ];
 
@@ -25,17 +25,26 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Count `DELETE FROM readings…` statements in the non-test part of a source file, over any
-/// whitespace, quoting or case.
+/// Count the deletes of readings in the non-test part of a source file, over any whitespace,
+/// quoting or case. Both spellings count: `DELETE FROM readings…` as text, and the built form,
+/// whose `from_table` names the entity (`from_table` exists only on a delete, so naming the
+/// readings entity through it is a delete of readings and nothing else).
 fn delete_statements(source: &str) -> usize {
     let live = source.split("#[cfg(test)]").next().unwrap_or("");
-    live.to_ascii_lowercase()
+    let lowered = live.to_ascii_lowercase();
+    let tokens: Vec<&str> = lowered
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .filter(|t| !t.is_empty())
-        .collect::<Vec<_>>()
+        .collect();
+    let spelled = tokens
         .windows(3)
         .filter(|w| w[0] == "delete" && w[1] == "from" && w[2].starts_with("readings"))
-        .count()
+        .count();
+    let built = tokens
+        .windows(2)
+        .filter(|w| w[0] == "from_table" && w[1].starts_with("readings"))
+        .count();
+    spelled + built
 }
 
 #[test]
@@ -68,6 +77,16 @@ fn test_delete_from_readings_appears_only_at_allowlisted_sites() {
 fn test_delete_statements_counts_across_lines_quoting_and_case() {
     assert_eq!(delete_statements("DELETE FROM readings WHERE x"), 1);
     assert_eq!(delete_statements("delete\n  from\n  readings r"), 1);
+    assert_eq!(
+        delete_statements("SeaQuery::delete().from_table(readings::Entity)"),
+        1,
+        "the built form counts too"
+    );
+    assert_eq!(
+        delete_statements("SeaQuery::delete().from_table(samples::Entity)"),
+        0,
+        "another table's delete is not one of these"
+    );
     assert_eq!(delete_statements(r#"r"DELETE FROM readings WHERE""#), 1);
     assert_eq!(delete_statements("DELETE FROM readings_hourly"), 1);
     assert_eq!(delete_statements("DELETE FROM samples"), 0);

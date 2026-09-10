@@ -236,33 +236,26 @@ impl CRUDOperations for ScheduleOperations {
             .map_err(ApiError::database)?;
         }
 
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO change_audit (subject, change, changed_by, old_value, new_value) \
-             VALUES ('schedule:' || $1, 'schedule_update', $2, $3::jsonb, $4::jsonb)",
-            [
-                job_name.clone().into(),
-                crate::common::actor::current().into(),
-                snapshot(
-                    before.enabled,
-                    before.interval_seconds,
-                    before.overlap_policy.as_ref(),
-                    before.catchup_policy.as_ref(),
-                    &before.tunables,
-                )
-                .to_string()
-                .into(),
-                snapshot(
-                    enabled,
-                    interval_seconds,
-                    overlap_policy.as_ref(),
-                    catchup_policy.as_ref(),
-                    &tunables,
-                )
-                .to_string()
-                .into(),
-            ],
-        ))
+        crate::routes::private::change_audit::service::record(
+            db,
+            format!("schedule:{job_name}"),
+            "schedule_update",
+            crate::common::actor::current(),
+            Some(snapshot(
+                before.enabled,
+                before.interval_seconds,
+                before.overlap_policy.as_ref(),
+                before.catchup_policy.as_ref(),
+                &before.tunables,
+            )),
+            Some(snapshot(
+                enabled,
+                interval_seconds,
+                overlap_policy.as_ref(),
+                catchup_policy.as_ref(),
+                &tunables,
+            )),
+        )
         .await
         .map_err(ApiError::database)?;
         Ok(())

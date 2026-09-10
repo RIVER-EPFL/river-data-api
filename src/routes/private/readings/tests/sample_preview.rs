@@ -20,7 +20,7 @@ fn excluding_the_highest_of_three_recomputes_over_the_other_two() {
         exclude: &[2],
         ..Change::default()
     };
-    let (current, proposed, delta, rows) = preview(&group, "sample", &change);
+    let (current, proposed, delta, rows) = preview_statistics(&group, "sample", &change);
     assert_eq!(current.n, 3);
     assert!(close(current.mean, 20.0));
     assert!(close(current.sd, 10.0));
@@ -41,7 +41,7 @@ fn restoring_a_flagged_replicate_brings_it_back() {
         include: &[2],
         ..Change::default()
     };
-    let (current, proposed, _, rows) = preview(&group, "sample", &change);
+    let (current, proposed, _, rows) = preview_statistics(&group, "sample", &change);
     assert_eq!(current.n, 2);
     assert_eq!(proposed.n, 3);
     assert!(close(proposed.mean, 20.0));
@@ -56,7 +56,7 @@ fn a_withdrawn_replicate_is_outside_both_counts() {
         include: &[2],
         ..Change::default()
     };
-    let (current, proposed, _, _) = preview(&group, "sample", &change);
+    let (current, proposed, _, _) = preview_statistics(&group, "sample", &change);
     assert_eq!(current.n, 2);
     assert_eq!(proposed.n, 2);
 }
@@ -68,7 +68,7 @@ fn switching_the_divisor_moves_only_the_sd() {
         estimator: Some("population"),
         ..Change::default()
     };
-    let (current, proposed, delta, _) = preview(&group, "sample", &change);
+    let (current, proposed, delta, _) = preview_statistics(&group, "sample", &change);
     assert!(close(current.sd, 10.0));
     // 10 * sqrt(2/3)
     assert!(close(proposed.sd, 8.164_965_809_277_26), "{proposed:?}");
@@ -91,7 +91,7 @@ fn a_hold_is_met_when_the_proposed_statistics_agree_within_tolerance() {
         exclude: &[2],
         ..Change::default()
     };
-    let (current, proposed, _, _) = preview(&group, "sample", &change);
+    let (current, proposed, _, _) = preview_statistics(&group, "sample", &change);
     let m = hold_match(hold_id, &expected, &current, &proposed);
     assert!(!m.meets_now);
     assert!(m.meets_after, "{m:?}");

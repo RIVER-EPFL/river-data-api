@@ -651,7 +651,10 @@ async fn a_run_cannot_be_saved_onto_another_visit() {
         &admin,
     )
     .await;
-    assert_eq!(status, 200, "apply the group to the other station: {applied}");
+    assert_eq!(
+        status, 200,
+        "apply the group to the other station: {applied}"
+    );
     crate::common::e2e::author_tool(
         &app,
         &admin,

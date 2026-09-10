@@ -79,3 +79,25 @@ fn a_key_with_no_site_names_nothing() {
     assert_eq!(key_site("pub_readings:test-river:"), None);
     assert_eq!(key_site("readings:format=\"json\""), None);
 }
+
+/// Scenario: the freshness backstop every unbounded readings request pays.
+/// Expected behaviour: the latest time over the named parameters, from the readings entity, so a
+/// column rename fails the build rather than the probe.
+#[test]
+fn test_latest_time_query_maxes_time_over_the_named_parameters() {
+    use sea_orm::QueryTrait;
+    let sql = latest_time_query(&[site()])
+        .into_query()
+        .to_string(sea_orm::sea_query::PostgresQueryBuilder);
+    assert!(
+        str::starts_with(
+            &sql,
+            r#"SELECT MAX("readings"."time") AS "max_time" FROM "readings""#
+        ),
+        "{sql}"
+    );
+    assert!(
+        str::contains(&sql, r#""readings"."parameter_id" IN ("#),
+        "{sql}"
+    );
+}

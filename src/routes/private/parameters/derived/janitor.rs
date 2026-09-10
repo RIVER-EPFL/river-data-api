@@ -1,12 +1,18 @@
 use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
+use sea_orm::sea_query::{
+    Alias, Expr, Func, JoinType, Order, PostgresQueryBuilder, Query as SeaQuery, SelectStatement,
+};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
-    QueryOrder, QuerySelect, QueryTrait, Statement,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, ExprTrait, FromQueryResult,
+    QueryFilter, QueryOrder, QuerySelect, QueryTrait, Statement,
 };
 use uuid::Uuid;
 
+use crate::routes::private::readings;
 use crate::routes::private::reprocessing_jobs::model as jobs;
 use crate::routes::private::sites::parameters::models as site_parameters;
+
+use super::{definition_model, source_model};
 
 const MAX_GAPS_PER_RUN: usize = 50_000;
 
@@ -44,43 +50,81 @@ pub async fn site_has_active_derived(
 /// pod's 64MB `/dev/shm` when another parallel query holds shared memory, so the run aborts and no
 /// gap is filled that hour. Bounded, it is an index-range probe over the last few hours; the
 /// periodic unbounded run is what still covers drift older than the window.
-fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> Statement {
-    let (bound, params): (&str, Vec<sea_orm::Value>) = match since {
-        Some(from) => (
-            "AND r.time >= $2",
-            vec![
-                (MAX_GAPS_PER_RUN as i64).into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(from).into(),
-            ],
-        ),
-        None => ("", vec![(MAX_GAPS_PER_RUN as i64).into()]),
-    };
-    Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        format!(
-            r"SELECT DISTINCT r.site_id, r.time
-              FROM readings r
-              JOIN site_parameters sp
-                ON sp.site_id = r.site_id
-               AND sp.entry_mode = 'tool'
-               AND COALESCE(sp.is_active, true) = true
-              JOIN calculation_formulas d
-                ON d.output_parameter_id = sp.parameter_id
-              JOIN derived_parameter_sources dps
-                ON dps.derived_definition_id = d.id
-               AND dps.parameter_id = r.parameter_id
-              WHERE NOT EXISTS (
-                  SELECT 1 FROM readings r2
-                  WHERE r2.site_id = r.site_id
-                    AND r2.parameter_id = sp.parameter_id
-                    AND r2.time = r.time
-              )
-              {bound}
-              ORDER BY r.site_id, r.time
-              LIMIT $1"
-        ),
-        params,
-    )
+fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> SelectStatement {
+    let (r, sp, d, dps, r2) = (
+        Alias::new("r"),
+        Alias::new("sp"),
+        Alias::new("d"),
+        Alias::new("dps"),
+        Alias::new("r2"),
+    );
+
+    let derived_written = SeaQuery::select()
+        .expr(Expr::val(1))
+        .from_as(readings::Entity, r2.clone())
+        .and_where(
+            Expr::col((r2.clone(), readings::Column::SiteId))
+                .equals((r.clone(), readings::Column::SiteId)),
+        )
+        .and_where(
+            Expr::col((r2.clone(), readings::Column::ParameterId))
+                .equals((sp.clone(), site_parameters::Column::ParameterId)),
+        )
+        .and_where(
+            Expr::col((r2, readings::Column::Time)).equals((r.clone(), readings::Column::Time)),
+        )
+        .take();
+
+    let mut query = SeaQuery::select();
+    query
+        .distinct()
+        .column((r.clone(), readings::Column::SiteId))
+        .column((r.clone(), readings::Column::Time))
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            JoinType::Join,
+            site_parameters::Entity,
+            sp.clone(),
+            Expr::col((sp.clone(), site_parameters::Column::SiteId))
+                .equals((r.clone(), readings::Column::SiteId))
+                .and(Expr::col((sp.clone(), site_parameters::Column::EntryMode)).eq("tool"))
+                .and(
+                    Expr::expr(Func::coalesce([
+                        Expr::col((sp.clone(), site_parameters::Column::IsActive)),
+                        Expr::val(true),
+                    ]))
+                    .eq(true),
+                ),
+        )
+        .join_as(
+            JoinType::Join,
+            definition_model::Entity,
+            d.clone(),
+            Expr::col((d.clone(), definition_model::Column::OutputParameterId))
+                .equals((sp.clone(), site_parameters::Column::ParameterId)),
+        )
+        .join_as(
+            JoinType::Join,
+            source_model::Entity,
+            dps.clone(),
+            Expr::col((dps.clone(), source_model::Column::DerivedDefinitionId))
+                .equals((d, definition_model::Column::Id))
+                .and(
+                    Expr::col((dps, source_model::Column::ParameterId))
+                        .equals((r.clone(), readings::Column::ParameterId)),
+                ),
+        )
+        .and_where(Expr::exists(derived_written).not())
+        .order_by((r.clone(), readings::Column::SiteId), Order::Asc)
+        .order_by((r.clone(), readings::Column::Time), Order::Asc)
+        .limit(MAX_GAPS_PER_RUN as u64);
+    if let Some(from) = since {
+        query.and_where(
+            Expr::col((r, readings::Column::Time))
+                .gte(sea_orm::prelude::DateTimeWithTimeZone::from(from)),
+        );
+    }
+    query
 }
 
 /// Find (site_id, time) pairs where a source reading exists but no corresponding
@@ -110,7 +154,14 @@ pub async fn run_once(
 ) -> Result<usize, sea_orm::DbErr> {
     let started = std::time::Instant::now();
 
-    let rows = db.query_all_raw(gap_scan(since)).await?;
+    let (sql, values) = gap_scan(since).build(PostgresQueryBuilder);
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            &sql,
+            values,
+        ))
+        .await?;
 
     let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
     if let Some(ctx) = ctx {
@@ -138,7 +189,7 @@ pub async fn run_once(
         {
             Ok(()) => {
                 filled += 1;
-                min_filled = Some(min_filled.map_or(utc_time, |m| m.min(utc_time)));
+                min_filled = Some(min_filled.map_or(utc_time, |m| Ord::min(m, utc_time)));
             }
             Err(e) => tracing::warn!(error = %e, site_id = %site_id, time = %utc_time, "Janitor failed to fill derived gap"),
         }

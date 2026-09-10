@@ -6,10 +6,10 @@
 use std::sync::{Arc, Mutex};
 
 use river_db::common::AppState;
+use river_db::routes::private::notifications::flows;
 use river_db::routes::private::notifications::models::{
     DeliveryResult, NotificationChannel, OutgoingMessage,
 };
-use river_db::routes::private::notifications::flows;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 

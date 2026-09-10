@@ -87,7 +87,7 @@ async fn test_simple_reassign() {
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await
     .expect("merge should succeed");
@@ -156,7 +156,7 @@ async fn test_conflict_merge() {
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await
     .expect("merge should succeed");
@@ -210,7 +210,7 @@ async fn test_cross_site() {
             crate::common::GLOBAL_PARAM_TURB_ID,
         ),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await
     .expect("merge should succeed");
@@ -276,7 +276,7 @@ async fn test_derived_sources_reassigned() {
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await
     .expect("merge should succeed");
@@ -339,7 +339,7 @@ async fn test_aliases_absorbed() {
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await
     .expect("merge should succeed");
@@ -372,7 +372,7 @@ async fn test_same_id_rejection() {
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await;
     assert!(result.is_err(), "should reject same-id merge");
@@ -391,7 +391,7 @@ async fn test_not_found_rejection() {
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await;
     assert!(result.is_err(), "should reject nonexistent source");
@@ -472,7 +472,7 @@ async fn test_merge_clears_needs_review_on_survivor() {
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await
     .expect("merge succeeds");
@@ -546,7 +546,7 @@ async fn a_merge_that_would_make_a_calculation_read_its_own_output_is_refused() 
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await
     .expect_err("the merge closes a loop and is refused");
@@ -605,7 +605,7 @@ async fn a_merge_that_closes_no_loop_still_merges() {
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await
     .expect("no loop, so nothing to refuse");
@@ -637,7 +637,7 @@ async fn a_formula_producing_the_merged_away_parameter_produces_the_survivor() {
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await
     .expect("the formula's output moves with everything else the merge moves");
@@ -688,7 +688,7 @@ async fn a_merge_leaves_one_entry_naming_both_sides() {
             "00000000-0000-4000-a000-0000000000ff",
         ),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await;
     assert!(refused.is_err(), "a merge onto an absent target is refused");
@@ -704,7 +704,7 @@ async fn a_merge_leaves_one_entry_naming_both_sides() {
             crate::common::GLOBAL_PARAM_TEMP_ID,
         ),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await
     .expect("merge should succeed");

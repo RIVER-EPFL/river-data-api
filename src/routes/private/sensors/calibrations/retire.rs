@@ -11,9 +11,11 @@ use axum::{
     extract::{Path, State},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::sea_query::Expr;
+use sea_orm::ExprTrait;
+use sea_orm::sea_query::{Alias, Expr, PostgresQueryBuilder, Query as SeaQuery};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QuerySelect, Statement,
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
+    QuerySelect, Statement,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -22,9 +24,8 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::readings::decisions::{
-    self, Kind, NewValue, Selection, not_pinned_sql,
-};
+use crate::routes::private::readings::models::{self as readings, Kind, Selection, decision_set};
+use crate::routes::private::readings::service::{self, NewValue, not_pinned_sql};
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -90,20 +91,43 @@ async fn counts<C: ConnectionTrait>(
     id: Uuid,
     sensor_id: Uuid,
 ) -> AppResult<(i64, i64, i64, i64)> {
+    // Each reading this curve corrects, with whether the retirement moves it and which curve
+    // would then cover it. The two fragments carry their own binds, so the outer counts are a
+    // built statement rather than a `format!` over them.
+    let moved = moved_rows_sql();
+    let covering = covering_curve_sql();
+    let per_reading = SeaQuery::select()
+        .expr_as(Expr::cust_with_values(moved, [id]), Alias::new("moved"))
+        .expr_as(
+            Expr::cust_with_values(covering, [id, sensor_id]),
+            Alias::new("covered"),
+        )
+        .from_as(readings::Entity, Alias::new("r"))
+        .and_where(ExprTrait::eq(
+            Expr::col((Alias::new("r"), readings::Column::CalibrationId)),
+            id,
+        ))
+        .take();
+    let count_filtered = |cond: &str| Expr::cust(format!("count(*) FILTER (WHERE {cond})::bigint"));
+    let query = SeaQuery::select()
+        .expr_as(Expr::cust("count(*)::bigint"), Alias::new("readings"))
+        .expr_as(
+            count_filtered("moved AND covered IS NOT NULL"),
+            Alias::new("repointed"),
+        )
+        .expr_as(
+            count_filtered("moved AND covered IS NULL"),
+            Alias::new("uncorrected"),
+        )
+        .expr_as(count_filtered("NOT moved"), Alias::new("pinned"))
+        .from_subquery(per_reading, Alias::new("x"))
+        .take();
+    let (sql, values) = query.build(PostgresQueryBuilder);
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT count(*) FILTER (WHERE true)::bigint AS readings,
-                        count(*) FILTER (WHERE moved AND covered IS NOT NULL)::bigint AS repointed,
-                        count(*) FILTER (WHERE moved AND covered IS NULL)::bigint AS uncorrected,
-                        count(*) FILTER (WHERE NOT moved)::bigint AS pinned
-                   FROM (SELECT ({moved}) AS moved, {covering} AS covered
-                           FROM readings r WHERE r.calibration_id = $1) x",
-                moved = moved_rows_sql(),
-                covering = covering_curve_sql(),
-            ),
-            [id.into(), sensor_id.into()],
+            sql,
+            values,
         ))
         .await?
         .ok_or_else(|| {
@@ -165,7 +189,7 @@ pub async fn retire_calibration(
         ..Default::default()
     };
     let set_id = crate::common::bulk_write::guarded(&state.db, async |txn| {
-        let set_id = decisions::open_set(
+        let set_id = service::open_set(
             txn,
             Kind::CurveRetire,
             &selection,
@@ -174,7 +198,7 @@ pub async fn retire_calibration(
             req.reason.as_deref(),
         )
         .await?;
-        let recorded = decisions::record_many(
+        let recorded = service::record_many(
             txn,
             Kind::CurveRetire,
             &moved_rows_sql(),
@@ -186,7 +210,7 @@ pub async fn retire_calibration(
             Some(set_id),
         )
         .await?;
-        decisions::close_set(txn, set_id, recorded.rows).await?;
+        service::close_set(txn, set_id, recorded.rows).await?;
         // The projection moved `calibration_id`; the value each reading serves is whatever the
         // curves it now names produce, including none at all.
         super::service::recompose_decided_rows(txn, set_id).await?;
@@ -285,7 +309,7 @@ pub async fn unretire_calibration(
     let restored = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let restored = if let Some(set_id) = set {
             let (n, _) =
-                decisions::rollback_set(txn, set_id, &actor, Some("curve unretired")).await?;
+                service::rollback_set(txn, set_id, &actor, Some("curve unretired")).await?;
             super::service::recompose_decided_rows(txn, set_id).await?;
             n
         } else {
@@ -342,18 +366,18 @@ async fn load<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<(Uuid, Option
 /// The retirement's own decision set: the newest one this curve opened that has not been rolled
 /// back.
 async fn latest_set<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<Option<Uuid>> {
-    let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id FROM reading_decision_sets
-              WHERE kind = 'curve_retire' AND rolled_back_at IS NULL
-                AND new ->> 'retired_calibration_id' = $1::text
-              ORDER BY at DESC LIMIT 1",
-            [id.to_string().into()],
+    Ok(decision_set::Entity::find()
+        .filter(decision_set::Column::Kind.eq("curve_retire"))
+        .filter(decision_set::Column::RolledBackAt.is_null())
+        // The retired calibration is a field of the set's `new` blob, not a column of its own.
+        .filter(Expr::cust_with_values(
+            "new ->> 'retired_calibration_id' = $1",
+            [id.to_string()],
         ))
-        .await?;
-    Ok(match row {
-        Some(row) => Some(row.try_get("", "id")?),
-        None => None,
-    })
+        .order_by_desc(decision_set::Column::At)
+        .select_only()
+        .column(decision_set::Column::Id)
+        .into_tuple::<Uuid>()
+        .one(conn)
+        .await?)
 }

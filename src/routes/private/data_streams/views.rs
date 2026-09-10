@@ -5,18 +5,22 @@ use axum::{
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
-    FromQueryResult, QueryFilter, Set, Statement,
+    FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 use uuid::Uuid;
 
 use super::flows::retire_slot;
+use super::models::receipts;
 use super::models::{
     ImportStreamRequest, ImportStreamResponse, PairStreamRequest, PairStreamResponse,
     PreviewInstant, PreviewReplicate, ReceiptRow, ReceiptsQuery, ReceiptsResponse,
     RegisterStreamRequest, RetagStreamsRequest, RetagStreamsResponse, SlotScope,
     StreamPreviewResponse, StreamStatsResponse, UnpairStreamResponse,
 };
-use super::service::{PreviewRow, StoredReceipt, StoredStreamStats, preview_estimator};
+use super::service::{
+    PreviewRow, StoredStreamStats, latest_raw_value_query, preview_estimator, preview_query,
+    stream_stats_query,
+};
 use crate::common::AppState;
 use crate::common::bulk_write;
 use crate::common::middleware::ProjectScope;
@@ -82,22 +86,14 @@ pub async fn stream_preview(
             .unwrap_or_default();
 
     // The newest `limit` instants, then every replicate at those instants.
+    let (sql, values) =
+        preview_query(id, limit.unsigned_abs()).build(sea_orm::sea_query::PostgresQueryBuilder);
     let rows = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT r.time, r.replicate_index,
-                    COALESCE(r.calibrated_value, r.raw_value) AS value,
-                    COALESCE(r.is_flagged, false) AS is_flagged,
-                    r.withdrawn_at IS NOT NULL AS withdrawn
-             FROM readings r
-             JOIN (
-                 SELECT DISTINCT time FROM readings WHERE stream_id = $1
-                 ORDER BY time DESC LIMIT $2
-             ) t ON t.time = r.time
-             WHERE r.stream_id = $1
-             ORDER BY r.time DESC, r.replicate_index",
-            [id.into(), limit.into()],
+            &sql,
+            values,
         ))
         .await?;
 
@@ -207,18 +203,10 @@ pub async fn stream_stats(
 
     guard_stream_scope(&state, &stream, &scope).await?;
 
-    let row = state.db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT COUNT(*) as count, COUNT(*) FILTER (WHERE withdrawn_at IS NOT NULL) as withdrawn, MIN(time) as min_time, MAX(time) as max_time FROM readings WHERE stream_id = $1",
-            [id.into()],
-        ))
-        .await?;
-
-    let stats = row
-        .as_ref()
-        .map(|r| StoredStreamStats::from_query_result(r, ""))
-        .transpose()?
+    let stats = stream_stats_query(id)
+        .into_model::<StoredStreamStats>()
+        .one(&state.db)
+        .await?
         .unwrap_or_default();
     let (count, withdrawn, min_time, max_time) = (
         stats.count,
@@ -227,16 +215,10 @@ pub async fn stream_stats(
         stats.max_time.map(|t| t.with_timezone(&Utc)),
     );
 
-    // Get latest value
-    let latest_row = state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT raw_value FROM readings WHERE stream_id = $1 ORDER BY time DESC LIMIT 1",
-            [id.into()],
-        ))
+    let latest_value: Option<f64> = latest_raw_value_query(id)
+        .into_tuple::<f64>()
+        .one(&state.db)
         .await?;
-    let latest_value: Option<f64> = latest_row.map(|r| r.try_get("", "raw_value")).transpose()?;
 
     Ok(Json(StreamStatsResponse {
         stream_id: id,
@@ -291,36 +273,23 @@ pub async fn stream_receipts(
     }
 
     let window = Window::from_page(q.page, q.page_size, 50, 200);
-    let total: i64 = state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT COUNT(*) AS n FROM ingest_receipts WHERE stream_id = $1",
-            [id.into()],
-        ))
-        .await?
-        .map(|r| r.try_get("", "n"))
-        .transpose()?
-        .unwrap_or(0);
-    let rows = state
-        .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, at, window_from, window_to, submitted, new_rows, changed, unchanged, \
-                    retained, rejected_total, dropped, withdrawn, braked \
-             FROM ingest_receipts WHERE stream_id = $1 \
-             ORDER BY at DESC LIMIT $2 OFFSET $3",
-            [
-                id.into(),
-                (window.limit as i64).into(),
-                (window.offset as i64).into(),
-            ],
-        ))
+    let total = i64::try_from(
+        receipts::Entity::find()
+            .filter(receipts::Column::StreamId.eq(id))
+            .count(&state.db)
+            .await?,
+    )
+    .unwrap_or(i64::MAX);
+    let rows = receipts::Entity::find()
+        .filter(receipts::Column::StreamId.eq(id))
+        .order_by_desc(receipts::Column::At)
+        .limit(window.limit as u64)
+        .offset(window.offset as u64)
+        .all(&state.db)
         .await?;
-    let mut receipts = Vec::with_capacity(rows.len());
-    for r in &rows {
-        let row = StoredReceipt::from_query_result(r, "")?;
-        receipts.push(ReceiptRow {
+    let receipts: Vec<ReceiptRow> = rows
+        .into_iter()
+        .map(|row| ReceiptRow {
             id: row.id,
             at: row.at.with_timezone(&Utc),
             window_from: row.window_from.map(|t| t.with_timezone(&Utc)),
@@ -334,8 +303,8 @@ pub async fn stream_receipts(
             dropped: row.dropped,
             withdrawn: row.withdrawn,
             braked: row.braked,
-        });
-    }
+        })
+        .collect();
     Ok(Json(ReceiptsResponse {
         stream_id: id,
         total: u64::try_from(total).unwrap_or(0),
@@ -361,7 +330,7 @@ pub async fn register_stream(
     ProjectScope(scope): ProjectScope,
     Json(RegisterStreamRequest(mut payload)): Json<RegisterStreamRequest>,
 ) -> AppResult<Json<DataStream>> {
-    crate::routes::private::readings::measurement::validate_measurement_type(
+    crate::routes::private::readings::service::validate_measurement_type(
         payload.measurement_type.as_deref(),
     )?;
     let stored = data_streams::Entity::find()
@@ -710,8 +679,8 @@ pub async fn pair_stream(
     // Gated on the stream holding readings at all, not on the backfill having moved rows: a stream
     // re-paired after an unpair, or one whose readings arrived already attributed, backfills nothing
     // and still needs its window resolved against the slot it now feeds.
-    let has_readings = crate::routes::private::readings::model::Entity::find()
-        .filter(crate::routes::private::readings::model::Column::StreamId.eq(stream_id))
+    let has_readings = crate::routes::private::readings::models::Entity::find()
+        .filter(crate::routes::private::readings::models::Column::StreamId.eq(stream_id))
         .one(&state.db)
         .await?
         .is_some();
@@ -834,7 +803,7 @@ pub async fn retag_streams(
         ));
     }
     if let Some(reason) =
-        crate::routes::private::readings::measurement::retag_target_rejection(&req.measurement_type)
+        crate::routes::private::readings::service::retag_target_rejection(&req.measurement_type)
     {
         return Err(AppError::BadRequest(reason));
     }
@@ -842,7 +811,7 @@ pub async fn retag_streams(
     // "declared" writes nothing to `data_streams`; it aligns each reading with its own stream's
     // declaration, which for a family stream is already spot.
     let streams_updated =
-        if req.measurement_type == crate::routes::private::readings::measurement::RETAG_DECLARED {
+        if req.measurement_type == crate::routes::private::readings::service::RETAG_DECLARED {
             0
         } else {
             if req.measurement_type != "spot" {

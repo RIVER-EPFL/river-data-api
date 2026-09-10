@@ -9,9 +9,12 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
+use sea_orm::sea_query::{
+    Alias, Condition, Expr, Func, JoinType, PostgresQueryBuilder, Query as SeaQuery,
+};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter,
-    Statement,
+    ColumnTrait, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, Order, PaginatorTrait,
+    QueryFilter, Statement,
 };
 use uuid::Uuid;
 
@@ -21,12 +24,18 @@ use super::models::{
     StagedEvent, VisitCell, VisitListQuery, VisitListRow, VisitRow, VisitsQuery, VisitsResponse,
 };
 use super::service::{
-    self, VISIT_COUNT_COLUMNS, limit_clause, paging, range_clause, visit_list_order,
+    self, limit_clause, paging, range_clause, visit_count_columns, visit_list_order,
 };
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
 use crate::common::paging::{Page, Window};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::collection_events::models as events;
+use crate::routes::private::data_streams::models as data_streams;
+use crate::routes::private::parameters::models as parameters;
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::samples::model as samples;
+use crate::routes::private::sites::parameters::models as site_parameters;
 use crate::routes::resolve_site;
 
 /// Recompute a collection event's tool outputs on demand: the chain executor runs every active
@@ -327,22 +336,64 @@ pub async fn list_site_visits(
     // it, since a measurement taken once forms no row there. Taking the union means a parameter
     // with no reading yet still gets a column, so its value has somewhere to render and the fill
     // ratio cannot exceed its own denominator.
+    let p = Alias::new("p");
+    let sp = Alias::new("sp");
+    let measured_here = SeaQuery::select()
+        .column((Alias::new("r"), readings::Column::ParameterId))
+        .from_as(readings::Entity, Alias::new("r"))
+        .inner_join(
+            events::Entity,
+            Expr::col((events::Entity, events::Column::Id))
+                .equals((Alias::new("r"), readings::Column::CollectionEventId)),
+        )
+        .and_where(Expr::col((events::Entity, events::Column::SiteId)).eq(site.id))
+        .take();
+    let declared_here = SeaQuery::select()
+        .column(site_parameters::Column::ParameterId)
+        .from(site_parameters::Entity)
+        .and_where(Expr::col(site_parameters::Column::SiteId).eq(site.id))
+        .and_where(Expr::cust("COALESCE(is_active, true) = true"))
+        .take();
+    let expected_query = SeaQuery::select()
+        .distinct_on([(p.clone(), parameters::Column::Code)])
+        .column((p.clone(), parameters::Column::Id))
+        .column((p.clone(), parameters::Column::Code))
+        .column((p.clone(), parameters::Column::Name))
+        .expr_as(
+            Func::coalesce([
+                Expr::col((sp.clone(), site_parameters::Column::DisplayUnits)),
+                Expr::col((p.clone(), parameters::Column::DefaultUnits)),
+            ]),
+            Alias::new("units"),
+        )
+        .column((sp.clone(), site_parameters::Column::DecimalPlaces))
+        .from_as(parameters::Entity, p.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            site_parameters::Entity,
+            sp.clone(),
+            Condition::all()
+                .add(
+                    Expr::col((sp.clone(), site_parameters::Column::ParameterId))
+                        .equals((p.clone(), parameters::Column::Id)),
+                )
+                .add(Expr::col((sp.clone(), site_parameters::Column::SiteId)).eq(site.id)),
+        )
+        .cond_where(
+            Condition::any()
+                .add(Expr::col((p.clone(), parameters::Column::Id)).in_subquery(measured_here))
+                .add(Expr::col((p.clone(), parameters::Column::Id)).in_subquery(declared_here)),
+        )
+        .order_by((p.clone(), parameters::Column::Code), Order::Asc)
+        .order_by((sp.clone(), site_parameters::Column::Id), Order::Asc)
+        .take();
+    let (expected_sql, expected_values) = expected_query.build(PostgresQueryBuilder);
     let expected_rows = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT DISTINCT ON (p.code) p.id, p.code, p.name, \
-                    COALESCE(sp.display_units, p.default_units) AS units, \
-                    sp.decimal_places \
-             FROM parameters p \
-             LEFT JOIN site_parameters sp ON sp.parameter_id = p.id AND sp.site_id = $1 \
-             WHERE p.id IN (SELECT r.parameter_id FROM readings r \
-                              JOIN collection_events ce ON ce.id = r.collection_event_id \
-                             WHERE ce.site_id = $1) \
-                OR p.id IN (SELECT sp2.parameter_id FROM site_parameters sp2 \
-                             WHERE sp2.site_id = $1 AND COALESCE(sp2.is_active, true) = true) \
-             ORDER BY p.code, sp.id",
-            [site.id.into()],
+            expected_sql,
+            expected_values,
         ))
         .await?;
     let mut expected_parameters = Vec::with_capacity(expected_rows.len());
@@ -359,13 +410,14 @@ pub async fn list_site_visits(
 
     let mut page_binds = binds;
     let limit = limit_clause(paging, &mut page_binds);
+    let counts = visit_count_columns();
     let rows = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT ce.id, ce.collected_at, ce.source, ce.created_by, ce.notes, \
-                        {VISIT_COUNT_COLUMNS} \
+                        {counts} \
                  FROM collection_events ce \
                  WHERE ce.site_id = $1{range} \
                  ORDER BY ce.collected_at DESC{limit}"
@@ -403,33 +455,74 @@ pub async fn list_site_visits(
     // One pass over the page's events fills the grid cells: served value per (event, parameter)
     // plus the all-flagged/all-withdrawn state, then the open finding kinds.
     if !event_ids.is_empty() {
+        // The served value is the sample mean where a replicate group formed one, else the lowest
+        // unflagged replicate's own value. The aggregates stay `Expr::cust`: FILTER, BOOL_AND and
+        // the array subscript have no builder form.
+        let r = Alias::new("r");
+        let s_ = Alias::new("s");
+        let agg =
+            |sql: &str, name: &str| (Expr::cust(sql.to_string()), Alias::new(name.to_string()));
+        let mut cell_query = SeaQuery::select();
+        cell_query
+            .expr_as(
+                Expr::col((r.clone(), readings::Column::CollectionEventId)),
+                Alias::new("event_id"),
+            )
+            .column((r.clone(), readings::Column::ParameterId));
+        for (expr, name) in [
+            agg(
+                "COALESCE(MAX(s.mean), \
+                 (ARRAY_AGG(COALESCE(r.calibrated_value, r.raw_value) ORDER BY r.replicate_index) \
+                  FILTER (WHERE r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL))[1])",
+                "value",
+            ),
+            agg("BOOL_AND(r.is_flagged IS TRUE)", "all_flagged"),
+            agg("BOOL_AND(r.withdrawn_at IS NOT NULL)", "all_withdrawn"),
+            agg("COUNT(*)::bigint", "n_total"),
+            agg(
+                "COUNT(*) FILTER (WHERE r.is_flagged IS TRUE)::bigint",
+                "n_flagged",
+            ),
+            agg(
+                "COUNT(*) FILTER (WHERE r.withdrawn_at IS NOT NULL)::bigint",
+                "n_withdrawn",
+            ),
+            agg("MAX(s.n)", "sample_n"),
+            agg("MAX(s.stdev)", "stdev"),
+            agg("MAX(s.median)", "median"),
+            agg("MAX(s.min_value)", "min_value"),
+            agg("MAX(s.max_value)", "max_value"),
+            agg("MAX(s.sd_estimator)", "sd_estimator"),
+            agg("MAX(s.sd_estimator_source)", "sd_estimator_source"),
+        ] {
+            cell_query.expr_as(expr, name);
+        }
+        let cell_query = cell_query
+            .from_as(readings::Entity, r.clone())
+            .join_as(
+                JoinType::LeftJoin,
+                samples::Entity,
+                s_.clone(),
+                Expr::col((s_.clone(), samples::Column::Id))
+                    .equals((r.clone(), readings::Column::SampleId)),
+            )
+            .and_where(Expr::cust_with_values(
+                "r.collection_event_id = ANY($1)",
+                [event_ids.clone()],
+            ))
+            .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).is_not_null())
+            .add_group_by([
+                Expr::col((r.clone(), readings::Column::CollectionEventId)).into(),
+                Expr::col((r.clone(), readings::Column::ParameterId)).into(),
+            ])
+            .take();
+        let (cell_sql, cell_values) = cell_query.build(PostgresQueryBuilder);
         let cell_rows = state
             .db
             .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT r.collection_event_id AS event_id, r.parameter_id,
-                        COALESCE(MAX(s.mean),
-                                 (ARRAY_AGG(COALESCE(r.calibrated_value, r.raw_value)
-                                            ORDER BY r.replicate_index)
-                                  FILTER (WHERE r.is_flagged IS NOT TRUE
-                                            AND r.withdrawn_at IS NULL))[1]) AS value,
-                        BOOL_AND(r.is_flagged IS TRUE) AS all_flagged,
-                        BOOL_AND(r.withdrawn_at IS NOT NULL) AS all_withdrawn,
-                        COUNT(*)::bigint AS n_total,
-                        COUNT(*) FILTER (WHERE r.is_flagged IS TRUE)::bigint AS n_flagged,
-                        COUNT(*) FILTER (WHERE r.withdrawn_at IS NOT NULL)::bigint AS n_withdrawn,
-                        MAX(s.n) AS sample_n,
-                        MAX(s.stdev) AS stdev,
-                        MAX(s.median) AS median,
-                        MAX(s.min_value) AS min_value,
-                        MAX(s.max_value) AS max_value,
-                        MAX(s.sd_estimator) AS sd_estimator,
-                        MAX(s.sd_estimator_source) AS sd_estimator_source
-                 FROM readings r
-                 LEFT JOIN samples s ON s.id = r.sample_id
-                 WHERE r.collection_event_id = ANY($1) AND r.parameter_id IS NOT NULL
-                 GROUP BY 1, 2",
-                [event_ids.clone().into()],
+                cell_sql,
+                cell_values,
             ))
             .await?;
         let finding_rows = state
@@ -599,13 +692,14 @@ pub async fn list_visits(
         .unwrap_or(0);
 
     let limit = limit_clause(paging, &mut binds);
+    let counts = visit_count_columns();
     let rows = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT ce.id, ce.site_id, s.name AS site_name, ce.collected_at, ce.source, \
-                        ce.created_by, ce.notes, {VISIT_COUNT_COLUMNS} \
+                        ce.created_by, ce.notes, {counts} \
                  FROM collection_events ce \
                  JOIN sites s ON s.id = ce.site_id \
                  {filter} \
@@ -788,29 +882,99 @@ pub async fn get_event_detail(
         }
     }
 
+    let r = Alias::new("r");
+    let p = Alias::new("p");
+    let ds = Alias::new("ds");
+    let s_ = Alias::new("s");
+    let mut detail_query = SeaQuery::select();
+    detail_query
+        .column((r.clone(), readings::Column::ParameterId))
+        .column((p.clone(), parameters::Column::Code))
+        .column((p.clone(), parameters::Column::Name))
+        .column((r.clone(), readings::Column::StreamId))
+        .column((ds.clone(), data_streams::Column::SourceSystem))
+        .column((ds.clone(), data_streams::Column::SourceKey))
+        .column((r.clone(), readings::Column::ReplicateIndex))
+        .column((r.clone(), readings::Column::RawValue))
+        .column((r.clone(), readings::Column::CalibratedValue))
+        .column((r.clone(), readings::Column::IsFlagged))
+        .expr_as(
+            Expr::col((r.clone(), readings::Column::WithdrawnAt)).is_not_null(),
+            Alias::new("withdrawn"),
+        )
+        .column((r.clone(), readings::Column::SampleId))
+        .expr_as(
+            Expr::col((s_.clone(), samples::Column::Mean)),
+            Alias::new("sample_mean"),
+        )
+        .expr_as(
+            Expr::col((s_.clone(), samples::Column::Stdev)),
+            Alias::new("sample_stdev"),
+        )
+        .expr_as(
+            Expr::col((s_.clone(), samples::Column::N)),
+            Alias::new("sample_n"),
+        )
+        .column((s_.clone(), samples::Column::StdevSample))
+        .column((s_.clone(), samples::Column::StdevPopulation))
+        .expr_as(
+            Expr::col((s_.clone(), samples::Column::Median)),
+            Alias::new("sample_median"),
+        )
+        .expr_as(
+            Expr::col((s_.clone(), samples::Column::MinValue)),
+            Alias::new("sample_min"),
+        )
+        .expr_as(
+            Expr::col((s_.clone(), samples::Column::MaxValue)),
+            Alias::new("sample_max"),
+        )
+        .column((s_.clone(), samples::Column::SdEstimator))
+        .column((s_.clone(), samples::Column::SdEstimatorSource))
+        .column((r.clone(), readings::Column::FlagReason))
+        .column((r.clone(), readings::Column::WithdrawnAt))
+        .column((r.clone(), readings::Column::CalibrationId))
+        .column((r.clone(), readings::Column::StandardCurveId))
+        .column((r.clone(), readings::Column::SensorId))
+        .expr_as(
+            Expr::col((r.clone(), readings::Column::Provenance)).is_not_null(),
+            Alias::new("has_provenance"),
+        )
+        .column((r.clone(), readings::Column::ProvenanceKind))
+        .expr_as(Expr::cust("r.provenance ->> 'tool'"), Alias::new("tool"))
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            parameters::Entity,
+            p.clone(),
+            Expr::col((p.clone(), parameters::Column::Id))
+                .equals((r.clone(), readings::Column::ParameterId)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            data_streams::Entity,
+            ds.clone(),
+            Expr::col((ds.clone(), data_streams::Column::Id))
+                .equals((r.clone(), readings::Column::StreamId)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            samples::Entity,
+            s_.clone(),
+            Expr::col((s_.clone(), samples::Column::Id))
+                .equals((r.clone(), readings::Column::SampleId)),
+        )
+        .and_where(Expr::col((r.clone(), readings::Column::CollectionEventId)).eq(id))
+        .order_by((p.clone(), parameters::Column::Code), Order::Asc)
+        .order_by((r.clone(), readings::Column::StreamId), Order::Asc)
+        .order_by((r.clone(), readings::Column::ReplicateIndex), Order::Asc);
+    let (detail_sql, detail_values) = detail_query.build(PostgresQueryBuilder);
     let rows = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT r.parameter_id, p.code, p.name, r.stream_id, \
-                    ds.source_system, ds.source_key, r.replicate_index, \
-                    r.raw_value, r.calibrated_value, r.is_flagged, \
-                    (r.withdrawn_at IS NOT NULL) AS withdrawn, r.sample_id, \
-                    s.mean AS sample_mean, s.stdev AS sample_stdev, s.n AS sample_n, \
-                    s.stdev_sample, s.stdev_population, s.median AS sample_median, \
-                    s.min_value AS sample_min, s.max_value AS sample_max, \
-                    s.sd_estimator, s.sd_estimator_source, \
-                    r.flag_reason, r.withdrawn_at, r.calibration_id, r.standard_curve_id, \
-                    r.sensor_id, \
-                    (r.provenance IS NOT NULL) AS has_provenance, \
-                    r.provenance_kind, r.provenance ->> 'tool' AS tool \
-             FROM readings r \
-             JOIN parameters p ON p.id = r.parameter_id \
-             LEFT JOIN data_streams ds ON ds.id = r.stream_id \
-             LEFT JOIN samples s ON s.id = r.sample_id \
-             WHERE r.collection_event_id = $1 \
-             ORDER BY p.code, r.stream_id, r.replicate_index",
-            [id.into()],
+            detail_sql,
+            detail_values,
         ))
         .await?
         .iter()
@@ -880,7 +1044,7 @@ pub async fn get_event_detail(
                 });
                 cells.push(EventCell {
                     parameter_id: r.parameter_id,
-                    origin: crate::routes::private::readings::provenance::classify_source(
+                    origin: crate::routes::private::readings::service::classify_source(
                         r.source_system.as_deref().unwrap_or(""),
                     )
                     .to_string(),
@@ -926,7 +1090,7 @@ pub async fn get_event_detail(
             parameter_code: catalog.map(|c| c.code.clone()).unwrap_or_default(),
             parameter_name: catalog.map(|c| c.name.clone()).unwrap_or_default(),
             stream_id: Uuid::nil(),
-            origin: crate::routes::private::readings::provenance::classify_source("").to_string(),
+            origin: crate::routes::private::readings::service::classify_source("").to_string(),
             has_provenance: false,
             provenance_kind: None,
             tool: None,
@@ -941,7 +1105,7 @@ pub async fn get_event_detail(
             written_by: None,
         });
     }
-    let mut records = crate::routes::private::readings::provenance::records_for_event(
+    let mut records = crate::routes::private::readings::service::records_for_event(
         &state.db,
         event.id,
         event.collected_at,

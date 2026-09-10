@@ -3,6 +3,9 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use sea_orm::sea_query::{
+    Alias, Condition, Expr, ExprTrait, Func, JoinType, Order, PostgresQueryBuilder, Query,
+};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, QuerySelect,
     Statement,
@@ -12,9 +15,14 @@ use super::models::*;
 use super::service::*;
 use crate::common::AppState;
 use crate::config::Config;
+use crate::routes::private::parameters::models as parameters;
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::service as readings_service;
 use crate::routes::private::reprocessing_jobs::job::Job;
 use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
 use crate::routes::private::reprocessing_jobs::schedule::Schedule;
+use crate::routes::private::sites::models as sites;
+use crate::routes::private::sites::parameters::models as site_parameters;
 use crate::routes::private::sync::models::services as sync_services;
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
@@ -44,15 +52,14 @@ pub async fn sweep(state: &AppState) -> Result<SweepOutcome, sea_orm::DbErr> {
                 // An access change is the one thing this sweep does that somebody may need to
                 // read back, and it belongs in the entity trail rather than the reading ledger
                 // (Q57, M164).
-                db.execute_raw(Statement::from_sql_and_values(
-                    PG,
-                    "INSERT INTO change_audit (subject, change, old_value, new_value, changed_by) \
-                     VALUES ($1, 'access_revoked', $2::jsonb, NULL, 'system')",
-                    [
-                        format!("push_subscriptions:{sub}").into(),
-                        serde_json::json!({ "removed": removed }).to_string().into(),
-                    ],
-                ))
+                crate::routes::private::change_audit::service::record(
+                    db,
+                    format!("push_subscriptions:{sub}"),
+                    "access_revoked",
+                    Some("system".to_string()),
+                    Some(serde_json::json!({ "removed": removed })),
+                    None,
+                )
                 .await?;
             }
             tracing::info!(sub = %sub, "push_reconcile: pruned subscriptions for revoked user");
@@ -231,6 +238,129 @@ pub async fn run(state: &AppState, channels: &[Box<dyn NotificationChannel>]) {
 /// keeps flowing says nothing about the grab series beside it, and a spot-only slot has no
 /// continuous series at all. Evaluated separately and keyed separately in `notification_state`, the
 /// same partition `alarm_events` uses.
+/// The newest reading of each cadence at every active slot, and the widest gap between the last
+/// five spot instants. Each scalar subquery is a backward walk of `idx_readings_site_param_time`
+/// stopping at the first match, never an aggregate over the slot.
+pub fn stale_slots_query() -> Statement {
+    let sp = Alias::new("sp");
+    let readings_at_slot = |alias: &Alias| {
+        Condition::all()
+            .add(
+                Expr::col((alias.clone(), readings::Column::SiteId))
+                    .equals((sp.clone(), site_parameters::Column::SiteId)),
+            )
+            .add(
+                Expr::col((alias.clone(), readings::Column::ParameterId))
+                    .equals((sp.clone(), site_parameters::Column::ParameterId)),
+            )
+    };
+
+    let r = Alias::new("r");
+    let last_continuous = Query::select()
+        .column((r.clone(), readings::Column::Time))
+        .from_as(readings::Entity, r.clone())
+        .cond_where(
+            readings_at_slot(&r)
+                .add(Expr::col((r.clone(), readings::Column::ReplicateIndex)).eq(0))
+                // sea-query has no IS DISTINCT FROM, and a NULL measurement_type reads as
+                // continuous, so the comparison cannot be a plain inequality.
+                .add(Expr::cust(format!(
+                    r#""r"."measurement_type" IS DISTINCT FROM '{}'"#,
+                    readings_service::SPOT
+                ))),
+        )
+        .order_by((r.clone(), readings::Column::Time), Order::Desc)
+        .limit(1)
+        .to_owned();
+
+    let spot_at_slot = |alias: &Alias| {
+        readings_at_slot(alias)
+            .add(
+                Expr::col((alias.clone(), readings::Column::MeasurementType))
+                    .eq(readings_service::SPOT),
+            )
+            .add(Expr::col((alias.clone(), readings::Column::WithdrawnAt)).is_null())
+    };
+
+    let last_spot = Query::select()
+        .column((r.clone(), readings::Column::Time))
+        .from_as(readings::Entity, r.clone())
+        .cond_where(spot_at_slot(&r))
+        .order_by((r.clone(), readings::Column::Time), Order::Desc)
+        .limit(1)
+        .to_owned();
+
+    // The five newest spot instants, their consecutive differences, and the widest of them.
+    let instants = Query::select()
+        .expr_as(
+            Expr::col((r.clone(), readings::Column::Time)),
+            Alias::new("t"),
+        )
+        .distinct()
+        .from_as(readings::Entity, r.clone())
+        .cond_where(spot_at_slot(&r))
+        .order_by((r.clone(), readings::Column::Time), Order::Desc)
+        .limit(5)
+        .to_owned();
+    let gaps = Query::select()
+        .expr_as(
+            Expr::cust(r#""s"."t" - LAG("s"."t") OVER (ORDER BY "s"."t")"#),
+            Alias::new("gap"),
+        )
+        .from_subquery(instants, Alias::new("s"))
+        .to_owned();
+    let widest_gap = Query::select()
+        .expr(Expr::cust(r#"EXTRACT(EPOCH FROM MAX("g"."gap"))::float8"#))
+        .from_subquery(gaps, Alias::new("g"))
+        .to_owned();
+
+    let agg = Alias::new("agg");
+    let lateral = Query::select()
+        .expr_as(Expr::expr(last_continuous), Alias::new("last_continuous"))
+        .expr_as(Expr::expr(last_spot), Alias::new("last_spot"))
+        .expr_as(Expr::expr(widest_gap), Alias::new("spot_max_gap_seconds"))
+        .to_owned();
+
+    let s = Alias::new("s");
+    let p = Alias::new("p");
+    let query = Query::select()
+        .column((sp.clone(), site_parameters::Column::SiteId))
+        .column((sp.clone(), site_parameters::Column::ParameterId))
+        .column((s.clone(), sites::Column::ProjectId))
+        .expr_as(
+            Expr::col((s.clone(), sites::Column::Name)),
+            Alias::new("site_name"),
+        )
+        .expr_as(
+            Expr::col((p.clone(), parameters::Column::Name)),
+            Alias::new("param_name"),
+        )
+        .column((agg.clone(), Alias::new("last_continuous")))
+        .column((agg.clone(), Alias::new("last_spot")))
+        .column((agg.clone(), Alias::new("spot_max_gap_seconds")))
+        .from_as(site_parameters::Entity, sp.clone())
+        .join_as(
+            JoinType::Join,
+            sites::Entity,
+            s.clone(),
+            Expr::col((s.clone(), sites::Column::Id))
+                .equals((sp.clone(), site_parameters::Column::SiteId)),
+        )
+        .join_as(
+            JoinType::Join,
+            parameters::Entity,
+            p.clone(),
+            Expr::col((p.clone(), parameters::Column::Id))
+                .equals((sp.clone(), site_parameters::Column::ParameterId)),
+        )
+        .join_lateral(JoinType::LeftJoin, lateral, agg, Expr::cust("TRUE"))
+        .and_where(Expr::col((sp, site_parameters::Column::IsActive)))
+        .to_owned();
+
+    let (sql, values) = query.build(PostgresQueryBuilder);
+    Statement::from_sql_and_values(PG, sql, values)
+}
+
 async fn stale_data(
     state: &AppState,
     channels: &[Box<dyn NotificationChannel>],
@@ -250,39 +380,7 @@ async fn stale_data(
 
     // The dispatcher wakes on every alarm-state broadcast, so each lookup is a backward walk of
     // idx_readings_site_param_time stopping at the first match, never an aggregate over the slot.
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            PG,
-            "SELECT sp.site_id, sp.parameter_id, s.project_id, s.name AS site_name, \
-                    p.name AS param_name, \
-                    agg.last_continuous, agg.last_spot, agg.spot_max_gap_seconds \
-             FROM site_parameters sp \
-             JOIN sites s ON s.id = sp.site_id \
-             JOIN parameters p ON p.id = sp.parameter_id \
-             LEFT JOIN LATERAL ( \
-                 SELECT \
-                   (SELECT r.time FROM readings r \
-                     WHERE r.site_id = sp.site_id AND r.parameter_id = sp.parameter_id \
-                       AND r.replicate_index = 0 \
-                       AND r.measurement_type IS DISTINCT FROM 'spot' \
-                     ORDER BY r.time DESC LIMIT 1) AS last_continuous, \
-                   (SELECT r.time FROM readings r \
-                     WHERE r.site_id = sp.site_id AND r.parameter_id = sp.parameter_id \
-                       AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL \
-                     ORDER BY r.time DESC LIMIT 1) AS last_spot, \
-                   (SELECT EXTRACT(EPOCH FROM MAX(g.gap))::float8 FROM ( \
-                      SELECT s.t - LAG(s.t) OVER (ORDER BY s.t) AS gap FROM ( \
-                        SELECT DISTINCT r.time AS t FROM readings r \
-                        WHERE r.site_id = sp.site_id AND r.parameter_id = sp.parameter_id \
-                          AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL \
-                        ORDER BY r.time DESC LIMIT 5) s \
-                    ) g) AS spot_max_gap_seconds \
-             ) agg ON TRUE \
-             WHERE sp.is_active"
-                .to_string(),
-        ))
-        .await?;
-
+    let rows = db.query_all_raw(stale_slots_query()).await?;
     let base_threshold = Duration::hours(config.stale_data_threshold_hours);
     for r in &rows {
         let StaleSlot {
@@ -362,6 +460,75 @@ async fn stale_data(
     Ok(())
 }
 
+/// The newest battery value at every site and its slope over the last week's quiet hours, one
+/// scalar subquery each. The night window is what keeps a charging day out of the trend.
+pub fn battery_trend_query(battery_param: uuid::Uuid) -> Statement {
+    let s = Alias::new("s");
+    let corrected_or_raw = |alias: &Alias| {
+        Func::coalesce([
+            Expr::col((alias.clone(), readings::Column::CalibratedValue)),
+            Expr::col((alias.clone(), readings::Column::RawValue)),
+        ])
+    };
+    let battery_at_site = |name: &'static str| {
+        let alias = &Alias::new(name);
+        Condition::all()
+            .add(
+                Expr::col((alias.clone(), readings::Column::SiteId))
+                    .equals((s.clone(), sites::Column::Id)),
+            )
+            .add(Expr::col((alias.clone(), readings::Column::ParameterId)).eq(battery_param))
+            .add(Expr::col((alias.clone(), readings::Column::ReplicateIndex)).eq(0))
+            .add(Expr::cust(format!(
+                r#""{name}"."measurement_type" IS DISTINCT FROM '{spot}'"#,
+                spot = readings_service::SPOT
+            )))
+    };
+
+    let r2 = Alias::new("r2");
+    let latest = Query::select()
+        .expr(corrected_or_raw(&r2))
+        .from_as(readings::Entity, r2.clone())
+        .cond_where(battery_at_site("r2"))
+        .order_by((r2.clone(), readings::Column::Time), Order::Desc)
+        .limit(1)
+        .to_owned();
+
+    let r3 = Alias::new("r3");
+    let slope = Query::select()
+        .expr(Expr::cust_with_exprs(
+            r#"regr_slope($1, EXTRACT(EPOCH FROM "r3"."time") / 86400.0)"#,
+            [corrected_or_raw(&r3).into()],
+        ))
+        .from_as(readings::Entity, r3.clone())
+        .cond_where(
+            battery_at_site("r3")
+                .add(Expr::cust(r#""r3"."time" > NOW() - INTERVAL '7 days'"#))
+                .add(Expr::cust(
+                    r#"EXTRACT(HOUR FROM "r3"."time") BETWEEN 2 AND 4"#,
+                )),
+        )
+        .to_owned();
+
+    let query = Query::select()
+        .expr_as(
+            Expr::col((s.clone(), sites::Column::Id)),
+            Alias::new("site_id"),
+        )
+        .column((s.clone(), sites::Column::ProjectId))
+        .expr_as(
+            Expr::col((s.clone(), sites::Column::Name)),
+            Alias::new("site_name"),
+        )
+        .expr_as(Expr::expr(latest), Alias::new("latest"))
+        .expr_as(Expr::expr(slope), Alias::new("slope"))
+        .from_as(sites::Entity, s)
+        .to_owned();
+
+    let (sql, values) = query.build(PostgresQueryBuilder);
+    Statement::from_sql_and_values(PG, sql, values)
+}
+
 async fn battery_forecast(
     state: &AppState,
     channels: &[Box<dyn NotificationChannel>],
@@ -383,24 +550,7 @@ async fn battery_forecast(
         return Ok(());
     };
 
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            PG,
-            "SELECT s.id AS site_id, s.project_id, s.name AS site_name, \
-                (SELECT COALESCE(r2.calibrated_value, r2.raw_value) FROM readings r2 \
-                   WHERE r2.site_id = s.id AND r2.parameter_id = $1 AND r2.replicate_index = 0 \
-                     AND r2.measurement_type IS DISTINCT FROM 'spot' \
-                   ORDER BY r2.time DESC LIMIT 1) AS latest, \
-                (SELECT regr_slope(COALESCE(r3.calibrated_value, r3.raw_value), \
-                                   EXTRACT(EPOCH FROM r3.time) / 86400.0) FROM readings r3 \
-                   WHERE r3.site_id = s.id AND r3.parameter_id = $1 AND r3.replicate_index = 0 \
-                     AND r3.measurement_type IS DISTINCT FROM 'spot' \
-                     AND r3.time > NOW() - INTERVAL '7 days' \
-                     AND EXTRACT(HOUR FROM r3.time) BETWEEN 2 AND 4) AS slope \
-             FROM sites s",
-            [battery_param.into()],
-        ))
-        .await?;
+    let rows = db.query_all_raw(battery_trend_query(battery_param)).await?;
 
     let cutoff = config.battery_cutoff_volts;
     for r in &rows {
@@ -646,7 +796,7 @@ async fn changes_pending(
     channels: &[Box<dyn NotificationChannel>],
 ) -> Result<(), DbErr> {
     let db = &state.db;
-    let counts = crate::routes::private::readings::proposals::pending_by_source(db)
+    let counts = crate::routes::private::readings::service::pending_by_source(db)
         .await
         .map_err(|e| DbErr::Custom(e.to_string()))?;
     // What arrived is the other half of the sentence Q84 asks for, and usually the larger number:
@@ -998,7 +1148,9 @@ impl Job for PushSubscriptionReconcile {
     }
 
     fn default_schedule(&self) -> Option<Schedule> {
-        Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
+        Some(Schedule::every_secs(
+            Ord::max(self.interval_seconds, 1) as i64
+        ))
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
@@ -1033,7 +1185,7 @@ impl NotifyHealth {
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
         Self {
-            interval_seconds: config.notify_health_interval_seconds.max(30),
+            interval_seconds: Ord::max(config.notify_health_interval_seconds, 30),
         }
     }
 }
@@ -1045,7 +1197,9 @@ impl Job for NotifyHealth {
     }
 
     fn default_schedule(&self) -> Option<Schedule> {
-        Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
+        Some(Schedule::every_secs(
+            Ord::max(self.interval_seconds, 1) as i64
+        ))
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
@@ -1084,7 +1238,9 @@ impl Job for DispatchNotifications {
     }
 
     fn default_schedule(&self) -> Option<Schedule> {
-        Some(Schedule::every_secs(self.interval_seconds.max(1) as i64))
+        Some(Schedule::every_secs(
+            Ord::max(self.interval_seconds, 1) as i64
+        ))
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
@@ -1099,3 +1255,7 @@ impl Job for DispatchNotifications {
         Ok(0)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/flows.rs"]
+mod tests;

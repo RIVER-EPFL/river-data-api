@@ -509,30 +509,88 @@ fn both_spellings_of_the_site_inputs_key_parse_the_same() {
     assert_eq!(by_station.site_inputs[0].target(), "alt");
 }
 
-/// The chain executor and the event-input resolver read the same instant, so both render
-/// this one string. The predicates below are the spot serving contract.
+/// The chain executor and the event-input resolver read the same instant, so both build this one
+/// expression. The predicates below are the spot serving contract.
 #[test]
-fn test_served_spot_value_sql_carries_the_serving_predicates() {
-    use crate::routes::private::tools::service::served_spot_value_sql;
-    for parameter in ["$2", "p.id"] {
-        let sql = served_spot_value_sql(parameter);
-        assert!(sql.contains("SELECT smp.mean FROM samples smp"));
-        assert!(sql.contains("r.measurement_type = 'spot'"));
-        assert!(sql.contains("r.is_flagged IS NOT TRUE"));
-        assert!(sql.contains("r.withdrawn_at IS NULL"));
-        assert!(sql.contains("ORDER BY r.replicate_index LIMIT 1"));
-        assert_eq!(
-            sql.matches(&format!("parameter_id = {parameter}")).count(),
-            2
+fn test_served_spot_value_carries_the_serving_predicates() {
+    use crate::routes::private::tools::service::{build, served_spot_value_expr};
+    use sea_orm::sea_query::{Alias, Expr, Query};
+
+    for parameter in [Expr::val(uuid::Uuid::nil()), Expr::col(Alias::new("p_id"))] {
+        let query = Query::select()
+            .expr_as(
+                served_spot_value_expr(
+                    Expr::val(uuid::Uuid::nil()),
+                    parameter,
+                    Expr::val(chrono::Utc::now()),
+                ),
+                Alias::new("value"),
+            )
+            .to_owned();
+        let sql = build(&query).sql;
+
+        assert!(sql.contains(r#"FROM "samples" AS "smp""#), "{sql}");
+        assert!(sql.contains(r#""smp"."mean""#), "{sql}");
+        assert!(sql.contains(r#""r"."measurement_type" = $"#), "{sql}");
+        assert!(sql.contains(r#""r"."is_flagged" IS NOT TRUE"#), "{sql}");
+        assert!(sql.contains(r#""r"."withdrawn_at" IS NULL"#), "{sql}");
+        assert!(
+            sql.contains(r#"ORDER BY "r"."replicate_index" ASC LIMIT $"#),
+            "{sql}"
         );
+        assert_eq!(sql.matches("parameter_id").count(), 2, "{sql}");
     }
 }
 
+/// The parameter is the only thing that differs between the two callers: one binds an id, the
+/// other names the column the statement already resolved.
 #[test]
-fn test_served_spot_value_sql_differs_only_in_the_parameter_expression() {
-    use crate::routes::private::tools::service::served_spot_value_sql;
+fn test_served_spot_value_takes_the_parameter_as_an_expression() {
+    use crate::routes::private::tools::service::{build, served_spot_value_expr};
+    use sea_orm::sea_query::{Alias, Expr, Query};
+
+    let named = build(
+        &Query::select()
+            .expr(served_spot_value_expr(
+                Expr::val(uuid::Uuid::nil()),
+                Expr::col(Alias::new("p_id")),
+                Expr::val(chrono::Utc::now()),
+            ))
+            .to_owned(),
+    )
+    .sql;
+    assert!(named.contains(r#""parameter_id" = "p_id""#), "{named}");
+}
+
+/// Scenario: the coverage query is built rather than written out.
+/// Expected behaviour: configuration and observation stay separate LATERALs, so a parameter with
+/// no readings still reports zeroes, and a site scope narrows both sides.
+#[test]
+fn test_coverage_query_keeps_the_two_sides_lateral() {
+    use crate::routes::private::tools::service::coverage_query;
+
+    let unscoped = coverage_query(&[uuid::Uuid::nil()], None).sql;
     assert_eq!(
-        served_spot_value_sql("p.id"),
-        served_spot_value_sql("$2").replace("$2", "p.id")
+        unscoped.matches("LEFT JOIN LATERAL").count(),
+        2,
+        "{unscoped}"
     );
+    assert!(
+        unscoped.contains(r#"FROM "parameters" AS "p""#),
+        "{unscoped}"
+    );
+    assert!(
+        unscoped.contains(r#"ARRAY_AGG(DISTINCT "ds"."source_system") FILTER (WHERE "ds"."source_system" IS NOT NULL)"#),
+        "{unscoped}"
+    );
+    assert!(unscoped.contains("ARRAY[]::text[]"), "{unscoped}");
+    assert!(
+        unscoped.contains(r#"ORDER BY "p"."code" ASC"#),
+        "{unscoped}"
+    );
+    assert!(!unscoped.contains(r#""sp"."site_id""#), "{unscoped}");
+
+    let scoped = coverage_query(&[uuid::Uuid::nil()], Some(uuid::Uuid::nil())).sql;
+    assert!(scoped.contains(r#""sp"."site_id" = $"#), "{scoped}");
+    assert!(scoped.contains(r#""r"."site_id" = $"#), "{scoped}");
 }

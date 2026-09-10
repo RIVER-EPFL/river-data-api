@@ -3,15 +3,25 @@
 
 use chrono::{DateTime, Utc};
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
+use sea_orm::sea_query::{
+    Alias, Asterisk, Expr, ExprTrait, Func, JoinType, OnConflict, Order, PostgresQueryBuilder,
+    Query, SelectStatement,
+};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
-    FromQueryResult, QueryFilter, Set, Statement, TransactionTrait,
+    FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::service as readings_service;
+use crate::routes::private::sensors::calibrations;
+use crate::routes::private::sensors::calibrations::model as calibrations_model;
 use crate::routes::private::sensors::deployments;
+use crate::routes::private::sensors::deployments::model as deployments_model;
+use crate::routes::private::sensors::standard_curves::model as standard_curves;
 use crate::routes::private::sync::service as audit;
 use crate::routes::private::{data_streams, sensors};
 
@@ -53,15 +63,7 @@ impl CRUDOperations for SensorOperations {
         id: Uuid,
     ) -> Result<(), ApiError> {
         let blocking = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT \
-                   EXISTS(SELECT 1 FROM readings WHERE sensor_id = $1) AS readings, \
-                   EXISTS(SELECT 1 FROM standard_curves WHERE sensor_id = $1) AS curves, \
-                   EXISTS(SELECT 1 FROM sensor_calibrations WHERE sensor_id = $1) AS calibrations, \
-                   EXISTS(SELECT 1 FROM sensor_deployments WHERE sensor_id = $1) AS deployments",
-                [id.into()],
-            ))
+            .query_one_raw(holders_of_instrument(id))
             .await
             .map_err(ApiError::database)?;
         if let Some(row) = blocking {
@@ -282,14 +284,7 @@ async fn enrich<C: ConnectionTrait>(
         }
     }
     let spot_rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT sensor_id, COUNT(*) AS n FROM readings \
-                  WHERE sensor_id = ANY($1) AND time > now() - INTERVAL '90 days' \
-                    AND measurement_type = 'spot' AND is_flagged IS NOT TRUE \
-                  GROUP BY sensor_id",
-            values.clone(),
-        ))
+        .query_all_raw(recent_spot_counts(ids))
         .await
         .map_err(ApiError::database)?;
     for row in &spot_rows {
@@ -331,7 +326,7 @@ async fn enrich<C: ConnectionTrait>(
     let mut window_end: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
     let note = |map: &mut HashMap<Uuid, DateTime<Utc>>, id: Uuid, t: DateTime<Utc>| {
         map.entry(id)
-            .and_modify(|cur| *cur = (*cur).max(t))
+            .and_modify(|cur| *cur = Ord::max(*cur, t))
             .or_insert(t);
     };
     for row in &cursor_rows {
@@ -365,14 +360,7 @@ async fn enrich<C: ConnectionTrait>(
         .collect();
     if !uncovered.is_empty() {
         let rows = db
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) AS value
-                  FROM readings
-                  WHERE sensor_id = ANY($1) AND time > now() - INTERVAL '90 days'
-                  ORDER BY sensor_id, time DESC",
-                [uncovered.into()],
-            ))
+            .query_all_raw(newest_value_per_instrument(&uncovered, None))
             .await
             .map_err(ApiError::database)?;
         record_values(&rows, &mut out);
@@ -393,18 +381,9 @@ async fn enrich<C: ConnectionTrait>(
             i += 1;
         }
         let rows = db
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"SELECT DISTINCT ON (sensor_id) sensor_id, time, COALESCE(calibrated_value, raw_value) AS value
-                  FROM readings
-                  WHERE sensor_id = ANY($1) AND time >= $2 AND time <= $3
-                  ORDER BY sensor_id, time DESC",
-                [
-                    cluster.into(),
-                    sea_orm::prelude::DateTimeWithTimeZone::from(lo - chrono::Duration::days(1))
-                        .into(),
-                    sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
-                ],
+            .query_all_raw(newest_value_per_instrument(
+                &cluster,
+                Some((lo - chrono::Duration::days(1), hi)),
             ))
             .await
             .map_err(ApiError::database)?;
@@ -419,15 +398,7 @@ async fn enrich<C: ConnectionTrait>(
         out.entry(*id).or_default().curve_count = Some(0);
     }
     let curve_rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT sc.sensor_id, COUNT(DISTINCT sc.id) AS curves, MAX(r.time) AS last_use
-                  FROM standard_curves sc
-                  LEFT JOIN readings r ON r.standard_curve_id = sc.id
-                  WHERE sc.sensor_id = ANY($1)
-                  GROUP BY sc.sensor_id",
-            [ids.to_vec().into()],
-        ))
+        .query_all_raw(curve_use_per_instrument(ids))
         .await
         .map_err(ApiError::database)?;
     for row in &curve_rows {
@@ -440,6 +411,136 @@ async fn enrich<C: ConnectionTrait>(
     }
 
     Ok(out)
+}
+
+/// What still points at an instrument. One row of four booleans, so a refusal names everything it
+/// holds rather than the first thing found.
+fn holders_of_instrument(id: Uuid) -> Statement {
+    let query = Query::select()
+        .expr_as(
+            holds(readings::Entity, readings::Column::SensorId, id),
+            Alias::new("readings"),
+        )
+        .expr_as(
+            holds(
+                standard_curves::Entity,
+                standard_curves::Column::SensorId,
+                id,
+            ),
+            Alias::new("curves"),
+        )
+        .expr_as(
+            holds(
+                calibrations_model::Entity,
+                calibrations_model::Column::SensorId,
+                id,
+            ),
+            Alias::new("calibrations"),
+        )
+        .expr_as(
+            holds(
+                deployments_model::Entity,
+                deployments_model::Column::SensorId,
+                id,
+            ),
+            Alias::new("deployments"),
+        )
+        .to_owned();
+    build(&query)
+}
+
+/// Whether any row of `entity` names this instrument.
+fn holds<E: EntityTrait>(entity: E, column: E::Column, id: Uuid) -> Expr {
+    Expr::exists(
+        Query::select()
+            .expr(Expr::val(1))
+            .from(entity)
+            .and_where(Expr::col(column).eq(id))
+            .to_owned(),
+    )
+}
+
+/// How many unflagged spot replicates each instrument produced in the last 90 days.
+fn recent_spot_counts(ids: &[Uuid]) -> Statement {
+    let query = Query::select()
+        .column(readings::Column::SensorId)
+        .expr_as(Expr::col(Asterisk).count(), Alias::new("n"))
+        .from(readings::Entity)
+        .and_where(readings::Column::SensorId.is_in(ids.to_vec()))
+        .and_where(Expr::cust("time > now() - INTERVAL '90 days'"))
+        .and_where(readings::Column::MeasurementType.eq(readings_service::SPOT))
+        .and_where(Expr::cust("is_flagged IS NOT TRUE"))
+        .add_group_by([Expr::col(readings::Column::SensorId)])
+        .to_owned();
+    build(&query)
+}
+
+/// The newest value each instrument measured, over the given window or the last 90 days. The
+/// window is what keeps the index scan bounded; `DISTINCT ON` takes the first row per instrument.
+fn newest_value_per_instrument(
+    ids: &[Uuid],
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Statement {
+    let mut query = Query::select();
+    query
+        .distinct_on([readings::Column::SensorId])
+        .column(readings::Column::SensorId)
+        .column(readings::Column::Time)
+        .expr_as(
+            Func::coalesce([
+                Expr::col(readings::Column::CalibratedValue),
+                Expr::col(readings::Column::RawValue),
+            ]),
+            Alias::new("value"),
+        )
+        .from(readings::Entity)
+        .and_where(readings::Column::SensorId.is_in(ids.to_vec()))
+        .order_by(readings::Column::SensorId, Order::Asc)
+        .order_by(readings::Column::Time, Order::Desc);
+    match window {
+        Some((from, to)) => {
+            query
+                .and_where(readings::Column::Time.gte(from))
+                .and_where(readings::Column::Time.lte(to));
+        }
+        None => {
+            query.and_where(Expr::cust("time > now() - INTERVAL '90 days'"));
+        }
+    }
+    build(&query)
+}
+
+/// The curves each lab instrument fitted, and the newest reading any of them corrected.
+fn curve_use_per_instrument(ids: &[Uuid]) -> Statement {
+    let sc = Alias::new("sc");
+    let r = Alias::new("r");
+    let query = Query::select()
+        .column((sc.clone(), standard_curves::Column::SensorId))
+        .expr_as(
+            Expr::col((sc.clone(), standard_curves::Column::Id)).count_distinct(),
+            Alias::new("curves"),
+        )
+        .expr_as(
+            Expr::col((r.clone(), readings::Column::Time)).max(),
+            Alias::new("last_use"),
+        )
+        .from_as(standard_curves::Entity, sc.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            readings::Entity,
+            r.clone(),
+            Expr::col((r, readings::Column::StandardCurveId))
+                .equals((sc.clone(), standard_curves::Column::Id)),
+        )
+        .and_where(Expr::col((sc.clone(), standard_curves::Column::SensorId)).is_in(ids.to_vec()))
+        .add_group_by([Expr::col((sc, standard_curves::Column::SensorId))])
+        .to_owned();
+    build(&query)
+}
+
+fn build(query: &SelectStatement) -> Statement {
+    let (sql, values) = query.build(PostgresQueryBuilder);
+    Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values)
 }
 
 /// What still points at an instrument, which is what refuses its deletion.
@@ -594,13 +695,6 @@ async fn link_stream_to_sensor<C: ConnectionTrait>(
 }
 
 #[derive(Debug, FromQueryResult)]
-struct InstrumentKindRow {
-    kind: Option<String>,
-    name: Option<String>,
-    is_lab_instrument: Option<bool>,
-}
-
-#[derive(Debug, FromQueryResult)]
 struct SlotNamesRow {
     site_name: String,
     parameter_name: String,
@@ -619,19 +713,20 @@ pub async fn require_measuring_instrument<C: ConnectionTrait>(
     sensor_id: Uuid,
     subject: &str,
 ) -> AppResult<()> {
-    let row = InstrumentKindRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT kind, name, is_lab_instrument FROM sensors WHERE id = $1",
-        [sensor_id.into()],
-    ))
-    .one(db)
-    .await?
-    .ok_or_else(|| AppError::BadRequest(format!("Instrument {sensor_id} not found")))?;
-    let kind = InstrumentKind::of(row.kind.as_deref(), row.is_lab_instrument);
+    let (stored_kind, name, is_lab_instrument) = Entity::find_by_id(sensor_id)
+        .select_only()
+        .column(Column::Kind)
+        .column(Column::Name)
+        .column(Column::IsLabInstrument)
+        .into_tuple::<(Option<String>, Option<String>, Option<bool>)>()
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::BadRequest(format!("Instrument {sensor_id} not found")))?;
+    let kind = InstrumentKind::of(stored_kind.as_deref(), is_lab_instrument);
     if !kind.is_bookkeeping() {
         return Ok(());
     }
-    let name = row.name.unwrap_or_else(|| sensor_id.to_string());
+    let name = name.unwrap_or_else(|| sensor_id.to_string());
     Err(AppError::BadRequest(format!(
         "{name} is a {} row, which records that nothing was declared; it cannot be {subject}",
         kind.as_str()
@@ -660,40 +755,43 @@ pub async fn upsert_source_instrument<C: ConnectionTrait>(
     data_frequency: &str,
     metadata: Option<serde_json::Value>,
 ) -> AppResult<Uuid> {
-    let is_lab_instrument = kind.is_lab_instrument();
-    let metadata_val: sea_orm::Value = match &metadata {
-        Some(v) => serde_json::to_string(v)
-            .unwrap_or_else(|_| "null".to_string())
-            .into(),
-        None => sea_orm::Value::String(None),
+    use sea_orm::sea_query::ExprTrait;
+    let mint = ActiveModel {
+        id: Set(Uuid::new_v4()),
+        name: Set(Some(name.to_string())),
+        is_active: Set(Some(true)),
+        is_lab_instrument: Set(Some(kind.is_lab_instrument())),
+        data_frequency: Set(data_frequency.to_string()),
+        source_system: Set(Some(source_system.to_string())),
+        source_key: Set(Some(source_key.to_string())),
+        metadata: Set(metadata),
+        kind: Set(kind.as_str().to_string()),
+        created_at: Set(Some(Utc::now())),
+        ..Default::default()
     };
-
-    let inserted = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r#"INSERT INTO sensors
-                   (id, name, is_active, is_lab_instrument, data_frequency,
-                    source_system, source_key, metadata, kind, created_at)
-               VALUES (gen_random_uuid(), $1, true, $2, $3, $4, $5, $6::jsonb, $7, now())
-               ON CONFLICT (source_system, source_key)
-                   WHERE source_system IS NOT NULL AND source_key IS NOT NULL
-               DO NOTHING
-               RETURNING id"#,
-            [
-                name.into(),
-                is_lab_instrument.into(),
-                data_frequency.into(),
-                source_system.into(),
-                source_key.into(),
-                metadata_val,
-                kind.as_str().into(),
-            ],
-        ))
+    // The unique index is partial, so the conflict target carries its predicate or Postgres
+    // cannot infer which index the arm names.
+    let inserted = Entity::insert(mint)
+        .on_conflict(
+            OnConflict::columns([Column::SourceSystem, Column::SourceKey])
+                .target_and_where(
+                    Expr::col(Column::SourceSystem)
+                        .is_not_null()
+                        .and(Expr::col(Column::SourceKey).is_not_null()),
+                )
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(db)
         .await?;
 
-    if let Some(row) = inserted {
-        let id: Uuid = row.try_get("", "id")?;
-        return Ok(id);
+    if inserted > 0 {
+        return find_sensor_by_source(db, source_system, source_key)
+            .await?
+            .map(|row| row.id)
+            .ok_or_else(|| {
+                AppError::Internal("the instrument just minted was not found".to_string())
+            });
     }
 
     let existing = find_sensor_by_source(db, source_system, source_key)
@@ -934,14 +1032,14 @@ pub async fn stream_history_start<C: ConnectionTrait>(
     db: &C,
     stream_id: Uuid,
 ) -> AppResult<DateTime<Utc>> {
-    let first = FirstReadingRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT MIN(time) AS first_reading FROM readings WHERE stream_id = $1",
-        [stream_id.into()],
-    ))
-    .one(db)
-    .await?
-    .and_then(|r| r.first_reading);
+    let first = readings::Entity::find()
+        .select_only()
+        .column_as(readings::Column::Time.min(), "first_reading")
+        .filter(readings::Column::StreamId.eq(stream_id))
+        .into_model::<FirstReadingRow>()
+        .one(db)
+        .await?
+        .and_then(|r| r.first_reading);
     Ok(first.unwrap_or_else(Utc::now))
 }
 
@@ -1034,19 +1132,17 @@ pub async fn close_sensor_deployment(
     site_id: Uuid,
     parameter_id: Uuid,
 ) -> AppResult<()> {
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE sensor_deployments
-          SET deployed_until = $1
-          WHERE sensor_id = $2 AND site_id = $3 AND parameter_id = $4 AND deployed_until IS NULL",
-        [
-            Utc::now().into(),
-            sensor_id.into(),
-            site_id.into(),
-            parameter_id.into(),
-        ],
-    ))
-    .await?;
+    deployments::Entity::update_many()
+        .col_expr(
+            deployments::Column::DeployedUntil,
+            Expr::value(Some(Utc::now())),
+        )
+        .filter(deployments::Column::SensorId.eq(sensor_id))
+        .filter(deployments::Column::SiteId.eq(site_id))
+        .filter(deployments::Column::ParameterId.eq(parameter_id))
+        .filter(deployments::Column::DeployedUntil.is_null())
+        .exec(db)
+        .await?;
     Ok(())
 }
 
@@ -1078,57 +1174,38 @@ pub async fn resolve_windows_for_times<C: ConnectionTrait>(
     // Read the raw nullable bounds (NULL = open / unbounded). Do NOT COALESCE to 'infinity' in SQL
     // and read it into a non-nullable DateTime, chrono/sqlx cannot represent infinity and would
     // panic for the (common) open calibration/deployment.
-    let cal_rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id, valid_from, valid_until
-              FROM sensor_calibrations WHERE sensor_id = $1 ORDER BY valid_from",
-            [sensor_id.into()],
-        ))
-        .await?;
-    let cals: Vec<(Uuid, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>)> = cal_rows
-        .iter()
-        .map(|r| CalWindow::from_query_result(r, ""))
-        .map(|r| {
-            r.map(|c| {
-                (
-                    c.id,
-                    c.valid_from.with_timezone(&Utc),
-                    c.valid_until.map(|u| u.with_timezone(&Utc)),
-                )
-            })
-        })
-        .collect::<Result<_, _>>()?;
+    let cals: Vec<(Uuid, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>)> =
+        calibrations::Entity::find()
+            .filter(calibrations::Column::SensorId.eq(sensor_id))
+            .select_only()
+            .column(calibrations::Column::Id)
+            .column(calibrations::Column::ValidFrom)
+            .column(calibrations::Column::ValidUntil)
+            .order_by_asc(calibrations::Column::ValidFrom)
+            .into_tuple()
+            .all(db)
+            .await?;
 
-    let dep_rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id, site_id, deployed_from, deployed_until
-              FROM sensor_deployments
-              WHERE sensor_id = $1 AND ($2::uuid IS NULL OR parameter_id = $2)
-              ORDER BY deployed_from",
-            [sensor_id.into(), parameter_id.into()],
-        ))
-        .await?;
+    let mut dep_query =
+        deployments::Entity::find().filter(deployments::Column::SensorId.eq(sensor_id));
+    if let Some(parameter_id) = parameter_id {
+        dep_query = dep_query.filter(deployments::Column::ParameterId.eq(parameter_id));
+    }
     let deps: Vec<(
         Uuid,
         Uuid,
         chrono::DateTime<Utc>,
         Option<chrono::DateTime<Utc>>,
-    )> = dep_rows
-        .iter()
-        .map(|r| SiteWindow::from_query_result(r, ""))
-        .map(|r| {
-            r.map(|d| {
-                (
-                    d.id,
-                    d.site_id,
-                    d.deployed_from.with_timezone(&Utc),
-                    d.deployed_until.map(|u| u.with_timezone(&Utc)),
-                )
-            })
-        })
-        .collect::<Result<_, _>>()?;
+    )> = dep_query
+        .select_only()
+        .column(deployments::Column::Id)
+        .column(deployments::Column::SiteId)
+        .column(deployments::Column::DeployedFrom)
+        .column(deployments::Column::DeployedUntil)
+        .order_by_asc(deployments::Column::DeployedFrom)
+        .into_tuple()
+        .all(db)
+        .await?;
 
     for &t in times {
         // A NULL upper bound is open-ended (covers everything from `from` onward).
@@ -1178,28 +1255,18 @@ pub async fn resolve_slot_owner_for_times<C: ConnectionTrait>(
         return Ok(out);
     }
 
-    let dep_rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT id, sensor_id, deployed_from, deployed_until
-              FROM sensor_deployments WHERE site_id = $1 AND parameter_id = $2 ORDER BY deployed_from",
-            [site_id.into(), parameter_id.into()],
-        ))
+    let deps: Vec<SlotWindowRow> = deployments::Entity::find()
+        .filter(deployments::Column::SiteId.eq(site_id))
+        .filter(deployments::Column::ParameterId.eq(parameter_id))
+        .select_only()
+        .column(deployments::Column::Id)
+        .column(deployments::Column::SensorId)
+        .column(deployments::Column::DeployedFrom)
+        .column(deployments::Column::DeployedUntil)
+        .order_by_asc(deployments::Column::DeployedFrom)
+        .into_tuple()
+        .all(db)
         .await?;
-    let deps: Vec<SlotWindowRow> = dep_rows
-        .iter()
-        .map(|r| SensorWindow::from_query_result(r, ""))
-        .map(|r| {
-            r.map(|d| {
-                (
-                    d.id,
-                    d.sensor_id,
-                    d.deployed_from.with_timezone(&Utc),
-                    d.deployed_until.map(|u| u.with_timezone(&Utc)),
-                )
-            })
-        })
-        .collect::<Result<_, _>>()?;
     if deps.is_empty() {
         for &t in times {
             out.insert(t, ResolvedOwner::default());
@@ -1345,29 +1412,6 @@ pub async fn raise_source_identity_hold<C: ConnectionTrait>(
 }
 
 /// The three window queries this module makes, each as the row its SELECT returns.
-#[derive(FromQueryResult)]
-struct CalWindow {
-    id: Uuid,
-    valid_from: DateTime<chrono::FixedOffset>,
-    valid_until: Option<DateTime<chrono::FixedOffset>>,
-}
-
-#[derive(FromQueryResult)]
-struct SiteWindow {
-    id: Uuid,
-    site_id: Uuid,
-    deployed_from: DateTime<chrono::FixedOffset>,
-    deployed_until: Option<DateTime<chrono::FixedOffset>>,
-}
-
-#[derive(FromQueryResult)]
-struct SensorWindow {
-    id: Uuid,
-    sensor_id: Uuid,
-    deployed_from: DateTime<chrono::FixedOffset>,
-    deployed_until: Option<DateTime<chrono::FixedOffset>>,
-}
-
 /// Which serial a newly minted instrument may claim.
 ///
 /// `idx_sensors_serial_unique` is partial and unique, so a serial already on another row cannot be

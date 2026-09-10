@@ -136,7 +136,7 @@ async fn merge_preserves_conflicting_readings() {
             target_site_parameter_id: crate::common::PARAM_S1_DO_ID.parse().unwrap(),
         },
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await;
 

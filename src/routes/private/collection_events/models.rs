@@ -339,7 +339,7 @@ pub struct EventCell {
     /// serves, so the point record opened from the grid needs no second fetch.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
-    pub record: Option<crate::routes::private::readings::provenance::ProvenanceRecord>,
+    pub record: Option<crate::routes::private::readings::models::ProvenanceRecord>,
     /// The oldest open event-audit finding for this cell.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]

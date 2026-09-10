@@ -1,52 +1,57 @@
-//! The `csv_import` job: the worker half of `readings/import.rs`. The request stages rows and
-//! enqueues; this inserts them, recomputes derived parameters, refreshes aggregates over the
-//! imported window and enqueues the alarm backfill.
-
 use async_trait::async_trait;
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, Set, Statement,
-};
+use sea_orm::ActiveModelTrait;
+use sea_orm::ColumnTrait;
+use sea_orm::ConnectionTrait;
+use sea_orm::DbErr;
+use sea_orm::EntityTrait;
+use sea_orm::FromQueryResult;
+use sea_orm::QueryFilter;
+use sea_orm::Set;
+use sea_orm::Statement;
+use sea_orm::entity::prelude::*;
 use uuid::Uuid;
 
-use super::batch::{ConflictMode, readings_on_conflict};
-use super::import::BATCH_SIZE as CSV_BATCH_SIZE;
-use super::{sample_groups, tail};
 use crate::routes::private::data_streams;
 use crate::routes::private::readings;
+use crate::routes::private::readings::models::ConflictMode;
+use crate::routes::private::readings::service::BATCH_SIZE as CSV_BATCH_SIZE;
+use crate::routes::private::readings::service::readings_on_conflict;
 use crate::routes::private::reprocessing_jobs::job::Job;
-use crate::routes::private::reprocessing_jobs::jobs::{
-    as_db_err, optional_datetime, required_uuid, uuid_pair_array,
-};
-use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
+use crate::routes::private::reprocessing_jobs::jobs::as_db_err;
+use crate::routes::private::reprocessing_jobs::jobs::optional_datetime;
+use crate::routes::private::reprocessing_jobs::jobs::required_uuid;
+use crate::routes::private::reprocessing_jobs::jobs::uuid_pair_array;
+use crate::routes::private::reprocessing_jobs::lifecycle::JobContext;
+use crate::routes::private::reprocessing_jobs::lifecycle::JobReport;
 use crate::routes::private::sensors::calibrations;
-use crate::routes::private::sensors::calibrations::service::{
-    Curve, apply_curves, recalculate_derived_at_timestamp,
-};
+use crate::routes::private::sensors::calibrations::service::Curve;
+use crate::routes::private::sensors::calibrations::service::apply_curves;
+use crate::routes::private::sensors::calibrations::service::recalculate_derived_at_timestamp;
 
 /// One staged row, as `csv_import_staging` holds it. The job reads the set four times, so the
 /// columns are named once here rather than in each pass.
 #[derive(Debug, Clone, Copy, FromQueryResult)]
-struct StagedRow {
-    stream_id: Uuid,
-    site_id: Option<Uuid>,
-    parameter_id: Option<Uuid>,
-    time: chrono::DateTime<chrono::FixedOffset>,
-    raw_value: f64,
-    sensor_id: Option<Uuid>,
-    calibration_id: Option<Uuid>,
-    deployment_id: Option<Uuid>,
+pub(super) struct StagedRow {
+    pub(super) stream_id: Uuid,
+    pub(super) site_id: Option<Uuid>,
+    pub(super) parameter_id: Option<Uuid>,
+    pub(super) time: chrono::DateTime<chrono::FixedOffset>,
+    pub(super) raw_value: f64,
+    pub(super) sensor_id: Option<Uuid>,
+    pub(super) calibration_id: Option<Uuid>,
+    pub(super) deployment_id: Option<Uuid>,
 }
 
 /// A curated replicate an overwrite is about to displace, and what makes it curated.
 #[derive(FromQueryResult)]
-struct CuratedRow {
-    replicate_index: i16,
-    reason: String,
+pub(super) struct CuratedRow {
+    pub(super) replicate_index: i16,
+    pub(super) reason: String,
 }
 
 #[derive(FromQueryResult)]
-struct IdRow {
-    id: Uuid,
+pub(super) struct IdRow {
+    pub(super) id: Uuid,
 }
 
 /// Take a spot group's replicates from `count` onwards out of what the group serves, ahead of an
@@ -56,7 +61,7 @@ struct IdRow {
 /// and the value itself all survive it, and an import that later carries the column again clears
 /// the stamp. A displaced row somebody had curated raises a `source_modified` hold, because
 /// dropping it out of the served group is a ruling the file's column count should not make alone.
-async fn displace_spot_tail(
+pub(super) async fn displace_spot_tail(
     txn: &sea_orm::DatabaseTransaction,
     stream_id: Uuid,
     time: chrono::DateTime<chrono::Utc>,
@@ -91,7 +96,7 @@ async fn displace_spot_tail(
                 }))
             })
             .collect::<Result<Vec<_>, DbErr>>()?;
-        crate::routes::private::readings::reconcile::upsert_source_modified_hold(
+        crate::routes::private::readings::service::upsert_source_modified_hold(
             txn,
             stream_id,
             time,
@@ -103,7 +108,10 @@ async fn displace_spot_tail(
     }
 
     // The displacement and its reversal are decisions of CSV origin (ADR 0008).
-    use crate::routes::private::readings::decisions::{Kind, NewValue, Origin, record_many};
+    use super::models::Kind;
+    use super::models::Origin;
+    use super::service::NewValue;
+    use super::service::record_many;
     record_many(
         txn,
         Kind::Withdraw,
@@ -170,7 +178,7 @@ impl Job for CsvImport {
 }
 
 impl CsvImport {
-    async fn run_import(ctx: &JobContext, import_token: Uuid) -> Result<i64, DbErr> {
+    pub(super) async fn run_import(ctx: &JobContext, import_token: Uuid) -> Result<i64, DbErr> {
         let params = ctx.params();
         let site_id = required_uuid(params, "site_id")?;
         let site_name = params
@@ -298,12 +306,11 @@ impl CsvImport {
             {
                 defaults.insert(stream.id, stream.measurement_type);
             }
-            let types =
-                crate::routes::private::readings::measurement::measurement_types_for_sensors(
-                    ctx.db(),
-                    &sensor_ids,
-                )
-                .await?;
+            let types = crate::routes::private::readings::service::measurement_types_for_sensors(
+                ctx.db(),
+                &sensor_ids,
+            )
+            .await?;
             (defaults, types)
         } else {
             (
@@ -327,7 +334,7 @@ impl CsvImport {
             } = row;
             distinct_ts.push(time.with_timezone(&chrono::Utc));
             let measurement_type =
-                crate::routes::private::readings::measurement::resolve_measurement_type(
+                crate::routes::private::readings::service::resolve_measurement_type(
                     request_measurement_type.as_deref(),
                     stream_defaults.get(&stream_id).and_then(|d| d.as_deref()),
                     sensor_id,
@@ -372,14 +379,16 @@ impl CsvImport {
             *counter += 1;
         }
 
-        // Whether a group is a sample is not decided here: `sample_groups::forms_sample` is the
+        // Whether a group is a sample is not decided here: `crate::routes::private::readings::service::forms_sample` is the
         // one answer, two or more rows classified spot sharing a slot instant.
         let mut spot_groups: std::collections::HashMap<
             (Uuid, Uuid, chrono::DateTime<chrono::Utc>),
             usize,
         > = std::collections::HashMap::new();
         for m in &models {
-            if m.measurement_type.as_ref().as_deref() != Some(sample_groups::SPOT) {
+            if m.measurement_type.as_ref().as_deref()
+                != Some(crate::routes::private::readings::service::SPOT)
+            {
                 continue;
             }
             if let (Some(sid), Some(pid)) = (*m.site_id.as_ref(), *m.parameter_id.as_ref()) {
@@ -390,7 +399,7 @@ impl CsvImport {
         }
         let replicate_groups = spot_groups
             .values()
-            .filter(|count| sample_groups::forms_sample(**count))
+            .filter(|count| crate::routes::private::readings::service::forms_sample(**count))
             .count();
 
         let total = i32::try_from(models.len()).unwrap_or(i32::MAX);
@@ -405,7 +414,9 @@ impl CsvImport {
         > = std::collections::HashMap::new();
         if conflict == ConflictMode::Overwrite {
             for m in &models {
-                if m.measurement_type.as_ref().as_deref() == Some(sample_groups::SPOT) {
+                if m.measurement_type.as_ref().as_deref()
+                    == Some(crate::routes::private::readings::service::SPOT)
+                {
                     *spot_group_sizes
                         .entry((
                             *m.stream_id.as_ref(),
@@ -432,11 +443,11 @@ impl CsvImport {
                 // (ADR 0008). The count it returns is what the run reports as overwritten.
                 if conflict == ConflictMode::Overwrite {
                     let corrections =
-                        crate::routes::private::readings::decisions::record_value_corrections(
+                        crate::routes::private::readings::service::record_value_corrections(
                             txn,
                             chunk,
                             "csv_import",
-                            crate::routes::private::readings::decisions::Origin::Csv,
+                            crate::routes::private::readings::models::Origin::Csv,
                         )
                         .await?;
                     corrected += usize::try_from(corrections.rows).unwrap_or(usize::MAX);
@@ -517,7 +528,7 @@ impl CsvImport {
                 last.to_rfc3339()
             );
             let stream_ids_for_events = stream_ids.clone();
-            sample_groups::materialise_samples(
+            crate::routes::private::readings::service::materialise_samples(
                 ctx.db(),
                 &row_predicate,
                 vec![stream_ids.clone().into()],
@@ -540,8 +551,10 @@ impl CsvImport {
             // events this looks them up by.
             touched_visits = crate::routes::private::collection_events::flows::touched_events(
                 ctx.db(),
-                &row_predicate,
-                vec![stream_ids_for_events.into()],
+                crate::routes::private::collection_events::flows::rows_matching(
+                    &row_predicate,
+                    vec![stream_ids_for_events.into()],
+                ),
             )
             .await
             .map_err(as_db_err)?;
@@ -579,29 +592,33 @@ impl CsvImport {
             // refresh reports an import as complete while the rollups still serve the old numbers.
             // The window can be long, so episodes are rebuilt by the `alarm_backfill` job.
             let app = crate::common::global_app_state();
-            let written =
-                tail::Written::new(u64::try_from(inserted_total + overwritten).unwrap_or(u64::MAX))
-                    .over(since.zip(latest))
-                    .at(param_streams
-                        .iter()
-                        .map(|(parameter_id, stream_id)| {
-                            tail::Slot::paired(site_id, *parameter_id).through(*stream_id)
-                        })
-                        .collect())
-                    .touching(touched_visits);
-            tail::run(
-                tail::Sink {
+            let written = crate::routes::private::readings::service::Written::new(
+                u64::try_from(inserted_total + overwritten).unwrap_or(u64::MAX),
+            )
+            .over(since.zip(latest))
+            .at(param_streams
+                .iter()
+                .map(|(parameter_id, stream_id)| {
+                    crate::routes::private::readings::service::Slot::paired(site_id, *parameter_id)
+                        .through(*stream_id)
+                })
+                .collect())
+            .touching(touched_visits);
+            crate::routes::private::readings::service::run(
+                crate::routes::private::readings::service::Sink {
                     db: ctx.db(),
                     events: ctx.events(),
                     cache: app.as_ref().map(|a| &a.response_cache),
                 },
                 &written,
-                &tail::Axes {
-                    cache: tail::Cache::Sites,
-                    refresh: tail::Refresh::Since { fatal: true },
+                &crate::routes::private::readings::service::Axes {
+                    cache: crate::routes::private::readings::service::Cache::Sites,
+                    refresh: crate::routes::private::readings::service::Refresh::Since {
+                        fatal: true,
+                    },
                     announce: true,
                     reconcile_alarms: false,
-                    episodes: tail::Episodes::Job,
+                    episodes: crate::routes::private::readings::service::Episodes::Job,
                     recompute_derived: false,
                     writer: crate::routes::private::collection_events::flows::Writer::Person,
                 },

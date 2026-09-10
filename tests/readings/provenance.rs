@@ -7,7 +7,8 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serde_json::json;
 use serial_test::serial;
 
-use river_db::routes::private::readings::decisions;
+use river_db::routes::private::readings::models as decision_models;
+use river_db::routes::private::readings::service as decisions;
 
 use crate::common::sensor_lifecycle::create_sensor_without_curve;
 use crate::common::{GLOBAL_PARAM_DO_ID, PARAM_S1_DO_ID, SITE1_ID};
@@ -406,11 +407,11 @@ async fn the_arrival_of_the_current_value_is_the_correction_that_wrote_it() {
             time: T1.parse().unwrap(),
             replicate_index: Some(0),
         },
-        kind: decisions::Kind::ValueCorrection,
+        kind: decision_models::Kind::ValueCorrection,
         new: json!({ "raw_value": 11.0 }),
         actor: "tester".to_string(),
         reason: Some("re-read".to_string()),
-        origin: decisions::Origin::Manual,
+        origin: decision_models::Origin::Manual,
         set_id: None,
     };
     let decision_id = river_db::common::bulk_write::guarded(&db, async |txn| {

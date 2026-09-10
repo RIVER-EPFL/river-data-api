@@ -221,13 +221,6 @@ pub(super) struct ChannelCounts {
     sent_30d: i64,
 }
 
-/// One channel the caller has overridden, and what they set it to.
-#[derive(FromQueryResult)]
-pub(super) struct ChannelOverride {
-    channel: String,
-    enabled: bool,
-}
-
 #[utoipa::path(
     get,
     path = "/api/notifications/channels",
@@ -262,18 +255,16 @@ pub async fn list_channels(
         let c = ChannelCounts::from_query_result(row, "")?;
         by_kind.insert(c.kind.clone(), c);
     }
-    let mine = state
-        .db
-        .query_all_raw(Statement::from_sql_and_values(
-            PG,
-            "SELECT channel, enabled FROM notification_subscriptions               WHERE keycloak_sub = $1 AND project_id IS NULL AND site_id IS NULL                 AND parameter_id IS NULL",
-            [sub.into()],
-        ))
+    let mine = subscription::Entity::find()
+        .filter(subscription::Column::KeycloakSub.eq(sub))
+        .filter(subscription::Column::ProjectId.is_null())
+        .filter(subscription::Column::SiteId.is_null())
+        .filter(subscription::Column::ParameterId.is_null())
+        .all(&state.db)
         .await?;
     let mut chosen = std::collections::HashMap::new();
-    for row in &mine {
-        let override_row = ChannelOverride::from_query_result(row, "")?;
-        chosen.insert(override_row.channel, override_row.enabled);
+    for row in mine {
+        chosen.insert(row.channel, row.enabled);
     }
     Ok(Json(
         CHANNELS
@@ -332,28 +323,26 @@ pub async fn set_my_subscriptions(
     }
 
     let txn = state.db.begin().await?;
-    txn.execute_raw(Statement::from_sql_and_values(
-        PG,
-        "DELETE FROM notification_subscriptions WHERE keycloak_sub = $1",
-        [sub.clone().into()],
-    ))
-    .await?;
-    for s in &req.subscriptions {
-        txn.execute_raw(Statement::from_sql_and_values(
-            PG,
-            "INSERT INTO notification_subscriptions \
-                (keycloak_sub, channel, project_id, site_id, parameter_id, enabled) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
-            [
-                sub.clone().into(),
-                s.channel.clone().into(),
-                s.project_id.into(),
-                s.site_id.into(),
-                s.parameter_id.into(),
-                s.enabled.into(),
-            ],
-        ))
+    subscription::Entity::delete_many()
+        .filter(subscription::Column::KeycloakSub.eq(sub.clone()))
+        .exec(&txn)
         .await?;
+    let rows: Vec<subscription::ActiveModel> = req
+        .subscriptions
+        .iter()
+        .map(|s| subscription::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            keycloak_sub: Set(sub.clone()),
+            channel: Set(s.channel.clone()),
+            project_id: Set(s.project_id),
+            site_id: Set(s.site_id),
+            parameter_id: Set(s.parameter_id),
+            enabled: Set(s.enabled),
+            ..Default::default()
+        })
+        .collect();
+    if !rows.is_empty() {
+        subscription::Entity::insert_many(rows).exec(&txn).await?;
     }
     txn.commit().await?;
 

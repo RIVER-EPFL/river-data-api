@@ -2,19 +2,23 @@
 //! lookups, and the row moves a slot's retirement and reassignment run.
 
 use crudcrate::{ApiError, CRUDOperations};
+use sea_orm::sea_query::{
+    Alias, Condition, Expr, JoinType, PostgresQueryBuilder, Query as SeaQuery, SelectStatement,
+};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
-    Set, Statement, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, ExprTrait, FromQueryResult,
+    Order, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use uuid::Uuid;
 
 use super::models::{
     self, DataStream, METADATA_KEY, MoveScope, Release, ReplicateSpec, SLOT_TABLES, SlotMove,
-    SlotScope,
+    SlotRows, SlotScope,
 };
 use crate::common::bulk_write::{self, TouchedRange};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::readings::sd_estimator;
+use crate::routes::private::readings;
+use crate::routes::private::readings::models as readings_model;
 use crate::routes::private::sites::parameters as site_parameters;
 
 pub struct DataStreamOperations;
@@ -256,7 +260,7 @@ pub fn validate_declaration(
             )));
         }
     }
-    if stream_measurement_type != Some(crate::routes::private::readings::sample_groups::SPOT) {
+    if stream_measurement_type != Some(crate::routes::private::readings::service::SPOT) {
         return Err(AppError::BadRequest(
             "a stream declaring replicates must be classified 'spot': samples only form from \
              spot readings"
@@ -343,21 +347,54 @@ pub async fn family_keys_in_streams<C: ConnectionTrait>(
     stream_ids: &[Uuid],
     source_system: Option<&str>,
 ) -> AppResult<Vec<String>> {
+    let mut selected = Condition::any().add(Expr::cust_with_values(
+        "s.id = ANY($1)",
+        [stream_ids.to_vec()],
+    ));
+    if let Some(system) = source_system {
+        selected = selected
+            .add(Expr::col((Alias::new("s"), models::Column::SourceSystem)).eq(system.to_string()));
+    }
+    let (sql, values) = family_keys_query(selected).build(PostgresQueryBuilder);
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT source_key FROM data_streams \
-             WHERE (id = ANY($1) OR ($2::text IS NOT NULL AND source_system = $2)) \
-               AND metadata -> $3 IS NOT NULL \
-             ORDER BY source_key",
-            [
-                stream_ids.to_vec().into(),
-                source_system.map(ToString::to_string).into(),
-                METADATA_KEY.into(),
-            ],
+            sql,
+            values,
         ))
         .await?;
     source_keys(&rows)
+}
+
+/// The declared replicate families among the streams `reached` selects, by source key.
+fn family_keys_query(reached: Condition) -> SelectStatement {
+    let s = Alias::new("s");
+    SeaQuery::select()
+        .column((s.clone(), models::Column::SourceKey))
+        .from_as(models::Entity, s.clone())
+        .and_where(Expr::cust_with_values(
+            "s.metadata -> $1 IS NOT NULL",
+            [METADATA_KEY],
+        ))
+        .cond_where(reached)
+        .order_by((s, models::Column::SourceKey), Order::Asc)
+        .take()
+}
+
+/// Streams whose readings carry one of these sensors, which attribution backfill sets without
+/// touching `data_streams.sensor_id`.
+fn readings_of_sensors(sensor_ids: &[Uuid]) -> Expr {
+    Expr::exists(
+        SeaQuery::select()
+            .expr(Expr::value(1))
+            .from_as(readings_model::Entity, Alias::new("r"))
+            .and_where(Expr::cust("r.stream_id = s.id"))
+            .and_where(Expr::cust_with_values(
+                "r.sensor_id = ANY($1)",
+                [sensor_ids.to_vec()],
+            ))
+            .take(),
+    )
 }
 
 /// The `source_key`s of the replicate families these sensors reach: streams the sensor owns, and
@@ -367,16 +404,20 @@ pub async fn family_keys_for_sensors<C: ConnectionTrait>(
     db: &C,
     sensor_ids: &[Uuid],
 ) -> AppResult<Vec<String>> {
+    let (sql, values) = family_keys_query(
+        Condition::any()
+            .add(Expr::cust_with_values(
+                "s.sensor_id = ANY($1)",
+                [sensor_ids.to_vec()],
+            ))
+            .add(readings_of_sensors(sensor_ids)),
+    )
+    .build(PostgresQueryBuilder);
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT source_key FROM data_streams s \
-             WHERE s.metadata -> $2 IS NOT NULL \
-               AND (s.sensor_id = ANY($1) \
-                    OR EXISTS (SELECT 1 FROM readings r \
-                               WHERE r.stream_id = s.id AND r.sensor_id = ANY($1))) \
-             ORDER BY source_key",
-            [sensor_ids.to_vec().into(), METADATA_KEY.into()],
+            sql,
+            values,
         ))
         .await?;
     source_keys(&rows)
@@ -391,23 +432,26 @@ pub async fn family_keys_in_retag_scope<C: ConnectionTrait>(
     stream_ids: &[Uuid],
     source_system: Option<&str>,
 ) -> AppResult<Vec<String>> {
+    let mut reached = Condition::any()
+        .add(Expr::cust_with_values(
+            "s.id = ANY($1)",
+            [stream_ids.to_vec()],
+        ))
+        .add(Expr::cust_with_values(
+            "s.sensor_id = ANY($1)",
+            [sensor_ids.to_vec()],
+        ))
+        .add(readings_of_sensors(sensor_ids));
+    if let Some(system) = source_system {
+        reached = reached
+            .add(Expr::col((Alias::new("s"), models::Column::SourceSystem)).eq(system.to_string()));
+    }
+    let (sql, values) = family_keys_query(reached).build(PostgresQueryBuilder);
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT source_key FROM data_streams s \
-             WHERE s.metadata -> $4 IS NOT NULL \
-               AND (s.id = ANY($2) \
-                    OR s.sensor_id = ANY($1) \
-                    OR ($3::text IS NOT NULL AND s.source_system = $3) \
-                    OR EXISTS (SELECT 1 FROM readings r \
-                               WHERE r.stream_id = s.id AND r.sensor_id = ANY($1))) \
-             ORDER BY source_key",
-            [
-                sensor_ids.to_vec().into(),
-                stream_ids.to_vec().into(),
-                source_system.map(ToString::to_string).into(),
-                METADATA_KEY.into(),
-            ],
+            sql,
+            values,
         ))
         .await?;
     source_keys(&rows)
@@ -444,55 +488,44 @@ pub fn with_assignments(model: super::models::Model) -> super::DataStream {
 pub(super) async fn preview_estimator(
     db: &DatabaseConnection,
     stream: &models::Model,
-) -> AppResult<sd_estimator::Resolved> {
+) -> AppResult<crate::routes::private::readings::service::Resolved> {
     let spec = super::service::ReplicateSpec::from_metadata(&stream.metadata)
         .and_then(|spec| spec.declared.sd_estimator);
-    let spec = sd_estimator::parse_opt(spec.as_deref())?;
+    let spec = crate::routes::private::readings::service::parse_opt(spec.as_deref())?;
     if let Some(estimator) = spec {
-        return Ok(sd_estimator::Resolved {
+        return Ok(crate::routes::private::readings::service::Resolved {
             estimator,
-            source: sd_estimator::Source::Stream,
+            source: crate::routes::private::readings::service::Source::Stream,
         });
     }
     let Some(site_parameter_id) = stream.site_parameter_id else {
-        return Ok(sd_estimator::Resolved::undeclared());
+        return Ok(crate::routes::private::readings::service::Resolved::undeclared());
     };
     let slot = site_parameters::Entity::find_by_id(site_parameter_id)
         .one(db)
         .await?;
     let Some(slot) = slot else {
-        return Ok(sd_estimator::Resolved::undeclared());
+        return Ok(crate::routes::private::readings::service::Resolved::undeclared());
     };
     Ok(
-        match sd_estimator::slot_declaration(db, slot.site_id, slot.parameter_id).await? {
-            Some(estimator) => sd_estimator::Resolved {
+        match crate::routes::private::readings::service::slot_declaration(
+            db,
+            slot.site_id,
+            slot.parameter_id,
+        )
+        .await?
+        {
+            Some(estimator) => crate::routes::private::readings::service::Resolved {
                 estimator,
-                source: sd_estimator::Source::Slot,
+                source: crate::routes::private::readings::service::Source::Slot,
             },
-            None => sd_estimator::Resolved::undeclared(),
+            None => crate::routes::private::readings::service::Resolved::undeclared(),
         },
     )
 }
 
 /// The stored shapes the hand mappings above read. Derived, so a column added to a query and not
 /// to its reader is a compile error rather than a field left at its default.
-#[derive(FromQueryResult)]
-pub(super) struct StoredReceipt {
-    pub(super) id: Uuid,
-    pub(super) at: chrono::DateTime<chrono::FixedOffset>,
-    pub(super) window_from: Option<chrono::DateTime<chrono::FixedOffset>>,
-    pub(super) window_to: Option<chrono::DateTime<chrono::FixedOffset>>,
-    pub(super) submitted: i32,
-    pub(super) new_rows: i32,
-    pub(super) changed: i32,
-    pub(super) unchanged: i32,
-    pub(super) retained: i32,
-    pub(super) rejected_total: i32,
-    pub(super) dropped: i32,
-    pub(super) withdrawn: i32,
-    pub(super) braked: bool,
-}
-
 #[derive(FromQueryResult)]
 pub(super) struct PreviewRow {
     pub(super) time: chrono::DateTime<chrono::FixedOffset>,
@@ -511,6 +544,72 @@ pub(super) struct StoredStreamStats {
     pub(super) max_time: Option<chrono::DateTime<chrono::FixedOffset>>,
 }
 
+/// The stream's stored extent: how many readings it holds, how many of those are withdrawn, and
+/// the span they cover.
+pub(super) fn stream_stats_query(stream_id: Uuid) -> sea_orm::Select<readings::Entity> {
+    readings::Entity::find()
+        .select_only()
+        .column_as(readings::Column::Time.count(), "count")
+        .expr_as(
+            Expr::cust("COUNT(*) FILTER (WHERE withdrawn_at IS NOT NULL)"),
+            "withdrawn",
+        )
+        .column_as(readings::Column::Time.min(), "min_time")
+        .column_as(readings::Column::Time.max(), "max_time")
+        .filter(readings::Column::StreamId.eq(stream_id))
+}
+
+/// The stream's most recent raw value.
+pub(super) fn latest_raw_value_query(stream_id: Uuid) -> sea_orm::Select<readings::Entity> {
+    readings::Entity::find()
+        .select_only()
+        .column(readings::Column::RawValue)
+        .filter(readings::Column::StreamId.eq(stream_id))
+        .order_by_desc(readings::Column::Time)
+        .limit(1)
+}
+
+/// Every replicate at the stream's newest `limit` instants, newest first. The instants are chosen
+/// first so a limit counts instants rather than replicates.
+pub(super) fn preview_query(stream_id: Uuid, limit: u64) -> SelectStatement {
+    let instants = SeaQuery::select()
+        .distinct()
+        .column(readings::Column::Time)
+        .from(readings::Entity)
+        .and_where(readings::Column::StreamId.eq(stream_id))
+        .order_by(readings::Column::Time, Order::Desc)
+        .limit(limit)
+        .take();
+    let t = Alias::new("t");
+    SeaQuery::select()
+        .column((readings::Entity, readings::Column::Time))
+        .column((readings::Entity, readings::Column::ReplicateIndex))
+        .expr_as(
+            Expr::cust("COALESCE(readings.calibrated_value, readings.raw_value)"),
+            "value",
+        )
+        .expr_as(
+            Expr::cust("COALESCE(readings.is_flagged, false)"),
+            "is_flagged",
+        )
+        .expr_as(Expr::cust("readings.withdrawn_at IS NOT NULL"), "withdrawn")
+        .from(readings::Entity)
+        .join_subquery(
+            sea_orm::JoinType::Join,
+            instants,
+            t.clone(),
+            Expr::col((t, readings::Column::Time))
+                .equals((readings::Entity, readings::Column::Time)),
+        )
+        .and_where(readings::Column::StreamId.eq(stream_id))
+        .order_by((readings::Entity, readings::Column::Time), Order::Desc)
+        .order_by(
+            (readings::Entity, readings::Column::ReplicateIndex),
+            Order::Asc,
+        )
+        .take()
+}
+
 /// Timestamps at which moving the source's rows onto `target_param` would violate a slot table's
 /// unique constraint, at most `LIMIT` of them. Empty when the move is safe.
 ///
@@ -527,33 +626,48 @@ pub async fn slot_move_collisions<C: ConnectionTrait>(
         let Some(unique_with) = slot.unique_with else {
             continue;
         };
-        let table = slot.table;
-        let mut values: Vec<sea_orm::Value> = vec![source_param.into(), target_param.into()];
-        let site_filter = match scope {
-            MoveScope::EverySite => String::new(),
-            MoveScope::Site(site_id) => {
-                values.push(site_id.into());
-                " AND src.site_id = $3".to_string()
-            }
-        };
-        let sql = format!(
-            "SELECT DISTINCT src.{unique_with}::text AS value \
-             FROM {table} src JOIN {table} dst \
-               ON dst.site_id = src.site_id AND dst.{unique_with} = src.{unique_with} \
-              AND dst.parameter_id = $2 \
-             WHERE src.parameter_id = $1{site_filter} \
-             ORDER BY 1 LIMIT 20"
-        );
+        let src = Alias::new("src");
+        let dst = Alias::new("dst");
+        let key = Alias::new(unique_with);
+        let mut same_slot = Condition::all()
+            .add(Expr::col((src.clone(), Alias::new("parameter_id"))).eq(source_param));
+        if let MoveScope::Site(site_id) = scope {
+            same_slot = same_slot.add(Expr::col((src.clone(), Alias::new("site_id"))).eq(site_id));
+        }
+        let (sql, values) = SeaQuery::select()
+            .distinct()
+            .expr_as(
+                Expr::cust(format!("src.{unique_with}::text")),
+                Alias::new("value"),
+            )
+            .from_as(slot.rows.table_ref(), src.clone())
+            .join_as(
+                JoinType::InnerJoin,
+                slot.rows.table_ref(),
+                dst.clone(),
+                Condition::all()
+                    .add(
+                        Expr::col((dst.clone(), Alias::new("site_id")))
+                            .equals((src.clone(), Alias::new("site_id"))),
+                    )
+                    .add(Expr::col((dst.clone(), key.clone())).equals((src.clone(), key.clone())))
+                    .add(Expr::col((dst.clone(), Alias::new("parameter_id"))).eq(target_param)),
+            )
+            .cond_where(same_slot)
+            .order_by(Alias::new("value"), Order::Asc)
+            .limit(20)
+            .take()
+            .build(PostgresQueryBuilder);
         for row in conn
             .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                &sql,
+                sql,
                 values,
             ))
             .await?
         {
             let value: String = row.try_get("", "value")?;
-            collisions.push(format!("{table} {value}"));
+            collisions.push(format!("{} {value}", slot.rows.name()));
         }
     }
     Ok(collisions)
@@ -569,7 +683,7 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
     source_param: Uuid,
     target_param: Uuid,
     actor: &str,
-    origin: crate::routes::private::readings::decisions::Origin,
+    origin: crate::routes::private::readings::models::Origin,
 ) -> AppResult<SlotMove> {
     // $1 is the target parameter, $2 the source, $3 the site when the scope names one.
     let (predicate, site) = match scope {
@@ -589,12 +703,12 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
             MoveScope::EverySite => "r.parameter_id = $2",
             MoveScope::Site(_) => "r.parameter_id = $2 AND r.site_id = $3",
         };
-        crate::routes::private::readings::decisions::record_many(
+        crate::routes::private::readings::service::record_many(
             conn,
-            crate::routes::private::readings::decisions::Kind::SlotMove,
+            crate::routes::private::readings::models::Kind::SlotMove,
             row_predicate,
             values,
-            crate::routes::private::readings::decisions::NewValue::Literal(
+            crate::routes::private::readings::service::NewValue::Literal(
                 serde_json::json!({ "parameter_id": target_param }),
             ),
             actor,
@@ -605,17 +719,17 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
         .await?;
     }
 
+    let mut on_source =
+        Condition::all().add(Expr::col(Alias::new("parameter_id")).eq(source_param));
+    if let Some(site_id) = site {
+        on_source = on_source.add(Expr::col(Alias::new("site_id")).eq(site_id));
+    }
     for slot in SLOT_TABLES {
-        let mut values: Vec<sea_orm::Value> = vec![target_param.into(), source_param.into()];
-        if let Some(site_id) = site {
-            values.push(site_id.into());
-        }
-        let sql = format!(
-            "UPDATE {} SET parameter_id = $1 WHERE {predicate}",
-            slot.table
-        );
-        let statement =
-            Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, values);
+        let statement = SeaQuery::update()
+            .table(slot.rows.table_ref())
+            .value(Alias::new("parameter_id"), target_param)
+            .cond_where(on_source.clone())
+            .take();
 
         let rows = if slot.timed {
             let touched = bulk_write::mutation(conn, statement).await?;
@@ -624,12 +738,19 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
             }
             touched.rows
         } else {
-            conn.execute_raw(statement).await?.rows_affected()
+            let (sql, values) = statement.build(PostgresQueryBuilder);
+            conn.execute_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                sql,
+                values,
+            ))
+            .await?
+            .rows_affected()
         };
 
-        match slot.table {
-            "readings" => moved.readings = rows,
-            "status_events" => moved.status_events = rows,
+        match slot.rows {
+            SlotRows::Readings => moved.readings = rows,
+            SlotRows::StatusEvents => moved.status_events = rows,
             _ => {}
         }
     }
@@ -637,11 +758,10 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
     Ok(moved)
 }
 
-/// The rows one [`SlotScope`] addresses.
+/// The rows one [`SlotScope`] addresses. The condition names columns every slot table carries,
+/// so one selection serves each of them.
 pub(super) struct RetireTarget {
-    /// `WHERE` fragment over the slot tables, binding `$1` (and `$2` for a slot).
-    pub(super) predicate: &'static str,
-    pub(super) values: Vec<sea_orm::Value>,
+    pub(super) rows: Condition,
     /// The slot itself is going away, so the streams pointing at it are unpaired too.
     pub(super) site_parameter_id: Option<Uuid>,
 }
@@ -652,8 +772,7 @@ pub(super) async fn resolve_retire_target<C: ConnectionTrait>(
 ) -> AppResult<Option<RetireTarget>> {
     match scope {
         SlotScope::Stream(stream_id) => Ok(Some(RetireTarget {
-            predicate: "stream_id = $1",
-            values: vec![stream_id.into()],
+            rows: Condition::all().add(Expr::col(Alias::new("stream_id")).eq(stream_id)),
             site_parameter_id: None,
         })),
         SlotScope::SiteParameter(sp_id) => {
@@ -661,8 +780,9 @@ pub(super) async fn resolve_retire_target<C: ConnectionTrait>(
                 return Ok(None);
             };
             Ok(Some(RetireTarget {
-                predicate: "site_id = $1 AND parameter_id = $2",
-                values: vec![row.site_id.into(), row.parameter_id.into()],
+                rows: Condition::all()
+                    .add(Expr::col(Alias::new("site_id")).eq(row.site_id))
+                    .add(Expr::col(Alias::new("parameter_id")).eq(row.parameter_id)),
                 site_parameter_id: Some(sp_id),
             }))
         }
@@ -681,48 +801,59 @@ pub(super) async fn release_slot_rows<C: ConnectionTrait>(
         match slot.release {
             Release::Retain => {}
             Release::Unattribute(columns) => {
-                let assignments = columns
-                    .iter()
-                    .map(|c| format!("{c} = NULL"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 // Narrow to rows that still carry something to release: an UPDATE that rewrites
                 // already-null rows maximises what it has to decompress and changes nothing.
-                let already = columns
-                    .iter()
-                    .map(|c| format!("{c} IS NOT NULL"))
-                    .collect::<Vec<_>>()
-                    .join(" OR ");
-                let sql = format!(
-                    "UPDATE {} SET {assignments} WHERE {} AND ({already})",
-                    slot.table, target.predicate
-                );
-                let statement = Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    &sql,
-                    target.values.clone(),
-                );
+                let mut carries = Condition::any();
+                let mut statement = SeaQuery::update();
+                statement.table(slot.rows.table_ref());
+                for c in columns {
+                    statement.value(Alias::new(*c), Expr::value(Option::<Uuid>::None));
+                    carries = carries.add(Expr::col(Alias::new(*c)).is_not_null());
+                }
+                let statement = statement
+                    .cond_where(target.rows.clone().add(carries))
+                    .take();
                 if slot.timed {
                     let range = bulk_write::mutation(conn, statement).await?;
                     if slot.feeds_rollups {
                         touched = touched.merge(range);
                     }
                 } else {
-                    conn.execute_raw(statement).await?;
+                    let (sql, values) = statement.build(PostgresQueryBuilder);
+                    conn.execute_raw(Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Postgres,
+                        sql,
+                        values,
+                    ))
+                    .await?;
                 }
             }
             Release::DeleteWhenOrphaned => {
                 if sample_ids.is_empty() {
                     continue;
                 }
+                let (sql, values) = SeaQuery::delete()
+                    .from_table(slot.rows.table_ref())
+                    .and_where(Expr::cust_with_values("id = ANY($1)", [sample_ids.clone()]))
+                    .and_where(
+                        Expr::exists(
+                            SeaQuery::select()
+                                .expr(Expr::value(1))
+                                .from_as(readings_model::Entity, Alias::new("r"))
+                                .and_where(Expr::cust(format!(
+                                    "r.sample_id = {}.id",
+                                    slot.rows.name()
+                                )))
+                                .take(),
+                        )
+                        .not(),
+                    )
+                    .take()
+                    .build(PostgresQueryBuilder);
                 conn.execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
-                    format!(
-                        "DELETE FROM {} s WHERE s.id = ANY($1) \
-                         AND NOT EXISTS (SELECT 1 FROM readings r WHERE r.sample_id = s.id)",
-                        slot.table
-                    ),
-                    [sample_ids.clone().into()],
+                    sql,
+                    values,
                 ))
                 .await?;
             }
@@ -733,11 +864,25 @@ pub(super) async fn release_slot_rows<C: ConnectionTrait>(
     // (site, collected_at) rather than on the slot, so it is released here rather than through
     // SLOT_TABLES: nothing that walks that list by parameter_id can address it.
     if !event_ids.is_empty() {
+        let (sql, values) = SeaQuery::delete()
+            .from_table(crate::routes::private::collection_events::models::Entity)
+            .and_where(Expr::cust_with_values("id = ANY($1)", [event_ids]))
+            .and_where(
+                Expr::exists(
+                    SeaQuery::select()
+                        .expr(Expr::value(1))
+                        .from_as(readings_model::Entity, Alias::new("r"))
+                        .and_where(Expr::cust("r.collection_event_id = collection_events.id"))
+                        .take(),
+                )
+                .not(),
+            )
+            .take()
+            .build(PostgresQueryBuilder);
         conn.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "DELETE FROM collection_events ce WHERE ce.id = ANY($1) \
-             AND NOT EXISTS (SELECT 1 FROM readings r WHERE r.collection_event_id = ce.id)",
-            [event_ids.into()],
+            sql,
+            values,
         ))
         .await?;
     }
@@ -745,13 +890,19 @@ pub(super) async fn release_slot_rows<C: ConnectionTrait>(
     if let Some(sp_id) = target.site_parameter_id {
         // Load-bearing rather than tidy-up: `data_streams.site_parameter_id` has no ON DELETE
         // clause, so the row cannot be deleted while a stream points at it.
-        conn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE data_streams SET site_parameter_id = NULL, paired_at = NULL, updated_at = now() \
-             WHERE site_parameter_id = $1",
-            [sp_id.into()],
-        ))
-        .await?;
+        models::Entity::update_many()
+            .col_expr(
+                models::Column::SiteParameterId,
+                Expr::value(Option::<Uuid>::None),
+            )
+            .col_expr(
+                models::Column::PairedAt,
+                Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+            )
+            .col_expr(models::Column::UpdatedAt, Expr::current_timestamp().into())
+            .filter(models::Column::SiteParameterId.eq(sp_id))
+            .exec(conn)
+            .await?;
     }
 
     Ok(touched)
@@ -763,15 +914,19 @@ async fn referenced_ids<C: ConnectionTrait>(
     target: &RetireTarget,
     column: &str,
 ) -> AppResult<Vec<Uuid>> {
-    let sql = format!(
-        "SELECT DISTINCT {column} AS id FROM readings WHERE {} AND {column} IS NOT NULL",
-        target.predicate
-    );
+    let col = Alias::new(column);
+    let (sql, values) = SeaQuery::select()
+        .distinct()
+        .expr_as(Expr::col(col.clone()), Alias::new("id"))
+        .from(readings_model::Entity)
+        .cond_where(target.rows.clone().add(Expr::col(col).is_not_null()))
+        .take()
+        .build(PostgresQueryBuilder);
     Ok(conn
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            target.values.clone(),
+            sql,
+            values,
         ))
         .await?
         .iter()

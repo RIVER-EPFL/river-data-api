@@ -6,7 +6,10 @@
 
 use axum::{Json, extract::State};
 use chrono::{DateTime, Utc};
-use sea_orm::sea_query::{Expr, ExprTrait, Func};
+use sea_orm::sea_query::{
+    Alias, Condition, Expr, ExprTrait, Func, JoinType, Order, PostgresQueryBuilder, Query,
+    SelectStatement,
+};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter,
     QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
@@ -18,7 +21,10 @@ use uuid::Uuid;
 use super::{Column, Entity, Model};
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::annotations::models as annotations;
 use crate::routes::private::parameters;
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::service::SPOT;
 use crate::routes::private::sensors;
 use crate::routes::private::sensors::models::InstrumentKind;
 use crate::routes::private::sensors::service::upsert_source_instrument;
@@ -57,15 +63,17 @@ pub struct RegisterStandardCurveResponse {
 /// Whether any reading was corrected with this curve, or any annotation records a source-side
 /// correction made with it; a used curve's coefficients are frozen.
 pub(crate) async fn curve_is_used<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<bool> {
-    Ok(conn
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT 1 AS one FROM readings WHERE standard_curve_id = $1
-             UNION ALL
-             SELECT 1 FROM annotations WHERE standard_curve_id = $1
-             LIMIT 1",
-            [id.into()],
-        ))
+    let on_a_reading = readings::Entity::find()
+        .filter(readings::Column::StandardCurveId.eq(id))
+        .one(conn)
+        .await?
+        .is_some();
+    if on_a_reading {
+        return Ok(true);
+    }
+    Ok(annotations::Entity::find()
+        .filter(annotations::Column::StandardCurveId.eq(id))
+        .one(conn)
         .await?
         .is_some())
 }
@@ -342,6 +350,69 @@ struct LastUsedRow {
     curve_created_at: Option<DateTime<Utc>>,
 }
 
+/// The newest grab at a slot that names an instrument or a curve, withdrawn rows excluded. The
+/// instrument is the reading's own where it has one and the curve's owner otherwise, so the join
+/// resolves the same name either way.
+fn last_curve_query(site_id: Uuid, parameter_id: Uuid) -> SelectStatement {
+    let r = Alias::new("r");
+    let c = Alias::new("c");
+    let s = Alias::new("s");
+    let owning_sensor: Expr = Func::coalesce([
+        Expr::col((r.clone(), readings::Column::SensorId)),
+        Expr::col((c.clone(), Column::SensorId)),
+    ])
+    .into();
+    Query::select()
+        .expr_as(
+            Expr::col((r.clone(), readings::Column::Time)),
+            Alias::new("time"),
+        )
+        .expr_as(owning_sensor.clone(), Alias::new("sensor_id"))
+        .expr_as(
+            Expr::col((s.clone(), sensors::Column::Name)),
+            Alias::new("sensor_name"),
+        )
+        .expr_as(
+            Expr::col((r.clone(), readings::Column::StandardCurveId)),
+            Alias::new("standard_curve_id"),
+        )
+        .expr_as(
+            Expr::col((c.clone(), Column::Name)),
+            Alias::new("curve_name"),
+        )
+        .expr_as(
+            Expr::col((c.clone(), Column::CreatedAt)),
+            Alias::new("curve_created_at"),
+        )
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            Entity,
+            c.clone(),
+            Expr::col((c.clone(), Column::Id))
+                .equals((r.clone(), readings::Column::StandardCurveId)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            sensors::Entity,
+            s.clone(),
+            Expr::col((s.clone(), sensors::Column::Id)).eq(owning_sensor),
+        )
+        .and_where(Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
+        .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).eq(parameter_id))
+        .and_where(Expr::col((r.clone(), readings::Column::MeasurementType)).eq(SPOT))
+        .and_where(Expr::col((r.clone(), readings::Column::WithdrawnAt)).is_null())
+        .cond_where(
+            Condition::any()
+                .add(Expr::col((r.clone(), readings::Column::StandardCurveId)).is_not_null())
+                .add(Expr::col((r.clone(), readings::Column::SensorId)).is_not_null()),
+        )
+        .order_by((r.clone(), readings::Column::Time), Order::Desc)
+        .order_by((r, readings::Column::ReplicateIndex), Order::Asc)
+        .limit(1)
+        .to_owned()
+}
+
 /// `GET /sites/{id}/last_curve`: what the last grab at a slot was measured on and corrected
 /// with, so the picker opens where the previous batch left off. `read_data`.
 #[utoipa::path(
@@ -387,26 +458,13 @@ pub async fn last_used_curve(
         }
     };
 
+    let query = last_curve_query(site_id, parameter_id);
+    let (sql, values) = query.build(PostgresQueryBuilder);
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT r.time,
-                    COALESCE(r.sensor_id, c.sensor_id) AS sensor_id,
-                    s.name AS sensor_name,
-                    r.standard_curve_id,
-                    c.name AS curve_name,
-                    c.created_at AS curve_created_at
-             FROM readings r
-             LEFT JOIN standard_curves c ON c.id = r.standard_curve_id
-             LEFT JOIN sensors s ON s.id = COALESCE(r.sensor_id, c.sensor_id)
-             WHERE r.site_id = $1
-               AND r.parameter_id = $2
-               AND r.measurement_type = 'spot'
-               AND r.withdrawn_at IS NULL
-               AND (r.standard_curve_id IS NOT NULL OR r.sensor_id IS NOT NULL)
-             ORDER BY r.time DESC, r.replicate_index ASC
-             LIMIT 1",
-            [site_id.into(), parameter_id.into()],
+            sql,
+            values,
         ))
         .await?;
 
@@ -432,3 +490,7 @@ pub async fn last_used_curve(
     }
     Ok(Json(out))
 }
+
+#[cfg(test)]
+#[path = "tests/views.rs"]
+mod tests;

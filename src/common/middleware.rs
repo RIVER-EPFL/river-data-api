@@ -156,8 +156,8 @@ impl AuthContext {
     /// (janitor, chain, system) because no caller made it; everything a request writes is named
     /// here.
     #[must_use]
-    pub fn origin(&self) -> crate::routes::private::readings::decisions::Origin {
-        use crate::routes::private::readings::decisions::Origin;
+    pub fn origin(&self) -> crate::routes::private::readings::models::Origin {
+        use crate::routes::private::readings::models::Origin;
         match self {
             AuthContext::SyncService { .. } => Origin::Sync,
             AuthContext::Keycloak { .. } | AuthContext::ApiToken { .. } => Origin::Manual,
@@ -699,10 +699,10 @@ fn crud_scope_condition(
     direction: Direction,
 ) -> Option<sea_orm::Condition> {
     use crate::routes::private::{
-        alarms::models as alarm_thresholds, annotations, data_streams, notes,
-        projects as projects_entity, projects::subprojects, readings::samples, reprocessing_jobs,
-        sensors, sensors::calibrations, sensors::deployments, sensors::standard_curves, sites,
-        sites::parameters as site_parameters,
+        alarms::models as alarm_thresholds, alarms::models::alarm_event as alarm_events,
+        annotations, data_streams, notes, projects as projects_entity, projects::subprojects,
+        readings::samples, reprocessing_jobs, sensors, sensors::calibrations, sensors::deployments,
+        sensors::standard_curves, sites, sites::parameters as site_parameters,
     };
     use sea_orm::{ColumnTrait, Condition};
     let ids = || projects.iter().copied();
@@ -725,6 +725,7 @@ fn crud_scope_condition(
         "alarm_thresholds" => {
             alarm_thresholds::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
         }
+        "alarm_events" => alarm_events::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
         "samples" => samples::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
         "data_streams" => data_streams::Column::SiteParameterId
             .in_subquery(scoped_site_parameter_ids_query(projects)),

@@ -62,3 +62,78 @@ fn trims_the_claimed_serial() {
         Some("4000138".to_string())
     );
 }
+
+/// Scenario: the instrument enrichment reads are built rather than written out.
+/// Expected behaviour: each keeps the shape that makes it cheap, so a renamed column fails the
+/// build and a lost window or `DISTINCT ON` fails here.
+#[test]
+fn test_holders_of_instrument_asks_all_four_tables() {
+    let sql = holders_of_instrument(Uuid::nil()).sql;
+
+    for table in [
+        "readings",
+        "standard_curves",
+        "sensor_calibrations",
+        "sensor_deployments",
+    ] {
+        assert!(
+            sql.contains(&format!(
+                r#"EXISTS(SELECT $1 FROM "{table}" WHERE "sensor_id" = $"#
+            )) || sql.contains(&format!(r#"FROM "{table}""#)),
+            "{table} is probed: {sql}"
+        );
+    }
+}
+
+#[test]
+fn test_recent_spot_counts_stays_inside_the_ninety_day_window() {
+    let sql = recent_spot_counts(&[Uuid::nil()]).sql;
+
+    assert!(sql.contains(r#"FROM "readings""#), "{sql}");
+    assert!(sql.contains("time > now() - INTERVAL '90 days'"), "{sql}");
+    assert!(sql.contains("is_flagged IS NOT TRUE"), "{sql}");
+    assert!(sql.contains(r#"GROUP BY "sensor_id""#), "{sql}");
+}
+
+#[test]
+fn test_newest_value_per_instrument_takes_one_row_per_instrument() {
+    let recent = newest_value_per_instrument(&[Uuid::nil()], None).sql;
+    assert!(recent.contains(r#"DISTINCT ON ("sensor_id")"#), "{recent}");
+    assert!(
+        recent.contains(r#"ORDER BY "sensor_id" ASC, "time" DESC"#),
+        "{recent}"
+    );
+    assert!(
+        recent.contains("time > now() - INTERVAL '90 days'"),
+        "{recent}"
+    );
+    assert!(
+        recent.contains(r#"COALESCE("calibrated_value", "raw_value")"#),
+        "{recent}"
+    );
+
+    let now = chrono::Utc::now();
+    let windowed = newest_value_per_instrument(&[Uuid::nil()], Some((now, now))).sql;
+    assert!(
+        windowed.contains(r#"DISTINCT ON ("sensor_id")"#),
+        "{windowed}"
+    );
+    assert!(
+        !windowed.contains("INTERVAL '90 days'"),
+        "a given window replaces the default one: {windowed}"
+    );
+}
+
+#[test]
+fn test_curve_use_per_instrument_counts_curves_and_their_newest_use() {
+    let sql = curve_use_per_instrument(&[Uuid::nil()]).sql;
+
+    assert!(sql.contains(r#"FROM "standard_curves" AS "sc""#), "{sql}");
+    assert!(
+        sql.contains(r#"LEFT JOIN "readings" AS "r" ON "r"."standard_curve_id" = "sc"."id""#),
+        "{sql}"
+    );
+    assert!(sql.contains(r#"COUNT(DISTINCT "sc"."id")"#), "{sql}");
+    assert!(sql.contains(r#"MAX("r"."time")"#), "{sql}");
+    assert!(sql.contains(r#"GROUP BY "sc"."sensor_id""#), "{sql}");
+}

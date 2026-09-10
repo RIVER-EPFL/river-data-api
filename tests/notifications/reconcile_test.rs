@@ -6,8 +6,8 @@
 //! Run: cargo test --test notifications reconcile -- --test-threads=1
 
 use river_db::common::authz::Role;
-use river_db::routes::private::notifications::models::RoleResolution;
 use river_db::routes::private::notifications::flows;
+use river_db::routes::private::notifications::models::RoleResolution;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 

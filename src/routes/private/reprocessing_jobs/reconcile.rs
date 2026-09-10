@@ -14,14 +14,27 @@
 
 use async_trait::async_trait;
 use chrono::Utc;
-use sea_orm::{ConnectionTrait, DbErr, FromQueryResult, Statement};
+use sea_orm::Order;
+use sea_orm::sea_query::{
+    Alias, CommonTableExpression, Condition, Expr, ExprTrait as _, JoinType, PostgresQueryBuilder,
+    Query as SeaQuery, WithClause,
+};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, QuerySelect,
+    Statement,
+};
 use uuid::Uuid;
+
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::samples::model as samples;
+use crate::routes::private::readings::status_events::model as status_events;
 
 use super::job::Job;
 use super::lifecycle::{JobContext, JobReport};
 use crate::common::bulk_write;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::readings::sample_groups;
+use crate::routes::private::data_streams;
+use crate::routes::private::sites::parameters as site_parameters;
 use crate::routes::private::sync::service::{DEFAULT_ABS_TOL, DEFAULT_REL_TOL};
 
 /// A family stream and the legacy avg stream it supersedes. The pairing is exact, not guessed:
@@ -89,6 +102,53 @@ fn bound_sql(a: &str, b: &str, rel_bind: &str) -> String {
     crate::routes::private::sync::service::bound_sql(a, b, rel_bind, DEFAULT_ABS_TOL)
 }
 
+/// The two sides one family verification compares: `o`, the old avg stream's served value at each
+/// instant, and `served`, what the family stream will serve there (the trigger-computed sample
+/// mean, or the group average before materialisation).
+fn comparison_ctes(old_id: Uuid, new_id: Uuid) -> WithClause {
+    let old = SeaQuery::select()
+        .column(readings::Column::Time)
+        .expr_as(
+            crate::common::served::continuous_value_of(Alias::new("readings")),
+            Alias::new("v"),
+        )
+        .from(readings::Entity)
+        .and_where(Expr::col(readings::Column::StreamId).eq(old_id))
+        .and_where(Expr::col(readings::Column::ReplicateIndex).eq(0))
+        .and_where(Expr::cust("is_flagged IS NOT TRUE"))
+        .take();
+
+    let r = Alias::new("r");
+    let smp = Alias::new("s");
+    let served = SeaQuery::select()
+        .column((r.clone(), readings::Column::Time))
+        .expr_as(
+            Expr::cust("COALESCE(MAX(s.mean), AVG(COALESCE(r.calibrated_value, r.raw_value)))"),
+            Alias::new("v"),
+        )
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            samples::Entity,
+            smp.clone(),
+            Expr::col((smp, samples::Column::Id)).equals((r.clone(), readings::Column::SampleId)),
+        )
+        .and_where(Expr::col((r.clone(), readings::Column::StreamId)).eq(new_id))
+        .and_where(Expr::cust("r.is_flagged IS NOT TRUE"))
+        .add_group_by([Expr::col((r, readings::Column::Time)).into()])
+        .take();
+
+    let cte = |name: &str, query: sea_orm::sea_query::SelectStatement| {
+        let mut cte = CommonTableExpression::new();
+        cte.table_name(Alias::new(name)).query(query);
+        cte
+    };
+    WithClause::new()
+        .cte(cte("o", old))
+        .cte(cte("served", served))
+        .to_owned()
+}
+
 #[derive(Debug, Clone, Copy, Default, FromQueryResult)]
 pub struct VerifyOutcome {
     pub compared: i64,
@@ -105,32 +165,33 @@ async fn verify_family<C: ConnectionTrait>(
     new_id: Uuid,
     rel_tol: f64,
 ) -> Result<VerifyOutcome, DbErr> {
-    let bound = bound_sql("served.v", "o.v", "$3");
+    let bound = bound_sql("served.v", "o.v", "$1");
+    let (sql, values) = SeaQuery::select()
+        .expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("compared"))
+        .expr_as(
+            Expr::cust_with_values(
+                format!(
+                    "COUNT(*) FILTER (WHERE served.v IS NULL OR abs(served.v - o.v) > {bound})::bigint"
+                ),
+                [rel_tol],
+            ),
+            Alias::new("mismatched"),
+        )
+        .from(Alias::new("o"))
+        .join_as(
+            JoinType::LeftJoin,
+            Alias::new("served"),
+            Alias::new("served"),
+            Expr::cust("served.time = o.time"),
+        )
+        .take()
+        .with(comparison_ctes(old_id, new_id))
+        .build(PostgresQueryBuilder);
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "WITH o AS (
-                     SELECT time, COALESCE(calibrated_value, raw_value) AS v
-                     FROM readings
-                     WHERE stream_id = $1 AND replicate_index = 0 AND is_flagged IS NOT TRUE
-                 ),
-                 served AS (
-                     SELECT r.time,
-                            COALESCE(MAX(s.mean), AVG(COALESCE(r.calibrated_value, r.raw_value)))
-                                AS v
-                     FROM readings r
-                     LEFT JOIN samples s ON s.id = r.sample_id
-                     WHERE r.stream_id = $2 AND r.is_flagged IS NOT TRUE
-                     GROUP BY r.time
-                 )
-                 SELECT COUNT(*)::bigint AS compared,
-                        COUNT(*) FILTER (
-                            WHERE served.v IS NULL OR abs(served.v - o.v) > {bound}
-                        )::bigint AS mismatched
-                 FROM o LEFT JOIN served ON served.time = o.time"
-            ),
-            [old_id.into(), new_id.into(), rel_tol.into()],
+            sql,
+            values,
         ))
         .await?
         .ok_or_else(|| DbErr::Custom("verification returned no row".to_string()))?;
@@ -145,32 +206,31 @@ async fn mismatch_examples<C: ConnectionTrait>(
     rel_tol: f64,
     limit: usize,
 ) -> Result<Vec<serde_json::Value>, DbErr> {
-    let bound = bound_sql("served.v", "o.v", "$3");
+    let bound = bound_sql("served.v", "o.v", "$1");
+    let (sql, values) = SeaQuery::select()
+        .expr(Expr::cust("o.time"))
+        .expr_as(Expr::cust("o.v"), Alias::new("old_value"))
+        .expr_as(Expr::cust("served.v"), Alias::new("new_value"))
+        .from(Alias::new("o"))
+        .join_as(
+            JoinType::LeftJoin,
+            Alias::new("served"),
+            Alias::new("served"),
+            Expr::cust("served.time = o.time"),
+        )
+        .cond_where(Condition::any().add(Expr::cust("served.v IS NULL")).add(
+            Expr::cust_with_values(format!("abs(served.v - o.v) > {bound}"), [rel_tol]),
+        ))
+        .order_by_expr(Expr::cust("o.time"), Order::Asc)
+        .limit(limit as u64)
+        .take()
+        .with(comparison_ctes(old_id, new_id))
+        .build(PostgresQueryBuilder);
     let rows = conn
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "WITH o AS (
-                     SELECT time, COALESCE(calibrated_value, raw_value) AS v
-                     FROM readings
-                     WHERE stream_id = $1 AND replicate_index = 0 AND is_flagged IS NOT TRUE
-                 ),
-                 served AS (
-                     SELECT r.time,
-                            COALESCE(MAX(s.mean), AVG(COALESCE(r.calibrated_value, r.raw_value)))
-                                AS v
-                     FROM readings r
-                     LEFT JOIN samples s ON s.id = r.sample_id
-                     WHERE r.stream_id = $2 AND r.is_flagged IS NOT TRUE
-                     GROUP BY r.time
-                 )
-                 SELECT o.time, o.v AS old_value, served.v AS new_value
-                 FROM o LEFT JOIN served ON served.time = o.time
-                 WHERE served.v IS NULL OR abs(served.v - o.v) > {bound}
-                 ORDER BY o.time
-                 LIMIT {limit}"
-            ),
-            [old_id.into(), new_id.into(), rel_tol.into()],
+            sql,
+            values,
         ))
         .await?;
     rows.iter()
@@ -203,16 +263,33 @@ async fn missing_instants<C: ConnectionTrait>(
     old_id: Uuid,
     new_id: Uuid,
 ) -> Result<i64, DbErr> {
+    let o = Alias::new("o");
+    let n = Alias::new("n");
+    let (sql, values) = SeaQuery::select()
+        .expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("missing"))
+        .from_as(readings::Entity, o.clone())
+        .and_where(Expr::col((o.clone(), readings::Column::StreamId)).eq(old_id))
+        .and_where(Expr::col((o.clone(), readings::Column::ReplicateIndex)).eq(0))
+        .and_where(
+            Expr::exists(
+                SeaQuery::select()
+                    .expr(Expr::value(1))
+                    .from_as(readings::Entity, n.clone())
+                    .and_where(Expr::col((n.clone(), readings::Column::StreamId)).eq(new_id))
+                    .and_where(
+                        Expr::col((n, readings::Column::Time)).equals((o, readings::Column::Time)),
+                    )
+                    .take(),
+            )
+            .not(),
+        )
+        .take()
+        .build(PostgresQueryBuilder);
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT COUNT(*)::bigint AS missing
-             FROM readings o
-             WHERE o.stream_id = $1 AND o.replicate_index = 0
-               AND NOT EXISTS (
-                   SELECT 1 FROM readings n WHERE n.stream_id = $2 AND n.time = o.time
-               )",
-            [old_id.into(), new_id.into()],
+            sql,
+            values,
         ))
         .await?
         .ok_or_else(|| DbErr::Custom("missing-instants probe returned no row".to_string()))?;
@@ -235,31 +312,36 @@ async fn cutover_family(
         ))
         .await?;
 
-        let slot = txn
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT site_id, parameter_id FROM site_parameters WHERE id = $1",
-                [site_parameter_id.into()],
-            ))
-            .await?
-            .ok_or_else(|| {
-                AppError::NotFound(format!("site_parameter {site_parameter_id} not found"))
-            })?;
-        let SlotRow {
-            site_id,
-            parameter_id,
-        } = SlotRow::from_query_result(&slot, "")?;
+        let (site_id, parameter_id) =
+            site_parameters::models::Entity::find_by_id(site_parameter_id)
+                .select_only()
+                .column(site_parameters::models::Column::SiteId)
+                .column(site_parameters::models::Column::ParameterId)
+                .into_tuple::<(Uuid, Uuid)>()
+                .one(txn)
+                .await?
+                .ok_or_else(|| {
+                    AppError::NotFound(format!("site_parameter {site_parameter_id} not found"))
+                })?;
 
-        let claimed = txn
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE data_streams
-                 SET site_parameter_id = $1, paired_at = NOW(), updated_at = NOW()
-                 WHERE id = $2 AND site_parameter_id IS NULL",
-                [site_parameter_id.into(), pair.new_id.into()],
-            ))
+        let claimed = data_streams::models::Entity::update_many()
+            .col_expr(
+                data_streams::models::Column::SiteParameterId,
+                Expr::value(site_parameter_id),
+            )
+            .col_expr(
+                data_streams::models::Column::PairedAt,
+                Expr::current_timestamp(),
+            )
+            .col_expr(
+                data_streams::models::Column::UpdatedAt,
+                Expr::current_timestamp(),
+            )
+            .filter(data_streams::models::Column::Id.eq(pair.new_id))
+            .filter(data_streams::models::Column::SiteParameterId.is_null())
+            .exec(txn)
             .await?
-            .rows_affected();
+            .rows_affected;
         if claimed == 0 {
             return Err(AppError::Conflict(format!(
                 "family stream {} is already paired",
@@ -272,21 +354,32 @@ async fn cutover_family(
         // they resolved at ingest, and rows from before pairing gain the stream's.
         bulk_write::mutation(
             txn,
-            Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE readings r
-                 SET site_id = $1, parameter_id = $2,
-                     sensor_id = COALESCE(r.sensor_id, ds.sensor_id),
-                     measurement_type = COALESCE(r.measurement_type, 'spot')
-                 FROM data_streams ds
-                 WHERE ds.id = r.stream_id AND r.stream_id = $3 AND r.site_id IS NULL",
-                [site_id.into(), parameter_id.into(), pair.new_id.into()],
-            ),
+            SeaQuery::update()
+                .table(readings::Entity)
+                .value(readings::Column::SiteId, site_id)
+                .value(readings::Column::ParameterId, parameter_id)
+                .value(
+                    readings::Column::SensorId,
+                    Expr::cust("COALESCE(readings.sensor_id, data_streams.sensor_id)"),
+                )
+                .value(
+                    readings::Column::MeasurementType,
+                    Expr::cust("COALESCE(readings.measurement_type, 'spot')"),
+                )
+                .from(data_streams::models::Entity)
+                .and_where(Expr::cust("data_streams.id = readings.stream_id"))
+                .and_where(Expr::col(readings::Column::StreamId).eq(pair.new_id))
+                .and_where(Expr::col(readings::Column::SiteId).is_null())
+                .take(),
         )
         .await?;
 
-        sample_groups::materialise_samples(txn, "r.stream_id = $1", vec![pair.new_id.into()])
-            .await?;
+        crate::routes::private::readings::service::materialise_samples(
+            txn,
+            "r.stream_id = $1",
+            vec![pair.new_id.into()],
+        )
+        .await?;
 
         // Trigger-computed verification: the row triggers have populated samples.mean inside this
         // transaction, so a disagreement here rolls everything back.
@@ -553,26 +646,20 @@ impl Job for ReplicateReconciliationDelete {
             let removed = bulk_write::guarded(db, async |txn| {
                 let removed = bulk_write::mutation(
                     txn,
-                    Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        "DELETE FROM readings WHERE stream_id = $1",
-                        [pair.old_id.into()],
-                    ),
+                    SeaQuery::delete()
+                        .from_table(readings::Entity)
+                        .and_where(Expr::col(readings::Column::StreamId).eq(pair.old_id))
+                        .take(),
                 )
                 .await?
                 .rows;
-                txn.execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "DELETE FROM status_events WHERE stream_id = $1",
-                    [pair.old_id.into()],
-                ))
-                .await?;
-                txn.execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "DELETE FROM data_streams WHERE id = $1",
-                    [pair.old_id.into()],
-                ))
-                .await?;
+                status_events::Entity::delete_many()
+                    .filter(status_events::Column::StreamId.eq(pair.old_id))
+                    .exec(txn)
+                    .await?;
+                data_streams::models::Entity::delete_by_id(pair.old_id)
+                    .exec(txn)
+                    .await?;
                 Ok(removed)
             })
             .await
@@ -604,11 +691,4 @@ impl Job for ReplicateReconciliationDelete {
         }
         Ok(deleted_readings)
     }
-}
-
-/// The slot a retired family's readings belong to.
-#[derive(FromQueryResult)]
-struct SlotRow {
-    site_id: Uuid,
-    parameter_id: Uuid,
 }

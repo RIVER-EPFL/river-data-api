@@ -3,10 +3,14 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, FromQueryResult, Statement};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
+    QueryFilter, QuerySelect, Statement,
+};
 use std::collections::HashSet;
 use uuid::Uuid;
 
+use super::models::alarm_event;
 use super::service::{
     EpisodeRow, ExtentRow, SlotRow, fetch_active_alarm_rows, fetch_episodes, resolve_threshold,
     severity_case,
@@ -14,6 +18,7 @@ use super::service::{
 use crate::common::{AppEvent, EventSender};
 use crate::config::Config;
 use crate::error::AppResult;
+use crate::routes::private::readings::models as readings;
 use crate::routes::private::reprocessing_jobs::job::Job;
 use crate::routes::private::reprocessing_jobs::jobs::{
     SlotOutcome, optional_datetime, optional_uuid, uuid_pair_array,
@@ -288,7 +293,8 @@ async fn reconcile_cadence<C: ConnectionTrait>(
     };
     // The latest served value under the same per-cadence rule the breach set uses, wrapped to a
     // single column for the scalar assignment.
-    let latest = super::service::latest_served_sql(spot, "ae.site_id", "ae.parameter_id");
+    let latest = super::service::latest_served_query(spot, "ae.site_id", "ae.parameter_id")
+        .to_string(sea_orm::sea_query::PostgresQueryBuilder);
     let resolve_sql = format!(
         "UPDATE alarm_events ae \
          SET resolved_at = NOW(), \
@@ -356,19 +362,14 @@ pub async fn evaluate_alarm_episodes(
     // Idempotent: clear the resolved episodes previously written for this slot+window, then reinsert
     // the freshly computed set. Open rows (`resolved_at IS NULL`) are owned by the sweeper and left
     // alone.
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "DELETE FROM alarm_events \
-         WHERE site_id = $1 AND parameter_id = $2 AND resolved_at IS NOT NULL \
-           AND started_at >= $3 AND started_at <= $4",
-        [
-            site_id.into(),
-            parameter_id.into(),
-            start.into(),
-            end.into(),
-        ],
-    ))
-    .await?;
+    alarm_event::Entity::delete_many()
+        .filter(alarm_event::Column::SiteId.eq(site_id))
+        .filter(alarm_event::Column::ParameterId.eq(parameter_id))
+        .filter(alarm_event::Column::ResolvedAt.is_not_null())
+        .filter(alarm_event::Column::StartedAt.gte(start))
+        .filter(alarm_event::Column::StartedAt.lte(end))
+        .exec(db)
+        .await?;
 
     for (cadence, episodes) in &all_episodes {
         for ep in episodes {
@@ -444,18 +445,16 @@ pub async fn rebuild_alarm_events(
         let (slot_start, slot_end) = if let (Some(a), Some(b)) = (start, end) {
             (a, b)
         } else {
-            let row = db
-                .query_one_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT MIN(time) AS lo, MAX(time) AS hi FROM readings \
-                     WHERE site_id = $1 AND parameter_id = $2",
-                    [s.into(), p.into()],
-                ))
-                .await?;
             // MIN/MAX over an empty slot are NULL, which is the "no readings" case below.
-            let extent = row
-                .map(|r| ExtentRow::from_query_result(&r, ""))
-                .transpose()?;
+            let extent = readings::Entity::find()
+                .select_only()
+                .column_as(readings::Column::Time.min(), "lo")
+                .column_as(readings::Column::Time.max(), "hi")
+                .filter(readings::Column::SiteId.eq(s))
+                .filter(readings::Column::ParameterId.eq(p))
+                .into_model::<ExtentRow>()
+                .one(db)
+                .await?;
             let lo = extent.as_ref().and_then(|e| e.lo);
             let hi = extent.as_ref().and_then(|e| e.hi);
             match (start.or(lo), end.or(hi)) {

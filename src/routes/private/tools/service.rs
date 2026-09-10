@@ -2,12 +2,15 @@
 //! evaluation, the closure walk, script linting and the runner calls.
 
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Alias, Expr, Func, JoinType, Order, PostgresQueryBuilder, Query};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
     FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use sea_orm_migration::sea_orm::DbErr;
+
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::samples::model as samples;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -29,12 +32,13 @@ use super::models::{
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::constants::models as constants;
+use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::parameters::groups::rules;
 use crate::routes::private::parameters::models as parameters;
-use crate::routes::private::readings::sd_estimator;
 use crate::routes::private::sensors::calibrations::service::evaluate_formula;
 use crate::routes::private::sensors::standard_curves::model as standard_curves;
 use crate::routes::private::sites::models as sites;
+use crate::routes::private::sites::parameters::models as site_parameters;
 use crate::routes::private::sync::service as replicate_audit;
 
 #[derive(Debug, Clone, sea_orm::FromQueryResult)]
@@ -676,24 +680,49 @@ pub async fn resolve_site_inputs(
     Ok(resolved)
 }
 
-/// The served spot value at one (site, parameter, instant): the sample mean, else the lowest
-/// unflagged replicate that is not withdrawn. `$1` is the site and `$3` the instant; `parameter`
-/// is the expression naming the parameter, so a statement resolving the parameter itself can
-/// pass its own column instead of a placeholder.
+/// A built query as the statement the connection takes.
 #[must_use]
-pub fn served_spot_value_sql(parameter: &str) -> String {
-    format!(
-        "COALESCE(
-            (SELECT smp.mean FROM samples smp
-              WHERE smp.site_id = $1 AND smp.parameter_id = {parameter}
-                AND smp.collected_at = $3),
-            (SELECT COALESCE(r.calibrated_value, r.raw_value) FROM readings r
-              WHERE r.site_id = $1 AND r.parameter_id = {parameter} AND r.time = $3
-                AND r.measurement_type = 'spot' AND r.is_flagged IS NOT TRUE
-                AND r.withdrawn_at IS NULL
-              ORDER BY r.replicate_index LIMIT 1)
-         )"
-    )
+pub fn build(query: &sea_orm::sea_query::SelectStatement) -> Statement {
+    let (sql, values) = query.build(PostgresQueryBuilder);
+    Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values)
+}
+
+/// The served spot value at one (site, parameter, instant): the sample mean, else the lowest
+/// unflagged replicate that is not withdrawn. Each of the three is an expression, so a statement
+/// resolving the parameter itself passes its own column where another passes a bound value.
+#[must_use]
+pub fn served_spot_value_expr(site: Expr, parameter: Expr, instant: Expr) -> Expr {
+    use sea_orm::sea_query::ExprTrait;
+    let smp = Alias::new("smp");
+    let mean = Query::select()
+        .column((smp.clone(), samples::Column::Mean))
+        .from_as(samples::Entity, smp.clone())
+        .and_where(Expr::col((smp.clone(), samples::Column::SiteId)).eq(site.clone()))
+        .and_where(Expr::col((smp.clone(), samples::Column::ParameterId)).eq(parameter.clone()))
+        .and_where(Expr::col((smp, samples::Column::CollectedAt)).eq(instant.clone()))
+        .to_owned();
+
+    let r = Alias::new("r");
+    let lowest_replicate = Query::select()
+        .expr(Func::coalesce([
+            Expr::col((r.clone(), readings::Column::CalibratedValue)),
+            Expr::col((r.clone(), readings::Column::RawValue)),
+        ]))
+        .from_as(readings::Entity, r.clone())
+        .and_where(Expr::col((r.clone(), readings::Column::SiteId)).eq(site))
+        .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).eq(parameter))
+        .and_where(Expr::col((r.clone(), readings::Column::Time)).eq(instant))
+        .and_where(
+            Expr::col((r.clone(), readings::Column::MeasurementType))
+                .eq(crate::routes::private::readings::service::SPOT),
+        )
+        .and_where(Expr::cust(r#""r"."is_flagged" IS NOT TRUE"#))
+        .and_where(Expr::col((r.clone(), readings::Column::WithdrawnAt)).is_null())
+        .order_by((r, readings::Column::ReplicateIndex), Order::Asc)
+        .limit(1)
+        .to_owned();
+
+    Func::coalesce([Expr::expr(mean), Expr::expr(lowest_replicate)]).into()
 }
 
 /// Fill the params the manifest's `event_inputs` declare from the collection event's stored
@@ -721,18 +750,17 @@ pub async fn resolve_event_inputs(
         let Some(parameter_id) = catalog_parameter_id(db, &e.parameter_code).await? else {
             continue;
         };
-        let Some(row) = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &format!("SELECT {} AS value", served_spot_value_sql("$2")),
-                [
-                    site_id.into(),
-                    parameter_id.into(),
-                    sea_orm::prelude::DateTimeWithTimeZone::from(collected_at).into(),
-                ],
-            ))
-            .await?
-        else {
+        let query = Query::select()
+            .expr_as(
+                served_spot_value_expr(
+                    Expr::val(site_id),
+                    Expr::val(parameter_id),
+                    Expr::val(sea_orm::prelude::DateTimeWithTimeZone::from(collected_at)),
+                ),
+                Alias::new("value"),
+            )
+            .to_owned();
+        let Some(row) = db.query_one_raw(build(&query)).await? else {
             continue;
         };
         let served = ServedSpotValue::from_query_result(&row, "")?;
@@ -1228,7 +1256,7 @@ pub(super) async fn apply_manifest_aggregates(
                     Some(fixed) => fixed,
                     None => displayed_sd_estimator(db, site_id, collected_at, param)
                         .await?
-                        .unwrap_or(sd_estimator::SAMPLE),
+                        .unwrap_or(crate::routes::private::readings::service::SAMPLE),
                 };
                 replicate_audit::group_stats(&values).under(estimator).sd
             }
@@ -1249,7 +1277,7 @@ pub(super) async fn apply_manifest_aggregates(
 /// The divisor the database will serve for the group this run is calculating, reachable only when
 /// the run carries a site and the param names a catalog code.
 ///
-/// Same ladder as the write path (`sd_estimator::resolve`), preceded by the one declaration that
+/// Same ladder as the write path (`crate::routes::private::readings::service::resolve`), preceded by the one declaration that
 /// belongs to the instant rather than the slot: an audit resolution scoped to a collection group
 /// records its choice on that `samples` row, and the trigger computes the served sd from it. A
 /// display resolved from the slot alone would show a different standard deviation for the same
@@ -1267,12 +1295,19 @@ pub(super) async fn displayed_sd_estimator(
         return Ok(None);
     };
     if let Some(at) = collected_at
-        && let Some(estimator) =
-            sd_estimator::instant_declaration(db, site, parameter_id, at).await?
+        && let Some(estimator) = crate::routes::private::readings::service::instant_declaration(
+            db,
+            site,
+            parameter_id,
+            at,
+        )
+        .await?
     {
         return Ok(Some(estimator));
     }
-    let resolved = sd_estimator::resolve(db, site, parameter_id, None, None).await?;
+    let resolved =
+        crate::routes::private::readings::service::resolve(db, site, parameter_id, None, None)
+            .await?;
     Ok(resolved.is_declared().then_some(resolved.estimator))
 }
 
@@ -2531,6 +2566,122 @@ pub(super) async fn calculation_slots(state: &AppState) -> AppResult<Vec<Uuid>> 
     Ok(ids)
 }
 
+/// Coverage for a set of parameters: how many slots declare each, and what its readings and their
+/// provenance say. Each side is its own LATERAL, so a parameter with no readings still reports a
+/// row with zeroes rather than dropping out of the join.
+pub(super) fn coverage_query(parameter_ids: &[Uuid], site_id: Option<Uuid>) -> Statement {
+    use sea_orm::sea_query::ExprTrait;
+
+    let p = Alias::new("p");
+    let sp = Alias::new("sp");
+    let r = Alias::new("r");
+    let ds = Alias::new("ds");
+    let cfg = Alias::new("cfg");
+    let obs = Alias::new("obs");
+
+    let mut configured = Query::select();
+    configured
+        .expr_as(
+            Expr::cust(r#"COUNT(*)::bigint"#),
+            Alias::new("sites_configured"),
+        )
+        .from_as(site_parameters::Entity, sp.clone())
+        .and_where(
+            Expr::col((sp.clone(), site_parameters::Column::ParameterId))
+                .equals((p.clone(), parameters::Column::Id)),
+        );
+    if let Some(id) = site_id {
+        configured.and_where(Expr::col((sp, site_parameters::Column::SiteId)).eq(id));
+    }
+
+    let mut observed = Query::select();
+    observed
+        .expr_as(Expr::cust(r#"COUNT(*)::bigint"#), Alias::new("reading_count"))
+        .expr_as(
+            Expr::col((r.clone(), readings::Column::Time)).min(),
+            Alias::new("first_reading"),
+        )
+        .expr_as(
+            Expr::col((r.clone(), readings::Column::Time)).max(),
+            Alias::new("last_reading"),
+        )
+        .expr_as(
+            Expr::cust(
+                r#"ARRAY_AGG(DISTINCT "ds"."source_system") FILTER (WHERE "ds"."source_system" IS NOT NULL)"#,
+            ),
+            Alias::new("source_systems"),
+        )
+        .expr_as(
+            Expr::cust(
+                r#"ARRAY_AGG(DISTINCT "r"."provenance" ->> 'source') FILTER (WHERE "r"."provenance" ->> 'source' IS NOT NULL)"#,
+            ),
+            Alias::new("run_sources"),
+        )
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            data_streams::Entity,
+            ds.clone(),
+            Expr::col((ds, data_streams::Column::Id))
+                .equals((r.clone(), readings::Column::StreamId)),
+        )
+        .and_where(
+            Expr::col((r.clone(), readings::Column::ParameterId))
+                .equals((p.clone(), parameters::Column::Id)),
+        );
+    if let Some(id) = site_id {
+        observed.and_where(Expr::col((r, readings::Column::SiteId)).eq(id));
+    }
+
+    let empty_text_array = Expr::cust("ARRAY[]::text[]");
+    let query = Query::select()
+        .expr_as(
+            Expr::col((p.clone(), parameters::Column::Id)),
+            Alias::new("parameter_id"),
+        )
+        .expr_as(
+            Expr::col((p.clone(), parameters::Column::Code)),
+            Alias::new("parameter_code"),
+        )
+        .expr_as(
+            Func::coalesce([
+                Expr::col((cfg.clone(), Alias::new("sites_configured"))),
+                Expr::val(0),
+            ]),
+            Alias::new("sites_configured"),
+        )
+        .expr_as(
+            Func::coalesce([
+                Expr::col((obs.clone(), Alias::new("reading_count"))),
+                Expr::val(0),
+            ]),
+            Alias::new("reading_count"),
+        )
+        .column((obs.clone(), Alias::new("first_reading")))
+        .column((obs.clone(), Alias::new("last_reading")))
+        .expr_as(
+            Func::coalesce([
+                Expr::col((obs.clone(), Alias::new("source_systems"))),
+                empty_text_array.clone(),
+            ]),
+            Alias::new("source_systems"),
+        )
+        .expr_as(
+            Func::coalesce([
+                Expr::col((obs.clone(), Alias::new("run_sources"))),
+                empty_text_array,
+            ]),
+            Alias::new("run_sources"),
+        )
+        .from_as(parameters::Entity, p.clone())
+        .join_lateral(JoinType::LeftJoin, configured, cfg, Expr::cust("TRUE"))
+        .join_lateral(JoinType::LeftJoin, observed, obs, Expr::cust("TRUE"))
+        .and_where(Expr::col((p.clone(), parameters::Column::Id)).is_in(parameter_ids.to_vec()))
+        .order_by((p, parameters::Column::Code), Order::Asc)
+        .to_owned();
+    build(&query)
+}
+
 /// Coverage for a set of parameters, one query each over configuration, readings and provenance.
 pub async fn coverage_for(
     state: &AppState,
@@ -2540,54 +2691,9 @@ pub async fn coverage_for(
     if parameter_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let mut binds: Vec<sea_orm::Value> = vec![parameter_ids.to_vec().into()];
-    let site_clause = match site_id {
-        Some(id) => {
-            binds.push(id.into());
-            " AND r.site_id = $2"
-        }
-        None => "",
-    };
-    let sp_clause = if site_id.is_some() {
-        " AND sp.site_id = $2"
-    } else {
-        ""
-    };
-
     let rows = state
         .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT p.id AS parameter_id, p.code AS parameter_code, \
-                        COALESCE(cfg.sites_configured, 0) AS sites_configured, \
-                        COALESCE(obs.reading_count, 0) AS reading_count, \
-                        obs.first_reading, obs.last_reading, \
-                        COALESCE(obs.source_systems, ARRAY[]::text[]) AS source_systems, \
-                        COALESCE(obs.run_sources, ARRAY[]::text[]) AS run_sources \
-                 FROM parameters p \
-                 LEFT JOIN LATERAL ( \
-                     SELECT COUNT(*)::bigint AS sites_configured \
-                       FROM site_parameters sp \
-                      WHERE sp.parameter_id = p.id{sp_clause} \
-                 ) cfg ON true \
-                 LEFT JOIN LATERAL ( \
-                     SELECT COUNT(*)::bigint AS reading_count, \
-                            MIN(r.time) AS first_reading, \
-                            MAX(r.time) AS last_reading, \
-                            ARRAY_AGG(DISTINCT ds.source_system) \
-                                FILTER (WHERE ds.source_system IS NOT NULL) AS source_systems, \
-                            ARRAY_AGG(DISTINCT r.provenance ->> 'source') \
-                                FILTER (WHERE r.provenance ->> 'source' IS NOT NULL) AS run_sources \
-                       FROM readings r \
-                       LEFT JOIN data_streams ds ON ds.id = r.stream_id \
-                      WHERE r.parameter_id = p.id{site_clause} \
-                 ) obs ON true \
-                 WHERE p.id = ANY($1) \
-                 ORDER BY p.code"
-            ),
-            binds,
-        ))
+        .query_all_raw(coverage_query(parameter_ids, site_id))
         .await?;
 
     let coverage = rows

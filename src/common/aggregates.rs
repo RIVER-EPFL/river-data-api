@@ -16,10 +16,14 @@
 //! a `DatabaseConnection`, after any guarded write has committed.
 
 use chrono::{DateTime, Datelike, Duration, DurationRound, Months, Utc, Weekday};
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
+    QueryFilter, QuerySelect, Statement,
+};
 
 use super::bulk_write::TouchedRange;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::readings::models as readings;
 
 /// A rollup view and its bucket width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,20 +200,25 @@ pub async fn refresh(db: &DatabaseConnection, window: Window) -> AppResult<()> {
 /// filter admits. Empty when every view covers its history (the steady state, two cheap MIN
 /// probes per tick).
 async fn views_missing_history(db: &DatabaseConnection) -> AppResult<Vec<Resolution>> {
-    let earliest = db
-        .query_one_raw(Statement::from_string(
-            DatabaseBackend::Postgres,
-            "SELECT MIN(time) AS t FROM readings
-             WHERE site_id IS NOT NULL AND replicate_index = 0
-               AND is_flagged IS NOT TRUE AND measurement_type IS DISTINCT FROM 'spot'"
-                .to_string(),
-        ))
+    let earliest = readings::Entity::find()
+        .select_only()
+        .column_as(readings::Column::Time.min(), "t")
+        .filter(readings::Column::SiteId.is_not_null())
+        .filter(readings::Column::ReplicateIndex.eq(0))
+        .filter(
+            Condition::any()
+                .add(readings::Column::IsFlagged.eq(false))
+                .add(readings::Column::IsFlagged.is_null()),
+        )
+        .filter(
+            Condition::any()
+                .add(readings::Column::MeasurementType.ne("spot"))
+                .add(readings::Column::MeasurementType.is_null()),
+        )
+        .into_tuple::<Option<sea_orm::prelude::DateTimeWithTimeZone>>()
+        .one(db)
         .await?
-        .and_then(|row| {
-            row.try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "t")
-                .ok()
-                .flatten()
-        });
+        .flatten();
     let Some(earliest) = earliest else {
         return Ok(Vec::new());
     };

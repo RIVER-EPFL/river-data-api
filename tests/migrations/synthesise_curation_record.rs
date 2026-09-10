@@ -107,7 +107,7 @@ async fn every_curated_row_gets_the_decision_it_could_have_been_decided_by() {
     seed_test_data(&db).await;
     let stream = seed_curated_rows(&db).await;
 
-    let drift_sql = river_db::routes::private::readings::decisions::inconsistent_rows_sql();
+    let drift_sql = river_db::routes::private::readings::service::inconsistent_rows_sql();
     assert_eq!(
         scalar_i64(
             &db,

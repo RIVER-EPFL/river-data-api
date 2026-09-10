@@ -10,6 +10,7 @@
 //! general the one covering a given reading's time, so which curve corrects a reading is left to
 //! the slot reprocess every caller enqueues post-commit.
 
+use sea_orm::sea_query::{Alias, Expr, Func, PostgresQueryBuilder, Query, UpdateStatement};
 use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
 use uuid::Uuid;
 
@@ -17,9 +18,13 @@ use super::models::{Backfilled, SlotScope};
 use super::service::{release_slot_rows, resolve_retire_target};
 use crate::common::bulk_write::{self, TouchedRange};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::collection_events::flows::touched_events;
+use crate::routes::private::collection_events::flows::{rows_matching, touched_events};
 use crate::routes::private::collection_events::service::{EventSource, attach_collection_events};
-use crate::routes::private::readings::sample_groups::materialise_samples;
+use crate::routes::private::data_streams::models as data_streams;
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::service::materialise_samples;
+use crate::routes::private::readings::status_events::model as status_events;
+use crate::routes::private::sites::parameters::models as site_parameters;
 use crate::routes::private::sync::service::{HoldScope, repoint_holds};
 
 /// The scope as a predicate over `data_streams ds`, which is the one table all four statements
@@ -29,6 +34,112 @@ fn predicate(scope: HoldScope) -> (&'static str, Vec<sea_orm::Value>) {
         HoldScope::Stream(id) => ("ds.id = $1", vec![id.into()]),
         HoldScope::Plan(id) => ("ds.pairing_plan_id = $1", vec![id.into()]),
     }
+}
+
+/// The same scope, built. The text form above stays until the three shared helpers this file calls
+/// take a condition instead of a string.
+fn scope_condition(scope: HoldScope) -> Expr {
+    use sea_orm::sea_query::ExprTrait;
+
+    // An UPDATE takes no alias, so the streams table is named rather than aliased.
+    let ds = Alias::new("data_streams");
+    match scope {
+        HoldScope::Stream(id) => Expr::col((ds, data_streams::Column::Id)).eq(id),
+        HoldScope::Plan(id) => Expr::col((ds, data_streams::Column::PairingPlanId)).eq(id),
+    }
+}
+
+/// Attribute a newly paired stream's readings from the slot it now serves. A reading already
+/// attributed keeps what it has; the instrument and cadence fall back to the stream's own.
+fn attribute_readings(scope: HoldScope, deployment_id: Option<Uuid>) -> UpdateStatement {
+    use sea_orm::sea_query::ExprTrait;
+
+    let r = Alias::new("readings");
+    let ds = Alias::new("data_streams");
+    let sp = Alias::new("site_parameters");
+    Query::update()
+        .table(readings::Entity)
+        .value(
+            readings::Column::SiteId,
+            Expr::col((sp.clone(), site_parameters::Column::SiteId)),
+        )
+        .value(
+            readings::Column::ParameterId,
+            Expr::col((sp.clone(), site_parameters::Column::ParameterId)),
+        )
+        .value(
+            readings::Column::SensorId,
+            Func::coalesce([
+                Expr::col((ds.clone(), data_streams::Column::SensorId)),
+                Expr::col((r.clone(), readings::Column::SensorId)),
+            ]),
+        )
+        .value(
+            readings::Column::DeploymentId,
+            Func::coalesce([
+                Expr::val(deployment_id).cast_as(Alias::new("uuid")),
+                Expr::col((r.clone(), readings::Column::DeploymentId)),
+            ]),
+        )
+        .value(
+            readings::Column::MeasurementType,
+            Func::coalesce([
+                Expr::col((r.clone(), readings::Column::MeasurementType)),
+                Expr::col((ds.clone(), data_streams::Column::MeasurementType)),
+            ]),
+        )
+        .from(data_streams::Entity)
+        .from(site_parameters::Entity)
+        .and_where(
+            Expr::col((ds.clone(), data_streams::Column::SiteParameterId))
+                .equals((sp, site_parameters::Column::Id)),
+        )
+        .and_where(
+            Expr::col((r.clone(), readings::Column::StreamId))
+                .equals((ds, data_streams::Column::Id)),
+        )
+        .and_where(Expr::col((r, readings::Column::SiteId)).is_null())
+        .and_where(scope_condition(scope))
+        .to_owned()
+}
+
+/// The same attribution for the non-numeric series, which carry no value to correct.
+fn attribute_status_events(scope: HoldScope) -> UpdateStatement {
+    use sea_orm::sea_query::ExprTrait;
+
+    let se = Alias::new("status_events");
+    let ds = Alias::new("data_streams");
+    let sp = Alias::new("site_parameters");
+    Query::update()
+        .table(status_events::Entity)
+        .value(
+            status_events::Column::SiteId,
+            Expr::col((sp.clone(), site_parameters::Column::SiteId)),
+        )
+        .value(
+            status_events::Column::ParameterId,
+            Expr::col((sp.clone(), site_parameters::Column::ParameterId)),
+        )
+        .value(
+            status_events::Column::SensorId,
+            Func::coalesce([
+                Expr::col((ds.clone(), data_streams::Column::SensorId)),
+                Expr::col((se.clone(), status_events::Column::SensorId)),
+            ]),
+        )
+        .from(data_streams::Entity)
+        .from(site_parameters::Entity)
+        .and_where(
+            Expr::col((ds.clone(), data_streams::Column::SiteParameterId))
+                .equals((sp, site_parameters::Column::Id)),
+        )
+        .and_where(
+            Expr::col((se.clone(), status_events::Column::StreamId))
+                .equals((ds, data_streams::Column::Id)),
+        )
+        .and_where(Expr::col((se, status_events::Column::SiteId)).is_null())
+        .and_where(scope_condition(scope))
+        .to_owned()
 }
 
 /// Attribute everything the newly paired streams already hold.
@@ -46,27 +157,9 @@ pub async fn backfill<C: ConnectionTrait>(
     // The backfill reaches chunks the compression policy has already closed.
     bulk_write::lift_decompression_cap(conn).await?;
 
-    let mut reading_binds = binds.clone();
-    reading_binds.push(deployment_id.into());
-    let readings = bulk_write::mutation(
-        conn,
-        Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                r"UPDATE readings r
-                  SET site_id = sp.site_id, parameter_id = sp.parameter_id,
-                      sensor_id = COALESCE(ds.sensor_id, r.sensor_id),
-                      deployment_id = COALESCE($2::uuid, r.deployment_id),
-                      measurement_type = COALESCE(r.measurement_type, ds.measurement_type)
-                  FROM data_streams ds
-                  JOIN site_parameters sp ON ds.site_parameter_id = sp.id
-                  WHERE r.stream_id = ds.id AND r.site_id IS NULL AND {scope_sql}"
-            ),
-            reading_binds,
-        ),
-    )
-    .await?
-    .rows;
+    let readings = bulk_write::mutation(conn, attribute_readings(scope, deployment_id))
+        .await?
+        .rows;
 
     // Replicate groups on the newly paired streams (2+ spot readings sharing a slot and timestamp,
     // e.g. migrated NOMIS A/B/C rows) form samples. The row-level triggers populate the statistics.
@@ -75,19 +168,13 @@ pub async fn backfill<C: ConnectionTrait>(
     // Attribution arriving is what makes these spot readings addressable as visits: attach their
     // collection events now, deriving the source from where each stream came from.
     attach_collection_events(conn, scope_sql, binds.clone(), EventSource::ByStreamOrigin).await?;
-    let touched = touched_events(conn, scope_sql, binds.clone()).await?;
+    let touched = touched_events(conn, rows_matching(scope_sql, binds.clone())).await?;
 
+    let (sql, values) = attribute_status_events(scope).build(PostgresQueryBuilder);
     conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        format!(
-            r"UPDATE status_events se
-              SET site_id = sp.site_id, parameter_id = sp.parameter_id,
-                  sensor_id = COALESCE(ds.sensor_id, se.sensor_id)
-              FROM data_streams ds
-              JOIN site_parameters sp ON ds.site_parameter_id = sp.id
-              WHERE se.stream_id = ds.id AND se.site_id IS NULL AND {scope_sql}"
-        ),
-        binds.clone(),
+        sql,
+        values,
     ))
     .await?;
 
@@ -150,3 +237,7 @@ pub async fn retire_slot<C: ConnectionTrait + TransactionTrait>(
 #[cfg(test)]
 #[path = "tests/flows.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/backfill.rs"]
+mod backfill_tests;

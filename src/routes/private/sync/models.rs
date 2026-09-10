@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::common::paging::Window;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::readings::sd_estimator::SdEstimator;
+use crate::routes::private::readings::models::SdEstimator;
 
 /// One replicate group's expectation, as the portal stored it. Declared in `river-data-core`.
 pub use river_data_core::models::GroupAudit;

@@ -242,7 +242,7 @@ pub struct StreamPreviewResponse {
     pub source_key: String,
     /// The divisor the standard deviations below were computed under, resolved the way the write
     /// path resolves it: the stream's spec, then the slot's declaration, else the fallback.
-    #[schema(value_type = crate::routes::private::readings::sd_estimator::SdEstimator)]
+    #[schema(value_type = crate::routes::private::readings::models::SdEstimator)]
     pub sd_estimator: &'static str,
     /// What chose it: 'stream', 'slot', or 'default' for the undeclared fallback.
     pub sd_estimator_source: &'static str,
@@ -377,10 +377,49 @@ pub enum Release {
     Retain,
 }
 
+/// The tables a slot owns rows in, named through their entities so a statement over one cannot
+/// spell a table or a column the entity does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotRows {
+    Readings,
+    StatusEvents,
+    Samples,
+    Annotations,
+}
+
+impl SlotRows {
+    /// The table, as the builder names it.
+    #[must_use]
+    pub fn table_ref(self) -> sea_orm::sea_query::TableRef {
+        use sea_orm::sea_query::IntoTableRef;
+        match self {
+            Self::Readings => crate::routes::private::readings::models::Entity.into_table_ref(),
+            Self::StatusEvents => {
+                crate::routes::private::readings::status_events::model::Entity.into_table_ref()
+            }
+            Self::Samples => {
+                crate::routes::private::readings::samples::model::Entity.into_table_ref()
+            }
+            Self::Annotations => crate::routes::private::annotations::Entity.into_table_ref(),
+        }
+    }
+
+    /// The table's own name, for a message naming which one a collision was found in.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Readings => "readings",
+            Self::StatusEvents => "status_events",
+            Self::Samples => "samples",
+            Self::Annotations => "annotations",
+        }
+    }
+}
+
 /// A table addressed by the (site, parameter) slot rather than by the stream that wrote its rows.
 #[derive(Debug, Clone, Copy)]
 pub struct SlotTable {
-    pub table: &'static str,
+    pub rows: SlotRows,
     pub release: Release,
     /// Rows carry a `time` column, so a mutation can report the span it touched.
     pub timed: bool,
@@ -398,7 +437,7 @@ pub struct SlotTable {
 /// what stops a merge stranding rows on a deleted parameter and a slot delete abandoning them.
 pub const SLOT_TABLES: [SlotTable; 4] = [
     SlotTable {
-        table: "readings",
+        rows: SlotRows::Readings,
         release: Release::Unattribute(&[
             "site_id",
             "parameter_id",
@@ -410,21 +449,21 @@ pub const SLOT_TABLES: [SlotTable; 4] = [
         unique_with: None,
     },
     SlotTable {
-        table: "status_events",
+        rows: SlotRows::StatusEvents,
         release: Release::Unattribute(&["site_id", "parameter_id"]),
         timed: true,
         feeds_rollups: false,
         unique_with: None,
     },
     SlotTable {
-        table: "samples",
+        rows: SlotRows::Samples,
         release: Release::DeleteWhenOrphaned,
         timed: false,
         feeds_rollups: false,
         unique_with: Some("collected_at"),
     },
     SlotTable {
-        table: "annotations",
+        rows: SlotRows::Annotations,
         release: Release::Retain,
         timed: false,
         feeds_rollups: false,
@@ -459,4 +498,75 @@ pub struct SlotMove {
     /// Feeds the caller's post-commit rollup refresh; the rollups group by `parameter_id`, so both
     /// the source's and the survivor's buckets are recomputed by the same window.
     pub touched: TouchedRange,
+}
+
+/// One committed windowed ingest pass.
+///
+/// The row is the account of what the pass did with what the source submitted, and the table's
+/// `receipt_arithmetic_closes` CHECK is what makes a write path that cannot account for a
+/// submitted row unable to commit. Named fields on the writer are the other half of that: the
+/// counts are five separate `integer` columns, and a positional bind list cannot tell them apart.
+///
+/// Read-only as an entity (`routes(read)`): the one writer is the ingest pass itself and the one
+/// deleter is the janitor's age prune.
+pub mod receipts {
+    use crudcrate::EntityToModels;
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(
+        Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize, EntityToModels,
+    )]
+    #[sea_orm(table_name = "ingest_receipts")]
+    #[crudcrate(
+        api_struct = "IngestReceipt",
+        name_singular = "ingest_receipt",
+        name_plural = "ingest_receipts",
+        generate_router,
+        routes(read)
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
+        pub id: Uuid,
+        #[crudcrate(filterable, sortable, exclude(update, create))]
+        pub stream_id: Uuid,
+        #[crudcrate(sortable, exclude(update, create))]
+        pub at: DateTimeWithTimeZone,
+        #[crudcrate(sortable, exclude(update, create))]
+        pub window_from: Option<DateTimeWithTimeZone>,
+        #[crudcrate(sortable, exclude(update, create))]
+        pub window_to: Option<DateTimeWithTimeZone>,
+        #[crudcrate(exclude(update, create))]
+        pub submitted: i32,
+        #[crudcrate(exclude(update, create))]
+        pub new_rows: i32,
+        #[crudcrate(exclude(update, create))]
+        pub changed: i32,
+        #[crudcrate(exclude(update, create))]
+        pub unchanged: i32,
+        #[crudcrate(exclude(update, create))]
+        pub retained: i32,
+        #[crudcrate(exclude(update, create))]
+        pub rejected_total: i32,
+        #[crudcrate(exclude(update, create))]
+        pub rejected: serde_json::Value,
+        #[crudcrate(exclude(update, create))]
+        pub dropped: i32,
+        #[crudcrate(exclude(update, create))]
+        pub withdrawn: i32,
+        #[crudcrate(exclude(update, create))]
+        pub changed_keys: Option<serde_json::Value>,
+        #[crudcrate(filterable, exclude(update, create))]
+        pub braked: bool,
+        #[crudcrate(exclude(update, create))]
+        pub brake_threshold: Option<f32>,
+        #[crudcrate(exclude(update, create))]
+        pub proposed: i32,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
 }

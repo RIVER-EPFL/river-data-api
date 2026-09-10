@@ -16,9 +16,10 @@ use axum::{
     Json,
     extract::{Path, State},
 };
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, PostgresQueryBuilder, Query as SeaQuery};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult,
-    QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait, sea_query::Expr,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use uuid::Uuid;
 
@@ -27,10 +28,11 @@ use super::models::{
     DeclareSdEstimatorRequest, DeclareSdEstimatorResponse, Entity, GroupMember, RetagCounts,
     RetagSdEstimatorRequest, RetagSdEstimatorResponse, UndeclaredRow,
 };
-use super::service::{SLOT_SCOPE, partition_members};
+use super::service::{partition_members, slot_scope};
 use crate::common::state::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::parameters::groups::member_model;
+use crate::routes::private::readings::samples;
 
 #[utoipa::path(
     post,
@@ -80,17 +82,17 @@ pub async fn declare_sd_estimator(
                 // Counted inside the transaction the declaration lands in, so the number
                 // reported is the one the retag will act on. A cleared declaration recomputes
                 // nothing: stored samples keep the estimator they were computed with.
+                // `sd_estimator` is NOT NULL, so `ne` is the `IS DISTINCT FROM` this had.
                 let affected = if let Some(est) = &estimator {
-                    txn.query_one_raw(Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        "SELECT COUNT(*)::bigint AS n FROM samples
-                         WHERE site_id = $1 AND parameter_id = $2
-                           AND sd_estimator IS DISTINCT FROM $3
-                           AND sd_estimator_source <> 'sample'",
-                        [site_id.into(), parameter_id.into(), est.clone().into()],
-                    ))
-                    .await?
-                    .map_or(Ok(0_i64), |row| row.try_get::<i64>("", "n"))?
+                    samples::Entity::find()
+                        .filter(samples::Column::SiteId.eq(site_id))
+                        .filter(samples::Column::ParameterId.eq(parameter_id))
+                        .filter(samples::Column::SdEstimator.ne(est.clone()))
+                        .filter(samples::Column::SdEstimatorSource.ne("sample"))
+                        .count(txn)
+                        .await?
+                        .try_into()
+                        .unwrap_or(i64::MAX)
                 } else {
                     0
                 };
@@ -150,9 +152,7 @@ pub async fn retag_sd_estimator(
     State(state): State<AppState>,
     Json(payload): Json<RetagSdEstimatorRequest>,
 ) -> AppResult<Json<RetagSdEstimatorResponse>> {
-    use crate::routes::private::readings::sd_estimator;
-
-    let estimator = sd_estimator::parse(&payload.estimator)?;
+    let estimator = crate::routes::private::readings::service::parse(&payload.estimator)?;
     if payload.site_parameter_ids.is_empty() && payload.stream_ids.is_empty() {
         return Err(AppError::BadRequest(
             "name at least one site_parameter_id or stream_id".to_string(),
@@ -208,30 +208,34 @@ pub async fn retag_sd_estimator(
         )));
     }
 
-    let mut binds: Vec<sea_orm::Value> = vec![
-        estimator.into(),
-        payload.site_parameter_ids.clone().into(),
-        payload.stream_ids.clone().into(),
-    ];
-    let mut window = String::new();
+    // One pass, split by whether the instant declared for itself: the two FILTER aggregates are
+    // the only text left, and the scope and window are composed rather than appended with
+    // hand-counted placeholders.
+    let mut counts_query = SeaQuery::select();
+    counts_query
+        .expr_as(
+            Expr::cust("COUNT(*) FILTER (WHERE sd_estimator_source <> 'sample')::bigint"),
+            Alias::new("slot_rows"),
+        )
+        .expr_as(
+            Expr::cust("COUNT(*) FILTER (WHERE sd_estimator_source = 'sample')::bigint"),
+            Alias::new("instant_rows"),
+        )
+        .from(samples::Entity)
+        .and_where(slot_scope(&payload.site_parameter_ids, &payload.stream_ids))
+        .and_where(Expr::col(samples::Column::SdEstimator).ne(estimator));
     if let Some(start) = payload.start {
-        binds.push(sea_orm::prelude::DateTimeWithTimeZone::from(start).into());
-        window.push_str(&format!(" AND s.collected_at >= ${}", binds.len()));
+        counts_query.and_where(Expr::col(samples::Column::CollectedAt).gte(start));
     }
     if let Some(end) = payload.end {
-        binds.push(sea_orm::prelude::DateTimeWithTimeZone::from(end).into());
-        window.push_str(&format!(" AND s.collected_at <= ${}", binds.len()));
+        counts_query.and_where(Expr::col(samples::Column::CollectedAt).lte(end));
     }
+    let (sql, values) = counts_query.build(PostgresQueryBuilder);
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT COUNT(*) FILTER (WHERE s.sd_estimator_source <> 'sample')::bigint AS slot_rows,
-                        COUNT(*) FILTER (WHERE s.sd_estimator_source = 'sample')::bigint AS instant_rows
-                 FROM samples s
-                 WHERE {SLOT_SCOPE} AND s.sd_estimator IS DISTINCT FROM $1{window}"
-            ),
-            binds,
+            sql,
+            values.0,
         ))
         .await?;
     let counts = row

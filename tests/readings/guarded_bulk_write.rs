@@ -79,7 +79,7 @@ async fn guarded_mutation_completes_where_the_bare_statement_hits_the_decompress
         "an uncapped bare UPDATE would prove nothing; the cap must bite first"
     );
 
-    let touched = bulk_write::guarded_mutation(&capped, bump_all(stream_id))
+    let touched = bulk_write::guarded_mutation_sql(&capped, bump_all(stream_id))
         .await
         .expect("the guarded write lifts the cap");
 
@@ -103,7 +103,7 @@ async fn a_failed_guarded_write_leaves_nothing_committed() {
     let before = sum_of(&db, stream_id).await;
 
     let outcome: Result<(), AppError> = bulk_write::guarded(&capped, async |txn| {
-        bulk_write::mutation(txn, bump_all(stream_id)).await?;
+        bulk_write::mutation_sql(txn, bump_all(stream_id)).await?;
         Err(AppError::Internal("second statement failed".to_string()))
     })
     .await;
@@ -122,7 +122,7 @@ async fn a_failed_guarded_write_leaves_nothing_committed() {
 async fn a_mutation_matching_nothing_reports_an_empty_range() {
     let (db, capped, _, _) = seed_compressed("guarded_bulk_write_empty").await;
 
-    let touched = bulk_write::guarded_mutation(&capped, bump_all(Uuid::new_v4()))
+    let touched = bulk_write::guarded_mutation_sql(&capped, bump_all(Uuid::new_v4()))
         .await
         .expect("a statement matching nothing is not an error");
 

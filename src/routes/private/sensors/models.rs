@@ -557,6 +557,54 @@ pub struct RetagFrequencyResponse {
     pub job_id: Option<Uuid>,
 }
 
+/// An instrument a source has offered and no pairing plan has admitted yet (Q134).
+pub mod proposal {
+    use crudcrate::EntityToModels;
+    use sea_orm::entity::prelude::*;
+
+    #[derive(
+        Clone,
+        Debug,
+        PartialEq,
+        DeriveEntityModel,
+        serde::Serialize,
+        serde::Deserialize,
+        EntityToModels,
+    )]
+    #[sea_orm(table_name = "instrument_proposals")]
+    #[crudcrate(
+        api_struct = "InstrumentProposal",
+        name_singular = "instrument_proposal",
+        name_plural = "instrument_proposals"
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
+        pub id: Uuid,
+        #[crudcrate(filterable)]
+        pub source_system: String,
+        #[crudcrate(filterable)]
+        pub source_key: String,
+        pub name: String,
+        pub serial_number: Option<String>,
+        pub manufacturer: Option<String>,
+        pub model: Option<String>,
+        pub notes: Option<String>,
+        pub is_lab_instrument: bool,
+        pub data_frequency: Option<String>,
+        pub metadata: Option<serde_json::Value>,
+        #[crudcrate(exclude(create, update), sortable)]
+        pub first_seen_at: chrono::DateTime<chrono::Utc>,
+        #[crudcrate(exclude(create, update), sortable)]
+        pub last_seen_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 #[cfg(test)]
 #[path = "tests/models.rs"]
 mod tests;

@@ -9,7 +9,10 @@ use axum::{
 };
 use chrono::Utc;
 use sea_orm::ExprTrait;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{
+    Alias, Expr, Func, JoinType, PostgresQueryBuilder, Query as SeaQuery, SelectStatement,
+    SimpleExpr, SubQueryStatement,
+};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
     QueryFilter, QueryOrder, Set, Statement,
@@ -17,6 +20,10 @@ use sea_orm::{
 use uuid::Uuid;
 
 use river_data_core::commands as core_commands;
+
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::samples::model as samples;
+use crate::routes::private::sites::parameters::models as site_parameters;
 use river_data_core::models::{
     CommandStatus, CommandUpdateRequest, EnrollRequest, EnrollResponse, HeartbeatRequest,
     HeartbeatResponse, PendingCommand, ServiceStatus, SyncEventStatus, SyncEventType,
@@ -910,6 +917,114 @@ pub async fn revoke_service(
     Ok(Json(RevokedResponse { revoked: true }))
 }
 
+/// A sample whose estimator was chosen for its own instant is not one a slot declaration moved,
+/// so a restore leaves it alone.
+fn not_chosen_per_instant() -> Expr {
+    Expr::col((samples::Entity, samples::Column::SdEstimatorSource)).ne("sample")
+}
+
+/// Put the samples a slot declaration moved back on the estimator that preceded it: the slot's
+/// own, or the default when the slot declares none.
+fn restore_estimator(previous: Option<String>) -> sea_orm::sea_query::UpdateStatement {
+    let mut update = SeaQuery::update();
+    update
+        .table(samples::Entity)
+        .value(
+            samples::Column::SdEstimator,
+            Expr::cust_with_values("COALESCE($1, 'sample')", [previous.clone()]),
+        )
+        .value(
+            samples::Column::SdEstimatorSource,
+            Expr::cust_with_values(
+                "CASE WHEN $1::text IS NULL THEN 'default' ELSE 'slot' END",
+                [previous],
+            ),
+        )
+        .from(site_parameters::Entity);
+    update
+}
+
+/// One slot's sample groups.
+fn slot_samples(site_id: Uuid, parameter_id: Uuid) -> Condition {
+    Condition::all()
+        .add(Expr::col(samples::Column::SiteId).eq(site_id))
+        .add(Expr::col(samples::Column::ParameterId).eq(parameter_id))
+}
+
+/// Recompute the statistics of the sample groups `rows` selects. The trigger function is called
+/// for its effect, so the statement is a SELECT that discards its result.
+fn refresh_group(rows: Condition) -> Statement {
+    built(
+        SeaQuery::select()
+            .expr(
+                Func::cust(Alias::new("refresh_sample_aggregate"))
+                    .arg(Expr::col(samples::Column::Id)),
+            )
+            .from(samples::Entity)
+            .cond_where(rows)
+            .take(),
+    )
+}
+
+/// One built statement, ready to execute.
+fn built(query: SelectStatement) -> Statement {
+    let (sql, values) = query.build(PostgresQueryBuilder);
+    Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values)
+}
+
+/// What the old avg stream holds, and how much of it the family stream has not covered yet.
+fn family_probe(old_id: Uuid, new_id: Uuid) -> Statement {
+    let at_index_zero = |alias: &Alias, stream: Uuid| {
+        Condition::all()
+            .add(Expr::col((alias.clone(), readings::Column::StreamId)).eq(stream))
+            .add(Expr::col((alias.clone(), readings::Column::ReplicateIndex)).eq(0))
+    };
+    let o = Alias::new("o");
+    let n = Alias::new("n");
+    let count = |cond: Condition, alias: &Alias| {
+        SimpleExpr::SubQuery(
+            None,
+            Box::new(SubQueryStatement::SelectStatement(
+                SeaQuery::select()
+                    .expr(Expr::cust("COUNT(*)::bigint"))
+                    .from_as(readings::Entity, alias.clone())
+                    .cond_where(cond)
+                    .take(),
+            )),
+        )
+    };
+    built(
+        SeaQuery::select()
+            .expr_as(
+                count(at_index_zero(&o, old_id), &o),
+                Alias::new("old_readings"),
+            )
+            .expr_as(
+                count(
+                    at_index_zero(&o, old_id).add(
+                        Expr::exists(
+                            SeaQuery::select()
+                                .expr(Expr::value(1))
+                                .from_as(readings::Entity, n.clone())
+                                .and_where(
+                                    Expr::col((n.clone(), readings::Column::StreamId)).eq(new_id),
+                                )
+                                .and_where(
+                                    Expr::col((n, readings::Column::Time))
+                                        .equals((o.clone(), readings::Column::Time)),
+                                )
+                                .take(),
+                        )
+                        .not(),
+                    ),
+                    &o,
+                ),
+                Alias::new("missing"),
+            )
+            .take(),
+    )
+}
+
 /// The replicate families of a source and their migration state.
 #[utoipa::path(
     get,
@@ -927,17 +1042,7 @@ pub async fn reconciliation_candidates(
     for pair in &pairs {
         let row = state
             .db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT
-                     (SELECT COUNT(*)::bigint FROM readings r
-                      WHERE r.stream_id = $1 AND r.replicate_index = 0) AS old_readings,
-                     (SELECT COUNT(*)::bigint FROM readings o
-                      WHERE o.stream_id = $1 AND o.replicate_index = 0
-                        AND NOT EXISTS (SELECT 1 FROM readings n
-                                        WHERE n.stream_id = $2 AND n.time = o.time)) AS missing",
-                [pair.old_id.into(), pair.new_id.into()],
-            ))
+            .query_one_raw(family_probe(pair.old_id, pair.new_id))
             .await?
             .ok_or_else(|| AppError::Internal("candidate probe returned no row".to_string()))?;
         let ProbeCounts {
@@ -1043,11 +1148,20 @@ pub async fn duplicate_slots(
         let (site_parameter_id, stream_id) = (slot.site_parameter_id, slot.stream_id);
         let stats = state
             .db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT COUNT(*)::bigint AS readings, MIN(time) AS first, MAX(time) AS last \
-                 FROM readings WHERE stream_id = $1",
-                [stream_id.into()],
+            .query_one_raw(built(
+                SeaQuery::select()
+                    .expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("readings"))
+                    .expr_as(
+                        Func::min(Expr::col(readings::Column::Time)),
+                        Alias::new("first"),
+                    )
+                    .expr_as(
+                        Func::max(Expr::col(readings::Column::Time)),
+                        Alias::new("last"),
+                    )
+                    .from(readings::Entity)
+                    .and_where(Expr::col(readings::Column::StreamId).eq(stream_id))
+                    .take(),
             ))
             .await?
             .ok_or_else(|| AppError::Internal("stream probe returned no row".to_string()))?;
@@ -1080,14 +1194,24 @@ pub async fn duplicate_slots(
     for slot in &mut slots {
         let row = state
             .db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT COUNT(*)::bigint AS c FROM ( \
-                     SELECT time FROM readings \
-                     WHERE site_id = $1 AND parameter_id = $2 AND withdrawn_at IS NULL \
-                     GROUP BY time HAVING COUNT(DISTINCT stream_id) > 1 \
-                 ) t",
-                [slot.site_id.into(), slot.parameter_id.into()],
+            .query_one_raw(built(
+                SeaQuery::select()
+                    .expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("c"))
+                    .from_subquery(
+                        SeaQuery::select()
+                            .column(readings::Column::Time)
+                            .from(readings::Entity)
+                            .and_where(Expr::col(readings::Column::SiteId).eq(slot.site_id))
+                            .and_where(
+                                Expr::col(readings::Column::ParameterId).eq(slot.parameter_id),
+                            )
+                            .and_where(Expr::col(readings::Column::WithdrawnAt).is_null())
+                            .add_group_by([Expr::col(readings::Column::Time).into()])
+                            .and_having(Expr::cust("COUNT(DISTINCT stream_id) > 1"))
+                            .take(),
+                        Alias::new("t"),
+                    )
+                    .take(),
             ))
             .await?;
         slot.duplicated_instants = row
@@ -1470,11 +1594,14 @@ pub async fn resolve_hold(
                 }
 
                 let group_rows = txn
-                    .query_all_raw(Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        "SELECT replicate_index, is_flagged IS TRUE AS flagged FROM readings
-                         WHERE stream_id = $1 AND time = $2",
-                        [stream_id.into(), group_time.into()],
+                    .query_all_raw(built(
+                        SeaQuery::select()
+                            .column(readings::Column::ReplicateIndex)
+                            .expr_as(Expr::cust("is_flagged IS TRUE"), Alias::new("flagged"))
+                            .from(readings::Entity)
+                            .and_where(Expr::col(readings::Column::StreamId).eq(stream_id))
+                            .and_where(Expr::col(readings::Column::Time).eq(group_time))
+                            .take(),
                     ))
                     .await?;
                 let mut existing: Vec<i16> = Vec::with_capacity(group_rows.len());
@@ -1525,20 +1652,20 @@ pub async fn resolve_hold(
 
                 // Each flagged replicate is a decision of audit origin (ADR 0008); the record's
                 // trigger projects it.
-                let flagged = crate::routes::private::readings::decisions::record_many(
+                let flagged = crate::routes::private::readings::service::record_many(
                     txn,
-                    crate::routes::private::readings::decisions::Kind::Flag,
+                    crate::routes::private::readings::models::Kind::Flag,
                     &format!(
                         "r.stream_id = $1 AND r.time = $2 AND r.replicate_index IN ({index_list}) \
                          AND r.is_flagged IS NOT TRUE"
                     ),
                     vec![stream_id.into(), group_time.into()],
-                    crate::routes::private::readings::decisions::NewValue::Literal(
+                    crate::routes::private::readings::service::NewValue::Literal(
                         serde_json::json!({ "reason": reason, "hold_id": id }),
                     ),
                     &by,
                     Some(&reason),
-                    crate::routes::private::readings::decisions::Origin::Audit,
+                    crate::routes::private::readings::models::Origin::Audit,
                     Some(id),
                 )
                 .await?;
@@ -1621,13 +1748,13 @@ async fn declare_estimator(
     payload: &ResolveHoldRequest,
     by: &str,
 ) -> AppResult<Json<ResolveHoldResponse>> {
-    use crate::routes::private::readings::sd_estimator;
-
-    let estimator = sd_estimator::parse(payload.estimator.as_deref().ok_or_else(|| {
-        AppError::BadRequest(
-            "an estimator resolution must name 'sample' or 'population'".to_string(),
-        )
-    })?)?;
+    let estimator = crate::routes::private::readings::service::parse(
+        payload.estimator.as_deref().ok_or_else(|| {
+            AppError::BadRequest(
+                "an estimator resolution must name 'sample' or 'population'".to_string(),
+            )
+        })?,
+    )?;
     let scope = payload.scope.as_deref().unwrap_or("slot");
     if !matches!(scope, "slot" | "instant") {
         return Err(AppError::BadRequest(format!(
@@ -1669,39 +1796,35 @@ async fn declare_estimator(
                 set_slot_estimator(txn, site_parameter_id, Some(estimator.to_string())).await?;
                 // Counted here, inside the same transaction the declaration lands in, so the
                 // number reported is the one the retag will act on.
-                txn.query_one_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT COUNT(*)::bigint AS n FROM samples
-                     WHERE site_id = $1 AND parameter_id = $2
-                       AND sd_estimator IS DISTINCT FROM $3
-                       AND sd_estimator_source <> 'sample'",
-                    [site_id.into(), parameter_id.into(), estimator.into()],
+                txn.query_one_raw(built(
+                    SeaQuery::select()
+                        .expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("n"))
+                        .from(samples::Entity)
+                        .cond_where(slot_samples(site_id, parameter_id))
+                        .and_where(Expr::cust_with_values(
+                            "sd_estimator IS DISTINCT FROM $1",
+                            [estimator.to_string()],
+                        ))
+                        .and_where(Expr::col(samples::Column::SdEstimatorSource).ne("sample"))
+                        .take(),
                 ))
                 .await?
                 .map_or(Ok(0_i64), |row| row.try_get::<i64>("", "n"))?
             } else {
                 // One group: set it and refresh that row alone. `sample` as the source is what
                 // keeps a later slot-level retag from overwriting this decision.
-                let rows = txn
-                    .execute_raw(Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        "UPDATE samples
-                         SET sd_estimator = $3, sd_estimator_source = 'sample'
-                         WHERE site_id = $1 AND parameter_id = $2 AND collected_at = $4",
-                        [
-                            site_id.into(),
-                            parameter_id.into(),
-                            estimator.into(),
-                            group_time.into(),
-                        ],
-                    ))
+                let rows = samples::Entity::update_many()
+                    .col_expr(samples::Column::SdEstimator, Expr::value(estimator))
+                    .col_expr(samples::Column::SdEstimatorSource, Expr::value("sample"))
+                    .filter(samples::Column::SiteId.eq(site_id))
+                    .filter(samples::Column::ParameterId.eq(parameter_id))
+                    .filter(samples::Column::CollectedAt.eq(group_time))
+                    .exec(txn)
                     .await?
-                    .rows_affected();
-                txn.execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT refresh_sample_aggregate(id) FROM samples
-                     WHERE site_id = $1 AND parameter_id = $2 AND collected_at = $3",
-                    [site_id.into(), parameter_id.into(), group_time.into()],
+                    .rows_affected;
+                txn.execute_raw(refresh_group(
+                    slot_samples(site_id, parameter_id)
+                        .add(Expr::col(samples::Column::CollectedAt).eq(group_time)),
                 ))
                 .await?;
                 i64::try_from(rows).unwrap_or(0)
@@ -1883,20 +2006,20 @@ pub async fn reopen_hold(
         {
             // Only the rows this resolution flagged: a flag someone set since, or with another
             // reason, stays.
-            crate::routes::private::readings::decisions::record_many(
+            crate::routes::private::readings::service::record_many(
                 txn,
-                crate::routes::private::readings::decisions::Kind::Unflag,
+                crate::routes::private::readings::models::Kind::Unflag,
                 &format!(
                     "r.stream_id = $1 AND r.time = $2 AND r.replicate_index IN ({index_list}) \
                      AND r.is_flagged = TRUE AND r.flag_reason = $3"
                 ),
                 vec![stream_id.into(), group_time.into(), reason.clone().into()],
-                crate::routes::private::readings::decisions::NewValue::Literal(
+                crate::routes::private::readings::service::NewValue::Literal(
                     serde_json::json!({ "hold_id": id, "reopened": true }),
                 ),
                 &by,
                 Some("reopened"),
-                crate::routes::private::readings::decisions::Origin::Audit,
+                crate::routes::private::readings::models::Origin::Audit,
                 Some(id),
             )
             .await?;
@@ -1909,55 +2032,84 @@ pub async fn reopen_hold(
                     set_slot_estimator(txn, sp_id, previous.clone()).await?;
                     // The samples this declaration moved go back with it. A row whose estimator
                     // was chosen for its own instant is not one of them.
+                    let slot_rows = Condition::all()
+                        .add(Expr::cust("site_parameters.site_id = samples.site_id"))
+                        .add(Expr::cust(
+                            "site_parameters.parameter_id = samples.parameter_id",
+                        ))
+                        .add(
+                            Expr::col((site_parameters::Entity, site_parameters::Column::Id))
+                                .eq(sp_id),
+                        )
+                        .add(not_chosen_per_instant());
+                    let (sql, values) = restore_estimator(previous.clone())
+                        .cond_where(slot_rows.clone())
+                        .take()
+                        .build(PostgresQueryBuilder);
                     txn.execute_raw(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
-                        "UPDATE samples s
-                         SET sd_estimator = COALESCE($3, 'sample'),
-                             sd_estimator_source = CASE WHEN $3::text IS NULL
-                                                        THEN 'default' ELSE 'slot' END
-                         FROM site_parameters sp
-                         WHERE sp.id = $1 AND s.site_id = sp.site_id
-                           AND s.parameter_id = sp.parameter_id
-                           AND s.sd_estimator_source <> 'sample'",
-                        [
-                            sp_id.into(),
-                            previous.clone().into(),
-                            previous.clone().into(),
-                        ],
+                        sql,
+                        values,
                     ))
                     .await?;
-                    txn.execute_raw(Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        "SELECT refresh_sample_aggregate(s.id) FROM samples s
-                         JOIN site_parameters sp
-                           ON sp.site_id = s.site_id AND sp.parameter_id = s.parameter_id
-                         WHERE sp.id = $1 AND s.sd_estimator_source <> 'sample'",
-                        [sp_id.into()],
+                    txn.execute_raw(built(
+                        SeaQuery::select()
+                            .expr(
+                                Func::cust(Alias::new("refresh_sample_aggregate"))
+                                    .arg(Expr::col((samples::Entity, samples::Column::Id))),
+                            )
+                            .from(samples::Entity)
+                            .join(
+                                JoinType::InnerJoin,
+                                site_parameters::Entity,
+                                Condition::all()
+                                    .add(Expr::cust("site_parameters.site_id = samples.site_id"))
+                                    .add(Expr::cust(
+                                        "site_parameters.parameter_id = samples.parameter_id",
+                                    )),
+                            )
+                            .and_where(
+                                Expr::col((site_parameters::Entity, site_parameters::Column::Id))
+                                    .eq(sp_id),
+                            )
+                            .and_where(not_chosen_per_instant())
+                            .take(),
                     ))
                     .await?;
                 }
             } else if let (Some(site_id), Some(parameter_id)) = (site_id, parameter_id) {
                 // The instant goes back to whatever its slot says, which is the state it would
                 // have been created in.
+                let instant = slot_samples(site_id, parameter_id)
+                    .add(Expr::col(samples::Column::CollectedAt).eq(group_time));
+                let (sql, values) = SeaQuery::update()
+                    .table(samples::Entity)
+                    .value(
+                        samples::Column::SdEstimator,
+                        Expr::cust("COALESCE(site_parameters.sd_estimator, 'sample')"),
+                    )
+                    .value(
+                        samples::Column::SdEstimatorSource,
+                        Expr::cust(
+                            "CASE WHEN site_parameters.sd_estimator IS NULL THEN 'default' \
+                             ELSE 'slot' END",
+                        ),
+                    )
+                    .from(site_parameters::Entity)
+                    .and_where(Expr::cust("site_parameters.site_id = samples.site_id"))
+                    .and_where(Expr::cust(
+                        "site_parameters.parameter_id = samples.parameter_id",
+                    ))
+                    .cond_where(instant.clone())
+                    .take()
+                    .build(PostgresQueryBuilder);
                 txn.execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
-                    "UPDATE samples s
-                     SET sd_estimator = COALESCE(sp.sd_estimator, 'sample'),
-                         sd_estimator_source = CASE WHEN sp.sd_estimator IS NULL
-                                                    THEN 'default' ELSE 'slot' END
-                     FROM site_parameters sp
-                     WHERE sp.site_id = s.site_id AND sp.parameter_id = s.parameter_id
-                       AND s.site_id = $1 AND s.parameter_id = $2 AND s.collected_at = $3",
-                    [site_id.into(), parameter_id.into(), group_time.into()],
+                    sql,
+                    values,
                 ))
                 .await?;
-                txn.execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT refresh_sample_aggregate(id) FROM samples
-                     WHERE site_id = $1 AND parameter_id = $2 AND collected_at = $3",
-                    [site_id.into(), parameter_id.into(), group_time.into()],
-                ))
-                .await?;
+                txn.execute_raw(refresh_group(instant)).await?;
             }
         }
         let restored = txn
@@ -2188,11 +2340,11 @@ pub fn manage_routes() -> Router<AppState> {
         )
         .route(
             "/change_proposals",
-            get(crate::routes::private::readings::proposals::list_proposals),
+            get(crate::routes::private::readings::views::list_proposals),
         )
         .route(
             "/change_proposals/decide",
-            post(crate::routes::private::readings::proposals::decide_proposals),
+            post(crate::routes::private::readings::views::decide_proposals),
         )
         .route(
             "/replicate_reconciliation/duplicate_slots",
@@ -2452,10 +2604,7 @@ pub async fn update_pairing_plan(
                 entry.sd_estimator = if declared.trim().is_empty() {
                     None
                 } else {
-                    Some(
-                        crate::routes::private::readings::sd_estimator::parse(declared)?
-                            .to_string(),
-                    )
+                    Some(crate::routes::private::readings::service::parse(declared)?.to_string())
                 };
             }
             if let Some(acknowledged) = update.acknowledged {
@@ -2966,11 +3115,17 @@ pub async fn plan_instruments(
     let mut usage: std::collections::HashMap<Uuid, i64> = std::collections::HashMap::new();
     for row in state
         .db
-        .query_all_raw(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT standard_curve_id AS id, COUNT(*) AS n FROM readings
-             WHERE standard_curve_id IS NOT NULL GROUP BY standard_curve_id"
-                .to_string(),
+        .query_all_raw(built(
+            SeaQuery::select()
+                .expr_as(
+                    Expr::col(readings::Column::StandardCurveId),
+                    Alias::new("id"),
+                )
+                .expr_as(Expr::cust("COUNT(*)"), Alias::new("n"))
+                .from(readings::Entity)
+                .and_where(Expr::col(readings::Column::StandardCurveId).is_not_null())
+                .add_group_by([Expr::col(readings::Column::StandardCurveId).into()])
+                .take(),
         ))
         .await?
     {

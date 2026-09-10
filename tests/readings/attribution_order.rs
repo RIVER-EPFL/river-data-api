@@ -136,48 +136,9 @@ async fn batch_attributes_a_row_to_the_deployed_instrument_over_the_channels_own
     crate::common::cleanup_test_db(&fx.db).await;
 }
 
-/// A row that names its own instrument outranks both, on every path.
-#[tokio::test]
-#[serial]
-async fn a_row_naming_its_own_instrument_outranks_the_deployment_and_the_channel() {
-    let fx = setup().await;
-    let named = create_sensor_without_curve(&fx.db, "Named on the row").await;
-
-    let (status, body) = crate::common::post_json_with_token(
-        &fx.app,
-        "/api/readings/batch",
-        &json!({ "readings": [{
-            "site_id": SITE1_ID,
-            "parameter_id": GLOBAL_PARAM_TEMP_ID,
-            "time": AT,
-            "raw_value": 1.0,
-            "sensor_id": named,
-        }]}),
-        &fx.token,
-    )
-    .await;
-    assert_eq!(status, 200, "batch ({status}): {body}");
-
-    let stored = fx
-        .db
-        .query_one_raw(Statement::from_string(
-            DatabaseBackend::Postgres,
-            format!(
-                "SELECT sensor_id FROM readings \
-                 WHERE site_id = '{SITE1_ID}' AND parameter_id = '{GLOBAL_PARAM_TEMP_ID}' \
-                   AND time = '{AT}'"
-            ),
-        ))
-        .await
-        .unwrap()
-        .expect("the reading is stored")
-        .try_get::<Option<Uuid>>("", "sensor_id")
-        .unwrap();
-    assert_eq!(stored, Some(named), "the row's own instrument wins");
-
-    crate::common::cleanup_test_db(&fx.db).await;
-}
-
+/// The row-first rung of both orders is asserted in `readings/tests/attribution.rs`; what these
+/// cover is that each handler feeds its resolver the right three candidates.
+///
 /// `/ingest` is the other order: the stream's frozen instrument is the owner, and the slot
 /// timeline is consulted only when the stream carries none.
 #[tokio::test]

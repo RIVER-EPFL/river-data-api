@@ -6,10 +6,13 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use river_data_core::models::MeasurementType;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{
+    Alias, Expr, ExprTrait as _, Func, JoinType, OnConflict, PostgresQueryBuilder,
+    Query as SeaQuery, SelectStatement, SimpleExpr, SubQueryStatement,
+};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
-    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult, Order,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -18,6 +21,7 @@ use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, sensor_in_scope};
 use crate::common::scope;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::readings::models as readings;
 use crate::routes::private::sensors::calibrations;
 use crate::routes::private::sensors::calibrations::service::recompute_deployed_until;
 use crate::routes::private::sensors::deployments;
@@ -178,6 +182,23 @@ async fn resolve_swap_parameter<C: ConnectionTrait>(
         })
 }
 
+/// Give the sensor's still-unparameterised readings the slot's parameter. The reprocess sets
+/// `site_id` and `deployment_id` by window and leaves `parameter_id` alone, and the aggregates
+/// group by it, so adopt and swap both claim it here inside their own transaction.
+async fn claim_unparameterised<C: ConnectionTrait>(
+    conn: &C,
+    sensor_id: Uuid,
+    parameter_id: Uuid,
+) -> AppResult<()> {
+    readings::Entity::update_many()
+        .col_expr(readings::Column::ParameterId, Expr::value(parameter_id))
+        .filter(readings::Column::SensorId.eq(sensor_id))
+        .filter(readings::Column::ParameterId.is_null())
+        .exec(conn)
+        .await?;
+    Ok(())
+}
+
 /// Adopt (deploy) a sensor to a site slot for a window. Auto-creates the site_parameter if missing,
 /// then re-derives the sensor's readings by window (tracked job). Requires `write_metadata`.
 #[utoipa::path(
@@ -300,12 +321,7 @@ pub async fn adopt_sensor(
     // insert, so a failure can't leave a half-applied adopt. The reprocess itself is a post-commit
     // tracked job (heavy, async, retryable).
     recompute_deployed_until(&txn, sensor_id).await?;
-    txn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "UPDATE readings SET parameter_id = $1 WHERE sensor_id = $2 AND parameter_id IS NULL",
-        [parameter_id.into(), sensor_id.into()],
-    ))
-    .await?;
+    claim_unparameterised(&txn, sensor_id, parameter_id).await?;
     txn.commit().await?;
 
     // Slot-scoped reprocess re-attributes the (site, parameter) by deployment window, so a backdated
@@ -366,13 +382,39 @@ pub async fn adopt_suggestions(
     if !sensor_in_scope(db, &scope, sensor_id).await? {
         return Err(AppError::NotFound("Sensor not found".to_string()));
     }
+    let scalar = |q: SelectStatement| {
+        SimpleExpr::SubQuery(None, Box::new(SubQueryStatement::SelectStatement(q)))
+    };
+    let (sql, values) = SeaQuery::select()
+        .expr_as(
+            scalar(
+                SeaQuery::select()
+                    .expr(Func::max(Expr::cust(
+                        "COALESCE(deployed_until, deployed_from)",
+                    )))
+                    .from(deployments::Entity)
+                    .and_where(Expr::col(deployments::Column::SensorId).eq(sensor_id))
+                    .take(),
+            ),
+            Alias::new("end_last"),
+        )
+        .expr_as(
+            scalar(
+                SeaQuery::select()
+                    .expr(Func::min(Expr::col(readings::Column::Time)))
+                    .from(readings::Entity)
+                    .and_where(Expr::col(readings::Column::SensorId).eq(sensor_id))
+                    .take(),
+            ),
+            Alias::new("first_reading"),
+        )
+        .take()
+        .build(PostgresQueryBuilder);
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            r"SELECT
-                (SELECT MAX(COALESCE(deployed_until, deployed_from)) FROM sensor_deployments WHERE sensor_id = $1) AS end_last,
-                (SELECT MIN(time) FROM readings WHERE sensor_id = $1) AS first_reading",
-            [sensor_id.into()],
+            sql,
+            values,
         ))
         .await?;
     // Both columns are nullable: a sensor with no prior deployment and no readings has neither.
@@ -521,12 +563,7 @@ pub async fn swap_sensors(
         .filter(data_streams::models::Column::SiteParameterId.eq(site_parameter_id))
         .exec(&txn)
         .await?;
-    txn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "UPDATE readings SET parameter_id = $1 WHERE sensor_id = $2 AND parameter_id IS NULL",
-        [parameter_id.into(), payload.incoming_sensor_id.into()],
-    ))
-    .await?;
+    claim_unparameterised(&txn, payload.incoming_sensor_id, parameter_id).await?;
     txn.commit().await?;
 
     // Per-(site,parameter) handover reprocess: re-owns existing readings to whichever sensor's
@@ -625,12 +662,30 @@ pub async fn get_instruments_overview(
         last: Option<DateTime<Utc>>,
     }
     let mut usage: HashMap<Uuid, Usage> = HashMap::new();
+    let (sql, values) = SeaQuery::select()
+        .expr_as(
+            Expr::col(readings::Column::StandardCurveId),
+            Alias::new("id"),
+        )
+        .expr_as(Expr::cust("COUNT(*)"), Alias::new("n"))
+        .expr_as(
+            Func::min(Expr::col(readings::Column::Time)),
+            Alias::new("first"),
+        )
+        .expr_as(
+            Func::max(Expr::col(readings::Column::Time)),
+            Alias::new("last"),
+        )
+        .from(readings::Entity)
+        .and_where(Expr::col(readings::Column::StandardCurveId).is_not_null())
+        .add_group_by([Expr::col(readings::Column::StandardCurveId).into()])
+        .take()
+        .build(PostgresQueryBuilder);
     for row in db
-        .query_all_raw(Statement::from_string(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT standard_curve_id AS id, COUNT(*) AS n, MIN(time) AS first, MAX(time) AS last
-             FROM readings WHERE standard_curve_id IS NOT NULL GROUP BY standard_curve_id"
-                .to_string(),
+            sql,
+            values,
         ))
         .await?
     {
@@ -763,32 +818,63 @@ pub async fn get_curve_usage(
         return Err(AppError::NotFound("Standard curve not found".to_string()));
     }
 
-    let count = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT COUNT(*) AS n FROM readings WHERE standard_curve_id = $1",
-            [curve_id.into()],
-        ))
-        .await?
-        .map(|r| r.try_get::<i64>("", "n"))
-        .transpose()?
-        .unwrap_or(0);
+    let count = i64::try_from(
+        readings::Entity::find()
+            .filter(readings::Column::StandardCurveId.eq(curve_id))
+            .count(db)
+            .await?,
+    )
+    .unwrap_or(i64::MAX);
 
+    let r = Alias::new("r");
+    let site = Alias::new("s");
+    let param = Alias::new("p");
+    let (sql, values) = SeaQuery::select()
+        .column((r.clone(), readings::Column::Time))
+        .column((r.clone(), readings::Column::ReplicateIndex))
+        .column((r.clone(), readings::Column::RawValue))
+        .column((r.clone(), readings::Column::CalibratedValue))
+        .expr_as(
+            Func::coalesce([
+                Expr::col((r.clone(), readings::Column::IsFlagged)),
+                Expr::value(false),
+            ]),
+            Alias::new("is_flagged"),
+        )
+        .expr_as(
+            Expr::col((site.clone(), sites::models::Column::Name)),
+            Alias::new("site_name"),
+        )
+        .expr_as(
+            Expr::col((param.clone(), parameters::models::Column::Code)),
+            Alias::new("parameter_code"),
+        )
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            sites::models::Entity,
+            site.clone(),
+            Expr::col((site, sites::models::Column::Id))
+                .equals((r.clone(), readings::Column::SiteId)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            parameters::models::Entity,
+            param.clone(),
+            Expr::col((param, parameters::models::Column::Id))
+                .equals((r.clone(), readings::Column::ParameterId)),
+        )
+        .and_where(Expr::col((r.clone(), readings::Column::StandardCurveId)).eq(curve_id))
+        .order_by((r.clone(), readings::Column::Time), Order::Desc)
+        .order_by((r, readings::Column::ReplicateIndex), Order::Asc)
+        .limit(MAX_POINTS.unsigned_abs())
+        .take()
+        .build(PostgresQueryBuilder);
     let points = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT r.time, r.replicate_index, r.raw_value, r.calibrated_value,
-                        COALESCE(r.is_flagged, false) AS is_flagged,
-                        s.name AS site_name, p.code AS parameter_code
-                 FROM readings r
-                 LEFT JOIN sites s ON s.id = r.site_id
-                 LEFT JOIN parameters p ON p.id = r.parameter_id
-                 WHERE r.standard_curve_id = $1
-                 ORDER BY r.time DESC, r.replicate_index ASC
-                 LIMIT {MAX_POINTS}"
-            ),
-            [curve_id.into()],
+            sql,
+            values,
         ))
         .await?
         .into_iter()
@@ -843,16 +929,42 @@ pub async fn get_sensor_curve_usage(
         return Err(AppError::NotFound("Sensor not found".to_string()));
     }
 
+    let c = Alias::new("c");
+    let r = Alias::new("r");
+    let (sql, values) = SeaQuery::select()
+        .expr_as(
+            Expr::col((c.clone(), standard_curves::Column::Id)),
+            Alias::new("curve_id"),
+        )
+        .expr_as(
+            Func::count(Expr::col((r.clone(), readings::Column::StandardCurveId))),
+            Alias::new("n"),
+        )
+        .expr_as(
+            Func::min(Expr::col((r.clone(), readings::Column::Time))),
+            Alias::new("first"),
+        )
+        .expr_as(
+            Func::max(Expr::col((r.clone(), readings::Column::Time))),
+            Alias::new("last"),
+        )
+        .from_as(standard_curves::Entity, c.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            readings::Entity,
+            r.clone(),
+            Expr::col((r, readings::Column::StandardCurveId))
+                .equals((c.clone(), standard_curves::Column::Id)),
+        )
+        .and_where(Expr::col((c.clone(), standard_curves::Column::SensorId)).eq(sensor_id))
+        .add_group_by([Expr::col((c, standard_curves::Column::Id)).into()])
+        .take()
+        .build(PostgresQueryBuilder);
     let usage = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT c.id AS curve_id, COUNT(r.standard_curve_id) AS n,
-                    MIN(r.time) AS first, MAX(r.time) AS last
-             FROM standard_curves c
-             LEFT JOIN readings r ON r.standard_curve_id = c.id
-             WHERE c.sensor_id = $1
-             GROUP BY c.id",
-            [sensor_id.into()],
+            sql,
+            values,
         ))
         .await?
         .into_iter()
@@ -990,31 +1102,28 @@ pub async fn get_sensor_readings(
     if !sensor_in_scope(db, &scope, sensor_id).await? {
         return Err(AppError::NotFound("Sensor not found".to_string()));
     }
-    // Appends `AND <col> IN (<scope project's sites>)` (and binds the project id) when scoped; a
-    // no-op for unscoped principals. Applied to every readings query below so the temporal extent
-    // and per-point series are both confined to the project.
-    let scope_filter = |values: &mut Vec<sea_orm::Value>, col: &str| -> String {
-        match scope.sql_project_array() {
-            Some(projects) => {
-                values.push(projects);
-                format!(
-                    " AND {col} IN (SELECT id FROM sites WHERE project_id = ANY(${}))",
-                    values.len()
-                )
-            }
-            None => String::new(),
-        }
+    // `<col> IN (<scope project's sites>)` when the caller is confined to a project, nothing
+    // otherwise. Applied to every readings query below so the temporal extent and per-point series
+    // are both confined to the project.
+    let scope_filter = |col: Expr| {
+        scope.sql_project_array().map(|projects| {
+            col.in_subquery(
+                SeaQuery::select()
+                    .column(sites::models::Column::Id)
+                    .from(sites::models::Entity)
+                    .and_where(Expr::cust_with_values("project_id = ANY($1)", [projects]))
+                    .take(),
+            )
+        })
     };
     // Confines a query to the resolved channel. A sensor with no resolved parameter is unfiltered,
     // so its plot still shows whatever is attributed to it.
-    let param_filter = |values: &mut Vec<sea_orm::Value>, col: &str| -> String {
-        match parameter_id {
-            Some(pid) => {
-                values.push(pid.into());
-                format!(" AND {col} = ${}", values.len())
-            }
-            None => String::new(),
+    let param_filter = |col: Expr| parameter_id.map(|pid| col.eq(pid));
+    let with = |mut cond: Condition, predicate: Option<Expr>| {
+        if let Some(predicate) = predicate {
+            cond = cond.add(predicate);
         }
+        cond
     };
 
     let resolution = query.resolution.as_deref().unwrap_or("raw");
@@ -1031,17 +1140,33 @@ pub async fn get_sensor_readings(
 
     // Full reading extent for this sensor on the served channel (drives the UI slider bounds,
     // independent of the window).
-    let mut extent_vals: Vec<sea_orm::Value> = vec![sensor_id.into()];
-    let extent_scope = scope_filter(&mut extent_vals, "site_id");
-    let extent_param = param_filter(&mut extent_vals, "parameter_id");
+    let mut extent_rows = Condition::all().add(Expr::col(readings::Column::SensorId).eq(sensor_id));
+    extent_rows = with(
+        extent_rows,
+        scope_filter(Expr::col(readings::Column::SiteId)),
+    );
+    extent_rows = with(
+        extent_rows,
+        param_filter(Expr::col(readings::Column::ParameterId)),
+    );
+    let (sql, values) = SeaQuery::select()
+        .expr_as(
+            Func::min(Expr::col(readings::Column::Time)),
+            Alias::new("data_start"),
+        )
+        .expr_as(
+            Func::max(Expr::col(readings::Column::Time)),
+            Alias::new("data_end"),
+        )
+        .from(readings::Entity)
+        .cond_where(extent_rows)
+        .take()
+        .build(PostgresQueryBuilder);
     let extent = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &format!(
-                r"SELECT MIN(time) AS data_start, MAX(time) AS data_end
-                  FROM readings WHERE sensor_id = $1{extent_scope}{extent_param}"
-            ),
-            extent_vals,
+            sql,
+            values,
         ))
         .await?;
     let data_start = extent
@@ -1062,20 +1187,41 @@ pub async fn get_sensor_readings(
     // Earliest reading at the sensor's OPEN deployment slot (same site + parameter, any sensor_id),
     // the true backdate target. Unattributed history (sensor_id NULL) is invisible to `data_start`
     // but lives here, and backdating `deployed_from` to it lets the slot reprocess claim it.
-    let mut slot_vals: Vec<sea_orm::Value> = vec![sensor_id.into()];
-    let slot_scope = scope_filter(&mut slot_vals, "r.site_id");
-    let slot_param = param_filter(&mut slot_vals, "d.parameter_id");
+    let r_ = Alias::new("r");
+    let d_ = Alias::new("d");
+    let mut slot_rows = Condition::all()
+        .add(Expr::cust("r.site_id = d.site_id"))
+        .add(Expr::cust("r.parameter_id = d.parameter_id"));
+    slot_rows = with(
+        slot_rows,
+        scope_filter(Expr::col((r_.clone(), readings::Column::SiteId))),
+    );
+    slot_rows = with(
+        slot_rows,
+        param_filter(Expr::col((d_.clone(), deployments::Column::ParameterId))),
+    );
+    let (sql, values) = SeaQuery::select()
+        .expr_as(
+            Func::min(Expr::col((r_.clone(), readings::Column::Time))),
+            Alias::new("slot_start"),
+        )
+        .from_as(readings::Entity, r_.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            deployments::Entity,
+            d_.clone(),
+            Condition::all()
+                .add(Expr::col((d_.clone(), deployments::Column::SensorId)).eq(sensor_id))
+                .add(Expr::col((d_.clone(), deployments::Column::DeployedUntil)).is_null()),
+        )
+        .cond_where(slot_rows)
+        .take()
+        .build(PostgresQueryBuilder);
     let slot_data_start = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &format!(
-                r"SELECT MIN(r.time) AS slot_start
-                  FROM readings r
-                  JOIN sensor_deployments d
-                    ON d.sensor_id = $1 AND d.deployed_until IS NULL
-                  WHERE r.site_id = d.site_id AND r.parameter_id = d.parameter_id{slot_scope}{slot_param}"
-            ),
-            slot_vals,
+            sql,
+            values,
         ))
         .await?
         .and_then(|r| {
@@ -1084,89 +1230,139 @@ pub async fn get_sensor_readings(
         })
         .map(|t| t.with_timezone(&Utc));
 
-    crate::routes::private::readings::measurement::validate_measurement_type(
+    crate::routes::private::readings::service::validate_measurement_type(
         query.measurement_type.as_deref().filter(|m| !m.is_empty()),
     )?;
 
-    // Build the query. Aggregated resolutions time-bucket the readings (avg + min/max of raw and
-    // calibrated), excluding flagged points and spot readings to match continuous-aggregate
-    // semantics; raw mode returns per-point values including flagged.
-    let mut values: Vec<sea_orm::Value> = vec![sensor_id.into()];
-    let mut sql = if let Some(interval) = bucket {
-        format!(
-            r"SELECT time_bucket('{interval}'::interval, time) AS time,
-                     avg(raw_value) AS raw_value, min(raw_value) AS raw_min, max(raw_value) AS raw_max,
-                     avg(calibrated_value) AS calibrated_value, min(calibrated_value) AS cal_min, max(calibrated_value) AS cal_max,
-                     last(site_id, time) AS site_id
-              FROM readings
-              WHERE sensor_id = $1 AND replicate_index = 0 AND is_flagged IS NOT TRUE
-                AND measurement_type IS DISTINCT FROM 'spot'"
-        )
-    } else {
-        String::from(
-            r"SELECT time, raw_value, calibrated_value, site_id
-              FROM readings
-              WHERE sensor_id = $1",
-        )
-    };
-    let mut shared_conditions = String::new();
+    // Every arm shares the sensor, the caller's scope, the resolved channel and the window.
+    let mut shared = Condition::all().add(Expr::col(readings::Column::SensorId).eq(sensor_id));
+    shared = with(shared, scope_filter(Expr::col(readings::Column::SiteId)));
+    shared = with(
+        shared,
+        param_filter(Expr::col(readings::Column::ParameterId)),
+    );
+    if let Some(start) = query.start {
+        shared = shared.add(Expr::col(readings::Column::Time).gte(start));
+    }
+    if let Some(end) = query.end {
+        shared = shared.add(Expr::col(readings::Column::Time).lte(end));
+    }
     if bucket.is_none()
         && let Some(mt) = query.measurement_type.as_deref().filter(|m| !m.is_empty())
     {
-        values.push(mt.into());
-        shared_conditions.push_str(&format!(
-            " AND (measurement_type = ${} OR (${} = 'continuous' AND measurement_type IS NULL))",
-            values.len(),
-            values.len()
+        shared = shared.add(Expr::cust_with_values(
+            "(measurement_type = $1 OR ($1 = 'continuous' AND measurement_type IS NULL))",
+            [mt.to_string()],
         ));
     }
-    shared_conditions.push_str(&scope_filter(&mut values, "site_id"));
-    shared_conditions.push_str(&param_filter(&mut values, "parameter_id"));
-    if let Some(start) = query.start {
-        values.push(start.into());
-        shared_conditions.push_str(&format!(" AND time >= ${}", values.len()));
-    }
-    if let Some(end) = query.end {
-        values.push(end.into());
-        shared_conditions.push_str(&format!(" AND time <= ${}", values.len()));
-    }
-    sql.push_str(&shared_conditions);
+    // Continuous and derived rows live at replicate_index 0, so a plain equality keeps the
+    // chunk-ordered scan.
+    let continuous = || {
+        Condition::all()
+            .add(Expr::col(readings::Column::ReplicateIndex).eq(0))
+            .add(Expr::cust("measurement_type IS DISTINCT FROM 'spot'"))
+    };
+
+    // Aggregated resolutions time-bucket the readings (avg + min/max of raw and calibrated),
+    // excluding flagged points and spot readings to match continuous-aggregate semantics; raw mode
+    // returns per-point values including flagged.
+    let query_statement = if let Some(interval) = bucket {
+        let bucketed =
+            |sql: &str, name: &str| (Expr::cust(sql.to_string()), Alias::new(name.to_string()));
+        let mut agg = SeaQuery::select();
+        agg.expr_as(
+            Expr::cust_with_values("time_bucket($1::interval, time)", [interval.to_string()]),
+            Alias::new("time"),
+        );
+        for (expr, name) in [
+            bucketed("avg(raw_value)", "raw_value"),
+            bucketed("min(raw_value)", "raw_min"),
+            bucketed("max(raw_value)", "raw_max"),
+            bucketed("avg(calibrated_value)", "calibrated_value"),
+            bucketed("min(calibrated_value)", "cal_min"),
+            bucketed("max(calibrated_value)", "cal_max"),
+            bucketed("last(site_id, time)", "site_id"),
+        ] {
+            agg.expr_as(expr, name);
+        }
+        agg.from(readings::Entity)
+            .cond_where(
+                shared
+                    .clone()
+                    .add(continuous())
+                    .add(Expr::cust("is_flagged IS NOT TRUE")),
+            )
+            // By ordinal: `time` is both the bucket's alias and a base column, and Postgres
+            // resolves the bare name to the column, which groups nothing.
+            .add_group_by([Expr::cust("1").into()])
+            .order_by_expr(Expr::cust("1"), Order::Asc);
+        agg.take()
+    } else {
+        SeaQuery::select()
+            .column(readings::Column::Time)
+            .column(readings::Column::RawValue)
+            .column(readings::Column::CalibratedValue)
+            .column(readings::Column::SiteId)
+            .from(readings::Entity)
+            .cond_where(shared.clone().add(continuous()))
+            .order_by(readings::Column::Time, Order::Asc)
+            .take()
+    };
+
     // The raw mode runs a second statement for the spot subset; both are time-ascending and are
     // merged below, so the continuous statement keeps the chunk-ordered scan a single UNION with
     // an outer sort would forfeit.
-    let mut spot_sql = None;
-    if bucket.is_some() {
-        sql.push_str(" GROUP BY 1 ORDER BY 1 ASC");
-    } else {
-        // Continuous and derived rows live at replicate_index 0, so a plain equality keeps the
-        // chunk-ordered scan. A spot instant is the replicate group `(stream_id, time)`, collapsed
-        // to its lowest unflagged replicate (flagged-only groups surface their flagged row: this
-        // is the instrument diagnostic view, which keeps flagged points visible). The DISTINCT ON
-        // is confined to the spot subset, whose row counts are small.
-        sql.push_str(" AND replicate_index = 0 AND measurement_type IS DISTINCT FROM 'spot'");
-        sql.push_str(" ORDER BY time ASC");
-        spot_sql = Some(format!(
-            "SELECT time, raw_value, calibrated_value, site_id FROM ( \
-                SELECT DISTINCT ON (stream_id, time) time, raw_value, calibrated_value, site_id \
-                FROM readings \
-                WHERE sensor_id = $1 AND measurement_type = 'spot' AND withdrawn_at IS NULL{shared_conditions} \
-                ORDER BY stream_id, time, (is_flagged IS TRUE), replicate_index \
-             ) sp ORDER BY time ASC"
-        ));
-    }
+    //
+    // A spot instant is the replicate group `(stream_id, time)`, collapsed to its lowest unflagged
+    // replicate (flagged-only groups surface their flagged row: this is the instrument diagnostic
+    // view, which keeps flagged points visible). The DISTINCT ON is confined to the spot subset,
+    // whose row counts are small.
+    let spot_statement = bucket.is_none().then(|| {
+        let group = SeaQuery::select()
+            .distinct_on([readings::Column::StreamId, readings::Column::Time])
+            .column(readings::Column::Time)
+            .column(readings::Column::RawValue)
+            .column(readings::Column::CalibratedValue)
+            .column(readings::Column::SiteId)
+            .from(readings::Entity)
+            .cond_where(
+                shared
+                    .clone()
+                    .add(Expr::col(readings::Column::MeasurementType).eq("spot"))
+                    .add(Expr::col(readings::Column::WithdrawnAt).is_null()),
+            )
+            .order_by(readings::Column::StreamId, Order::Asc)
+            .order_by(readings::Column::Time, Order::Asc)
+            .order_by_expr(Expr::cust("(is_flagged IS TRUE)"), Order::Asc)
+            .order_by(readings::Column::ReplicateIndex, Order::Asc)
+            .take();
+        let sp = Alias::new("sp");
+        SeaQuery::select()
+            .columns([
+                (sp.clone(), Alias::new("time")),
+                (sp.clone(), Alias::new("raw_value")),
+                (sp.clone(), Alias::new("calibrated_value")),
+                (sp.clone(), Alias::new("site_id")),
+            ])
+            .from_subquery(group, sp)
+            .order_by(Alias::new("time"), Order::Asc)
+            .take()
+    });
 
+    let (sql, values) = query_statement.build(PostgresQueryBuilder);
     let mut rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            values.clone(),
+            sql,
+            values,
         ))
         .await?;
-    if let Some(spot_sql) = spot_sql {
+    if let Some(spot_statement) = spot_statement {
+        let (sql, values) = spot_statement.build(PostgresQueryBuilder);
         let spot_rows = db
             .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                &spot_sql,
+                sql,
                 values,
             ))
             .await?;
@@ -1452,34 +1648,37 @@ pub async fn propose_instruments(
             already_admitted += 1;
             continue;
         }
-        state
-            .db
-            .execute_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "INSERT INTO instrument_proposals \
-                     (source_system, source_key, name, serial_number, manufacturer, model, notes, \
-                      is_lab_instrument, data_frequency, metadata) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-                 ON CONFLICT (source_system, source_key) DO UPDATE SET \
-                     name = EXCLUDED.name, serial_number = EXCLUDED.serial_number, \
-                     manufacturer = EXCLUDED.manufacturer, model = EXCLUDED.model, \
-                     notes = EXCLUDED.notes, is_lab_instrument = EXCLUDED.is_lab_instrument, \
-                     data_frequency = EXCLUDED.data_frequency, metadata = EXCLUDED.metadata, \
-                     last_seen_at = now()",
-                [
-                    source_system.clone().into(),
-                    key.to_string().into(),
-                    instrument.name.clone().into(),
-                    instrument.serial_number.clone().into(),
-                    instrument.manufacturer.clone().into(),
-                    instrument.model.clone().into(),
-                    instrument.notes.clone().into(),
-                    instrument.is_lab_instrument.into(),
-                    instrument.data_frequency.clone().into(),
-                    instrument.metadata.clone().into(),
-                ],
-            ))
-            .await?;
+        proposal::Entity::insert(proposal::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            source_system: Set(source_system.clone()),
+            source_key: Set(key.to_string()),
+            name: Set(instrument.name.clone()),
+            serial_number: Set(instrument.serial_number.clone()),
+            manufacturer: Set(instrument.manufacturer.clone()),
+            model: Set(instrument.model.clone()),
+            notes: Set(instrument.notes.clone()),
+            is_lab_instrument: Set(instrument.is_lab_instrument),
+            data_frequency: Set(instrument.data_frequency.clone()),
+            metadata: Set(instrument.metadata.clone()),
+            ..Default::default()
+        })
+        .on_conflict(
+            OnConflict::columns([proposal::Column::SourceSystem, proposal::Column::SourceKey])
+                .update_columns([
+                    proposal::Column::Name,
+                    proposal::Column::SerialNumber,
+                    proposal::Column::Manufacturer,
+                    proposal::Column::Model,
+                    proposal::Column::Notes,
+                    proposal::Column::IsLabInstrument,
+                    proposal::Column::DataFrequency,
+                    proposal::Column::Metadata,
+                ])
+                .value(proposal::Column::LastSeenAt, Expr::current_timestamp())
+                .to_owned(),
+        )
+        .exec(&state.db)
+        .await?;
         stored += 1;
     }
     Ok(Json(ProposeInstrumentsResponse {

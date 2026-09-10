@@ -5,6 +5,7 @@
 //! and a variable the station did not report at that interval is an empty cell.
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult,
     QueryFilter, Set, Statement,
@@ -13,7 +14,7 @@ use uuid::Uuid;
 
 use super::models::{Point, Series, Subscriber};
 use crate::routes::private::{
-    data_streams, parameters, sensors, sites::parameters as site_parameters,
+    data_streams, parameters, readings, sensors, sites::parameters as site_parameters,
 };
 
 /// The catalog parameter the feed lands on, seeded by `m20260907_000007_meteoswiss_pressure`.
@@ -243,40 +244,35 @@ pub async fn insert<C: ConnectionTrait>(
 ) -> Result<usize, DbErr> {
     let mut written = 0usize;
     for chunk in points.chunks(CHUNK) {
-        let mut values = Vec::with_capacity(chunk.len());
-        let mut binds: Vec<sea_orm::Value> = vec![
-            stream_id.into(),
-            site_id.into(),
-            parameter_id.into(),
-            sensor_id.into(),
-        ];
-        for point in chunk {
-            let time_at = binds.len() + 1;
-            let value_at = binds.len() + 2;
-            values.push(format!(
-                "($1, ${time_at}, 0, $2, $3, ${value_at}, $4, 'continuous')"
-            ));
-            binds.push(point.time.into());
-            binds.push(point.value.into());
-        }
-        let sql = format!(
-            "INSERT INTO readings
-                 (stream_id, \"time\", replicate_index, site_id, parameter_id, raw_value,
-                  sensor_id, measurement_type)
-             VALUES {}
-             ON CONFLICT DO NOTHING",
-            values.join(", ")
-        );
-        let result = db
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &sql,
-                binds,
-            ))
+        let affected = insert_chunk(stream_id, site_id, parameter_id, sensor_id, chunk)
+            .exec_without_returning(db)
             .await?;
-        written += usize::try_from(result.rows_affected()).unwrap_or(0);
+        written += usize::try_from(affected).unwrap_or(0);
     }
     Ok(written)
+}
+
+/// One chunk's insert. Every column the feed knows is set and the rest take their database
+/// defaults, which is what the hand-written column list did.
+fn insert_chunk(
+    stream_id: Uuid,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    sensor_id: Uuid,
+    points: &[&Point],
+) -> sea_orm::InsertMany<readings::ActiveModel> {
+    readings::Entity::insert_many(points.iter().map(|point| readings::ActiveModel {
+        stream_id: Set(stream_id),
+        time: Set(point.time.into()),
+        replicate_index: Set(0),
+        site_id: Set(Some(site_id)),
+        parameter_id: Set(Some(parameter_id)),
+        raw_value: Set(point.value),
+        sensor_id: Set(Some(sensor_id)),
+        measurement_type: Set(Some("continuous".to_string())),
+        ..Default::default()
+    }))
+    .on_conflict(OnConflict::new().do_nothing().to_owned())
 }
 
 #[cfg(test)]

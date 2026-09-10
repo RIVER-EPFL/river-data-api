@@ -18,6 +18,14 @@
 //! one, and are matched by `readings.standard_curve_id`, never by window.
 
 use chrono::{DateTime, Utc};
+use sea_orm::Order;
+use sea_orm::sea_query::{
+    Alias, Condition, Expr, ExprTrait as _, IntoIden, IntoTableRef, JoinType, PostgresQueryBuilder,
+    Query as SeaQuery, QueryStatementWriter, SelectStatement, TableRef, UpdateStatement,
+};
+
+use super::model;
+use crate::routes::private::readings::models as readings;
 use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -36,30 +44,68 @@ use crate::error::AppResult;
 /// A retired curve is never a candidate (M146): retirement is what takes a curve out of
 /// circulation, and this is the one producer of the ranking, so the predicate has one home.
 #[must_use]
-pub fn pick_calibration_lateral(sensor_expr: &str) -> String {
-    pick_calibration_lateral_excluding(sensor_expr, None)
+pub fn pick_calibration_query(sensor_expr: &str) -> SelectStatement {
+    pick_calibration_query_excluding(sensor_expr, None)
 }
 
-/// [`pick_calibration_lateral`] with one curve held out of the candidates. The delete path is the
+/// [`pick_calibration_query`] with one curve held out of the candidates. The delete path is the
 /// only caller: a curve on its way out must not be the answer to what covers a reading now.
 #[must_use]
-pub fn pick_calibration_lateral_excluding(sensor_expr: &str, exclude_expr: Option<&str>) -> String {
-    let exclude =
-        exclude_expr.map_or_else(String::new, |e| format!("\n            AND c.id <> {e}"));
-    format!(
-        r"SELECT c.id, c.slope, c.intercept
-          FROM sensor_calibrations c
-          WHERE c.sensor_id = {sensor_expr}{exclude}
-            AND c.retired_at IS NULL
-            AND (c.parameter_id = r.parameter_id OR c.parameter_id IS NULL OR r.parameter_id IS NULL)
-            AND r.time >= c.valid_from
-            AND r.time < COALESCE(c.valid_until, 'infinity'::timestamptz)
-          ORDER BY (c.parameter_id IS NOT DISTINCT FROM r.parameter_id) DESC,
-                   (c.parameter_id IS NOT NULL) DESC,
-                   c.valid_from DESC,
-                   c.id DESC
-          LIMIT 1"
+pub fn pick_calibration_query_excluding(
+    sensor_expr: &str,
+    exclude_expr: Option<&str>,
+) -> SelectStatement {
+    pick_calibration_query_owned(
+        Expr::cust(format!("c.sensor_id = {sensor_expr}")),
+        exclude_expr,
     )
+}
+
+/// [`pick_calibration_query`] with the owning instrument as an expression rather than a spelled
+/// one, so a built statement can bind it instead of naming a placeholder the builder renumbers.
+#[must_use]
+pub fn pick_calibration_query_owned(owner: Expr, exclude_expr: Option<&str>) -> SelectStatement {
+    let c = Alias::new("c");
+    let mut pick = SeaQuery::select();
+    pick.columns([
+        (c.clone(), model::Column::Id),
+        (c.clone(), model::Column::Slope),
+        (c.clone(), model::Column::Intercept),
+    ])
+    .from_as(model::Entity, c.clone())
+    .and_where(owner)
+    .and_where(Expr::col((c.clone(), model::Column::RetiredAt)).is_null())
+    .and_where(Expr::cust(
+        "(c.parameter_id = r.parameter_id OR c.parameter_id IS NULL OR r.parameter_id IS NULL)",
+    ))
+    .and_where(Expr::cust("r.time >= c.valid_from"))
+    .and_where(Expr::cust(
+        "r.time < COALESCE(c.valid_until, 'infinity'::timestamptz)",
+    ))
+    .order_by_expr(
+        Expr::cust("(c.parameter_id IS NOT DISTINCT FROM r.parameter_id)"),
+        Order::Desc,
+    )
+    .order_by_expr(Expr::cust("(c.parameter_id IS NOT NULL)"), Order::Desc)
+    .order_by((c.clone(), model::Column::ValidFrom), Order::Desc)
+    .order_by((c.clone(), model::Column::Id), Order::Desc)
+    .limit(1);
+    if let Some(e) = exclude_expr {
+        pick.and_where(Expr::cust(format!("c.id <> {e}")));
+    }
+    pick.take()
+}
+
+/// [`pick_calibration_query`] rendered, for a caller whose own statement is still SQL text.
+#[must_use]
+pub fn pick_calibration_lateral(sensor_expr: &str) -> String {
+    pick_calibration_query(sensor_expr).to_string(PostgresQueryBuilder)
+}
+
+/// [`pick_calibration_query_excluding`] rendered, for the same reason.
+#[must_use]
+pub fn pick_calibration_lateral_excluding(sensor_expr: &str, exclude_expr: Option<&str>) -> String {
+    pick_calibration_query_excluding(sensor_expr, exclude_expr).to_string(PostgresQueryBuilder)
 }
 
 /// One instant's resolved curve, as the timeline query returns it.
@@ -175,183 +221,83 @@ pub async fn attribute_stream_by_window<C>(
 where
     C: ConnectionTrait + sea_orm::TransactionTrait,
 {
-    let sql = attribute_by_window_sql();
-
-    let touched = bulk_write::guarded_mutation(
-        db,
-        Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            [stream_id.into(), sensor_id.into()],
-        ),
-    )
-    .await?;
+    let touched =
+        bulk_write::guarded_mutation(db, attribute_by_window_query(stream_id, sensor_id)).await?;
     Ok(touched.rows)
 }
 
-/// The statement `attribute_stream_by_window` runs, as one expression so its row set and its
-/// change predicate can be read without a database.
-fn attribute_by_window_sql() -> String {
-    format!(
-        r"UPDATE readings tgt
-      SET sensor_id = $2,
-          calibration_id = CASE
-              WHEN {windowed}
-                  THEN COALESCE(picked.cal_id, tgt.calibration_id)
-              ELSE tgt.calibration_id
-          END,
-          calibrated_value = CASE
-              WHEN picked.cal_id IS NOT NULL AND {windowed}
-                  THEN {value}
-              ELSE tgt.calibrated_value
-          END
-      FROM (
-          SELECT r.stream_id AS p_stream_id, r.time AS p_time,
-                 r.replicate_index AS p_replicate_index,
-                 cw.id AS cal_id, cw.slope, cw.intercept
-          FROM readings r
-          LEFT JOIN LATERAL ({pick}) cw ON true
-          WHERE r.stream_id = $1 AND (r.sensor_id IS NULL OR r.sensor_id = $2)
-      ) picked
-      WHERE tgt.stream_id = picked.p_stream_id
-        AND tgt.time = picked.p_time
-        AND tgt.replicate_index = picked.p_replicate_index
-        AND (tgt.sensor_id IS DISTINCT FROM $2
-             OR (picked.cal_id IS NOT NULL
-                 AND {windowed}
-                 AND tgt.calibration_id IS DISTINCT FROM picked.cal_id))",
-        windowed = super::service::calibration_derivable("tgt"),
-        value = calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
-        pick = pick_calibration_lateral("$2")
-    )
+/// The statement `attribute_stream_by_window` runs, built so its row set and its change predicate
+/// can be read without a database.
+fn attribute_by_window_query(stream_id: Uuid, sensor_id: Uuid) -> UpdateStatement {
+    let tgt = Alias::new("tgt");
+    let r = Alias::new("r");
+    let cw = Alias::new("cw");
+    let windowed = super::service::calibration_derivable("tgt");
+    let value = calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept");
+
+    // One row per reading of the stream, with the curve whose window covers its own time.
+    let picked = SeaQuery::select()
+        .expr_as(Expr::cust("r.stream_id"), Alias::new("p_stream_id"))
+        .expr_as(Expr::cust("r.time"), Alias::new("p_time"))
+        .expr_as(
+            Expr::cust("r.replicate_index"),
+            Alias::new("p_replicate_index"),
+        )
+        .expr_as(Expr::cust("cw.id"), Alias::new("cal_id"))
+        .expr(Expr::cust("cw.slope"))
+        .expr(Expr::cust("cw.intercept"))
+        .from_as(readings::Entity, r.clone())
+        .join_lateral(
+            JoinType::LeftJoin,
+            pick_calibration_query_owned(
+                Expr::cust_with_values("c.sensor_id = $1", [sensor_id]),
+                None,
+            ),
+            cw.clone(),
+            Condition::all().add(Expr::cust("true")),
+        )
+        .and_where(Expr::cust_with_values("r.stream_id = $1", [stream_id]))
+        .and_where(Expr::cust_with_values(
+            "(r.sensor_id IS NULL OR r.sensor_id = $1)",
+            [sensor_id],
+        ))
+        .take();
+
+    SeaQuery::update()
+        .table(readings::Entity.into_table_ref().alias(tgt))
+        .value(Alias::new("sensor_id"), sensor_id)
+        .value(
+            Alias::new("calibration_id"),
+            Expr::cust(format!(
+                "CASE WHEN {windowed} THEN COALESCE(picked.cal_id, tgt.calibration_id) \
+                 ELSE tgt.calibration_id END"
+            )),
+        )
+        .value(
+            Alias::new("calibrated_value"),
+            Expr::cust(format!(
+                "CASE WHEN picked.cal_id IS NOT NULL AND {windowed} THEN {value} \
+                 ELSE tgt.calibrated_value END"
+            )),
+        )
+        .from(TableRef::SubQuery(
+            Box::new(picked),
+            Alias::new("picked").into_iden(),
+        ))
+        .and_where(Expr::cust("tgt.stream_id = picked.p_stream_id"))
+        .and_where(Expr::cust("tgt.time = picked.p_time"))
+        .and_where(Expr::cust("tgt.replicate_index = picked.p_replicate_index"))
+        .and_where(Expr::cust_with_values(
+            format!(
+                "(tgt.sensor_id IS DISTINCT FROM $1 \
+                  OR (picked.cal_id IS NOT NULL AND {windowed} \
+                      AND tgt.calibration_id IS DISTINCT FROM picked.cal_id))"
+            ),
+            [sensor_id],
+        ))
+        .take()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_import_reads_the_streams_own_rows_and_writes_only_what_moves() {
-        let sql = attribute_by_window_sql();
-        assert!(
-            sql.contains("WHERE r.stream_id = $1 AND (r.sensor_id IS NULL OR r.sensor_id = $2)"),
-            "the row set is the stream's unowned rows and the ones this instrument already owns: \
-             {sql}"
-        );
-        assert!(
-            sql.contains("tgt.sensor_id IS DISTINCT FROM $2"),
-            "a row already owned is only rewritten for its curve: {sql}"
-        );
-        assert!(
-            sql.contains("tgt.calibration_id IS DISTINCT FROM picked.cal_id"),
-            "so the count reports rows that moved rather than rows that matched: {sql}"
-        );
-    }
-
-    #[test]
-    fn the_ranking_is_one_expression_parameterised_only_by_the_sensor() {
-        let by_bind = pick_calibration_lateral("$1");
-        let by_column = pick_calibration_lateral("r.sensor_id");
-        assert_eq!(
-            by_bind.replace("c.sensor_id = $1", "c.sensor_id = r.sensor_id"),
-            by_column,
-            "the two call shapes differ only in what names the sensor"
-        );
-    }
-
-    #[test]
-    fn the_ranking_is_deterministic_for_curves_sharing_a_valid_from() {
-        let sql = pick_calibration_lateral("$1");
-        assert!(
-            sql.contains("c.valid_from DESC"),
-            "recency ranks first: {sql}"
-        );
-        assert!(
-            sql.contains("c.id DESC"),
-            "and a tie on valid_from still resolves to one row: {sql}"
-        );
-    }
-
-    #[test]
-    fn the_window_is_half_open() {
-        let sql = pick_calibration_lateral("$1");
-        assert!(sql.contains("r.time >= c.valid_from"), "{sql}");
-        assert!(
-            sql.contains("r.time < COALESCE(c.valid_until, 'infinity'::timestamptz)"),
-            "{sql}"
-        );
-    }
-
-    #[test]
-    fn applying_a_resolved_curve_is_slope_times_raw_plus_intercept() {
-        let curve = Curve {
-            id: Uuid::nil(),
-            slope: 2.0,
-            intercept: 5.0,
-        };
-        assert!((curve.apply(10.0) - 25.0).abs() < f64::EPSILON);
-        let identity = Curve {
-            id: Uuid::nil(),
-            slope: 1.0,
-            intercept: 0.0,
-        };
-        assert!((identity.apply(10.0) - 10.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn the_sql_and_rust_forms_name_the_same_operands_in_the_same_order() {
-        assert_eq!(
-            calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
-            "picked.slope * tgt.raw_value + picked.intercept",
-            "the set-based writers correct a row the way `apply_calibration` does"
-        );
-    }
-
-    /// The SQL form carries the same rule as the Rust one about what a missing curve means: a row
-    /// that resolves neither is uncorrected, and an uncorrected row's value is null rather than a
-    /// copy of its raw value.
-    #[test]
-    fn the_sql_recomposition_writes_null_when_no_curve_applies() {
-        use super::super::service::{CurveColumns, recomposed_value_sql};
-        let sql = recomposed_value_sql(
-            "tgt.raw_value",
-            &CurveColumns {
-                id: "picked.cal_id",
-                slope: "picked.slope",
-                intercept: "picked.intercept",
-            },
-            &CurveColumns {
-                id: "sc.id",
-                slope: "sc.slope",
-                intercept: "sc.intercept",
-            },
-        );
-        assert!(
-            sql.contains("WHEN picked.cal_id IS NULL AND sc.id IS NULL THEN NULL"),
-            "{sql}"
-        );
-        assert!(
-            sql.contains("sc.slope * (CASE WHEN picked.cal_id IS NULL THEN tgt.raw_value"),
-            "the standard curve corrects what the base produced: {sql}"
-        );
-    }
-
-    #[test]
-    fn a_standard_curve_corrects_what_the_base_calibration_produced() {
-        use super::super::service::apply_curves;
-        let base = Curve {
-            id: Uuid::nil(),
-            slope: 2.0,
-            intercept: 5.0,
-        };
-        let standard = Curve {
-            id: Uuid::nil(),
-            slope: 10.0,
-            intercept: 1.0,
-        };
-        assert!((apply_curves(10.0, Some(base), Some(standard)) - 251.0).abs() < f64::EPSILON);
-        assert!((apply_curves(10.0, Some(base), None) - 25.0).abs() < f64::EPSILON);
-        assert!((apply_curves(10.0, None, Some(standard)) - 101.0).abs() < f64::EPSILON);
-        assert!((apply_curves(10.0, None, None) - 10.0).abs() < f64::EPSILON);
-    }
-}
+#[path = "tests/resolver.rs"]
+mod tests;

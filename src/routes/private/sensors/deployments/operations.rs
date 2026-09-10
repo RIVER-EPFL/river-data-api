@@ -1,9 +1,11 @@
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
+use sea_orm::sea_query::Expr;
 use sea_orm::{ConnectionTrait, EntityTrait, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use super::model::SensorDeployment;
 use super::slots::{self, SlotRequest};
+use crate::routes::private::readings::models as readings;
 use crate::routes::private::sensors::calibrations::service::recompute_deployed_until;
 
 pub struct SensorDeploymentOperations;
@@ -328,13 +330,17 @@ impl CRUDOperations for SensorDeploymentOperations {
         // `deployment_id` is neither the segmentby nor the time dimension, so no compressed batch can
         // be excluded by metadata: the clear goes through the guarded writer, which lifts the
         // decompression cap it would otherwise hit on a sensor with historical readings.
+        use sea_orm::sea_query::ExprTrait;
         crate::common::bulk_write::guarded_mutation(
             db,
-            Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE readings SET deployment_id = NULL WHERE deployment_id = $1",
-                [id.into()],
-            ),
+            sea_orm::sea_query::Query::update()
+                .table(readings::Entity)
+                .value(
+                    readings::Column::DeploymentId,
+                    Expr::value(Option::<Uuid>::None),
+                )
+                .and_where(Expr::col(readings::Column::DeploymentId).eq(Expr::value(id)))
+                .to_owned(),
         )
         .await
         .map_err(|e| {

@@ -17,13 +17,15 @@ use crate::common::middleware::{
 };
 use crate::common::rate_limit::FallbackIpKeyExtractor;
 use crate::routes::private::{
-    alarms::models::AlarmThreshold,
+    alarms::models::{AlarmThreshold, alarm_event::AlarmEvent},
     annotations::Annotation,
     api_tokens::ApiToken,
     api_tokens::audit_log::ApiTokenAuditLog,
+    change_audit::models::ChangeAudit,
     collection_events::CollectionEvent,
     constants::Constant,
     data_streams::DataStream,
+    data_streams::models::receipts::IngestReceipt,
     data_streams::pairing_plans::PairingPlan,
     notes::Note,
     notifications::{NotificationLog, NotificationMute},
@@ -45,6 +47,7 @@ use crate::routes::private::{
     sync::models::credentials::SyncServiceCredential,
     sync::models::events::SyncEvent,
     sync::models::services::SyncService,
+    tools::models::run::ToolRun,
 };
 
 const ACTION_BODY_LIMIT: usize = 1024 * 1024; // 1 MB, preserved from the former admin tier
@@ -210,6 +213,9 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/alarm_thresholds",
             catalog_crud(AlarmThreshold::router(db)),
         )
+        // Read only: an episode is opened by the sweeper and closed by a reading returning to
+        // range, never by a client.
+        .nest("/alarm_events", field_data_crud(AlarmEvent::router(db)))
         .nest(
             "/tokens",
             admin_only_crud(ApiToken::router(db)).layer(middleware::from_fn_with_state(
@@ -226,7 +232,16 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/api_token_audit_logs",
             admin_only_crud(ApiTokenAuditLog::router(db)),
         )
+        // The append-only entity trail, across every subject. `GET /change_audit` answers the same
+        // question for one subject.
+        .nest("/change_audit_entries", field_crud(ChangeAudit::router(db)))
+        // One row per calculation run, minted only by `/tools/{name}/calculate` and never edited,
+        // which is why it mounts read-only. The provenance panel reads a saved reading's run here.
+        .nest("/tool_runs", field_data_crud(ToolRun::router(db)))
         .nest("/data_streams", admin_write_crud(DataStream::router(db)))
+        // One row per committed windowed ingest pass, read-only: the ingest writes them and the
+        // janitor's age prune is the only delete. `GET /streams/{id}/receipts` is one stream's.
+        .nest("/ingest_receipts", field_crud(IngestReceipt::router(db)))
         .nest(
             "/subprojects",
             invalidate_public_config(field_crud(Subproject::router(db))),
@@ -266,9 +281,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         alarms::views as alarm_views,
         data_streams::views as stream_views,
         readings::status_events::batch as status_events_batch,
-        readings::{
-            batch as readings_batch, flags, grab_samples, import as readings_import, ingest,
-        },
+        readings::views as readings_views,
         search,
         sync::views as sync_views,
         tools,
@@ -374,18 +387,21 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     // Data push paths. Each handler self-enforces project scope (a scoped token may only write
     // within its project), so these stay reachable by per-client logger keys.
     let data_push_routes = Router::new()
-        .route("/ingest", post(ingest::ingest_readings))
-        .route("/ingest/status_events", post(ingest::ingest_status_events))
+        .route("/ingest", post(readings_views::ingest_readings))
+        .route(
+            "/ingest/status_events",
+            post(readings_views::ingest_status_events),
+        )
         .route(
             "/readings/batch",
-            post(readings_batch::insert_batch_readings),
+            post(readings_views::insert_batch_readings),
         )
         .route(
             "/status_events/batch",
             post(status_events_batch::insert_batch_status_events),
         )
         .layer(RequestBodyLimitLayer::new(DATA_BODY_LIMIT))
-        .route("/readings/import_csv", post(readings_import::import_csv))
+        .route("/readings/import_csv", post(readings_views::import_csv))
         .layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT))
         .route(
             "/collection_events/stage",
@@ -405,31 +421,34 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         .route(
             "/readings/edits/preview",
-            post(crate::routes::private::readings::edits::preview),
+            post(crate::routes::private::readings::views::preview),
         )
         .route(
             "/readings/edits",
-            post(crate::routes::private::readings::edits::commit),
+            post(crate::routes::private::readings::views::commit),
         )
         .route(
             "/readings/edits/{id}/rollback",
-            post(crate::routes::private::readings::edits::rollback),
+            post(crate::routes::private::readings::views::rollback),
         )
         .route(
             "/readings/edits/sets/{set_id}/rollback",
-            post(crate::routes::private::readings::edits::rollback_edit_set),
+            post(crate::routes::private::readings::views::rollback_edit_set),
         )
-        .route("/readings/flag", patch(flags::flag_readings))
-        .route("/readings/unflag", patch(flags::unflag_readings))
-        .route("/readings/flag_range", patch(flags::flag_range))
-        .route("/readings/unflag_range", patch(flags::unflag_range))
+        .route("/readings/flag", patch(readings_views::flag_readings))
+        .route("/readings/unflag", patch(readings_views::unflag_readings))
+        .route("/readings/flag_range", patch(readings_views::flag_range))
+        .route(
+            "/readings/unflag_range",
+            patch(readings_views::unflag_range),
+        )
         .layer(middleware::from_fn(require_write_data))
         .with_state(state.clone());
 
     // Entering a field measurement. An intern reaches this and nothing else that writes: the
     // save lands unverified and is refused a replace (Q21, M44).
     let field_entry_routes = Router::new()
-        .route("/grab_samples", post(grab_samples::insert_grab_samples))
+        .route("/grab_samples", post(readings_views::insert_grab_samples))
         .layer(middleware::from_fn(require_enter_field_data))
         .with_state(state.clone());
 
@@ -467,7 +486,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .route("/actions/preview_derived", post(actions::preview_derived))
         .route(
             "/readings/sample_preview",
-            post(crate::routes::private::readings::sample_preview::sample_preview),
+            post(crate::routes::private::readings::views::sample_preview),
         )
         .route("/alarms/active", get(alarm_views::get_active_alarms))
         .route("/alarms/summary", get(alarm_views::get_alarm_summary))
@@ -489,27 +508,27 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         .route(
             "/readings/seasonal_check",
-            post(crate::routes::private::readings::checks::seasonal_check),
+            post(crate::routes::private::readings::views::seasonal_check),
         )
         .route(
             "/readings/provenance",
-            get(crate::routes::private::readings::provenance::get_reading_provenance),
+            get(crate::routes::private::readings::views::get_reading_provenance),
         )
         .route(
             "/readings/ledger",
-            get(crate::routes::private::readings::ledger::get_reading_ledger),
+            get(crate::routes::private::readings::views::get_reading_ledger),
         )
         .route(
             "/readings/decisions",
-            get(crate::routes::private::readings::decisions::list_decisions),
+            get(crate::routes::private::readings::views::list_decisions),
         )
         .route(
             "/readings/edits/inspect",
-            post(crate::routes::private::readings::edits::inspect),
+            post(crate::routes::private::readings::views::inspect),
         )
         .route(
             "/tool_runs/{id}/reload",
-            get(crate::routes::private::readings::edits::reload_run),
+            get(crate::routes::private::readings::views::reload_run),
         )
         .route(
             "/sites/{id}/visits",
@@ -553,7 +572,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         .route(
             "/change_audit",
-            get(crate::routes::private::change_audit::list_change_audit),
+            get(crate::routes::private::change_audit::views::list_change_audit),
         )
         .layer(middleware::from_fn(require_read_metadata))
         .with_state(state.clone());
@@ -687,11 +706,11 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .nest("/sync", sync_views::admin_routes())
         .route(
             "/readings/detach",
-            post(crate::routes::private::readings::decisions::detach_output),
+            post(crate::routes::private::readings::views::detach_output),
         )
         .route(
             "/readings/return",
-            post(crate::routes::private::readings::decisions::return_output),
+            post(crate::routes::private::readings::views::return_output),
         )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(require_admin))

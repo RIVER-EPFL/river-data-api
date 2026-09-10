@@ -6,13 +6,22 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use crudcrate::{ApiError, CRUDOperations};
-use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement, TransactionTrait};
+use sea_orm::sea_query::{
+    Alias, Expr, ExprTrait, IntoTableRef, JoinType, OnConflict, PostgresQueryBuilder,
+    Query as SeaQuery,
+};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult,
+    PaginatorTrait, QueryFilter, Statement, TransactionTrait,
+};
 use uuid::Uuid;
 
 use super::models::CollectionEvent;
 use crate::common::bulk_write;
 use crate::common::paging::Window;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::data_streams::models as data_streams;
+use crate::routes::private::readings::models as readings;
 
 pub(super) const MAX_PAGE_SIZE: u64 = 200;
 
@@ -21,18 +30,12 @@ pub struct CollectionEventOperations;
 /// How many readings the event holds. The FK is `ON DELETE SET NULL`, so a delete would leave
 /// them attached to no visit with no route to re-attach them.
 async fn attached_readings<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<i64, ApiError> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT COUNT(*) AS n FROM readings WHERE collection_event_id = $1",
-            [id.into()],
-        ))
+    let n = readings::Entity::find()
+        .filter(readings::Column::CollectionEventId.eq(id))
+        .count(db)
         .await
         .map_err(ApiError::database)?;
-    row.map(|r| r.try_get::<i64>("", "n"))
-        .transpose()
-        .map_err(ApiError::database)
-        .map(Option::unwrap_or_default)
+    Ok(i64::try_from(n).unwrap_or(i64::MAX))
 }
 
 impl CRUDOperations for CollectionEventOperations {
@@ -85,6 +88,19 @@ impl EventSource {
     }
 }
 
+/// The aliases the attach statements and the predicates they are given share.
+fn r() -> Alias {
+    Alias::new("r")
+}
+
+fn ds() -> Alias {
+    Alias::new("ds")
+}
+
+fn ce() -> Alias {
+    Alias::new("ce")
+}
+
 /// Find-or-create the `collection_events` rows for the attributed spot readings a predicate
 /// selects, then stamp `collection_event_id` onto them.
 ///
@@ -98,40 +114,88 @@ pub async fn attach_collection_events<C: ConnectionTrait>(
     binds: Vec<sea_orm::Value>,
     source: EventSource,
 ) -> AppResult<()> {
+    let attributed_spot = |predicate: String, binds: Vec<sea_orm::Value>| {
+        Condition::all()
+            .add(Expr::cust_with_values(predicate, binds))
+            .add(Expr::col((r(), readings::Column::CollectionEventId)).is_null())
+            .add(Expr::col((r(), readings::Column::SiteId)).is_not_null())
+            .add(ExprTrait::eq(
+                Expr::col((r(), readings::Column::MeasurementType)),
+                "spot",
+            ))
+    };
+
+    let mut rows = SeaQuery::select();
+    rows.column((r(), readings::Column::SiteId))
+        .column((r(), readings::Column::Time))
+        .expr(Expr::cust(source.sql()))
+        .from_as(readings::Entity, r())
+        .join_as(
+            JoinType::InnerJoin,
+            data_streams::Entity,
+            ds(),
+            Expr::col((r(), readings::Column::StreamId)).equals((ds(), data_streams::Column::Id)),
+        )
+        .cond_where(attributed_spot(row_predicate.to_string(), binds.clone()))
+        .add_group_by([
+            Expr::col((r(), readings::Column::SiteId)).into(),
+            Expr::col((r(), readings::Column::Time)).into(),
+        ]);
+    let mut insert = SeaQuery::insert();
+    insert
+        .into_table(super::Entity)
+        .columns([
+            super::Column::SiteId,
+            super::Column::CollectedAt,
+            super::Column::Source,
+        ])
+        .on_conflict(
+            OnConflict::columns([super::Column::SiteId, super::Column::CollectedAt])
+                .do_nothing()
+                .to_owned(),
+        );
+    insert
+        .select_from(rows)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let (sql, values) = insert.build(PostgresQueryBuilder);
     conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        format!(
-            "INSERT INTO collection_events (site_id, collected_at, source)
-             SELECT r.site_id, r.time, {source}
-             FROM readings r
-             JOIN data_streams ds ON r.stream_id = ds.id
-             WHERE {row_predicate}
-               AND r.collection_event_id IS NULL
-               AND r.site_id IS NOT NULL
-               AND r.measurement_type = 'spot'
-             GROUP BY r.site_id, r.time
-             ON CONFLICT (site_id, collected_at) DO NOTHING",
-            source = source.sql(),
-        ),
-        binds.clone(),
+        sql,
+        values,
     ))
     .await?;
 
     // The stamping UPDATE can reach chunks the compression policy already closed.
     bulk_write::lift_decompression_cap(conn).await?;
+    let mut stamp = SeaQuery::update();
+    stamp
+        .table(IntoTableRef::into_table_ref(readings::Entity).alias(r()))
+        .value(
+            readings::Column::CollectionEventId,
+            Expr::col((ce(), super::Column::Id)),
+        )
+        .from(IntoTableRef::into_table_ref(data_streams::Entity).alias(ds()))
+        .from(IntoTableRef::into_table_ref(super::Entity).alias(ce()))
+        .cond_where(
+            attributed_spot(row_predicate.to_string(), binds)
+                .add(
+                    Expr::col((r(), readings::Column::StreamId))
+                        .equals((ds(), data_streams::Column::Id)),
+                )
+                .add(
+                    Expr::col((ce(), super::Column::SiteId))
+                        .equals((r(), readings::Column::SiteId)),
+                )
+                .add(
+                    Expr::col((ce(), super::Column::CollectedAt))
+                        .equals((r(), readings::Column::Time)),
+                ),
+        );
+    let (sql, values) = stamp.build(PostgresQueryBuilder);
     conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        format!(
-            "UPDATE readings r SET collection_event_id = ce.id
-             FROM data_streams ds, collection_events ce
-             WHERE r.stream_id = ds.id
-               AND {row_predicate}
-               AND r.collection_event_id IS NULL
-               AND r.site_id IS NOT NULL
-               AND r.measurement_type = 'spot'
-               AND ce.site_id = r.site_id AND ce.collected_at = r.time"
-        ),
-        binds,
+        sql,
+        values,
     ))
     .await?;
 
@@ -141,16 +205,27 @@ pub async fn attach_collection_events<C: ConnectionTrait>(
 /// The per-visit counts, computed the same way on the site grid and the cross-site list. A
 /// hold is keyed on the slot (an event-audit finding) or on the stream that raised it, so the
 /// stream's pairing resolves the site.
-pub(super) const VISIT_COUNT_COLUMNS: &str = "\
-    (SELECT COUNT(DISTINCT r.parameter_id) FROM readings r \
-      WHERE r.collection_event_id = ce.id AND r.withdrawn_at IS NULL \
-        AND r.is_flagged IS NOT TRUE \
-        AND r.parameter_id IS NOT NULL) AS filled, \
-    (SELECT COUNT(*) FROM replicate_audit_holds h \
-      LEFT JOIN data_streams ds ON ds.id = h.stream_id \
-      LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id \
-      WHERE h.group_time = ce.collected_at AND h.status = 'pending' \
-        AND COALESCE(h.site_id, sp.site_id) = ce.site_id) AS findings_open";
+pub(super) fn visit_count_columns() -> String {
+    let filled = SeaQuery::select()
+        .expr(Expr::col((r(), readings::Column::ParameterId)).count_distinct())
+        .from_as(readings::Entity, r())
+        .and_where(
+            Expr::col((r(), readings::Column::CollectionEventId)).equals((ce(), super::Column::Id)),
+        )
+        .and_where(Expr::col((r(), readings::Column::WithdrawnAt)).is_null())
+        .and_where(Expr::cust("r.is_flagged IS NOT TRUE"))
+        .and_where(Expr::col((r(), readings::Column::ParameterId)).is_not_null())
+        .to_owned()
+        .to_string(PostgresQueryBuilder);
+    format!(
+        "({filled}) AS filled, \
+         (SELECT COUNT(*) FROM replicate_audit_holds h \
+           LEFT JOIN data_streams ds ON ds.id = h.stream_id \
+           LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id \
+           WHERE h.group_time = ce.collected_at AND h.status = 'pending' \
+             AND COALESCE(h.site_id, sp.site_id) = ce.site_id) AS findings_open"
+    )
+}
 
 /// Paging is opt-in: a caller naming neither `page` nor `page_size` gets every row.
 pub(super) fn paging(page: Option<u64>, page_size: Option<u64>) -> Option<Window> {

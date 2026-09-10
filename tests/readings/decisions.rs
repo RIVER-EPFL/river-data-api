@@ -6,7 +6,8 @@
 //! Run with: cargo test --test readings decisions
 
 use river_db::common::bulk_write;
-use river_db::routes::private::readings::decisions::{self, Decision, DecisionKey, Kind, Origin};
+use river_db::routes::private::readings::models::{Kind, Origin};
+use river_db::routes::private::readings::service::{self as decisions, Decision, DecisionKey};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde_json::json;
 use serial_test::serial;
@@ -683,7 +684,7 @@ async fn a_merge_moves_every_reading_as_a_slot_move_and_deletes_none() {
             target_site_parameter_id: crate::common::PARAM_S1_DO_ID.parse().unwrap(),
         },
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await
     .expect("the merge applies");
@@ -1031,7 +1032,7 @@ async fn wait_for_csv_value(db: &DatabaseConnection, expected: f64) {
 #[tokio::test]
 #[serial]
 async fn a_second_save_at_one_slot_instant_refreshes_the_hold_it_lost_to() {
-    use river_db::routes::private::readings::grab_samples::open_unverified_holds;
+    use river_db::routes::private::readings::service::open_unverified_holds;
     use sea_orm::TransactionTrait;
 
     let f = setup().await;

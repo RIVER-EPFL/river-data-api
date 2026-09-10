@@ -11,7 +11,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Statement};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -20,6 +20,7 @@ use super::model::{Column, Entity};
 use crate::common::AppState;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::readings::models as readings;
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -121,15 +122,9 @@ async fn retired_at<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<Option<
 }
 
 async fn readings_using<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<i64> {
-    let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT count(*)::bigint AS n FROM readings WHERE standard_curve_id = $1",
-            [id.into()],
-        ))
+    let count = readings::Entity::find()
+        .filter(readings::Column::StandardCurveId.eq(id))
+        .count(conn)
         .await?;
-    Ok(match row {
-        Some(row) => row.try_get("", "n")?,
-        None => 0,
-    })
+    Ok(i64::try_from(count).unwrap_or(i64::MAX))
 }

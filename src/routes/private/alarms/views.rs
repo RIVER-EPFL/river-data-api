@@ -6,7 +6,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter,
+    QueryOrder, Set, Statement,
 };
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -27,6 +28,7 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::sites::parameters as site_parameters;
 use crate::routes::{cache, resolve_site_with_project, validate_time_range};
 
+use super::models::alarm_event;
 use super::models::{
     AcknowledgedAlarmResponse, ActiveAlarm, ActiveAlarmsResponse, AlarmEventResponse,
     AlarmEventsQuery, AlarmEventsResponse, AlarmSeverityCounts, AlarmSiteSummary,
@@ -36,7 +38,7 @@ use super::models::{
 use super::service::{
     ActiveAlarmRow, AlarmEventRow, ParameterWithThreshold, ViolationRow, cadence_label,
     confine_alarm_event, fetch_active_alarm_rows, fetch_last_alarm_warning_times,
-    fetch_latest_reading_times, fetch_open_events, violations_sql,
+    fetch_latest_reading_times, fetch_open_events, violations_query,
 };
 use crate::routes::private::sites::models::{ProjectRef, SiteRef};
 /// The violations export, built from the same structs the JSON body serialises. A parameter that
@@ -184,7 +186,8 @@ pub async fn get_site_alarms(
 
     let sql = format!(
         "{}\nORDER BY sv.time, sv.parameter_id",
-        violations_sql(site.id, Some(alarm_param_ids), query.severity.unwrap_or(1))
+        violations_query(site.id, Some(alarm_param_ids), query.severity.unwrap_or(1))
+            .to_string(sea_orm::sea_query::PostgresQueryBuilder)
     );
 
     let values: Vec<sea_orm::Value> = vec![site.id.into(), query.start.into(), query.end.into()];
@@ -373,62 +376,40 @@ pub async fn acknowledge_alarm(
     ProjectScope(scope): ProjectScope,
     Path(event_id): Path<Uuid>,
 ) -> AppResult<Json<AcknowledgedAlarmResponse>> {
-    #[derive(Debug, FromQueryResult)]
-    struct EventState {
-        resolved_at: Option<chrono::DateTime<chrono::FixedOffset>>,
-        acknowledged_at: Option<chrono::DateTime<chrono::FixedOffset>>,
-        acknowledged_by: Option<String>,
-    }
-
     confine_alarm_event(&state, &scope, event_id).await?;
 
-    let existing = state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT resolved_at, acknowledged_at, acknowledged_by FROM alarm_events WHERE id = $1",
-            [event_id.into()],
-        ))
+    let event = alarm_event::Entity::find_by_id(event_id)
+        .one(&state.db)
         .await?
-        .and_then(|r| EventState::from_query_result(&r, "").ok());
+        .ok_or_else(|| AppError::NotFound(format!("Alarm event {event_id} not found")))?;
 
-    let Some(ev) = existing else {
-        return Err(AppError::NotFound(format!(
-            "Alarm event {event_id} not found"
-        )));
-    };
-    if ev.resolved_at.is_some() {
+    if event.resolved_at.is_some() {
         return Err(AppError::Conflict("Alarm already resolved".to_string()));
     }
     // Idempotent: an already-acknowledged open event returns its existing acknowledgement.
-    if let (Some(at), Some(by)) = (ev.acknowledged_at, ev.acknowledged_by) {
+    if let (Some(at), Some(by)) = (event.acknowledged_at, event.acknowledged_by.clone()) {
         return Ok(Json(AcknowledgedAlarmResponse {
             event_id,
-            acknowledged_at: at.with_timezone(&Utc),
+            acknowledged_at: at,
             acknowledged_by: by,
         }));
     }
 
     let actor = crate::common::actor::label(&auth);
-    let row = state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE alarm_events SET acknowledged_at = NOW(), acknowledged_by = $2, updated_at = NOW() \
-             WHERE id = $1 AND resolved_at IS NULL RETURNING acknowledged_at",
-            [event_id.into(), actor.clone().into()],
-        ))
-        .await?;
-    // No row means the event was already resolved; a row that will not decode is an error, not
-    // the same answer.
-    let acknowledged_at: chrono::DateTime<chrono::FixedOffset> = row
-        .map(|r| r.try_get("", "acknowledged_at"))
-        .transpose()?
-        .ok_or_else(|| AppError::Conflict("Alarm already resolved".to_string()))?;
+    let now = Utc::now();
+    let acknowledged = alarm_event::ActiveModel {
+        id: Set(event_id),
+        acknowledged_at: Set(Some(now)),
+        acknowledged_by: Set(Some(actor.clone())),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .update(&state.db)
+    .await?;
 
     Ok(Json(AcknowledgedAlarmResponse {
         event_id,
-        acknowledged_at: acknowledged_at.with_timezone(&Utc),
+        acknowledged_at: acknowledged.acknowledged_at.unwrap_or(now),
         acknowledged_by: actor,
     }))
 }
@@ -453,41 +434,26 @@ pub async fn unacknowledge_alarm(
     ProjectScope(scope): ProjectScope,
     Path(event_id): Path<Uuid>,
 ) -> AppResult<StatusCode> {
-    #[derive(Debug, FromQueryResult)]
-    struct EventCheck {
-        resolved_at: Option<chrono::DateTime<chrono::FixedOffset>>,
-    }
-
     confine_alarm_event(&state, &scope, event_id).await?;
 
-    let existing = state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT resolved_at FROM alarm_events WHERE id = $1",
-            [event_id.into()],
-        ))
+    let event = alarm_event::Entity::find_by_id(event_id)
+        .one(&state.db)
         .await?
-        .and_then(|r| EventCheck::from_query_result(&r, "").ok());
+        .ok_or_else(|| AppError::NotFound(format!("Alarm event {event_id} not found")))?;
 
-    let Some(ev) = existing else {
-        return Err(AppError::NotFound(format!(
-            "Alarm event {event_id} not found"
-        )));
-    };
-    if ev.resolved_at.is_some() {
+    if event.resolved_at.is_some() {
         return Err(AppError::Conflict("Alarm already resolved".to_string()));
     }
 
-    state
-        .db
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE alarm_events SET acknowledged_at = NULL, acknowledged_by = NULL, updated_at = NOW() \
-             WHERE id = $1 AND resolved_at IS NULL",
-            [event_id.into()],
-        ))
-        .await?;
+    alarm_event::ActiveModel {
+        id: Set(event_id),
+        acknowledged_at: Set(None),
+        acknowledged_by: Set(None),
+        updated_at: Set(Utc::now()),
+        ..Default::default()
+    }
+    .update(&state.db)
+    .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -736,8 +702,11 @@ pub async fn get_thresholds(
     ProjectScope(scope): ProjectScope,
     Query(query): Query<ThresholdsQuery>,
 ) -> AppResult<Json<Vec<ThresholdWithValue>>> {
-    let resolved_cte =
-        super::service::resolve_thresholds_sql(query.site_id, query.parameter_id.map(|p| vec![p]));
+    let resolved_cte = super::service::resolve_thresholds_query(
+        query.site_id,
+        query.parameter_id.map(|p| vec![p]),
+    )
+    .to_string(sea_orm::sea_query::PostgresQueryBuilder);
 
     // Confined to the caller's projects, the same rule the three alarm siblings apply: the payload
     // is one row per active slot, so an unconfined answer is an inventory of every project's slots
@@ -752,20 +721,9 @@ pub async fn get_thresholds(
     // unscoped/global view); a slot with no recent reading gets a NULL current value. Continuous
     // readings win over spot so an occasional grab does not stand in for a sensor's current value;
     // a spot-only slot still reports its latest grab.
+    let latest_cte = super::service::latest_slot_values_sql();
     let sql = format!(
-        "WITH resolved AS ({resolved_cte}), \
-         latest AS ( \
-            SELECT DISTINCT ON (r.site_id, r.parameter_id) r.site_id, r.parameter_id, \
-                   COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS current_value \
-            FROM readings r \
-            LEFT JOIN samples smp ON smp.id = r.sample_id \
-            WHERE r.site_id IS NOT NULL AND r.is_flagged IS NOT TRUE \
-              AND r.unverified IS NOT TRUE \
-              AND r.time > now() - interval '30 days' \
-            ORDER BY r.site_id, r.parameter_id, \
-                     (r.measurement_type IS NOT DISTINCT FROM 'spot') ASC, r.time DESC, \
-                     r.replicate_index ASC \
-         ) \
+        "WITH resolved AS ({resolved_cte}), latest AS ({latest_cte}) \
          SELECT r.site_id, r.parameter_id, r.warning_min, r.warning_max, r.alarm_min, r.alarm_max, \
                 r.source, l.current_value \
          FROM resolved r \

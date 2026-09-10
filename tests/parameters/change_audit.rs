@@ -354,3 +354,43 @@ async fn a_catalog_parameter_leaves_a_trail_with_both_snapshots() {
         entries[0]
     );
 }
+
+/// Scenario: the trail is read across every subject rather than one at a time.
+///
+/// Expected behaviour: the entity's list route answers with the same rows the subject-keyed route
+/// serves, carrying the subject and the writer, so the two readers cannot disagree about a column.
+#[tokio::test]
+#[serial]
+async fn the_entity_lists_the_same_entry_the_subject_route_serves() {
+    let (_db, app, token) = setup().await;
+    let slot = crate::common::PARAM_S1_TEMP_ID;
+    let subject = format!("site_parameter:{slot}");
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/site_parameters/{slot}"),
+        &json!({ "decimal_places": 3 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let newest = trail(&app, &token, &subject).await.remove(0);
+
+    let (status, listed) = crate::common::get_json_with_token(
+        &app,
+        &format!(
+            "/api/change_audit_entries?filter=%7B%22subject%22%3A%22{subject}%22%7D\
+             &sort=%5B%22changed_at%22%2C%22DESC%22%5D"
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{listed}");
+    let rows = listed.as_array().cloned().unwrap_or_default();
+    assert!(!rows.is_empty(), "the entity lists the trail: {listed}");
+    assert_eq!(rows[0]["subject"], subject);
+    assert_eq!(rows[0]["change"], newest["change"]);
+    assert_eq!(rows[0]["changed_by"], newest["changed_by"]);
+    assert_eq!(rows[0]["new_value"], newest["new_value"]);
+}

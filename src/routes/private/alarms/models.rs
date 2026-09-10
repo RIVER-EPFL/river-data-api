@@ -357,3 +357,101 @@ impl Related<crate::routes::private::sites::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+/// The alarm episode as an entity.
+///
+/// `alarm_events` is written by the sweeper and by the acknowledge routes, never by a client, so
+/// the entity mounts read only (`routes(read)`): the list, filter and pagination the alarm history
+/// needs come from the derive, and nothing may post an episode that no breach produced.
+pub mod alarm_event {
+    use crudcrate::EntityToModels;
+    use sea_orm::entity::prelude::*;
+
+    #[derive(
+        Clone,
+        Debug,
+        PartialEq,
+        DeriveEntityModel,
+        serde::Serialize,
+        serde::Deserialize,
+        EntityToModels,
+    )]
+    #[sea_orm(table_name = "alarm_events")]
+    #[crudcrate(
+        api_struct = "AlarmEvent",
+        name_singular = "alarm_event",
+        name_plural = "alarm_events",
+        generate_router,
+        routes(read)
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
+        pub id: Uuid,
+        #[crudcrate(filterable, sortable)]
+        pub site_id: Uuid,
+        #[crudcrate(filterable, sortable)]
+        pub parameter_id: Uuid,
+        /// 1 = warning, 2 = alarm; what the episode reads as now.
+        #[crudcrate(filterable, sortable)]
+        pub severity: i16,
+        /// The worst it has been, which is what the history is ranked by.
+        #[crudcrate(filterable, sortable)]
+        pub max_severity: i16,
+        #[crudcrate(sortable)]
+        pub started_at: chrono::DateTime<chrono::Utc>,
+        pub value_at_start: f64,
+        #[crudcrate(sortable)]
+        pub last_seen_at: chrono::DateTime<chrono::Utc>,
+        pub last_value: f64,
+        #[crudcrate(filterable, sortable)]
+        pub acknowledged_at: Option<chrono::DateTime<chrono::Utc>>,
+        #[crudcrate(filterable)]
+        pub acknowledged_by: Option<String>,
+        /// NULL while the breach stands; the sweeper stamps it when the value returns to range.
+        #[crudcrate(filterable, sortable)]
+        pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+        pub resolved_value: Option<f64>,
+        #[crudcrate(exclude(create, update), sortable)]
+        pub created_at: chrono::DateTime<chrono::Utc>,
+        #[crudcrate(exclude(create, update))]
+        pub updated_at: chrono::DateTime<chrono::Utc>,
+        /// When the subscribers were told the episode opened.
+        pub notified_at: Option<chrono::DateTime<chrono::Utc>>,
+        /// When they were told it closed.
+        pub resolution_notified_at: Option<chrono::DateTime<chrono::Utc>>,
+        /// The cadence the episode belongs to: a grab series and a sensor series alarm apart.
+        #[crudcrate(filterable, sortable)]
+        pub measurement_type: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "crate::routes::private::parameters::Entity",
+            from = "Column::ParameterId",
+            to = "crate::routes::private::parameters::Column::Id"
+        )]
+        Parameter,
+        #[sea_orm(
+            belongs_to = "crate::routes::private::sites::Entity",
+            from = "Column::SiteId",
+            to = "crate::routes::private::sites::Column::Id"
+        )]
+        Site,
+    }
+
+    impl Related<crate::routes::private::parameters::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::Parameter.def()
+        }
+    }
+
+    impl Related<crate::routes::private::sites::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::Site.def()
+        }
+    }
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

@@ -1,11 +1,12 @@
 use crudcrate::{ApiError, CRUDOperations};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Statement,
-    TransactionTrait,
+    ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, TransactionTrait,
 };
 use uuid::Uuid;
 
 use super::model::{Column, Entity, StandardCurve};
+use crate::routes::private::annotations::models as annotations;
+use crate::routes::private::readings::models as readings;
 
 pub struct StandardCurveOperations;
 
@@ -18,18 +19,22 @@ pub struct StandardCurveOperations;
 /// so there is no window to reprocess and no way to tell which readings the operator meant to change.
 /// A corrected curve is a new row, and the affected grabs are re-entered against it.
 async fn curve_is_used<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<bool, ApiError> {
-    let found = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT 1 AS one FROM readings WHERE standard_curve_id = $1
-             UNION ALL
-             SELECT 1 FROM annotations WHERE standard_curve_id = $1
-             LIMIT 1",
-            [id.into()],
-        ))
+    let on_a_reading = readings::Entity::find()
+        .filter(readings::Column::StandardCurveId.eq(id))
+        .one(db)
         .await
-        .map_err(ApiError::database)?;
-    Ok(found.is_some())
+        .map_err(ApiError::database)?
+        .is_some();
+    if on_a_reading {
+        return Ok(true);
+    }
+    let on_an_annotation = annotations::Entity::find()
+        .filter(annotations::Column::StandardCurveId.eq(id))
+        .one(db)
+        .await
+        .map_err(ApiError::database)?
+        .is_some();
+    Ok(on_an_annotation)
 }
 
 /// How many curves were copied from this one. A copy records where its coefficients came from, and

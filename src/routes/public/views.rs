@@ -4,7 +4,11 @@ use axum::{
     response::Response,
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
-use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
+use sea_orm::sea_query::{
+    Alias, Condition, Expr, Func, JoinType, PostgresQueryBuilder, Query as SeaQuery,
+    SelectStatement, UnionType,
+};
+use sea_orm::{ConnectionTrait, ExprTrait, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
@@ -14,8 +18,10 @@ use crate::common::AppState;
 use crate::common::cache;
 use crate::common::cache_key;
 use crate::common::series::{self, Cells, Table};
-use crate::common::served::{SERVED_CONTINUOUS, SERVED_SPOT, SPOT_INSTANT_KEY, SPOT_INSTANT_ORDER};
+use crate::common::served;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::samples::model as samples;
 use crate::routes::private::sites::service::resolution_of;
 use crate::routes::public::service::{PublicProjectConfig, PublicSiteConfig, get_public_config};
 
@@ -279,25 +285,57 @@ pub async fn get_site(
         // param_ids are global parameter IDs; also filter by site_id
         // The composite DISTINCT is confined to the spot subset, whose row counts are tiny; the
         // continuous half stays a plain parallel aggregate with no sort.
-        let sql = format!(
-            "SELECT LEAST(c.min_time, sp.min_time) AS min_time, \
-                    GREATEST(c.max_time, sp.max_time) AS max_time, \
-                    c.count + sp.count AS count \
-             FROM (SELECT MIN(r.time) AS min_time, MAX(r.time) AS max_time, COUNT(*) AS count \
-                   FROM readings r \
-                   WHERE r.site_id = $1 AND r.parameter_id = ANY($2) \
-                     AND {SERVED_CONTINUOUS}) c \
-             CROSS JOIN \
-                  (SELECT MIN(r.time) AS min_time, MAX(r.time) AS max_time, \
-                          COUNT(DISTINCT (r.stream_id, r.time)) AS count \
-                   FROM readings r \
-                   WHERE r.site_id = $1 AND r.parameter_id = ANY($2) \
-                     AND {SERVED_SPOT}) sp"
-        );
-
-        let values: Vec<sea_orm::Value> = vec![site.site_id.into(), param_ids.clone().into()];
-
-        let stmt = Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, &sql, values);
+        let slot = || {
+            Condition::all()
+                .add(Expr::col((served::r(), readings::Column::SiteId)).eq(site.site_id))
+                .add(Expr::cust_with_values(
+                    "r.parameter_id = ANY($1)",
+                    [param_ids.clone()],
+                ))
+        };
+        let extent = |count: Expr, arm: Condition| {
+            SeaQuery::select()
+                .expr_as(
+                    Func::min(Expr::col((served::r(), readings::Column::Time))),
+                    Alias::new("min_time"),
+                )
+                .expr_as(
+                    Func::max(Expr::col((served::r(), readings::Column::Time))),
+                    Alias::new("max_time"),
+                )
+                .expr_as(count, Alias::new("count"))
+                .from_as(readings::Entity, served::r())
+                .cond_where(slot().add(arm))
+                .take()
+        };
+        let query = SeaQuery::select()
+            .expr_as(
+                Expr::cust("LEAST(c.min_time, sp.min_time)"),
+                Alias::new("min_time"),
+            )
+            .expr_as(
+                Expr::cust("GREATEST(c.max_time, sp.max_time)"),
+                Alias::new("max_time"),
+            )
+            .expr_as(Expr::cust("c.count + sp.count"), Alias::new("count"))
+            .from_subquery(
+                extent(Expr::cust("COUNT(*)"), served::served_continuous()),
+                Alias::new("c"),
+            )
+            // `ON TRUE` rather than `JoinType::CrossJoin`, which the builder still writes an
+            // `ON` clause after; the two mean the same thing.
+            .join_subquery(
+                JoinType::InnerJoin,
+                extent(
+                    Expr::cust("COUNT(DISTINCT (r.stream_id, r.time))"),
+                    served::served_spot(),
+                ),
+                Alias::new("sp"),
+                Condition::all(),
+            )
+            .take();
+        let (sql, values) = query.build(PostgresQueryBuilder);
+        let stmt = Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values);
 
         let range = state
             .db
@@ -542,7 +580,7 @@ pub async fn get_readings(
     let format = query.format.to_lowercase();
     let measurement_type = query.measurement_type.as_deref().unwrap_or("");
     if !measurement_type.is_empty() {
-        crate::routes::private::readings::measurement::validate_measurement_type(Some(
+        crate::routes::private::readings::service::validate_measurement_type(Some(
             measurement_type,
         ))?;
     }
@@ -1042,46 +1080,103 @@ async fn aggregates_response_from_data(
 
 // Shared Helpers
 
-/// Fetch raw readings for resolved parameters, build time axis and parameter arrays.
-/// The public readings query's two serving arms. `continuous_extra` is None when the request
-/// narrows to spot, and otherwise carries any extra narrowing on the continuous arm.
-pub(crate) fn readings_sql(
-    continuous_extra: Option<&str>,
+/// The public readings query's two serving arms, over one site's resolved parameters.
+/// `continuous_extra` is None when the request narrows to spot, and otherwise carries any extra
+/// narrowing on the continuous arm.
+pub(crate) fn readings_query(
+    site_id: Uuid,
+    param_ids: &[Uuid],
+    continuous_extra: Option<Condition>,
     include_spot: bool,
-    time_cond: &str,
-) -> String {
-    let mut arms: Vec<String> = Vec::new();
+    time_cond: Condition,
+) -> SelectStatement {
+    let r = served::r();
+    let slot = || {
+        Condition::all()
+            .add(Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
+            .add(Expr::cust_with_values(
+                "r.parameter_id = ANY($1)",
+                [param_ids.to_vec()],
+            ))
+            .add(time_cond.clone())
+    };
+    let mut arms: Vec<SelectStatement> = Vec::new();
     if let Some(extra) = continuous_extra {
-        arms.push(format!(
-            "SELECT r.parameter_id::TEXT AS param_id, r.time, \
-                    COALESCE(r.calibrated_value, r.raw_value) AS value, r.measurement_type, \
-                    NULL::BIGINT AS n, NULL::DOUBLE PRECISION AS mean, \
-                    NULL::DOUBLE PRECISION AS sd, NULL::DOUBLE PRECISION AS min, \
-                    NULL::DOUBLE PRECISION AS max, NULL::TEXT AS sd_estimator \
-             FROM readings r \
-             WHERE r.site_id = $1 AND r.parameter_id = ANY($2) \
-               AND {SERVED_CONTINUOUS}{time_cond}{extra}"
-        ));
+        arms.push(
+            SeaQuery::select()
+                .expr_as(Expr::cust("r.parameter_id::TEXT"), Alias::new("param_id"))
+                .column((r.clone(), readings::Column::Time))
+                .expr_as(served::continuous_value(), Alias::new("value"))
+                .column((r.clone(), readings::Column::MeasurementType))
+                .expr_as(Expr::cust("NULL::BIGINT"), Alias::new("n"))
+                .expr_as(Expr::cust("NULL::DOUBLE PRECISION"), Alias::new("mean"))
+                .expr_as(Expr::cust("NULL::DOUBLE PRECISION"), Alias::new("sd"))
+                .expr_as(Expr::cust("NULL::DOUBLE PRECISION"), Alias::new("min"))
+                .expr_as(Expr::cust("NULL::DOUBLE PRECISION"), Alias::new("max"))
+                .expr_as(Expr::cust("NULL::TEXT"), Alias::new("sd_estimator"))
+                .from_as(readings::Entity, r.clone())
+                .cond_where(slot().add(served::served_continuous()).add(extra))
+                .take(),
+        );
     }
     if include_spot {
-        arms.push(format!(
-            "SELECT sp.param_id, sp.time, sp.value, sp.measurement_type, \
-                    sp.n, sp.mean, sp.sd, sp.min, sp.max, sp.sd_estimator FROM ( \
-                SELECT DISTINCT ON ({SPOT_INSTANT_KEY}) \
-                       r.parameter_id::TEXT AS param_id, r.time, \
-                       COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, \
-                       r.measurement_type, \
-                       smp.n::BIGINT AS n, smp.mean, smp.stdev AS sd, \
-                       smp.min_value AS min, smp.max_value AS max, smp.sd_estimator \
-                FROM readings r \
-                LEFT JOIN samples smp ON smp.id = r.sample_id \
-                WHERE r.site_id = $1 AND r.parameter_id = ANY($2) \
-                  AND {SERVED_SPOT}{time_cond} \
-                ORDER BY {SPOT_INSTANT_ORDER} \
-             ) sp"
-        ));
+        let smp = Alias::new("smp");
+        let mut group = SeaQuery::select();
+        group
+            .distinct_on(served::spot_instant_key())
+            .expr_as(Expr::cust("r.parameter_id::TEXT"), Alias::new("param_id"))
+            .column((r.clone(), readings::Column::Time))
+            .expr_as(served::spot_value(), Alias::new("value"))
+            .column((r.clone(), readings::Column::MeasurementType))
+            .expr_as(Expr::cust("smp.n::BIGINT"), Alias::new("n"))
+            .column((smp.clone(), samples::Column::Mean))
+            .expr_as(
+                Expr::col((smp.clone(), samples::Column::Stdev)),
+                Alias::new("sd"),
+            )
+            .expr_as(
+                Expr::col((smp.clone(), samples::Column::MinValue)),
+                Alias::new("min"),
+            )
+            .expr_as(
+                Expr::col((smp.clone(), samples::Column::MaxValue)),
+                Alias::new("max"),
+            )
+            .column((smp.clone(), samples::Column::SdEstimator))
+            .from_as(readings::Entity, r.clone())
+            .join_as(
+                JoinType::LeftJoin,
+                samples::Entity,
+                smp.clone(),
+                Expr::col((smp.clone(), samples::Column::Id))
+                    .equals((r.clone(), readings::Column::SampleId)),
+            )
+            .cond_where(slot().add(served::served_spot()));
+        for (expr, order) in served::spot_instant_order() {
+            group.order_by_expr(expr, order);
+        }
+        let sp = Alias::new("sp");
+        arms.push(
+            SeaQuery::select()
+                .columns([
+                    (sp.clone(), Alias::new("param_id")),
+                    (sp.clone(), Alias::new("time")),
+                    (sp.clone(), Alias::new("value")),
+                    (sp.clone(), Alias::new("measurement_type")),
+                    (sp.clone(), Alias::new("n")),
+                    (sp.clone(), Alias::new("mean")),
+                    (sp.clone(), Alias::new("sd")),
+                    (sp.clone(), Alias::new("min")),
+                    (sp.clone(), Alias::new("max")),
+                    (sp.clone(), Alias::new("sd_estimator")),
+                ])
+                .from_subquery(group.take(), sp.clone())
+                .take(),
+        );
     }
-    arms.join(" UNION ALL ")
+    let mut arms = arms.into_iter();
+    let first = arms.next().unwrap_or_default();
+    arms.fold(first, |mut acc, arm| acc.union(UnionType::All, arm).take())
 }
 
 async fn fetch_readings(
@@ -1118,16 +1213,12 @@ async fn fetch_readings(
         .map(|rp| rp.site_id)
         .ok_or_else(|| AppError::NotFound("No resolved parameters found".to_string()))?;
 
-    let mut values: Vec<sea_orm::Value> = vec![site_id.into(), param_ids.to_vec().into()];
-
-    let mut time_cond = String::new();
+    let mut time_cond = Condition::all();
     if let Some(s) = start {
-        values.push(s.into());
-        time_cond.push_str(&format!(" AND r.time >= ${}", values.len()));
+        time_cond = time_cond.add(Expr::col((served::r(), readings::Column::Time)).gte(s));
     }
     if let Some(e) = end {
-        values.push(e.into());
-        time_cond.push_str(&format!(" AND r.time <= ${}", values.len()));
+        time_cond = time_cond.add(Expr::col((served::r(), readings::Column::Time)).lte(e));
     }
 
     // Same semantics as the private readings filter: 'continuous' means everything that is
@@ -1135,16 +1226,22 @@ async fn fetch_readings(
     // The filter selects which arms are built: 'spot' and 'continuous' each keep one, any other
     // named type is continuous-shaped and narrows the continuous arm.
     let continuous_extra = match measurement_type {
-        "" | "continuous" => Some(String::new()),
+        "" | "continuous" => Some(Condition::all()),
         "spot" => None,
-        other => {
-            values.push(other.into());
-            Some(format!(" AND r.measurement_type = ${}", values.len()))
-        }
+        other => Some(Condition::all().add(
+            Expr::col((served::r(), readings::Column::MeasurementType)).eq(other.to_string()),
+        )),
     };
     let include_spot = matches!(measurement_type, "" | "spot");
 
-    let sql = readings_sql(continuous_extra.as_deref(), include_spot, &time_cond);
+    let query = readings_query(
+        site_id,
+        &param_ids,
+        continuous_extra,
+        include_spot,
+        time_cond,
+    );
+    let (sql, values) = query.build(PostgresQueryBuilder);
     let stmt = Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values);
 
     let rows: Vec<ReadingRow> = state

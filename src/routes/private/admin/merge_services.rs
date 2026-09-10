@@ -1,3 +1,4 @@
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
     QuerySelect, Statement,
@@ -14,6 +15,8 @@ use crate::routes::private::data_streams::models::{MoveScope, SlotMove};
 use crate::routes::private::data_streams::service::{move_slot_rows, slot_move_collisions};
 use crate::routes::private::parameters::derived::{definition_model, source_model};
 use crate::routes::private::parameters::models as parameters;
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::status_events::model as status_events;
 use crate::routes::private::sensors::calibrations::model as sensor_calibrations;
 use crate::routes::private::sensors::deployments::model as sensor_deployments;
 use crate::routes::private::sites::parameters::models as site_parameters;
@@ -99,20 +102,15 @@ async fn record_merge<C: ConnectionTrait>(
     let mut absorbed = serde_json::Map::new();
     absorbed.insert("source".to_string(), source);
     absorbed.insert("counts".to_string(), counts);
-    txn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO change_audit (subject, change, changed_by, old_value, new_value) \
-         VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)",
-        [
-            format!("{subject}:{target_id}").into(),
-            format!("{subject}_merge").into(),
-            actor.into(),
-            serde_json::Value::Object(absorbed).to_string().into(),
-            target.to_string().into(),
-        ],
-    ))
-    .await
-    .map_err(AppError::Database)?;
+    crate::routes::private::change_audit::service::record(
+        txn,
+        format!("{subject}:{target_id}"),
+        &format!("{subject}_merge"),
+        Some(actor.to_string()),
+        Some(serde_json::Value::Object(absorbed)),
+        Some(target.clone()),
+    )
+    .await?;
     Ok(())
 }
 
@@ -120,7 +118,7 @@ pub async fn merge_site_parameters(
     db: &DatabaseConnection,
     req: &MergeSiteParametersRequest,
     actor: &str,
-    origin: crate::routes::private::readings::decisions::Origin,
+    origin: crate::routes::private::readings::models::Origin,
 ) -> AppResult<MergeSiteParametersResponse> {
     let source_id = req.source_site_parameter_id;
     let target_id = req.target_site_parameter_id;
@@ -259,31 +257,24 @@ async fn delete_source<C: ConnectionTrait>(
     // Backstop: the move above re-points every slot-keyed row, so these match nothing unless a row
     // was written between the two statements. Nothing deletes a reading: a straggler is re-pointed
     // like the rest, so the site_parameter can go without leaving a row attributed to it.
-    let sql = "UPDATE readings SET parameter_id = $3 WHERE site_id = $1 AND parameter_id = $2";
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        sql,
-        vec![
-            site_id.into(),
-            source_param_id.into(),
-            target_param_id.into(),
-        ],
-    ))
-    .await
-    .map_err(AppError::Database)?;
+    readings::Entity::update_many()
+        .col_expr(readings::Column::ParameterId, Expr::value(target_param_id))
+        .filter(readings::Column::SiteId.eq(site_id))
+        .filter(readings::Column::ParameterId.eq(source_param_id))
+        .exec(db)
+        .await
+        .map_err(AppError::Database)?;
 
-    let sql = "UPDATE status_events SET parameter_id = $3 WHERE site_id = $1 AND parameter_id = $2";
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        sql,
-        vec![
-            site_id.into(),
-            source_param_id.into(),
-            target_param_id.into(),
-        ],
-    ))
-    .await
-    .map_err(AppError::Database)?;
+    status_events::Entity::update_many()
+        .col_expr(
+            status_events::Column::ParameterId,
+            Expr::value(target_param_id),
+        )
+        .filter(status_events::Column::SiteId.eq(site_id))
+        .filter(status_events::Column::ParameterId.eq(source_param_id))
+        .exec(db)
+        .await
+        .map_err(AppError::Database)?;
 
     alarm_thresholds::Entity::delete_many()
         .filter(alarm_thresholds::Column::ParameterId.eq(source_param_id))
@@ -407,7 +398,7 @@ pub async fn merge_parameters(
     db: &DatabaseConnection,
     req: &MergeParametersRequest,
     actor: &str,
-    origin: crate::routes::private::readings::decisions::Origin,
+    origin: crate::routes::private::readings::models::Origin,
 ) -> AppResult<MergeParametersResponse> {
     let source_id = req.source_parameter_id;
     let target_id = req.target_parameter_id;
@@ -494,7 +485,7 @@ async fn merge_site_parameters_per_site(
     source_id: Uuid,
     target_id: Uuid,
     actor: &str,
-    origin: crate::routes::private::readings::decisions::Origin,
+    origin: crate::routes::private::readings::models::Origin,
 ) -> AppResult<(u64, u64, MergeTotals)> {
     let source_sps = site_parameters::Entity::find()
         .filter(site_parameters::Column::ParameterId.eq(source_id))
@@ -572,7 +563,7 @@ async fn reassign_parameter_references(
     source_id: Uuid,
     target_id: Uuid,
     actor: &str,
-    origin: crate::routes::private::readings::decisions::Origin,
+    origin: crate::routes::private::readings::models::Origin,
 ) -> AppResult<SlotMove> {
     let to_target = |id: Uuid| sea_orm::sea_query::Expr::value(id);
 

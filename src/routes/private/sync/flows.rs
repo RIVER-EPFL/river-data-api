@@ -2,12 +2,15 @@
 
 use async_trait::async_trait;
 use axum::Json;
+use sea_orm::sea_query::{Alias, Expr, Query as SeaQuery};
 use sea_orm::{ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter};
 use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::data_streams::models::receipts;
+use crate::routes::private::readings::models as readings;
 use crate::routes::private::reprocessing_jobs;
 use crate::routes::private::reprocessing_jobs::job::Job;
 use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
@@ -179,20 +182,31 @@ impl Job for SyncLedgerRetention {
         }
         let mut receipts_pruned = 0u64;
         if self.ingest_receipt_retention_days > 0 {
-            receipts_pruned = db
-                .execute_raw(sea_orm::Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "DELETE FROM ingest_receipts
-                     WHERE at < NOW() - ($1 || ' days')::interval
-                       AND NOT EXISTS (
-                             SELECT 1 FROM readings r
-                              WHERE r.stream_id = ingest_receipts.stream_id
-                                AND r.time >= ingest_receipts.window_from
-                                AND r.time < ingest_receipts.window_to)",
-                    [self.ingest_receipt_retention_days.to_string().into()],
-                ))
+            // The readings the pass wrote are what a receipt explains, so one whose window still
+            // holds rows is kept however old it is.
+            use sea_orm::sea_query::ExprTrait as _;
+            let explains_a_stored_reading = SeaQuery::select()
+                .expr(Expr::value(1))
+                .from_as(readings::Entity, Alias::new("r"))
+                .and_where(
+                    Expr::col((Alias::new("r"), readings::Column::StreamId))
+                        .equals((receipts::Entity, receipts::Column::StreamId)),
+                )
+                .and_where(
+                    Expr::col((Alias::new("r"), readings::Column::Time))
+                        .gte(Expr::col((receipts::Entity, receipts::Column::WindowFrom))),
+                )
+                .and_where(
+                    Expr::col((Alias::new("r"), readings::Column::Time))
+                        .lt(Expr::col((receipts::Entity, receipts::Column::WindowTo))),
+                )
+                .take();
+            receipts_pruned = receipts::Entity::delete_many()
+                .filter(receipts::Column::At.lt(days_ago(self.ingest_receipt_retention_days)))
+                .filter(Expr::exists(explains_a_stored_reading).not())
+                .exec(db)
                 .await?
-                .rows_affected();
+                .rows_affected;
         }
         ctx.report(
             JobReport::new()

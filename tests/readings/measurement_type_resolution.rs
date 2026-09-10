@@ -72,43 +72,17 @@ async fn ingest_one(
     assert_eq!(body["inserted"], 1, "inserted: {body}");
 }
 
+/// What the resolver reads is unit-tested in `readings/tests/measurement.rs`; what the handler
+/// hands it is not reachable from there. This covers the wiring: the stream default and the owning
+/// sensor's frequency come from the database, and the override comes from the request body.
 #[tokio::test]
 #[serial]
-async fn ingest_resolution_chain_override_stream_sensor_fallback() {
+async fn ingest_passes_the_stream_default_the_sensor_map_and_the_override() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
 
-    // Fallback: no override, no stream default, no sensor → continuous.
-    let plain = register_stream(&app, &token, "plain", None).await;
-    ingest_one(&app, &token, &plain, 1.0, None).await;
-    assert_eq!(
-        stored_measurement_type(&db, &plain, 1.0).await,
-        "continuous"
-    );
-
-    // Stream default: declared spot at registration → spot.
-    let spot_stream = register_stream(&app, &token, "grabs", Some("spot")).await;
-    ingest_one(&app, &token, &spot_stream, 2.0, None).await;
-    assert_eq!(
-        stored_measurement_type(&db, &spot_stream, 2.0).await,
-        "spot"
-    );
-
-    // Registration mints no instrument (M172), so the chain has no sensor rung to consult here and
-    // the stream's own declaration is what makes these readings spot. That a bookkeeping row minted
-    // later carries `data_frequency = 'high'`, and so stays silent on this chain, is pinned where
-    // the minting happens (`tests/sensors/instrument_kinds.rs`).
-
-    // Per-reading override beats the stream default.
-    ingest_one(&app, &token, &spot_stream, 3.0, Some("continuous")).await;
-    assert_eq!(
-        stored_measurement_type(&db, &spot_stream, 3.0).await,
-        "continuous"
-    );
-
-    // Sensor frequency: low-frequency sensor owning an undeclared stream → spot.
     let (status, sensor) = crate::common::post_json_parse_with_token(
         &app,
         "/api/sensors",
@@ -123,6 +97,8 @@ async fn ingest_resolution_chain_override_stream_sensor_fallback() {
     let sensor_id = e2e::id_of(&sensor);
     assert_eq!(sensor["data_frequency"], "low", "sensor: {sensor}");
 
+    // The sensor map: an undeclared stream owned by a low-frequency sensor resolves to spot, so
+    // the handler read `sensors.data_frequency` and passed it.
     let lab_stream = register_stream(&app, &token, "lab", None).await;
     crate::common::exec(
         &db,
@@ -132,7 +108,8 @@ async fn ingest_resolution_chain_override_stream_sensor_fallback() {
     ingest_one(&app, &token, &lab_stream, 4.0, None).await;
     assert_eq!(stored_measurement_type(&db, &lab_stream, 4.0).await, "spot");
 
-    // A declared stream default beats the sensor's frequency.
+    // The stream default: the same sensor under a stream that declares continuous, which the
+    // resolver prefers. Reaching it at all means the handler passed `data_streams.measurement_type`.
     let mixed = register_stream(&app, &token, "mixed", Some("continuous")).await;
     crate::common::exec(
         &db,
@@ -144,6 +121,10 @@ async fn ingest_resolution_chain_override_stream_sensor_fallback() {
         stored_measurement_type(&db, &mixed, 5.0).await,
         "continuous"
     );
+
+    // The override travels from the request body, which neither of the two above can show.
+    ingest_one(&app, &token, &mixed, 6.0, Some("spot")).await;
+    assert_eq!(stored_measurement_type(&db, &mixed, 6.0).await, "spot");
 }
 
 #[tokio::test]

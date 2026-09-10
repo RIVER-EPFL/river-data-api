@@ -116,6 +116,18 @@ jobs:
         if: failure()
         run: docker logs tools-r
 
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # A crate that drifts out of rustfmt turns every later change into a diff of two hundred
+      # unrelated files, which is what hides the change under review.
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
   audit:
     runs-on: ubuntu-latest
     steps:

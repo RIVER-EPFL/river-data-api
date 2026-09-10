@@ -1,7 +1,7 @@
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, Statement,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
+    Statement, TransactionTrait,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -30,28 +30,27 @@ async fn mint_derived_version<C: ConnectionTrait>(
     // The same hash the migration computes for the same text, so version 1 and every version
     // after it are hashed one way.
     let hash = migration::m20260910_000014_derived_definition_versions::formula_hash(formula);
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"INSERT INTO derived_parameter_definition_versions
-              (definition_id, version_no, formula, content_hash, created_by)
-          SELECT $1,
-                 COALESCE((SELECT MAX(version_no) FROM derived_parameter_definition_versions
-                            WHERE definition_id = $1), 0) + 1,
-                 $2, $3, $4
-           WHERE NOT EXISTS (
-              SELECT 1 FROM derived_parameter_definition_versions v
-               WHERE v.definition_id = $1 AND v.content_hash = $3
-                 AND v.version_no = (SELECT MAX(version_no)
-                                       FROM derived_parameter_definition_versions
-                                      WHERE definition_id = $1)
-           )",
-        [
-            definition_id.into(),
-            formula.into(),
-            hash.into(),
-            actor.map(str::to_string).into(),
-        ],
-    ))
+    let newest = super::version_model::Entity::find()
+        .filter(super::version_model::Column::DefinitionId.eq(definition_id))
+        .order_by_desc(super::version_model::Column::VersionNo)
+        .one(db)
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+    // A re-save that changed nothing else leaves the formula where it is, so the newest version
+    // already carrying this text is the version.
+    if newest.as_ref().is_some_and(|v| v.content_hash == hash) {
+        return Ok(());
+    }
+    super::version_model::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        definition_id: Set(definition_id),
+        version_no: Set(newest.map_or(1, |v| v.version_no + 1)),
+        formula: Set(formula.to_string()),
+        content_hash: Set(hash),
+        created_by: Set(actor.map(str::to_string)),
+        ..Default::default()
+    }
+    .insert(db)
     .await
     .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
     Ok(())

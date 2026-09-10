@@ -113,3 +113,64 @@ fn resolve_all_keeps_input_order_and_tolerates_a_missing_catalog_entry() {
     assert_eq!(resolved[1].id, unknown.id);
     assert_eq!(resolved[1].units, None);
 }
+
+/// Expected behaviour: the scope resolves through `site_parameters` whichever way the caller named
+/// the slot, and it reads `samples` unaliased so it composes into a find and an update_many alike.
+#[test]
+fn the_slot_scope_reaches_a_slot_by_id_and_through_a_stream_pairing() {
+    use sea_orm::sea_query::{PostgresQueryBuilder, Query};
+
+    let mut q = Query::select();
+    q.expr(sea_orm::sea_query::Expr::val(1))
+        .from(crate::routes::private::readings::samples::Entity)
+        .and_where(super::slot_scope(
+            &[Uuid::from_u128(1)],
+            &[Uuid::from_u128(2)],
+        ));
+    let sql = q.to_string(PostgresQueryBuilder);
+
+    assert!(
+        sql.contains(r#"EXISTS(SELECT 1 FROM "site_parameters" AS "sp""#),
+        "the scope resolves through site_parameters: {sql}"
+    );
+    assert!(
+        sql.contains(r#""sp"."site_id" = "samples"."site_id""#)
+            && sql.contains(r#""sp"."parameter_id" = "samples"."parameter_id""#),
+        "the slot is joined to the sample by site and parameter: {sql}"
+    );
+    assert!(
+        sql.contains(r#"EXISTS(SELECT 1 FROM "data_streams" AS "ds""#)
+            && sql.contains(r#""ds"."site_parameter_id" = "sp"."id""#),
+        "a stream reaches its slot by its pairing: {sql}"
+    );
+    assert!(
+        !sql.contains(r#"AS "s""#),
+        "samples is read unaliased, so an update_many with no alias composes: {sql}"
+    );
+}
+
+/// A retag that names no stream still scopes by slot id, and one that names no slot still reaches
+/// the streams' slots: neither empty list may widen the scope to every sample.
+#[test]
+fn an_empty_id_list_narrows_the_scope_rather_than_widening_it() {
+    use sea_orm::sea_query::{PostgresQueryBuilder, Query};
+
+    let render = |slots: &[Uuid], streams: &[Uuid]| {
+        let mut q = Query::select();
+        q.expr(sea_orm::sea_query::Expr::val(1))
+            .from(crate::routes::private::readings::samples::Entity)
+            .and_where(super::slot_scope(slots, streams));
+        q.to_string(PostgresQueryBuilder)
+    };
+
+    let no_streams = render(&[Uuid::from_u128(1)], &[]);
+    assert!(
+        no_streams.contains(r#""sp"."id" IN ('00000000-0000-0000-0000-000000000001')"#),
+        "the slot id is still matched: {no_streams}"
+    );
+    let no_slots = render(&[], &[Uuid::from_u128(2)]);
+    assert!(
+        no_slots.contains(r#""ds"."id" IN ('00000000-0000-0000-0000-000000000002')"#),
+        "the stream id is still matched: {no_slots}"
+    );
+}

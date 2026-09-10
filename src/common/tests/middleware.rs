@@ -34,6 +34,7 @@ fn test_the_entities_with_no_project_dimension_are_the_ones_a_scoped_token_is_re
             "subprojects",
             "data_streams",
             "alarm_thresholds",
+            "alarm_events",
             "sensor_deployments",
             "sensor_calibrations",
             "standard_curves",

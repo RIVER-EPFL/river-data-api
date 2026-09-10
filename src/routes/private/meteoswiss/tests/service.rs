@@ -1,6 +1,7 @@
-use super::{recent_url, series};
+use super::{insert_chunk, recent_url, series};
 use crate::routes::private::meteoswiss::models::Point;
 use chrono::{TimeZone, Utc};
+use uuid::Uuid;
 
 const HEADER: &str = "station_abbr;reference_timestamp;tre200s0;prestas0";
 
@@ -81,4 +82,34 @@ fn test_recent_url_lowercases_the_station() {
         recent_url("https://data.geo.admin.ch/ch.meteoschweiz.ogd-smn/", "MOB"),
         "https://data.geo.admin.ch/ch.meteoschweiz.ogd-smn/mob/ogd-smn_mob_t_recent.csv"
     );
+}
+
+/// Scenario: the SMN feed re-publishes an instant it already sent.
+/// Expected behaviour: the insert names every column the feed knows, tags the rows continuous, and
+/// does nothing on conflict, because a replayed instant is a duplicate and not a correction.
+#[test]
+fn test_the_insert_tags_the_rows_continuous_and_does_nothing_on_conflict() {
+    use sea_orm::QueryTrait;
+    let point = Point {
+        time: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        value: 963.4,
+    };
+    let sql = insert_chunk(
+        Uuid::nil(),
+        Uuid::nil(),
+        Uuid::nil(),
+        Uuid::nil(),
+        &[&point],
+    )
+    .into_query()
+    .to_string(sea_orm::sea_query::PostgresQueryBuilder);
+    assert!(
+        str::starts_with(
+            &sql,
+            r#"INSERT INTO "readings" ("stream_id", "time", "replicate_index", "site_id", "parameter_id", "raw_value", "sensor_id", "measurement_type")"#
+        ),
+        "{sql}"
+    );
+    assert!(str::contains(&sql, "'continuous'"), "{sql}");
+    assert!(str::ends_with(&sql, "DO NOTHING"), "{sql}");
 }

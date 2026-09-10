@@ -5,13 +5,21 @@ use std::collections::HashMap;
 use axum::http::header::{self, HeaderValue};
 use axum::response::Response;
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
+use sea_orm::sea_query::{
+    Alias, Expr, ExprTrait, Func, JoinType, PostgresQueryBuilder, Query as SeaQuery,
+    SelectStatement,
+};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
+    QuerySelect, Statement,
+};
 use uuid::Uuid;
 
 use super::models::*;
 use crate::common::aggregates::Resolution;
 use crate::common::series::{Cells, Table};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::samples;
 use crate::routes::private::sites::parameters as site_parameters;
 
@@ -27,17 +35,26 @@ pub(super) struct ParameterExtent {
 
 pub(super) fn min_opt(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
     match (a, b) {
-        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), Some(b)) => Some(Ord::min(a, b)),
         (some, None) | (None, some) => some,
     }
 }
 
 pub(super) fn max_opt(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
     match (a, b) {
-        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), Some(b)) => Some(Ord::max(a, b)),
         (some, None) | (None, some) => some,
     }
 }
+
+/// The FILTER aggregates the extent passes count with. Text, because `COUNT(*) FILTER (WHERE ...)`
+/// has no builder form; the statements they sit in are composed.
+const SERVED_SPOT_COUNT: &str =
+    "COUNT(*) FILTER (WHERE is_flagged IS NOT TRUE AND withdrawn_at IS NULL)::bigint";
+const SPOT_COUNT: &str = "COUNT(*) FILTER (WHERE measurement_type = 'spot' \
+     AND is_flagged IS NOT TRUE AND withdrawn_at IS NULL)";
+const CONTINUOUS_COUNT: &str = "COUNT(*) FILTER (WHERE measurement_type IS DISTINCT FROM 'spot' \
+     AND replicate_index = 0 AND is_flagged IS NOT TRUE)";
 
 /// How far back the raw-readings freshness pass looks. Wide enough to cover the hourly
 /// aggregate's refresh lag (one bucket + one schedule interval) many times over, narrow enough
@@ -84,47 +101,51 @@ pub(super) async fn parameter_extents(
     .all(db)
     .await?;
 
-    let spot = SpotExtentRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT parameter_id, MIN(time) AS min_time, MAX(time) AS max_time, \
-                COUNT(*) FILTER (WHERE is_flagged IS NOT TRUE \
-                                   AND withdrawn_at IS NULL)::bigint AS count \
-         FROM readings WHERE site_id = $1 AND parameter_id IS NOT NULL \
-           AND measurement_type = 'spot' \
-         GROUP BY parameter_id",
-        [site_id.into()],
-    ))
-    .all(db)
-    .await?;
+    let spot = readings::Entity::find()
+        .select_only()
+        .column(readings::Column::ParameterId)
+        .expr_as(Func::min(Expr::col(readings::Column::Time)), "min_time")
+        .expr_as(Func::max(Expr::col(readings::Column::Time)), "max_time")
+        .expr_as(Expr::cust(SERVED_SPOT_COUNT), "count")
+        .filter(readings::Column::SiteId.eq(site_id))
+        .filter(readings::Column::ParameterId.is_not_null())
+        .filter(readings::Column::MeasurementType.eq("spot"))
+        .group_by(readings::Column::ParameterId)
+        .into_model::<SpotExtentRow>()
+        .all(db)
+        .await?;
 
-    let recent = RecentExtentRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        &format!(
-            "SELECT parameter_id, MIN(time) AS min_time, MAX(time) AS max_time, \
-                    COUNT(*) FILTER (WHERE measurement_type = 'spot' \
-                                       AND is_flagged IS NOT TRUE AND withdrawn_at IS NULL) AS spot_count, \
-                    COUNT(*) FILTER (WHERE measurement_type IS DISTINCT FROM 'spot' \
-                                       AND replicate_index = 0 AND is_flagged IS NOT TRUE) AS continuous_count \
-             FROM readings \
-             WHERE site_id = $1 AND parameter_id IS NOT NULL \
-               AND time > now() - INTERVAL '{RECENT_EXTENT_DAYS} days' \
-             GROUP BY parameter_id"
-        ),
-        [site_id.into()],
-    ))
-    .all(db)
-    .await?;
+    let recent = readings::Entity::find()
+        .select_only()
+        .column(readings::Column::ParameterId)
+        .expr_as(Func::min(Expr::col(readings::Column::Time)), "min_time")
+        .expr_as(Func::max(Expr::col(readings::Column::Time)), "max_time")
+        .expr_as(Expr::cust(SPOT_COUNT), "spot_count")
+        .expr_as(Expr::cust(CONTINUOUS_COUNT), "continuous_count")
+        .filter(readings::Column::SiteId.eq(site_id))
+        .filter(readings::Column::ParameterId.is_not_null())
+        // An interval literal has no builder form, and keeping it a literal is what lets chunk
+        // exclusion see the bound.
+        .filter(Expr::cust(format!(
+            "time > now() - INTERVAL '{RECENT_EXTENT_DAYS} days'"
+        )))
+        .group_by(readings::Column::ParameterId)
+        .into_model::<RecentExtentRow>()
+        .all(db)
+        .await?;
 
     let mut flagged_heads: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
-    for row in FlaggedHeadRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT parameter_id, MIN(time) AS min_time FROM readings \
-             WHERE site_id = $1 AND parameter_id IS NOT NULL AND is_flagged \
-             GROUP BY parameter_id",
-        [site_id.into()],
-    ))
-    .all(db)
-    .await?
+    for row in readings::Entity::find()
+        .select_only()
+        .column(readings::Column::ParameterId)
+        .expr_as(Func::min(Expr::col(readings::Column::Time)), "min_time")
+        .filter(readings::Column::SiteId.eq(site_id))
+        .filter(readings::Column::ParameterId.is_not_null())
+        .filter(Expr::col(readings::Column::IsFlagged))
+        .group_by(readings::Column::ParameterId)
+        .into_model::<FlaggedHeadRow>()
+        .all(db)
+        .await?
     {
         if let Some(t) = row.min_time {
             flagged_heads.insert(row.parameter_id, t);
@@ -565,30 +586,31 @@ pub(super) async fn fetch_sample_stats(
         .collect();
 
     // The time bounds keep chunk exclusion in play; sample_id alone plans across every chunk.
-    let (time_clause, mut values) = match end {
-        Some(e) => (
-            "AND time >= $2 AND time <= $3",
-            vec![sample_ids.to_vec().into(), start.into(), e.into()],
-        ),
-        None => (
-            "AND time >= $2",
-            vec![sample_ids.to_vec().into(), start.into()],
-        ),
-    };
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT sample_id, replicate_index, raw_value, calibrated_value, is_flagged, \
-                 calibration_id, standard_curve_id, (withdrawn_at IS NOT NULL) AS withdrawn \
-                 FROM readings WHERE sample_id = ANY($1) {time_clause} \
-                 ORDER BY sample_id, replicate_index"
-            ),
-            std::mem::take(&mut values),
-        ))
-        .await?;
-    for row in rows {
-        let row = SampleReplicateRow::from_query_result(&row, "")?;
+    let mut replicates = readings::Entity::find()
+        .select_only()
+        .column(readings::Column::SampleId)
+        .column(readings::Column::ReplicateIndex)
+        .column(readings::Column::RawValue)
+        .column(readings::Column::CalibratedValue)
+        .column(readings::Column::IsFlagged)
+        .column(readings::Column::CalibrationId)
+        .column(readings::Column::StandardCurveId)
+        .expr_as(
+            Expr::col(readings::Column::WithdrawnAt).is_not_null(),
+            "withdrawn",
+        )
+        .filter(readings::Column::SampleId.is_in(sample_ids.to_vec()))
+        .filter(readings::Column::Time.gte(start))
+        .order_by_asc(readings::Column::SampleId)
+        .order_by_asc(readings::Column::ReplicateIndex);
+    if let Some(end) = end {
+        replicates = replicates.filter(readings::Column::Time.lte(end));
+    }
+    for row in replicates
+        .into_model::<SampleReplicateRow>()
+        .all(db)
+        .await?
+    {
         if let Some(stat) = stats.get_mut(&row.sample_id) {
             stat.replicates.push(ReplicateOut {
                 replicate_index: row.replicate_index,
@@ -615,35 +637,13 @@ pub(super) async fn count_withdrawn_instants(
     if parameter_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let (time_clause, values) = match end {
-        Some(e) => (
-            "AND r.time >= $3 AND r.time <= $4",
-            vec![
-                site_id.into(),
-                parameter_ids.to_vec().into(),
-                start.into(),
-                e.into(),
-            ],
-        ),
-        None => (
-            "AND r.time >= $3",
-            vec![site_id.into(), parameter_ids.to_vec().into(), start.into()],
-        ),
-    };
+    let (sql, values) =
+        withdrawn_instants_query(site_id, parameter_ids, start, end).build(PostgresQueryBuilder);
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT parameter_id, count(*) AS withdrawn_count FROM ( \
-                     SELECT r.parameter_id, r.time \
-                     FROM readings r \
-                     WHERE r.site_id = $1 AND r.parameter_id = ANY($2) \
-                       AND r.measurement_type = 'spot' {time_clause} \
-                     GROUP BY r.parameter_id, r.time \
-                     HAVING bool_and(r.withdrawn_at IS NOT NULL) \
-                 ) g GROUP BY parameter_id"
-            ),
-            values,
+            sql,
+            values.0,
         ))
         .await?;
     let mut counts = HashMap::with_capacity(rows.len());
@@ -652,6 +652,44 @@ pub(super) async fn count_withdrawn_instants(
         counts.insert(withdrawn.parameter_id, withdrawn.withdrawn_count);
     }
     Ok(counts)
+}
+
+/// Fully withdrawn spot instants per parameter, counted once each.
+///
+/// An instant is withdrawn only when every replicate in it is, so the grouping happens in the
+/// subquery and the outer count is over instants rather than rows. The time bounds are on the
+/// inner query, where chunk exclusion can see them.
+pub(super) fn withdrawn_instants_query(
+    site_id: Uuid,
+    parameter_ids: &[Uuid],
+    start: DateTime<Utc>,
+    end: Option<DateTime<Utc>>,
+) -> SelectStatement {
+    let mut instants = SeaQuery::select();
+    instants
+        .column(readings::Column::ParameterId)
+        .column(readings::Column::Time)
+        .from(readings::Entity)
+        .and_where(Expr::col(readings::Column::SiteId).eq(site_id))
+        .and_where(Expr::col(readings::Column::ParameterId).is_in(parameter_ids.to_vec()))
+        .and_where(Expr::col(readings::Column::MeasurementType).eq("spot"))
+        .and_where(Expr::col(readings::Column::Time).gte(start))
+        .add_group_by([
+            Expr::col(readings::Column::ParameterId),
+            Expr::col(readings::Column::Time),
+        ])
+        .and_having(Expr::cust("bool_and(withdrawn_at IS NOT NULL)"));
+    if let Some(end) = end {
+        instants.and_where(Expr::col(readings::Column::Time).lte(end));
+    }
+
+    let mut counts = SeaQuery::select();
+    counts
+        .column(readings::Column::ParameterId)
+        .expr_as(Expr::cust("count(*)"), Alias::new("withdrawn_count"))
+        .from_subquery(instants, Alias::new("g"))
+        .add_group_by([Expr::col(readings::Column::ParameterId)]);
+    counts
 }
 
 // --- Aggregates ---
@@ -761,24 +799,59 @@ pub(super) fn build_status_events_ndjson(events: &[StatusEventData]) -> AppResul
 /// Continuous rows live at `replicate_index = 0` and are the reading itself. A spot instant is
 /// summarised at the value the API serves for it, the sample mean over the live replicates, so the
 /// period statistics and the plotted series are the same numbers.
-pub(super) fn value_source(measurement_type: &str) -> &'static str {
+pub(super) fn value_source(
+    measurement_type: &str,
+    site_id: Uuid,
+    parameter_ids: &[Uuid],
+) -> SelectStatement {
+    let r = Alias::new("r");
+    let mut source = SeaQuery::select();
+    source
+        .column((r.clone(), readings::Column::ParameterId))
+        .column((r.clone(), readings::Column::Time))
+        .from_as(readings::Entity, r.clone())
+        .and_where(Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
+        .and_where(
+            Expr::col((r.clone(), readings::Column::ParameterId)).is_in(parameter_ids.to_vec()),
+        )
+        .and_where(
+            Expr::col((r.clone(), readings::Column::IsFlagged))
+                .ne(true)
+                .or(Expr::col((r.clone(), readings::Column::IsFlagged)).is_null()),
+        )
+        .add_group_by([
+            Expr::col((r.clone(), readings::Column::ParameterId)).into(),
+            Expr::col((r.clone(), readings::Column::Time)).into(),
+        ]);
     if measurement_type == "spot" {
-        "SELECT r.parameter_id, r.time, \
-                COALESCE(MAX(smp.mean), AVG(COALESCE(r.calibrated_value, r.raw_value))) AS value \
-         FROM readings r \
-         LEFT JOIN samples smp ON smp.id = r.sample_id \
-         WHERE r.site_id = $1 AND r.parameter_id = ANY($2) AND r.measurement_type = 'spot' \
-           AND r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL \
-         GROUP BY r.parameter_id, r.time"
+        let smp = Alias::new("smp");
+        source
+            .expr_as(
+                Expr::cust(
+                    "COALESCE(MAX(smp.mean), AVG(COALESCE(r.calibrated_value, r.raw_value)))",
+                ),
+                Alias::new("value"),
+            )
+            .join_as(
+                JoinType::LeftJoin,
+                samples::Entity,
+                smp.clone(),
+                Expr::col((smp, samples::Column::Id))
+                    .equals((r.clone(), readings::Column::SampleId)),
+            )
+            .and_where(Expr::col((r.clone(), readings::Column::MeasurementType)).eq("spot"))
+            .and_where(Expr::col((r, readings::Column::WithdrawnAt)).is_null());
     } else {
         // Several streams can serve one slot instant; the period counts the instant once.
-        "SELECT r.parameter_id, r.time, \
-                AVG(COALESCE(r.calibrated_value, r.raw_value)) AS value \
-         FROM readings r \
-         WHERE r.site_id = $1 AND r.parameter_id = ANY($2) AND r.replicate_index = 0 \
-           AND r.measurement_type IS DISTINCT FROM 'spot' AND r.is_flagged IS NOT TRUE \
-         GROUP BY r.parameter_id, r.time"
+        source
+            .expr_as(
+                Expr::cust("AVG(COALESCE(r.calibrated_value, r.raw_value))"),
+                Alias::new("value"),
+            )
+            .and_where(Expr::col((r.clone(), readings::Column::ReplicateIndex)).eq(0))
+            .and_where(Expr::cust("r.measurement_type IS DISTINCT FROM 'spot'"));
     }
+    source
 }
 
 // --- Sensor identity bands ---

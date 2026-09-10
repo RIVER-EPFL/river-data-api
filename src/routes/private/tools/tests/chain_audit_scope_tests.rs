@@ -3,58 +3,89 @@ use uuid::Uuid;
 
 #[test]
 fn an_unscoped_audit_covers_every_event_and_reads_no_provenance() {
-    let (sql, binds) = audit_event_set(None, None, None, None);
+    let statement = audit_event_set(None, None, None, None);
     assert_eq!(
-        sql,
-        "SELECT id FROM collection_events ORDER BY collected_at"
+        statement.sql,
+        r#"SELECT "id" FROM "collection_events" ORDER BY "collected_at" ASC"#
     );
-    assert!(binds.is_empty());
+    assert!(statement.values.is_none_or(|v| v.0.is_empty()));
 }
 
 #[test]
 fn a_constant_scope_narrows_to_the_events_whose_provenance_names_it() {
-    let (sql, binds) = audit_event_set(None, None, Some("xO2"), None);
+    let statement = audit_event_set(None, None, Some("xO2"), None);
     assert!(
-        sql.contains("jsonb_exists(r.provenance -> 'constants', $1)"),
-        "{sql}"
+        statement
+            .sql
+            .contains(r#"jsonb_exists("r"."provenance" -> 'constants', $1)"#),
+        "{}",
+        statement.sql
     );
-    assert_eq!(binds.len(), 1);
+    assert_eq!(statement.values.map(|v| v.0.len()), Some(1));
 }
 
 #[test]
 fn a_site_scope_and_a_constant_scope_both_apply_and_bind_in_order() {
     let site = Uuid::new_v4();
-    let (sql, binds) = audit_event_set(None, Some(site), Some("xO2"), None);
-    assert!(sql.contains("site_id = $1"), "{sql}");
-    assert!(sql.contains(", $2)"), "{sql}");
-    assert_eq!(binds.len(), 2);
+    let statement = audit_event_set(None, Some(site), Some("xO2"), None);
+    assert!(
+        statement.sql.contains(r#""site_id" = $1"#),
+        "{}",
+        statement.sql
+    );
+    assert!(statement.sql.contains(", $2)"), "{}", statement.sql);
+    assert_eq!(statement.values.map(|v| v.0.len()), Some(2));
 }
 
 /// A calculation edit audits the visits that calculation actually wrote, which is what makes
 /// the report proportionate to the edit rather than a pass over every visit ever recorded.
 #[test]
 fn a_calculation_scope_narrows_to_the_visits_it_wrote() {
-    let (sql, binds) = audit_event_set(None, None, None, Some("pco2"));
+    let statement = audit_event_set(None, None, None, Some("pco2"));
     assert!(
-        sql.contains("r.provenance ->> 'tool' = $1"),
-        "the scope reads the stored provenance: {sql}"
+        statement
+            .sql
+            .contains(r#""r"."provenance" ->> 'tool' = $1"#),
+        "the scope reads the stored provenance: {}",
+        statement.sql
     );
-    assert_eq!(binds.len(), 1);
+    assert_eq!(statement.values.map(|v| v.0.len()), Some(1));
 }
 
 /// The two content scopes stack, so editing a constant a calculation reads audits only where
 /// both are named.
 #[test]
 fn a_constant_and_a_calculation_scope_both_apply_and_bind_in_order() {
-    let (sql, binds) = audit_event_set(None, None, Some("xO2"), Some("pco2"));
-    assert!(sql.contains("jsonb_exists(r.provenance -> 'constants', $1)"));
-    assert!(sql.contains("r.provenance ->> 'tool' = $2"));
-    assert_eq!(binds.len(), 2);
+    let statement = audit_event_set(None, None, Some("xO2"), Some("pco2"));
+    assert!(
+        statement
+            .sql
+            .contains(r#"jsonb_exists("r"."provenance" -> 'constants', $1)"#)
+    );
+    assert!(
+        statement
+            .sql
+            .contains(r#""r"."provenance" ->> 'tool' = $2"#)
+    );
+    assert_eq!(statement.values.map(|v| v.0.len()), Some(2));
 }
 
 #[test]
 fn an_event_scope_outranks_a_site_scope() {
-    let (sql, _) = audit_event_set(Some(Uuid::new_v4()), Some(Uuid::new_v4()), None, None);
-    assert!(sql.contains("id = $1"), "{sql}");
-    assert!(!sql.contains("site_id"), "{sql}");
+    let statement = audit_event_set(Some(Uuid::new_v4()), Some(Uuid::new_v4()), None, None);
+    assert!(statement.sql.contains(r#""id" = $1"#), "{}", statement.sql);
+    assert!(!statement.sql.contains("site_id"), "{}", statement.sql);
+}
+
+/// The correlation is what keeps the scope a per-visit index probe rather than a scan.
+#[test]
+fn a_content_scope_correlates_the_subquery_to_the_visit() {
+    let statement = audit_event_set(None, None, Some("xO2"), None);
+    assert!(
+        statement
+            .sql
+            .contains(r#""r"."collection_event_id" = "collection_events"."id""#),
+        "{}",
+        statement.sql
+    );
 }

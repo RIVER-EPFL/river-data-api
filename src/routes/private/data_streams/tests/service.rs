@@ -103,3 +103,74 @@ fn a_non_spot_stream_cannot_declare_replicates() {
     );
     assert!(validate_declaration(&declaration(&["DOC_rep_1", "DOC_rep_2"]), None).is_err());
 }
+
+/// Scenario: the three reads behind `/streams/{id}/stats` and `/streams/{id}/preview`.
+/// Expected behaviour: they are built from the readings entity, and the preview counts instants
+/// rather than replicates, so a limit of one still returns a whole replicate group.
+mod stream_reads {
+    use super::super::{latest_raw_value_query, preview_query, stream_stats_query};
+    use sea_orm::QueryTrait;
+    use sea_orm::sea_query::PostgresQueryBuilder;
+    use uuid::Uuid;
+
+    #[test]
+    fn test_stream_stats_counts_the_withdrawn_rows_apart_from_the_rest() {
+        let sql = stream_stats_query(Uuid::nil())
+            .into_query()
+            .to_string(PostgresQueryBuilder);
+        assert!(
+            str::contains(
+                &sql,
+                r#"COUNT(*) FILTER (WHERE withdrawn_at IS NOT NULL) AS "withdrawn""#
+            ),
+            "{sql}"
+        );
+        for expected in [
+            r#"COUNT("readings"."time") AS "count""#,
+            r#"MIN("readings"."time") AS "min_time""#,
+            r#"MAX("readings"."time") AS "max_time""#,
+            r#"FROM "readings" WHERE "readings"."stream_id" ="#,
+        ] {
+            assert!(str::contains(&sql, expected), "{expected} missing: {sql}");
+        }
+    }
+
+    #[test]
+    fn test_the_latest_raw_value_is_the_newest_row_of_the_stream() {
+        let sql = latest_raw_value_query(Uuid::nil())
+            .into_query()
+            .to_string(PostgresQueryBuilder);
+        assert!(
+            str::starts_with(&sql, r#"SELECT "readings"."raw_value" FROM "readings""#),
+            "{sql}"
+        );
+        assert!(
+            str::ends_with(&sql, r#"ORDER BY "readings"."time" DESC LIMIT 1"#),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn test_the_preview_limit_counts_instants_not_replicates() {
+        let sql = preview_query(Uuid::nil(), 3).to_string(PostgresQueryBuilder);
+        // The limit sits on the DISTINCT-time subquery, so three instants come back whole.
+        assert!(
+            str::contains(
+                &sql,
+                r#"SELECT DISTINCT "time" FROM "readings" WHERE "readings"."stream_id" ="#
+            ),
+            "{sql}"
+        );
+        assert!(
+            str::contains(&sql, r#"ORDER BY "time" DESC LIMIT 3) AS "t""#),
+            "{sql}"
+        );
+        assert!(
+            str::ends_with(
+                &sql,
+                r#"ORDER BY "readings"."time" DESC, "readings"."replicate_index" ASC"#
+            ),
+            "{sql}"
+        );
+    }
+}

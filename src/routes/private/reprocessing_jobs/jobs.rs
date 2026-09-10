@@ -3,7 +3,12 @@
 
 use std::time::Duration;
 
+use crate::routes::private::parameters::derived::definition_model as formulas;
+use crate::routes::private::parameters::derived::source_model as sources;
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::sites::parameters::models as site_parameters;
 use async_trait::async_trait;
+use sea_orm::sea_query;
 use sea_orm::{ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QuerySelect, Statement};
 use uuid::Uuid;
 
@@ -54,11 +59,11 @@ pub(crate) fn required_uuid(params: &serde_json::Value, key: &str) -> Result<Uui
 /// The origin the request that enqueued a merge was recorded under. A row queued before the origin
 /// travelled with the actor names none, and a merge is asked for by an operator, so that reads as
 /// manual.
-fn merge_origin(params: &serde_json::Value) -> crate::routes::private::readings::decisions::Origin {
+fn merge_origin(params: &serde_json::Value) -> crate::routes::private::readings::models::Origin {
     params
         .get("origin")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or(crate::routes::private::readings::decisions::Origin::Manual)
+        .unwrap_or(crate::routes::private::readings::models::Origin::Manual)
 }
 
 pub(crate) fn optional_uuid(params: &serde_json::Value, key: &str) -> Option<Uuid> {
@@ -216,16 +221,23 @@ impl Job for ReprocessSensor {
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        use sea_orm::sea_query::ExprTrait;
+
         let sensor_id = required_uuid(ctx.params(), "sensor_id")?;
         ctx.info(&format!("Reprocessing readings for sensor {sensor_id}"))
             .await;
         let count = reprocess_sensor_readings(ctx.db(), sensor_id, Some(ctx.job_id())).await?;
         if let Ok(Some(row)) = ctx
             .db()
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT DISTINCT site_id FROM readings WHERE sensor_id = $1 AND site_id IS NOT NULL LIMIT 1",
-                [sensor_id.into()],
+            .query_one_raw(build(
+                &sea_query::Query::select()
+                    .distinct()
+                    .column(readings::Column::SiteId)
+                    .from(readings::Entity)
+                    .and_where(sea_query::Expr::col(readings::Column::SensorId).eq(sensor_id))
+                    .and_where(sea_query::Expr::col(readings::Column::SiteId).is_not_null())
+                    .limit(1)
+                    .to_owned(),
             ))
             .await
         {
@@ -409,25 +421,138 @@ impl Job for ReprocessDeployment {
 /// behind.
 pub struct DerivedRecompute;
 
+/// A built query as the statement the connection takes.
+fn build(query: &sea_query::SelectStatement) -> Statement {
+    let (sql, values) = query.build(sea_query::PostgresQueryBuilder);
+    Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values)
+}
+
+/// The `(site, time)` instants a derived recompute covers: every reading of a parameter some
+/// calculation reads, at a site whose slot for that calculation's output is tool-entered.
+fn derived_instants(
+    scope: sea_query::Condition,
+    join_definition_on: Option<Uuid>,
+) -> sea_query::SelectStatement {
+    use sea_orm::sea_query::ExprTrait;
+
+    let r = sea_query::Alias::new("r");
+    let d = sea_query::Alias::new("d");
+    let dps = sea_query::Alias::new("dps");
+    let sp = sea_query::Alias::new("sp");
+
+    let mut query = sea_query::Query::select();
+    query
+        .distinct()
+        .column((r.clone(), readings::Column::SiteId))
+        .column((r.clone(), readings::Column::Time))
+        .from_as(readings::Entity, r.clone());
+
+    match join_definition_on {
+        // One calculation: the definition is the given row, and the sources join to it.
+        Some(definition_id) => {
+            query
+                .join_as(
+                    sea_query::JoinType::Join,
+                    formulas::Entity,
+                    d.clone(),
+                    sea_query::Expr::col((d.clone(), formulas::Column::Id)).eq(definition_id),
+                )
+                .join_as(
+                    sea_query::JoinType::Join,
+                    sources::Entity,
+                    dps.clone(),
+                    sea_query::Condition::all()
+                        .add(
+                            sea_query::Expr::col((
+                                dps.clone(),
+                                sources::Column::DerivedDefinitionId,
+                            ))
+                            .equals((d.clone(), formulas::Column::Id)),
+                        )
+                        .add(
+                            sea_query::Expr::col((dps.clone(), sources::Column::ParameterId))
+                                .equals((r.clone(), readings::Column::ParameterId)),
+                        ),
+                );
+        }
+        // Every calculation that reads the parameter this reading carries.
+        None => {
+            query
+                .join_as(
+                    sea_query::JoinType::Join,
+                    sources::Entity,
+                    dps.clone(),
+                    sea_query::Expr::col((dps.clone(), sources::Column::ParameterId))
+                        .equals((r.clone(), readings::Column::ParameterId)),
+                )
+                .join_as(
+                    sea_query::JoinType::Join,
+                    formulas::Entity,
+                    d.clone(),
+                    sea_query::Expr::col((d.clone(), formulas::Column::Id))
+                        .equals((dps.clone(), sources::Column::DerivedDefinitionId)),
+                );
+        }
+    }
+
+    query
+        .join_as(
+            sea_query::JoinType::Join,
+            site_parameters::Entity,
+            sp.clone(),
+            sea_query::Condition::all()
+                .add(
+                    sea_query::Expr::col((sp.clone(), site_parameters::Column::SiteId))
+                        .equals((r.clone(), readings::Column::SiteId)),
+                )
+                .add(
+                    sea_query::Expr::col((sp.clone(), site_parameters::Column::EntryMode))
+                        .eq("tool"),
+                )
+                .add(
+                    sea_query::Expr::col((sp, site_parameters::Column::ParameterId))
+                        .equals((d, formulas::Column::OutputParameterId)),
+                ),
+        )
+        .cond_where(scope)
+        .order_by((r.clone(), readings::Column::SiteId), sea_query::Order::Asc)
+        .order_by((r, readings::Column::Time), sea_query::Order::Asc)
+        .to_owned()
+}
+
+/// The instants at one site where a calculation's inputs were recorded.
+fn instants_a_calculation_reads(definition_id: Uuid, site_id: Uuid) -> sea_query::SelectStatement {
+    use sea_orm::sea_query::ExprTrait;
+
+    let r = sea_query::Alias::new("r");
+    let dps = sea_query::Alias::new("dps");
+    sea_query::Query::select()
+        .distinct()
+        .column((r.clone(), readings::Column::Time))
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            sea_query::JoinType::Join,
+            sources::Entity,
+            dps.clone(),
+            sea_query::Expr::col((dps.clone(), sources::Column::ParameterId))
+                .equals((r.clone(), readings::Column::ParameterId)),
+        )
+        .and_where(
+            sea_query::Expr::col((dps, sources::Column::DerivedDefinitionId)).eq(definition_id),
+        )
+        .and_where(sea_query::Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
+        .order_by((r, readings::Column::Time), sea_query::Order::Asc)
+        .to_owned()
+}
+
 /// The `(site, time)` instants a `derived_recompute` run must recompute, in either scope.
 fn derived_recompute_instants(params: &serde_json::Value) -> Result<Statement, DbErr> {
     if params.get("derived_definition_id").is_some() {
         let derived_id = required_uuid(params, "derived_definition_id")?;
-        return Ok(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT DISTINCT r.site_id, r.time
-              FROM readings r
-              JOIN calculation_formulas d ON d.id = $1
-              JOIN site_parameters sp
-                ON sp.site_id = r.site_id
-               AND sp.entry_mode = 'tool'
-               AND sp.parameter_id = d.output_parameter_id
-              JOIN derived_parameter_sources dps
-                ON dps.derived_definition_id = d.id
-               AND dps.parameter_id = r.parameter_id
-              ORDER BY r.site_id, r.time",
-            [derived_id.into()],
-        ));
+        return Ok(build(&derived_instants(
+            sea_query::Condition::all(),
+            Some(derived_id),
+        )));
     }
 
     let uuids = |key: &str| -> Result<Vec<Uuid>, DbErr> {
@@ -451,26 +576,18 @@ fn derived_recompute_instants(params: &serde_json::Value) -> Result<Statement, D
             .ok_or_else(|| DbErr::Custom(format!("derived_recompute: missing {key}")))
     };
 
-    Ok(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"SELECT DISTINCT r.site_id, r.time
-          FROM readings r
-          JOIN derived_parameter_sources dps ON dps.parameter_id = r.parameter_id
-          JOIN calculation_formulas d ON d.id = dps.derived_definition_id
-          JOIN site_parameters sp
-            ON sp.site_id = r.site_id
-           AND sp.entry_mode = 'tool'
-           AND sp.parameter_id = d.output_parameter_id
-          WHERE r.site_id = ANY($1) AND r.parameter_id = ANY($2)
-            AND r.time >= $3 AND r.time <= $4
-          ORDER BY r.site_id, r.time",
-        [
-            uuids("site_ids")?.into(),
-            uuids("parameter_ids")?.into(),
-            time("start")?.into(),
-            time("end")?.into(),
-        ],
-    ))
+    use sea_orm::sea_query::ExprTrait;
+
+    let r = sea_query::Alias::new("r");
+    let window = sea_query::Condition::all()
+        .add(sea_query::Expr::col((r.clone(), readings::Column::SiteId)).is_in(uuids("site_ids")?))
+        .add(
+            sea_query::Expr::col((r.clone(), readings::Column::ParameterId))
+                .is_in(uuids("parameter_ids")?),
+        )
+        .add(sea_query::Expr::col((r.clone(), readings::Column::Time)).gte(time("start")?))
+        .add(sea_query::Expr::col((r, readings::Column::Time)).lte(time("end")?));
+    Ok(build(&derived_instants(window, None)))
 }
 
 #[async_trait]
@@ -567,15 +684,7 @@ impl Job for DerivedAssignment {
 
         let rows = ctx
             .db()
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"SELECT DISTINCT r.time
-                  FROM readings r
-                  JOIN derived_parameter_sources dps ON dps.parameter_id = r.parameter_id
-                  WHERE dps.derived_definition_id = $1 AND r.site_id = $2
-                  ORDER BY r.time",
-                [def_id.into(), site_id.into()],
-            ))
+            .query_all_raw(build(&instants_a_calculation_reads(def_id, site_id)))
             .await?;
 
         let mut filled = 0i64;
@@ -1311,6 +1420,81 @@ impl Job for JanitorRun {
 /// Decompression-safe: portal/lab history lives in compressed (>30-day) chunks.
 pub struct MeasurementRetag;
 
+/// The rewrite a `measurement_retag` run makes. `target` is the classification every reading in
+/// scope takes; `None` is the 'declared' arm, which joins each reading to its stream and takes the
+/// stream's own. The scope also matches by stream ownership: a reading ingested before attribution
+/// backfill carries `sensor_id` NULL and belongs to the sensor's streams all the same.
+fn retag_readings(
+    target: Option<&str>,
+    sensor_ids: &[Uuid],
+    stream_ids: &[Uuid],
+    source_system: Option<&str>,
+) -> sea_query::UpdateStatement {
+    use crate::routes::private::data_streams::models as data_streams;
+    use crate::routes::private::readings::models as readings;
+    use sea_orm::sea_query::ExprTrait;
+
+    let r = sea_query::Alias::new("readings");
+    let ds = sea_query::Alias::new("data_streams");
+    let col = |alias: &sea_query::Alias, column: readings::Column| {
+        sea_query::Expr::col((alias.clone(), column))
+    };
+
+    let streams_of = |predicate: sea_query::Expr| {
+        sea_query::Query::select()
+            .column(data_streams::Column::Id)
+            .from(data_streams::Entity)
+            .and_where(predicate)
+            .to_owned()
+    };
+    let mut scope = sea_query::Condition::any()
+        .add(col(&r, readings::Column::SensorId).is_in(sensor_ids.to_vec()))
+        .add(col(&r, readings::Column::StreamId).is_in(stream_ids.to_vec()))
+        .add(col(&r, readings::Column::StreamId).in_subquery(streams_of(
+            sea_query::Expr::col(data_streams::Column::SensorId).is_in(sensor_ids.to_vec()),
+        )));
+    if let Some(system) = source_system {
+        scope = scope.add(col(&r, readings::Column::StreamId).in_subquery(streams_of(
+            sea_query::Expr::col(data_streams::Column::SourceSystem).eq(system),
+        )));
+    }
+
+    let mut update = sea_query::Query::update();
+    update.table(readings::Entity);
+    match target {
+        Some(value) => {
+            update
+                .value(readings::Column::MeasurementType, value)
+                // sea-query has no IS DISTINCT FROM, and a NULL measurement_type reads as
+                // continuous, so the comparison cannot be a plain inequality.
+                .and_where(sea_query::Expr::cust(format!(
+                    r#""readings"."measurement_type" IS DISTINCT FROM '{value}'"#
+                )));
+        }
+        None => {
+            update
+                .value(
+                    readings::Column::MeasurementType,
+                    sea_query::Expr::col((ds.clone(), data_streams::Column::MeasurementType)),
+                )
+                .from(data_streams::Entity)
+                .and_where(
+                    col(&r, readings::Column::StreamId)
+                        .equals((ds.clone(), data_streams::Column::Id)),
+                )
+                .and_where(
+                    sea_query::Expr::col((ds.clone(), data_streams::Column::MeasurementType))
+                        .is_not_null(),
+                )
+                .and_where(sea_query::Expr::cust(
+                    r#""readings"."measurement_type" IS DISTINCT FROM "data_streams"."measurement_type""#,
+                ));
+        }
+    }
+    update.cond_where(scope);
+    update.to_owned()
+}
+
 #[async_trait]
 impl Job for MeasurementRetag {
     fn name(&self) -> &'static str {
@@ -1323,13 +1507,13 @@ impl Job for MeasurementRetag {
             .get("target")
             .and_then(serde_json::Value::as_str)
             .filter(|t| {
-                crate::routes::private::readings::measurement::retag_target_rejection(t).is_none()
+                crate::routes::private::readings::service::retag_target_rejection(t).is_none()
             })
             .ok_or_else(|| DbErr::Custom("measurement_retag needs target".to_string()))?
             .to_string();
         // 'declared' aligns each reading with its own stream's classification, for source systems
         // that mix grab and logger columns.
-        let declared = target == crate::routes::private::readings::measurement::RETAG_DECLARED;
+        let declared = target == crate::routes::private::readings::service::RETAG_DECLARED;
         let sensor_ids = uuid_array(params, "sensor_ids");
         let stream_ids = uuid_array(params, "stream_ids");
         let source_system = params
@@ -1359,40 +1543,6 @@ impl Job for MeasurementRetag {
             crate::routes::private::data_streams::service::refuse_family_retag(&families, &target)
                 .map_err(|e| DbErr::Custom(e.to_string()))?;
         }
-
-        // 'declared' joins each reading to its stream in the rewrite and drops the target
-        // parameter; a fixed target compares against $1.
-        // The sensor arm also matches by stream ownership: readings ingested before attribution
-        // backfill carry sensor_id NULL but belong to the sensor's streams all the same.
-        let (scope, mismatch, new_value, update_from) = if declared {
-            (
-                "(r.sensor_id = ANY($1) OR r.stream_id = ANY($2) \
-                  OR r.stream_id IN (SELECT id FROM data_streams WHERE sensor_id = ANY($1)) \
-                  OR ($3::text IS NOT NULL AND r.stream_id IN \
-                      (SELECT id FROM data_streams WHERE source_system = $3)))",
-                "r.stream_id = ds.id AND ds.measurement_type IS NOT NULL \
-                 AND r.measurement_type IS DISTINCT FROM ds.measurement_type",
-                "ds.measurement_type",
-                "FROM data_streams ds",
-            )
-        } else {
-            (
-                "(r.sensor_id = ANY($2) OR r.stream_id = ANY($3) \
-                  OR r.stream_id IN (SELECT id FROM data_streams WHERE sensor_id = ANY($2)) \
-                  OR ($4::text IS NOT NULL AND r.stream_id IN \
-                      (SELECT id FROM data_streams WHERE source_system = $4)))",
-                "r.measurement_type IS DISTINCT FROM $1",
-                "$1",
-                "",
-            )
-        };
-        let mut values: Vec<sea_orm::Value> = Vec::new();
-        if !declared {
-            values.push(target.clone().into());
-        }
-        values.push(sensor_ids.clone().into());
-        values.push(stream_ids.clone().into());
-        values.push(source_system.clone().into());
 
         // A stream declaring a different classification will keep writing its own value on
         // ingest, so the retag would drift back; surface the conflict in the job timeline.
@@ -1433,13 +1583,13 @@ impl Job for MeasurementRetag {
             .await;
         let touched = crate::common::bulk_write::guarded_mutation(
             ctx.db(),
-            Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &format!(
-                    "UPDATE readings r SET measurement_type = {new_value} \
-                     {update_from} WHERE {mismatch} AND {scope}"
-                ),
-                values,
+            retag_readings(
+                declared
+                    .then_some(())
+                    .map_or(Some(target.as_str()), |()| None),
+                &sensor_ids,
+                &stream_ids,
+                source_system.as_deref(),
             ),
         )
         .await
@@ -1481,134 +1631,13 @@ impl Job for MeasurementRetag {
 }
 
 #[cfg(test)]
-mod slot_outcome_tests {
-    use super::SlotOutcome;
-    use sea_orm::DbErr;
-
-    fn slot(n: u32) -> serde_json::Value {
-        serde_json::json!({ "site_id": n })
-    }
-
-    #[test]
-    fn a_failed_slot_is_named_and_the_rest_still_count() {
-        let outcome = SlotOutcome::from(vec![
-            (slot(1), Ok(4)),
-            (slot(2), Err(DbErr::Custom("lock timeout".into()))),
-            (slot(3), Ok(6)),
-        ]);
-
-        assert_eq!(outcome.succeeded, 2);
-        assert_eq!(outcome.readings, 10);
-        assert_eq!(outcome.failed.len(), 1);
-        assert_eq!(outcome.failed[0].0, slot(2));
-        assert!(outcome.failed[0].1.contains("lock timeout"));
-        assert!(!outcome.all_failed());
-    }
-
-    #[test]
-    fn every_slot_failing_is_a_failed_run() {
-        let outcome = SlotOutcome::from(vec![
-            (slot(1), Err(DbErr::Custom("a".into()))),
-            (slot(2), Err(DbErr::Custom("b".into()))),
-        ]);
-
-        assert_eq!(outcome.readings, 0);
-        assert!(outcome.all_failed());
-        assert!(outcome.error().to_string().contains('2'));
-    }
-
-    #[test]
-    fn an_empty_slot_set_is_not_a_failure() {
-        let outcome = SlotOutcome::from(Vec::new());
-
-        assert_eq!(outcome.succeeded, 0);
-        assert_eq!(outcome.readings, 0);
-        assert!(!outcome.all_failed());
-    }
-}
+#[path = "tests/tunable_validation.rs"]
+mod tunable_validation_tests;
 
 #[cfg(test)]
-mod tunable_validation_tests {
-    use super::JanitorRun;
-    use crate::routes::private::alarms::flows::AlarmSweep;
-    use crate::routes::private::reprocessing_jobs::job::{Job, TunableKind};
+#[path = "tests/slot_outcome.rs"]
+mod slot_outcome_tests;
 
-    fn janitor() -> JanitorRun {
-        JanitorRun {
-            interval_seconds: 300,
-            full_refresh_seconds: 3600,
-            maintenance_retention_days: 7,
-            operator_retention_days: 90,
-            maintenance_max_rows: 100_000,
-        }
-    }
-
-    #[test]
-    fn a_misspelt_tunable_is_refused_naming_it() {
-        let err = janitor()
-            .validate(&serde_json::json!({ "retention_dayz": 7 }))
-            .unwrap_err();
-        assert!(err.contains("retention_dayz"), "{err}");
-        assert!(err.contains("retention_days"), "{err}");
-    }
-
-    #[test]
-    fn the_janitor_still_takes_its_one_key() {
-        assert!(
-            janitor()
-                .validate(&serde_json::json!({ "retention_days": 7 }))
-                .is_ok()
-        );
-        assert!(janitor().validate(&serde_json::json!({})).is_ok());
-        assert!(janitor().validate(&serde_json::Value::Null).is_ok());
-        assert!(
-            janitor()
-                .validate(&serde_json::json!({ "retention_days": 0 }))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn a_job_with_no_tunables_refuses_every_key() {
-        let sweep = AlarmSweep {
-            interval_seconds: 60,
-        };
-        assert!(sweep.validate(&serde_json::json!({})).is_ok());
-        let err = sweep
-            .validate(&serde_json::json!({ "retention_days": 7 }))
-            .unwrap_err();
-        assert!(err.contains("no tunables"), "{err}");
-        assert!(err.contains("retention_days"), "{err}");
-    }
-
-    /// Every job accepts a tunables object built from its own declared defaults, and refuses a
-    /// value outside a spec's range.
-    #[test]
-    fn every_job_accepts_its_own_defaults_and_refuses_an_out_of_range_value() {
-        let registry = crate::routes::private::reprocessing_jobs::job::build_registry();
-        for name in registry.names() {
-            let handler = registry.get(name).expect("a listed name is registered");
-            let specs = handler.tunables();
-            let defaults: serde_json::Map<String, serde_json::Value> = specs
-                .iter()
-                .map(|s| (s.key.to_string(), s.default.clone()))
-                .collect();
-            handler
-                .validate(&serde_json::Value::Object(defaults))
-                .unwrap_or_else(|e| panic!("{name} refuses its own defaults: {e}"));
-
-            for spec in &specs {
-                let Some(min) = spec.min else { continue };
-                if !matches!(spec.kind, TunableKind::Integer | TunableKind::Duration) {
-                    continue;
-                }
-                let below = serde_json::json!({ &spec.key: min - 1 });
-                assert!(
-                    handler.validate(&below).is_err(),
-                    "{name} accepts {} below its minimum",
-                    spec.key
-                );
-            }
-        }
-    }
-}
+#[cfg(test)]
+#[path = "tests/retag_and_instants.rs"]
+mod retag_and_instants_tests;

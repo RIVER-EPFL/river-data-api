@@ -7,7 +7,8 @@
 use chrono::{DateTime, FixedOffset, Utc};
 use crudcrate::{ApiError, CRUDOperations};
 use sea_orm::sea_query::{
-    Alias, Expr, JoinType, PostgresQueryBuilder, Query as SeaQuery, SelectStatement,
+    Alias, CommonTableExpression, Condition, Expr, Func, JoinType, Order, PostgresQueryBuilder,
+    Query as SeaQuery, SelectStatement, UnionType, WithClause, WithQuery,
 };
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, ExprTrait, FromQueryResult, Statement,
@@ -17,13 +18,15 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::flows::reconcile_all_from_hook;
-use super::models::{AlarmThreshold, ResolvedThreshold};
+use super::models::{AlarmThreshold, ResolvedThreshold, alarm_event};
 use crate::common::AppState;
-use crate::common::scope::{
-    Unowned, project_filter_sql, project_of_alarm_event, require_row_in_scope,
-};
-use crate::common::served::{CONTINUOUS_ROWS, SERVED_SPOT, SPOT_INSTANT_KEY, SPOT_INSTANT_ORDER};
+use crate::common::scope::{Unowned, project_filter, project_of_alarm_event, require_row_in_scope};
+use crate::common::served::{self};
 use crate::error::AppResult;
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::samples::model as samples;
+use crate::routes::private::sites::models as sites;
+use crate::routes::private::sites::parameters::models as site_parameters;
 /// site if needed.
 pub fn severity_case(val: &str, wmin: &str, wmax: &str, amin: &str, amax: &str) -> String {
     format!(
@@ -175,10 +178,53 @@ pub fn resolve_thresholds_query(
     winner
 }
 
-/// Render [`resolve_thresholds_query`] to a standalone SQL string (scope values inlined, so it
-/// carries no bind params) for splicing as a CTE body into raw-SQL consumers without `$N` clashes.
-pub fn resolve_thresholds_sql(site_id: Option<Uuid>, param_ids: Option<Vec<Uuid>>) -> String {
-    resolve_thresholds_query(site_id, param_ids).to_string(PostgresQueryBuilder)
+/// The latest value at each `(site, parameter)` slot in the last 30 days, one row per slot.
+///
+/// Bounded to recent chunks so TimescaleDB excludes the rest. Continuous readings win over spot,
+/// so an occasional grab does not stand in for a sensor's current value; a spot-only slot still
+/// reports its latest grab.
+pub fn latest_slot_values_query() -> SelectStatement {
+    SeaQuery::select()
+        .distinct_on([
+            (Alias::new("r"), readings::Column::SiteId),
+            (Alias::new("r"), readings::Column::ParameterId),
+        ])
+        .column((Alias::new("r"), readings::Column::SiteId))
+        .column((Alias::new("r"), readings::Column::ParameterId))
+        .expr_as(
+            Expr::cust("COALESCE(smp.mean, r.calibrated_value, r.raw_value)"),
+            Alias::new("current_value"),
+        )
+        .from_as(readings::Entity, Alias::new("r"))
+        .join_as(
+            JoinType::LeftJoin,
+            samples::Entity,
+            Alias::new("smp"),
+            Expr::col((Alias::new("smp"), samples::Column::Id))
+                .equals((Alias::new("r"), readings::Column::SampleId)),
+        )
+        .and_where(Expr::col((Alias::new("r"), readings::Column::SiteId)).is_not_null())
+        .and_where(Expr::cust("r.is_flagged IS NOT TRUE"))
+        .and_where(Expr::cust("r.unverified IS NOT TRUE"))
+        .and_where(Expr::cust("r.time > now() - interval '30 days'"))
+        .order_by((Alias::new("r"), readings::Column::SiteId), Order::Asc)
+        .order_by((Alias::new("r"), readings::Column::ParameterId), Order::Asc)
+        .order_by_expr(
+            Expr::cust("(r.measurement_type IS NOT DISTINCT FROM 'spot')"),
+            Order::Asc,
+        )
+        .order_by((Alias::new("r"), readings::Column::Time), Order::Desc)
+        .order_by(
+            (Alias::new("r"), readings::Column::ReplicateIndex),
+            Order::Asc,
+        )
+        .to_owned()
+}
+
+/// Render [`latest_slot_values_query`] to a standalone SQL string, for splicing as a CTE body
+/// beside [`resolve_thresholds_query`].
+pub fn latest_slot_values_sql() -> String {
+    latest_slot_values_query().to_string(PostgresQueryBuilder)
 }
 
 /// Resolve the resolved threshold for one `(site, parameter)` slot, the per-slot wrapper over the
@@ -267,73 +313,136 @@ pub(super) struct ParameterWithThreshold {
 /// the lowest unflagged replicate's own value when no sample row exists), so flagging a bad
 /// replicate moves the evaluated value instead of hiding the instant or handing it to a
 /// different replicate. A fully flagged group is not evaluated.
-pub(crate) fn violations_sql(
+pub(crate) fn violations_query(
     site_id: Uuid,
     param_ids: Option<Vec<Uuid>>,
     min_severity: i16,
-) -> String {
-    // The violation filter and severity ladder are spliced into each cadence arm over that arm's
-    // own value expression, so the filter stays inside the index scan rather than above the union.
+) -> WithQuery {
+    // The violation filter and severity ladder are built over each cadence arm's own value
+    // expression, so the filter stays inside the index scan rather than above the union.
     let arm_predicates = |val_expr: &str| {
         (
-            violation_condition(
+            Expr::cust(violation_condition(
                 val_expr,
                 "t.warning_min",
                 "t.warning_max",
                 "t.alarm_min",
                 "t.alarm_max",
                 min_severity,
-            ),
-            severity_case(
-                val_expr,
-                "t.warning_min",
-                "t.warning_max",
-                "t.alarm_min",
-                "t.alarm_max",
-            ),
+            )),
+            Expr::cust(format!(
+                "({})::smallint",
+                severity_case(
+                    val_expr,
+                    "t.warning_min",
+                    "t.warning_max",
+                    "t.alarm_min",
+                    "t.alarm_max",
+                )
+            )),
         )
     };
     let (violation_cont, sev_cont) = arm_predicates("COALESCE(r.calibrated_value, r.raw_value)");
     let (violation_spot, sev_spot) = arm_predicates("sp.value");
-    let resolved_cte = resolve_thresholds_sql(Some(site_id), param_ids);
 
-    format!(
-        r"
-        WITH resolved_thresholds AS ({resolved_cte})
-        SELECT sv.parameter_id, sv.time, sv.value, sv.severity FROM (
-            SELECT r.parameter_id, r.time,
-                   COALESCE(r.calibrated_value, r.raw_value) AS value,
-                   ({sev_cont})::smallint AS severity
-            FROM readings r
-            JOIN resolved_thresholds t ON r.parameter_id = t.parameter_id
-            WHERE r.site_id = $1
-              AND r.time >= $2
-              AND r.time <= $3
-              AND {CONTINUOUS_ROWS}
-              AND {violation_cont}
-            UNION ALL
-            SELECT sp.parameter_id, sp.time, sp.value,
-                   ({sev_spot})::smallint AS severity
-            FROM (
-                SELECT DISTINCT ON ({SPOT_INSTANT_KEY})
-                    r.parameter_id,
-                    r.time,
-                    COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value
-                FROM readings r
-                LEFT JOIN samples smp ON smp.id = r.sample_id
-                WHERE r.site_id = $1
-                  AND r.time >= $2
-                  AND r.time <= $3
-                  AND r.parameter_id IN (SELECT parameter_id FROM resolved_thresholds)
-                  AND {SERVED_SPOT}
-                ORDER BY {SPOT_INSTANT_ORDER}
-            ) sp
-            JOIN resolved_thresholds t ON sp.parameter_id = t.parameter_id
-            WHERE {violation_spot}
-        ) sv
-        "
-    )
+    let r = served::r();
+    let t = Alias::new("t");
+    let sp = Alias::new("sp");
+    let resolved = Alias::new("resolved_thresholds");
+    let in_range = || {
+        Condition::all()
+            .add(Expr::cust("r.site_id = $1"))
+            .add(Expr::cust("r.time >= $2"))
+            .add(Expr::cust("r.time <= $3"))
+    };
+
+    let mut continuous_arm = SeaQuery::select()
+        .column((r.clone(), readings::Column::ParameterId))
+        .column((r.clone(), readings::Column::Time))
+        .expr_as(served::continuous_value(), Alias::new("value"))
+        .expr_as(sev_cont, Alias::new("severity"))
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            resolved.clone(),
+            t.clone(),
+            Expr::col((r.clone(), readings::Column::ParameterId))
+                .equals((t.clone(), Alias::new("parameter_id"))),
+        )
+        .cond_where(
+            in_range()
+                .add(served::continuous_rows())
+                .add(violation_cont),
+        )
+        .take();
+
+    let smp = Alias::new("smp");
+    let mut group = SeaQuery::select();
+    group
+        .distinct_on(served::spot_instant_key())
+        .column((r.clone(), readings::Column::ParameterId))
+        .column((r.clone(), readings::Column::Time))
+        .expr_as(served::spot_value(), Alias::new("value"))
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            samples::Entity,
+            smp.clone(),
+            Expr::col((smp, samples::Column::Id)).equals((r.clone(), readings::Column::SampleId)),
+        )
+        .cond_where(
+            in_range()
+                .add(
+                    Expr::col((r.clone(), readings::Column::ParameterId)).in_subquery(
+                        SeaQuery::select()
+                            .column(Alias::new("parameter_id"))
+                            .from(resolved.clone())
+                            .take(),
+                    ),
+                )
+                .add(served::served_spot()),
+        );
+    for (expr, order) in served::spot_instant_order() {
+        group.order_by_expr(expr, order);
+    }
+    let spot_arm = SeaQuery::select()
+        .columns([
+            (sp.clone(), Alias::new("parameter_id")),
+            (sp.clone(), Alias::new("time")),
+            (sp.clone(), Alias::new("value")),
+        ])
+        .expr_as(sev_spot, Alias::new("severity"))
+        .from_subquery(group.take(), sp.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            resolved.clone(),
+            t.clone(),
+            Expr::col((sp.clone(), Alias::new("parameter_id")))
+                .equals((t.clone(), Alias::new("parameter_id"))),
+        )
+        .and_where(violation_spot)
+        .take();
+
+    let sv = Alias::new("sv");
+    let violations = SeaQuery::select()
+        .columns([
+            (sv.clone(), Alias::new("parameter_id")),
+            (sv.clone(), Alias::new("time")),
+            (sv.clone(), Alias::new("value")),
+            (sv.clone(), Alias::new("severity")),
+        ])
+        .from_subquery(
+            continuous_arm.union(UnionType::All, spot_arm).take(),
+            sv.clone(),
+        )
+        .take();
+
+    let mut cte = CommonTableExpression::new();
+    cte.table_name(resolved)
+        .query(resolve_thresholds_query(Some(site_id), param_ids));
+    violations.with(WithClause::new().cte(cte).to_owned())
 }
+
 /// How many breaching readings each parameter contributes over a range, from the same definition
 /// [`violations_sql`] serves, so a count and the export it gates cannot disagree.
 /// One parameter's row count over a range.
@@ -350,7 +459,7 @@ pub async fn count_violations_by_parameter(
 ) -> AppResult<std::collections::HashMap<Uuid, i64>> {
     let sql = format!(
         "SELECT parameter_id AS pid, COUNT(*) AS n FROM ({}) v GROUP BY parameter_id",
-        violations_sql(site_id, None, 1)
+        violations_query(site_id, None, 1).to_string(PostgresQueryBuilder)
     );
     let mut counts = std::collections::HashMap::new();
     for row in db
@@ -379,24 +488,35 @@ pub(crate) fn cadence_label(spot: bool) -> &'static str {
 /// over its unflagged replicates (fallback: the lowest unflagged replicate's own value when no
 /// sample row exists), so flagging a bad replicate moves the evaluated value instead of hiding
 /// the instant or handing it to a different replicate; a fully flagged group is skipped.
-pub(crate) fn latest_served_sql(spot: bool, site_col: &str, param_col: &str) -> String {
+pub(crate) fn latest_served_query(spot: bool, site_col: &str, param_col: &str) -> SelectStatement {
+    let r = served::r();
+    let mut latest = SeaQuery::select();
+    latest
+        .column((r.clone(), readings::Column::Time))
+        .from_as(readings::Entity, r.clone())
+        .and_where(Expr::cust(format!("r.site_id = {site_col}")))
+        .and_where(Expr::cust(format!("r.parameter_id = {param_col}")))
+        .order_by((r.clone(), readings::Column::Time), Order::Desc)
+        .limit(1);
     if spot {
-        format!(
-            "SELECT COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, r.time \
-             FROM readings r LEFT JOIN samples smp ON smp.id = r.sample_id \
-             WHERE r.site_id = {site_col} AND r.parameter_id = {param_col} \
-               AND {SERVED_SPOT} \
-             ORDER BY r.time DESC, r.replicate_index LIMIT 1"
-        )
+        let smp = Alias::new("smp");
+        latest
+            .expr_as(served::spot_value(), Alias::new("value"))
+            .join_as(
+                JoinType::LeftJoin,
+                samples::Entity,
+                smp.clone(),
+                Expr::col((smp, samples::Column::Id))
+                    .equals((r.clone(), readings::Column::SampleId)),
+            )
+            .cond_where(served::served_spot())
+            .order_by((r.clone(), readings::Column::ReplicateIndex), Order::Asc);
     } else {
-        format!(
-            "SELECT COALESCE(r.calibrated_value, r.raw_value) AS value, r.time \
-             FROM readings r \
-             WHERE r.site_id = {site_col} AND r.parameter_id = {param_col} \
-               AND {CONTINUOUS_ROWS} \
-             ORDER BY r.time DESC LIMIT 1"
-        )
+        latest
+            .expr_as(served::continuous_value(), Alias::new("value"))
+            .cond_where(served::continuous_rows());
     }
+    latest.take()
 }
 /// Row from the active alarms query
 #[derive(Debug, FromQueryResult)]
@@ -455,69 +575,113 @@ pub(crate) async fn fetch_active_alarm_rows<C: ConnectionTrait>(
         1,
     );
 
-    // The single resolution definition across all active slots (no scope), spliced as the CTE.
-    let resolved_cte = resolve_thresholds_sql(None, None);
+    let rt = Alias::new("rt");
+    let s_ = Alias::new("s");
+    let sp = Alias::new("sp");
+    let lr = Alias::new("lr");
+    let resolved = Alias::new("resolved_thresholds");
 
-    // Bind params are appended in order: optional project scope, then optional (site, parameter)
-    // slot pairs. `next` tracks the next `$N` placeholder.
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-
-    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
-        .map(|predicate| format!("AND {predicate}"))
-        .unwrap_or_default();
-    let mut next = values.len() + 1;
-
-    let slot_filter = if let Some(slots) = slots {
-        let mut pairs = Vec::with_capacity(slots.len());
-        for (site_id, parameter_id) in slots {
-            pairs.push(format!("(${},${})", next, next + 1));
-            values.push((*site_id).into());
-            values.push((*parameter_id).into());
-            next += 2;
-        }
-        format!("AND (rt.site_id, rt.parameter_id) IN ({})", pairs.join(","))
-    } else {
-        String::new()
-    };
+    let mut active = Condition::all().add(Expr::cust(violation));
+    if let Some(predicate) = project_filter(scope, (s_.clone(), sites::Column::ProjectId)) {
+        active = active.add(predicate);
+    }
+    if let Some(slots) = slots {
+        let pairs: Vec<Expr> = slots
+            .iter()
+            .map(|(site_id, parameter_id)| {
+                Expr::tuple([Expr::value(*site_id), Expr::value(*parameter_id)])
+            })
+            .collect();
+        active = active.add(
+            Expr::tuple([
+                Expr::col((rt.clone(), Alias::new("site_id"))),
+                Expr::col((rt.clone(), Alias::new("parameter_id"))),
+            ])
+            .is_in(pairs),
+        );
+    }
 
     // Loose index scan: one `ORDER BY time DESC LIMIT 1` per active slot via
     // `idx_readings_site_param_time`, instead of a `DISTINCT ON` over the whole hypertable. Cost is
     // O(active slots), independent of history depth. The lateral body carries the per-cadence
-    // serving rule (see `latest_served_sql`).
-    let latest = latest_served_sql(spot, "rt.site_id", "rt.parameter_id");
-    let sql = format!(
-        r"
-        WITH resolved_thresholds AS ({resolved_cte})
-        SELECT
-            rt.site_id,
-            s.name AS site_name,
-            rt.parameter_id,
-            sp.name AS parameter_name,
-            lr.value AS current_value,
-            lr.time,
-            rt.warning_min,
-            rt.warning_max,
-            rt.alarm_min,
-            rt.alarm_max,
-            ({sev_case})::smallint AS severity
-        FROM resolved_thresholds rt
-        JOIN sites s ON s.id = rt.site_id
-        JOIN site_parameters sp
-            ON sp.site_id = rt.site_id
-            AND sp.parameter_id = rt.parameter_id
-            AND sp.is_active = true
-        CROSS JOIN LATERAL ({latest}) lr
-        WHERE {violation}
-        {project_filter}
-        {slot_filter}
-        ORDER BY severity DESC, s.name, parameter_name
-        "
-    );
+    // serving rule (see `latest_served_query`).
+    let latest = latest_served_query(spot, "rt.site_id", "rt.parameter_id");
+
+    let mut rows_query = SeaQuery::select();
+    rows_query
+        .column((rt.clone(), Alias::new("site_id")))
+        .expr_as(
+            Expr::col((s_.clone(), sites::Column::Name)),
+            Alias::new("site_name"),
+        )
+        .column((rt.clone(), Alias::new("parameter_id")))
+        .expr_as(
+            Expr::col((sp.clone(), site_parameters::Column::Name)),
+            Alias::new("parameter_name"),
+        )
+        .expr_as(
+            Expr::col((lr.clone(), Alias::new("value"))),
+            Alias::new("current_value"),
+        )
+        .column((lr.clone(), Alias::new("time")))
+        .columns([
+            (rt.clone(), Alias::new("warning_min")),
+            (rt.clone(), Alias::new("warning_max")),
+            (rt.clone(), Alias::new("alarm_min")),
+            (rt.clone(), Alias::new("alarm_max")),
+        ])
+        .expr_as(
+            Expr::cust(format!("({sev_case})::smallint")),
+            Alias::new("severity"),
+        )
+        .from_as(resolved.clone(), rt.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            sites::Entity,
+            s_.clone(),
+            Expr::col((s_.clone(), sites::Column::Id)).equals((rt.clone(), Alias::new("site_id"))),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            site_parameters::Entity,
+            sp.clone(),
+            Condition::all()
+                .add(
+                    Expr::col((sp.clone(), site_parameters::Column::SiteId))
+                        .equals((rt.clone(), Alias::new("site_id"))),
+                )
+                .add(
+                    Expr::col((sp.clone(), site_parameters::Column::ParameterId))
+                        .equals((rt.clone(), Alias::new("parameter_id"))),
+                )
+                .add(Expr::col((sp.clone(), site_parameters::Column::IsActive)).eq(true)),
+        )
+        // `ON TRUE` rather than `JoinType::CrossJoin`, which the builder still writes an `ON`
+        // clause after; the two mean the same thing.
+        .join_lateral(
+            JoinType::InnerJoin,
+            latest,
+            lr.clone(),
+            Condition::all().add(Expr::cust("true")),
+        )
+        .cond_where(active)
+        .order_by(Alias::new("severity"), Order::Desc)
+        .order_by((s_.clone(), sites::Column::Name), Order::Asc)
+        .order_by(Alias::new("parameter_name"), Order::Asc);
+
+    // The single resolution definition across all active slots (no scope), as the CTE.
+    let mut cte = CommonTableExpression::new();
+    cte.table_name(resolved)
+        .query(resolve_thresholds_query(None, None));
+    let (sql, values) = rows_query
+        .take()
+        .with(WithClause::new().cte(cte).to_owned())
+        .build(PostgresQueryBuilder);
 
     let rows: Vec<ActiveAlarmRow> = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
+            sql,
             values,
         ))
         .await?
@@ -547,20 +711,40 @@ pub(super) async fn fetch_open_events(
     db: &sea_orm::DatabaseConnection,
     scope: &crate::common::authz::AccessScope,
 ) -> AppResult<HashMap<(Uuid, Uuid, String), OpenEventRow>> {
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
-        .map(|predicate| format!("AND {predicate}"))
-        .unwrap_or_default();
-    let sql = format!(
-        "SELECT ae.site_id, ae.parameter_id, ae.measurement_type, ae.id, ae.started_at, ae.acknowledged_at, ae.acknowledged_by, ae.max_severity \
-         FROM alarm_events ae JOIN sites s ON s.id = ae.site_id \
-         WHERE ae.resolved_at IS NULL {project_filter}"
-    );
+    let ae = Alias::new("ae");
+    let s_ = Alias::new("s");
+    let mut open =
+        Condition::all().add(Expr::col((ae.clone(), alarm_event::Column::ResolvedAt)).is_null());
+    if let Some(predicate) = project_filter(scope, (s_.clone(), sites::Column::ProjectId)) {
+        open = open.add(predicate);
+    }
+    let (sql, values) = SeaQuery::select()
+        .columns([
+            (ae.clone(), alarm_event::Column::SiteId),
+            (ae.clone(), alarm_event::Column::ParameterId),
+            (ae.clone(), alarm_event::Column::MeasurementType),
+            (ae.clone(), alarm_event::Column::Id),
+            (ae.clone(), alarm_event::Column::StartedAt),
+            (ae.clone(), alarm_event::Column::AcknowledgedAt),
+            (ae.clone(), alarm_event::Column::AcknowledgedBy),
+            (ae.clone(), alarm_event::Column::MaxSeverity),
+        ])
+        .from_as(alarm_event::Entity, ae.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            sites::Entity,
+            s_.clone(),
+            Expr::col((s_.clone(), sites::Column::Id))
+                .equals((ae.clone(), alarm_event::Column::SiteId)),
+        )
+        .cond_where(open)
+        .take()
+        .build(PostgresQueryBuilder);
     let mut map = HashMap::new();
     for row in db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
+            sql,
             values,
         ))
         .await?
@@ -594,26 +778,50 @@ pub(super) async fn fetch_latest_reading_times(
     db: &sea_orm::DatabaseConnection,
     scope: &crate::common::authz::AccessScope,
 ) -> AppResult<HashMap<Uuid, (String, DateTime<Utc>)>> {
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
-        .map(|predicate| format!("WHERE {predicate}"))
-        .unwrap_or_default();
-
+    let s_ = Alias::new("s");
+    let r_ = Alias::new("r");
+    let mut scoped = Condition::all();
+    if let Some(predicate) = project_filter(scope, (s_.clone(), sites::Column::ProjectId)) {
+        scoped = scoped.add(predicate);
+    }
     // Continuous-only: a monthly grab must not make a dead logger look alive.
-    let sql = format!(
-        r"
-        SELECT s.id AS site_id, s.name AS site_name, MAX(r.time) AS latest_time
-        FROM sites s
-        JOIN readings r ON r.site_id = s.id AND r.measurement_type IS DISTINCT FROM 'spot'
-        {project_filter}
-        GROUP BY s.id, s.name
-        "
-    );
+    let (sql, values) = SeaQuery::select()
+        .expr_as(
+            Expr::col((s_.clone(), sites::Column::Id)),
+            Alias::new("site_id"),
+        )
+        .expr_as(
+            Expr::col((s_.clone(), sites::Column::Name)),
+            Alias::new("site_name"),
+        )
+        .expr_as(
+            Func::max(Expr::col((r_.clone(), readings::Column::Time))),
+            Alias::new("latest_time"),
+        )
+        .from_as(sites::Entity, s_.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            readings::Entity,
+            r_.clone(),
+            Condition::all()
+                .add(
+                    Expr::col((r_.clone(), readings::Column::SiteId))
+                        .equals((s_.clone(), sites::Column::Id)),
+                )
+                .add(Expr::cust("r.measurement_type IS DISTINCT FROM 'spot'")),
+        )
+        .cond_where(scoped)
+        .add_group_by([
+            Expr::col((s_.clone(), sites::Column::Id)).into(),
+            Expr::col((s_.clone(), sites::Column::Name)).into(),
+        ])
+        .take()
+        .build(PostgresQueryBuilder);
 
     let rows: Vec<LatestReadingTimeRow> = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
+            sql,
             values,
         ))
         .await?
@@ -639,27 +847,42 @@ pub(super) async fn fetch_last_alarm_warning_times(
     db: &sea_orm::DatabaseConnection,
     scope: &crate::common::authz::AccessScope,
 ) -> AppResult<HashMap<Uuid, (Option<DateTime<Utc>>, Option<DateTime<Utc>>)>> {
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
-        .map(|predicate| format!("WHERE {predicate}"))
-        .unwrap_or_default();
-
-    let sql = format!(
-        r"
-        SELECT s.id AS site_id,
-               MAX(ae.last_seen_at) FILTER (WHERE ae.max_severity = 1) AS last_warning_at,
-               MAX(ae.last_seen_at) FILTER (WHERE ae.max_severity = 2) AS last_alarm_at
-        FROM alarm_events ae
-        JOIN sites s ON s.id = ae.site_id
-        {project_filter}
-        GROUP BY s.id
-        "
-    );
+    let s_ = Alias::new("s");
+    let ae = Alias::new("ae");
+    let mut scoped = Condition::all();
+    if let Some(predicate) = project_filter(scope, (s_.clone(), sites::Column::ProjectId)) {
+        scoped = scoped.add(predicate);
+    }
+    let (sql, values) = SeaQuery::select()
+        .expr_as(
+            Expr::col((s_.clone(), sites::Column::Id)),
+            Alias::new("site_id"),
+        )
+        .expr_as(
+            Expr::cust("MAX(ae.last_seen_at) FILTER (WHERE ae.max_severity = 1)"),
+            Alias::new("last_warning_at"),
+        )
+        .expr_as(
+            Expr::cust("MAX(ae.last_seen_at) FILTER (WHERE ae.max_severity = 2)"),
+            Alias::new("last_alarm_at"),
+        )
+        .from_as(alarm_event::Entity, ae.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            sites::Entity,
+            s_.clone(),
+            Expr::col((s_.clone(), sites::Column::Id))
+                .equals((ae.clone(), alarm_event::Column::SiteId)),
+        )
+        .cond_where(scoped)
+        .add_group_by([Expr::col((s_.clone(), sites::Column::Id)).into()])
+        .take()
+        .build(PostgresQueryBuilder);
 
     let rows: Vec<LastAlarmWarningRow> = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
+            sql,
             values,
         ))
         .await?
@@ -714,30 +937,52 @@ pub(super) struct EpisodeRow {
 /// The series one cadence's episodes are computed over: continuous and derived rows stay when
 /// flagged, because an out-of-range value keeps alerting, while a spot instant is served at the
 /// sample mean over its unflagged replicates, so a fully flagged group is skipped.
-pub(crate) fn ordered_sql(spot: bool) -> String {
+pub(crate) fn ordered_query(spot: bool) -> SelectStatement {
+    let r = served::r();
+    let in_window = || {
+        Condition::all()
+            .add(Expr::cust("r.site_id = $1"))
+            .add(Expr::cust("r.parameter_id = $2"))
+            .add(Expr::cust("r.time >= $3"))
+            .add(Expr::cust("r.time <= $4"))
+    };
     if spot {
-        format!(
-            r"SELECT sp.t, sp.v FROM (
-              SELECT DISTINCT ON ({SPOT_INSTANT_KEY})
-                     r.time AS t,
-                     COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS v
-              FROM readings r
-              LEFT JOIN samples smp ON smp.id = r.sample_id
-              WHERE r.site_id = $1 AND r.parameter_id = $2
-                AND r.time >= $3 AND r.time <= $4
-                AND {SERVED_SPOT}
-              ORDER BY {SPOT_INSTANT_ORDER}
-          ) sp"
-        )
+        let smp = Alias::new("smp");
+        let mut group = SeaQuery::select();
+        group
+            .distinct_on(served::spot_instant_key())
+            .expr_as(
+                Expr::col((r.clone(), readings::Column::Time)),
+                Alias::new("t"),
+            )
+            .expr_as(served::spot_value(), Alias::new("v"))
+            .from_as(readings::Entity, r.clone())
+            .join_as(
+                JoinType::LeftJoin,
+                samples::Entity,
+                smp.clone(),
+                Expr::col((smp, samples::Column::Id))
+                    .equals((r.clone(), readings::Column::SampleId)),
+            )
+            .cond_where(in_window().add(served::served_spot()));
+        for (expr, order) in served::spot_instant_order() {
+            group.order_by_expr(expr, order);
+        }
+        let sp = Alias::new("sp");
+        SeaQuery::select()
+            .columns([(sp.clone(), Alias::new("t")), (sp.clone(), Alias::new("v"))])
+            .from_subquery(group.take(), sp)
+            .take()
     } else {
-        format!(
-            r"SELECT r.time AS t,
-                 COALESCE(r.calibrated_value, r.raw_value) AS v
-          FROM readings r
-          WHERE r.site_id = $1 AND r.parameter_id = $2
-            AND r.time >= $3 AND r.time <= $4
-            AND {CONTINUOUS_ROWS}"
-        )
+        SeaQuery::select()
+            .expr_as(
+                Expr::col((r.clone(), readings::Column::Time)),
+                Alias::new("t"),
+            )
+            .expr_as(served::continuous_value(), Alias::new("v"))
+            .from_as(readings::Entity, r.clone())
+            .cond_where(in_window().add(served::continuous_rows()))
+            .take()
     }
 }
 
@@ -762,7 +1007,7 @@ pub(super) async fn fetch_episodes(
     // another, so these must be separate CTEs). `run_id` increments at each breach that follows a
     // non-breach, so all consecutive breaching readings share one id. `next_t`/`next_v` from the
     // run's last row is the following in-range reading (NULL when the run reaches the window edge).
-    let ordered = ordered_sql(spot);
+    let ordered = ordered_query(spot).to_string(PostgresQueryBuilder);
     let sql = format!(
         r"
         WITH ordered AS ({ordered}),
@@ -836,3 +1081,7 @@ pub(super) struct ExtentRow {
     pub(super) lo: Option<DateTime<Utc>>,
     pub(super) hi: Option<DateTime<Utc>>,
 }
+
+#[cfg(test)]
+#[path = "tests/service.rs"]
+mod tests;

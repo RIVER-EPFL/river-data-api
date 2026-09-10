@@ -6,7 +6,9 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{
+    Alias, Expr, ExprTrait as _, JoinType, PostgresQueryBuilder, Query as SeaQuery,
+};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
     FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
@@ -23,13 +25,16 @@ use river_data_core::commands as core_commands;
 
 use crate::common::AppState;
 use crate::common::authz::AccessScope;
+use crate::common::bulk_write;
 use crate::common::middleware::enforce_project_scope_for_sites;
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::api_tokens::service::hash_token;
 use crate::routes::private::parameters::groups::group_model as parameter_groups;
+use crate::routes::private::readings::samples::model as samples;
+use crate::routes::private::readings::status_events::model as status_events;
 use crate::routes::private::sensors;
-use crate::routes::private::sensors::models::InstrumentKind;
+use crate::routes::private::sensors::models::{InstrumentKind, proposal};
 use crate::routes::private::sensors::service::{
     create_sensor_for_stream, upsert_source_instrument,
 };
@@ -148,7 +153,7 @@ pub(super) static SESSION_TOKEN_CACHE_TTL: OnceLock<Duration> = OnceLock::new();
 /// before the cache is first touched; without it the default lifetime applies.
 pub fn init_session_token_cache_ttl(token_ttl_secs: u64) {
     let window = (token_ttl_secs as f64 * CACHE_FRACTION_OF_TTL) as u64;
-    let _ = SESSION_TOKEN_CACHE_TTL.set(Duration::from_secs(window.max(1)));
+    let _ = SESSION_TOKEN_CACHE_TTL.set(Duration::from_secs(Ord::max(window, 1)));
 }
 
 pub(crate) static SESSION_TOKEN_CACHE: LazyLock<Cache<Uuid, String>> = LazyLock::new(|| {
@@ -1440,7 +1445,8 @@ pub(super) async fn rule_on_entry(
     reason: Option<&str>,
     by: &str,
 ) -> AppResult<Json<ResolveHoldResponse>> {
-    use crate::routes::private::readings::decisions::{Kind, NewValue, Origin, record_many};
+    use crate::routes::private::readings::models::{Kind, Origin};
+    use crate::routes::private::readings::service::{NewValue, record_many};
     let hold = state
         .db
         .query_one_raw(Statement::from_sql_and_values(
@@ -1983,15 +1989,17 @@ pub async fn load_instrument_catalog(
 
     // Names are read across every source: see `by_name`.
     let named_rows = sensors::Entity::find().all(db).await?;
-    let with_readings: std::collections::HashSet<Uuid> = db
-        .query_all_raw(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT DISTINCT sensor_id FROM readings WHERE sensor_id IS NOT NULL".to_string(),
-        ))
+    let with_readings: std::collections::HashSet<Uuid> = readings::models::Entity::find()
+        .select_only()
+        .column(readings::models::Column::SensorId)
+        .distinct()
+        .filter(readings::models::Column::SensorId.is_not_null())
+        .into_tuple::<Option<Uuid>>()
+        .all(db)
         .await?
-        .iter()
-        .map(|r| r.try_get::<Uuid>("", "sensor_id"))
-        .collect::<Result<_, _>>()?;
+        .into_iter()
+        .flatten()
+        .collect();
     let mut by_name: HashMap<String, InstrumentNameConflict> = HashMap::new();
     for row in &named_rows {
         let Some(name) = row
@@ -3389,7 +3397,7 @@ pub(super) async fn resolve_or_create_site_param<C: ConnectionTrait>(
     // Refused rather than defaulted: the review chose this, and an unrecognised value is a bug in
     // the caller, not a licence to pick a divisor.
     let sd_estimator =
-        crate::routes::private::readings::sd_estimator::parse_opt(entry.sd_estimator.as_deref())?;
+        crate::routes::private::readings::service::parse_opt(entry.sd_estimator.as_deref())?;
     let key = (site_id, parameter_id);
     if let Some(&id) = caches.site_params.get(&key) {
         return Ok(id);
@@ -3521,29 +3529,25 @@ pub async fn pending_instrument_proposals<C: ConnectionTrait>(
     db: &C,
     source_system: &str,
 ) -> AppResult<Vec<PlanInstrumentProposal>> {
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT source_key, name, serial_number, manufacturer, model, notes, \
-                    is_lab_instrument, metadata \
-               FROM instrument_proposals WHERE source_system = $1 ORDER BY source_key",
-            [source_system.into()],
-        ))
+    let rows = proposal::Entity::find()
+        .filter(proposal::Column::SourceSystem.eq(source_system))
+        .order_by_asc(proposal::Column::SourceKey)
+        .all(db)
         .await?;
-    let mut proposals = Vec::with_capacity(rows.len());
-    for row in &rows {
-        proposals.push(PlanInstrumentProposal {
-            source_key: row.try_get("", "source_key")?,
-            name: row.try_get("", "name")?,
-            serial_number: row.try_get("", "serial_number")?,
-            manufacturer: row.try_get("", "manufacturer")?,
-            model: row.try_get("", "model")?,
-            notes: row.try_get("", "notes")?,
-            is_lab_instrument: row.try_get("", "is_lab_instrument")?,
-            metadata: row.try_get("", "metadata")?,
+    let proposals = rows
+        .into_iter()
+        .map(|row| PlanInstrumentProposal {
+            source_key: row.source_key,
+            name: row.name,
+            serial_number: row.serial_number,
+            manufacturer: row.manufacturer,
+            model: row.model,
+            notes: row.notes,
+            is_lab_instrument: row.is_lab_instrument,
+            metadata: row.metadata,
             admit: true,
-        });
-    }
+        })
+        .collect();
     Ok(proposals)
 }
 
@@ -3555,25 +3559,25 @@ pub(super) async fn admit_instrument_proposals<C: ConnectionTrait>(
     proposals: &[PlanInstrumentProposal],
 ) -> AppResult<u32> {
     let mut created = 0u32;
-    for proposal in proposals.iter().filter(|p| p.admit) {
+    for offered in proposals.iter().filter(|p| p.admit) {
         let id = upsert_source_instrument(
             txn,
             source_system,
-            &proposal.source_key,
-            &proposal.name,
-            if proposal.is_lab_instrument {
+            &offered.source_key,
+            &offered.name,
+            if offered.is_lab_instrument {
                 InstrumentKind::Lab
             } else {
                 InstrumentKind::Device
             },
             "high",
-            proposal.metadata.clone(),
+            offered.metadata.clone(),
         )
         .await?;
         // The serial is claimed only where no other instrument holds it: METALP's register carries
         // one serial on two probes, and losing the instrument over that would be worse than storing
         // it without one.
-        if let Some(serial) = proposal
+        if let Some(serial) = offered
             .serial_number
             .as_deref()
             .map(str::trim)
@@ -3587,18 +3591,17 @@ pub(super) async fn admit_instrument_proposals<C: ConnectionTrait>(
                 [
                     id.into(),
                     serial.to_string().into(),
-                    proposal.manufacturer.clone().into(),
-                    proposal.model.clone().into(),
+                    offered.manufacturer.clone().into(),
+                    offered.model.clone().into(),
                 ],
             ))
             .await?;
         }
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "DELETE FROM instrument_proposals WHERE source_system = $1 AND source_key = $2",
-            [source_system.into(), proposal.source_key.clone().into()],
-        ))
-        .await?;
+        proposal::Entity::delete_many()
+            .filter(proposal::Column::SourceSystem.eq(source_system))
+            .filter(proposal::Column::SourceKey.eq(offered.source_key.clone()))
+            .exec(txn)
+            .await?;
         created += 1;
     }
     Ok(created)
@@ -3727,20 +3730,60 @@ pub(super) async fn pair_entry_stream<C: ConnectionTrait>(
 }
 
 /// Rows the plan's readings point at through `column`, read before the readings lose it.
+/// Clear the attribution a plan's pairing gave `table`'s rows, keyed through the streams the plan
+/// paired. The columns are the ones the pairing set, per table.
+fn unattribute_plan_rows(
+    table: impl sea_orm::sea_query::IntoTableRef,
+    plan_id: Uuid,
+    columns: &[&str],
+) -> sea_orm::sea_query::UpdateStatement {
+    use sea_orm::sea_query::ExprTrait as _;
+    let mut update = SeaQuery::update();
+    update.table(table);
+    for column in columns {
+        update.value(Alias::new(*column), Expr::value(Option::<Uuid>::None));
+    }
+    update
+        .from(data_streams::models::Entity)
+        .and_where(Expr::cust("stream_id = data_streams.id"))
+        .and_where(
+            Expr::col((
+                data_streams::models::Entity,
+                data_streams::models::Column::PairingPlanId,
+            ))
+            .eq(plan_id),
+        )
+        .take()
+}
+
 pub(super) async fn plan_reading_references<C: ConnectionTrait>(
     conn: &C,
     plan_id: Uuid,
-    column: &str,
+    column: readings::models::Column,
 ) -> AppResult<Vec<Uuid>> {
+    use sea_orm::sea_query::ExprTrait as _;
+    let r = Alias::new("r");
+    let ds = Alias::new("ds");
+    let (sql, values) = SeaQuery::select()
+        .distinct()
+        .expr_as(Expr::col((r.clone(), column)), Alias::new("id"))
+        .from_as(readings::models::Entity, r.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            data_streams::models::Entity,
+            ds.clone(),
+            Expr::col((r.clone(), readings::models::Column::StreamId))
+                .equals((ds.clone(), data_streams::models::Column::Id)),
+        )
+        .and_where(Expr::col((ds, data_streams::models::Column::PairingPlanId)).eq(plan_id))
+        .and_where(Expr::col((r, column)).is_not_null())
+        .take()
+        .build(PostgresQueryBuilder);
     Ok(conn
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT DISTINCT r.{column} AS id FROM readings r
-                 JOIN data_streams ds ON r.stream_id = ds.id
-                 WHERE ds.pairing_plan_id = $1 AND r.{column} IS NOT NULL"
-            ),
-            [plan_id.into()],
+            sql,
+            values,
         ))
         .await?
         .iter()
@@ -3818,34 +3861,48 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
     // NULL out readings for streams from this plan; samples formed by the pairing backfill
     // lose their last reference and are removed below
     // Samples referenced by this plan's readings, so only those can be removed below.
-    let sample_ids = plan_reading_references(&txn, plan_id, "sample_id").await?;
+    let sample_ids =
+        plan_reading_references(&txn, plan_id, readings::models::Column::SampleId).await?;
     // The visit is attributed state too: `collection_events::attach` only stamps a reading whose
     // collection_event_id is NULL, so a reading left pointing at the reverted site's visit would
     // never be re-attached when the stream is paired somewhere else.
-    let event_ids = plan_reading_references(&txn, plan_id, "collection_event_id").await?;
+    let event_ids =
+        plan_reading_references(&txn, plan_id, readings::models::Column::CollectionEventId).await?;
 
-    txn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE readings r
-          SET site_id = NULL, parameter_id = NULL, sample_id = NULL, collection_event_id = NULL
-          FROM data_streams ds
-          WHERE r.stream_id = ds.id AND ds.pairing_plan_id = $1",
-        [plan_id.into()],
-    ))
+    bulk_write::mutation(
+        &txn,
+        unattribute_plan_rows(
+            readings::models::Entity,
+            plan_id,
+            &[
+                "site_id",
+                "parameter_id",
+                "sample_id",
+                "collection_event_id",
+            ],
+        ),
+    )
     .await?;
 
     // Reverting the pairing takes the reviewer away again; open reviews wait as deferred.
     repoint_holds(&txn, HoldScope::Plan(plan_id), false).await?;
 
     if !sample_ids.is_empty() {
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"DELETE FROM samples s
-              WHERE s.id = ANY($1)
-                AND NOT EXISTS (SELECT 1 FROM readings r WHERE r.sample_id = s.id)",
-            [sample_ids.into()],
-        ))
-        .await?;
+        // A sample a reading still points at is not this plan's to delete. The subquery is bounded
+        // to the same ids, so it stays the anti-join the correlated form was.
+        samples::Entity::delete_many()
+            .filter(samples::Column::Id.is_in(sample_ids.clone()))
+            .filter(
+                samples::Column::Id.not_in_subquery(
+                    SeaQuery::select()
+                        .column(readings::models::Column::SampleId)
+                        .from(readings::models::Entity)
+                        .and_where(readings::models::Column::SampleId.is_in(sample_ids))
+                        .take(),
+                ),
+            )
+            .exec(&txn)
+            .await?;
     }
 
     if !event_ids.is_empty() {
@@ -3856,10 +3913,10 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
             .filter(
                 collection_events::models::Column::Id.not_in_subquery(
                     sea_orm::sea_query::Query::select()
-                        .column(readings::model::Column::CollectionEventId)
-                        .from(readings::model::Entity)
+                        .column(readings::models::Column::CollectionEventId)
+                        .from(readings::models::Entity)
                         .and_where(
-                            readings::model::Column::CollectionEventId.is_in(event_ids.clone()),
+                            readings::models::Column::CollectionEventId.is_in(event_ids.clone()),
                         )
                         .to_owned(),
                 ),
@@ -3868,12 +3925,13 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
             .await?;
     }
 
+    let (sql, values) =
+        unattribute_plan_rows(status_events::Entity, plan_id, &["site_id", "parameter_id"])
+            .build(PostgresQueryBuilder);
     txn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        r"UPDATE status_events se SET site_id = NULL, parameter_id = NULL
-          FROM data_streams ds
-          WHERE se.stream_id = ds.id AND ds.pairing_plan_id = $1",
-        [plan_id.into()],
+        sql,
+        values,
     ))
     .await?;
 
@@ -4196,20 +4254,52 @@ pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityC
     // Usage per parameter in one pass. `readings.parameter_id` is indexed and the group-by is over
     // the slots, not the hypertable's rows, so this stays a catalog-sized query.
     let mut usage: HashMap<Uuid, (i64, i64)> = HashMap::new();
+    let sp = Alias::new("sp");
+    let r = Alias::new("r");
+    let per_slot = SeaQuery::select()
+        .column(readings::models::Column::SiteId)
+        .column(readings::models::Column::ParameterId)
+        .expr_as(Expr::cust("COUNT(*)"), Alias::new("n"))
+        .from(readings::models::Entity)
+        .and_where(Expr::col(readings::models::Column::ParameterId).is_not_null())
+        .add_group_by([
+            Expr::col(readings::models::Column::SiteId).into(),
+            Expr::col(readings::models::Column::ParameterId).into(),
+        ])
+        .take();
+    let (sql, values) = SeaQuery::select()
+        .expr_as(
+            Expr::col((sp.clone(), site_parameters::Column::ParameterId)),
+            Alias::new("parameter_id"),
+        )
+        .expr_as(Expr::cust("COUNT(*)"), Alias::new("slots"))
+        .expr_as(
+            Expr::cust("COALESCE(SUM(r.n), 0)::bigint"),
+            Alias::new("readings"),
+        )
+        .from_as(site_parameters::Entity, sp.clone())
+        .join_subquery(
+            JoinType::LeftJoin,
+            per_slot,
+            r.clone(),
+            Condition::all()
+                .add(
+                    Expr::col((r.clone(), site_parameters::Column::ParameterId))
+                        .equals((sp.clone(), site_parameters::Column::ParameterId)),
+                )
+                .add(
+                    Expr::col((r, site_parameters::Column::SiteId))
+                        .equals((sp.clone(), site_parameters::Column::SiteId)),
+                ),
+        )
+        .add_group_by([Expr::col((sp, site_parameters::Column::ParameterId)).into()])
+        .take()
+        .build(PostgresQueryBuilder);
     for row in db
-        .query_all_raw(Statement::from_string(
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT sp.parameter_id AS parameter_id,
-                    COUNT(*) AS slots,
-                    COALESCE(SUM(r.n), 0)::bigint AS readings
-             FROM site_parameters sp
-             LEFT JOIN (
-                 SELECT site_id, parameter_id, COUNT(*) AS n
-                 FROM readings WHERE parameter_id IS NOT NULL
-                 GROUP BY site_id, parameter_id
-             ) r ON r.parameter_id = sp.parameter_id AND r.site_id = sp.site_id
-             GROUP BY sp.parameter_id"
-                .to_owned(),
+            sql,
+            values,
         ))
         .await?
     {

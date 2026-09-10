@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
-    QuerySelect, Set, Statement,
+    QueryOrder, QuerySelect, Set, Statement,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::parameters::derived::definition_model as calculation_formulas;
 use crate::routes::private::parameters::derived::source_model as derived_sources;
-use crate::routes::private::readings::decisions;
+use crate::routes::private::parameters::derived::version_model as derived_versions;
 
 /// The reprocess engines are driven by `Job::run`, whose error type is `DbErr`. The shared bulk-write
 /// and aggregate-refresh primitives report `AppError`; carrying the message through keeps a failed
@@ -120,9 +120,9 @@ pub fn calibration_derivable(alias: &str) -> String {
     format!(
         "{} AND {}",
         window_resolved_rows(alias),
-        crate::routes::private::readings::decisions::not_pinned_sql(
+        crate::routes::private::readings::service::not_pinned_sql(
             alias,
-            crate::routes::private::readings::decisions::Kind::CalibrationPin
+            crate::routes::private::readings::models::Kind::CalibrationPin
         )
     )
 }
@@ -133,9 +133,9 @@ pub fn attribution_derivable(alias: &str) -> String {
     format!(
         "{} AND {}",
         window_resolved_rows(alias),
-        crate::routes::private::readings::decisions::not_pinned_sql(
+        crate::routes::private::readings::service::not_pinned_sql(
             alias,
-            crate::routes::private::readings::decisions::Kind::InstrumentPin
+            crate::routes::private::readings::models::Kind::InstrumentPin
         )
     )
 }
@@ -424,8 +424,8 @@ pub async fn sweep_curve_drift(
                    WHERE collection_event_id IS NOT NULL AND parameter_id IS NOT NULL) AS touched
             FROM drift",
         update = recompose_statement(&drifted, "TRUE"),
-        kind = decisions::Kind::CurveRecompose.as_str(),
-        origin = decisions::Origin::Janitor.as_str(),
+        kind = crate::routes::private::readings::models::Kind::CurveRecompose.as_str(),
+        origin = crate::routes::private::readings::models::Origin::Janitor.as_str(),
     );
 
     // Drift in a chunk past the compression policy has to decompress, and the roll-up carries its
@@ -532,15 +532,14 @@ async fn newest_derived_version(
     db: &DatabaseConnection,
     definition_id: Uuid,
 ) -> Result<Option<Uuid>, sea_orm::DbErr> {
-    db.query_one_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT id FROM derived_parameter_definition_versions \
-              WHERE definition_id = $1 ORDER BY version_no DESC LIMIT 1",
-        [definition_id.into()],
-    ))
-    .await?
-    .map(|row| row.try_get::<Uuid>("", "id"))
-    .transpose()
+    derived_versions::Entity::find()
+        .filter(derived_versions::Column::DefinitionId.eq(definition_id))
+        .select_only()
+        .column(derived_versions::Column::Id)
+        .order_by_desc(derived_versions::Column::VersionNo)
+        .into_tuple::<Uuid>()
+        .one(db)
+        .await
 }
 
 /// The slots this site computes. The producing definition is the one whose output is the slot's
@@ -794,7 +793,7 @@ async fn unattribute_derived_at(
     item: &DerivedWork,
     time: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), sea_orm::DbErr> {
-    crate::common::bulk_write::guarded_mutation(
+    crate::common::bulk_write::guarded_mutation_sql(
         db,
         Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -845,22 +844,22 @@ async fn record_formula_transition(
     if prior.raw_value == Some(result) && prior.derived_version_id == version {
         return Ok(false);
     }
-    decisions::record(
+    crate::routes::private::readings::service::record(
         db,
-        &decisions::Decision {
-            key: decisions::DecisionKey {
+        &crate::routes::private::readings::service::Decision {
+            key: crate::routes::private::readings::service::DecisionKey {
                 stream_id,
                 time,
                 replicate_index: Some(0),
             },
-            kind: decisions::Kind::FormulaTransition,
+            kind: crate::routes::private::readings::models::Kind::FormulaTransition,
             new: serde_json::json!({
                 "raw_value": result,
                 "derived_version_id": version,
             }),
             actor: "system".to_string(),
             reason: None,
-            origin: decisions::Origin::System,
+            origin: crate::routes::private::readings::models::Origin::System,
             set_id: None,
         },
     )
@@ -917,7 +916,7 @@ async fn evaluate_and_upsert_derived(
     // the value outright. Writing both columns also made the upsert lopsided: the previous
     // ON CONFLICT maintained only `calibrated_value`, so a recomputed row's `raw_value` stayed
     // frozen at whatever the very first evaluation produced.
-    crate::common::bulk_write::guarded_mutation(
+    crate::common::bulk_write::guarded_mutation_sql(
         db,
         Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -952,15 +951,15 @@ async fn record_derived_arrival(
     stream_id: Uuid,
     time: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), sea_orm::DbErr> {
-    decisions::record_many(
+    crate::routes::private::readings::service::record_many(
         db,
-        decisions::Kind::DerivedComputed,
+        crate::routes::private::readings::models::Kind::DerivedComputed,
         "r.stream_id = $1 AND r.time = $2 AND r.replicate_index = 0",
         vec![stream_id.into(), time.into()],
-        decisions::NewValue::Born,
+        crate::routes::private::readings::service::NewValue::Born,
         "system",
         None,
-        decisions::Origin::System,
+        crate::routes::private::readings::models::Origin::System,
         None,
     )
     .await
@@ -1232,8 +1231,8 @@ fn record_moved(update_sql: &str, columns: &[&str], job_param: usize) -> String 
           SELECT site_id, time FROM moved",
         old = pairs("was"),
         new = pairs("now"),
-        kind = decisions::Kind::Reprocess.as_str(),
-        origin = decisions::Origin::System.as_str(),
+        kind = crate::routes::private::readings::models::Kind::Reprocess.as_str(),
+        origin = crate::routes::private::readings::models::Origin::System.as_str(),
     )
 }
 
@@ -1481,110 +1480,5 @@ async fn write_and_collect<C: ConnectionTrait>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The report and the split ask the same question at different moments: a reading whose curve
-    /// belongs to another instrument. Keeping the predicate in one place is what stops the report
-    /// listing rows the split would not have asked about.
-    #[test]
-    fn a_foreign_curve_is_one_whose_owner_is_not_the_reading_s_instrument() {
-        assert_eq!(
-            foreign_curve_rows("r", "sc"),
-            "sc.sensor_id IS DISTINCT FROM r.sensor_id"
-        );
-        // NULL on either side is foreign, not skipped: a reading with no instrument corrected by
-        // somebody's curve is exactly the case worth listing.
-        assert!(foreign_curve_rows("r", "sc").contains("IS DISTINCT FROM"));
-    }
-
-    /// A reprocess visits far more readings than it moves, and Q125 bounds the ledger to the ones
-    /// that moved.
-    #[test]
-    fn a_recording_statement_inserts_only_where_a_written_column_differs() {
-        let sql = record_moved("UPDATE readings", &["site_id", "deployment_id"], 3);
-        assert!(sql.contains("m.was_site_id IS DISTINCT FROM m.now_site_id"));
-        assert!(sql.contains("m.was_deployment_id IS DISTINCT FROM m.now_deployment_id"));
-        assert!(sql.contains("'site_id', to_jsonb(m.was_site_id)"));
-        assert!(sql.contains("'site_id', to_jsonb(m.now_site_id)"));
-        assert!(sql.contains("'reprocess'"), "the kind is named: {sql}");
-        assert!(
-            sql.contains("$3"),
-            "the job is the statement's last bind: {sql}"
-        );
-    }
-
-    #[test]
-    fn the_drift_sweep_repairs_exactly_what_the_recompose_writes() {
-        let drifted = format!(
-            "{corrected} AND tgt.calibrated_value IS DISTINCT FROM ({value})",
-            corrected = corrected_rows("r"),
-            value = recomposed_own_curve_value(),
-        );
-        let sweep = recompose_statement(&drifted, "TRUE");
-        assert!(
-            sweep.contains(&recomposed_own_curve_value()),
-            "the sweep writes the value the recompose computes: {sweep}"
-        );
-        assert!(
-            sweep.contains(&orphaned_correction_rows("r")),
-            "and leaves an orphaned correction alone, as the recompose does: {sweep}"
-        );
-        assert_eq!(
-            recompose_statement("r.measurement_type = 'spot'", "TRUE")
-                .replace("r.measurement_type = 'spot'", &drifted),
-            sweep,
-            "the two statements differ only in which rows qualify"
-        );
-    }
-
-    /// A retired curve is out of circulation: no write path and no reprocess may resolve one, and
-    /// the one producer of the ranking is where that is said.
-    #[test]
-    fn a_retired_curve_is_never_a_candidate() {
-        for pick in [
-            super::super::resolver::pick_calibration_lateral("$1"),
-            super::super::resolver::pick_calibration_lateral_excluding("$2", Some("$1")),
-        ] {
-            assert!(
-                pick.contains("c.retired_at IS NULL"),
-                "the ranking excludes retired curves: {pick}"
-            );
-        }
-    }
-
-    /// The reprocess engine and the calibration-delete hook repoint readings by the same rule. They
-    /// were two copies of it, and a fix landing on one is the way they diverge.
-    #[test]
-    fn both_repoint_callers_emit_one_statement() {
-        let engine = repoint_statement(
-            &super::super::resolver::pick_calibration_lateral("$1"),
-            "SELECTION",
-            "",
-        );
-        let delete_hook = repoint_statement(
-            &super::super::resolver::pick_calibration_lateral_excluding("$2", Some("$1")),
-            "SELECTION",
-            "",
-        );
-        let pick_of = |sql: &str| {
-            let start = sql.find("LEFT JOIN LATERAL (").expect("lateral");
-            let end = sql.find(") cw ON true").expect("lateral close");
-            sql[start..end].to_owned()
-        };
-        assert_eq!(
-            engine.replace(&pick_of(&engine), "PICK"),
-            delete_hook.replace(&pick_of(&delete_hook), "PICK"),
-            "the two differ only in which windows the lateral ranks"
-        );
-        assert!(
-            engine.contains("LEFT JOIN LATERAL"),
-            "the lateral stays an outer join, so a reading no window covers is repointed to none \
-             rather than skipped: {engine}"
-        );
-        assert!(
-            engine.contains("LEFT JOIN standard_curves sc"),
-            "and the operator's standard curve is re-applied on top of the new base: {engine}"
-        );
-    }
-}
+#[path = "tests/service.rs"]
+mod tests;

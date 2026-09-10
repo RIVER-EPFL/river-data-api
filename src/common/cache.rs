@@ -44,7 +44,7 @@ use axum::{
     response::Response,
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
+use sea_orm::{ColumnTrait, EntityTrait, FromQueryResult, QueryFilter, QuerySelect};
 use serde::Serialize;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -52,6 +52,7 @@ use uuid::Uuid;
 use super::state::ResponseCache;
 use super::{AppEvent, AppState, CachedResponse};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::readings;
 
 /// Result of checking the latest data time in the database
 #[derive(Debug, FromQueryResult)]
@@ -185,18 +186,19 @@ pub async fn get_latest_time(
         return Ok(None);
     }
 
-    let result = state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT MAX(time) as max_time FROM readings WHERE parameter_id = ANY($1)",
-            [param_ids.to_vec().into()],
-        ))
-        .await?;
-
-    Ok(result
-        .and_then(|row| MaxTimeRow::from_query_result(&row, "").ok())
+    Ok(latest_time_query(param_ids)
+        .into_model::<MaxTimeRow>()
+        .one(&state.db)
+        .await?
         .and_then(|r| r.max_time))
+}
+
+/// The freshness backstop's query: the latest reading time over the given parameters.
+fn latest_time_query(param_ids: &[Uuid]) -> sea_orm::Select<readings::Entity> {
+    readings::Entity::find()
+        .select_only()
+        .column_as(readings::Column::Time.max(), "max_time")
+        .filter(readings::Column::ParameterId.is_in(param_ids.to_vec()))
 }
 
 /// Try to get a cached response.

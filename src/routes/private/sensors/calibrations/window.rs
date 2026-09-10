@@ -3,7 +3,11 @@ use axum::{
     extract::{Path, State},
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, EntityTrait, FromQueryResult, Statement};
+use sea_orm::sea_query::{
+    Alias, Condition, Expr, Func, PostgresQueryBuilder, Query as SeaQuery, SelectStatement,
+    SimpleExpr, SubQueryStatement, UnionType,
+};
+use sea_orm::{ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, Order, Statement};
 use serde::Serialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -11,6 +15,8 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, sensor_in_scope};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::sites::models as sites;
 
 /// One reading the calibration's `[valid_from, valid_until)` window resolves.
 #[derive(Debug, Serialize, ToSchema)]
@@ -71,19 +77,16 @@ pub async fn get_calibration_window(
     if !sensor_in_scope(db, &scope, sensor_id).await? {
         return Err(AppError::NotFound("Calibration not found".to_string()));
     }
-    // Appends `AND site_id IN (<scope project's sites>)` (binding the project id) when scoped.
-    let scope_clause = |values: &mut Vec<sea_orm::Value>| -> String {
-        match scope.sql_project_array() {
-            Some(projects) => {
-                values.push(projects);
-                format!(
-                    " AND site_id IN (SELECT id FROM sites WHERE project_id = ANY(${}))",
-                    values.len()
-                )
-            }
-            None => String::new(),
-        }
-    };
+    // `site_id IN (<scope project's sites>)` when the caller is confined to a project.
+    let scope_cond = scope.sql_project_array().map(|projects| {
+        Expr::col(readings::Column::SiteId).in_subquery(
+            SeaQuery::select()
+                .column(sites::Column::Id)
+                .from(sites::Entity)
+                .and_where(Expr::cust_with_values("project_id = ANY($1)", [projects]))
+                .take(),
+        )
+    });
     let super::model::Model {
         parameter_id,
         slope,
@@ -99,29 +102,62 @@ pub async fn get_calibration_window(
         None => sea_orm::Value::ChronoDateTimeWithTimeZone(None),
     };
 
-    // The window is [valid_from, COALESCE(valid_until, 'infinity')). The count is per instant:
-    // continuous and derived rows live at replicate_index 0, so their count is a plain COUNT(*)
-    // with no sort; a spot instant is the replicate group `(stream_id, time)`, and the composite
-    // DISTINCT is confined to that small subset.
-    let mut count_vals: Vec<sea_orm::Value> = vec![sensor_id.into(), vf.clone(), vu.clone()];
-    let count_scope = scope_clause(&mut count_vals);
+    // The window is [valid_from, COALESCE(valid_until, 'infinity')), and every arm below shares it.
+    let in_window = || {
+        let mut cond = Condition::all()
+            .add(Expr::col(readings::Column::SensorId).eq(sensor_id))
+            .add(Expr::col(readings::Column::Time).gte(vf.clone()))
+            .add(Expr::cust_with_values(
+                "time < COALESCE($1, 'infinity'::timestamptz)",
+                [vu.clone()],
+            ));
+        if let Some(scope) = scope_cond.clone() {
+            cond = cond.add(scope);
+        }
+        cond
+    };
+    let continuous = || {
+        in_window()
+            .add(Expr::col(readings::Column::ReplicateIndex).eq(0))
+            .add(Expr::cust("measurement_type IS DISTINCT FROM 'spot'"))
+    };
+    let spot = || {
+        in_window()
+            .add(Expr::col(readings::Column::MeasurementType).eq("spot"))
+            .add(Expr::col(readings::Column::WithdrawnAt).is_null())
+    };
+
+    // The count is per instant: continuous and derived rows live at replicate_index 0, so their
+    // count is a plain COUNT(*) with no sort; a spot instant is the replicate group
+    // `(stream_id, time)`, and the composite DISTINCT is confined to that small subset.
+    let subquery = |q: SelectStatement| {
+        SimpleExpr::SubQuery(None, Box::new(SubQueryStatement::SelectStatement(q)))
+    };
+    let count_query = SeaQuery::select()
+        .expr_as(
+            subquery(
+                SeaQuery::select()
+                    .expr(Func::count(Expr::cust("*")))
+                    .from(readings::Entity)
+                    .cond_where(continuous())
+                    .take(),
+            )
+            .add(subquery(
+                SeaQuery::select()
+                    .expr(Expr::cust("COUNT(DISTINCT (stream_id, time))"))
+                    .from(readings::Entity)
+                    .cond_where(spot())
+                    .take(),
+            )),
+            Alias::new("c"),
+        )
+        .take();
+    let (count_sql, count_values) = count_query.build(PostgresQueryBuilder);
     let count_row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &format!(
-                r"SELECT (SELECT COUNT(*) FROM readings
-                          WHERE sensor_id = $1
-                            AND time >= $2
-                            AND time < COALESCE($3, 'infinity'::timestamptz)
-                            AND replicate_index = 0
-                            AND measurement_type IS DISTINCT FROM 'spot'{count_scope})
-                       + (SELECT COUNT(DISTINCT (stream_id, time)) FROM readings
-                          WHERE sensor_id = $1
-                            AND time >= $2
-                            AND time < COALESCE($3, 'infinity'::timestamptz)
-                            AND measurement_type = 'spot' AND withdrawn_at IS NULL{count_scope}) AS c"
-            ),
-            count_vals,
+            count_sql,
+            count_values,
         ))
         .await?;
     // The count query is an aggregate over a subquery, so it always returns a row; no row means no
@@ -135,44 +171,69 @@ pub async fn get_calibration_window(
     // outer sort then orders at most twice the cap. The spot arm collapses a replicate group to
     // its lowest unflagged replicate (a flagged-only group surfaces its flagged row: the editor
     // shows flagged points).
-    let mut point_vals: Vec<sea_orm::Value> = vec![sensor_id.into(), vf, vu];
-    let point_scope = scope_clause(&mut point_vals);
-    point_vals.push(MAX_POINTS.into());
-    let limit_idx = point_vals.len();
+    let point_cols = [
+        Alias::new("time"),
+        Alias::new("raw_value"),
+        Alias::new("calibrated_value"),
+        Alias::new("is_flagged"),
+    ];
+    let flag = || {
+        Func::coalesce([
+            Expr::col(readings::Column::IsFlagged).into(),
+            Expr::value(false),
+        ])
+    };
+    let continuous_arm = SeaQuery::select()
+        .column(readings::Column::Time)
+        .column(readings::Column::RawValue)
+        .column(readings::Column::CalibratedValue)
+        .expr_as(flag(), Alias::new("is_flagged"))
+        .from(readings::Entity)
+        .cond_where(continuous())
+        .order_by(readings::Column::Time, Order::Desc)
+        .limit(MAX_POINTS.unsigned_abs())
+        .take();
+    // The spot arm collapses a replicate group to its lowest unflagged replicate (a flagged-only
+    // group surfaces its flagged row: the editor shows flagged points).
+    let spot_group = SeaQuery::select()
+        .distinct_on([readings::Column::StreamId, readings::Column::Time])
+        .column(readings::Column::Time)
+        .column(readings::Column::RawValue)
+        .column(readings::Column::CalibratedValue)
+        .expr_as(flag(), Alias::new("is_flagged"))
+        .from(readings::Entity)
+        .cond_where(spot())
+        .order_by(readings::Column::StreamId, Order::Asc)
+        .order_by(readings::Column::Time, Order::Asc)
+        .order_by_expr(Expr::cust("(is_flagged IS TRUE)"), Order::Asc)
+        .order_by(readings::Column::ReplicateIndex, Order::Asc)
+        .take();
+    let spot_arm = SeaQuery::select()
+        .columns(point_cols.clone())
+        .from_subquery(spot_group, Alias::new("sp"))
+        .order_by(Alias::new("time"), Order::Desc)
+        .limit(MAX_POINTS.unsigned_abs())
+        .take();
+    // Each arm carries its own LIMIT so the continuous arm keeps the index-backed early stop; the
+    // outer sort then orders at most twice the cap. Each is wrapped in its own derived table so
+    // the union keeps those limits instead of hoisting one of them to the top.
+    let wrap = |arm: SelectStatement, alias: &str| {
+        SeaQuery::select()
+            .columns(point_cols.clone())
+            .from_subquery(arm, Alias::new(alias))
+            .take()
+    };
+    let points_query = wrap(continuous_arm, "c")
+        .union(UnionType::All, wrap(spot_arm, "s"))
+        .order_by(Alias::new("time"), Order::Desc)
+        .limit(MAX_POINTS.unsigned_abs())
+        .take();
+    let (points_sql, points_values) = points_query.build(PostgresQueryBuilder);
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &format!(
-                r"SELECT time, raw_value, calibrated_value, is_flagged FROM (
-                      (SELECT time, raw_value, calibrated_value,
-                              COALESCE(is_flagged, false) AS is_flagged
-                       FROM readings
-                       WHERE sensor_id = $1
-                         AND time >= $2
-                         AND time < COALESCE($3, 'infinity'::timestamptz)
-                         AND replicate_index = 0
-                         AND measurement_type IS DISTINCT FROM 'spot'{point_scope}
-                       ORDER BY time DESC
-                       LIMIT ${limit_idx})
-                      UNION ALL
-                      (SELECT time, raw_value, calibrated_value, is_flagged FROM (
-                          SELECT DISTINCT ON (stream_id, time)
-                                 time, raw_value, calibrated_value,
-                                 COALESCE(is_flagged, false) AS is_flagged
-                          FROM readings
-                          WHERE sensor_id = $1
-                            AND time >= $2
-                            AND time < COALESCE($3, 'infinity'::timestamptz)
-                            AND measurement_type = 'spot' AND withdrawn_at IS NULL{point_scope}
-                          ORDER BY stream_id, time, (is_flagged IS TRUE), replicate_index
-                       ) sp
-                       ORDER BY time DESC
-                       LIMIT ${limit_idx})
-                  ) w
-                  ORDER BY time DESC
-                  LIMIT ${limit_idx}"
-            ),
-            point_vals,
+            points_sql,
+            points_values,
         ))
         .await?;
 

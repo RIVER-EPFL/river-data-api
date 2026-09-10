@@ -1004,17 +1004,6 @@ pub(super) fn require_sub(auth: &AuthContext) -> AppResult<String> {
     })
 }
 
-/// A stored subscription row. The two columns that carry a default are read as nullable, so a row
-/// written before either existed takes the default rather than failing the whole read.
-#[derive(FromQueryResult)]
-pub(super) struct StoredSubscription {
-    channel: Option<String>,
-    project_id: Option<Uuid>,
-    site_id: Option<Uuid>,
-    parameter_id: Option<Uuid>,
-    enabled: Option<bool>,
-}
-
 pub(super) async fn ensure_subscriber(state: &AppState, sub: &str) -> AppResult<()> {
     state
         .db
@@ -1054,24 +1043,18 @@ pub(super) async fn load(state: &AppState, sub: &str) -> AppResult<MyNotificatio
     )
     .unwrap_or(i64::MAX);
 
-    let sub_rows = state
-        .db
-        .query_all_raw(Statement::from_sql_and_values(
-            PG,
-            "SELECT channel, project_id, site_id, parameter_id, enabled \
-             FROM notification_subscriptions WHERE keycloak_sub = $1",
-            [sub.into()],
-        ))
+    let sub_rows = subscription::Entity::find()
+        .filter(subscription::Column::KeycloakSub.eq(sub))
+        .all(&state.db)
         .await?;
     let mut subscriptions = Vec::with_capacity(sub_rows.len());
-    for r in &sub_rows {
-        let row = StoredSubscription::from_query_result(r, "")?;
+    for row in sub_rows {
         subscriptions.push(SubscriptionScope {
-            channel: row.channel.unwrap_or_else(default_channel),
+            channel: row.channel,
             project_id: row.project_id,
             site_id: row.site_id,
             parameter_id: row.parameter_id,
-            enabled: row.enabled.unwrap_or(true),
+            enabled: row.enabled,
         });
     }
 

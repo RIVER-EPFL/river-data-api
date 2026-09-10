@@ -2,7 +2,10 @@ use axum::{
     Json,
     extract::{Query, State},
 };
-use sea_orm::sea_query::Expr;
+use sea_orm::Order;
+use sea_orm::sea_query::{
+    Alias, Condition, Expr, ExprTrait as _, Func, JoinType, PostgresQueryBuilder, Query as SeaQuery,
+};
 use sea_orm::{ColumnTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, QuerySelect};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -18,12 +21,18 @@ use crate::common::scope::{
 };
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams;
+use crate::routes::private::parameters::models as parameters;
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::samples::model as samples;
 use crate::routes::private::sensors::calibrations;
 use crate::routes::private::sensors::calibrations::service::{
     evaluate_formula, recompute_deployed_until,
 };
 use crate::routes::private::sensors::deployments;
 use crate::routes::private::sensors::deployments::slots;
+use crate::routes::private::sensors::standard_curves::model as standard_curves;
+use crate::routes::private::sites::models as sites;
+use crate::routes::private::sites::parameters::models as site_parameters;
 
 /// The rows this file's raw queries return. Derived rather than hand-decoded so a column added to
 /// a query and not to its reader is a compile error rather than a field silently left behind.
@@ -561,7 +570,7 @@ pub async fn rollback_deployment(
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<RollbackDeploymentRequest>,
 ) -> AppResult<Json<RollbackDeploymentResponse>> {
-    use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
+    use sea_orm::TransactionTrait;
 
     let db = &app_state.db;
 
@@ -608,15 +617,16 @@ pub async fn rollback_deployment(
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
     crate::common::bulk_write::lift_decompression_cap(&txn).await?;
 
-    let cleared = txn
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings SET deployment_id = NULL WHERE deployment_id = $1",
-            [payload.deployment_id.into()],
-        ))
+    let readings_reassigned = readings::Entity::update_many()
+        .col_expr(
+            readings::Column::DeploymentId,
+            Expr::value(Option::<Uuid>::None),
+        )
+        .filter(readings::Column::DeploymentId.eq(payload.deployment_id))
+        .exec(&txn)
         .await
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-    let readings_reassigned = cleared.rows_affected();
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
+        .rows_affected;
 
     deployments::Entity::delete_by_id(payload.deployment_id)
         .exec(&txn)
@@ -852,22 +862,39 @@ pub async fn preview_derived(
     for (var_name, _sp_id, parameter_id, units) in &param_info {
         source_units.insert(var_name.clone(), units.clone());
 
+        let r = Alias::new("r");
+        let smp = Alias::new("smp");
+        let (sql, values) = SeaQuery::select()
+            .distinct_on([(r.clone(), readings::Column::Time)])
+            .column((r.clone(), readings::Column::Time))
+            .expr_as(crate::common::served::spot_value(), Alias::new("val"))
+            .from_as(readings::Entity, r.clone())
+            .join_as(
+                JoinType::LeftJoin,
+                samples::Entity,
+                smp.clone(),
+                Expr::col((smp.clone(), samples::Column::Id))
+                    .equals((r.clone(), readings::Column::SampleId)),
+            )
+            .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).eq(*parameter_id))
+            .and_where(Expr::col((r.clone(), readings::Column::SiteId)).eq(payload.site_id))
+            .and_where(Expr::col((r.clone(), readings::Column::Time)).gte(payload.start))
+            .and_where(Expr::col((r.clone(), readings::Column::Time)).lte(payload.end))
+            .order_by((r.clone(), readings::Column::Time), Order::Asc)
+            .order_by_expr(
+                Expr::cust("(r.measurement_type IS NOT DISTINCT FROM 'spot')"),
+                Order::Asc,
+            )
+            .order_by((r.clone(), readings::Column::StreamId), Order::Asc)
+            .order_by_expr(Expr::cust("(r.is_flagged IS TRUE)"), Order::Asc)
+            .order_by((r.clone(), readings::Column::ReplicateIndex), Order::Asc)
+            .take()
+            .build(PostgresQueryBuilder);
         let rows = db
             .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                r"SELECT DISTINCT ON (r.time)
-                         r.time, COALESCE(smp.mean, r.calibrated_value, r.raw_value) as val
-                  FROM readings r
-                  LEFT JOIN samples smp ON smp.id = r.sample_id
-                  WHERE r.parameter_id = $1 AND r.site_id = $2 AND r.time >= $3 AND r.time <= $4
-                  ORDER BY r.time ASC, (r.measurement_type IS NOT DISTINCT FROM 'spot') ASC,
-                           r.stream_id, (r.is_flagged IS TRUE), r.replicate_index",
-                [
-                    (*parameter_id).into(),
-                    payload.site_id.into(),
-                    payload.start.into(),
-                    payload.end.into(),
-                ],
+                sql,
+                values,
             ))
             .await
             .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
@@ -1019,43 +1046,91 @@ async fn fetch_backfill_candidates(
     scope: &AccessScope,
 ) -> AppResult<Vec<BackfillCandidate>> {
     use sea_orm::{ConnectionTrait, Statement};
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
-        .map(|predicate| format!("AND {predicate}"))
-        .unwrap_or_default();
+    let d = Alias::new("d");
+    let s_ = Alias::new("s");
+    let pe = Alias::new("pe");
+    let c = Alias::new("c");
+    let r = Alias::new("r");
+    let p = Alias::new("p");
+
+    let prior_end = SeaQuery::select()
+        .expr_as(
+            Func::max(Expr::col((p.clone(), deployments::Column::DeployedUntil))),
+            Alias::new("prior_end"),
+        )
+        .from_as(deployments::Entity, p.clone())
+        .and_where(Expr::cust("p.site_id = d.site_id"))
+        .and_where(Expr::cust("p.parameter_id = d.parameter_id"))
+        .and_where(Expr::cust("p.id <> d.id"))
+        .and_where(Expr::col((p.clone(), deployments::Column::DeployedUntil)).is_not_null())
+        .and_where(Expr::cust("p.deployed_until <= d.deployed_from"))
+        .take();
+
     // Claimable is "no deployment covers this reading", not "no instrument names it": every
     // non-derived row names an instrument from the moment it is written
     // (`readings_instrument_required`), and it is the deployment the backdate supplies. A derived
     // value carries the slot and no instrument by design, so it is never claimed.
-    let sql = format!(
-        r"SELECT d.id AS deployment_id, d.sensor_id, d.site_id, d.parameter_id,
-                 d.deployed_from, c.target_from, c.claimable_count
-          FROM sensor_deployments d
-          JOIN sites s ON s.id = d.site_id
-          CROSS JOIN LATERAL (
-              SELECT MAX(p.deployed_until) AS prior_end
-              FROM sensor_deployments p
-              WHERE p.site_id = d.site_id AND p.parameter_id = d.parameter_id
-                AND p.id <> d.id AND p.deployed_until IS NOT NULL
-                AND p.deployed_until <= d.deployed_from
-          ) pe
-          CROSS JOIN LATERAL (
-              SELECT MIN(r.time) AS target_from, COUNT(*) AS claimable_count
-              FROM readings r
-              WHERE r.site_id = d.site_id AND r.parameter_id = d.parameter_id
-                AND r.deployment_id IS NULL
-                AND r.measurement_type IS DISTINCT FROM 'derived'
-                AND r.time < d.deployed_from
-                AND (pe.prior_end IS NULL OR r.time >= pe.prior_end)
-          ) c
-          WHERE d.deployed_until IS NULL AND c.claimable_count > 0
-          {project_filter}
-          ORDER BY c.claimable_count DESC"
-    );
+    let claimable = SeaQuery::select()
+        .expr_as(
+            Func::min(Expr::col((r.clone(), readings::Column::Time))),
+            Alias::new("target_from"),
+        )
+        .expr_as(Expr::cust("COUNT(*)"), Alias::new("claimable_count"))
+        .from_as(readings::Entity, r.clone())
+        .and_where(Expr::cust("r.site_id = d.site_id"))
+        .and_where(Expr::cust("r.parameter_id = d.parameter_id"))
+        .and_where(Expr::col((r.clone(), readings::Column::DeploymentId)).is_null())
+        .and_where(Expr::cust("r.measurement_type IS DISTINCT FROM 'derived'"))
+        .and_where(Expr::cust("r.time < d.deployed_from"))
+        .and_where(Expr::cust(
+            "(pe.prior_end IS NULL OR r.time >= pe.prior_end)",
+        ))
+        .take();
+
+    let mut open = Condition::all()
+        .add(Expr::col((d.clone(), deployments::Column::DeployedUntil)).is_null())
+        .add(Expr::cust("c.claimable_count > 0"));
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    if let Some(predicate) = project_filter_sql(scope, "s.project_id", &mut values) {
+        open = open.add(Expr::cust_with_values(predicate, values));
+    }
+
+    let on_true = || Condition::all().add(Expr::cust("true"));
+    let (sql, values) = SeaQuery::select()
+        .expr_as(
+            Expr::col((d.clone(), deployments::Column::Id)),
+            Alias::new("deployment_id"),
+        )
+        .columns([
+            (d.clone(), deployments::Column::SensorId),
+            (d.clone(), deployments::Column::SiteId),
+            (d.clone(), deployments::Column::ParameterId),
+            (d.clone(), deployments::Column::DeployedFrom),
+        ])
+        .columns([
+            (c.clone(), Alias::new("target_from")),
+            (c.clone(), Alias::new("claimable_count")),
+        ])
+        .from_as(deployments::Entity, d.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            sites::Entity,
+            s_.clone(),
+            Expr::col((s_.clone(), sites::Column::Id))
+                .equals((d.clone(), deployments::Column::SiteId)),
+        )
+        // `ON TRUE` rather than `JoinType::CrossJoin`, which the builder still writes an `ON`
+        // clause after; the two mean the same thing.
+        .join_lateral(JoinType::InnerJoin, prior_end, pe.clone(), on_true())
+        .join_lateral(JoinType::InnerJoin, claimable, c.clone(), on_true())
+        .cond_where(open)
+        .order_by_expr(Expr::cust("c.claimable_count"), Order::Desc)
+        .take()
+        .build(PostgresQueryBuilder);
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
+            sql,
             values,
         ))
         .await
@@ -1275,8 +1350,6 @@ const CANDIDATE_SCAN_DAYS: i64 = 90;
 async fn default_scan_floor(
     db: &sea_orm::DatabaseConnection,
 ) -> AppResult<Option<chrono::DateTime<chrono::Utc>>> {
-    use sea_orm::{ConnectionTrait, Statement};
-
     // The stream ingest cursors carry the newest instant without touching the hypertable: an
     // unbounded MAX(time) over readings pays a planning cost proportional to the chunk count.
     // A batch-written reading newer than every cursor at most shifts the floor slightly later,
@@ -1292,32 +1365,50 @@ async fn default_scan_floor(
             .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
             .flatten();
     if newest.is_none() {
-        let row = db
-            .query_one_raw(Statement::from_string(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT MAX(time) AS newest FROM readings".to_string(),
-            ))
+        newest = readings::Entity::find()
+            .select_only()
+            .column_as(readings::Column::Time.max(), "newest")
+            .into_tuple::<Option<chrono::DateTime<chrono::FixedOffset>>>()
+            .one(db)
             .await
-            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-        newest = match row {
-            Some(r) => r.try_get("", "newest")?,
-            None => None,
-        };
+            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
+            .flatten();
     }
     Ok(newest.map(|t| t.with_timezone(&chrono::Utc) - chrono::Duration::days(CANDIDATE_SCAN_DAYS)))
 }
 
-/// `AND r.time >= $n` for a floor, registering its value; empty for an unbounded scan.
-fn scan_floor_sql(
-    since: Option<chrono::DateTime<chrono::Utc>>,
-    values: &mut Vec<sea_orm::Value>,
-) -> String {
+/// The caller's projects, reached through the sensor's deployments: an instrument deployed
+/// nowhere resolves to no project and does not appear in a restricted caller's enumeration.
+fn deployed_in_scope(scope: &AccessScope) -> Option<Expr> {
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let predicate = project_filter_sql(scope, "s.project_id", &mut values)?;
+    Some(Expr::cust_with_values(
+        format!(
+            "EXISTS (SELECT 1 FROM sensor_deployments d \
+             JOIN sites s ON s.id = d.site_id \
+             WHERE d.sensor_id = r.sensor_id AND {predicate})"
+        ),
+        values,
+    ))
+}
+
+/// The caller's projects, reached through the reading's own site.
+fn site_in_scope(scope: &AccessScope) -> Option<Expr> {
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let predicate = project_filter_sql(scope, "s.project_id", &mut values)?;
+    Some(Expr::cust_with_values(
+        format!("EXISTS (SELECT 1 FROM sites s WHERE s.id = r.site_id AND {predicate})"),
+        values,
+    ))
+}
+
+/// The floor a scan reads from, or no condition at all for an unbounded scan.
+fn scan_floor(since: Option<chrono::DateTime<chrono::Utc>>) -> Condition {
     match since {
         Some(t) => {
-            values.push(t.into());
-            format!("AND r.time >= ${}", values.len())
+            Condition::all().add(Expr::col((Alias::new("r"), readings::Column::Time)).gte(t))
         }
-        None => String::new(),
+        None => Condition::all(),
     }
 }
 
@@ -1415,43 +1506,49 @@ async fn fetch_calibration_candidates(
 ) -> AppResult<Vec<CalibrationBackfillCandidate>> {
     use sea_orm::{ConnectionTrait, Statement};
 
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    let time_filter = scan_floor_sql(since, &mut values);
-    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
-        .map(|predicate| {
-            format!(
-                "AND EXISTS (SELECT 1 FROM sensor_deployments d \
-                 JOIN sites s ON s.id = d.site_id \
-                 WHERE d.sensor_id = r.sensor_id AND {predicate})"
-            )
-        })
-        .unwrap_or_default();
+    let r = Alias::new("r");
+    let cw = Alias::new("cw");
+    let mut scanned = scan_floor(since)
+        .add(Expr::col((r.clone(), readings::Column::SensorId)).is_not_null())
+        .add(Expr::col((r.clone(), readings::Column::CalibrationId)).is_null())
+        .add(Expr::col((cw.clone(), Alias::new("id"))).is_not_null())
+        .add(Expr::cust(
+            crate::routes::private::sensors::calibrations::service::window_resolved_rows("r"),
+        ));
+    if let Some(predicate) = deployed_in_scope(scope) {
+        scanned = scanned.add(predicate);
+    }
     // The lateral is the same window pick the reprocess engine runs, so `cw.id IS NOT NULL` means
     // exactly "a reprocess would stamp a curve here". Grabs resolve their curves by hand at entry
     // and are never windowed, hence `window_resolved_rows`. It runs once per row the scan keeps, so
     // the floor is what decides how often: every other predicate here is a filter, not a lookup.
-    let sql = format!(
-        r"SELECT r.sensor_id, COUNT(*) AS uncalibrated_count, MIN(r.time) AS target_from
-          FROM readings r
-          LEFT JOIN LATERAL ({pick}) cw ON true
-          WHERE r.sensor_id IS NOT NULL AND r.calibration_id IS NULL
-            AND cw.id IS NOT NULL
-            AND {windowed}
-          {time_filter}
-          {project_filter}
-          GROUP BY r.sensor_id
-          ORDER BY COUNT(*) DESC",
-        pick = crate::routes::private::sensors::calibrations::resolver::pick_calibration_lateral(
-            "r.sensor_id"
-        ),
-        windowed =
-            crate::routes::private::sensors::calibrations::service::window_resolved_rows("r"),
+    let pick = crate::routes::private::sensors::calibrations::resolver::pick_calibration_query(
+        "r.sensor_id",
     );
+    let (sql, values) = SeaQuery::select()
+        .column((r.clone(), readings::Column::SensorId))
+        .expr_as(Expr::cust("COUNT(*)"), Alias::new("uncalibrated_count"))
+        .expr_as(
+            Func::min(Expr::col((r.clone(), readings::Column::Time))),
+            Alias::new("target_from"),
+        )
+        .from_as(readings::Entity, r.clone())
+        .join_lateral(
+            JoinType::LeftJoin,
+            pick,
+            cw.clone(),
+            Condition::all().add(Expr::cust("true")),
+        )
+        .cond_where(scanned)
+        .add_group_by([Expr::col((r.clone(), readings::Column::SensorId)).into()])
+        .order_by_expr(Expr::cust("COUNT(*)"), Order::Desc)
+        .take()
+        .build(PostgresQueryBuilder);
 
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
+            sql,
             values,
         ))
         .await
@@ -1508,32 +1605,64 @@ async fn fetch_foreign_curve_uses(
 ) -> AppResult<Vec<ForeignCurveUse>> {
     use sea_orm::{ConnectionTrait, Statement};
 
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    let time_filter = scan_floor_sql(since, &mut values);
-    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
-        .map(|predicate| {
-            format!("AND EXISTS (SELECT 1 FROM sites s WHERE s.id = r.site_id AND {predicate})")
-        })
-        .unwrap_or_default();
-    let sql = format!(
-        r"SELECT r.sensor_id, sc.id AS standard_curve_id, sc.sensor_id AS curve_sensor_id,
-                 sc.name AS curve_name, r.site_id, r.parameter_id, COUNT(*) AS n,
-                 MIN(r.time) AS first_time, MAX(r.time) AS last_time
-          FROM readings r
-          JOIN standard_curves sc ON sc.id = r.standard_curve_id
-          WHERE {foreign}
-          {time_filter}
-          {project_filter}
-          GROUP BY r.sensor_id, sc.id, sc.sensor_id, sc.name, r.site_id, r.parameter_id
-          ORDER BY COUNT(*) DESC",
-        foreign =
-            crate::routes::private::sensors::calibrations::service::foreign_curve_rows("r", "sc"),
-    );
+    let r = Alias::new("r");
+    let sc = Alias::new("sc");
+    let mut scanned = scan_floor(since).add(Expr::cust(
+        crate::routes::private::sensors::calibrations::service::foreign_curve_rows("r", "sc"),
+    ));
+    if let Some(predicate) = site_in_scope(scope) {
+        scanned = scanned.add(predicate);
+    }
+    let (sql, values) = SeaQuery::select()
+        .column((r.clone(), readings::Column::SensorId))
+        .expr_as(
+            Expr::col((sc.clone(), standard_curves::Column::Id)),
+            Alias::new("standard_curve_id"),
+        )
+        .expr_as(
+            Expr::col((sc.clone(), standard_curves::Column::SensorId)),
+            Alias::new("curve_sensor_id"),
+        )
+        .expr_as(
+            Expr::col((sc.clone(), standard_curves::Column::Name)),
+            Alias::new("curve_name"),
+        )
+        .column((r.clone(), readings::Column::SiteId))
+        .column((r.clone(), readings::Column::ParameterId))
+        .expr_as(Expr::cust("COUNT(*)"), Alias::new("n"))
+        .expr_as(
+            Func::min(Expr::col((r.clone(), readings::Column::Time))),
+            Alias::new("first_time"),
+        )
+        .expr_as(
+            Func::max(Expr::col((r.clone(), readings::Column::Time))),
+            Alias::new("last_time"),
+        )
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            standard_curves::Entity,
+            sc.clone(),
+            Expr::col((sc.clone(), standard_curves::Column::Id))
+                .equals((r.clone(), readings::Column::StandardCurveId)),
+        )
+        .cond_where(scanned)
+        .add_group_by([
+            Expr::col((r.clone(), readings::Column::SensorId)).into(),
+            Expr::col((sc.clone(), standard_curves::Column::Id)).into(),
+            Expr::col((sc.clone(), standard_curves::Column::SensorId)).into(),
+            Expr::col((sc.clone(), standard_curves::Column::Name)).into(),
+            Expr::col((r.clone(), readings::Column::SiteId)).into(),
+            Expr::col((r.clone(), readings::Column::ParameterId)).into(),
+        ])
+        .order_by_expr(Expr::cust("COUNT(*)"), Order::Desc)
+        .take()
+        .build(PostgresQueryBuilder);
 
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
+            sql,
             values,
         ))
         .await
@@ -1564,31 +1693,43 @@ async fn fetch_orphaned_corrections(
 ) -> AppResult<Vec<OrphanedCorrection>> {
     use sea_orm::{ConnectionTrait, Statement};
 
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    let time_filter = scan_floor_sql(since, &mut values);
-    let project_filter = project_filter_sql(scope, "s.project_id", &mut values)
-        .map(|predicate| {
-            format!("AND EXISTS (SELECT 1 FROM sites s WHERE s.id = r.site_id AND {predicate})")
-        })
-        .unwrap_or_default();
-    let sql = format!(
-        r"SELECT r.sensor_id, r.site_id, r.parameter_id, COUNT(*) AS orphan_count,
-                 MIN(r.time) AS first_time, MAX(r.time) AS last_time
-          FROM readings r
-          WHERE {orphaned}
-            AND r.measurement_type IS DISTINCT FROM 'derived'
-          {time_filter}
-          {project_filter}
-          GROUP BY r.sensor_id, r.site_id, r.parameter_id
-          ORDER BY COUNT(*) DESC",
-        orphaned =
+    let r = Alias::new("r");
+    let mut scanned = scan_floor(since)
+        .add(Expr::cust(
             crate::routes::private::sensors::calibrations::service::orphaned_correction_rows("r"),
-    );
+        ))
+        .add(Expr::cust("r.measurement_type IS DISTINCT FROM 'derived'"));
+    if let Some(predicate) = site_in_scope(scope) {
+        scanned = scanned.add(predicate);
+    }
+    let (sql, values) = SeaQuery::select()
+        .column((r.clone(), readings::Column::SensorId))
+        .column((r.clone(), readings::Column::SiteId))
+        .column((r.clone(), readings::Column::ParameterId))
+        .expr_as(Expr::cust("COUNT(*)"), Alias::new("orphan_count"))
+        .expr_as(
+            Func::min(Expr::col((r.clone(), readings::Column::Time))),
+            Alias::new("first_time"),
+        )
+        .expr_as(
+            Func::max(Expr::col((r.clone(), readings::Column::Time))),
+            Alias::new("last_time"),
+        )
+        .from_as(readings::Entity, r.clone())
+        .cond_where(scanned)
+        .add_group_by([
+            Expr::col((r.clone(), readings::Column::SensorId)).into(),
+            Expr::col((r.clone(), readings::Column::SiteId)).into(),
+            Expr::col((r.clone(), readings::Column::ParameterId)).into(),
+        ])
+        .order_by_expr(Expr::cust("COUNT(*)"), Order::Desc)
+        .take()
+        .build(PostgresQueryBuilder);
 
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
+            sql,
             values,
         ))
         .await
@@ -1844,53 +1985,140 @@ pub async fn undeclared_sd_estimators(
 ) -> AppResult<Json<UndeclaredEstimatorsResponse>> {
     use sea_orm::{FromQueryResult, Statement};
 
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    let project_filter = project_filter_sql(&scope, "st.project_id", &mut values)
-        .map(|predicate| format!(" AND {predicate}"))
-        .unwrap_or_default();
     let population_sd = &*crate::routes::private::sync::service::POPULATION_SD_SQL;
+    let sp = Alias::new("sp");
+    let st = Alias::new("st");
+    let p = Alias::new("p");
+    let u = Alias::new("u");
+    let s_ = Alias::new("s");
+    let h = Alias::new("h");
+    let sm = Alias::new("sm");
+    let ds = Alias::new("ds");
+    let ds2 = Alias::new("ds2");
+    let hold = Alias::new("h");
 
-    let sql = format!(
-        r"SELECT sp.site_id, sp.parameter_id, sp.id AS site_parameter_id,
-                 st.name AS site_name, p.name AS parameter_name, p.code AS parameter_code,
-                 u.undeclared_samples,
-                 COALESCE(s.source_reports_sd, false) AS source_reports_sd,
-                 COALESCE(s.streams, '[]'::jsonb) AS streams,
-                 COALESCE(h.open_holds, 0) AS open_holds,
-                 COALESCE(h.population_signature_holds, 0) AS population_signature_holds
-          FROM site_parameters sp
-          JOIN sites st ON st.id = sp.site_id
-          JOIN parameters p ON p.id = sp.parameter_id
-          JOIN LATERAL (
-              SELECT COUNT(*)::bigint AS undeclared_samples
-              FROM samples sm
-              WHERE sm.site_id = sp.site_id AND sm.parameter_id = sp.parameter_id
-                AND sm.sd_estimator_source = 'default'
-          ) u ON u.undeclared_samples > 0
-          LEFT JOIN LATERAL (
-              SELECT bool_or(ds.metadata #>> '{{replicates,portal_sd_column}}' IS NOT NULL)
-                         AS source_reports_sd,
-                     jsonb_agg(jsonb_build_object(
-                         'stream_id', ds.id,
-                         'source_system', ds.source_system,
-                         'source_key', ds.source_key)) AS streams
-              FROM data_streams ds
-              WHERE ds.site_parameter_id = sp.id
-          ) s ON true
-          LEFT JOIN LATERAL (
-              SELECT COUNT(*)::bigint AS open_holds,
-                     COUNT(*) FILTER (WHERE {population_sd})::bigint
-                         AS population_signature_holds
-              FROM replicate_audit_holds h
-              JOIN data_streams ds2 ON ds2.id = h.stream_id
-              WHERE ds2.site_parameter_id = sp.id
-                AND h.kind = 'replicate_stats'
-                AND h.status IN ('pending', 'deferred')
-          ) h ON true
-          WHERE sp.sd_estimator IS NULL{project_filter}
-          ORDER BY COALESCE(h.population_signature_holds, 0) DESC,
-                   u.undeclared_samples DESC"
-    );
+    let undeclared = SeaQuery::select()
+        .expr_as(
+            Expr::cust("COUNT(*)::bigint"),
+            Alias::new("undeclared_samples"),
+        )
+        .from_as(samples::Entity, sm.clone())
+        .and_where(Expr::cust("sm.site_id = sp.site_id"))
+        .and_where(Expr::cust("sm.parameter_id = sp.parameter_id"))
+        .and_where(Expr::col((sm.clone(), samples::Column::SdEstimatorSource)).eq("default"))
+        .take();
+
+    let sources = SeaQuery::select()
+        .expr_as(
+            Expr::cust("bool_or(ds.metadata #>> '{replicates,portal_sd_column}' IS NOT NULL)"),
+            Alias::new("source_reports_sd"),
+        )
+        .expr_as(
+            Expr::cust(
+                "jsonb_agg(jsonb_build_object('stream_id', ds.id, 'source_system', \
+                 ds.source_system, 'source_key', ds.source_key))",
+            ),
+            Alias::new("streams"),
+        )
+        .from_as(data_streams::Entity, ds.clone())
+        .and_where(Expr::cust("ds.site_parameter_id = sp.id"))
+        .take();
+
+    let holds = SeaQuery::select()
+        .expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("open_holds"))
+        .expr_as(
+            Expr::cust(format!("COUNT(*) FILTER (WHERE {population_sd})::bigint")),
+            Alias::new("population_signature_holds"),
+        )
+        .from_as(Alias::new("replicate_audit_holds"), hold.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            data_streams::Entity,
+            ds2.clone(),
+            Expr::cust("ds2.id = h.stream_id"),
+        )
+        .and_where(Expr::cust("ds2.site_parameter_id = sp.id"))
+        .and_where(Expr::cust("h.kind = 'replicate_stats'"))
+        .and_where(Expr::cust("h.status IN ('pending', 'deferred')"))
+        .take();
+
+    let mut undeclared_slots = Condition::all()
+        .add(Expr::col((sp.clone(), site_parameters::Column::SdEstimator)).is_null());
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    if let Some(predicate) = project_filter_sql(&scope, "st.project_id", &mut values) {
+        undeclared_slots = undeclared_slots.add(Expr::cust_with_values(predicate, values));
+    }
+
+    let on_true = || Condition::all().add(Expr::cust("true"));
+    let (sql, values) = SeaQuery::select()
+        .columns([
+            (sp.clone(), site_parameters::Column::SiteId),
+            (sp.clone(), site_parameters::Column::ParameterId),
+        ])
+        .expr_as(
+            Expr::col((sp.clone(), site_parameters::Column::Id)),
+            Alias::new("site_parameter_id"),
+        )
+        .expr_as(
+            Expr::col((st.clone(), sites::Column::Name)),
+            Alias::new("site_name"),
+        )
+        .expr_as(
+            Expr::col((p.clone(), parameters::Column::Name)),
+            Alias::new("parameter_name"),
+        )
+        .expr_as(
+            Expr::col((p.clone(), parameters::Column::Code)),
+            Alias::new("parameter_code"),
+        )
+        .column((u.clone(), Alias::new("undeclared_samples")))
+        .expr_as(
+            Expr::cust("COALESCE(s.source_reports_sd, false)"),
+            Alias::new("source_reports_sd"),
+        )
+        .expr_as(
+            Expr::cust("COALESCE(s.streams, '[]'::jsonb)"),
+            Alias::new("streams"),
+        )
+        .expr_as(
+            Expr::cust("COALESCE(h.open_holds, 0)"),
+            Alias::new("open_holds"),
+        )
+        .expr_as(
+            Expr::cust("COALESCE(h.population_signature_holds, 0)"),
+            Alias::new("population_signature_holds"),
+        )
+        .from_as(site_parameters::Entity, sp.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            sites::Entity,
+            st.clone(),
+            Expr::col((st.clone(), sites::Column::Id))
+                .equals((sp.clone(), site_parameters::Column::SiteId)),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            parameters::Entity,
+            p.clone(),
+            Expr::col((p.clone(), parameters::Column::Id))
+                .equals((sp.clone(), site_parameters::Column::ParameterId)),
+        )
+        .join_lateral(
+            JoinType::InnerJoin,
+            undeclared,
+            u.clone(),
+            Condition::all().add(Expr::cust("u.undeclared_samples > 0")),
+        )
+        .join_lateral(JoinType::LeftJoin, sources, s_.clone(), on_true())
+        .join_lateral(JoinType::LeftJoin, holds, h.clone(), on_true())
+        .cond_where(undeclared_slots)
+        .order_by_expr(
+            Expr::cust("COALESCE(h.population_signature_holds, 0)"),
+            Order::Desc,
+        )
+        .order_by_expr(Expr::cust("u.undeclared_samples"), Order::Desc)
+        .take()
+        .build(PostgresQueryBuilder);
 
     let slots = UndeclaredEstimatorSlot::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
@@ -1965,6 +2193,9 @@ pub async fn curation_drift(
     values.push(i64::from(limit).into());
     let limit_param = values.len();
 
+    // Still spelled: the drift definition it reads from is `inconsistent_rows_sql`, a CTE with
+    // nested laterals over a VALUES list, and a subquery in `FROM` takes a built statement or
+    // nothing. It converts when that fragment does (C223).
     let sql = format!(
         r"SELECT d.stream_id, d.time, d.replicate_index, r.site_id, r.parameter_id,
                  jsonb_strip_nulls(jsonb_build_object(
@@ -1981,7 +2212,7 @@ pub async fn curation_drift(
           {project_filter}
           ORDER BY d.time DESC
           LIMIT ${limit_param}",
-        drift = crate::routes::private::readings::decisions::inconsistent_rows_sql(),
+        drift = crate::routes::private::readings::service::inconsistent_rows_sql(),
     );
 
     let rows = app_state
@@ -1997,7 +2228,7 @@ pub async fn curation_drift(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Json(CurationDriftResponse {
-        total: crate::routes::private::readings::decisions::curation_drift_count(&app_state.db)
+        total: crate::routes::private::readings::service::curation_drift_count(&app_state.db)
             .await?,
         rows,
     }))

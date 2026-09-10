@@ -18,6 +18,10 @@
 //! ```
 
 use chrono::{DateTime, Utc};
+use sea_orm::sea_query::{
+    Alias, CommonTableExpression, DeleteStatement, Expr, Func, InsertStatement,
+    PostgresQueryBuilder, Query, SubQueryStatement, UpdateStatement, WithClause,
+};
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, FromQueryResult, Statement, TransactionSession,
     TransactionTrait,
@@ -129,13 +133,61 @@ where
     outcome
 }
 
+/// The three statement kinds a guarded mutation accepts, so a caller hands over what the builder
+/// produced rather than SQL text.
+pub enum Dml {
+    Update(UpdateStatement),
+    Delete(DeleteStatement),
+    Insert(InsertStatement),
+}
+
+impl From<UpdateStatement> for Dml {
+    fn from(statement: UpdateStatement) -> Self {
+        Self::Update(statement)
+    }
+}
+
+impl From<DeleteStatement> for Dml {
+    fn from(statement: DeleteStatement) -> Self {
+        Self::Delete(statement)
+    }
+}
+
+impl From<InsertStatement> for Dml {
+    fn from(statement: InsertStatement) -> Self {
+        Self::Insert(statement)
+    }
+}
+
+impl Dml {
+    /// The statement with `RETURNING time` on it, as the summary wrapper needs.
+    fn returning_time(self) -> SubQueryStatement {
+        let time = Alias::new("time");
+        match self {
+            Self::Update(mut statement) => {
+                statement.returning_col(time);
+                SubQueryStatement::UpdateStatement(statement)
+            }
+            Self::Delete(mut statement) => {
+                statement.returning_col(time);
+                SubQueryStatement::DeleteStatement(statement)
+            }
+            Self::Insert(mut statement) => {
+                statement.returning_col(time);
+                SubQueryStatement::InsertStatement(statement)
+            }
+        }
+    }
+}
+
 /// One hypertable DML statement in its own guarded transaction, reporting the rows and the time span
 /// it touched.
 pub async fn guarded_mutation<C: TransactionTrait>(
     db: &C,
-    statement: Statement,
+    statement: impl Into<Dml>,
 ) -> AppResult<TouchedRange> {
-    guarded(db, async |txn| mutation(txn, statement).await).await
+    let statement = summary_of(statement.into());
+    guarded(db, async |txn| run_summary(txn, statement).await).await
 }
 
 /// One hypertable DML statement on a connection that is already inside a guarded transaction,
@@ -143,14 +195,43 @@ pub async fn guarded_mutation<C: TransactionTrait>(
 /// `DELETE` against a table with a `time` column, and must not carry its own `RETURNING`.
 pub async fn mutation<C: ConnectionTrait>(
     conn: &C,
+    statement: impl Into<Dml>,
+) -> AppResult<TouchedRange> {
+    run_summary(conn, summary_of(statement.into())).await
+}
+
+/// [`guarded_mutation`] over a statement still spelled as text.
+pub async fn guarded_mutation_sql<C: TransactionTrait>(
+    db: &C,
     statement: Statement,
 ) -> AppResult<TouchedRange> {
-    let wrapped = Statement {
-        sql: wrap_returning_time(&statement.sql),
-        values: statement.values,
-        db_backend: statement.db_backend,
-    };
-    let row = conn.query_one_raw(wrapped).await?.ok_or_else(|| {
+    guarded(db, async |txn| mutation_sql(txn, statement).await).await
+}
+
+/// The same wrapper over a statement still spelled as text. Every caller here is a lifted
+/// hypertable write not yet expressed through the builder.
+pub async fn mutation_sql<C: ConnectionTrait>(
+    conn: &C,
+    statement: Statement,
+) -> AppResult<TouchedRange> {
+    run_summary(
+        conn,
+        Statement {
+            sql: wrap_returning_time(&statement.sql),
+            values: statement.values,
+            db_backend: statement.db_backend,
+        },
+    )
+    .await
+}
+
+/// Read back the summary a wrapped statement returns. Takes the statement already wrapped, so
+/// nothing has to recognise the wrapper by its own text.
+async fn run_summary<C: ConnectionTrait>(
+    conn: &C,
+    statement: Statement,
+) -> AppResult<TouchedRange> {
+    let row = conn.query_one_raw(statement).await?.ok_or_else(|| {
         AppError::Internal("Guarded mutation returned no summary row".to_string())
     })?;
     let summary = TouchedSummary::from_query_result(&row, "")?;
@@ -159,6 +240,32 @@ pub async fn mutation<C: ConnectionTrait>(
         min_time: summary.min_time,
         max_time: summary.max_time,
     })
+}
+
+/// The same wrapper as [`wrap_returning_time`], built rather than formatted.
+fn summary_of(statement: Dml) -> Statement {
+    let mut mutated = CommonTableExpression::new();
+    mutated
+        .table_name(Alias::new("mutated"))
+        .query(statement.returning_time());
+    let with = WithClause::new().cte(mutated).to_owned();
+
+    let query = Query::select()
+        .expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("touched_rows"))
+        .expr_as(
+            Func::min(Expr::col(Alias::new("time"))),
+            Alias::new("min_time"),
+        )
+        .expr_as(
+            Func::max(Expr::col(Alias::new("time"))),
+            Alias::new("max_time"),
+        )
+        .from(Alias::new("mutated"))
+        .to_owned()
+        .with(with);
+
+    let (sql, values) = query.build(PostgresQueryBuilder);
+    Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values)
 }
 
 /// Wrap a DML statement so it reports its row count and time span in one round trip.

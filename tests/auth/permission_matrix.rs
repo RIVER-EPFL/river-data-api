@@ -386,6 +386,26 @@ fn entities() -> Vec<Entity> {
             families: &["read", "update"],
             ..sensor("schedules", CrudScope::Global)
         },
+        // The alarm history: the sweeper opens and resolves episodes, nothing else writes one.
+        Entity {
+            families: &["read"],
+            ..field_data("alarm_events", CrudScope::ProjectBound)
+        },
+        // One row per tool calculation, minted by the run itself.
+        Entity {
+            families: &["read"],
+            ..field_data("tool_runs", CrudScope::ProjectBound)
+        },
+        // Append-only: every writer is a side effect of the change it records.
+        Entity {
+            families: &["read"],
+            ..field("change_audit_entries", CrudScope::Global)
+        },
+        // Written by the ingest pass, deleted only by the janitor's age prune.
+        Entity {
+            families: &["read"],
+            ..field("ingest_receipts", CrudScope::Global)
+        },
     ]
 }
 
@@ -1208,9 +1228,11 @@ fn every_registered_route_has_a_row() {
         // credential and the session token, not the capability gates this table covers.
         "/api/sync/enroll",
         "/api/sync/heartbeat",
+        "/api/sync/events/{id}",
         // The tool authoring surface's runner-backed drafts, exercised by the tools theme against
         // a live runner; the gate is the same require_admin as its siblings in the table.
         "/api/tool_scripts/draft_run",
+        "/api/tool_scripts/{id}/formulas/draft_run",
         // Both send: a probe here would try to deliver. Their gates are the require_read_data and
         // require_admin the sibling rows in the table already carry.
         "/api/notifications/me/push/test",
@@ -1309,7 +1331,14 @@ fn every_row_names_a_route_that_still_exists() {
         .map(|r| r.declared)
         .filter(|d| d.starts_with("/api/sync/"))
         .filter(|d| !registered.contains(*d) && !registered.contains(d.trim_end_matches('/')))
-        .filter(|d| !["/api/sync/enroll", "/api/sync/heartbeat"].contains(d))
+        .filter(|d| {
+            ![
+                "/api/sync/enroll",
+                "/api/sync/heartbeat",
+                "/api/sync/events/{id}",
+            ]
+            .contains(d)
+        })
         .collect();
     assert!(
         gone.is_empty(),

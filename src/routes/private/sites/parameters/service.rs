@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query, SimpleExpr};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
     QuerySelect, TransactionTrait,
@@ -13,8 +13,10 @@ use super::models::{
     SlotDescriptor,
 };
 use crate::error::AppResult;
+use crate::routes::private::data_streams;
 use crate::routes::private::parameters;
 use crate::routes::private::parameters::derived::definition_model as calculation_formulas;
+use crate::routes::private::readings::samples;
 use crate::routes::private::reprocessing_jobs::model as reprocessing_jobs;
 use crate::routes::private::sensors::service::require_measuring_instrument;
 
@@ -314,12 +316,41 @@ pub fn partition_members(
     (create, existing)
 }
 
-/// SQL selecting the slots a retag names, by slot id (`$2`) or through a stream's pairing (`$3`).
-pub const SLOT_SCOPE: &str = "EXISTS (SELECT 1 FROM site_parameters sp \
-     WHERE sp.site_id = s.site_id AND sp.parameter_id = s.parameter_id \
-       AND (sp.id = ANY($2) \
-            OR EXISTS (SELECT 1 FROM data_streams ds \
-                       WHERE ds.id = ANY($3) AND ds.site_parameter_id = sp.id)))";
+/// The `samples` rows a retag names: those whose slot is named by id, or reached through the
+/// pairing of a named stream. Written against the unaliased `samples` table, so it composes into
+/// `samples::Entity::find()` and `update_many()` alike.
+#[must_use]
+pub fn slot_scope(site_parameter_ids: &[Uuid], stream_ids: &[Uuid]) -> SimpleExpr {
+    let sp = Alias::new("sp");
+    let ds = Alias::new("ds");
+    let mut streams = Query::select();
+    streams
+        .expr(Expr::val(1))
+        .from_as(data_streams::Entity, ds.clone())
+        .and_where(Expr::col((ds.clone(), data_streams::Column::Id)).is_in(stream_ids.to_vec()))
+        .and_where(
+            Expr::col((ds, data_streams::Column::SiteParameterId)).equals((sp.clone(), Column::Id)),
+        );
+
+    let mut slots = Query::select();
+    slots
+        .expr(Expr::val(1))
+        .from_as(Entity, sp.clone())
+        .and_where(
+            Expr::col((sp.clone(), Column::SiteId))
+                .equals((samples::Entity, samples::Column::SiteId)),
+        )
+        .and_where(
+            Expr::col((sp.clone(), Column::ParameterId))
+                .equals((samples::Entity, samples::Column::ParameterId)),
+        )
+        .and_where(
+            Expr::col((sp, Column::Id))
+                .is_in(site_parameter_ids.to_vec())
+                .or(Expr::exists(streams)),
+        );
+    Expr::exists(slots)
+}
 
 #[cfg(test)]
 #[path = "tests/service.rs"]

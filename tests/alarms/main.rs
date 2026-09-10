@@ -7,6 +7,7 @@
 mod common;
 
 mod backfill_reconstruction;
+mod curation_and_evaluation;
 mod event_driven_reconcile;
 mod events_feed_and_summary;
 mod export_summary_counts;

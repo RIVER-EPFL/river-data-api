@@ -2143,3 +2143,71 @@ pub struct EventRecompute;
 
 /// `event_audit`: the missing/stale report over one event, one site, or everything.
 pub struct EventAudit;
+
+pub mod run {
+    use crudcrate::EntityToModels;
+    use sea_orm::entity::prelude::*;
+
+    /// One execution of a calculation: what went in, what came out, and the version that decided.
+    /// A row is minted only by `/tools/{name}/calculate` and never edited, which is what lets a
+    /// saved reading point at one as its provenance (D9). `context` records the calculation
+    /// context the server resolved, `source` the path that minted it (interactive, csv_import,
+    /// chain).
+    #[derive(
+        Clone,
+        Debug,
+        PartialEq,
+        DeriveEntityModel,
+        serde::Serialize,
+        serde::Deserialize,
+        EntityToModels,
+    )]
+    #[sea_orm(table_name = "tool_runs")]
+    #[crudcrate(
+        api_struct = "ToolRun",
+        name_singular = "tool_run",
+        name_plural = "tool_runs",
+        generate_router,
+        routes(read),
+        derive_partial_eq
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
+        pub id: Uuid,
+        #[crudcrate(filterable, sortable)]
+        pub tool_name: String,
+        /// The version that ran, as the provenance blob carries it.
+        #[sea_orm(column_type = "JsonBinary")]
+        pub tool_version: serde_json::Value,
+        #[sea_orm(column_type = "JsonBinary")]
+        #[crudcrate(exclude(list))]
+        pub inputs: serde_json::Value,
+        #[sea_orm(column_type = "JsonBinary")]
+        #[crudcrate(exclude(list))]
+        pub constants: serde_json::Value,
+        #[sea_orm(column_type = "JsonBinary")]
+        #[crudcrate(exclude(list))]
+        pub curves: serde_json::Value,
+        #[sea_orm(column_type = "JsonBinary")]
+        #[crudcrate(exclude(list))]
+        pub outputs: serde_json::Value,
+        #[crudcrate(filterable, sortable)]
+        pub created_by: String,
+        #[crudcrate(exclude(create, update), sortable)]
+        pub created_at: chrono::DateTime<chrono::Utc>,
+        /// The resolved calculation context: site, collected_at, and the station and event inputs
+        /// the server read. Null on a run that named none.
+        #[sea_orm(column_type = "JsonBinary", nullable)]
+        #[crudcrate(exclude(list))]
+        pub context: Option<serde_json::Value>,
+        /// Which path minted the run: `interactive`, `csv_import` or `chain`.
+        #[crudcrate(filterable, sortable)]
+        pub source: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

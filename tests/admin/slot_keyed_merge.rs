@@ -116,7 +116,7 @@ async fn a_merge_carries_every_slot_keyed_table_to_the_survivor() {
         &db,
         &request(),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await
     .expect("the merge applies");
@@ -156,7 +156,7 @@ async fn a_merge_that_would_collide_two_samples_is_refused_and_changes_nothing()
         &db,
         &request(),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await;
     let Err(AppError::Conflict(message)) = outcome else {
@@ -199,7 +199,7 @@ async fn merging_an_empty_slot_reports_no_rows_and_still_deletes_it() {
         &db,
         &request(),
         "tester",
-        river_db::routes::private::readings::decisions::Origin::Manual,
+        river_db::routes::private::readings::models::Origin::Manual,
     )
     .await
     .expect("a slot with no data merges");
@@ -236,7 +236,7 @@ async fn a_merge_onto_itself_is_refused() {
             &db,
             &same,
             "tester",
-            river_db::routes::private::readings::decisions::Origin::Manual
+            river_db::routes::private::readings::models::Origin::Manual
         )
         .await,
         Err(AppError::BadRequest(_))

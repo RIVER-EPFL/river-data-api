@@ -390,6 +390,125 @@
         ],
         "type": "object"
       },
+      "AlarmEventList": {
+        "properties": {
+          "acknowledged_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "acknowledged_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "last_seen_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "last_value": {
+            "format": "double",
+            "type": "number"
+          },
+          "max_severity": {
+            "description": "The worst it has been, which is what the history is ranked by.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "measurement_type": {
+            "description": "The cadence the episode belongs to: a grab series and a sensor series alarm apart.",
+            "type": "string"
+          },
+          "notified_at": {
+            "description": "When the subscribers were told the episode opened.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parameter_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "resolution_notified_at": {
+            "description": "When they were told it closed.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolved_at": {
+            "description": "NULL while the breach stands; the sweeper stamps it when the value returns to range.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolved_value": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "severity": {
+            "description": "1 = warning, 2 = alarm; what the episode reads as now.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "site_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "value_at_start": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "site_id",
+          "parameter_id",
+          "severity",
+          "max_severity",
+          "started_at",
+          "value_at_start",
+          "last_seen_at",
+          "last_value",
+          "acknowledged_at",
+          "acknowledged_by",
+          "resolved_at",
+          "resolved_value",
+          "created_at",
+          "updated_at",
+          "notified_at",
+          "resolution_notified_at",
+          "measurement_type"
+        ],
+        "type": "object"
+      },
       "AlarmEventResponse": {
         "description": "A single persisted alarm event",
         "properties": {
@@ -3239,8 +3358,84 @@
         },
         "type": "object"
       },
+      "ChangeAuditList": {
+        "properties": {
+          "change": {
+            "description": "What happened, as the writer named it: `schedule_update`, `member_insert`, and so on.",
+            "type": "string"
+          },
+          "changed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "changed_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "new_value": {},
+          "old_value": {},
+          "subject": {
+            "description": "The thing the change was made to, as the writer keyed it: `schedule:{job_name}`,\n`parameter:{id}`, `site_parameter:{id}`, `parameter_group:{id}`, `push_subscriptions:{sub}`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "subject",
+          "change",
+          "changed_by",
+          "old_value",
+          "new_value",
+          "changed_at"
+        ],
+        "type": "object"
+      },
+      "ChangeAuditResponse": {
+        "properties": {
+          "change": {
+            "description": "What happened, as the writer named it: `schedule_update`, `member_insert`, and so on.",
+            "type": "string"
+          },
+          "changed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "changed_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "new_value": {},
+          "old_value": {},
+          "subject": {
+            "description": "The thing the change was made to, as the writer keyed it: `schedule:{job_name}`,\n`parameter:{id}`, `site_parameter:{id}`, `parameter_group:{id}`, `push_subscriptions:{sub}`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "subject",
+          "change",
+          "changed_by",
+          "old_value",
+          "new_value",
+          "changed_at"
+        ],
+        "type": "object"
+      },
       "ChangeEntry": {
-        "description": "One entry as the API exposes it.",
+        "description": "One entry as the subject-keyed reader exposes it.",
         "properties": {
           "change": {
             "description": "What happened, as the writer named it: `schedule_update`, `member_insert`, and so on.",
@@ -5728,6 +5923,54 @@
         ],
         "type": "object"
       },
+      "DraftFormula": {
+        "description": "One formula of a draft set, as the calculation editor holds it: the same fields the stored\nformula carries, without an id, because the point is to run what is not saved yet.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "curve_slot": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "formula": {
+            "type": "string"
+          },
+          "intermediate": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ordinal": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "per_replicate": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "units": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "code",
+          "formula",
+          "ordinal"
+        ],
+        "type": "object"
+      },
       "DraftRunFailure": {
         "properties": {
           "call": {
@@ -6778,6 +7021,151 @@
           "count",
           "first_time",
           "last_time"
+        ],
+        "type": "object"
+      },
+      "FormulaDraftRunRequest": {
+        "description": "Run a formula calculation's unsaved formula set at a visit. The formulas replace the stored\nset for this run only; nothing is written.",
+        "properties": {
+          "constants": {
+            "additionalProperties": {
+              "format": "double",
+              "type": "number"
+            },
+            "description": "Constant values in place of the catalog; omit to read the catalog.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "formulas": {
+            "items": {
+              "$ref": "#/components/schemas/DraftFormula"
+            },
+            "type": "array"
+          },
+          "inputs": {
+            "additionalProperties": {},
+            "description": "The calculate request body: `site_id`, `collected_at`, replicate lists and any value\noverriding what the visit holds.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "formulas"
+        ],
+        "type": "object"
+      },
+      "FormulaDraftRunResponse": {
+        "allOf": [
+          {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FormulaDraftRunResults"
+              }
+            ]
+          },
+          {
+            "properties": {
+              "failure": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/DraftRunFailure"
+                  }
+                ]
+              },
+              "manifest": {
+                "description": "The manifest the formula set implies: its params, outputs, constants, curve slots and the\nsite and event inputs, in the shape `GET /tools` serves.",
+                "type": "object"
+              },
+              "ran": {
+                "description": "True when the run fields are present; false when `failure` is.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "ran",
+              "failure",
+              "manifest"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "FormulaDraftRunResults": {
+        "description": "What the formula set produced, present only when the run reached the end.",
+        "properties": {
+          "constants": {
+            "additionalProperties": {
+              "format": "double",
+              "type": "number"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "curves": {
+            "items": {
+              "$ref": "#/components/schemas/CurveSnapshot"
+            },
+            "type": "array"
+          },
+          "event_inputs": {
+            "description": "The visit's stored values the run read, as `{param, parameter_code, parameter_id, value}`.",
+            "items": {},
+            "type": "array"
+          },
+          "inputs_ignored": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "inputs_used": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "results": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "site_inputs": {
+            "description": "The site properties the run read, as `{property, param, value}`.",
+            "items": {},
+            "type": "array"
+          },
+          "skipped": {
+            "description": "Outputs the run did not produce, each with its reason.",
+            "items": {},
+            "type": "array"
+          }
+        },
+        "required": [
+          "results",
+          "skipped",
+          "inputs_used",
+          "inputs_ignored",
+          "constants",
+          "curves",
+          "site_inputs",
+          "event_inputs"
         ],
         "type": "object"
       },
@@ -8168,6 +8556,204 @@
         "required": [
           "stream_id",
           "readings"
+        ],
+        "type": "object"
+      },
+      "IngestReceiptList": {
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "brake_threshold": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "braked": {
+            "type": "boolean"
+          },
+          "changed": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "changed_keys": {},
+          "dropped": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "new_rows": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "proposed": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "rejected": {},
+          "rejected_total": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "retained": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "stream_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "submitted": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "unchanged": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "window_from": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "window_to": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "withdrawn": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "stream_id",
+          "at",
+          "window_from",
+          "window_to",
+          "submitted",
+          "new_rows",
+          "changed",
+          "unchanged",
+          "retained",
+          "rejected_total",
+          "rejected",
+          "dropped",
+          "withdrawn",
+          "changed_keys",
+          "braked",
+          "brake_threshold",
+          "proposed"
+        ],
+        "type": "object"
+      },
+      "IngestReceiptResponse": {
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "brake_threshold": {
+            "format": "float",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "braked": {
+            "type": "boolean"
+          },
+          "changed": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "changed_keys": {},
+          "dropped": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "new_rows": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "proposed": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "rejected": {},
+          "rejected_total": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "retained": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "stream_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "submitted": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "unchanged": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "window_from": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "window_to": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "withdrawn": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "stream_id",
+          "at",
+          "window_from",
+          "window_to",
+          "submitted",
+          "new_rows",
+          "changed",
+          "unchanged",
+          "retained",
+          "rejected_total",
+          "rejected",
+          "dropped",
+          "withdrawn",
+          "changed_keys",
+          "braked",
+          "brake_threshold",
+          "proposed"
         ],
         "type": "object"
       },
@@ -22785,6 +23371,86 @@
         ],
         "type": "object"
       },
+      "ToolRunList": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "source": {
+            "description": "Which path minted the run: `interactive`, `csv_import` or `chain`.",
+            "type": "string"
+          },
+          "tool_name": {
+            "type": "string"
+          },
+          "tool_version": {
+            "description": "The version that ran, as the provenance blob carries it."
+          }
+        },
+        "required": [
+          "id",
+          "tool_name",
+          "tool_version",
+          "created_by",
+          "created_at",
+          "source"
+        ],
+        "type": "object"
+      },
+      "ToolRunResponse": {
+        "properties": {
+          "constants": {},
+          "context": {
+            "description": "The resolved calculation context: site, collected_at, and the station and event inputs\nthe server read. Null on a run that named none."
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "type": "string"
+          },
+          "curves": {},
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "inputs": {},
+          "outputs": {},
+          "source": {
+            "description": "Which path minted the run: `interactive`, `csv_import` or `chain`.",
+            "type": "string"
+          },
+          "tool_name": {
+            "type": "string"
+          },
+          "tool_version": {
+            "description": "The version that ran, as the provenance blob carries it."
+          }
+        },
+        "required": [
+          "id",
+          "tool_name",
+          "tool_version",
+          "inputs",
+          "constants",
+          "curves",
+          "outputs",
+          "created_by",
+          "created_at",
+          "context",
+          "source"
+        ],
+        "type": "object"
+      },
       "ToolScript": {
         "properties": {
           "active_version_id": {
@@ -24719,6 +25385,150 @@
         "tags": [
           "actions"
         ]
+      }
+    },
+    "/api/alarm_events": {
+      "get": {
+        "description": "Retrieves all alarm_events.\n\nThis resource manages alarm_event items\n\nAdditional sortable columns: \n- site_id\n- parameter_id\n- severity\n- max_severity\n- started_at\n- last_seen_at\n- acknowledged_at\n- resolved_at\n- created_at\n- measurement_type.\n\nAdditional filterable columns: \n- site_id\n- parameter_id\n- severity\n- max_severity\n- acknowledged_at\n- acknowledged_by\n- resolved_at\n- measurement_type.",
+        "operationId": "get_all_alarm_events",
+        "parameters": [
+          {
+            "description": "JSON-encoded filter for querying resources.\n\nThis parameter supports various filtering options:\n- Free text search: `{\"q\": \"search text\"}`\n- Filtering by a single ID: `{\"id\": \"550e8400-e29b-41d4-a716-446655440000\"}`\n- Filtering by multiple IDs: `{\"id\": [\"550e8400-e29b-41d4-a716-446655440000\", \"550e8400-e29b-41d4-a716-446655440001\"]}`\n- Filtering on other columns: `{\"name\": \"example\"}`",
+            "example": {
+              "id": "550e8400-e29b-41d4-a716-446655440000",
+              "name": "example",
+              "q": "search text"
+            },
+            "in": "query",
+            "name": "filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Range for pagination in the format \"[start, end]\".\n\nExample: `[0,9]`",
+            "example": "[0,9]",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number for standard REST pagination (1-based).\n\nExample: `1`",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page for standard REST pagination.\n\nExample: `10`",
+            "example": 10,
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort order for the results in the format `[\"column\", \"order\"]`.\n\nExample: `[\"id\", \"ASC\"]`",
+            "example": "[\"id\", \"ASC\"]",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort column for standard REST format.\n\nExample: `title`",
+            "example": "title",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort order for standard REST format (ASC or DESC).\n\nExample: `ASC`",
+            "example": "ASC",
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AlarmEventList"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "List of resources"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get all alarm_events"
+      }
+    },
+    "/api/alarm_events/{id}": {
+      "get": {
+        "description": "Retrieves one alarm_event by its ID.\n\nThis resource manages alarm_event items",
+        "operationId": "get_one_alarm_event",
+        "parameters": [
+          {
+            "description": "Resource identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AlarmEventResponse"
+                }
+              }
+            },
+            "description": "The requested resource"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get one alarm_event"
       }
     },
     "/api/alarm_thresholds": {
@@ -26672,6 +27482,150 @@
         "tags": [
           "admin"
         ]
+      }
+    },
+    "/api/change_audit_entries": {
+      "get": {
+        "description": "Retrieves all change_audit_entries.\n\nThis resource manages change_audit_entry items\n\nAdditional sortable columns: \n- subject\n- change\n- changed_by\n- changed_at.\n\nAdditional filterable columns: \n- subject\n- change\n- changed_by.",
+        "operationId": "get_all_change_audit_entries",
+        "parameters": [
+          {
+            "description": "JSON-encoded filter for querying resources.\n\nThis parameter supports various filtering options:\n- Free text search: `{\"q\": \"search text\"}`\n- Filtering by a single ID: `{\"id\": \"550e8400-e29b-41d4-a716-446655440000\"}`\n- Filtering by multiple IDs: `{\"id\": [\"550e8400-e29b-41d4-a716-446655440000\", \"550e8400-e29b-41d4-a716-446655440001\"]}`\n- Filtering on other columns: `{\"name\": \"example\"}`",
+            "example": {
+              "id": "550e8400-e29b-41d4-a716-446655440000",
+              "name": "example",
+              "q": "search text"
+            },
+            "in": "query",
+            "name": "filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Range for pagination in the format \"[start, end]\".\n\nExample: `[0,9]`",
+            "example": "[0,9]",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number for standard REST pagination (1-based).\n\nExample: `1`",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page for standard REST pagination.\n\nExample: `10`",
+            "example": 10,
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort order for the results in the format `[\"column\", \"order\"]`.\n\nExample: `[\"id\", \"ASC\"]`",
+            "example": "[\"id\", \"ASC\"]",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort column for standard REST format.\n\nExample: `title`",
+            "example": "title",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort order for standard REST format (ASC or DESC).\n\nExample: `ASC`",
+            "example": "ASC",
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ChangeAuditList"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "List of resources"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get all change_audit_entries"
+      }
+    },
+    "/api/change_audit_entries/{id}": {
+      "get": {
+        "description": "Retrieves one change_audit_entry by its ID.\n\nThis resource manages change_audit_entry items",
+        "operationId": "get_one_change_audit_entry",
+        "parameters": [
+          {
+            "description": "Resource identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeAuditResponse"
+                }
+              }
+            },
+            "description": "The requested resource"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get one change_audit_entry"
       }
     },
     "/api/collection_events": {
@@ -29336,6 +30290,150 @@
         "tags": [
           "ingestion"
         ]
+      }
+    },
+    "/api/ingest_receipts": {
+      "get": {
+        "description": "Retrieves all ingest_receipts.\n\nThis resource manages ingest_receipt items\n\nAdditional sortable columns: \n- stream_id\n- at\n- window_from\n- window_to.\n\nAdditional filterable columns: \n- stream_id\n- braked.",
+        "operationId": "get_all_ingest_receipts",
+        "parameters": [
+          {
+            "description": "JSON-encoded filter for querying resources.\n\nThis parameter supports various filtering options:\n- Free text search: `{\"q\": \"search text\"}`\n- Filtering by a single ID: `{\"id\": \"550e8400-e29b-41d4-a716-446655440000\"}`\n- Filtering by multiple IDs: `{\"id\": [\"550e8400-e29b-41d4-a716-446655440000\", \"550e8400-e29b-41d4-a716-446655440001\"]}`\n- Filtering on other columns: `{\"name\": \"example\"}`",
+            "example": {
+              "id": "550e8400-e29b-41d4-a716-446655440000",
+              "name": "example",
+              "q": "search text"
+            },
+            "in": "query",
+            "name": "filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Range for pagination in the format \"[start, end]\".\n\nExample: `[0,9]`",
+            "example": "[0,9]",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number for standard REST pagination (1-based).\n\nExample: `1`",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page for standard REST pagination.\n\nExample: `10`",
+            "example": 10,
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort order for the results in the format `[\"column\", \"order\"]`.\n\nExample: `[\"id\", \"ASC\"]`",
+            "example": "[\"id\", \"ASC\"]",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort column for standard REST format.\n\nExample: `title`",
+            "example": "title",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort order for standard REST format (ASC or DESC).\n\nExample: `ASC`",
+            "example": "ASC",
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/IngestReceiptList"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "List of resources"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get all ingest_receipts"
+      }
+    },
+    "/api/ingest_receipts/{id}": {
+      "get": {
+        "description": "Retrieves one ingest_receipt by its ID.\n\nThis resource manages ingest_receipt items",
+        "operationId": "get_one_ingest_receipt",
+        "parameters": [
+          {
+            "description": "Resource identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestReceiptResponse"
+                }
+              }
+            },
+            "description": "The requested resource"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get one ingest_receipt"
       }
     },
     "/api/instruments/overview": {
@@ -46011,6 +47109,150 @@
         ]
       }
     },
+    "/api/tool_runs": {
+      "get": {
+        "description": "Retrieves all tool_runs.\n\nThis resource manages tool_run items\n\nAdditional sortable columns: \n- tool_name\n- created_by\n- created_at\n- source.\n\nAdditional filterable columns: \n- tool_name\n- created_by\n- source.",
+        "operationId": "get_all_tool_runs",
+        "parameters": [
+          {
+            "description": "JSON-encoded filter for querying resources.\n\nThis parameter supports various filtering options:\n- Free text search: `{\"q\": \"search text\"}`\n- Filtering by a single ID: `{\"id\": \"550e8400-e29b-41d4-a716-446655440000\"}`\n- Filtering by multiple IDs: `{\"id\": [\"550e8400-e29b-41d4-a716-446655440000\", \"550e8400-e29b-41d4-a716-446655440001\"]}`\n- Filtering on other columns: `{\"name\": \"example\"}`",
+            "example": {
+              "id": "550e8400-e29b-41d4-a716-446655440000",
+              "name": "example",
+              "q": "search text"
+            },
+            "in": "query",
+            "name": "filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Range for pagination in the format \"[start, end]\".\n\nExample: `[0,9]`",
+            "example": "[0,9]",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number for standard REST pagination (1-based).\n\nExample: `1`",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page for standard REST pagination.\n\nExample: `10`",
+            "example": 10,
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort order for the results in the format `[\"column\", \"order\"]`.\n\nExample: `[\"id\", \"ASC\"]`",
+            "example": "[\"id\", \"ASC\"]",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort column for standard REST format.\n\nExample: `title`",
+            "example": "title",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort order for standard REST format (ASC or DESC).\n\nExample: `ASC`",
+            "example": "ASC",
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ToolRunList"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "List of resources"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get all tool_runs"
+      }
+    },
+    "/api/tool_runs/{id}": {
+      "get": {
+        "description": "Retrieves one tool_run by its ID.\n\nThis resource manages tool_run items",
+        "operationId": "get_one_tool_run",
+        "parameters": [
+          {
+            "description": "Resource identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolRunResponse"
+                }
+              }
+            },
+            "description": "The requested resource"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get one tool_run"
+      }
+    },
     "/api/tool_runs/{id}/reload": {
       "get": {
         "operationId": "reload_run",
@@ -46275,6 +47517,56 @@
           }
         },
         "summary": "The script's activation history, newest first. Requires Administrator.",
+        "tags": [
+          "tool_scripts"
+        ]
+      }
+    },
+    "/api/tool_scripts/{id}/formulas/draft_run": {
+      "post": {
+        "description": "Each formula's variables resolve as a save would resolve them (a catalog parameter, a\nconstant, a column of `sites`), the set is ordered and checked as a version mint would check\nit, and the run reads the visit exactly as `/tools/{name}/calculate` does. Nothing is stored:\nno version, no run row, no reading. A formula the set refuses (an unknown variable, a cycle,\nan unreadable expression) is a 400 naming it; a run that ends without results reports why at\n200, as the script draft run does.",
+        "operationId": "draft_run_formulas",
+        "parameters": [
+          {
+            "description": "The formula calculation",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FormulaDraftRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FormulaDraftRunResponse"
+                }
+              }
+            },
+            "description": "The results or the reason the run ended, and the manifest the set implies"
+          },
+          "400": {
+            "description": "A formula the set refuses, or a calculation that is not formula-engined"
+          },
+          "404": {
+            "description": "No such calculation"
+          }
+        },
+        "summary": "Run an unsaved formula set at a visit, in place of the calculation's stored formulas.",
         "tags": [
           "tool_scripts"
         ]

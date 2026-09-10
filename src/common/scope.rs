@@ -112,6 +112,23 @@ pub fn project_filter_sql(
     Some(format!("{column} = ANY(${})", values.len()))
 }
 
+/// The same confinement as an expression, for a caller that builds its query rather than spelling
+/// it. `None` when the caller is unrestricted, which is a predicate the query then omits.
+#[must_use]
+pub fn project_filter(
+    scope: &AccessScope,
+    column: impl sea_orm::sea_query::IntoColumnRef,
+) -> Option<sea_orm::sea_query::Expr> {
+    use sea_orm::sea_query::ExprTrait;
+    let projects = scope.sql_project_array()?;
+    Some(
+        sea_orm::sea_query::Expr::col(column).eq(sea_orm::sea_query::Expr::cust_with_values(
+            "ANY($1)",
+            [projects],
+        )),
+    )
+}
+
 /// The projects a tracked job belongs to: its `site_id`, else every project its `sensor_id` is
 /// deployed into. A job with neither is [`RowProject::Global`].
 pub async fn project_of_job(db: &DatabaseConnection, job_id: Uuid) -> AppResult<RowProject> {

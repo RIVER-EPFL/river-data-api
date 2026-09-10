@@ -1,9 +1,12 @@
 //! The tracked job a slot's sd-estimator declaration enqueues.
 
 use async_trait::async_trait;
-use sea_orm::{ConnectionTrait, DbErr, Statement};
+use chrono::{DateTime, Utc};
+use sea_orm::sea_query::{Alias, Condition, Expr, Func, Query as SeaQuery};
+use sea_orm::{ColumnTrait, ConnectionTrait, DbErr, EntityTrait, PaginatorTrait, QueryFilter};
 
-use super::service::SLOT_SCOPE;
+use super::service::slot_scope;
+use crate::routes::private::readings::samples;
 use crate::routes::private::reprocessing_jobs::job::Job;
 use crate::routes::private::reprocessing_jobs::jobs::uuid_array;
 use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
@@ -52,46 +55,47 @@ impl Job for SdEstimatorRetag {
         let end = params.get("end").and_then(serde_json::Value::as_str);
 
         // The scope names slots, so it resolves through `site_parameters` either way: a stream
-        // reaches its slot by its pairing, and an unpaired stream reaches none.
-        let mut binds: Vec<sea_orm::Value> = vec![
-            target.clone().into(),
-            site_parameter_ids.clone().into(),
-            stream_ids.clone().into(),
-        ];
-        let mut window = String::new();
+        // reaches its slot by its pairing, and an unpaired stream reaches none. `sd_estimator` is
+        // NOT NULL, so `ne` is the `IS DISTINCT FROM` this carried.
+        let parse = |bound: Option<&str>, which: &str| -> Result<Option<DateTime<Utc>>, DbErr> {
+            bound
+                .map(|b| {
+                    DateTime::parse_from_rfc3339(b)
+                        .map(|t| t.with_timezone(&Utc))
+                        .map_err(|e| DbErr::Custom(format!("invalid {which}: {e}")))
+                })
+                .transpose()
+        };
+        let start = parse(start, "start")?;
+        let end = parse(end, "end")?;
+
+        let mut window = Condition::all();
         if let Some(start) = start {
-            let parsed = chrono::DateTime::parse_from_rfc3339(start)
-                .map_err(|e| DbErr::Custom(format!("invalid start: {e}")))?;
-            binds.push(sea_orm::Value::from(parsed));
-            window.push_str(&format!(" AND s.collected_at >= ${}", binds.len()));
+            window = window.add(samples::Column::CollectedAt.gte(start));
         }
         if let Some(end) = end {
-            let parsed = chrono::DateTime::parse_from_rfc3339(end)
-                .map_err(|e| DbErr::Custom(format!("invalid end: {e}")))?;
-            binds.push(sea_orm::Value::from(parsed));
-            window.push_str(&format!(" AND s.collected_at <= ${}", binds.len()));
+            window = window.add(samples::Column::CollectedAt.lte(end));
         }
-        let instant_guard = if override_instants {
-            ""
-        } else {
-            " AND s.sd_estimator_source <> 'sample'"
+        let in_scope = Condition::all()
+            .add(slot_scope(&site_parameter_ids, &stream_ids))
+            .add(window.clone());
+        let instant_guard = |cond: Condition| -> Condition {
+            if override_instants {
+                cond
+            } else {
+                cond.add(samples::Column::SdEstimatorSource.ne("sample"))
+            }
         };
 
         let skipped = if override_instants {
             0
         } else {
-            ctx.db()
-                .query_one_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    format!(
-                        "SELECT COUNT(*)::bigint AS n FROM samples s \
-                         WHERE {SLOT_SCOPE} AND s.sd_estimator_source = 'sample' \
-                           AND s.sd_estimator IS DISTINCT FROM $1{window}"
-                    ),
-                    binds.clone(),
-                ))
+            samples::Entity::find()
+                .filter(in_scope.clone())
+                .filter(samples::Column::SdEstimatorSource.eq("sample"))
+                .filter(samples::Column::SdEstimator.ne(target.clone()))
+                .count(ctx.db())
                 .await?
-                .map_or(Ok(0_i64), |row| row.try_get::<i64>("", "n"))?
         };
 
         ctx.info(&format!(
@@ -101,35 +105,34 @@ impl Job for SdEstimatorRetag {
 
         // The UPDATE fires the samples trigger per row, which recomputes `stdev` from the
         // replicates under the new divisor. Nothing here writes a statistic.
-        let retagged = ctx
-            .db()
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    "UPDATE samples s SET sd_estimator = $1, sd_estimator_source = 'slot' \
-                     WHERE {SLOT_SCOPE} AND s.sd_estimator IS DISTINCT FROM $1{instant_guard}{window}"
-                ),
-                binds,
+        let retagged = samples::Entity::update_many()
+            .col_expr(samples::Column::SdEstimator, Expr::value(target.clone()))
+            .col_expr(samples::Column::SdEstimatorSource, Expr::value("slot"))
+            .filter(instant_guard(
+                in_scope
+                    .clone()
+                    .add(samples::Column::SdEstimator.ne(target.clone())),
             ))
+            .exec(ctx.db())
             .await?
-            .rows_affected();
+            .rows_affected;
 
         // The samples trigger fires on readings, not on the samples row itself, so the UPDATE
         // above changes the declaration without recomputing. Refresh each touched row explicitly.
-        ctx.db()
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    "SELECT refresh_sample_aggregate(s.id) FROM samples s \
-                     WHERE {SLOT_SCOPE} AND s.sd_estimator = $1{instant_guard}"
-                ),
-                vec![
-                    target.clone().into(),
-                    site_parameter_ids.clone().into(),
-                    stream_ids.clone().into(),
-                ],
-            ))
-            .await?;
+        let mut refresh = SeaQuery::select();
+        refresh
+            .expr(
+                Func::cust(Alias::new("refresh_sample_aggregate"))
+                    .arg(Expr::col(samples::Column::Id)),
+            )
+            .from(samples::Entity)
+            .cond_where(instant_guard(
+                Condition::all()
+                    .add(slot_scope(&site_parameter_ids, &stream_ids))
+                    .add(samples::Column::SdEstimator.eq(target.clone())),
+            ));
+        let refresh = ctx.db().get_database_backend().build(&refresh);
+        ctx.db().query_all_raw(refresh).await?;
 
         if skipped > 0 {
             ctx.log(

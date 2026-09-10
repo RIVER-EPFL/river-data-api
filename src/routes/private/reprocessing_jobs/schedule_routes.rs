@@ -93,15 +93,15 @@ pub async fn run_now(
     get,
     path = "/api/schedules/{job_name}/audit",
     params(("job_name" = String, Path, description = "Registered job name")),
-    responses((status = 200, description = "The schedule's edit trail, newest first", body = Vec<crate::routes::private::change_audit::ChangeEntry>)),
+    responses((status = 200, description = "The schedule's edit trail, newest first", body = Vec<crate::routes::private::change_audit::models::ChangeEntry>)),
     tag = "schedules"
 )]
 pub async fn get_schedule_audit(
     State(state): State<AppState>,
     Path(job_name): Path<String>,
-) -> AppResult<Json<Vec<crate::routes::private::change_audit::ChangeEntry>>> {
+) -> AppResult<Json<Vec<crate::routes::private::change_audit::models::ChangeEntry>>> {
     Ok(Json(
-        crate::routes::private::change_audit::entries_for(
+        crate::routes::private::change_audit::service::entries_for(
             &state.db,
             &format!("schedule:{job_name}"),
         )

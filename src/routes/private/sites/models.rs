@@ -650,15 +650,6 @@ pub(super) struct AggregatesCacheKey<'a> {
 
 // --- Status events ---
 
-/// A single status event row from the database
-#[derive(Debug, FromQueryResult)]
-pub(super) struct StatusEventRow {
-    pub(super) parameter_id: Uuid,
-    pub(super) time: chrono::DateTime<chrono::FixedOffset>,
-    pub(super) value: String,
-    pub(super) sensor_id: Option<Uuid>,
-}
-
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct StatusEventsQuery {
     /// Start time (optional, ISO 8601). If omitted, returns from earliest data.

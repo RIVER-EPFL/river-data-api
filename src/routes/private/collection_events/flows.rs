@@ -6,14 +6,20 @@
 //! calculations read is left alone. One queued job per visit coalesces a burst of cell saves; the
 //! claim releases the job's dedupe key, so a change landing during a run yields one follow-up.
 
+use sea_orm::sea_query::{
+    Alias, Condition, Expr, JoinType, PostgresQueryBuilder, Query as SeaQuery,
+};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
-    Statement,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, ExprTrait, FromQueryResult,
+    QueryFilter, Statement,
 };
 use uuid::Uuid;
 
 use super::service::dedupe_key;
 use crate::error::AppResult;
+use crate::routes::private::collection_events::models as events;
+use crate::routes::private::data_streams::models as data_streams;
+use crate::routes::private::readings::models as readings;
 use crate::routes::private::reprocessing_jobs::worker;
 use crate::routes::private::tools::service as tool_service;
 
@@ -32,26 +38,56 @@ pub enum Writer {
     Chain,
 }
 
-/// The visits whose readings `row_predicate` selects, with the parameters touched at each.
-/// The predicate is SQL over `r` (`readings`) and `ds` (`data_streams`), the same shape the
-/// attach helper takes, so a write path passes the predicate it just attached with.
+/// A row selection still spelled as SQL over `r` (`readings`) and `ds` (`data_streams`), with the
+/// values its `$n` placeholders bind. The write paths build these predicates as text today, so
+/// this is how one is handed to [`touched_events`] until they build them.
+#[must_use]
+pub fn rows_matching(row_predicate: &str, binds: Vec<sea_orm::Value>) -> Condition {
+    Condition::all().add(Expr::cust_with_values(row_predicate.to_string(), binds))
+}
+
+/// The visits whose readings `rows` selects, with the parameters touched at each.
 pub async fn touched_events<C: ConnectionTrait>(
     conn: &C,
-    row_predicate: &str,
-    binds: Vec<sea_orm::Value>,
+    rows: Condition,
 ) -> AppResult<Vec<TouchedEvent>> {
+    let r = Alias::new("r");
+    let ds = Alias::new("ds");
+    let ce = Alias::new("ce");
+    let (sql, values) = SeaQuery::select()
+        .column((ce.clone(), events::Column::Id))
+        .column((ce.clone(), events::Column::Source))
+        .expr_as(
+            Expr::cust("array_agg(DISTINCT r.parameter_id)"),
+            Alias::new("parameter_ids"),
+        )
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            data_streams::Entity,
+            ds.clone(),
+            Expr::col((ds.clone(), data_streams::Column::Id))
+                .equals((r.clone(), readings::Column::StreamId)),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            events::Entity,
+            ce.clone(),
+            Expr::col((ce.clone(), events::Column::Id))
+                .equals((r.clone(), readings::Column::CollectionEventId)),
+        )
+        .cond_where(rows)
+        .add_group_by([
+            Expr::col((ce.clone(), events::Column::Id)).into(),
+            Expr::col((ce.clone(), events::Column::Source)).into(),
+        ])
+        .take()
+        .build(PostgresQueryBuilder);
     Ok(
         TouchedEvent::find_by_statement(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT ce.id, ce.source, array_agg(DISTINCT r.parameter_id) AS parameter_ids
-                 FROM readings r
-                 JOIN data_streams ds ON ds.id = r.stream_id
-                 JOIN collection_events ce ON ce.id = r.collection_event_id
-                 WHERE {row_predicate}
-                 GROUP BY ce.id, ce.source"
-            ),
-            binds,
+            sql,
+            values,
         ))
         .all(conn)
         .await?,

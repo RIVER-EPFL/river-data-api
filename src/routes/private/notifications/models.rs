@@ -521,6 +521,53 @@ pub mod log {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+/// One scope a subscriber has chosen for a channel: the row that overrides the channel default.
+pub mod subscription {
+    use crudcrate::EntityToModels;
+    use sea_orm::entity::prelude::*;
+
+    #[derive(
+        Clone,
+        Debug,
+        PartialEq,
+        DeriveEntityModel,
+        serde::Serialize,
+        serde::Deserialize,
+        EntityToModels,
+    )]
+    #[sea_orm(table_name = "notification_subscriptions")]
+    #[crudcrate(
+        api_struct = "NotificationSubscription",
+        name_singular = "notification_subscription",
+        name_plural = "notification_subscriptions"
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
+        pub id: Uuid,
+        #[crudcrate(filterable)]
+        pub keycloak_sub: String,
+        #[crudcrate(filterable)]
+        pub project_id: Option<Uuid>,
+        #[crudcrate(filterable)]
+        pub site_id: Option<Uuid>,
+        #[crudcrate(filterable)]
+        pub parameter_id: Option<Uuid>,
+        pub enabled: bool,
+        #[crudcrate(exclude(create, update), sortable)]
+        pub created_at: chrono::DateTime<chrono::Utc>,
+        #[crudcrate(exclude(create, update))]
+        pub updated_at: chrono::DateTime<chrono::Utc>,
+        #[crudcrate(filterable)]
+        pub channel: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 /// A browser push endpoint a subscriber registered, one row per device.
 pub mod push_subscription {
     use crudcrate::EntityToModels;

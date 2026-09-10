@@ -11,8 +11,13 @@ use axum::{
     routing::get,
 };
 use chrono::{DateTime, Utc};
+use sea_orm::sea_query::{
+    Alias, Condition, Expr, Func, JoinType, PostgresQueryBuilder, Query as SeaQuery,
+    SelectStatement, UnionType,
+};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Statement,
+    ColumnTrait, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, Order, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Statement,
 };
 use utoipa_axum::router::OpenApiRouter;
 use uuid::Uuid;
@@ -26,11 +31,15 @@ use crate::common::middleware::{
 };
 use crate::common::paging::Window;
 use crate::common::series;
-use crate::common::served::{CONTINUOUS_ROWS, SPOT_INSTANT_KEY, SPOT_INSTANT_ORDER};
+use crate::common::served;
 use crate::common::{AppState, bulk, cache_key};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::annotations::{self, Annotation};
+use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::parameters;
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::samples::model as samples;
+use crate::routes::private::readings::status_events::model as status_events;
 use crate::routes::private::sites::parameters as site_parameters;
 use crate::routes::{
     cache, resolve_site, resolve_site_with_project, validate_optional_time_range,
@@ -281,7 +290,7 @@ pub async fn get_site_readings(
     if let Some(mt) = query.measurement_type.as_deref()
         && !mt.is_empty()
     {
-        crate::routes::private::readings::measurement::validate_measurement_type(Some(mt))?;
+        crate::routes::private::readings::service::validate_measurement_type(Some(mt))?;
     }
     let measurement_type_filter = query.measurement_type.as_deref().unwrap_or("");
 
@@ -329,16 +338,14 @@ pub async fn get_site_readings(
 
     let num_params = params_list.len();
 
-    // Build parameterized raw SQL query
-    // $1 = site_id, $2 = the parameter ids as one array
-    let mut values: Vec<sea_orm::Value> = vec![site.id.into(), param_ids.to_vec().into()];
+    let r_ = served::r();
+    let t = Alias::new("t");
+    let sv = Alias::new("sv");
 
-    // One row shape either way: severity is selected as NULL when the caller did not ask for it,
-    // so the projection below has a single collection loop rather than one per select.
     // Severity comes from the one shared ladder (alarms engine). NULL when the slot has no
     // threshold at any tier (no `t` row); otherwise the ladder treats all-NULL bounds as 0
     // (disabled).
-    let severity_expr = |value_expr: &str| -> String {
+    let severity_expr = |value_expr: &str| -> Expr {
         if annotations.alarms {
             let sev = crate::routes::private::alarms::service::severity_case(
                 value_expr,
@@ -347,97 +354,114 @@ pub async fn get_site_readings(
                 "t.alarm_min",
                 "t.alarm_max",
             );
-            format!("CASE WHEN t.parameter_id IS NULL THEN NULL ELSE ({sev})::smallint END")
+            Expr::cust(format!(
+                "CASE WHEN t.parameter_id IS NULL THEN NULL ELSE ({sev})::smallint END"
+            ))
         } else {
-            "NULL::smallint".to_string()
+            Expr::cust("NULL::smallint")
         }
     };
     // The 3-tier threshold per slot via the single engine definition (site → global → parameter
     // default), scoped to this site and LEFT JOINed, so a parameter with only defaults still gets
     // a severity (the old direct join to alarm_thresholds did not).
-    let threshold_cte = annotations.alarms.then(|| {
-        crate::routes::private::alarms::service::resolve_thresholds_sql(
+    let thresholds = || {
+        crate::routes::private::alarms::service::resolve_thresholds_query(
             Some(site.id),
-            Some(param_ids.clone()),
+            Some(param_ids.to_vec()),
         )
-    });
+    };
 
-    let next_param = values.len() + 1;
-    let time_conditions = match effective_end {
-        Some(end) => {
-            let cond = format!(
-                " AND r.time >= ${} AND r.time <= ${}",
-                next_param,
-                next_param + 1
-            );
-            values.push(effective_start.into());
-            values.push(end.into());
-            cond
+    let in_window = |alias: &Alias| {
+        let mut cond = Condition::all()
+            .add(Expr::col((alias.clone(), readings::Column::Time)).gte(effective_start));
+        if let Some(end) = effective_end {
+            cond = cond.add(Expr::col((alias.clone(), readings::Column::Time)).lte(end));
         }
-        None => {
-            let cond = format!(" AND r.time >= ${next_param}");
-            values.push(effective_start.into());
-            cond
+        cond
+    };
+    let slot = |alias: &Alias| {
+        let mut cond = Condition::all()
+            .add(Expr::col((alias.clone(), readings::Column::SiteId)).eq(site.id))
+            .add(
+                Expr::col((alias.clone(), readings::Column::ParameterId)).is_in(param_ids.to_vec()),
+            )
+            .add(in_window(alias));
+        if !annotations.flagged {
+            cond = cond.add(Expr::cust("(r.is_flagged IS NOT TRUE)"));
         }
+        if let Some(sid) = query.sample_id {
+            cond = cond.add(Expr::col((alias.clone(), readings::Column::SampleId)).eq(sid));
+        }
+        cond
     };
 
-    let flagged_condition = if annotations.flagged {
-        ""
-    } else {
-        " AND (r.is_flagged IS NOT TRUE)"
-    };
-
-    let sample_id_condition = if let Some(sid) = query.sample_id {
-        let idx = values.len() + 1;
-        values.push(sid.into());
-        format!(" AND r.sample_id = ${idx}")
-    } else {
-        String::new()
-    };
-
-    let sql = if include_replicates {
+    let query_statement = if include_replicates {
         // Every stored row, one per replicate; the caller reconstructs the groups.
         // "continuous" means everything that is not a grab: derived rows plot on the continuous
         // line (matching the continuous aggregates, which exclude only 'spot'), and legacy NULL
         // rows predate the measurement_type column.
-        let measurement_type_condition = match measurement_type_filter {
-            "" => String::new(),
-            "continuous" => " AND (r.measurement_type IS DISTINCT FROM 'spot')".to_string(),
-            other => {
-                let idx = values.len() + 1;
-                values.push(other.to_string().into());
-                format!(" AND r.measurement_type = ${idx}")
+        let mut rows = slot(&r_);
+        match measurement_type_filter {
+            "" => {}
+            "continuous" => {
+                rows = rows.add(Expr::cust("(r.measurement_type IS DISTINCT FROM 'spot')"));
             }
-        };
-        let severity = severity_expr("COALESCE(r.calibrated_value, r.raw_value)");
-        let select_clause = format!(
-            "r.parameter_id, r.time, r.replicate_index, \
-             COALESCE(r.calibrated_value, r.raw_value) AS value, \
-             {severity} AS severity, r.is_flagged, r.flag_reason, r.measurement_type, r.unverified, \
-             r.sample_id, r.calibration_id, r.standard_curve_id, \
-             (r.withdrawn_at IS NOT NULL) AS withdrawn"
-        );
+            other => {
+                rows = rows.add(
+                    Expr::col((r_.clone(), readings::Column::MeasurementType))
+                        .eq(other.to_string()),
+                );
+            }
+        }
         // The collapsed spot arm excludes withdrawn rows; the replicate view was exporting them
         // as ordinary values, which publishes a number the source has taken back.
-        let withdrawn_condition = if query.include_withdrawn.unwrap_or(false) {
-            ""
-        } else {
-            " AND r.withdrawn_at IS NULL"
-        };
-        let from_clause = match &threshold_cte {
-            Some(cte) => format!(
-                "readings r LEFT JOIN ({cte}) t \
-                 ON t.parameter_id = r.parameter_id AND t.site_id = r.site_id"
-            ),
-            None => "readings r".to_string(),
-        };
-        format!(
-            "SELECT {select_clause} FROM {from_clause} \
-             WHERE r.site_id = $1 AND r.parameter_id = ANY($2)\
-             {time_conditions}{measurement_type_condition}{flagged_condition}{sample_id_condition}\
-             {withdrawn_condition} \
-             ORDER BY r.parameter_id, r.time, r.replicate_index"
-        )
+        if !query.include_withdrawn.unwrap_or(false) {
+            rows = rows.add(Expr::col((r_.clone(), readings::Column::WithdrawnAt)).is_null());
+        }
+        let mut replicates = SeaQuery::select();
+        replicates
+            .column((r_.clone(), readings::Column::ParameterId))
+            .column((r_.clone(), readings::Column::Time))
+            .column((r_.clone(), readings::Column::ReplicateIndex))
+            .expr_as(served::continuous_value(), Alias::new("value"))
+            .expr_as(
+                severity_expr("COALESCE(r.calibrated_value, r.raw_value)"),
+                Alias::new("severity"),
+            )
+            .column((r_.clone(), readings::Column::IsFlagged))
+            .column((r_.clone(), readings::Column::FlagReason))
+            .column((r_.clone(), readings::Column::MeasurementType))
+            .column((r_.clone(), readings::Column::Unverified))
+            .column((r_.clone(), readings::Column::SampleId))
+            .column((r_.clone(), readings::Column::CalibrationId))
+            .column((r_.clone(), readings::Column::StandardCurveId))
+            .expr_as(
+                Expr::col((r_.clone(), readings::Column::WithdrawnAt)).is_not_null(),
+                Alias::new("withdrawn"),
+            )
+            .from_as(readings::Entity, r_.clone());
+        if annotations.alarms {
+            replicates.join_subquery(
+                JoinType::LeftJoin,
+                thresholds(),
+                t.clone(),
+                Condition::all()
+                    .add(
+                        Expr::col((t.clone(), Alias::new("parameter_id")))
+                            .equals((r_.clone(), readings::Column::ParameterId)),
+                    )
+                    .add(
+                        Expr::col((t.clone(), Alias::new("site_id")))
+                            .equals((r_.clone(), readings::Column::SiteId)),
+                    ),
+            );
+        }
+        replicates
+            .cond_where(rows)
+            .order_by((r_.clone(), readings::Column::ParameterId), Order::Asc)
+            .order_by((r_.clone(), readings::Column::Time), Order::Asc)
+            .order_by((r_.clone(), readings::Column::ReplicateIndex), Order::Asc);
+        replicates.take()
     } else {
         // Continuous and derived rows live at replicate_index 0 (every continuous writer defaults
         // to it), so the plain equality keeps the ordered scan. A spot instant is the replicate
@@ -448,75 +472,141 @@ pub async fn get_site_readings(
         // 'spot'); any other named type is continuous-shaped and narrows the continuous arm.
         let (include_continuous_arm, include_spot_arm, continuous_extra) =
             match measurement_type_filter {
-                "" => (true, true, String::new()),
-                "continuous" => (true, false, String::new()),
-                "spot" => (false, true, String::new()),
-                other => {
-                    let idx = values.len() + 1;
-                    values.push(other.to_string().into());
-                    (true, false, format!(" AND r.measurement_type = ${idx}"))
-                }
+                "" => (true, true, None),
+                "continuous" => (true, false, None),
+                "spot" => (false, true, None),
+                other => (true, false, Some(other.to_string())),
             };
-        let base_cols = "r.parameter_id, r.time, r.site_id, r.is_flagged, r.flag_reason, \
-             r.measurement_type, r.sample_id, r.calibration_id, r.standard_curve_id, \
-             (r.withdrawn_at IS NOT NULL) AS withdrawn, r.unverified";
-        let mut arms: Vec<String> = Vec::new();
+        let base_cols = |q: &mut SelectStatement| {
+            q.column((r_.clone(), readings::Column::ParameterId))
+                .column((r_.clone(), readings::Column::Time))
+                .column((r_.clone(), readings::Column::SiteId))
+                .column((r_.clone(), readings::Column::IsFlagged))
+                .column((r_.clone(), readings::Column::FlagReason))
+                .column((r_.clone(), readings::Column::MeasurementType))
+                .column((r_.clone(), readings::Column::SampleId))
+                .column((r_.clone(), readings::Column::CalibrationId))
+                .column((r_.clone(), readings::Column::StandardCurveId))
+                .expr_as(
+                    Expr::col((r_.clone(), readings::Column::WithdrawnAt)).is_not_null(),
+                    Alias::new("withdrawn"),
+                )
+                .column((r_.clone(), readings::Column::Unverified));
+        };
+        let served_cols = [
+            Alias::new("value"),
+            Alias::new("parameter_id"),
+            Alias::new("time"),
+            Alias::new("site_id"),
+            Alias::new("is_flagged"),
+            Alias::new("flag_reason"),
+            Alias::new("measurement_type"),
+            Alias::new("sample_id"),
+            Alias::new("calibration_id"),
+            Alias::new("standard_curve_id"),
+            Alias::new("withdrawn"),
+            Alias::new("unverified"),
+        ];
+        let mut arms: Vec<SelectStatement> = Vec::new();
         if include_continuous_arm {
-            arms.push(format!(
-                "SELECT COALESCE(r.calibrated_value, r.raw_value) AS value, {base_cols} \
-                 FROM readings r \
-                 WHERE r.site_id = $1 AND r.parameter_id = ANY($2) \
-                   AND {CONTINUOUS_ROWS}\
-                 {time_conditions}{continuous_extra}{flagged_condition}{sample_id_condition}"
-            ));
+            let mut cond = slot(&r_).add(served::continuous_rows());
+            if let Some(other) = &continuous_extra {
+                cond = cond.add(
+                    Expr::col((r_.clone(), readings::Column::MeasurementType)).eq(other.clone()),
+                );
+            }
+            let mut arm = SeaQuery::select();
+            arm.expr_as(served::continuous_value(), Alias::new("value"));
+            base_cols(&mut arm);
+            arm.from_as(readings::Entity, r_.clone()).cond_where(cond);
+            arms.push(arm.take());
         }
-        // A retracted instant is served only when asked for, and then the ordering above prefers a
-        // live replicate, so `withdrawn` on the served row means the whole group is retracted.
-        let spot_withdrawn_condition = if annotations.withdrawn {
-            ""
-        } else {
-            " AND r.withdrawn_at IS NULL"
-        };
         if include_spot_arm {
-            arms.push(format!(
-                // One row per slot instant, not per stream; the key and its ordering are
-                // `common::served`, shared with the public arm and the alarm evaluator.
-                "SELECT sp.* FROM ( \
-                    SELECT DISTINCT ON ({SPOT_INSTANT_KEY}) \
-                           COALESCE(smp.mean, r.calibrated_value, r.raw_value) AS value, \
-                           {base_cols} \
-                    FROM readings r LEFT JOIN samples smp ON smp.id = r.sample_id \
-                    WHERE r.site_id = $1 AND r.parameter_id = ANY($2) \
-                      AND r.measurement_type = 'spot'{spot_withdrawn_condition}\
-                    {time_conditions}{flagged_condition}{sample_id_condition} \
-                    ORDER BY {SPOT_INSTANT_ORDER} \
-                 ) sp"
-            ));
+            // A retracted instant is served only when asked for, and then the ordering below
+            // prefers a live replicate, so `withdrawn` on the served row means the whole group is
+            // retracted.
+            let mut cond = slot(&r_)
+                .add(Expr::col((r_.clone(), readings::Column::MeasurementType)).eq("spot"));
+            if !annotations.withdrawn {
+                cond = cond.add(Expr::col((r_.clone(), readings::Column::WithdrawnAt)).is_null());
+            }
+            // One row per slot instant, not per stream; the key and its ordering are
+            // `common::served`, shared with the public arm and the alarm evaluator.
+            let smp = Alias::new("smp");
+            let mut group = SeaQuery::select();
+            group
+                .distinct_on(served::spot_instant_key())
+                .expr_as(served::spot_value(), Alias::new("value"));
+            base_cols(&mut group);
+            group
+                .from_as(readings::Entity, r_.clone())
+                .join_as(
+                    JoinType::LeftJoin,
+                    samples::Entity,
+                    smp.clone(),
+                    Expr::col((smp, samples::Column::Id))
+                        .equals((r_.clone(), readings::Column::SampleId)),
+                )
+                .cond_where(cond);
+            for (expr, order) in served::spot_instant_order() {
+                group.order_by_expr(expr, order);
+            }
+            let sp = Alias::new("sp");
+            arms.push(
+                SeaQuery::select()
+                    .columns(served_cols.map(|c| (sp.clone(), c)))
+                    .from_subquery(group.take(), sp.clone())
+                    .take(),
+            );
         }
-        let inner = arms.join(" UNION ALL ");
-        let severity = severity_expr("sv.value");
-        let threshold_join = match &threshold_cte {
-            Some(cte) => format!(
-                " LEFT JOIN ({cte}) t \
-                 ON t.parameter_id = sv.parameter_id AND t.site_id = sv.site_id"
-            ),
-            None => String::new(),
-        };
-        format!(
-            "SELECT sv.parameter_id, sv.time, NULL::smallint AS replicate_index, sv.value, \
-                    {severity} AS severity, \
-                    sv.is_flagged, sv.flag_reason, sv.measurement_type, sv.sample_id, \
-                    sv.calibration_id, sv.standard_curve_id, sv.withdrawn, sv.unverified \
-             FROM ({inner}) sv{threshold_join} \
-             ORDER BY sv.parameter_id, sv.time"
-        )
+        let mut arms = arms.into_iter();
+        let first = arms.next().unwrap_or_default();
+        let inner = arms.fold(first, |mut acc, arm| acc.union(UnionType::All, arm).take());
+
+        let mut series = SeaQuery::select();
+        series
+            .column((sv.clone(), Alias::new("parameter_id")))
+            .column((sv.clone(), Alias::new("time")))
+            .expr_as(Expr::cust("NULL::smallint"), Alias::new("replicate_index"))
+            .column((sv.clone(), Alias::new("value")))
+            .expr_as(severity_expr("sv.value"), Alias::new("severity"))
+            .column((sv.clone(), Alias::new("is_flagged")))
+            .column((sv.clone(), Alias::new("flag_reason")))
+            .column((sv.clone(), Alias::new("measurement_type")))
+            .column((sv.clone(), Alias::new("sample_id")))
+            .column((sv.clone(), Alias::new("calibration_id")))
+            .column((sv.clone(), Alias::new("standard_curve_id")))
+            .column((sv.clone(), Alias::new("withdrawn")))
+            .column((sv.clone(), Alias::new("unverified")))
+            .from_subquery(inner, sv.clone());
+        if annotations.alarms {
+            series.join_subquery(
+                JoinType::LeftJoin,
+                thresholds(),
+                t.clone(),
+                Condition::all()
+                    .add(
+                        Expr::col((t.clone(), Alias::new("parameter_id")))
+                            .equals((sv.clone(), Alias::new("parameter_id"))),
+                    )
+                    .add(
+                        Expr::col((t.clone(), Alias::new("site_id")))
+                            .equals((sv.clone(), Alias::new("site_id"))),
+                    ),
+            );
+        }
+        series
+            .order_by((sv.clone(), Alias::new("parameter_id")), Order::Asc)
+            .order_by((sv.clone(), Alias::new("time")), Order::Asc);
+        series.take()
     };
+    let (sql, values) = query_statement.build(PostgresQueryBuilder);
 
     let query_result = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
+            sql,
             values,
         ))
         .await?;
@@ -962,32 +1052,45 @@ pub async fn get_site_aggregates(
         .filter_map(|row| AggregateRow::from_query_result(&row, "").ok())
         .collect();
 
-    let flagged_sql = format!(
-        r"
-        SELECT
-            time_bucket('{interval}'::interval, time) AS bucket,
-            parameter_id,
-            {sensor_select},
-            COUNT(*)::bigint AS flagged_count
-        FROM readings
-        WHERE site_id = $1
-          AND parameter_id = ANY($2)
-          AND time >= ${start_param}
-          AND time <= ${end_param}
-          AND is_flagged = TRUE
-          AND replicate_index = 0
-          AND measurement_type IS DISTINCT FROM 'spot'
-        GROUP BY bucket, parameter_id{sensor_group}
-        ",
-        interval = bucket_interval(rollup),
+    let mut flagged = SeaQuery::select();
+    flagged.expr_as(
+        Expr::cust_with_values(
+            "time_bucket($1::interval, time)",
+            [bucket_interval(rollup).to_string()],
+        ),
+        Alias::new("bucket"),
     );
+    flagged.column(readings::Column::ParameterId);
+    if split {
+        flagged.column(readings::Column::SensorId);
+    } else {
+        flagged.expr_as(Expr::cust("NULL::uuid"), Alias::new("sensor_id"));
+    }
+    flagged
+        .expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("flagged_count"))
+        .from(readings::Entity)
+        .and_where(Expr::col(readings::Column::SiteId).eq(site.id))
+        .and_where(Expr::col(readings::Column::ParameterId).is_in(param_ids.to_vec()))
+        .and_where(Expr::col(readings::Column::Time).gte(query.start))
+        .and_where(Expr::col(readings::Column::Time).lte(query.end))
+        .and_where(Expr::col(readings::Column::IsFlagged).eq(true))
+        .and_where(Expr::col(readings::Column::ReplicateIndex).eq(0))
+        .and_where(Expr::cust("measurement_type IS DISTINCT FROM 'spot'"))
+        .add_group_by([
+            Expr::col(Alias::new("bucket")).into(),
+            Expr::col(readings::Column::ParameterId).into(),
+        ]);
+    if split {
+        flagged.add_group_by([Expr::col(readings::Column::SensorId).into()]);
+    }
+    let (flagged_sql, flagged_values) = flagged.take().build(PostgresQueryBuilder);
 
     let flagged_rows: Vec<FlaggedBucketRow> = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &flagged_sql,
-            bind(&window),
+            flagged_sql,
+            flagged_values,
         ))
         .await?
         .into_iter()
@@ -1158,103 +1261,67 @@ pub async fn get_site_status_events(
 
     let _permit = bulk::acquire_bulk_permit(&format, &state.bulk_semaphore)?;
 
-    // Build parameterized raw SQL query
-    let mut values: Vec<sea_orm::Value> = vec![site.id.into()];
-    let mut next_param = 2;
-
-    let time_conditions = match (query.start, query.end) {
-        (Some(start), Some(end)) => {
-            let cond = format!(
-                " AND time >= ${} AND time <= ${}",
-                next_param,
-                next_param + 1
-            );
-            values.push(start.into());
-            values.push(end.into());
-            next_param += 2;
-            cond
-        }
-        (Some(start), None) => {
-            let cond = format!(" AND time >= ${next_param}");
-            values.push(start.into());
-            next_param += 1;
-            cond
-        }
-        (None, Some(end)) => {
-            let cond = format!(" AND time <= ${next_param}");
-            values.push(end.into());
-            next_param += 1;
-            cond
-        }
-        (None, None) => String::new(),
-    };
-    let _ = next_param; // suppress unused warning
+    let mut at_this_site = Condition::all().add(status_events::Column::SiteId.eq(site.id));
+    if let Some(start) = query.start {
+        at_this_site = at_this_site.add(status_events::Column::Time.gte(start));
+    }
+    if let Some(end) = query.end {
+        at_this_site = at_this_site.add(status_events::Column::Time.lte(end));
+    }
 
     let dir = if query.order.as_deref() == Some("desc") {
-        "DESC"
+        Order::Desc
     } else {
-        "ASC"
+        Order::Asc
     };
 
     // Pagination applies to JSON only; CSV/NDJSON remain full-range exports.
-    let pagination = match (format.as_str(), query.limit) {
-        ("json", Some(limit)) => {
-            let window = Window::from_limit_offset(Some(limit), query.offset, 1000, 1000);
-            format!(" LIMIT {} OFFSET {}", window.limit, window.offset)
-        }
-        _ => String::new(),
+    let page = match (format.as_str(), query.limit) {
+        ("json", Some(limit)) => Some(Window::from_limit_offset(
+            Some(limit),
+            query.offset,
+            1000,
+            1000,
+        )),
+        _ => None,
     };
 
     // Count the full match set only when a LIMIT truncates the result; otherwise
     // the row count already is the total.
-    let counted_total: Option<u64> = if pagination.is_empty() {
-        None
-    } else {
-        let count_sql = format!(
-            "SELECT COUNT(*) AS cnt FROM status_events WHERE site_id = $1{time_conditions}"
-        );
-        let total = state
-            .db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &count_sql,
-                values.clone(),
-            ))
-            .await?
-            .map(|row| row.try_get::<i64>("", "cnt"))
-            .transpose()?
-            .unwrap_or(0)
-            .max(0) as u64;
-        Some(total)
+    let counted_total: Option<u64> = match page {
+        None => None,
+        Some(_) => Some(
+            status_events::Entity::find()
+                .filter(at_this_site.clone())
+                .count(&state.db)
+                .await?,
+        ),
     };
 
     // `time` is not unique here (the PK is (stream_id, time), so one timestamp carries one row per
     // stream), and LIMIT/OFFSET over a partial order can repeat or skip a tied row between pages.
     // Ordering by the full key makes the walk a total order.
-    let sql = format!(
-        "SELECT parameter_id, time, value, sensor_id FROM status_events WHERE site_id = $1{time_conditions} ORDER BY time {dir}, stream_id {dir}{pagination}"
-    );
+    let mut rows = status_events::Entity::find()
+        .filter(at_this_site)
+        .order_by(status_events::Column::Time, dir.clone())
+        .order_by(status_events::Column::StreamId, dir);
+    if let Some(window) = page {
+        rows = rows.limit(window.limit as u64).offset(window.offset as u64);
+    }
 
-    let query_result = state
-        .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            values,
-        ))
-        .await?;
-
-    let events: Vec<StatusEventData> = query_result
-        .iter()
-        .filter_map(|row| {
-            StatusEventRow::from_query_result(row, "")
-                .ok()
-                .map(|r| StatusEventData {
-                    parameter_id: r.parameter_id,
-                    time: r.time.with_timezone(&Utc),
-                    value: r.value,
-                    sensor_id: r.sensor_id,
-                })
+    let events: Vec<StatusEventData> = rows
+        .all(&state.db)
+        .await?
+        .into_iter()
+        // A status event whose slot is unpaired names no parameter and has no column to render
+        // under, which is what the row shape said before the entity did.
+        .filter_map(|r| {
+            r.parameter_id.map(|parameter_id| StatusEventData {
+                parameter_id,
+                time: r.time.with_timezone(&Utc),
+                value: r.value,
+                sensor_id: r.sensor_id,
+            })
         })
         .collect();
 
@@ -1402,11 +1469,8 @@ pub async fn get_site_export_summary(
     if query.end <= query.start {
         return Err(AppError::BadRequest("end must be after start".to_string()));
     }
-    let range: [sea_orm::Value; 3] = [
-        site.id.into(),
-        sea_orm::prelude::DateTimeWithTimeZone::from(query.start).into(),
-        sea_orm::prelude::DateTimeWithTimeZone::from(query.end).into(),
-    ];
+    let start = sea_orm::prelude::DateTimeWithTimeZone::from(query.start);
+    let end = sea_orm::prelude::DateTimeWithTimeZone::from(query.end);
 
     let mut by_param: std::collections::BTreeMap<Uuid, ParameterExportSummary> =
         std::collections::BTreeMap::new();
@@ -1423,21 +1487,47 @@ pub async fn get_site_export_summary(
     // Annotations overlapping the range, each joined to the served (non-withdrawn) readings its
     // own window covers, clipped to the query range. DISTINCT r.time so two overlapping
     // annotations do not double-count an instant within a parameter.
+    let a = Alias::new("a");
+    let r_ = Alias::new("r");
+    let (sql, values) = SeaQuery::select()
+        .expr_as(
+            Expr::col((a.clone(), annotations::Column::ParameterId)),
+            Alias::new("pid"),
+        )
+        .expr_as(Expr::cust("COUNT(DISTINCT a.id)"), Alias::new("ann_count"))
+        .expr_as(Expr::cust("COUNT(DISTINCT r.time)"), Alias::new("pts"))
+        .from_as(annotations::Entity, a.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            readings::Entity,
+            r_.clone(),
+            Condition::all()
+                .add(
+                    Expr::col((r_.clone(), readings::Column::SiteId))
+                        .equals((a.clone(), annotations::Column::SiteId)),
+                )
+                .add(
+                    Expr::col((r_.clone(), readings::Column::ParameterId))
+                        .equals((a.clone(), annotations::Column::ParameterId)),
+                )
+                .add(Expr::cust_with_values(
+                    "r.time >= GREATEST(a.start_time, $1) AND r.time <= LEAST(a.end_time, $2)",
+                    [start, end],
+                ))
+                .add(Expr::col((r_.clone(), readings::Column::WithdrawnAt)).is_null()),
+        )
+        .and_where(Expr::col((a.clone(), annotations::Column::SiteId)).eq(site.id))
+        .and_where(Expr::col((a.clone(), annotations::Column::EndTime)).gte(start))
+        .and_where(Expr::col((a.clone(), annotations::Column::StartTime)).lte(end))
+        .add_group_by([Expr::col((a.clone(), annotations::Column::ParameterId)).into()])
+        .take()
+        .build(PostgresQueryBuilder);
     let rows = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT a.parameter_id AS pid,
-                    COUNT(DISTINCT a.id) AS ann_count,
-                    COUNT(DISTINCT r.time) AS pts
-             FROM annotations a
-             LEFT JOIN readings r
-               ON r.site_id = a.site_id AND r.parameter_id = a.parameter_id
-              AND r.time >= GREATEST(a.start_time, $2) AND r.time <= LEAST(a.end_time, $3)
-              AND r.withdrawn_at IS NULL
-             WHERE a.site_id = $1 AND a.end_time >= $2 AND a.start_time <= $3
-             GROUP BY a.parameter_id",
-            range.clone(),
+            sql,
+            values,
         ))
         .await?;
     for r in &rows {
@@ -1448,18 +1538,31 @@ pub async fn get_site_export_summary(
     }
 
     // Flagged and extra-replicate rows in one pass over the range's readings.
+    let (sql, values) = SeaQuery::select()
+        .expr_as(Expr::col(readings::Column::ParameterId), Alias::new("pid"))
+        .expr_as(
+            Expr::cust("COUNT(*) FILTER (WHERE is_flagged = TRUE)"),
+            Alias::new("flagged"),
+        )
+        .expr_as(
+            Expr::cust("COUNT(*) FILTER (WHERE replicate_index > 0)"),
+            Alias::new("reps"),
+        )
+        .from(readings::Entity)
+        .and_where(Expr::col(readings::Column::SiteId).eq(site.id))
+        .and_where(Expr::col(readings::Column::Time).gte(start))
+        .and_where(Expr::col(readings::Column::Time).lte(end))
+        .and_where(Expr::col(readings::Column::WithdrawnAt).is_null())
+        .and_where(Expr::cust("(is_flagged = TRUE OR replicate_index > 0)"))
+        .add_group_by([Expr::col(readings::Column::ParameterId).into()])
+        .take()
+        .build(PostgresQueryBuilder);
     let rows = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT parameter_id AS pid,
-                    COUNT(*) FILTER (WHERE is_flagged = TRUE) AS flagged,
-                    COUNT(*) FILTER (WHERE replicate_index > 0) AS reps
-             FROM readings
-             WHERE site_id = $1 AND time >= $2 AND time <= $3 AND withdrawn_at IS NULL
-               AND (is_flagged = TRUE OR replicate_index > 0)
-             GROUP BY parameter_id",
-            range,
+            sql,
+            values,
         ))
         .await?;
     for r in &rows {
@@ -1590,46 +1693,87 @@ pub async fn get_site_statistics(
         .into_response());
     }
 
-    let mut binds: Vec<sea_orm::Value> = vec![
-        site.id.into(),
-        parameter_ids.clone().into(),
-        effective_start.into(),
-    ];
-    let end_clause = match query.end {
-        Some(end) => {
-            binds.push(end.into());
-            " AND v.time <= $4"
-        }
-        None => "",
-    };
+    let p = Alias::new("p");
+    let sp = Alias::new("sp");
+    let v = Alias::new("v");
+    let mut in_range = Condition::all()
+        .add(
+            Expr::col((v.clone(), readings::Column::ParameterId))
+                .equals((p.clone(), parameters::Column::Id)),
+        )
+        .add(Expr::col((v.clone(), readings::Column::Time)).gte(effective_start));
+    if let Some(end) = query.end {
+        in_range = in_range.add(Expr::col((v.clone(), readings::Column::Time)).lte(end));
+    }
+    let agg = |sql: &str, name: &str| (Expr::cust(sql.to_string()), Alias::new(name.to_string()));
+    let mut statistics = SeaQuery::select();
+    statistics.expr_as(
+        Expr::col((p.clone(), parameters::Column::Id)),
+        Alias::new("parameter_id"),
+    );
+    statistics
+        .column((p.clone(), parameters::Column::Code))
+        .column((p.clone(), parameters::Column::Name))
+        .expr_as(
+            Func::coalesce([
+                Expr::col((sp.clone(), site_parameters::Column::DisplayUnits)),
+                Expr::col((p.clone(), parameters::Column::DefaultUnits)),
+            ]),
+            Alias::new("units"),
+        )
+        .column((sp.clone(), site_parameters::Column::DecimalPlaces));
+    for (expr, name) in [
+        agg("COUNT(v.time)", "time_points"),
+        agg("COUNT(v.value)", "n"),
+        agg(
+            "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v.value)",
+            "median",
+        ),
+        agg("AVG(v.value)", "mean"),
+        agg("STDDEV_SAMP(v.value)", "stdev_sample"),
+        agg("STDDEV_POP(v.value)", "stdev_population"),
+        agg("MIN(v.value)", "min_value"),
+        agg("MAX(v.value)", "max_value"),
+    ] {
+        statistics.expr_as(expr, name);
+    }
+    let (sql, values) = statistics
+        .from_as(parameters::Entity, p.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            site_parameters::Entity,
+            sp.clone(),
+            Condition::all()
+                .add(
+                    Expr::col((sp.clone(), site_parameters::Column::ParameterId))
+                        .equals((p.clone(), parameters::Column::Id)),
+                )
+                .add(Expr::col((sp.clone(), site_parameters::Column::SiteId)).eq(site.id)),
+        )
+        .join_subquery(
+            JoinType::LeftJoin,
+            value_source(measurement_type, site.id, &parameter_ids),
+            v.clone(),
+            in_range,
+        )
+        .and_where(Expr::col((p.clone(), parameters::Column::Id)).is_in(parameter_ids.clone()))
+        .add_group_by([
+            Expr::col((p.clone(), parameters::Column::Id)).into(),
+            Expr::col((p.clone(), parameters::Column::Code)).into(),
+            Expr::col((p.clone(), parameters::Column::Name)).into(),
+            Expr::col(Alias::new("units")).into(),
+            Expr::col((sp.clone(), site_parameters::Column::DecimalPlaces)).into(),
+        ])
+        .order_by((p.clone(), parameters::Column::Code), Order::Asc)
+        .take()
+        .build(PostgresQueryBuilder);
 
     let rows = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT p.id AS parameter_id, p.code, p.name, \
-                        COALESCE(sp.display_units, p.default_units) AS units, \
-                        sp.decimal_places, \
-                        COUNT(v.time) AS time_points, \
-                        COUNT(v.value) AS n, \
-                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY v.value) AS median, \
-                        AVG(v.value) AS mean, \
-                        STDDEV_SAMP(v.value) AS stdev_sample, \
-                        STDDEV_POP(v.value) AS stdev_population, \
-                        MIN(v.value) AS min_value, \
-                        MAX(v.value) AS max_value \
-                 FROM parameters p \
-                 LEFT JOIN site_parameters sp \
-                        ON sp.parameter_id = p.id AND sp.site_id = $1 \
-                 LEFT JOIN ({source}) v \
-                        ON v.parameter_id = p.id AND v.time >= $3{end_clause} \
-                 WHERE p.id = ANY($2) \
-                 GROUP BY p.id, p.code, p.name, units, sp.decimal_places \
-                 ORDER BY p.code",
-                source = value_source(measurement_type),
-            ),
-            binds,
+            sql,
+            values,
         ))
         .await?;
 
@@ -1721,44 +1865,76 @@ pub async fn get_site_replicates(
         None => None,
     };
 
-    let mut values: Vec<sea_orm::Value> = vec![site.id.into(), effective_start.into()];
-    let mut conditions = String::new();
+    let r_ = Alias::new("r");
+    let p = Alias::new("p");
+    let ds = Alias::new("ds");
+    let mut spot_replicates = Condition::all()
+        .add(Expr::col((r_.clone(), readings::Column::SiteId)).eq(site.id))
+        .add(Expr::col((r_.clone(), readings::Column::Time)).gte(effective_start))
+        .add(Expr::col((r_.clone(), readings::Column::MeasurementType)).eq("spot"))
+        .add(Expr::col((r_.clone(), readings::Column::SampleId)).is_not_null());
     if let Some(end) = query.end {
-        values.push(end.into());
-        conditions.push_str(&format!(" AND r.time <= ${}", values.len()));
+        spot_replicates =
+            spot_replicates.add(Expr::col((r_.clone(), readings::Column::Time)).lte(end));
     }
     if let Some(ids) = parameter_ids {
-        values.push(ids.into());
-        conditions.push_str(&format!(" AND r.parameter_id = ANY(${})", values.len()));
+        spot_replicates =
+            spot_replicates.add(Expr::col((r_.clone(), readings::Column::ParameterId)).is_in(ids));
     }
     if !query.include_withdrawn.unwrap_or(false) {
-        conditions.push_str(" AND r.withdrawn_at IS NULL");
+        spot_replicates =
+            spot_replicates.add(Expr::col((r_.clone(), readings::Column::WithdrawnAt)).is_null());
     }
 
-    let sql = format!(
-        r"SELECT r.time,
-                 p.code AS parameter,
-                 r.sample_id,
-                 r.replicate_index,
-                 COALESCE(r.calibrated_value, r.raw_value) AS value,
-                 COALESCE(r.is_flagged, false) AS flagged,
-                 (r.withdrawn_at IS NOT NULL) AS withdrawn,
-                 ds.source_system,
-                 ds.source_key
-          FROM readings r
-          JOIN parameters p ON p.id = r.parameter_id
-          LEFT JOIN data_streams ds ON ds.id = r.stream_id
-          WHERE r.site_id = $1 AND r.time >= $2
-            AND r.measurement_type = 'spot'
-            AND r.sample_id IS NOT NULL{conditions}
-          ORDER BY r.time, p.code, r.replicate_index"
-    );
+    let (sql, values) = SeaQuery::select()
+        .column((r_.clone(), readings::Column::Time))
+        .expr_as(
+            Expr::col((p.clone(), parameters::Column::Code)),
+            Alias::new("parameter"),
+        )
+        .column((r_.clone(), readings::Column::SampleId))
+        .column((r_.clone(), readings::Column::ReplicateIndex))
+        .expr_as(served::continuous_value(), Alias::new("value"))
+        .expr_as(
+            Func::coalesce([
+                Expr::col((r_.clone(), readings::Column::IsFlagged)),
+                Expr::value(false),
+            ]),
+            Alias::new("flagged"),
+        )
+        .expr_as(
+            Expr::col((r_.clone(), readings::Column::WithdrawnAt)).is_not_null(),
+            Alias::new("withdrawn"),
+        )
+        .column((ds.clone(), data_streams::Column::SourceSystem))
+        .column((ds.clone(), data_streams::Column::SourceKey))
+        .from_as(readings::Entity, r_.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            parameters::Entity,
+            p.clone(),
+            Expr::col((p.clone(), parameters::Column::Id))
+                .equals((r_.clone(), readings::Column::ParameterId)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            data_streams::Entity,
+            ds.clone(),
+            Expr::col((ds.clone(), data_streams::Column::Id))
+                .equals((r_.clone(), readings::Column::StreamId)),
+        )
+        .cond_where(spot_replicates)
+        .order_by((r_.clone(), readings::Column::Time), Order::Asc)
+        .order_by((p.clone(), parameters::Column::Code), Order::Asc)
+        .order_by((r_.clone(), readings::Column::ReplicateIndex), Order::Asc)
+        .take()
+        .build(PostgresQueryBuilder);
 
     let rows: Vec<ReplicateRow> = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
+            sql,
             values,
         ))
         .await?
@@ -1855,73 +2031,114 @@ pub async fn get_sensor_vs_grab(
     let effective_end = query.end;
     validate_optional_time_range(Some(effective_start), effective_end)?;
 
-    let mut values: Vec<sea_orm::Value> = vec![
-        site.id.into(),
-        query.parameter_id.into(),
-        effective_start.into(),
-        query.window_start_hours.into(),
-        query.window_end_hours.into(),
-    ];
-    let end_condition = match effective_end {
-        Some(end) => {
-            values.push(end.into());
-            " AND g.collected_at <= $6"
-        }
-        None => "",
-    };
-
+    let r_ = Alias::new("r");
+    let smp = Alias::new("smp");
+    let g = Alias::new("g");
+    // A grab instant is its sample's statistics, or the lone measurement itself: a single reading
+    // forms no sample, and n = 1 is derived from it here.
+    let grabs = SeaQuery::select()
+        .column((r_.clone(), readings::Column::SiteId))
+        .column((r_.clone(), readings::Column::ParameterId))
+        .expr_as(
+            Expr::col((r_.clone(), readings::Column::Time)),
+            Alias::new("collected_at"),
+        )
+        .expr_as(
+            Expr::cust("COALESCE(MAX(smp.mean), AVG(COALESCE(r.calibrated_value, r.raw_value)))"),
+            Alias::new("mean"),
+        )
+        .expr_as(Expr::cust("MAX(smp.stdev)"), Alias::new("stdev"))
+        .expr_as(
+            Expr::cust("COALESCE(MAX(smp.n), COUNT(*)::int)"),
+            Alias::new("n"),
+        )
+        .from_as(readings::Entity, r_.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            samples::Entity,
+            smp.clone(),
+            Expr::col((smp.clone(), samples::Column::Id))
+                .equals((r_.clone(), readings::Column::SampleId)),
+        )
+        .and_where(Expr::col((r_.clone(), readings::Column::SiteId)).eq(site.id))
+        .and_where(Expr::col((r_.clone(), readings::Column::ParameterId)).eq(query.parameter_id))
+        .cond_where(served::served_spot_at(&r_))
+        .add_group_by([
+            Expr::col((r_.clone(), readings::Column::SiteId)).into(),
+            Expr::col((r_.clone(), readings::Column::ParameterId)).into(),
+            Expr::col((r_.clone(), readings::Column::Time)).into(),
+        ])
+        .take();
     // Continuous = anything that is not a grab ('spot') or derived reading; `IS DISTINCT FROM`
     // keeps NULL-typed legacy/seed readings on the continuous side.
-    let sql = format!(
-        r#"
-        SELECT
-            g.collected_at AS grab_time,
-            g.mean         AS grab_value,
-            g.stdev        AS grab_sd,
-            g.n            AS grab_n,
-            agg.sensor_avg,
-            agg.sensor_sd,
-            agg.sensor_n
-        FROM (
-            -- A grab instant is its sample's statistics, or the lone measurement itself: a single
-            -- reading forms no sample, and n = 1 is derived from it here.
-            SELECT r.site_id, r.parameter_id, r.time AS collected_at,
-                   COALESCE(MAX(smp.mean), AVG(COALESCE(r.calibrated_value, r.raw_value)))
-                       AS mean,
-                   MAX(smp.stdev) AS stdev,
-                   COALESCE(MAX(smp.n), COUNT(*)::int) AS n
-            FROM readings r
-            LEFT JOIN samples smp ON smp.id = r.sample_id
-            WHERE r.site_id = $1 AND r.parameter_id = $2
-              AND r.measurement_type = 'spot'
-              AND r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL
-            GROUP BY r.site_id, r.parameter_id, r.time
-        ) g
-        LEFT JOIN LATERAL (
-            SELECT
-                avg(COALESCE(r.calibrated_value, r.raw_value))         AS sensor_avg,
-                stddev_samp(COALESCE(r.calibrated_value, r.raw_value)) AS sensor_sd,
-                count(*)                                               AS sensor_n
-            FROM readings r
-            WHERE r.site_id = g.site_id
-              AND r.parameter_id = g.parameter_id
-              AND r.measurement_type IS DISTINCT FROM 'spot'
-              AND r.measurement_type IS DISTINCT FROM 'derived'
-              AND r.is_flagged IS NOT TRUE
-              AND r.replicate_index = 0
-              AND r.time >= g.collected_at + ($4 * interval '1 hour')
-              AND r.time <= g.collected_at + ($5 * interval '1 hour')
-        ) agg ON true
-        WHERE g.collected_at >= $3{end_condition}
-        ORDER BY g.collected_at
-        "#,
-    );
+    let window = SeaQuery::select()
+        .expr_as(
+            Expr::cust("avg(COALESCE(r.calibrated_value, r.raw_value))"),
+            Alias::new("sensor_avg"),
+        )
+        .expr_as(
+            Expr::cust("stddev_samp(COALESCE(r.calibrated_value, r.raw_value))"),
+            Alias::new("sensor_sd"),
+        )
+        .expr_as(Expr::cust("count(*)"), Alias::new("sensor_n"))
+        .from_as(readings::Entity, r_.clone())
+        .and_where(Expr::cust("r.site_id = g.site_id"))
+        .and_where(Expr::cust("r.parameter_id = g.parameter_id"))
+        .and_where(Expr::cust("r.measurement_type IS DISTINCT FROM 'spot'"))
+        .and_where(Expr::cust("r.measurement_type IS DISTINCT FROM 'derived'"))
+        .and_where(Expr::cust("r.is_flagged IS NOT TRUE"))
+        .and_where(Expr::col((r_.clone(), readings::Column::ReplicateIndex)).eq(0))
+        .and_where(Expr::cust_with_values(
+            "r.time >= g.collected_at + ($1 * interval '1 hour')",
+            [query.window_start_hours],
+        ))
+        .and_where(Expr::cust_with_values(
+            "r.time <= g.collected_at + ($1 * interval '1 hour')",
+            [query.window_end_hours],
+        ))
+        .take();
+    let mut in_range = Condition::all()
+        .add(Expr::col((g.clone(), Alias::new("collected_at"))).gte(effective_start));
+    if let Some(end) = effective_end {
+        in_range = in_range.add(Expr::col((g.clone(), Alias::new("collected_at"))).lte(end));
+    }
+    let (sql, values) = SeaQuery::select()
+        .expr_as(
+            Expr::col((g.clone(), Alias::new("collected_at"))),
+            Alias::new("grab_time"),
+        )
+        .expr_as(
+            Expr::col((g.clone(), Alias::new("mean"))),
+            Alias::new("grab_value"),
+        )
+        .expr_as(
+            Expr::col((g.clone(), Alias::new("stdev"))),
+            Alias::new("grab_sd"),
+        )
+        .expr_as(
+            Expr::col((g.clone(), Alias::new("n"))),
+            Alias::new("grab_n"),
+        )
+        .expr(Expr::cust("agg.sensor_avg"))
+        .expr(Expr::cust("agg.sensor_sd"))
+        .expr(Expr::cust("agg.sensor_n"))
+        .from_subquery(grabs, g.clone())
+        .join_lateral(
+            JoinType::LeftJoin,
+            window,
+            Alias::new("agg"),
+            Condition::all().add(Expr::cust("true")),
+        )
+        .cond_where(in_range)
+        .order_by((g.clone(), Alias::new("collected_at")), Order::Asc)
+        .take()
+        .build(PostgresQueryBuilder);
 
     let query_result = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
+            sql,
             values,
         ))
         .await?;

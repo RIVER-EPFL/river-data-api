@@ -1,12 +1,14 @@
 use crudcrate::{ApiError, CRUDOperations, CRUDResource, MergeIntoActiveModel};
+use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, Statement,
+    ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect, Statement,
     TransactionTrait,
 };
 use uuid::Uuid;
 
 use super::model::SensorCalibration;
 use super::service::recompute_valid_until;
+use crate::routes::private::readings::models as readings;
 
 pub struct SensorCalibrationOperations;
 
@@ -96,27 +98,17 @@ async fn reprocess_after_calibration_write<C: ConnectionTrait>(
 /// none. The repoint that clears the way for the delete excludes pinned rows, so each one still
 /// names the curve when the DELETE runs and the foreign key refuses the statement.
 async fn pinned_readings<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<Option<i64>, ApiError> {
-    let sql = format!(
-        "SELECT count(*) AS n FROM readings r
-         WHERE r.calibration_id = $1 AND NOT ({not_pinned})",
-        not_pinned = crate::routes::private::readings::decisions::not_pinned_sql(
-            "r",
-            crate::routes::private::readings::decisions::Kind::CalibrationPin
-        ),
+    let not_pinned = crate::routes::private::readings::service::not_pinned_sql(
+        "readings",
+        crate::routes::private::readings::models::Kind::CalibrationPin,
     );
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            [id.into()],
-        ))
+    let n = readings::Entity::find()
+        .filter(readings::Column::CalibrationId.eq(id))
+        .filter(Expr::cust(format!("NOT ({not_pinned})")))
+        .count(db)
         .await
         .map_err(ApiError::database)?;
-    let n = row
-        .map(|r| r.try_get::<i64>("", "n"))
-        .transpose()
-        .map_err(ApiError::database)?
-        .unwrap_or_default();
+    let n = i64::try_from(n).unwrap_or(i64::MAX);
     Ok((n > 0).then_some(n))
 }
 
@@ -268,18 +260,11 @@ impl CRUDOperations for SensorCalibrationOperations {
         // A curve that has corrected a reading is retired, never removed (Q107, M146): the row is
         // the provenance of every value it produced, and a delete would take that away and leave
         // the readings pointing at nothing. A curve nothing names has no history to keep.
-        let used: i64 = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT count(*)::bigint AS n FROM readings WHERE calibration_id = $1",
-                [id.into()],
-            ))
+        let used = readings::Entity::find()
+            .filter(readings::Column::CalibrationId.eq(id))
+            .count(db)
             .await
-            .map_err(ApiError::database)?
-            .map(|r| r.try_get::<i64>("", "n"))
-            .transpose()
-            .map_err(ApiError::database)?
-            .unwrap_or(0);
+            .map_err(ApiError::database)?;
         if used > 0 {
             return Err(ApiError::bad_request(format!(
                 "This calibration has corrected {used} reading(s), so it is retired rather than \

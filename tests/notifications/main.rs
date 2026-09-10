@@ -12,5 +12,6 @@ mod dispatcher_test;
 mod fanout_test;
 mod me_test;
 mod mute_gate;
+mod probe_sql;
 mod reconcile_test;
 mod triggers_test;

@@ -2,26 +2,31 @@
 //! recompute chain and the two jobs that drive it.
 
 use async_trait::async_trait;
+use sea_orm::sea_query::{Alias, Expr, Order, Query};
 use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, FromQueryResult, Statement,
+    ActiveModelTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
+    Set, Statement,
 };
 use std::collections::HashSet;
 use uuid::Uuid;
 
 use super::models::{
     ActiveTool, AuditCounts, Engine, EventAudit, EventContext, EventRecompute, MissingConstant,
-    RecomputeOutcome, RecomputeScope, RunOutcome, ToolResult, parse_manifest,
+    RecomputeOutcome, RecomputeScope, RunOutcome, ToolResult, parse_manifest, run,
 };
 use super::service::{
-    ParameterCatalog, ResolvedRun, execute_resolved, list_active_tools, load_parameter_catalog,
-    parse_pinned, resolve_event_inputs, resolve_run, resolve_site_inputs, run_active_tool,
-    run_fingerprint, runner_runtime, served_spot_value_sql,
+    ParameterCatalog, ResolvedRun, build, execute_resolved, list_active_tools,
+    load_parameter_catalog, parse_pinned, resolve_event_inputs, resolve_run, resolve_site_inputs,
+    run_active_tool, run_fingerprint, runner_runtime, served_spot_value_expr,
 };
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::readings::grab_samples::{
-    GrabSampleReading, GrabSampleRequest, GrabWriteMode, insert_grab_samples,
+use crate::routes::private::collection_events::models as collection_events;
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::models::{
+    GrabSampleReading, GrabSampleRequest, GrabWriteMode,
 };
+use crate::routes::private::readings::views::insert_grab_samples;
 use crate::routes::private::reprocessing_jobs::job::Job;
 use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
 use crate::routes::private::sync::service as audit;
@@ -96,30 +101,21 @@ pub(super) async fn store_run(
     };
 
     let run_id = Uuid::new_v4();
-    state
-        .db
-        .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO tool_runs (id, tool_name, tool_version, inputs, constants, curves, \
-             outputs, created_by, context, source) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-            [
-                run_id.into(),
-                tool.name.clone().into(),
-                serde_json::to_value(&tool_version)
-                    .unwrap_or(serde_json::Value::Null)
-                    .into(),
-                serde_json::Value::Object(outcome.inputs).into(),
-                constants.clone().into(),
-                serde_json::to_value(&outcome.curves)
-                    .unwrap_or(serde_json::Value::Null)
-                    .into(),
-                stored_outputs.into(),
-                actor.into(),
-                context.into(),
-                source.into(),
-            ],
-        ))
-        .await?;
+    run::ActiveModel {
+        id: Set(run_id),
+        tool_name: Set(tool.name.clone()),
+        tool_version: Set(serde_json::to_value(&tool_version).unwrap_or(serde_json::Value::Null)),
+        inputs: Set(serde_json::Value::Object(outcome.inputs)),
+        constants: Set(constants.clone()),
+        curves: Set(serde_json::to_value(&outcome.curves).unwrap_or(serde_json::Value::Null)),
+        outputs: Set(stored_outputs),
+        created_by: Set(actor.to_string()),
+        context: Set((!context.is_null()).then_some(context)),
+        source: Set(source.to_string()),
+        ..Default::default()
+    }
+    .insert(&state.db)
+    .await?;
 
     Ok(ToolResult {
         tool: tool.name.clone(),
@@ -234,14 +230,17 @@ pub async fn served_spot_value(
     at: chrono::DateTime<chrono::Utc>,
 ) -> AppResult<Option<f64>> {
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &format!("SELECT {} AS value", served_spot_value_sql("$2")),
-            [
-                site_id.into(),
-                parameter_id.into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(at).into(),
-            ],
+        .query_one_raw(build(
+            &Query::select()
+                .expr_as(
+                    served_spot_value_expr(
+                        Expr::val(site_id),
+                        Expr::val(parameter_id),
+                        Expr::val(sea_orm::prelude::DateTimeWithTimeZone::from(at)),
+                    ),
+                    Alias::new("value"),
+                )
+                .to_owned(),
         ))
         .await?;
     match row {
@@ -256,17 +255,18 @@ pub(super) async fn blob_at_event(
     event: &EventContext,
     tool: &str,
 ) -> AppResult<Option<serde_json::Value>> {
+    use sea_orm::sea_query::ExprTrait;
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT provenance FROM readings
-             WHERE site_id = $1 AND time = $2 AND provenance ->> 'tool' = $3
-             ORDER BY provenance ->> 'saved_at' DESC LIMIT 1",
-            [
-                event.site_id.into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(event.collected_at).into(),
-                tool.into(),
-            ],
+        .query_one_raw(build(
+            &Query::select()
+                .column(readings::Column::Provenance)
+                .from(readings::Entity)
+                .and_where(Expr::col(readings::Column::SiteId).eq(event.site_id))
+                .and_where(Expr::col(readings::Column::Time).eq(event.collected_at))
+                .and_where(Expr::cust_with_values("provenance ->> 'tool' = $1", [tool]))
+                .order_by_expr(Expr::cust("provenance ->> 'saved_at'"), Order::Desc)
+                .limit(1)
+                .to_owned(),
         ))
         .await?;
     // The column is nullable, so a row with no blob is None; a row that will not decode is an
@@ -473,14 +473,14 @@ pub async fn recompute_event(
         // is returned (Q40, Q47): the chain leaves it alone and says so.
         let mut owned_outputs: Vec<(String, Uuid)> = Vec::with_capacity(saved_outputs.len());
         for (key, parameter_id) in &saved_outputs {
-            if crate::routes::private::readings::decisions::output_owner(
+            if crate::routes::private::readings::service::output_owner(
                 &state.db,
                 event.site_id,
                 *parameter_id,
                 event.collected_at,
             )
             .await?
-                == crate::routes::private::readings::decisions::Owner::Manual
+                == crate::routes::private::readings::models::Owner::Manual
             {
                 outcome.skipped.push((
                     tool.name.clone(),
@@ -498,25 +498,25 @@ pub async fn recompute_event(
                 continue;
             }
             let withdrawn = crate::common::bulk_write::guarded(&state.db, async |txn| {
-                crate::routes::private::readings::decisions::record_many(
+                crate::routes::private::readings::service::record_many(
                     txn,
-                    crate::routes::private::readings::decisions::Kind::Withdraw,
+                    crate::routes::private::readings::models::Kind::Withdraw,
                     &format!(
                         "r.site_id = $1 AND r.parameter_id = $2 AND r.time = $3 \
                          AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL AND {free}",
-                        free = crate::routes::private::readings::decisions::unjudged_sql("r")
+                        free = crate::routes::private::readings::service::unjudged_sql("r")
                     ),
                     vec![
                         event.site_id.into(),
                         (*parameter_id).into(),
                         sea_orm::prelude::DateTimeWithTimeZone::from(event.collected_at).into(),
                     ],
-                    crate::routes::private::readings::decisions::NewValue::Literal(
+                    crate::routes::private::readings::service::NewValue::Literal(
                         serde_json::json!({ "reason": "the calculation now yields no value" }),
                     ),
                     actor,
                     Some("computed as NA by the recompute"),
-                    crate::routes::private::readings::decisions::Origin::Chain,
+                    crate::routes::private::readings::models::Origin::Chain,
                     None,
                 )
                 .await
@@ -556,15 +556,7 @@ pub async fn recompute_event(
         // entered at this visit carries into everything the chain derives from it.
         let inputs_pending: bool = state
             .db
-            .query_one_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT EXISTS (SELECT 1 FROM readings
-                                 WHERE site_id = $1 AND time = $2 AND unverified IS TRUE) AS p",
-                [
-                    event.site_id.into(),
-                    sea_orm::prelude::DateTimeWithTimeZone::from(event.collected_at).into(),
-                ],
-            ))
+            .query_one_raw(pending_inputs_at(event.site_id, event.collected_at))
             .await?
             .map(|r| r.try_get("", "p"))
             .transpose()?
@@ -1207,6 +1199,24 @@ impl Job for EventRecompute {
     }
 }
 
+/// Whether anything stored at this visit is still awaiting verification.
+fn pending_inputs_at(site_id: Uuid, collected_at: chrono::DateTime<chrono::Utc>) -> Statement {
+    use sea_orm::sea_query::ExprTrait;
+
+    let unverified = Query::select()
+        .expr(Expr::cust("1"))
+        .from(readings::Entity)
+        .and_where(Expr::col(readings::Column::SiteId).eq(site_id))
+        .and_where(Expr::col(readings::Column::Time).eq(collected_at))
+        .and_where(Expr::cust(r#""unverified" IS TRUE"#))
+        .to_owned();
+    build(
+        &Query::select()
+            .expr_as(Expr::exists(unverified), Alias::new("p"))
+            .to_owned(),
+    )
+}
+
 /// The events one audit run covers, most specific scope first. A `constant` or `calculation` scope
 /// narrows to the visits whose stored provenance names it, so editing one audits what that edit
 /// could have changed rather than every visit ever recorded; a visit where the tool never ran
@@ -1216,41 +1226,50 @@ pub(super) fn audit_event_set(
     site_id: Option<Uuid>,
     constant: Option<&str>,
     calculation: Option<&str>,
-) -> (String, Vec<sea_orm::Value>) {
-    let mut sql = String::from("SELECT id FROM collection_events");
-    let mut binds: Vec<sea_orm::Value> = Vec::new();
-    let mut clauses: Vec<String> = Vec::new();
+) -> Statement {
+    use sea_orm::sea_query::ExprTrait;
+
+    let events = Alias::new("collection_events");
+    let r = Alias::new("r");
+    // A visit whose stored provenance names the scope. The correlation is on the event id, so the
+    // subquery is one index probe per visit.
+    let names_in_provenance = |predicate: Expr| {
+        Expr::exists(
+            Query::select()
+                .expr(Expr::cust("1"))
+                .from_as(readings::Entity, r.clone())
+                .and_where(
+                    Expr::col((r.clone(), readings::Column::CollectionEventId))
+                        .equals((events.clone(), collection_events::Column::Id)),
+                )
+                .and_where(predicate)
+                .to_owned(),
+        )
+    };
+
+    let mut query = Query::select();
+    query
+        .column(collection_events::Column::Id)
+        .from(collection_events::Entity);
     if let Some(id) = event_id {
-        binds.push(id.into());
-        clauses.push(format!("id = ${}", binds.len()));
+        query.and_where(Expr::col(collection_events::Column::Id).eq(id));
     } else if let Some(site) = site_id {
-        binds.push(site.into());
-        clauses.push(format!("site_id = ${}", binds.len()));
+        query.and_where(Expr::col(collection_events::Column::SiteId).eq(site));
     }
     if let Some(name) = constant {
-        binds.push(name.into());
-        clauses.push(format!(
-            "EXISTS (SELECT 1 FROM readings r \
-              WHERE r.collection_event_id = collection_events.id \
-                AND jsonb_exists(r.provenance -> 'constants', ${}))",
-            binds.len()
-        ));
+        query.and_where(names_in_provenance(Expr::cust_with_values(
+            r#"jsonb_exists("r"."provenance" -> 'constants', $1)"#,
+            [name],
+        )));
     }
     if let Some(name) = calculation {
-        binds.push(name.into());
-        clauses.push(format!(
-            "EXISTS (SELECT 1 FROM readings r \
-              WHERE r.collection_event_id = collection_events.id \
-                AND r.provenance ->> 'tool' = ${})",
-            binds.len()
-        ));
+        query.and_where(names_in_provenance(Expr::cust_with_values(
+            r#""r"."provenance" ->> 'tool' = $1"#,
+            [name],
+        )));
     }
-    if !clauses.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&clauses.join(" AND "));
-    }
-    sql.push_str(" ORDER BY collected_at");
-    (sql, binds)
+    query.order_by(collection_events::Column::CollectedAt, Order::Asc);
+    build(&query.to_owned())
 }
 
 #[async_trait]
@@ -1287,18 +1306,13 @@ impl Job for EventAudit {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
 
-        let (sql, binds) = audit_event_set(
-            event_id,
-            site_id,
-            constant.as_deref(),
-            calculation.as_deref(),
-        );
         let event_rows = ctx
             .db()
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                sql,
-                binds,
+            .query_all_raw(audit_event_set(
+                event_id,
+                site_id,
+                constant.as_deref(),
+                calculation.as_deref(),
             ))
             .await?;
 
