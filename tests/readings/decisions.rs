@@ -720,7 +720,7 @@ async fn a_derivation_writer_appends_no_decision() {
     seed_group(&f, &[10.0, 20.0]).await;
     // The janitor recompose re-derives corrected values from the row's own curves: a derivation,
     // never a decision.
-    river_db::routes::private::sensors::calibrations::service::recompose_from_own_curves(
+    river_db::routes::private::sensor_calibrations::service::recompose_from_own_curves(
         &f.db,
         "TRUE",
         "r.stream_id = $1",

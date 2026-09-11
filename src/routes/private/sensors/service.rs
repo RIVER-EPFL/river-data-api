@@ -17,11 +17,11 @@ use uuid::Uuid;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::service as readings_service;
-use crate::routes::private::sensors::calibrations;
-use crate::routes::private::sensors::calibrations::model as calibrations_model;
-use crate::routes::private::sensors::deployments;
-use crate::routes::private::sensors::deployments::model as deployments_model;
-use crate::routes::private::sensors::standard_curves::model as standard_curves;
+use crate::routes::private::sensor_calibrations;
+use crate::routes::private::sensor_calibrations::models as calibrations_model;
+use crate::routes::private::sensor_deployments as deployments;
+use crate::routes::private::sensor_deployments::models as deployments_model;
+use crate::routes::private::standard_curves::models as standard_curves;
 use crate::routes::private::sync::models::HoldKind;
 use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::private::sync::service as audit;
@@ -1177,13 +1177,13 @@ pub async fn resolve_windows_for_times<C: ConnectionTrait>(
     // and read it into a non-nullable DateTime, chrono/sqlx cannot represent infinity and would
     // panic for the (common) open calibration/deployment.
     let cals: Vec<(Uuid, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>)> =
-        calibrations::Entity::find()
-            .filter(calibrations::Column::SensorId.eq(sensor_id))
+        sensor_calibrations::Entity::find()
+            .filter(sensor_calibrations::Column::SensorId.eq(sensor_id))
             .select_only()
-            .column(calibrations::Column::Id)
-            .column(calibrations::Column::ValidFrom)
-            .column(calibrations::Column::ValidUntil)
-            .order_by_asc(calibrations::Column::ValidFrom)
+            .column(sensor_calibrations::Column::Id)
+            .column(sensor_calibrations::Column::ValidFrom)
+            .column(sensor_calibrations::Column::ValidUntil)
+            .order_by_asc(sensor_calibrations::Column::ValidFrom)
             .into_tuple()
             .all(db)
             .await?;
@@ -1295,7 +1295,7 @@ pub async fn resolve_slot_owner_for_times<C: ConnectionTrait>(
     // earliest covering window and disagree with every other write path.
     let mut curve_at: HashMap<(Uuid, chrono::DateTime<Utc>), Uuid> = HashMap::new();
     for (sensor_id, sensor_times) in &times_by_sensor {
-        let curves = sensors::calibrations::resolver::resolve_for_times(
+        let curves = sensor_calibrations::resolver::resolve_for_times(
             db,
             *sensor_id,
             Some(parameter_id),

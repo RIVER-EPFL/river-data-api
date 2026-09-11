@@ -9,7 +9,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;
 
-use river_db::routes::private::sensors::calibrations::service::sweep_curve_drift;
+use river_db::routes::private::sensor_calibrations::service::sweep_curve_drift;
 
 use crate::common::sensor_lifecycle::{add_calibration, create_sensor, deploy_sensor, dt};
 use crate::common::{GLOBAL_PARAM_DO_ID, SITE1_ID};

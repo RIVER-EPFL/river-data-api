@@ -13,13 +13,13 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::alarms::models as alarm_thresholds;
 use crate::routes::private::data_streams::models::{MoveScope, SlotMove};
 use crate::routes::private::data_streams::service::{move_slot_rows, slot_move_collisions};
-use crate::routes::private::parameters::derived::{definition_model, source_model};
+use crate::routes::private::derived_parameters::models::{definition, source};
 use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::models as readings;
-use crate::routes::private::readings::status_events::model as status_events;
-use crate::routes::private::sensors::calibrations::model as sensor_calibrations;
-use crate::routes::private::sensors::deployments::model as sensor_deployments;
-use crate::routes::private::sites::parameters::models as site_parameters;
+use crate::routes::private::readings::status_events::models as status_events;
+use crate::routes::private::sensor_calibrations::models as sensor_calibrations;
+use crate::routes::private::sensor_deployments::models as sensor_deployments;
+use crate::routes::private::site_parameters::models as site_parameters;
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct MergeSiteParametersRequest {
@@ -321,15 +321,15 @@ async fn refuse_derived_cycle<C: sea_orm::ConnectionTrait>(
     source_id: Uuid,
     target_id: Uuid,
 ) -> AppResult<()> {
-    let formulas = definition_model::Entity::find()
-        .filter(definition_model::Column::OutputParameterId.is_not_null())
+    let formulas = definition::Entity::find()
+        .filter(definition::Column::OutputParameterId.is_not_null())
         .all(conn)
         .await?;
-    let sources: Vec<(Uuid, Option<Uuid>)> = source_model::Entity::find()
+    let sources: Vec<(Uuid, Option<Uuid>)> = source::Entity::find()
         .select_only()
         .columns([
-            source_model::Column::DerivedDefinitionId,
-            source_model::Column::ParameterId,
+            source::Column::DerivedDefinitionId,
+            source::Column::ParameterId,
         ])
         .into_tuple()
         .all(conn)
@@ -589,23 +589,23 @@ async fn reassign_parameter_references(
         .map_err(AppError::Database)?;
 
     // Derived parameter sources: delete conflicts, then reassign
-    let already_reading_target: Vec<Uuid> = source_model::Entity::find()
-        .filter(source_model::Column::ParameterId.eq(target_id))
+    let already_reading_target: Vec<Uuid> = source::Entity::find()
+        .filter(source::Column::ParameterId.eq(target_id))
         .all(txn)
         .await
         .map_err(AppError::Database)?
         .into_iter()
         .map(|s| s.derived_definition_id)
         .collect();
-    source_model::Entity::delete_many()
-        .filter(source_model::Column::ParameterId.eq(source_id))
-        .filter(source_model::Column::DerivedDefinitionId.is_in(already_reading_target))
+    source::Entity::delete_many()
+        .filter(source::Column::ParameterId.eq(source_id))
+        .filter(source::Column::DerivedDefinitionId.is_in(already_reading_target))
         .exec(txn)
         .await
         .map_err(AppError::Database)?;
-    source_model::Entity::update_many()
-        .col_expr(source_model::Column::ParameterId, to_target(target_id))
-        .filter(source_model::Column::ParameterId.eq(source_id))
+    source::Entity::update_many()
+        .col_expr(source::Column::ParameterId, to_target(target_id))
+        .filter(source::Column::ParameterId.eq(source_id))
         .exec(txn)
         .await
         .map_err(AppError::Database)?;
@@ -613,12 +613,12 @@ async fn reassign_parameter_references(
     // What a formula produces moves with what it reads. Without this the delete below raises the
     // output foreign key, and the merge fails on a constraint name rather than doing its job; a
     // formula whose output would close a loop is already refused before any of this runs.
-    definition_model::Entity::update_many()
+    definition::Entity::update_many()
         .col_expr(
-            definition_model::Column::OutputParameterId,
+            definition::Column::OutputParameterId,
             to_target(target_id),
         )
-        .filter(definition_model::Column::OutputParameterId.eq(source_id))
+        .filter(definition::Column::OutputParameterId.eq(source_id))
         .exec(txn)
         .await
         .map_err(AppError::Database)?;

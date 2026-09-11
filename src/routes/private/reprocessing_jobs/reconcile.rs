@@ -26,15 +26,15 @@ use sea_orm::{
 use uuid::Uuid;
 
 use crate::routes::private::readings::models as readings;
-use crate::routes::private::readings::samples::model as samples;
-use crate::routes::private::readings::status_events::model as status_events;
+use crate::routes::private::readings::samples::models as samples;
+use crate::routes::private::readings::status_events::models as status_events;
 
 use super::job::Job;
 use super::lifecycle::{JobContext, JobReport};
 use crate::common::bulk_write;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams;
-use crate::routes::private::sites::parameters as site_parameters;
+use crate::routes::private::site_parameters;
 use crate::routes::private::sync::service::{DEFAULT_ABS_TOL, DEFAULT_REL_TOL};
 
 /// A family stream and the legacy avg stream it supersedes. The pairing is exact, not guessed:

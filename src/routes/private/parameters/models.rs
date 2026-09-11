@@ -43,17 +43,17 @@ pub struct Model {
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_many = "crate::routes::private::sites::parameters::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::site_parameters::Entity")]
     SiteParameters,
     #[sea_orm(has_many = "crate::routes::private::alarms::models::Entity")]
     AlarmThresholds,
     #[sea_orm(has_many = "crate::routes::private::readings::status_events::Entity")]
     StatusEvents,
-    #[sea_orm(has_many = "crate::routes::private::parameters::derived::source_model::Entity")]
+    #[sea_orm(has_many = "crate::routes::private::derived_parameters::models::source::Entity")]
     DerivedParameterSources,
 }
 
-impl Related<crate::routes::private::sites::parameters::Entity> for Entity {
+impl Related<crate::routes::private::site_parameters::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SiteParameters.def()
     }
@@ -71,7 +71,7 @@ impl Related<crate::routes::private::readings::status_events::Entity> for Entity
     }
 }
 
-impl Related<crate::routes::private::parameters::derived::source_model::Entity> for Entity {
+impl Related<crate::routes::private::derived_parameters::models::source::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::DerivedParameterSources.def()
     }

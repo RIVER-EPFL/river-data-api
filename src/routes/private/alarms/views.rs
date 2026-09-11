@@ -1,8 +1,9 @@
 use axum::{
-    Json,
+    Json, Router, middleware,
     extract::{Path, Query, State},
     http::{StatusCode, header::HeaderMap},
     response::{IntoResponse, Response},
+    routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{
@@ -25,7 +26,7 @@ use crate::common::paging::Window;
 use crate::common::scope::project_filter_sql;
 use crate::common::series::{self, Cells, Table};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::sites::parameters as site_parameters;
+use crate::routes::private::site_parameters;
 use crate::routes::{cache, resolve_site_with_project, validate_time_range};
 
 use super::models::alarm_event;
@@ -760,4 +761,38 @@ pub async fn coalesce_reconcile(
         super::flows::reconcile_all_now(&state.db).await;
     }
     response
+}
+
+/// The alarm surface a reader asks for: what is breaching now, the rollup of it, the episode
+/// history and the thresholds those are judged against.
+///
+/// `/sites/{id}/alarms` is not here. It is the per-site time series, addressed under the site
+/// rather than under the alarm, and it stays with the other cross-cutting site routes (Q143).
+pub fn read_routes() -> Router<AppState> {
+    Router::new()
+        .route("/alarms/active", get(get_active_alarms))
+        .route("/alarms/summary", get(get_alarm_summary))
+        .route("/alarms/events", get(get_alarm_events))
+        .route("/alarms/thresholds", get(get_thresholds))
+        .layer(middleware::from_fn(
+            crate::common::middleware::require_read_data,
+        ))
+}
+
+/// Acknowledging an episode, and taking that back.
+///
+/// `deny_scoped_token` alongside the write gate: an acknowledgement is not confined to a project,
+/// so a project-scoped token has no business making one.
+pub fn write_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/alarms/{event_id}/acknowledge",
+            post(acknowledge_alarm).delete(unacknowledge_alarm),
+        )
+        .layer(middleware::from_fn(
+            crate::common::middleware::deny_scoped_token,
+        ))
+        .layer(middleware::from_fn(
+            crate::common::middleware::require_write_data,
+        ))
 }

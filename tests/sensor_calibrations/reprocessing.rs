@@ -393,7 +393,7 @@ async fn reprocess_prefers_a_parameter_specific_curve_over_an_open_wildcard() {
 #[tokio::test]
 #[serial]
 async fn recalled_inputs_take_their_derived_output_out_of_the_site() {
-    use river_db::routes::private::sensors::calibrations::service::reprocess_sensor_readings;
+    use river_db::routes::private::sensor_calibrations::service::reprocess_sensor_readings;
 
     let db = setup_test_db().await;
     cleanup_test_db(&db).await;
@@ -506,7 +506,7 @@ async fn recalled_inputs_take_their_derived_output_out_of_the_site() {
 #[tokio::test]
 #[serial]
 async fn slot_reprocess_recalls_only_after_the_first_deployment() {
-    use river_db::routes::private::sensors::calibrations::service::reprocess_site_parameter_readings;
+    use river_db::routes::private::sensor_calibrations::service::reprocess_site_parameter_readings;
 
     let db = setup_test_db().await;
     cleanup_test_db(&db).await;
@@ -589,7 +589,7 @@ async fn slot_reprocess_recalls_only_after_the_first_deployment() {
 #[tokio::test]
 #[serial]
 async fn slot_reprocess_leaves_spot_grabs_untouched() {
-    use river_db::routes::private::sensors::calibrations::service::reprocess_site_parameter_readings;
+    use river_db::routes::private::sensor_calibrations::service::reprocess_site_parameter_readings;
 
     let db = setup_test_db().await;
     cleanup_test_db(&db).await;
@@ -1402,7 +1402,7 @@ async fn full_cascade_calibration_to_aggregates() {
 #[tokio::test]
 #[serial]
 async fn slot_reprocess_picks_the_later_of_two_open_windows() {
-    use river_db::routes::private::sensors::calibrations::service::reprocess_site_parameter_readings;
+    use river_db::routes::private::sensor_calibrations::service::reprocess_site_parameter_readings;
 
     let db = setup_test_db().await;
     cleanup_test_db(&db).await;
@@ -1485,7 +1485,7 @@ async fn slot_reprocess_picks_the_later_of_two_open_windows() {
 #[tokio::test]
 #[serial]
 async fn a_reprocess_records_the_readings_it_moved_against_its_job() {
-    use river_db::routes::private::sensors::calibrations::service::reprocess_sensor_readings;
+    use river_db::routes::private::sensor_calibrations::service::reprocess_sensor_readings;
     use sea_orm::Statement;
 
     let db = setup_test_db().await;

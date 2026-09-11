@@ -2,9 +2,10 @@
 //! `/notifications/me` handler a subscriber manages their own channels through.
 
 use axum::{
-    Extension, Json,
+    Extension, Json, Router, middleware,
     extract::{Query, State},
     http::StatusCode,
+    routing::{get, post, put},
 };
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
@@ -461,4 +462,43 @@ pub async fn schedule_ping(
         .await;
     });
     Ok(Json(serde_json::json!({ "seconds": seconds })))
+}
+
+/// Notification oversight: per-channel health, the delivery log, a one-off test send and the
+/// subscriber roster. Administrator only, the same gate the rest of the roster carries.
+pub fn oversight_routes() -> Router<AppState> {
+    Router::new()
+        .route("/notifications/health", get(get_health))
+        .route("/notifications/deliveries", get(list_delivery_log))
+        .route("/notifications/health/refresh", post(refresh_health))
+        .route("/notifications/test-send", post(test_send))
+        .route("/notifications/subscribers", get(list_subscribers))
+        .layer(middleware::from_fn(
+            crate::common::middleware::require_admin,
+        ))
+}
+
+/// Self-service notification preferences: any Keycloak user manages their OWN settings.
+///
+/// The gate is `require_read_data` rather than an admin one because every handler binds to the
+/// caller's JWT `sub`; an API token has no user sub and each handler refuses one itself.
+pub fn subscriber_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/notifications/me",
+            get(get_my_notifications).patch(update_my_notifications),
+        )
+        .route("/notifications/me/subscriptions", put(set_my_subscriptions))
+        .route(
+            "/notifications/me/push",
+            post(register_push_subscription)
+                .get(list_push_subscriptions)
+                .delete(delete_push_subscription),
+        )
+        .route("/notifications/channels", get(list_channels))
+        .route("/notifications/me/push/test", post(test_push))
+        .route("/notifications/me/push/ping", post(schedule_ping))
+        .layer(middleware::from_fn(
+            crate::common::middleware::require_read_data,
+        ))
 }

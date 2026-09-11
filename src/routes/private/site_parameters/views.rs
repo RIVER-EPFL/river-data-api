@@ -1,0 +1,407 @@
+//! The site-parameter handlers: applying a parameter group to a site, and declaring or retagging
+//! a slot's sd estimator.
+//!
+//! Under Q98 a calculation applies at a site when the group's output slots are configured there,
+//! so the site parameters *are* the declaration and `apply_group` is the flow that writes it. One
+//! action per group rather than one per member: pCO2, DIC and Chl a carry roughly 45 stage-1
+//! intermediates between them (Q95), and there are 23 CNET stations. Applying twice adds only what
+//! is missing, so a group that grows is applied again rather than diffed by hand.
+//!
+//! `sd_estimator` is excluded from CRUD update because changing the declaration must also
+//! recompute the slot's stored samples; `declare_sd_estimator` is the one path, writing the column
+//! and enqueueing the tracked `sd_estimator_retag` in the same breath, exactly as the audit
+//! resolution's slot scope does.
+
+use axum::{
+    Json,
+    extract::{Path, State},
+};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, PostgresQueryBuilder, Query as SeaQuery};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
+};
+use uuid::Uuid;
+
+use super::models::{
+    ActiveModel, AppliedSlot, ApplyGroupRequest, ApplyGroupResponse, Column,
+    DeclareSdEstimatorRequest, DeclareSdEstimatorResponse, Entity, GroupMember, RetagCounts,
+    RetagSdEstimatorRequest, RetagSdEstimatorResponse, UndeclaredRow,
+};
+use super::service::{partition_members, slot_scope};
+use crate::common::state::AppState;
+use crate::error::{AppError, AppResult};
+use crate::routes::private::parameter_groups::member_model;
+use crate::routes::private::readings::samples;
+
+#[utoipa::path(
+    post,
+    path = "/api/site_parameters/{id}/declare_sd_estimator",
+    request_body = DeclareSdEstimatorRequest,
+    responses(
+        (status = 200, body = DeclareSdEstimatorResponse),
+        (status = 400, description = "Estimator is not 'sample', 'population' or null"),
+        (status = 404, description = "No site parameter with this id"),
+    ),
+    tag = "site_parameters"
+)]
+pub async fn declare_sd_estimator(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<DeclareSdEstimatorRequest>,
+) -> AppResult<Json<DeclareSdEstimatorResponse>> {
+    let estimator = match payload.estimator.as_deref() {
+        None | Some("sample" | "population") => payload.estimator.clone(),
+        Some(other) => {
+            return Err(AppError::BadRequest(format!(
+                "estimator must be 'sample', 'population' or null, not '{other}'"
+            )));
+        }
+    };
+
+    let (previous, affected) = state
+        .db
+        .transaction::<_, (Option<String>, i64), sea_orm::DbErr>(|txn| {
+            let estimator = estimator.clone();
+            Box::pin(async move {
+                crate::common::actor::declare(txn).await?;
+                let slot = Entity::find_by_id(id)
+                    .lock_exclusive()
+                    .one(txn)
+                    .await?
+                    .ok_or_else(|| sea_orm::DbErr::RecordNotFound(id.to_string()))?;
+                let (site_id, parameter_id, previous) =
+                    (slot.site_id, slot.parameter_id, slot.sd_estimator);
+
+                Entity::update_many()
+                    .col_expr(Column::SdEstimator, Expr::value(estimator.clone()))
+                    .filter(Column::Id.eq(id))
+                    .exec(txn)
+                    .await?;
+
+                // Counted inside the transaction the declaration lands in, so the number
+                // reported is the one the retag will act on. A cleared declaration recomputes
+                // nothing: stored samples keep the estimator they were computed with.
+                // `sd_estimator` is NOT NULL, so `ne` is the `IS DISTINCT FROM` this had.
+                let affected = if let Some(est) = &estimator {
+                    samples::Entity::find()
+                        .filter(samples::Column::SiteId.eq(site_id))
+                        .filter(samples::Column::ParameterId.eq(parameter_id))
+                        .filter(samples::Column::SdEstimator.ne(est.clone()))
+                        .filter(samples::Column::SdEstimatorSource.ne("sample"))
+                        .count(txn)
+                        .await?
+                        .try_into()
+                        .unwrap_or(i64::MAX)
+                } else {
+                    0
+                };
+                Ok((previous, affected))
+            })
+        })
+        .await
+        .map_err(|e| match e {
+            sea_orm::TransactionError::Transaction(sea_orm::DbErr::RecordNotFound(_)) => {
+                AppError::NotFound(format!("site parameter {id} not found"))
+            }
+            sea_orm::TransactionError::Connection(db) => AppError::from(db),
+            sea_orm::TransactionError::Transaction(db) => AppError::from(db),
+        })?;
+
+    let job_id = if let Some(est) = &estimator
+        && affected > 0
+    {
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
+            &state.db,
+            "sd_estimator_retag",
+            None,
+            None,
+            &serde_json::json!({
+                "estimator": est,
+                "site_parameter_ids": [id],
+            }),
+            None,
+        )
+        .await?
+    } else {
+        None
+    };
+
+    Ok(Json(DeclareSdEstimatorResponse {
+        site_parameter_id: id,
+        estimator,
+        previous,
+        samples_affected: affected,
+        job_id,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/actions/retag_sd_estimator",
+    request_body = RetagSdEstimatorRequest,
+    responses(
+        (status = 200, body = RetagSdEstimatorResponse),
+        (status = 400, description = "Unknown estimator, no slot or stream named, a window \
+                                      that ends before it starts, or a slot in scope that does \
+                                      not declare the estimator"),
+    ),
+    tag = "actions"
+)]
+pub async fn retag_sd_estimator(
+    State(state): State<AppState>,
+    Json(payload): Json<RetagSdEstimatorRequest>,
+) -> AppResult<Json<RetagSdEstimatorResponse>> {
+    let estimator = crate::routes::private::readings::service::parse(&payload.estimator)?;
+    if payload.site_parameter_ids.is_empty() && payload.stream_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "name at least one site_parameter_id or stream_id".to_string(),
+        ));
+    }
+    if let (Some(start), Some(end)) = (payload.start, payload.end)
+        && end < start
+    {
+        return Err(AppError::BadRequest(
+            "the window ends before it starts".to_string(),
+        ));
+    }
+
+    let db = &state.db;
+    let undeclared = if payload.dry_run {
+        Vec::new()
+    } else {
+        db.query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT st.name AS site_name, p.name AS parameter_name, sp.sd_estimator
+             FROM site_parameters sp
+             JOIN sites st ON st.id = sp.site_id
+             JOIN parameters p ON p.id = sp.parameter_id
+             WHERE (sp.id = ANY($1)
+                    OR EXISTS (SELECT 1 FROM data_streams ds
+                               WHERE ds.id = ANY($2) AND ds.site_parameter_id = sp.id))
+               AND sp.sd_estimator IS DISTINCT FROM $3
+             ORDER BY st.name, p.name",
+            [
+                payload.site_parameter_ids.clone().into(),
+                payload.stream_ids.clone().into(),
+                estimator.into(),
+            ],
+        ))
+        .await?
+    };
+    if !undeclared.is_empty() {
+        let named: Vec<String> = undeclared
+            .iter()
+            .map(|row| {
+                let row = UndeclaredRow::from_query_result(row, "")?;
+                Ok(format!(
+                    "{} / {} ({})",
+                    row.site_name,
+                    row.parameter_name,
+                    row.sd_estimator.as_deref().unwrap_or("not declared")
+                ))
+            })
+            .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
+        return Err(AppError::BadRequest(format!(
+            "declare '{estimator}' on the slot first; it is not what {} declares",
+            named.join(", ")
+        )));
+    }
+
+    // One pass, split by whether the instant declared for itself: the two FILTER aggregates are
+    // the only text left, and the scope and window are composed rather than appended with
+    // hand-counted placeholders.
+    let mut counts_query = SeaQuery::select();
+    counts_query
+        .expr_as(
+            Expr::cust("COUNT(*) FILTER (WHERE sd_estimator_source <> 'sample')::bigint"),
+            Alias::new("slot_rows"),
+        )
+        .expr_as(
+            Expr::cust("COUNT(*) FILTER (WHERE sd_estimator_source = 'sample')::bigint"),
+            Alias::new("instant_rows"),
+        )
+        .from(samples::Entity)
+        .and_where(slot_scope(&payload.site_parameter_ids, &payload.stream_ids))
+        .and_where(Expr::col(samples::Column::SdEstimator).ne(estimator));
+    if let Some(start) = payload.start {
+        counts_query.and_where(Expr::col(samples::Column::CollectedAt).gte(start));
+    }
+    if let Some(end) = payload.end {
+        counts_query.and_where(Expr::col(samples::Column::CollectedAt).lte(end));
+    }
+    let (sql, values) = counts_query.build(PostgresQueryBuilder);
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values.0,
+        ))
+        .await?;
+    let counts = row
+        .map(|row| RetagCounts::from_query_result(&row, ""))
+        .transpose()?;
+    let (slot_rows, instant_rows) = counts.map_or((0, 0), |c| (c.slot_rows, c.instant_rows));
+    let affected = if payload.override_instants {
+        slot_rows + instant_rows
+    } else {
+        slot_rows
+    };
+
+    let job_id = if affected > 0 && !payload.dry_run {
+        let mut params = serde_json::json!({
+            "estimator": estimator,
+            "site_parameter_ids": payload.site_parameter_ids,
+            "stream_ids": payload.stream_ids,
+            "override_instants": payload.override_instants,
+        });
+        if let Some(start) = payload.start {
+            params["start"] = start.to_rfc3339().into();
+        }
+        if let Some(end) = payload.end {
+            params["end"] = end.to_rfc3339().into();
+        }
+        crate::routes::private::reprocessing_jobs::worker::enqueue(
+            db,
+            "sd_estimator_retag",
+            None,
+            None,
+            &params,
+            None,
+        )
+        .await?
+    } else {
+        None
+    };
+
+    Ok(Json(RetagSdEstimatorResponse {
+        estimator: estimator.to_string(),
+        samples_affected: affected,
+        instant_decisions: instant_rows,
+        job_id,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/sites/{site_id}/parameter_groups",
+    request_body = ApplyGroupRequest,
+    responses(
+        (status = 200, body = ApplyGroupResponse),
+        (status = 404, description = "No site or no parameter group with this id"),
+    ),
+    tag = "site_parameters"
+)]
+pub async fn apply_group(
+    State(state): State<AppState>,
+    Path(site_id): Path<Uuid>,
+    Json(payload): Json<ApplyGroupRequest>,
+) -> AppResult<Json<ApplyGroupResponse>> {
+    let site = crate::routes::private::sites::models::Entity::find_by_id(site_id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Site {site_id} not found")))?;
+
+    let members = member_model::Entity::find()
+        .filter(member_model::Column::GroupId.eq(payload.group_id))
+        .order_by_asc(member_model::Column::Ordinal)
+        .all(&state.db)
+        .await?;
+    if members.is_empty() {
+        return Err(AppError::NotFound(format!(
+            "Parameter group {} holds no members",
+            payload.group_id
+        )));
+    }
+
+    let codes: std::collections::HashMap<Uuid, String> =
+        crate::routes::private::parameters::Entity::find()
+            .filter(
+                crate::routes::private::parameters::Column::Id
+                    .is_in(members.iter().map(|m| m.parameter_id)),
+            )
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .map(|p| (p.id, p.code))
+            .collect();
+
+    let rows: Vec<GroupMember> = members
+        .iter()
+        .map(|m| {
+            (
+                m.parameter_id,
+                codes.get(&m.parameter_id).cloned().unwrap_or_default(),
+                m.role.clone(),
+            )
+        })
+        .collect();
+
+    let held: std::collections::HashSet<Uuid> = Entity::find()
+        .filter(Column::SiteId.eq(site_id))
+        .select_only()
+        .column(Column::ParameterId)
+        .into_tuple::<Uuid>()
+        .all(&state.db)
+        .await?
+        .into_iter()
+        .collect();
+
+    let (to_create, already) = partition_members(&rows, &held);
+    let slot = |(parameter_id, parameter_code, role): &GroupMember,
+                site_parameter_id: Option<Uuid>| AppliedSlot {
+        parameter_id: *parameter_id,
+        parameter_code: parameter_code.clone(),
+        role: role.clone(),
+        site_parameter_id,
+    };
+
+    if payload.dry_run {
+        return Ok(Json(ApplyGroupResponse {
+            site_id,
+            group_id: payload.group_id,
+            dry_run: true,
+            created: to_create.iter().map(|m| slot(m, None)).collect(),
+            existing: already.iter().map(|m| slot(m, None)).collect(),
+        }));
+    }
+
+    // One transaction: a half-applied group is a site whose calculations partly apply, which is
+    // the state this whole flow exists to prevent.
+    let txn = state.db.begin().await?;
+    // The change-audit trigger reads the writer from the transaction it fires in.
+    crate::common::actor::declare(&txn).await?;
+    crate::common::actor::declare(&txn).await?;
+    let mut created = Vec::with_capacity(to_create.len());
+    for member in &to_create {
+        let id = Uuid::new_v4();
+        ActiveModel {
+            id: Set(id),
+            site_id: Set(site_id),
+            parameter_id: Set(member.0),
+            name: Set(format!("{} {}", site.name, member.1).trim().to_string()),
+            sensor_type: Set(String::new()),
+            is_active: Set(Some(true)),
+            is_public: Set(Some(false)),
+            needs_review: Set(false),
+            instrument_sensor_id: Set(payload.instrument_sensor_id),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await?;
+        created.push(slot(member, Some(id)));
+    }
+    txn.commit().await?;
+
+    if !created.is_empty() {
+        crate::common::cache::invalidate_site(&state.response_cache, site_id);
+    }
+
+    Ok(Json(ApplyGroupResponse {
+        site_id,
+        group_id: payload.group_id,
+        dry_run: false,
+        created,
+        existing: already.iter().map(|m| slot(m, None)).collect(),
+    }))
+}

@@ -3,10 +3,10 @@
 
 use std::time::Duration;
 
-use crate::routes::private::parameters::derived::definition_model as formulas;
-use crate::routes::private::parameters::derived::source_model as sources;
+use crate::routes::private::derived_parameters::models::definition as formulas;
+use crate::routes::private::derived_parameters::models::source as sources;
 use crate::routes::private::readings::models as readings;
-use crate::routes::private::sites::parameters::models as site_parameters;
+use crate::routes::private::site_parameters::models as site_parameters;
 use async_trait::async_trait;
 use sea_orm::sea_query;
 use sea_orm::{ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QuerySelect, Statement};
@@ -17,10 +17,10 @@ use super::lifecycle::{JobContext, JobReport};
 use super::schedule::Schedule;
 use crate::common::sync_state;
 use crate::config::Config;
-use crate::routes::private::sensors::calibrations::service::{
+use crate::routes::private::sensor_calibrations::service::{
     recalculate_derived_at_timestamp, reprocess_sensor_readings, reprocess_site_parameter_readings,
 };
-use crate::routes::private::sensors::deployments;
+use crate::routes::private::sensor_deployments as deployments;
 
 /// One instant of one site's derived work.
 #[derive(FromQueryResult)]
@@ -920,10 +920,10 @@ impl Job for ReprocessAll {
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        let slots: Vec<(Uuid, Uuid)> = deployments::model::Entity::find()
+        let slots: Vec<(Uuid, Uuid)> = deployments::models::Entity::find()
             .select_only()
-            .column(deployments::model::Column::SiteId)
-            .column(deployments::model::Column::ParameterId)
+            .column(deployments::models::Column::SiteId)
+            .column(deployments::models::Column::ParameterId)
             .distinct()
             .into_tuple()
             .all(ctx.db())
@@ -1252,7 +1252,7 @@ impl Job for JanitorRun {
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        use crate::routes::private::parameters::derived::janitor;
+        use crate::routes::private::derived_parameters::flows as janitor;
         let db = ctx.db();
 
         // A scheduled run carries the schedule's tunables snapshot under `params.tunables`
@@ -1308,7 +1308,7 @@ impl Job for JanitorRun {
         //    it eventual, so a hook that never fired costs staleness rather than a wrong number.
         //    Refreshed over the span it moved, before the rollups below settle for this tick.
         let mut recomposed = 0u64;
-        match crate::routes::private::sensors::calibrations::service::sweep_curve_drift(
+        match crate::routes::private::sensor_calibrations::service::sweep_curve_drift(
             db,
             Some(ctx.job_id()),
         )

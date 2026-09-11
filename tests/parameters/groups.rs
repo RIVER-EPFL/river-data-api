@@ -1,7 +1,7 @@
 //! Parameter groups: the rules SQL holds, and the definition document the grid renders from.
 //!
 //! The move and delete decisions themselves are unit-tested in
-//! `routes::private::parameters::groups::rules`; what only real SQL can show is the unique
+//! `routes::private::parameter_groups::rules`; what only real SQL can show is the unique
 //! membership, the role CHECK, the history trigger firing on every writer, and the document the
 //! endpoint assembles from a group and the catalog.
 

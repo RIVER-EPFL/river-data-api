@@ -21,7 +21,7 @@ use crate::common::series::{Cells, Table};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::samples;
-use crate::routes::private::sites::parameters as site_parameters;
+use crate::routes::private::site_parameters;
 
 // --- Site detail and the parameter list ---
 

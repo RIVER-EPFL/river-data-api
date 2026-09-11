@@ -21,7 +21,7 @@ use crate::common::series::{self, Cells, Table};
 use crate::common::served;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::models as readings;
-use crate::routes::private::readings::samples::model as samples;
+use crate::routes::private::readings::samples::models as samples;
 use crate::routes::private::sites::service::resolution_of;
 use crate::routes::public::service::{PublicProjectConfig, PublicSiteConfig, get_public_config};
 

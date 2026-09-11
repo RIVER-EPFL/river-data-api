@@ -30,9 +30,9 @@ use crate::common::middleware::enforce_project_scope_for_sites;
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::api_tokens::service::hash_token;
-use crate::routes::private::parameters::groups::group_model as parameter_groups;
-use crate::routes::private::readings::samples::model as samples;
-use crate::routes::private::readings::status_events::model as status_events;
+use crate::routes::private::parameter_groups::group_model as parameter_groups;
+use crate::routes::private::readings::samples::models as samples;
+use crate::routes::private::readings::status_events::models as status_events;
 use crate::routes::private::sensors;
 use crate::routes::private::sensors::models::{InstrumentKind, proposal};
 use crate::routes::private::sensors::service::{
@@ -40,7 +40,7 @@ use crate::routes::private::sensors::service::{
 };
 use crate::routes::private::{
     annotations, data_streams, data_streams::pairing_plans, parameters, projects,
-    sensors::standard_curves, sites, sites::parameters as site_parameters,
+    standard_curves, sites, site_parameters as site_parameters,
 };
 use crate::routes::private::{collection_events, readings};
 
@@ -2905,7 +2905,7 @@ pub(super) async fn assign_plan_curves<C: ConnectionTrait>(
                 intent.curve_id, intent.instrument_source_key
             )));
         };
-        if crate::routes::private::sensors::standard_curves::views::curve_is_used(
+        if crate::routes::private::standard_curves::views::curve_is_used(
             txn,
             intent.curve_id,
         )
@@ -2917,12 +2917,12 @@ pub(super) async fn assign_plan_curves<C: ConnectionTrait>(
                 intent.curve_id
             )));
         }
-        let result = standard_curves::model::Entity::update_many()
+        let result = standard_curves::models::Entity::update_many()
             .col_expr(
-                standard_curves::model::Column::SensorId,
+                standard_curves::models::Column::SensorId,
                 Expr::value(sensor_id),
             )
-            .filter(standard_curves::model::Column::Id.eq(intent.curve_id))
+            .filter(standard_curves::models::Column::Id.eq(intent.curve_id))
             .exec(txn)
             .await?;
         if result.rows_affected == 0 {
@@ -4844,7 +4844,7 @@ pub(super) async fn apply_curve_updates(
                  existing instrument takes it through the curve itself"
             )));
         }
-        if crate::routes::private::sensors::standard_curves::Entity::find_by_id(update.curve_id)
+        if crate::routes::private::standard_curves::Entity::find_by_id(update.curve_id)
             .one(db)
             .await?
             .is_none()
@@ -4854,7 +4854,7 @@ pub(super) async fn apply_curve_updates(
                 update.curve_id
             )));
         }
-        if crate::routes::private::sensors::standard_curves::views::curve_is_used(
+        if crate::routes::private::standard_curves::views::curve_is_used(
             db,
             update.curve_id,
         )
@@ -5032,9 +5032,9 @@ pub(super) async fn apply_instrument_updates(
         // The chosen instrument's curves travel with the entry, so the review shows what it
         // corrects with rather than only its name.
         let repointed_curves = match &repointed {
-            Some(sensor) => crate::routes::private::sensors::standard_curves::Entity::find()
+            Some(sensor) => crate::routes::private::standard_curves::Entity::find()
                 .filter(
-                    crate::routes::private::sensors::standard_curves::Column::SensorId
+                    crate::routes::private::standard_curves::Column::SensorId
                         .eq(sensor.id),
                 )
                 .all(&state.db)
@@ -5183,10 +5183,10 @@ pub(super) async fn claim_plan_status<C: ConnectionTrait>(
     from: &str,
     to: &str,
 ) -> AppResult<bool> {
-    let claimed = pairing_plans::model::Entity::update_many()
-        .col_expr(pairing_plans::model::Column::Status, Expr::value(to))
-        .filter(pairing_plans::model::Column::Id.eq(plan_id))
-        .filter(pairing_plans::model::Column::Status.eq(from))
+    let claimed = pairing_plans::models::Entity::update_many()
+        .col_expr(pairing_plans::models::Column::Status, Expr::value(to))
+        .filter(pairing_plans::models::Column::Id.eq(plan_id))
+        .filter(pairing_plans::models::Column::Status.eq(from))
         .exec(db)
         .await?;
     Ok(claimed.rows_affected > 0)
@@ -5194,9 +5194,9 @@ pub(super) async fn claim_plan_status<C: ConnectionTrait>(
 
 /// Fetch a pairing plan's version, or 404 if unknown.
 pub(super) async fn plan_version(db: &sea_orm::DatabaseConnection, id: Uuid) -> AppResult<i32> {
-    let plan = pairing_plans::model::Entity::find_by_id(id)
+    let plan = pairing_plans::models::Entity::find_by_id(id)
         .select_only()
-        .column(pairing_plans::model::Column::Version)
+        .column(pairing_plans::models::Column::Version)
         .into_tuple::<i32>()
         .one(db)
         .await?
@@ -5206,9 +5206,9 @@ pub(super) async fn plan_version(db: &sea_orm::DatabaseConnection, id: Uuid) -> 
 
 /// Fetch a pairing plan's status, or 404 if unknown.
 pub(super) async fn plan_status(db: &sea_orm::DatabaseConnection, id: Uuid) -> AppResult<String> {
-    let plan = pairing_plans::model::Entity::find_by_id(id)
+    let plan = pairing_plans::models::Entity::find_by_id(id)
         .select_only()
-        .column(pairing_plans::model::Column::Status)
+        .column(pairing_plans::models::Column::Status)
         .into_tuple::<String>()
         .one(db)
         .await?

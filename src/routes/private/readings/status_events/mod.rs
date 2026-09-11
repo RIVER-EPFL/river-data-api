@@ -1,3 +1,4 @@
-pub mod batch;
-pub mod model;
-pub use model::*;
+pub mod models;
+pub mod views;
+
+pub use models::*;

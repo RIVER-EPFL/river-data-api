@@ -19,7 +19,7 @@ use crate::common::bulk_write::{self, TouchedRange};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings;
 use crate::routes::private::readings::models as readings_model;
-use crate::routes::private::sites::parameters as site_parameters;
+use crate::routes::private::site_parameters;
 
 pub struct DataStreamOperations;
 

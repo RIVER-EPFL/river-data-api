@@ -22,7 +22,7 @@ use crate::routes::private::reprocessing_jobs::job::Job;
 use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
 use crate::routes::private::reprocessing_jobs::schedule::Schedule;
 use crate::routes::private::sites::models as sites;
-use crate::routes::private::sites::parameters::models as site_parameters;
+use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::sync::models::services as sync_services;
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;

@@ -547,7 +547,7 @@ async fn a_sensor_with_no_curves_reprocesses_and_stays_uncorrected() {
 #[tokio::test]
 #[serial]
 async fn slot_reprocess_clears_a_reading_in_a_curve_gap() {
-    use river_db::routes::private::sensors::calibrations::service::reprocess_site_parameter_readings;
+    use river_db::routes::private::sensor_calibrations::service::reprocess_site_parameter_readings;
 
     let db = setup_test_db().await;
     cleanup_test_db(&db).await;
@@ -643,7 +643,7 @@ async fn slot_reprocess_clears_a_reading_in_a_curve_gap() {
 #[tokio::test]
 #[serial]
 async fn slot_reprocess_leaves_a_reading_before_the_first_curve_uncorrected() {
-    use river_db::routes::private::sensors::calibrations::service::reprocess_site_parameter_readings;
+    use river_db::routes::private::sensor_calibrations::service::reprocess_site_parameter_readings;
 
     let db = setup_test_db().await;
     cleanup_test_db(&db).await;
@@ -715,7 +715,7 @@ async fn slot_reprocess_leaves_a_reading_before_the_first_curve_uncorrected() {
 #[tokio::test]
 #[serial]
 async fn slot_reprocess_prefers_a_parameter_curve_over_an_open_wildcard() {
-    use river_db::routes::private::sensors::calibrations::service::reprocess_site_parameter_readings;
+    use river_db::routes::private::sensor_calibrations::service::reprocess_site_parameter_readings;
 
     let db = setup_test_db().await;
     cleanup_test_db(&db).await;

@@ -3,7 +3,8 @@
 
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json};
+use axum::routing::{get, post};
+use axum::{Extension, Json, Router, middleware};
 use crudcrate::CRUDResource;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -37,7 +38,7 @@ use super::service::{
 use crate::common::AppState;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::parameters::derived::operations::{
+use crate::routes::private::derived_parameters::service::{
     resolve_identifiers, validate_formula,
 };
 
@@ -795,4 +796,38 @@ pub async fn list_activations(
             })
             .collect(),
     ))
+}
+
+/// The tool-script authoring surface, with the gate it is authored behind.
+///
+/// Administrator only: a script is remote code, and authoring one is not something a token with
+/// `write_metadata` may do. Executing the ACTIVE version stays open through `/tools`, which is a
+/// different surface with a different gate.
+pub fn script_routes() -> Router<AppState> {
+    Router::new()
+        .route("/tool_scripts", get(list_scripts).post(create_script))
+        .route("/tool_scripts/{id}", get(get_script).patch(update_script))
+        .route("/tool_scripts/draft_run", post(draft_run))
+        .route(
+            "/tool_scripts/{id}/formulas/draft_run",
+            post(draft_run_formulas),
+        )
+        .route("/tool_scripts/inspect", post(inspect_script))
+        .route("/tool_scripts/{id}/versions", post(create_version))
+        .route(
+            "/tool_scripts/{id}/versions/{version_id}",
+            get(get_version),
+        )
+        .route(
+            "/tool_scripts/{id}/versions/{version_id}/validate",
+            post(validate_version),
+        )
+        .route(
+            "/tool_scripts/{id}/versions/{version_id}/activate",
+            post(activate_version),
+        )
+        .route("/tool_scripts/{id}/activations", get(list_activations))
+        .layer(middleware::from_fn(
+            crate::common::middleware::require_admin,
+        ))
 }

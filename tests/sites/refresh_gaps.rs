@@ -18,7 +18,6 @@
 //!
 //! Run: cargo test --test sites refresh_gaps -- --test-threads=1
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;

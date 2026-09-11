@@ -283,7 +283,7 @@ pub fn build_registry() -> JobRegistry {
     registry.register(Arc::new(super::jobs::ReprocessAll));
     registry.register(Arc::new(super::jobs::MeasurementRetag));
     registry.register(Arc::new(
-        crate::routes::private::sites::parameters::flows::SdEstimatorRetag,
+        crate::routes::private::site_parameters::flows::SdEstimatorRetag,
     ));
     registry.register(Arc::new(crate::routes::private::readings::flows::CsvImport));
     registry.register(Arc::new(

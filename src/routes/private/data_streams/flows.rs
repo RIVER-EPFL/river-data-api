@@ -23,8 +23,8 @@ use crate::routes::private::collection_events::service::{EventSource, attach_col
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::service::materialise_samples;
-use crate::routes::private::readings::status_events::model as status_events;
-use crate::routes::private::sites::parameters::models as site_parameters;
+use crate::routes::private::readings::status_events::models as status_events;
+use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::sync::service::{HoldScope, repoint_holds};
 
 /// The scope as a predicate over `data_streams ds`, which is the one table all four statements

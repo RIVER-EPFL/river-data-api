@@ -19,7 +19,7 @@ fn test_division_by_zero_produces_non_finite() {
     vars.insert("b".to_string(), 0.0);
 
     let result =
-        river_db::routes::private::sensors::calibrations::service::evaluate_formula("a / b", &vars);
+        river_db::routes::private::sensor_calibrations::service::evaluate_formula("a / b", &vars);
     // evaluate_formula returns Ok(Infinity), the caller must check is_finite()
     assert!(result.is_ok(), "meval should not error on division by zero");
     let value = result.unwrap();
@@ -36,7 +36,7 @@ fn test_missing_variable_returns_error() {
     // "b" is missing
 
     let result =
-        river_db::routes::private::sensors::calibrations::service::evaluate_formula("a + b", &vars);
+        river_db::routes::private::sensor_calibrations::service::evaluate_formula("a + b", &vars);
     assert!(result.is_err(), "missing variable should produce an error");
 }
 
@@ -46,7 +46,7 @@ fn test_normal_formula_evaluation() {
     vars.insert("a".to_string(), 3.0);
     vars.insert("b".to_string(), 4.0);
 
-    let result = river_db::routes::private::sensors::calibrations::service::evaluate_formula(
+    let result = river_db::routes::private::sensor_calibrations::service::evaluate_formula(
         "a * b + 2",
         &vars,
     );
@@ -154,7 +154,7 @@ async fn test_derived_parameter_skips_infinity() {
     let time_dt: chrono::DateTime<chrono::Utc> = time.parse().unwrap();
 
     let result =
-        river_db::routes::private::sensors::calibrations::service::recalculate_derived_at_timestamp(&db, site_uuid, time_dt)
+        river_db::routes::private::sensor_calibrations::service::recalculate_derived_at_timestamp(&db, site_uuid, time_dt)
             .await;
     assert!(result.is_ok(), "recalculate should not error: {result:?}");
 
@@ -186,19 +186,19 @@ async fn test_derived_parameter_skips_infinity() {
 async fn apply_calibration_formula_correctness() {
     // Test the actual formula against expected lab calibration results.
     // The code uses: calibrated = slope * raw + intercept
-    let result = river_db::routes::private::sensors::calibrations::service::apply_calibration(
+    let result = river_db::routes::private::sensor_calibrations::service::apply_calibration(
         10.0, 2.0, 5.0,
     );
     assert_eq!(result, 25.0, "calibrated = 2.0 * 10.0 + 5.0 = 25.0");
 
     // A 1:1 curve (slope=1, intercept=0)
-    let result = river_db::routes::private::sensors::calibrations::service::apply_calibration(
+    let result = river_db::routes::private::sensor_calibrations::service::apply_calibration(
         42.0, 1.0, 0.0,
     );
     assert_eq!(result, 42.0, "a 1:1 curve returns the raw value");
 
     // Negative intercept
-    let result = river_db::routes::private::sensors::calibrations::service::apply_calibration(
+    let result = river_db::routes::private::sensor_calibrations::service::apply_calibration(
         100.0, 1.0, -273.15,
     );
     assert!(

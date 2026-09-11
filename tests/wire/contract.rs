@@ -11,7 +11,7 @@ use river_db::routes::private::data_streams::models::{
 };
 use river_db::routes::private::notes::models::NoteItem;
 use river_db::routes::private::sensors::models::RegisterSensorRequest;
-use river_db::routes::private::sensors::standard_curves::views::RegisterStandardCurveRequest;
+use river_db::routes::private::standard_curves::models::RegisterStandardCurveRequest;
 
 fn at(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)

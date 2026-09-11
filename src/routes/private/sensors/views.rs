@@ -1,8 +1,9 @@
 //! The component's HTTP surface.
 
 use axum::{
-    Json,
+    Json, Router, middleware,
     extract::{Path, Query, State},
+    routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use river_data_core::models::MeasurementType;
@@ -22,13 +23,13 @@ use crate::common::middleware::{ProjectScope, sensor_in_scope};
 use crate::common::scope;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::models as readings;
-use crate::routes::private::sensors::calibrations;
-use crate::routes::private::sensors::calibrations::service::recompute_deployed_until;
-use crate::routes::private::sensors::deployments;
-use crate::routes::private::sensors::standard_curves;
+use crate::routes::private::sensor_calibrations;
+use crate::routes::private::sensor_calibrations::service::recompute_deployed_until;
+use crate::routes::private::sensor_deployments as deployments;
+use crate::routes::private::standard_curves;
 use crate::routes::private::sites::service::{bucket_interval, resolution_of};
 use crate::routes::private::{
-    data_streams, parameters, sensors, sites, sites::parameters as site_parameters,
+    data_streams, parameters, sensors, sites, site_parameters as site_parameters,
 };
 
 use super::models::*;
@@ -128,10 +129,10 @@ async fn resolve_sensor_parameter<C: ConnectionTrait>(
         .all(db)
         .await?;
     params.extend(
-        calibrations::Entity::find()
-            .filter(calibrations::Column::SensorId.eq(sensor_id))
+        sensor_calibrations::Entity::find()
+            .filter(sensor_calibrations::Column::SensorId.eq(sensor_id))
             .select_only()
-            .column(calibrations::Column::ParameterId)
+            .column(sensor_calibrations::Column::ParameterId)
             .distinct()
             .into_tuple::<Option<Uuid>>()
             .all(db)
@@ -1777,4 +1778,59 @@ pub async fn retag_frequency(
         data_frequency: req.data_frequency,
         job_id,
     }))
+}
+
+/// The instrument views the plots overlay: a sensor's readings and deployment bands, a
+/// calibration's window, and which readings a curve accounts for.
+///
+/// Four prefixes, one component. `/sensors`, `/sensor_calibrations`, `/standard_curves` and
+/// `/instruments` are one instrument seen from four sides, and keeping their gate in one function
+/// is the point: it was spread over four blocks in `service/mod.rs`, and adding a view meant
+/// finding which block already carried the right layer (Q143, C272).
+pub fn read_routes() -> Router<AppState> {
+    Router::new()
+        .route("/sensors/{id}/readings", get(get_sensor_readings))
+        .route(
+            "/sensors/{id}/deployment_bands",
+            get(get_sensor_deployment_bands),
+        )
+        .route(
+            "/sensor_calibrations/{id}/window",
+            get(crate::routes::private::sensor_calibrations::views::get_calibration_window),
+        )
+        .route("/sensors/{id}/curve_usage", get(get_sensor_curve_usage))
+        .route("/instruments/overview", get(get_instruments_overview))
+        .route("/standard_curves/{id}/usage", get(get_curve_usage))
+        .layer(middleware::from_fn(
+            crate::common::middleware::require_read_data,
+        ))
+}
+
+/// What an instrument could adopt, before adopting it.
+pub fn adopt_read_routes() -> Router<AppState> {
+    Router::new()
+        .route("/sensors/{sensor_id}/adopt_suggestions", get(adopt_suggestions))
+        .layer(middleware::from_fn(
+            crate::common::middleware::require_read_metadata,
+        ))
+}
+
+/// Moving an instrument: adopting a stream's history onto it, and reclassifying its cadence.
+///
+/// `/actions/swap` and `/actions/rollback_deployment` carry the same gate and are the same kind of
+/// movement, but they are `/actions/*` and stay registered centrally with the rest of that prefix
+/// (Q143).
+///
+/// MANAGER, or a token with `write_metadata`: deploying an instrument at a slot is instrument
+/// movement, not data.
+pub fn adopt_write_routes() -> Router<AppState> {
+    Router::new()
+        .route("/sensors/{sensor_id}/adopt", post(adopt_sensor))
+        .route("/sensors/retag_frequency", post(retag_frequency))
+        .layer(middleware::from_fn(
+            crate::common::middleware::deny_scoped_token,
+        ))
+        .layer(middleware::from_fn(
+            crate::common::middleware::require_manage_sensors,
+        ))
 }

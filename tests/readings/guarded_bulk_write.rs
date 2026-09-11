@@ -144,7 +144,7 @@ async fn a_mutation_matching_nothing_reports_an_empty_range() {
 async fn recompose_from_own_curves_lifts_the_cap_for_itself() {
     let (db, capped, stream_id, base) = seed_compressed("guarded_recompose_cap").await;
 
-    let recomposed = river_db::routes::private::sensors::calibrations::service::recompose_from_own_curves_guarded(
+    let recomposed = river_db::routes::private::sensor_calibrations::service::recompose_from_own_curves_guarded(
         &capped,
         "TRUE",
         "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",

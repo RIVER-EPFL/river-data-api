@@ -28,10 +28,10 @@ use crate::routes::private::reprocessing_jobs::jobs::required_uuid;
 use crate::routes::private::reprocessing_jobs::jobs::uuid_pair_array;
 use crate::routes::private::reprocessing_jobs::lifecycle::JobContext;
 use crate::routes::private::reprocessing_jobs::lifecycle::JobReport;
-use crate::routes::private::sensors::calibrations;
-use crate::routes::private::sensors::calibrations::service::Curve;
-use crate::routes::private::sensors::calibrations::service::apply_curves;
-use crate::routes::private::sensors::calibrations::service::recalculate_derived_at_timestamp;
+use crate::routes::private::sensor_calibrations;
+use crate::routes::private::sensor_calibrations::service::Curve;
+use crate::routes::private::sensor_calibrations::service::apply_curves;
+use crate::routes::private::sensor_calibrations::service::recalculate_derived_at_timestamp;
 use crate::routes::private::sync::models::HoldStatus;
 
 /// One staged row, as `csv_import_staging` holds it. The job reads the set four times, so the
@@ -282,8 +282,8 @@ impl CsvImport {
             let mut curves: std::collections::HashMap<Uuid, Curve> =
                 std::collections::HashMap::new();
             if !ids.is_empty() {
-                for curve in calibrations::model::Entity::find()
-                    .filter(calibrations::model::Column::Id.is_in(ids))
+                for curve in sensor_calibrations::models::Entity::find()
+                    .filter(sensor_calibrations::models::Column::Id.is_in(ids))
                     .all(ctx.db())
                     .await?
                 {
@@ -507,7 +507,7 @@ impl CsvImport {
             stream_ids.sort_unstable();
             stream_ids.dedup();
             let recomposed =
-                crate::routes::private::sensors::calibrations::service::recompose_from_own_curves_guarded(
+                crate::routes::private::sensor_calibrations::service::recompose_from_own_curves_guarded(
                     ctx.db(),
                     "TRUE",
                     "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3",

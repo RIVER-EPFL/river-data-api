@@ -90,7 +90,7 @@ async fn test_janitor_fills_derived_gaps() {
     let before = count_derived(&db, site_id, derived_param_uuid).await;
     assert_eq!(before, 0, "no derived readings should exist before janitor");
 
-    let filled = river_db::routes::private::parameters::derived::janitor::run_once(&db, None, None)
+    let filled = river_db::routes::private::derived_parameters::flows::run_once(&db, None, None)
         .await
         .unwrap();
     assert!(filled > 0, "janitor should fill at least one gap");
@@ -135,7 +135,7 @@ async fn test_janitor_fills_derived_gaps() {
     );
 
     let filled_again =
-        river_db::routes::private::parameters::derived::janitor::run_once(&db, None, None)
+        river_db::routes::private::derived_parameters::flows::run_once(&db, None, None)
             .await
             .unwrap();
     assert!(filled_again >= 1, "second janitor run should heal new gap");
@@ -169,7 +169,7 @@ async fn test_janitor_fills_derived_gaps() {
         arrivals[0].2
     );
 
-    river_db::routes::private::parameters::derived::janitor::run_once(&db, None, None)
+    river_db::routes::private::derived_parameters::flows::run_once(&db, None, None)
         .await
         .unwrap();
     assert_eq!(

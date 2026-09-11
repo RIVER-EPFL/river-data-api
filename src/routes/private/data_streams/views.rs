@@ -1,6 +1,7 @@
 use axum::{
-    Json,
+    Json, Router, middleware,
     extract::{Path, Query, State},
+    routing::{get, post},
 };
 use chrono::Utc;
 use sea_orm::{
@@ -29,12 +30,12 @@ use crate::common::scope;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::DataStream;
 use crate::routes::private::sensors;
-use crate::routes::private::sensors::calibrations;
+use crate::routes::private::sensor_calibrations;
 use crate::routes::private::sensors::service::{
     close_sensor_deployment, create_sensor_for_stream, extract_vaisala_device_serial,
 };
 use crate::routes::private::sync::service as sync_service;
-use crate::routes::private::{data_streams, sites::parameters as site_parameters};
+use crate::routes::private::{data_streams, site_parameters as site_parameters};
 
 /// The most recent instants a stream holds, as the replicate rows they will be served as.
 ///
@@ -521,7 +522,7 @@ pub async fn import_stream(
     // Each reading takes the curve whose window covers its OWN time, not the sensor's newest one,
     // so an import of deep history does not stamp today's curve across all of it.
     let attributed =
-        calibrations::resolver::attribute_stream_by_window(db, stream_id, ctx.sensor_id).await?;
+        sensor_calibrations::resolver::attribute_stream_by_window(db, stream_id, ctx.sensor_id).await?;
 
     let updated = data_streams::Entity::find_by_id(stream_id)
         .one(db)
@@ -863,4 +864,39 @@ pub async fn retag_streams(
         measurement_type: req.measurement_type,
         job_id,
     }))
+}
+
+/// What a stream looks like before anything is done with it: its shape, a sample of what it
+/// carries, and the receipts of what has already been ingested from it.
+pub fn read_routes() -> Router<AppState> {
+    Router::new()
+        .route("/streams/{id}/stats", get(stream_stats))
+        .route("/streams/{id}/preview", get(stream_preview))
+        .route("/streams/{id}/receipts", get(stream_receipts))
+        .layer(middleware::from_fn(
+            crate::common::middleware::require_read_metadata,
+        ))
+}
+
+/// Reshaping a stream that already exists: its cadence, the history it adopts, and the slot it is
+/// paired to.
+///
+/// Registration is not here. `POST /streams/register` is one of the five `/x/register` routes that
+/// a sync-service session token enrols through, which is a cross-cutting surface rather than this
+/// component's, and it stays registered centrally with the rest of that family (Q143).
+///
+/// An Administrator action for humans, with the `write_metadata` token bit preserved so a
+/// sync-service session token keeps pairing what it registered.
+pub fn write_routes() -> Router<AppState> {
+    Router::new()
+        .route("/streams/retag", post(retag_streams))
+        .route("/streams/{id}/import", post(import_stream))
+        .route("/streams/{id}/pair", post(pair_stream))
+        .route("/streams/{id}/unpair", post(unpair_stream))
+        .layer(middleware::from_fn(
+            crate::common::middleware::deny_scoped_token,
+        ))
+        .layer(middleware::from_fn(
+            crate::common::middleware::require_admin_or_token_write_metadata,
+        ))
 }

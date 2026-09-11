@@ -23,16 +23,16 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams;
 use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::models as readings;
-use crate::routes::private::readings::samples::model as samples;
-use crate::routes::private::sensors::calibrations;
-use crate::routes::private::sensors::calibrations::service::{
+use crate::routes::private::readings::samples::models as samples;
+use crate::routes::private::sensor_calibrations;
+use crate::routes::private::sensor_calibrations::service::{
     evaluate_formula, recompute_deployed_until,
 };
-use crate::routes::private::sensors::deployments;
-use crate::routes::private::sensors::deployments::slots;
-use crate::routes::private::sensors::standard_curves::model as standard_curves;
+use crate::routes::private::sensor_deployments as deployments;
+use crate::routes::private::sensor_deployments::flows as slots;
+use crate::routes::private::standard_curves::models as standard_curves;
 use crate::routes::private::sites::models as sites;
-use crate::routes::private::sites::parameters::models as site_parameters;
+use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::sync::models::HoldKind;
 use crate::routes::private::sync::models::HoldStatus;
 
@@ -1506,7 +1506,7 @@ async fn fetch_calibration_candidates(
         .add(Expr::col((r.clone(), readings::Column::CalibrationId)).is_null())
         .add(Expr::col((cw.clone(), Alias::new("id"))).is_not_null())
         .add(Expr::cust(
-            crate::routes::private::sensors::calibrations::service::window_resolved_rows("r"),
+            crate::routes::private::sensor_calibrations::service::window_resolved_rows("r"),
         ));
     if let Some(predicate) = deployed_in_scope(scope) {
         scanned = scanned.add(predicate);
@@ -1515,7 +1515,7 @@ async fn fetch_calibration_candidates(
     // exactly "a reprocess would stamp a curve here". Grabs resolve their curves by hand at entry
     // and are never windowed, hence `window_resolved_rows`. It runs once per row the scan keeps, so
     // the floor is what decides how often: every other predicate here is a filter, not a lookup.
-    let pick = crate::routes::private::sensors::calibrations::resolver::pick_calibration_query(
+    let pick = crate::routes::private::sensor_calibrations::resolver::pick_calibration_query(
         "r.sensor_id",
     );
     let (sql, values) = SeaQuery::select()
@@ -1555,11 +1555,11 @@ async fn fetch_calibration_candidates(
             target_from,
         } = CandidateRow::from_query_result(row, "")?;
 
-        let earliest_calibration_from = calibrations::Entity::find()
+        let earliest_calibration_from = sensor_calibrations::Entity::find()
             .select_only()
-            .column(calibrations::Column::ValidFrom)
-            .filter(calibrations::Column::SensorId.eq(sensor_id))
-            .order_by_asc(calibrations::Column::ValidFrom)
+            .column(sensor_calibrations::Column::ValidFrom)
+            .filter(sensor_calibrations::Column::SensorId.eq(sensor_id))
+            .order_by_asc(sensor_calibrations::Column::ValidFrom)
             .into_tuple::<chrono::DateTime<chrono::FixedOffset>>()
             .one(db)
             .await
@@ -1601,7 +1601,7 @@ async fn fetch_foreign_curve_uses(
     let r = Alias::new("r");
     let sc = Alias::new("sc");
     let mut scanned = scan_floor(since).add(Expr::cust(
-        crate::routes::private::sensors::calibrations::service::foreign_curve_rows("r", "sc"),
+        crate::routes::private::sensor_calibrations::service::foreign_curve_rows("r", "sc"),
     ));
     if let Some(predicate) = site_in_scope(scope) {
         scanned = scanned.add(predicate);
@@ -1689,7 +1689,7 @@ async fn fetch_orphaned_corrections(
     let r = Alias::new("r");
     let mut scanned = scan_floor(since)
         .add(Expr::cust(
-            crate::routes::private::sensors::calibrations::service::orphaned_correction_rows("r"),
+            crate::routes::private::sensor_calibrations::service::orphaned_correction_rows("r"),
         ))
         .add(Expr::cust("r.measurement_type IS DISTINCT FROM 'derived'"));
     if let Some(predicate) = site_in_scope(scope) {

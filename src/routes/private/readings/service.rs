@@ -56,8 +56,8 @@ use crate::routes::private::collection_events::flows;
 use crate::routes::private::collection_events::flows::TouchedEvent;
 use crate::routes::private::data_streams;
 use crate::routes::private::data_streams::models::receipts;
-use crate::routes::private::parameters::derived::definition_model as calculation_formulas;
-use crate::routes::private::parameters::derived::version_model as derived_versions;
+use crate::routes::private::derived_parameters::models::definition as calculation_formulas;
+use crate::routes::private::derived_parameters::models::version as derived_versions;
 use crate::routes::private::readings;
 use crate::routes::private::readings::models::ConflictMode;
 use crate::routes::private::readings::models::Kind;
@@ -68,11 +68,11 @@ use crate::routes::private::readings::models::Selection;
 use crate::routes::private::readings::samples;
 use crate::routes::private::reprocessing_jobs::job::Job;
 use crate::routes::private::sensors;
-use crate::routes::private::sensors::calibrations;
-use crate::routes::private::sensors::deployments;
-use crate::routes::private::sensors::standard_curves;
+use crate::routes::private::sensor_calibrations;
+use crate::routes::private::sensor_deployments as deployments;
+use crate::routes::private::standard_curves;
 use crate::routes::private::sites;
-use crate::routes::private::sites::parameters as site_parameters;
+use crate::routes::private::site_parameters;
 use crate::routes::private::sync::models::GroupAudit;
 use crate::routes::private::sync::models::HoldKind;
 use crate::routes::private::sync::models::HoldStatus;
@@ -105,19 +105,19 @@ impl Related<crate::routes::private::sensors::Entity> for Entity {
     }
 }
 
-impl Related<crate::routes::private::sensors::calibrations::Entity> for Entity {
+impl Related<crate::routes::private::sensor_calibrations::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SensorCalibration.def()
     }
 }
 
-impl Related<crate::routes::private::sensors::standard_curves::Entity> for Entity {
+impl Related<crate::routes::private::standard_curves::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::StandardCurve.def()
     }
 }
 
-impl Related<crate::routes::private::sensors::deployments::Entity> for Entity {
+impl Related<crate::routes::private::sensor_deployments::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SensorDeployment.def()
     }
@@ -2509,9 +2509,9 @@ pub(super) async fn recompose_corrected<C: ConnectionTrait>(
     scope_sql: &str,
     params: Vec<sea_orm::Value>,
 ) -> AppResult<()> {
-    crate::routes::private::sensors::calibrations::service::recompose_from_own_curves(
+    crate::routes::private::sensor_calibrations::service::recompose_from_own_curves(
         conn,
-        &crate::routes::private::sensors::calibrations::service::corrected_rows("r"),
+        &crate::routes::private::sensor_calibrations::service::corrected_rows("r"),
         scope_sql,
         params,
     )
@@ -4373,8 +4373,8 @@ pub async fn assemble_records(
         .into_iter()
         .map(|d| (d.id, d))
         .collect();
-    let calibration_map: HashMap<Uuid, calibrations::Model> = calibrations::Entity::find()
-        .filter(calibrations::Column::Id.is_in(collect(|r| r.calibration_id)))
+    let calibration_map: HashMap<Uuid, sensor_calibrations::Model> = sensor_calibrations::Entity::find()
+        .filter(sensor_calibrations::Column::Id.is_in(collect(|r| r.calibration_id)))
         .all(db)
         .await?
         .into_iter()

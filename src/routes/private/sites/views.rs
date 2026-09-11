@@ -38,9 +38,9 @@ use crate::routes::private::annotations::{self, Annotation};
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::parameters;
 use crate::routes::private::readings::models as readings;
-use crate::routes::private::readings::samples::model as samples;
-use crate::routes::private::readings::status_events::model as status_events;
-use crate::routes::private::sites::parameters as site_parameters;
+use crate::routes::private::readings::samples::models as samples;
+use crate::routes::private::readings::status_events::models as status_events;
+use crate::routes::private::site_parameters;
 use crate::routes::{
     cache, resolve_site, resolve_site_with_project, validate_optional_time_range,
     validate_time_range,
@@ -1668,10 +1668,9 @@ pub async fn get_site_statistics(
             .collect::<Result<_, _>>()
             .map_err(|_| AppError::BadRequest("parameter_ids must be UUIDs".to_string()))?,
         None => {
-            use crate::routes::private::sites::parameters;
             use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-            parameters::Entity::find()
-                .filter(parameters::Column::SiteId.eq(site.id))
+            site_parameters::Entity::find()
+                .filter(site_parameters::Column::SiteId.eq(site.id))
                 .all(&state.db)
                 .await?
                 .into_iter()
@@ -2380,7 +2379,7 @@ pub fn service_router(state: &AppState) -> OpenApiRouter {
         .route("/{site_id}/sensor_identity", get(get_site_sensor_identity))
         .route(
             "/{site_id}/last_curve",
-            get(crate::routes::private::sensors::standard_curves::views::last_used_curve),
+            get(crate::routes::private::standard_curves::views::last_used_curve),
         )
         .with_state(state.clone())
         .layer(middleware::from_fn(require_read_data));

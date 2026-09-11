@@ -158,7 +158,7 @@ pub async fn declared_parameters(
     db: &DatabaseConnection,
     site_id: Uuid,
 ) -> AppResult<HashSet<Uuid>> {
-    use crate::routes::private::sites::parameters::models as site_parameters;
+    use crate::routes::private::site_parameters::models as site_parameters;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
     Ok(site_parameters::Entity::find()
         .filter(site_parameters::Column::SiteId.eq(site_id))

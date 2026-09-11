@@ -3,7 +3,7 @@ use axum::{
     extract::{Request, State},
     middleware,
     response::Response,
-    routing::{get, patch, post, put},
+    routing::{get, post, put},
 };
 use tower_http::limit::RequestBodyLimitLayer;
 use utoipa_axum::router::OpenApiRouter;
@@ -30,20 +30,20 @@ use crate::routes::private::{
     notes::Note,
     notifications::{NotificationLog, NotificationMute},
     parameters::Parameter,
-    parameters::derived::definition_model::CalculationFormula,
-    parameters::derived::source_model::DerivedParameterSource,
-    parameters::groups::group_model::ParameterGroup,
-    parameters::groups::member_model::ParameterGroupMember,
+    derived_parameters::models::definition::CalculationFormula,
+    derived_parameters::models::source::DerivedParameterSource,
+    parameter_groups::group_model::ParameterGroup,
+    parameter_groups::member_model::ParameterGroupMember,
     projects::subprojects::Subproject,
     readings::decision_model::ReadingDecision,
     readings::samples::Sample,
     reprocessing_jobs::ReprocessingJob,
     reprocessing_jobs::schedule_model::Schedule,
     sensors::Sensor,
-    sensors::calibrations::SensorCalibration,
-    sensors::deployments::SensorDeployment,
-    sensors::standard_curves::StandardCurve,
-    sites::parameters::SiteParameter,
+    sensor_calibrations::SensorCalibration,
+    sensor_deployments::SensorDeployment,
+    standard_curves::StandardCurve,
+    site_parameters::SiteParameter,
     sync::hold_model::ReplicateAuditHold,
     sync::models::commands::SyncCommand,
     sync::models::credentials::SyncServiceCredential,
@@ -52,9 +52,9 @@ use crate::routes::private::{
     tools::models::run::ToolRun,
 };
 
-const ACTION_BODY_LIMIT: usize = 1024 * 1024; // 1 MB, preserved from the former admin tier
-const DATA_BODY_LIMIT: usize = 10 * 1024 * 1024; // 10 MB, bulk ingestion
-const IMPORT_BODY_LIMIT: usize = 50 * 1024 * 1024; // 50 MB, CSV import
+pub(crate) const ACTION_BODY_LIMIT: usize = 1024 * 1024; // 1 MB, preserved from the former admin tier
+pub(crate) const DATA_BODY_LIMIT: usize = 10 * 1024 * 1024; // 10 MB, bulk ingestion
+pub(crate) const IMPORT_BODY_LIMIT: usize = 50 * 1024 * 1024; // 50 MB, CSV import
 
 /// Clear the public API config cache after a successful mutating request.
 ///
@@ -294,54 +294,30 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         admin::{actions, calibrations, derived, merge, public_config, users},
         alarms::views as alarm_views,
         data_streams::views as stream_views,
-        readings::status_events::batch as status_events_batch,
+        readings::status_events::views as status_events_batch,
         readings::views as readings_views,
         search,
         sync::views as sync_views,
         tools,
     };
 
-    let stream_read_routes = Router::new()
-        .route("/streams/{id}/stats", get(stream_views::stream_stats))
-        .route("/streams/{id}/preview", get(stream_views::stream_preview))
-        .route("/streams/{id}/receipts", get(stream_views::stream_receipts))
-        .layer(middleware::from_fn(require_read_metadata))
-        .with_state(state.clone());
+    let stream_read_routes = stream_views::read_routes().with_state(state.clone());
+    let stream_write_routes = stream_views::write_routes().with_state(state.clone());
 
-    // Plain-handler sensor/calibration read views (not CrudCrate routes) for the plot overlays.
-    let sensor_view_read_routes = Router::new()
-        .route(
-            "/sensors/{id}/readings",
-            get(crate::routes::private::sensors::views::get_sensor_readings),
-        )
-        .route(
-            "/sensors/{id}/deployment_bands",
-            get(crate::routes::private::sensors::views::get_sensor_deployment_bands),
-        )
-        .route(
-            "/sensor_calibrations/{id}/window",
-            get(crate::routes::private::sensors::calibrations::window::get_calibration_window),
-        )
-        .route(
-            "/sensors/{id}/curve_usage",
-            get(crate::routes::private::sensors::views::get_sensor_curve_usage),
-        )
-        .route(
-            "/instruments/overview",
-            get(crate::routes::private::sensors::views::get_instruments_overview),
-        )
-        .route(
-            "/standard_curves/{id}/usage",
-            get(crate::routes::private::sensors::views::get_curve_usage),
-        )
-        .layer(middleware::from_fn(require_read_data))
-        .with_state(state.clone());
+    let sensor_view_read_routes =
+        crate::routes::private::sensors::views::read_routes().with_state(state.clone());
 
-    let stream_write_routes = Router::new()
+    // What a sync service enrols through: one surface across five prefixes, held together by one
+    // gate rather than by a component. It stays registered here for that reason, and is not any
+    // one component's to take (Q143, C273).
+    //
+    // An Administrator action for humans; the `write_metadata` token bit is preserved so a
+    // sync-service session token keeps registering what it discovers.
+    let registration_routes = Router::new()
         .route("/streams/register", post(stream_views::register_stream))
         .route(
             "/standard_curves/register",
-            post(crate::routes::private::sensors::standard_curves::views::register_standard_curve),
+            post(crate::routes::private::standard_curves::views::register_standard_curve),
         )
         .route(
             "/sensors/register",
@@ -359,33 +335,17 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/annotations/register",
             post(crate::routes::private::annotations::views::register_annotations),
         )
-        .route("/streams/retag", post(stream_views::retag_streams))
-        .route("/streams/{id}/import", post(stream_views::import_stream))
-        .route("/streams/{id}/pair", post(stream_views::pair_stream))
-        .route("/streams/{id}/unpair", post(stream_views::unpair_stream))
         .layer(middleware::from_fn(deny_scoped_token))
-        // Stream registration/pairing is an Administrator action for humans; the write_metadata
-        // token bit is preserved so sync-service session tokens keep registering streams.
         .layer(middleware::from_fn(require_admin_or_token_write_metadata))
         .with_state(state.clone());
 
     use crate::routes::private::sensors::views as sensor_adopt;
-    let sensor_adopt_read = Router::new()
-        .route(
-            "/sensors/{sensor_id}/adopt_suggestions",
-            get(sensor_adopt::adopt_suggestions),
-        )
-        .layer(middleware::from_fn(require_read_metadata))
-        .with_state(state.clone());
-    let sensor_adopt_write = Router::new()
-        .route(
-            "/sensors/{sensor_id}/adopt",
-            post(sensor_adopt::adopt_sensor),
-        )
-        .route(
-            "/sensors/retag_frequency",
-            post(crate::routes::private::sensors::views::retag_frequency),
-        )
+    let sensor_adopt_read = sensor_adopt::adopt_read_routes().with_state(state.clone());
+    let sensor_adopt_write = sensor_adopt::adopt_write_routes().with_state(state.clone());
+
+    // Instrument movement spelled as an action. Same gate as the component's own adopt routes, but
+    // these are `/actions/*`, which stays registered centrally (Q143).
+    let sensor_action_routes = Router::new()
         .route("/actions/swap", post(sensor_adopt::swap_sensors))
         // Rolling a deployment back undoes one, so it takes the capability deleting a deployment
         // takes rather than the weaker write_data the other operator actions carry.
@@ -394,7 +354,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             post(actions::rollback_deployment),
         )
         .layer(middleware::from_fn(deny_scoped_token))
-        // Deploying/swapping a sensor at a slot is sensor movement: MANAGER (write_metadata token).
         .layer(middleware::from_fn(require_manage_sensors))
         .with_state(state.clone());
 
@@ -407,15 +366,13 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             post(readings_views::ingest_status_events),
         )
         .route(
-            "/readings/batch",
-            post(readings_views::insert_batch_readings),
-        )
-        .route(
             "/status_events/batch",
             post(status_events_batch::insert_batch_status_events),
         )
+        // The enforced cap, and the extractor's own limit above it: `/readings/import_csv` was
+        // what raised the second one, and it stays because the push routes were reading under it
+        // before that route moved to `readings/views.rs`.
         .layer(RequestBodyLimitLayer::new(DATA_BODY_LIMIT))
-        .route("/readings/import_csv", post(readings_views::import_csv))
         .layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT))
         .route(
             "/collection_events/stage",
@@ -432,29 +389,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .route(
             "/actions/event_recompute",
             post(crate::routes::private::collection_events::views::run_event_recompute),
-        )
-        .route(
-            "/readings/edits/preview",
-            post(crate::routes::private::readings::views::preview),
-        )
-        .route(
-            "/readings/edits",
-            post(crate::routes::private::readings::views::commit),
-        )
-        .route(
-            "/readings/edits/{id}/rollback",
-            post(crate::routes::private::readings::views::rollback),
-        )
-        .route(
-            "/readings/edits/sets/{set_id}/rollback",
-            post(crate::routes::private::readings::views::rollback_edit_set),
-        )
-        .route("/readings/flag", patch(readings_views::flag_readings))
-        .route("/readings/unflag", patch(readings_views::unflag_readings))
-        .route("/readings/flag_range", patch(readings_views::flag_range))
-        .route(
-            "/readings/unflag_range",
-            patch(readings_views::unflag_range),
         )
         .layer(middleware::from_fn(require_write_data))
         .with_state(state.clone());
@@ -488,24 +422,15 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/actions/backfill_calibrations",
             post(actions::backfill_calibrations),
         )
-        .route(
-            "/alarms/{event_id}/acknowledge",
-            post(alarm_views::acknowledge_alarm).delete(alarm_views::unacknowledge_alarm),
-        )
         .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_write_data))
         .with_state(state.clone());
 
+    let alarm_read_routes = alarm_views::read_routes().with_state(state.clone());
+    let alarm_write_routes = alarm_views::write_routes().with_state(state.clone());
+
     let data_read_routes = Router::new()
         .route("/actions/preview_derived", post(actions::preview_derived))
-        .route(
-            "/readings/sample_preview",
-            post(crate::routes::private::readings::views::sample_preview),
-        )
-        .route("/alarms/active", get(alarm_views::get_active_alarms))
-        .route("/alarms/summary", get(alarm_views::get_alarm_summary))
-        .route("/alarms/events", get(alarm_views::get_alarm_events))
-        .route("/alarms/thresholds", get(alarm_views::get_thresholds))
         .route("/events", get(crate::routes::private::events::event_stream))
         .route(
             "/reprocessing_jobs/{id}/logs",
@@ -519,26 +444,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .route(
             "/tools/{tool_name}/calculate",
             post(tools::views::calculate_tool),
-        )
-        .route(
-            "/readings/seasonal_check",
-            post(crate::routes::private::readings::views::seasonal_check),
-        )
-        .route(
-            "/readings/provenance",
-            get(crate::routes::private::readings::views::get_reading_provenance),
-        )
-        .route(
-            "/readings/ledger",
-            get(crate::routes::private::readings::views::get_reading_ledger),
-        )
-        .route(
-            "/readings/decisions",
-            get(crate::routes::private::readings::views::list_decisions),
-        )
-        .route(
-            "/readings/edits/inspect",
-            post(crate::routes::private::readings::views::inspect),
         )
         .route(
             "/tool_runs/{id}/reload",
@@ -578,7 +483,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         .route(
             "/parameter_groups/{id}/definition",
-            get(crate::routes::private::parameters::groups::definition::group_definition),
+            get(crate::routes::private::parameter_groups::views::group_definition),
         )
         .route(
             "/schedules/{job_name}/audit",
@@ -598,7 +503,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     let operator_action_routes = Router::new()
         .route(
             "/parameter_groups/{id}/intermediates",
-            post(crate::routes::private::parameters::groups::intermediates::declare_intermediates),
+            post(crate::routes::private::parameter_groups::views::declare_intermediates),
         )
         .route(
             "/actions/sensor_calibrations/{id}/recalculate",
@@ -607,19 +512,19 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .route("/actions/reprocess", post(actions::reprocess_sensor))
         .route(
             "/sensor_calibrations/{id}/retire",
-            post(crate::routes::private::sensors::calibrations::retire::retire_calibration),
+            post(crate::routes::private::sensor_calibrations::views::retire_calibration),
         )
         .route(
             "/sensor_calibrations/{id}/unretire",
-            post(crate::routes::private::sensors::calibrations::retire::unretire_calibration),
+            post(crate::routes::private::sensor_calibrations::views::unretire_calibration),
         )
         .route(
             "/standard_curves/{id}/retire",
-            post(crate::routes::private::sensors::standard_curves::retire::retire_standard_curve),
+            post(crate::routes::private::standard_curves::views::retire_standard_curve),
         )
         .route(
             "/standard_curves/{id}/unretire",
-            post(crate::routes::private::sensors::standard_curves::retire::unretire_standard_curve),
+            post(crate::routes::private::standard_curves::views::unretire_standard_curve),
         )
         .route(
             "/actions/derived_parameters/{id}/recompute",
@@ -647,15 +552,15 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         // MANAGER gate the other slot-shaping actions do.
         .route(
             "/sites/{site_id}/parameter_groups",
-            post(crate::routes::private::sites::parameters::views::apply_group),
+            post(crate::routes::private::site_parameters::views::apply_group),
         )
         .route(
             "/site_parameters/{id}/declare_sd_estimator",
-            post(crate::routes::private::sites::parameters::views::declare_sd_estimator),
+            post(crate::routes::private::site_parameters::views::declare_sd_estimator),
         )
         .route(
             "/actions/retag_sd_estimator",
-            post(crate::routes::private::sites::parameters::views::retag_sd_estimator),
+            post(crate::routes::private::site_parameters::views::retag_sd_estimator),
         )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))
@@ -685,49 +590,25 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     // Sync admin views split by required permission. Credential creation/revoke is
     // require_admin because it mints full-permission sync session tokens, a token
     // with write_metadata must not be able to bootstrap a more privileged token.
+    // Each sync group carries its own layers in `sync/views.rs` (Q143), so these only mount them.
     let sync_admin_read = Router::new()
         .nest("/sync", sync_views::read_routes())
-        .layer(middleware::from_fn(require_read_metadata))
         .with_state(state.clone());
 
     let sync_admin_write = Router::new()
         .nest("/sync", sync_views::write_routes())
-        .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
-        .layer(middleware::from_fn(deny_scoped_token))
-        // Human management of sync services is Administrator-only; write_metadata token preserved.
-        .layer(middleware::from_fn(require_admin_or_token_write_metadata))
         .with_state(state.clone());
 
-    // The replicate audit backlog and reconciliation are review surfaces for managers and
-    // administrators; sync-service session tokens pass on their write_metadata bit.
     let sync_admin_manage = Router::new()
         .nest("/sync", sync_views::manage_routes())
-        .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
-        .layer(middleware::from_fn(deny_scoped_token))
-        .layer(middleware::from_fn(require_manage_sensors))
         .with_state(state.clone());
 
-    // Destructive reconciliation deletes streams and their readings, so it takes the same gate
-    // as stream deletion on CRUD rather than the manager review layer.
     let sync_admin_destructive = Router::new()
         .nest("/sync", sync_views::destructive_routes())
-        .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
-        .layer(middleware::from_fn(deny_scoped_token))
-        .layer(middleware::from_fn(require_admin_or_token_write_metadata))
         .with_state(state.clone());
 
     let sync_admin_admin = Router::new()
         .nest("/sync", sync_views::admin_routes())
-        .route(
-            "/readings/detach",
-            post(crate::routes::private::readings::views::detach_output),
-        )
-        .route(
-            "/readings/return",
-            post(crate::routes::private::readings::views::return_output),
-        )
-        .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
-        .layer(middleware::from_fn(require_admin))
         .with_state(state.clone());
 
     // Keycloak user management proxy. Conditional, only mounted if AppState has
@@ -741,93 +622,14 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             .with_state(state.clone())
     });
 
-    // Tool script authoring: versioned R code executed by the runner. Administrator only, it is
-    // remote code authorship; execution of the ACTIVE version stays open via /tools.
-    let tool_script_routes = {
-        use crate::routes::private::tools::views as scripts;
-        Router::new()
-            .route(
-                "/tool_scripts",
-                get(scripts::list_scripts).post(scripts::create_script),
-            )
-            .route(
-                "/tool_scripts/{id}",
-                get(scripts::get_script).patch(scripts::update_script),
-            )
-            .route("/tool_scripts/draft_run", post(scripts::draft_run))
-            .route(
-                "/tool_scripts/{id}/formulas/draft_run",
-                post(scripts::draft_run_formulas),
-            )
-            .route("/tool_scripts/inspect", post(scripts::inspect_script))
-            .route("/tool_scripts/{id}/versions", post(scripts::create_version))
-            .route(
-                "/tool_scripts/{id}/versions/{version_id}",
-                get(scripts::get_version),
-            )
-            .route(
-                "/tool_scripts/{id}/versions/{version_id}/validate",
-                post(scripts::validate_version),
-            )
-            .route(
-                "/tool_scripts/{id}/versions/{version_id}/activate",
-                post(scripts::activate_version),
-            )
-            .route(
-                "/tool_scripts/{id}/activations",
-                get(scripts::list_activations),
-            )
-            .layer(middleware::from_fn(require_admin))
-            .with_state(state.clone())
-    };
+    let tool_script_routes =
+        crate::routes::private::tools::views::script_routes().with_state(state.clone());
 
-    // Admin notification oversight: per-channel health probe, one-off test send, subscriber roster.
-    let notifications_admin_routes = {
-        use crate::routes::private::notifications::views as notif_views;
-        Router::new()
-            .route("/notifications/health", get(notif_views::get_health))
-            .route(
-                "/notifications/deliveries",
-                get(notif_views::list_delivery_log),
-            )
-            .route(
-                "/notifications/health/refresh",
-                post(notif_views::refresh_health),
-            )
-            .route("/notifications/test-send", post(notif_views::test_send))
-            .route(
-                "/notifications/subscribers",
-                get(notif_views::list_subscribers),
-            )
-            .layer(middleware::from_fn(require_admin))
-            .with_state(state.clone())
-    };
+    let notifications_admin_routes =
+        crate::routes::private::notifications::views::oversight_routes().with_state(state.clone());
 
-    // Self-service notification preferences. Any Keycloak user manages their OWN settings (the handler
-    // binds to the caller's JWT sub; API tokens are refused in-handler since they have no user sub).
-    let notifications_me_routes = {
-        use crate::routes::private::notifications::views as me;
-        Router::new()
-            .route(
-                "/notifications/me",
-                get(me::get_my_notifications).patch(me::update_my_notifications),
-            )
-            .route(
-                "/notifications/me/subscriptions",
-                put(me::set_my_subscriptions),
-            )
-            .route(
-                "/notifications/me/push",
-                post(me::register_push_subscription)
-                    .get(me::list_push_subscriptions)
-                    .delete(me::delete_push_subscription),
-            )
-            .route("/notifications/channels", get(me::list_channels))
-            .route("/notifications/me/push/test", post(me::test_push))
-            .route("/notifications/me/push/ping", post(me::schedule_ping))
-            .layer(middleware::from_fn(require_read_data))
-            .with_state(state.clone())
-    };
+    let notifications_me_routes =
+        crate::routes::private::notifications::views::subscriber_routes().with_state(state.clone());
 
     // The caller's own identity, level, and project visibility. No extra capability gate, the
     // access gate in `service_auth_middleware` already guarantees a river role; the handler refuses
@@ -868,12 +670,19 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .merge(stream_read_routes)
         .merge(sensor_view_read_routes)
         .merge(stream_write_routes)
+        .merge(registration_routes)
         .merge(sensor_adopt_read)
         .merge(sensor_adopt_write)
+        .merge(sensor_action_routes)
         .merge(metadata_read_routes)
+        .merge(readings_views::readings_read_routes(state))
+        .merge(readings_views::readings_write_routes(state))
+        .merge(readings_views::readings_admin_routes(state))
         .merge(data_push_routes)
         .merge(field_entry_routes)
         .merge(data_action_routes)
+        .merge(alarm_read_routes)
+        .merge(alarm_write_routes)
         .merge(data_read_routes)
         .merge(operator_action_routes)
         .merge(catalog_merge_routes)
@@ -934,3 +743,7 @@ pub fn sync_control_router(state: &AppState) -> Router<AppState> {
 
     Router::new().nest("/sync", enroll.merge(session))
 }
+
+#[cfg(test)]
+#[path = "tests/route_guards.rs"]
+mod route_guards;

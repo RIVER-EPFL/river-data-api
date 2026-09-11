@@ -34,8 +34,8 @@ use crate::routes::private::collection_events::models as events;
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::models as readings;
-use crate::routes::private::readings::samples::model as samples;
-use crate::routes::private::sites::parameters::models as site_parameters;
+use crate::routes::private::readings::samples::models as samples;
+use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::resolve_site;
 
@@ -1085,7 +1085,7 @@ pub async fn get_event_detail(
     // Findings for parameters with no readings at the event (missing outputs) still get a cell.
     // One filtered find for all of them: an audit reporting eight missing outputs at one visit was
     // costing eight round trips on the request path.
-    let finding_catalog = crate::routes::private::sites::parameters::service::catalog_map(
+    let finding_catalog = crate::routes::private::site_parameters::service::catalog_map(
         &state.db,
         finding_by_param.keys().copied(),
     )

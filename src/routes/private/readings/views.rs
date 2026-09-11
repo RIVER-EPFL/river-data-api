@@ -23,12 +23,15 @@ use sea_orm::entity::prelude::*;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use tower_http::limit::RequestBodyLimitLayer;
+
 use crate::common::AppState;
 use crate::common::actor::label;
 use crate::common::middleware::AuthContext;
 use crate::common::middleware::IsSyncService;
 use crate::common::middleware::ProjectScope;
 use crate::common::middleware::enforce_project_scope_for_sites;
+use crate::common::middleware::{require_admin, require_read_data, require_write_data};
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::routes::private::collection_events::flows;
@@ -51,22 +54,23 @@ use crate::routes::private::readings::service::rows_at;
 use crate::routes::private::readings::service::run_id_of;
 use crate::routes::private::readings::status_events;
 use crate::routes::private::reprocessing_jobs::job::Job;
-use crate::routes::private::sensors::calibrations;
-use crate::routes::private::sensors::calibrations::resolver;
-use crate::routes::private::sensors::calibrations::service::Curve;
-use crate::routes::private::sensors::calibrations::service::apply_curves;
+use crate::routes::private::sensor_calibrations;
+use crate::routes::private::sensor_calibrations::resolver;
+use crate::routes::private::sensor_calibrations::service::Curve;
+use crate::routes::private::sensor_calibrations::service::apply_curves;
 use crate::routes::private::sensors::models::ResolvedOwner;
 use crate::routes::private::sensors::service::resolve_slot_owner_for_times;
 use crate::routes::private::sensors::service::resolve_windows_for_times;
-use crate::routes::private::sensors::standard_curves;
+use crate::routes::private::standard_curves;
 use crate::routes::private::sites;
-use crate::routes::private::sites::parameters as site_parameters;
+use crate::routes::private::site_parameters;
 use crate::routes::private::sync::models::GroupAudit;
 use crate::routes::private::sync::models::HoldKind;
 use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::private::sync::service as audit;
 use crate::routes::private::tools::models::run as tool_run;
 use crate::routes::resolve_site_with_project;
+use crate::routes::service::{ACTION_BODY_LIMIT, DATA_BODY_LIMIT, IMPORT_BODY_LIMIT};
 
 /// Preview a replicate group's statistics after flagging, restoring or switching the sd divisor.
 /// Nothing is written. Requires `read_data`.
@@ -1320,7 +1324,7 @@ pub async fn insert_batch_readings(
     // curves produces: instrument correction first, hand-picked curve on its result. Rows whose
     // caller supplied no value need their base too: stamping the id while leaving the value
     // uncorrected would claim a calibration the number never went through.
-    let base_calibrations: HashMap<Uuid, calibrations::service::Curve> = {
+    let base_calibrations: HashMap<Uuid, sensor_calibrations::service::Curve> = {
         let mut ids: Vec<Uuid> = payload
             .readings
             .iter()
@@ -1333,15 +1337,15 @@ pub async fn insert_batch_readings(
         if ids.is_empty() {
             HashMap::new()
         } else {
-            calibrations::Entity::find()
-                .filter(calibrations::Column::Id.is_in(ids))
+            sensor_calibrations::Entity::find()
+                .filter(sensor_calibrations::Column::Id.is_in(ids))
                 .all(&state.db)
                 .await?
                 .into_iter()
                 .map(|c| {
                     (
                         c.id,
-                        calibrations::service::Curve {
+                        sensor_calibrations::service::Curve {
                             id: c.id,
                             slope: c.slope,
                             intercept: c.intercept,
@@ -1378,7 +1382,7 @@ pub async fn insert_batch_readings(
                 .unwrap_or(false);
             let standard = r.standard_curve_id.map(|id| {
                 let c = &standard_curve_models[&id];
-                calibrations::service::Curve {
+                sensor_calibrations::service::Curve {
                     id: c.id,
                     slope: c.slope,
                     intercept: c.intercept,
@@ -1389,7 +1393,7 @@ pub async fn insert_batch_readings(
             // with neither gets its resolved base applied, so the stamped calibration_id is always
             // a curve the stored value went through.
             let calibrated_value = match (standard, r.calibrated_value) {
-                (Some(curve), _) => Some(calibrations::service::apply_curves(
+                (Some(curve), _) => Some(sensor_calibrations::service::apply_curves(
                     r.raw_value,
                     base,
                     Some(curve),
@@ -1569,7 +1573,7 @@ pub async fn insert_batch_readings(
         let times: Vec<chrono::DateTime<chrono::FixedOffset>> =
             models.iter().map(|m| *m.time.as_ref()).collect();
         if let (Some(first), Some(last)) = (times.iter().min(), times.iter().max()) {
-            calibrations::service::recompose_from_own_curves_guarded(
+            sensor_calibrations::service::recompose_from_own_curves_guarded(
                 &state.db,
                 "TRUE",
                 "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3",
@@ -1602,7 +1606,7 @@ pub async fn insert_batch_readings(
     if inserted > 0 || overwritten > 0 {
         let mut derived_sites: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
         for (site_id, timestamps) in &site_timestamps_for_derived {
-            if crate::routes::private::parameters::derived::janitor::site_has_active_derived(
+            if crate::routes::private::derived_parameters::flows::site_has_active_derived(
                 &state.db, *site_id,
             )
             .await
@@ -1900,8 +1904,8 @@ pub async fn ingest_readings(
         if ids.is_empty() {
             HashMap::new()
         } else {
-            calibrations::Entity::find()
-                .filter(calibrations::Column::Id.is_in(ids))
+            sensor_calibrations::Entity::find()
+                .filter(sensor_calibrations::Column::Id.is_in(ids))
                 .all(db)
                 .await?
                 .into_iter()
@@ -2426,7 +2430,7 @@ pub async fn ingest_readings(
     let corrected = payload.overwrite && inserted > 0;
     if corrected
         && let Some((lo, hi)) = span
-        && let Err(e) = calibrations::service::recompose_from_own_curves_guarded(
+        && let Err(e) = sensor_calibrations::service::recompose_from_own_curves_guarded(
             &state.db,
             "TRUE",
             "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
@@ -2536,7 +2540,7 @@ pub async fn ingest_readings(
     if paired
         && effect
         && let Some(sid) = site_id
-        && crate::routes::private::parameters::derived::janitor::site_has_active_derived(db, sid)
+        && crate::routes::private::derived_parameters::flows::site_has_active_derived(db, sid)
             .await
             .unwrap_or(true)
     {
@@ -2888,7 +2892,7 @@ pub async fn insert_grab_samples(
                     .map(|sid| (sid, Some(r.parameter_id), r.time))
             })
             .collect();
-        calibrations::resolver::resolve_many(&state.db, &requests).await?
+        sensor_calibrations::resolver::resolve_many(&state.db, &requests).await?
     };
 
     let preview: Vec<GrabPreview> = payload
@@ -2902,7 +2906,7 @@ pub async fn insert_grab_samples(
                     .copied();
             let standard = r.standard_curve_id.map(|cid| {
                 let c = &standard_curves[&cid];
-                calibrations::service::Curve {
+                sensor_calibrations::service::Curve {
                     id: c.id,
                     slope: c.slope,
                     intercept: c.intercept,
@@ -2913,7 +2917,7 @@ pub async fn insert_grab_samples(
             // resolves neither is stored uncorrected, and `calibrated_value` stays NULL so a null
             // still means "no curve was applied" rather than "a curve happened to be identity".
             let calibrated_value = (base.is_some() || standard.is_some())
-                .then(|| calibrations::service::apply_curves(r.value, base, standard));
+                .then(|| sensor_calibrations::service::apply_curves(r.value, base, standard));
             let composed_equation = match (base, standard) {
                 (Some(b), Some(s)) => Some(equation(
                     s.slope * b.slope,
@@ -4256,4 +4260,64 @@ pub async fn import_csv(
         curves: Vec::new(),
         check,
     }))
+}
+
+// --- The `/readings` surface ---
+
+/// The routes under `/readings`, one router per authorization they carry, each with its own
+/// layer (Q143). `service/mod.rs` merges them; it keeps the cross-cutting paths that act on
+/// readings without naming them, `/actions/*` and `/sites/{id}/readings`.
+///
+/// The names carry the component because `tests/route_guards.rs` keys a router block by its
+/// function name alone, across every file it scans: two components exporting `read_routes`
+/// would be one block there, and the table would lose whichever it read first.
+///
+/// The body limits travel with the routes they were declared against: `RequestBodyLimitLayer` is
+/// the enforced cap and `DefaultBodyLimit` the extractor's, and a batch carries both because the
+/// central file applied both to it.
+pub fn readings_read_routes(state: &AppState) -> axum::Router {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route("/readings/sample_preview", post(sample_preview))
+        .route("/readings/seasonal_check", post(seasonal_check))
+        .route("/readings/provenance", get(get_reading_provenance))
+        .route("/readings/ledger", get(get_reading_ledger))
+        .route("/readings/decisions", get(list_decisions))
+        .route("/readings/edits/inspect", post(inspect))
+        .layer(axum::middleware::from_fn(require_read_data))
+        .with_state(state.clone())
+}
+
+pub fn readings_write_routes(state: &AppState) -> axum::Router {
+    use axum::routing::{patch, post};
+    axum::Router::new()
+        .route("/readings/batch", post(insert_batch_readings))
+        .layer(RequestBodyLimitLayer::new(DATA_BODY_LIMIT))
+        .route("/readings/import_csv", post(import_csv))
+        .layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT))
+        .route("/readings/edits/preview", post(preview))
+        .route("/readings/edits", post(commit))
+        .route("/readings/edits/{id}/rollback", post(rollback))
+        .route(
+            "/readings/edits/sets/{set_id}/rollback",
+            post(rollback_edit_set),
+        )
+        .route("/readings/flag", patch(flag_readings))
+        .route("/readings/unflag", patch(unflag_readings))
+        .route("/readings/flag_range", patch(flag_range))
+        .route("/readings/unflag_range", patch(unflag_range))
+        .layer(axum::middleware::from_fn(require_write_data))
+        .with_state(state.clone())
+}
+
+/// Detaching a derived output from its inputs and returning it are corrections to what the chain
+/// decided, so they sit with the other administrator-only writes rather than with `write_data`.
+pub fn readings_admin_routes(state: &AppState) -> axum::Router {
+    use axum::routing::post;
+    axum::Router::new()
+        .route("/readings/detach", post(detach_output))
+        .route("/readings/return", post(return_output))
+        .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
+        .layer(axum::middleware::from_fn(require_admin))
+        .with_state(state.clone())
 }

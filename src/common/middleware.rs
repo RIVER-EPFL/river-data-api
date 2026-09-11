@@ -628,7 +628,7 @@ fn scoped_site_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectStateme
 /// Subquery selecting sensor ids that have at least one deployment at a site in the scoped set.
 /// Used to confine `sensors` and `sensor_calibrations`.
 fn scoped_sensor_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
-    use crate::routes::private::sensors::deployments;
+    use crate::routes::private::sensor_deployments as deployments;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
     deployments::Entity::find()
         .select_only()
@@ -640,7 +640,7 @@ fn scoped_sensor_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectState
 /// Subquery selecting the site_parameter ids within a restricted principal's project set. Used to
 /// confine `data_streams`, whose scoping column is `site_parameter_id`.
 fn scoped_site_parameter_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
-    use crate::routes::private::sites::parameters as site_parameters;
+    use crate::routes::private::site_parameters;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
     site_parameters::Entity::find()
         .select_only()
@@ -689,7 +689,7 @@ enum Direction {
 /// Subquery selecting every sensor id that has any deployment at all. Its complement is the bench
 /// inventory, which belongs to no project.
 fn deployed_sensor_ids_query() -> sea_orm::sea_query::SelectStatement {
-    use crate::routes::private::sensors::deployments;
+    use crate::routes::private::sensor_deployments as deployments;
     use sea_orm::{EntityTrait, QuerySelect, QueryTrait};
     deployments::Entity::find()
         .select_only()
@@ -718,8 +718,8 @@ fn crud_scope_condition(
         alarms::models as alarm_thresholds, alarms::models::alarm_event as alarm_events,
         annotations, data_streams, notes, projects as projects_entity, projects::subprojects,
         readings::decision_model as reading_decisions, readings::samples, reprocessing_jobs,
-        sensors, sensors::calibrations, sensors::deployments, sensors::standard_curves, sites,
-        sites::parameters as site_parameters, sync::hold_model as holds,
+        sensor_deployments, sensors, sensor_calibrations, standard_curves, sites,
+        site_parameters, sync::hold_model as holds,
     };
     use sea_orm::{ColumnTrait, Condition};
     let ids = || projects.iter().copied();
@@ -737,7 +737,7 @@ fn crud_scope_condition(
         "notes" => notes::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
         "annotations" => annotations::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
         "sensor_deployments" => {
-            deployments::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
+            sensor_deployments::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
         }
         "alarm_thresholds" => {
             alarm_thresholds::Column::SiteId.in_subquery(scoped_site_ids_query(projects))
@@ -767,7 +767,7 @@ fn crud_scope_condition(
         "sensors" if direction != Direction::Read => return None,
         "sensors" => sensors::Column::Id.in_subquery(scoped_sensor_ids_query(projects)),
         "sensor_calibrations" => {
-            calibrations::Column::SensorId.in_subquery(scoped_sensor_ids_query(projects))
+            sensor_calibrations::Column::SensorId.in_subquery(scoped_sensor_ids_query(projects))
         }
         "standard_curves" => {
             let scoped =

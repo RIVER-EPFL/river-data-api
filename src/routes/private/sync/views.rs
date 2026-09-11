@@ -2,6 +2,7 @@
 //! drives, and the pairing-plan and review-queue handlers.
 
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware;
 use axum::routing::{get, patch, post};
 use axum::{
     Json, Router,
@@ -17,13 +18,19 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
     QueryFilter, QueryOrder, Set, Statement,
 };
+use tower_http::limit::RequestBodyLimitLayer;
 use uuid::Uuid;
 
+use crate::common::middleware::{
+    deny_scoped_token, require_admin, require_admin_or_token_write_metadata,
+    require_manage_sensors, require_read_metadata,
+};
+use crate::routes::service::ACTION_BODY_LIMIT;
 use river_data_core::commands as core_commands;
 
 use crate::routes::private::readings::models as readings;
-use crate::routes::private::readings::samples::model as samples;
-use crate::routes::private::sites::parameters::models as site_parameters;
+use crate::routes::private::readings::samples::models as samples;
+use crate::routes::private::site_parameters::models as site_parameters;
 use river_data_core::models::{
     CommandStatus, CommandUpdateRequest, EnrollRequest, EnrollResponse, HeartbeatRequest,
     HeartbeatResponse, PendingCommand, ServiceStatus, SyncEventStatus, SyncEventType,
@@ -1475,11 +1482,16 @@ async fn decide_hold<C: sea_orm::ConnectionTrait>(
     use super::hold_model::{Column, Entity};
     let acknowledged_at = match by {
         Some(_) => sea_orm::sea_query::Expr::current_timestamp(),
-        None => sea_orm::sea_query::Expr::value(Option::<sea_orm::prelude::DateTimeWithTimeZone>::None),
+        None => {
+            sea_orm::sea_query::Expr::value(Option::<sea_orm::prelude::DateTimeWithTimeZone>::None)
+        }
     };
     let result = Entity::update_many()
         .col_expr(Column::Status, sea_orm::sea_query::Expr::value(to.as_str()))
-        .col_expr(Column::Resolution, sea_orm::sea_query::Expr::value(resolution))
+        .col_expr(
+            Column::Resolution,
+            sea_orm::sea_query::Expr::value(resolution),
+        )
         .col_expr(
             Column::AcknowledgedBy,
             sea_orm::sea_query::Expr::value(by.map(ToString::to_string)),
@@ -2158,15 +2170,8 @@ pub async fn reopen_hold(
                 txn.execute_raw(refresh_group(instant)).await?;
             }
         }
-        let restored = decide_hold(
-            txn,
-            id,
-            &HoldStatus::REOPENABLE,
-            reopened,
-            resolution,
-            None,
-        )
-        .await?;
+        let restored =
+            decide_hold(txn, id, &HoldStatus::REOPENABLE, reopened, resolution, None).await?;
         if restored != 1 {
             return Err(AppError::Conflict(format!(
                 "replicate audit hold {id} changed under this request; no flag was reverted"
@@ -2332,8 +2337,10 @@ pub async fn acknowledge_holds_bulk(
     }))
 }
 
-/// Sync admin views are split by required authorization so the unified `/api/` router
-/// can layer the right middleware per group without route-level overrides.
+/// Sync admin views are split by required authorization, and each group carries its own layers
+/// (Q143), so `service/mod.rs` mounts them under `/sync` and adds nothing. The layers used to sit
+/// at the nest site, where `tests/route_guards.rs` could not see them and all 36 routes recorded
+/// as unguarded (T97).
 ///
 /// Group membership:
 /// - `read_routes`: list/get operations, fine for any read_metadata caller.
@@ -2360,6 +2367,7 @@ pub fn read_routes() -> Router<AppState> {
         .route("/pairing-plans/{id}/site-metadata", get(plan_site_metadata))
         .route("/pairing-plans/{id}/instruments", get(plan_instruments))
         .route("/unpaired-summary", get(unpaired_summary))
+        .layer(middleware::from_fn(require_read_metadata))
 }
 
 pub fn write_routes() -> Router<AppState> {
@@ -2375,6 +2383,10 @@ pub fn write_routes() -> Router<AppState> {
             post(supersede_pairing_plan),
         )
         .route("/pairing-plans/{id}/revert", post(revert_pairing_plan))
+        .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
+        .layer(middleware::from_fn(deny_scoped_token))
+        // Human management of sync services is Administrator-only; write_metadata token preserved.
+        .layer(middleware::from_fn(require_admin_or_token_write_metadata))
 }
 
 pub fn manage_routes() -> Router<AppState> {
@@ -2407,16 +2419,23 @@ pub fn manage_routes() -> Router<AppState> {
             get(reconciliation_candidates),
         )
         .route("/replicate_reconciliation", post(start_reconciliation))
+        .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
+        .layer(middleware::from_fn(deny_scoped_token))
+        .layer(middleware::from_fn(require_manage_sensors))
 }
 
 /// Destructive reconciliation: the delete job removes obsolete streams and their readings, so it
 /// sits behind the same gate as stream deletion on CRUD (Keycloak Administrator or a
 /// write_metadata token), not the manager review layer the non-destructive endpoints use.
 pub fn destructive_routes() -> Router<AppState> {
-    Router::new().route(
-        "/replicate_reconciliation/delete",
-        post(start_reconciliation_delete),
-    )
+    Router::new()
+        .route(
+            "/replicate_reconciliation/delete",
+            post(start_reconciliation_delete),
+        )
+        .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
+        .layer(middleware::from_fn(deny_scoped_token))
+        .layer(middleware::from_fn(require_admin_or_token_write_metadata))
 }
 
 pub fn admin_routes() -> Router<AppState> {
@@ -2426,6 +2445,8 @@ pub fn admin_routes() -> Router<AppState> {
             get(list_credentials).post(create_credential),
         )
         .route("/credentials/{id}/revoke", post(revoke_credential))
+        .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
+        .layer(middleware::from_fn(require_admin))
 }
 
 /// Create a draft pairing plan describing a batch of intended stream-to-site_parameter
@@ -3191,9 +3212,9 @@ pub async fn plan_instruments(
         .map(|i| (i.source_key.as_str(), i.name.as_str()))
         .collect();
     let mut curves: Vec<PlanCurveAssignment> =
-        crate::routes::private::sensors::standard_curves::Entity::find()
+        crate::routes::private::standard_curves::Entity::find()
             .filter(
-                crate::routes::private::sensors::standard_curves::Column::SourceSystem
+                crate::routes::private::standard_curves::Column::SourceSystem
                     .eq(plan.source_system.clone()),
             )
             .all(&state.db)

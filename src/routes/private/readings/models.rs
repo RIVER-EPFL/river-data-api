@@ -111,21 +111,21 @@ pub enum Relation {
     )]
     Sensor,
     #[sea_orm(
-        belongs_to = "crate::routes::private::sensors::calibrations::Entity",
+        belongs_to = "crate::routes::private::sensor_calibrations::Entity",
         from = "Column::CalibrationId",
-        to = "crate::routes::private::sensors::calibrations::Column::Id"
+        to = "crate::routes::private::sensor_calibrations::Column::Id"
     )]
     SensorCalibration,
     #[sea_orm(
-        belongs_to = "crate::routes::private::sensors::standard_curves::Entity",
+        belongs_to = "crate::routes::private::standard_curves::Entity",
         from = "Column::StandardCurveId",
-        to = "crate::routes::private::sensors::standard_curves::Column::Id"
+        to = "crate::routes::private::standard_curves::Column::Id"
     )]
     StandardCurve,
     #[sea_orm(
-        belongs_to = "crate::routes::private::sensors::deployments::Entity",
+        belongs_to = "crate::routes::private::sensor_deployments::Entity",
         from = "Column::DeploymentId",
-        to = "crate::routes::private::sensors::deployments::Column::Id"
+        to = "crate::routes::private::sensor_deployments::Column::Id"
     )]
     SensorDeployment,
     #[sea_orm(
@@ -560,7 +560,7 @@ impl Kind {
     ///
     /// `calibrated_value` is not among them for a value correction: a corrected value is what the
     /// curves the row names produce from its raw value, so it is recomposed after the projection
-    /// rather than recorded and restored (`calibrations::service::recompose_from_own_curves`).
+    /// rather than recorded and restored (`sensor_calibrations::service::recompose_from_own_curves`).
     /// `ingested_at` is not among them either: it is the row's first arrival and nothing moves it,
     /// so the arrival of the value a row currently serves is the latest correction's own `at`.
     #[must_use]

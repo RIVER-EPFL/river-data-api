@@ -396,6 +396,19 @@ fn entities() -> Vec<Entity> {
             families: &["read"],
             ..field_data("tool_runs", CrudScope::ProjectBound)
         },
+        // The review queue as rows: a hold is raised by the path that detects it and decided
+        // through the named transitions under `/sync/replicate_audit_holds`, so the entity is
+        // read-only and carries the sensor gate those transitions carry.
+        Entity {
+            families: &["read"],
+            ..sensor("replicate_audit_holds", CrudScope::Global)
+        },
+        // The curation ledger: append-only, every writer a curation path with its own rules
+        // (ADR 0008). `GET /readings/decisions` is one reading's history; this is the table.
+        Entity {
+            families: &["read"],
+            ..field_data("reading_decisions", CrudScope::Global)
+        },
         // Append-only: every writer is a side effect of the change it records.
         Entity {
             families: &["read"],

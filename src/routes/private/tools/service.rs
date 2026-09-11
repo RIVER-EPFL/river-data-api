@@ -10,7 +10,7 @@ use sea_orm::{
 use sea_orm_migration::sea_orm::DbErr;
 
 use crate::routes::private::readings::models as readings;
-use crate::routes::private::readings::samples::model as samples;
+use crate::routes::private::readings::samples::models as samples;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -33,12 +33,12 @@ use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::constants::models as constants;
 use crate::routes::private::data_streams::models as data_streams;
-use crate::routes::private::parameters::groups::rules;
+use crate::routes::private::parameter_groups::service::rules;
 use crate::routes::private::parameters::models as parameters;
-use crate::routes::private::sensors::calibrations::service::evaluate_formula;
-use crate::routes::private::sensors::standard_curves::model as standard_curves;
+use crate::routes::private::sensor_calibrations::service::evaluate_formula;
+use crate::routes::private::standard_curves::models as standard_curves;
 use crate::routes::private::sites::models as sites;
-use crate::routes::private::sites::parameters::models as site_parameters;
+use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::sync::service as replicate_audit;
 
 #[derive(Debug, Clone, sea_orm::FromQueryResult)]

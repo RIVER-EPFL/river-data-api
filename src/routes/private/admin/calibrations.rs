@@ -30,7 +30,7 @@ pub async fn recalculate_calibration(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<RecalculateResponse>> {
-    let row = crate::routes::private::sensors::calibrations::Entity::find_by_id(id)
+    let row = crate::routes::private::sensor_calibrations::Entity::find_by_id(id)
         .one(&state.db)
         .await
         .map_err(|e| crate::error::AppError::Internal(e.to_string()))?;

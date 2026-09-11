@@ -11,7 +11,7 @@ use sea_orm::{
 use super::models::{ParameterResult, ProjectResult, SensorResult, SiteResult};
 use crate::common::authz::AccessScope;
 use crate::error::AppResult;
-use crate::routes::private::sensors::deployments;
+use crate::routes::private::sensor_deployments as deployments;
 use crate::routes::private::{parameters, projects, sensors, sites};
 
 /// Matching sites, sensors, parameters and projects, ten of each.
