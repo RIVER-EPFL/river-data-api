@@ -33,6 +33,8 @@ fn test_the_entities_with_no_project_dimension_are_the_ones_a_scoped_token_is_re
             "samples",
             "subprojects",
             "data_streams",
+            "reading_decisions",
+            "replicate_audit_holds",
             "alarm_thresholds",
             "alarm_events",
             "sensor_deployments",
@@ -98,7 +100,13 @@ fn test_only_a_members_write_reaches_a_curve_on_an_instrument_deployed_nowhere()
         sql("standard_curves", Direction::TokenWrite),
         "a project-scoped token is confined to where the instrument stood, in both directions"
     );
-    for entity in ["sites", "notes", "sensor_calibrations", "data_streams"] {
+    for entity in [
+        "sites",
+        "notes",
+        "sensor_calibrations",
+        "data_streams",
+        "reading_decisions",
+    ] {
         assert_eq!(
             sql(entity, Direction::Read),
             sql(entity, Direction::MemberWrite),

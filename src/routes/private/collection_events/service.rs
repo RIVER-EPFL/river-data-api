@@ -22,6 +22,8 @@ use crate::common::paging::Window;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::readings::models as readings;
+use crate::routes::private::sync::models::HoldKind;
+use crate::routes::private::sync::models::HoldStatus;
 
 pub(super) const MAX_PAGE_SIZE: u64 = 200;
 
@@ -222,8 +224,9 @@ pub(super) fn visit_count_columns() -> String {
          (SELECT COUNT(*) FROM replicate_audit_holds h \
            LEFT JOIN data_streams ds ON ds.id = h.stream_id \
            LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id \
-           WHERE h.group_time = ce.collected_at AND h.status = 'pending' \
-             AND COALESCE(h.site_id, sp.site_id) = ce.site_id) AS findings_open"
+           WHERE h.group_time = ce.collected_at AND h.status = '{pending}' \
+             AND COALESCE(h.site_id, sp.site_id) = ce.site_id) AS findings_open",
+        pending = HoldStatus::Pending.as_str()
     )
 }
 
@@ -358,13 +361,17 @@ pub async fn status_for(
     }
     let stale = EventIdRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "SELECT DISTINCT ce.id
-             FROM replicate_audit_holds h
-             JOIN collection_events ce
-               ON ce.site_id = h.site_id AND ce.collected_at = h.group_time
-             WHERE h.kind IN ('stale_output', 'skipped_output')
-               AND h.status = 'pending' AND h.stream_id IS NULL
-               AND ce.id = ANY($1)",
+        format!(
+            "SELECT DISTINCT ce.id
+                 FROM replicate_audit_holds h
+                 JOIN collection_events ce
+                   ON ce.site_id = h.site_id AND ce.collected_at = h.group_time
+                 WHERE h.kind IN {kinds}
+                   AND h.status = '{pending}' AND h.stream_id IS NULL
+                   AND ce.id = ANY($1)",
+            pending = HoldStatus::Pending.as_str(),
+            kinds = HoldKind::sql_list(&[HoldKind::StaleOutput, HoldKind::SkippedOutput])
+        ),
         [event_ids.to_vec().into()],
     ))
     .all(db)

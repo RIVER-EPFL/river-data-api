@@ -1302,7 +1302,8 @@ pub async fn list_holds(
     match query.classification.as_deref() {
         Some("population_sd") => {
             conditions.push(format!(
-                "h.kind = 'replicate_stats' AND ({})",
+                "h.kind = '{}' AND ({})",
+                HoldKind::ReplicateStats.as_str(),
                 *POPULATION_SD_SQL
             ));
         }
@@ -1312,7 +1313,8 @@ pub async fn list_holds(
             // what makes the two filters partition the replicate-stats holds exactly, matching
             // the `count(*) FILTER (...)` evidence quoted elsewhere.
             conditions.push(format!(
-                "h.kind = 'replicate_stats' AND NOT COALESCE(({}), false)",
+                "h.kind = '{}' AND NOT COALESCE(({}), false)",
+                HoldKind::ReplicateStats.as_str(),
                 *POPULATION_SD_SQL
             ));
         }
@@ -1335,17 +1337,16 @@ pub async fn list_holds(
     // come from the allowlist below, so inlining them is safe.
     let base_clause = conditions.join(" AND ");
     let status_sql = match query.status.as_deref() {
-        Some(
-            s @ ("pending" | "deferred" | "acknowledged" | "remediated" | "superseded"
-            | "use_portal" | "use_manual" | "consumed"),
-        ) => format!("h.status = '{s}'"),
-        Some("resolved") => format!("h.status IN {RESOLVED}"),
-        Some(other) => {
-            return Err(AppError::BadRequest(format!(
-                "unknown hold status '{other}'"
-            )));
-        }
-        None => "h.status = 'pending'".to_string(),
+        Some("resolved") => format!("h.status IN {}", *RESOLVED),
+        Some(other) => match HoldStatus::parse(other) {
+            Some(status) => format!("h.status = '{}'", status.as_str()),
+            None => {
+                return Err(AppError::BadRequest(format!(
+                    "unknown hold status '{other}'"
+                )));
+            }
+        },
+        None => format!("h.status = '{}'", HoldStatus::Pending.as_str()),
     };
     let where_clause = format!("{base_clause} AND {status_sql}");
     let order_by = match query.sort.as_deref() {
@@ -1366,11 +1367,13 @@ pub async fn list_holds(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT COUNT(*) FILTER (WHERE {status_sql})::bigint AS total,
-                        COUNT(*) FILTER (WHERE h.status = 'pending')::bigint AS pending,
-                        COUNT(*) FILTER (WHERE h.status = 'deferred')::bigint AS deferred
+                        COUNT(*) FILTER (WHERE h.status = '{pending}')::bigint AS pending,
+                        COUNT(*) FILTER (WHERE h.status = '{deferred}')::bigint AS deferred
                  FROM replicate_audit_holds h
                  LEFT JOIN data_streams ds ON ds.id = h.stream_id
-                 WHERE {base_clause}"
+                 WHERE {base_clause}",
+                pending = HoldStatus::Pending.as_str(),
+                deferred = HoldStatus::Deferred.as_str()
             ),
             binds.clone(),
         ))
@@ -1395,7 +1398,7 @@ pub async fn list_holds(
                     h.group_time,
                     h.expected, h.computed, h.delta, h.status,
                     ''::text AS classification,
-                    CASE WHEN h.kind = 'replicate_stats'
+                    CASE WHEN h.kind = '{REPLICATE_STATS}'
                          THEN COALESCE(h.computed->>'sd_estimator', sp.sd_estimator, 'sample')
                     END AS sd_estimator,
                     h.resolution,
@@ -1412,7 +1415,8 @@ pub async fn list_holds(
              LEFT JOIN parameters ep ON ep.id = h.parameter_id
              WHERE {where_clause}
              ORDER BY {order_by}
-             LIMIT {limit} OFFSET {offset}"
+             LIMIT {limit} OFFSET {offset}",
+            REPLICATE_STATS = HoldKind::ReplicateStats.as_str()
         ),
         binds.clone(),
     ))
@@ -1421,7 +1425,7 @@ pub async fn list_holds(
     for row in &mut rows {
         // The disagreement signature is a replicate-statistics concept; other kinds carry their
         // meaning in `kind` itself.
-        if row.kind == "replicate_stats" {
+        if row.kind == HoldKind::ReplicateStats.as_str() {
             row.classification = classify(&row.expected, &row.computed).to_string();
         }
     }
@@ -1436,8 +1440,9 @@ pub async fn list_holds(
                 "SELECT h.kind, COUNT(*)::bigint AS n
                  FROM replicate_audit_holds h
                  LEFT JOIN data_streams ds ON ds.id = h.stream_id
-                 WHERE {base_clause} AND h.status = 'pending'
-                 GROUP BY h.kind"
+                 WHERE {base_clause} AND h.status = '{pending}'
+                 GROUP BY h.kind",
+                pending = HoldStatus::Pending.as_str()
             ),
             binds.clone(),
         ))
@@ -1455,6 +1460,36 @@ pub async fn list_holds(
         deferred: u64::try_from(deferred).unwrap_or(0),
         pending_by_kind,
     }))
+}
+
+/// Move a hold to a terminal status, but only from the statuses that transition takes it from.
+/// The count returned is what tells a caller its decision landed rather than raced another.
+async fn decide_hold<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    id: Uuid,
+    from: &[HoldStatus],
+    to: HoldStatus,
+    resolution: serde_json::Value,
+    by: Option<&str>,
+) -> AppResult<u64> {
+    use super::hold_model::{Column, Entity};
+    let acknowledged_at = match by {
+        Some(_) => sea_orm::sea_query::Expr::current_timestamp(),
+        None => sea_orm::sea_query::Expr::value(Option::<sea_orm::prelude::DateTimeWithTimeZone>::None),
+    };
+    let result = Entity::update_many()
+        .col_expr(Column::Status, sea_orm::sea_query::Expr::value(to.as_str()))
+        .col_expr(Column::Resolution, sea_orm::sea_query::Expr::value(resolution))
+        .col_expr(
+            Column::AcknowledgedBy,
+            sea_orm::sea_query::Expr::value(by.map(ToString::to_string)),
+        )
+        .col_expr(Column::AcknowledgedAt, acknowledged_at)
+        .filter(Column::Id.eq(id))
+        .filter(Column::Status.is_in(from.iter().map(|s| s.as_str())))
+        .exec(conn)
+        .await?;
+    Ok(result.rows_affected)
 }
 
 /// Acknowledge one pending hold: the operator confirms the statistics recomputed from the stored
@@ -1547,9 +1582,12 @@ pub async fn resolve_hold(
                 let hold = txn
                     .query_one_raw(Statement::from_sql_and_values(
                         sea_orm::DatabaseBackend::Postgres,
-                        "SELECT stream_id, group_time, resolution, computed
-                         FROM replicate_audit_holds
-                         WHERE id = $1 AND status = 'pending' FOR UPDATE",
+                        format!(
+                            "SELECT stream_id, group_time, resolution, computed
+                             FROM replicate_audit_holds
+                             WHERE id = $1 AND status = '{pending}' FOR UPDATE",
+                            pending = HoldStatus::Pending.as_str()
+                        ),
                         [id.into()],
                     ))
                     .await?
@@ -1685,17 +1723,15 @@ pub async fn resolve_hold(
                     }),
                     &by,
                 );
-                let decided = txn
-                    .execute_raw(Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        "UPDATE replicate_audit_holds
-                         SET status = 'remediated', resolution = $2,
-                             acknowledged_by = $3, acknowledged_at = NOW()
-                         WHERE id = $1 AND status = 'pending'",
-                        [id.into(), resolution.into(), by.clone().into()],
-                    ))
-                    .await?
-                    .rows_affected();
+                let decided = decide_hold(
+                    txn,
+                    id,
+                    &[HoldStatus::Pending],
+                    HoldStatus::Remediated,
+                    resolution,
+                    Some(&by),
+                )
+                .await?;
                 if decided != 1 {
                     return Err(AppError::Conflict(format!(
                         "replicate audit hold {id} was resolved by another request; nothing was \
@@ -1767,13 +1803,16 @@ async fn declare_estimator(
             let hold = txn
                 .query_one_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
-                    "SELECT h.group_time, h.resolution, sp.id AS site_parameter_id,
-                            sp.site_id, sp.parameter_id, sp.sd_estimator AS previous
-                     FROM replicate_audit_holds h
-                     JOIN data_streams ds ON ds.id = h.stream_id
-                     JOIN site_parameters sp ON sp.id = ds.site_parameter_id
-                     WHERE h.id = $1 AND h.status = 'pending'
-                     FOR UPDATE OF h",
+                    format!(
+                        "SELECT h.group_time, h.resolution, sp.id AS site_parameter_id,
+                                sp.site_id, sp.parameter_id, sp.sd_estimator AS previous
+                         FROM replicate_audit_holds h
+                         JOIN data_streams ds ON ds.id = h.stream_id
+                         JOIN site_parameters sp ON sp.id = ds.site_parameter_id
+                         WHERE h.id = $1 AND h.status = '{pending}'
+                         FOR UPDATE OF h",
+                        pending = HoldStatus::Pending.as_str()
+                    ),
                     [id.into()],
                 ))
                 .await?
@@ -1840,17 +1879,15 @@ async fn declare_estimator(
                 }),
                 by,
             );
-            let updated = txn
-                .execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "UPDATE replicate_audit_holds
-                     SET status = 'remediated', resolution = $2,
-                         acknowledged_by = $3, acknowledged_at = NOW()
-                     WHERE id = $1 AND status = 'pending'",
-                    [id.into(), resolution.into(), by.to_string().into()],
-                ))
-                .await?
-                .rows_affected();
+            let updated = decide_hold(
+                txn,
+                id,
+                &[HoldStatus::Pending],
+                HoldStatus::Remediated,
+                resolution,
+                Some(by),
+            )
+            .await?;
             if updated != 1 {
                 return Err(AppError::Conflict(format!(
                     "replicate audit hold {id} was resolved by another request; no estimator was \
@@ -1934,14 +1971,17 @@ pub async fn reopen_hold(
         let hold = txn
             .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT h.stream_id, h.group_time, h.status, h.resolution,
-                        (ds.site_parameter_id IS NOT NULL) AS paired,
-                        ds.site_parameter_id, sp.site_id, sp.parameter_id
-                 FROM replicate_audit_holds h
-                 JOIN data_streams ds ON ds.id = h.stream_id
-                 LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id
-                 WHERE h.id = $1 AND h.status IN ('acknowledged', 'remediated')
-                 FOR UPDATE OF h",
+                format!(
+                    "SELECT h.stream_id, h.group_time, h.status, h.resolution,
+                            (ds.site_parameter_id IS NOT NULL) AS paired,
+                            ds.site_parameter_id, sp.site_id, sp.parameter_id
+                     FROM replicate_audit_holds h
+                     JOIN data_streams ds ON ds.id = h.stream_id
+                     LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id
+                     WHERE h.id = $1 AND h.status IN {reopenable}
+                     FOR UPDATE OF h",
+                    reopenable = HoldStatus::sql_list(&HoldStatus::REOPENABLE)
+                ),
                 [id.into()],
             ))
             .await?
@@ -1998,9 +2038,9 @@ pub async fn reopen_hold(
             })
         });
 
-        let reopened = if paired { "pending" } else { "deferred" };
+        let reopened = super::service::status_for(paired);
         let resolution = merged_resolution(prev, serde_json::json!({"action": "reopened"}), &by);
-        if status == "remediated"
+        if status == HoldStatus::Remediated.as_str()
             && let Some((index_list, reason)) = &flagged
             && !index_list.is_empty()
         {
@@ -2024,7 +2064,7 @@ pub async fn reopen_hold(
             )
             .await?;
         }
-        if status == "remediated"
+        if status == HoldStatus::Remediated.as_str()
             && let Some((decl_scope, previous, _)) = &declared
         {
             if decl_scope == "slot" {
@@ -2112,16 +2152,15 @@ pub async fn reopen_hold(
                 txn.execute_raw(refresh_group(instant)).await?;
             }
         }
-        let restored = txn
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE replicate_audit_holds
-                 SET status = $2, resolution = $3, acknowledged_by = NULL, acknowledged_at = NULL
-                 WHERE id = $1 AND status IN ('acknowledged', 'remediated')",
-                [id.into(), reopened.to_string().into(), resolution.into()],
-            ))
-            .await?
-            .rows_affected();
+        let restored = decide_hold(
+            txn,
+            id,
+            &HoldStatus::REOPENABLE,
+            reopened,
+            resolution,
+            None,
+        )
+        .await?;
         if restored != 1 {
             return Err(AppError::Conflict(format!(
                 "replicate audit hold {id} changed under this request; no flag was reverted"
@@ -2129,7 +2168,7 @@ pub async fn reopen_hold(
         }
         // The note said a decision had been taken here, and it has not any more.
         delete_audit_annotations(txn, id).await?;
-        Ok(reopened.to_string())
+        Ok(reopened.as_str().to_string())
     })
     .await?;
     state.response_cache.invalidate_all();
@@ -2204,9 +2243,10 @@ pub async fn acknowledge_holds_bulk(
     // at n = 10 the divisor offset is only ~5%, well inside a plausible ceiling.
     let population_sd = &*POPULATION_SD_SQL;
     let undeclared_gate = format!(
-        "(({population_sd}) AND h.kind = 'replicate_stats' \
+        "(({population_sd}) AND h.kind = '{kind}' \
           AND EXISTS (SELECT 1 FROM site_parameters sp \
-                      WHERE sp.id = ds.site_parameter_id AND sp.sd_estimator IS NULL))"
+                      WHERE sp.id = ds.site_parameter_id AND sp.sd_estimator IS NULL))",
+        kind = HoldKind::ReplicateStats.as_str()
     );
     let skipped = state
         .db
@@ -2216,7 +2256,8 @@ pub async fn acknowledge_holds_bulk(
                 "SELECT COUNT(*)::bigint AS n
                  FROM replicate_audit_holds h
                  JOIN data_streams ds ON ds.id = h.stream_id
-                 WHERE h.status = 'pending' AND {undeclared_gate}{bounds}"
+                 WHERE h.status = '{pending}' AND {undeclared_gate}{bounds}",
+                pending = HoldStatus::Pending.as_str()
             ),
             binds.clone(),
         ))
@@ -2230,11 +2271,13 @@ pub async fn acknowledge_holds_bulk(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "UPDATE replicate_audit_holds AS h
-                 SET status = 'acknowledged', resolution = {resolution_sql},
+                 SET status = '{acknowledged}', resolution = {resolution_sql},
                      acknowledged_by = $1, acknowledged_at = NOW()
                  FROM data_streams ds
-                 WHERE ds.id = h.stream_id AND h.status = 'pending'
-                   AND NOT {undeclared_gate}{bounds}"
+                 WHERE ds.id = h.stream_id AND h.status = '{pending}'
+                   AND NOT {undeclared_gate}{bounds}",
+                acknowledged = HoldStatus::Acknowledged.as_str(),
+                pending = HoldStatus::Pending.as_str()
             ),
             binds,
         ))
@@ -2248,7 +2291,8 @@ pub async fn acknowledge_holds_bulk(
             .db
             .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "INSERT INTO annotations
+                format!(
+                    "INSERT INTO annotations
                      (site_id, parameter_id, start_time, end_time, text, category,
                       created_by, audit_hold_id)
                  SELECT sp.site_id, sp.parameter_id, h.group_time, h.group_time,
@@ -2264,9 +2308,11 @@ pub async fn acknowledge_holds_bulk(
                  FROM replicate_audit_holds h
                  JOIN data_streams ds ON ds.id = h.stream_id
                  JOIN site_parameters sp ON sp.id = ds.site_parameter_id
-                 WHERE h.status = 'acknowledged' AND h.acknowledged_by = $1
+                 WHERE h.status = '{acknowledged}' AND h.acknowledged_by = $1
                    AND h.acknowledged_at > NOW() - INTERVAL '1 minute'
                    AND NOT EXISTS (SELECT 1 FROM annotations a WHERE a.audit_hold_id = h.id)",
+                    acknowledged = HoldStatus::Acknowledged.as_str()
+                ),
                 [by.into(), AUDIT_ANNOTATION_CATEGORY.into()],
             ))
             .await;

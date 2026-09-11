@@ -10,6 +10,8 @@ use uuid::Uuid;
 use super::models::script::ToolScript;
 use super::models::version::ToolScriptVersion;
 use super::service::{ParameterCatalog, deserialize_parse_error};
+use crate::routes::private::sync::models::HoldKind;
+use crate::routes::private::sync::models::HoldStatus;
 
 pub mod activation {
     use sea_orm::entity::prelude::*;
@@ -2120,10 +2122,14 @@ impl RecomputeScope {
         }
         if self.only_findings {
             sql.push_str(
-                " AND EXISTS (SELECT 1 FROM replicate_audit_holds h \
-                  WHERE h.stream_id IS NULL AND h.status = 'pending' \
-                    AND h.kind IN ('missing_output', 'stale_output', 'skipped_output') \
-                    AND h.site_id = ce.site_id AND h.group_time = ce.collected_at)",
+                &format!(
+                    " AND EXISTS (SELECT 1 FROM replicate_audit_holds h \
+                      WHERE h.stream_id IS NULL AND h.status = '{pending}' \
+                        AND h.kind IN {kinds} \
+                        AND h.site_id = ce.site_id AND h.group_time = ce.collected_at)",
+                    pending = HoldStatus::Pending.as_str(),
+                    kinds = HoldKind::sql_list(&HoldKind::EVENT_AUDIT)
+                ),
             );
         }
         sql.push_str(" ORDER BY ce.collected_at");

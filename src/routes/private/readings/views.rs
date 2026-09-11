@@ -58,6 +58,9 @@ use crate::routes::private::sensors::standard_curves;
 use crate::routes::private::sites;
 use crate::routes::private::sites::parameters as site_parameters;
 use crate::routes::private::sync::models::GroupAudit;
+use crate::routes::private::sync::models::HoldKind;
+use crate::routes::private::sync::models::HoldStatus;
+use crate::routes::private::sync::service as audit;
 use crate::routes::private::tools::models::run as tool_run;
 use crate::routes::resolve_site_with_project;
 
@@ -199,8 +202,11 @@ pub async fn sample_preview(
                 .db
                 .query_one_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
-                    "SELECT expected FROM replicate_audit_holds
-                     WHERE id = $1 AND kind = 'replicate_stats' AND group_time = $2",
+                    format!(
+                        "SELECT expected FROM replicate_audit_holds
+                         WHERE id = $1 AND kind = '{kind}' AND group_time = $2",
+                        kind = HoldKind::ReplicateStats.as_str()
+                    ),
                     [hold_id.into(), time.into()],
                 ))
                 .await?
@@ -2391,7 +2397,7 @@ pub async fn ingest_readings(
                 // upsert wins, and a stripped claim explains the disagreement the audit would
                 // otherwise report bare.
                 if !stripped_claims.is_empty() {
-                    let hold_status = if paired { "pending" } else { "deferred" };
+                    let hold_status = audit::status_for(paired);
                     for (time, claims) in &stripped_claims {
                         upsert_curve_claim_hold(txn, payload.stream_id, *time, claims, hold_status)
                             .await?;
@@ -3279,7 +3285,7 @@ pub async fn insert_grab_samples(
                                 *time,
                                 serde_json::json!({ "claim": "replaced", "kept": entries }),
                                 serde_json::json!({ "kept": true }),
-                                "pending",
+                                HoldStatus::Pending,
                             )
                             .await?;
                             kept_total += kept.len();

@@ -2,15 +2,28 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use sea_orm::{ConnectionTrait, EntityTrait, FromQueryResult, Statement};
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Statement};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::model::{Column, Entity};
 use crate::common::AppState;
 use crate::common::authz::AccessScope;
 use crate::common::middleware::ProjectScope;
 use crate::common::scope::{self, RowProject, Unowned};
 use crate::error::{AppError, AppResult};
+
+
+/// The statuses a job can still be cancelled or found in flight from: not yet finished, whoever
+/// holds it. `pending` and `retrying` are historical and still on rows.
+const CANCELLABLE_STATES: [&str; 4] = ["queued", "pending", "running", "retrying"];
+
+/// A `status IN (...)` list for the statuses above, quoted for SQL.
+fn sql_list(states: &[&str]) -> String {
+    let quoted: Vec<String> = states.iter().map(|s| format!("'{s}'")).collect();
+    format!("({})", quoted.join(", "))
+}
 
 /// Refuse a job whose target lies outside the caller's grants. An out-of-scope job and an absent
 /// one answer 404 alike, so the response does not confirm the job exists.
@@ -123,19 +136,26 @@ pub async fn cancel_job(
 
     // Set the durable flag so the owning replica, which may not be this one, stops the job at its
     // next checkpoint; a still-queued job is cancelled outright since nothing is running it yet.
-    let flagged = state
-        .db
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE reprocessing_jobs \
-             SET cancel_requested = true, \
-                 status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END, \
-                 completed_at = CASE WHEN status = 'queued' THEN NOW() ELSE completed_at END \
-             WHERE id = $1 AND status IN ('queued', 'pending', 'running', 'retrying')",
-            [id.into()],
-        ))
+    let queued = || Column::Status.eq("queued");
+    let flagged = Entity::update_many()
+        .col_expr(Column::CancelRequested, Expr::value(true))
+        .col_expr(
+            Column::Status,
+            Expr::case(queued(), "cancelled")
+                .finally(Expr::col(Column::Status))
+                .into(),
+        )
+        .col_expr(
+            Column::CompletedAt,
+            Expr::case(queued(), Expr::current_timestamp())
+                .finally(Expr::col(Column::CompletedAt))
+                .into(),
+        )
+        .filter(Column::Id.eq(id))
+        .filter(Column::Status.is_in(CANCELLABLE_STATES))
+        .exec(&state.db)
         .await?
-        .rows_affected();
+        .rows_affected;
 
     if flagged > 0 {
         Ok(Json(CancelResponse {
@@ -201,13 +221,16 @@ pub async fn rerun_job(
         .db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT 1 FROM reprocessing_jobs \
-             WHERE status IN ('queued', 'pending', 'running', 'retrying') \
-               AND trigger_type = $1 \
-               AND sensor_id IS NOT DISTINCT FROM $2 \
-               AND trigger_id IS NOT DISTINCT FROM $3 \
-               AND params IS NOT DISTINCT FROM $4::jsonb \
-             LIMIT 1",
+            format!(
+                "SELECT 1 FROM reprocessing_jobs \
+                 WHERE status IN {in_flight_states} \
+                   AND trigger_type = $1 \
+                   AND sensor_id IS NOT DISTINCT FROM $2 \
+                   AND trigger_id IS NOT DISTINCT FROM $3 \
+                   AND params IS NOT DISTINCT FROM $4::jsonb \
+                 LIMIT 1",
+                in_flight_states = sql_list(&CANCELLABLE_STATES)
+            ),
             [
                 trigger_type.as_str().into(),
                 sensor_id.map_or(sea_orm::Value::Uuid(None), Into::into),

@@ -209,10 +209,10 @@ fn bound_sql_carries_the_quantum_floor() {
     assert!(sql.contains(&DEFAULT_ABS_TOL.to_string()), "{sql}");
 }
 
-fn hold(key: HoldKey, status: &str) -> Hold<'_> {
+fn hold(key: HoldKey, status: HoldStatus) -> Hold<'static> {
     Hold {
         key,
-        kind: "replicate_stats",
+        kind: HoldKind::ReplicateStats,
         expected: serde_json::json!({ "mean": 1.0 }),
         computed: serde_json::json!({ "mean": 2.0 }),
         delta: serde_json::json!({ "mean": -1.0 }),
@@ -232,7 +232,7 @@ fn a_stream_hold_conflicts_on_the_open_stream_index() {
             stream_id: Uuid::nil(),
             group_time: at(),
         },
-        "pending",
+        HoldStatus::Pending,
     ))
     .to_string();
     assert!(
@@ -251,7 +251,7 @@ fn a_slot_hold_conflicts_on_the_streamless_event_index() {
             parameter_id: Uuid::nil(),
             group_time: at(),
         },
-        "pending",
+        HoldStatus::Pending,
     ))
     .to_string();
     assert!(
@@ -272,7 +272,7 @@ fn a_standing_stream_hold_stamps_its_own_instant_and_conflicts_on_the_stream() {
         HoldKey::StreamStanding {
             stream_id: Uuid::nil(),
         },
-        "pending",
+        HoldStatus::Pending,
     ))
     .to_string();
     assert!(
@@ -292,7 +292,7 @@ fn a_re_detection_refreshes_the_payload_and_promotes_a_deferred_hold_only() {
             stream_id: Uuid::nil(),
             group_time: at(),
         },
-        "pending",
+        HoldStatus::Pending,
     ))
     .to_string();
     assert!(sql.contains("expected = EXCLUDED.expected"), "{sql}");
@@ -307,6 +307,6 @@ fn a_re_detection_refreshes_the_payload_and_promotes_a_deferred_hold_only() {
 
 #[test]
 fn an_unpaired_stream_defers_its_hold() {
-    assert_eq!(status_for(true), "pending");
-    assert_eq!(status_for(false), "deferred");
+    assert_eq!(status_for(true), HoldStatus::Pending);
+    assert_eq!(status_for(false), HoldStatus::Deferred);
 }

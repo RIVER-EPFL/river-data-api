@@ -36,6 +36,7 @@ use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::samples::model as samples;
 use crate::routes::private::sites::parameters::models as site_parameters;
+use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::resolve_site;
 
 /// Recompute a collection event's tool outputs on demand: the chain executor runs every active
@@ -535,7 +536,8 @@ pub async fn list_site_visits(
                 // pairing resolves the slot rather than the hold being skipped for lacking one.
                 // Oldest first, matching the detail endpoint, so the two grids cannot disagree
                 // about which finding a cell carries.
-                "SELECT COALESCE(h.parameter_id, sp.parameter_id) AS parameter_id, \
+                format!(
+                    "SELECT COALESCE(h.parameter_id, sp.parameter_id) AS parameter_id, \
                         h.group_time, h.kind, h.created_at \
                  FROM replicate_audit_holds h \
                  LEFT JOIN data_streams ds ON ds.id = h.stream_id \
@@ -543,9 +545,11 @@ pub async fn list_site_visits(
                  JOIN collection_events ce \
                    ON ce.site_id = COALESCE(h.site_id, sp.site_id) \
                   AND ce.collected_at = h.group_time \
-                 WHERE h.status = 'pending' AND ce.id = ANY($1) \
+                 WHERE h.status = '{pending}' AND ce.id = ANY($1) \
                    AND COALESCE(h.parameter_id, sp.parameter_id) IS NOT NULL \
                  ORDER BY h.created_at",
+                    pending = HoldStatus::Pending.as_str()
+                ),
                 [event_ids.into()],
             ))
             .await?;
@@ -985,10 +989,13 @@ pub async fn get_event_detail(
         .db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, kind, parameter_id, tool, status FROM replicate_audit_holds \
-             WHERE stream_id IS NULL AND site_id = $1 AND group_time = $2 \
-               AND status = 'pending' \
-             ORDER BY created_at",
+            format!(
+                "SELECT id, kind, parameter_id, tool, status FROM replicate_audit_holds \
+                 WHERE stream_id IS NULL AND site_id = $1 AND group_time = $2 \
+                   AND status = '{pending}' \
+                 ORDER BY created_at",
+                pending = HoldStatus::Pending.as_str()
+            ),
             [event.site_id.into(), event.collected_at.into()],
         ))
         .await?

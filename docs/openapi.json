@@ -15233,6 +15233,204 @@
         ],
         "type": "object"
       },
+      "ReadingDecisionList": {
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "job_id": {
+            "description": "The tracked job that made a system change, where one did. Cleared when that job row is\npruned, so an old decision keeps its record and loses only the link to the run.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "new": {
+            "description": "What the decision asserts about those columns."
+          },
+          "old": {
+            "description": "The projected columns as they stood before the decision."
+          },
+          "origin": {
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replicate_index": {
+            "description": "The replicate the decision names, or NULL for one taken on the whole group.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rolled_back_by": {
+            "description": "The `rollback` that inverted this decision, once one has.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "set_id": {
+            "description": "The set-level decision this row materialises, where it belongs to one.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stream_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "supersedes": {
+            "description": "The live decision of the same family this one replaces.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "stream_id",
+          "time",
+          "replicate_index",
+          "kind",
+          "old",
+          "new",
+          "actor",
+          "at",
+          "reason",
+          "origin",
+          "supersedes",
+          "rolled_back_by",
+          "set_id",
+          "job_id"
+        ],
+        "type": "object"
+      },
+      "ReadingDecisionResponse": {
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "job_id": {
+            "description": "The tracked job that made a system change, where one did. Cleared when that job row is\npruned, so an old decision keeps its record and loses only the link to the run.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "new": {
+            "description": "What the decision asserts about those columns."
+          },
+          "old": {
+            "description": "The projected columns as they stood before the decision."
+          },
+          "origin": {
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replicate_index": {
+            "description": "The replicate the decision names, or NULL for one taken on the whole group.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rolled_back_by": {
+            "description": "The `rollback` that inverted this decision, once one has.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "set_id": {
+            "description": "The set-level decision this row materialises, where it belongs to one.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stream_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "supersedes": {
+            "description": "The live decision of the same family this one replaces.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "stream_id",
+          "time",
+          "replicate_index",
+          "kind",
+          "old",
+          "new",
+          "actor",
+          "at",
+          "reason",
+          "origin",
+          "supersedes",
+          "rolled_back_by",
+          "set_id",
+          "job_id"
+        ],
+        "type": "object"
+      },
       "ReadingFacet": {
         "properties": {
           "calibrated_value": {
@@ -16019,6 +16217,212 @@
         ],
         "type": "object"
       },
+      "ReplicateAuditHoldList": {
+        "properties": {
+          "acknowledged_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "acknowledged_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "computed": {
+            "description": "What river-data computes over what it stores."
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "delta": {},
+          "expected": {
+            "description": "What the source said, as the raise recorded it."
+          },
+          "group_time": {
+            "description": "The instant the finding is about.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "manual_value": {
+            "description": "The value an operator entered in place of both, where one was.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "parameter_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution": {
+            "description": "What the decision was, as the transition recorded it."
+          },
+          "site_id": {
+            "description": "The slot half of the key, for a finding no stream produced.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "stream_id": {
+            "description": "The stream the finding is about, or NULL for one no stream produced.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool": {
+            "description": "The calculation a finding is about, where one produced it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "stream_id",
+          "group_time",
+          "expected",
+          "computed",
+          "delta",
+          "status",
+          "created_at",
+          "acknowledged_by",
+          "acknowledged_at",
+          "manual_value",
+          "resolution",
+          "kind",
+          "site_id",
+          "parameter_id",
+          "tool"
+        ],
+        "type": "object"
+      },
+      "ReplicateAuditHoldResponse": {
+        "properties": {
+          "acknowledged_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "acknowledged_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "computed": {
+            "description": "What river-data computes over what it stores."
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "delta": {},
+          "expected": {
+            "description": "What the source said, as the raise recorded it."
+          },
+          "group_time": {
+            "description": "The instant the finding is about.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "manual_value": {
+            "description": "The value an operator entered in place of both, where one was.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "parameter_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution": {
+            "description": "What the decision was, as the transition recorded it."
+          },
+          "site_id": {
+            "description": "The slot half of the key, for a finding no stream produced.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "stream_id": {
+            "description": "The stream the finding is about, or NULL for one no stream produced.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool": {
+            "description": "The calculation a finding is about, where one produced it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "stream_id",
+          "group_time",
+          "expected",
+          "computed",
+          "delta",
+          "status",
+          "created_at",
+          "acknowledged_by",
+          "acknowledged_at",
+          "manual_value",
+          "resolution",
+          "kind",
+          "site_id",
+          "parameter_id",
+          "tool"
+        ],
+        "type": "object"
+      },
       "ReplicateOut": {
         "description": "One replicate behind a grab-sample point.",
         "properties": {
@@ -16226,6 +16630,10 @@
       },
       "ReprocessingJobList": {
         "properties": {
+          "cancel_requested": {
+            "description": "Set by `POST /reprocessing_jobs/{id}/cancel`; the run stops at its next checkpoint.",
+            "type": "boolean"
+          },
           "cancellable": {
             "description": "Whether `POST /reprocessing_jobs/{id}/cancel` accepts this row, from the registry's policy.",
             "type": "boolean"
@@ -16245,6 +16653,13 @@
             "format": "date-time",
             "type": "string"
           },
+          "dedupe_key": {
+            "description": "Coalescing key while a job waits: an enqueue naming one that is already queued creates\nnothing. The claim clears it, so the next enqueue queues a fresh run.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "detail": {
             "description": "Structured per-job summary + provenance (scope, time range, counts, source, samples)."
           },
@@ -16257,6 +16672,31 @@
           "id": {
             "format": "uuid",
             "type": "string"
+          },
+          "lease_epoch": {
+            "description": "Bumped on every claim, so a lease granted before a takeover cannot write after it.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "lease_expires_at": {
+            "description": "When the current lease lapses, after which a reaper arm may claim the row again.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_attempt_at": {
+            "description": "When the row becomes claimable, which a retry pushes out by the backoff.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "owner": {
+            "description": "The worker replica holding the lease, while one does.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "params": {
             "description": "What the run was asked to do, the object `worker::enqueue` stored and a rerun replays."
@@ -16345,6 +16785,12 @@
           "params",
           "created_at",
           "completed_at",
+          "owner",
+          "lease_expires_at",
+          "lease_epoch",
+          "cancel_requested",
+          "next_attempt_at",
+          "dedupe_key",
           "rerunnable",
           "cancellable"
         ],
@@ -16352,6 +16798,10 @@
       },
       "ReprocessingJobResponse": {
         "properties": {
+          "cancel_requested": {
+            "description": "Set by `POST /reprocessing_jobs/{id}/cancel`; the run stops at its next checkpoint.",
+            "type": "boolean"
+          },
           "cancellable": {
             "description": "Whether `POST /reprocessing_jobs/{id}/cancel` accepts this row, from the registry's policy.",
             "type": "boolean"
@@ -16371,6 +16821,13 @@
             "format": "date-time",
             "type": "string"
           },
+          "dedupe_key": {
+            "description": "Coalescing key while a job waits: an enqueue naming one that is already queued creates\nnothing. The claim clears it, so the next enqueue queues a fresh run.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "detail": {
             "description": "Structured per-job summary + provenance (scope, time range, counts, source, samples)."
           },
@@ -16383,6 +16840,31 @@
           "id": {
             "format": "uuid",
             "type": "string"
+          },
+          "lease_epoch": {
+            "description": "Bumped on every claim, so a lease granted before a takeover cannot write after it.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "lease_expires_at": {
+            "description": "When the current lease lapses, after which a reaper arm may claim the row again.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_attempt_at": {
+            "description": "When the row becomes claimable, which a retry pushes out by the backoff.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "owner": {
+            "description": "The worker replica holding the lease, while one does.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "params": {
             "description": "What the run was asked to do, the object `worker::enqueue` stored and a rerun replays."
@@ -16471,6 +16953,12 @@
           "params",
           "created_at",
           "completed_at",
+          "owner",
+          "lease_expires_at",
+          "lease_epoch",
+          "cancel_requested",
+          "next_attempt_at",
+          "dedupe_key",
           "rerunnable",
           "cancellable"
         ],
@@ -34864,6 +35352,150 @@
         ]
       }
     },
+    "/api/reading_decisions": {
+      "get": {
+        "description": "Retrieves all reading_decisions.\n\nThis resource manages reading_decision items\n\nAdditional sortable columns: \n- stream_id\n- time\n- replicate_index\n- kind\n- actor\n- at\n- origin.\n\nAdditional filterable columns: \n- stream_id\n- time\n- replicate_index\n- kind\n- actor\n- origin\n- supersedes\n- rolled_back_by\n- set_id\n- job_id.",
+        "operationId": "get_all_reading_decisions",
+        "parameters": [
+          {
+            "description": "JSON-encoded filter for querying resources.\n\nThis parameter supports various filtering options:\n- Free text search: `{\"q\": \"search text\"}`\n- Filtering by a single ID: `{\"id\": \"550e8400-e29b-41d4-a716-446655440000\"}`\n- Filtering by multiple IDs: `{\"id\": [\"550e8400-e29b-41d4-a716-446655440000\", \"550e8400-e29b-41d4-a716-446655440001\"]}`\n- Filtering on other columns: `{\"name\": \"example\"}`",
+            "example": {
+              "id": "550e8400-e29b-41d4-a716-446655440000",
+              "name": "example",
+              "q": "search text"
+            },
+            "in": "query",
+            "name": "filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Range for pagination in the format \"[start, end]\".\n\nExample: `[0,9]`",
+            "example": "[0,9]",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number for standard REST pagination (1-based).\n\nExample: `1`",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page for standard REST pagination.\n\nExample: `10`",
+            "example": 10,
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort order for the results in the format `[\"column\", \"order\"]`.\n\nExample: `[\"id\", \"ASC\"]`",
+            "example": "[\"id\", \"ASC\"]",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort column for standard REST format.\n\nExample: `title`",
+            "example": "title",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort order for standard REST format (ASC or DESC).\n\nExample: `ASC`",
+            "example": "ASC",
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ReadingDecisionList"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "List of resources"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get all reading_decisions"
+      }
+    },
+    "/api/reading_decisions/{id}": {
+      "get": {
+        "description": "Retrieves one reading_decision by its ID.\n\nThis resource manages reading_decision items",
+        "operationId": "get_one_reading_decision",
+        "parameters": [
+          {
+            "description": "Resource identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadingDecisionResponse"
+                }
+              }
+            },
+            "description": "The requested resource"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get one reading_decision"
+      }
+    },
     "/api/readings/batch": {
       "post": {
         "operationId": "insert_batch_readings",
@@ -35668,9 +36300,153 @@
         ]
       }
     },
+    "/api/replicate_audit_holds": {
+      "get": {
+        "description": "Retrieves all replicate_audit_holds.\n\nThis resource manages replicate_audit_hold items\n\nAdditional sortable columns: \n- stream_id\n- group_time\n- status\n- created_at\n- acknowledged_at\n- kind\n- site_id\n- parameter_id\n- tool.\n\nAdditional filterable columns: \n- stream_id\n- group_time\n- status\n- acknowledged_by\n- kind\n- site_id\n- parameter_id\n- tool.",
+        "operationId": "get_all_replicate_audit_holds",
+        "parameters": [
+          {
+            "description": "JSON-encoded filter for querying resources.\n\nThis parameter supports various filtering options:\n- Free text search: `{\"q\": \"search text\"}`\n- Filtering by a single ID: `{\"id\": \"550e8400-e29b-41d4-a716-446655440000\"}`\n- Filtering by multiple IDs: `{\"id\": [\"550e8400-e29b-41d4-a716-446655440000\", \"550e8400-e29b-41d4-a716-446655440001\"]}`\n- Filtering on other columns: `{\"name\": \"example\"}`",
+            "example": {
+              "id": "550e8400-e29b-41d4-a716-446655440000",
+              "name": "example",
+              "q": "search text"
+            },
+            "in": "query",
+            "name": "filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Range for pagination in the format \"[start, end]\".\n\nExample: `[0,9]`",
+            "example": "[0,9]",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number for standard REST pagination (1-based).\n\nExample: `1`",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page for standard REST pagination.\n\nExample: `10`",
+            "example": 10,
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort order for the results in the format `[\"column\", \"order\"]`.\n\nExample: `[\"id\", \"ASC\"]`",
+            "example": "[\"id\", \"ASC\"]",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort column for standard REST format.\n\nExample: `title`",
+            "example": "title",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort order for standard REST format (ASC or DESC).\n\nExample: `ASC`",
+            "example": "ASC",
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ReplicateAuditHoldList"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "List of resources"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get all replicate_audit_holds"
+      }
+    },
+    "/api/replicate_audit_holds/{id}": {
+      "get": {
+        "description": "Retrieves one replicate_audit_hold by its ID.\n\nThis resource manages replicate_audit_hold items",
+        "operationId": "get_one_replicate_audit_hold",
+        "parameters": [
+          {
+            "description": "Resource identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplicateAuditHoldResponse"
+                }
+              }
+            },
+            "description": "The requested resource"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get one replicate_audit_hold"
+      }
+    },
     "/api/reprocessing_jobs": {
       "get": {
-        "description": "Retrieves all reprocessing_jobs.\n\nThis resource manages reprocessing_job items\n\nAdditional sortable columns: \n- status\n- created_at\n- completed_at.\n\nAdditional filterable columns: \n- sensor_id\n- trigger_type\n- trigger_id\n- status\n- category\n- site_id\n- parent_job_id.",
+        "description": "Retrieves all reprocessing_jobs.\n\nThis resource manages reprocessing_job items\n\nAdditional sortable columns: \n- status\n- created_at\n- completed_at\n- lease_expires_at\n- next_attempt_at.\n\nAdditional filterable columns: \n- sensor_id\n- trigger_type\n- trigger_id\n- status\n- category\n- site_id\n- parent_job_id\n- cancel_requested\n- dedupe_key.",
         "operationId": "get_all_reprocessing_jobs",
         "parameters": [
           {

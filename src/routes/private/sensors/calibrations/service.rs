@@ -1,8 +1,12 @@
 use chrono::{DateTime, Utc};
-use sea_orm::sea_query::OnConflict;
+use sea_orm::sea_query::{
+    Alias, CommonTableExpression, Condition, Expr, ExprTrait as _, Func, IntoIden, IntoTableRef,
+    JoinType, OnConflict, Order, PostgresQueryBuilder, Query as SeaQuery, ReturningClause,
+    SelectStatement, SubQueryStatement, TableRef, UpdateStatement, WithClause, WithQuery,
+};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
-    QueryOrder, QuerySelect, Set, Statement,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
+    FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -11,6 +15,14 @@ use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::parameters::derived::definition_model as calculation_formulas;
 use crate::routes::private::parameters::derived::source_model as derived_sources;
 use crate::routes::private::parameters::derived::version_model as derived_versions;
+use crate::routes::private::parameters::models as parameters;
+use crate::routes::private::readings::decision_model as reading_decisions;
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::models::{Kind, Origin};
+use crate::routes::private::readings::samples::model as samples;
+use crate::routes::private::sensors::deployments::model as sensor_deployments;
+use crate::routes::private::sensors::standard_curves::model as standard_curves;
+use crate::routes::private::sites::parameters::models as site_parameters;
 
 /// The reprocess engines are driven by `Job::run`, whose error type is `DbErr`. The shared bulk-write
 /// and aggregate-refresh primitives report `AppError`; carrying the message through keeps a failed
@@ -21,6 +33,9 @@ fn app_error_as_db_err(e: crate::error::AppError) -> sea_orm::DbErr {
         other => sea_orm::DbErr::Custom(other.to_string()),
     }
 }
+
+/// A computed reading's cadence, and the provenance it is written with.
+const DERIVED: &str = "derived";
 
 #[must_use]
 pub fn apply_calibration(raw: f64, slope: f64, intercept: f64) -> f64 {
@@ -201,47 +216,85 @@ fn recomposed_own_curve_value() -> String {
     recomposed_value_sql(
         "tgt.raw_value",
         &CurveColumns {
-            id: "c.id",
-            slope: "c.slope",
-            intercept: "c.intercept",
+            id: "r.cal_id",
+            slope: "r.cal_slope",
+            intercept: "r.cal_intercept",
         },
         &CurveColumns {
-            id: "sc.id",
-            slope: "sc.slope",
-            intercept: "sc.intercept",
+            id: "r.std_id",
+            slope: "r.std_slope",
+            intercept: "r.std_intercept",
         },
     )
 }
 
-/// The `UPDATE readings` both curve-recomposing statements are: `rows_sql` narrows which readings
-/// qualify, `scope_sql` selects them as `r`.
-fn recompose_statement(rows_sql: &str, scope_sql: &str) -> String {
-    format!(
-        r"UPDATE readings tgt
-          SET calibrated_value = {value}
-          FROM readings r
-          LEFT JOIN sensor_calibrations c ON c.id = r.calibration_id
-          LEFT JOIN standard_curves sc ON sc.id = r.standard_curve_id
-          WHERE tgt.stream_id = r.stream_id
-            AND tgt.time = r.time
-            AND tgt.replicate_index = r.replicate_index
-            AND ({rows_sql})
-            AND NOT ({orphaned})
-            AND ({scope_sql})",
-        value = recomposed_own_curve_value(),
-        orphaned = orphaned_correction_rows("r"),
-    )
+/// The readings a recomposition reads from, each row beside the curves it names, as `r`.
+///
+/// A subquery rather than a join list because `UPDATE ... FROM` takes tables and not joins.
+/// Postgres flattens it, so the rows the statement visits are the ones the join would have given.
+fn recompose_source() -> TableRef {
+    let r = Alias::new("r");
+    let joined = SeaQuery::select()
+        .expr(Expr::cust("r.*"))
+        .expr_as(Expr::cust("c.id"), Alias::new("cal_id"))
+        .expr_as(Expr::cust("c.slope"), Alias::new("cal_slope"))
+        .expr_as(Expr::cust("c.intercept"), Alias::new("cal_intercept"))
+        .expr_as(Expr::cust("sc.id"), Alias::new("std_id"))
+        .expr_as(Expr::cust("sc.slope"), Alias::new("std_slope"))
+        .expr_as(Expr::cust("sc.intercept"), Alias::new("std_intercept"))
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            super::model::Entity,
+            Alias::new("c"),
+            Condition::all().add(Expr::cust("c.id = r.calibration_id")),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            standard_curves::Entity,
+            Alias::new("sc"),
+            Condition::all().add(Expr::cust("sc.id = r.standard_curve_id")),
+        )
+        .take();
+    TableRef::SubQuery(Box::new(joined), r.into_iden())
+}
+
+/// The `UPDATE readings` every curve recomposition is: `qualify` narrows which readings it writes,
+/// against `r`.
+fn recompose_statement(qualify: Expr) -> UpdateStatement {
+    SeaQuery::update()
+        .table(readings::Entity.into_table_ref().alias(Alias::new("tgt")))
+        .value(
+            readings::Column::CalibratedValue,
+            Expr::cust(recomposed_own_curve_value()),
+        )
+        .from(recompose_source())
+        .and_where(Expr::cust("tgt.stream_id = r.stream_id"))
+        .and_where(Expr::cust("tgt.time = r.time"))
+        .and_where(Expr::cust("tgt.replicate_index = r.replicate_index"))
+        .and_where(qualify)
+        .take()
+}
+
+/// `qualify`, less the corrections no curve on the row accounts for. A recomposition driven by the
+/// row's own curves cannot reproduce one of those numbers, so it leaves them standing.
+fn own_curve_rows(qualify: Expr) -> Expr {
+    qualify.and(Expr::cust(orphaned_correction_rows("r")).not())
 }
 
 /// The one statement that repoints readings onto the calibration window covering them and rebuilds
 /// `calibrated_value` from it, the operator's standard curve re-applied on top.
 ///
-/// `pick` is the lateral that ranks the windows, `selection` chooses the rows as `r`, and
-/// `returning` is appended verbatim so a caller that needs the instants it wrote can ask for them.
-/// `picked` carries the row's state before the write (`p_was_*`) for a caller that records the move.
-/// The lateral is an outer join: a reading no window covers has to be reachable, because a repoint
-/// must be able to clear a correction as well as replace one.
-pub(super) fn repoint_statement(pick: &str, selection: &str, returning: &str) -> String {
+/// `pick` is the ranking of the windows, `selection` chooses the rows as `r`, and `returning` is
+/// what a caller that needs the instants it wrote asks for. `picked` carries the row's state before
+/// the write (`p_was_*`) for a caller that records the move. The lateral is an outer join: a
+/// reading no window covers has to be reachable, because a repoint must be able to clear a
+/// correction as well as replace one.
+pub(super) fn repoint_statement(
+    pick: SelectStatement,
+    selection: Expr,
+    returning: Option<ReturningClause>,
+) -> UpdateStatement {
     let value = recomposed_value_sql(
         "tgt.raw_value",
         &CurveColumns {
@@ -250,31 +303,67 @@ pub(super) fn repoint_statement(pick: &str, selection: &str, returning: &str) ->
             intercept: "picked.intercept",
         },
         &CurveColumns {
-            id: "sc.id",
-            slope: "sc.slope",
-            intercept: "sc.intercept",
+            id: "picked.std_id",
+            slope: "picked.std_slope",
+            intercept: "picked.std_intercept",
         },
     );
-    format!(
-        r"UPDATE readings tgt
-            SET calibration_id = picked.cal_id,
-                calibrated_value = {value}
-            FROM (
-                SELECT r.stream_id AS p_stream_id, r.time AS p_time,
-                       r.replicate_index AS p_replicate_index,
-                       r.standard_curve_id AS p_standard_curve_id,
-                       r.calibration_id AS p_was_calibration_id,
-                       r.calibrated_value AS p_was_calibrated_value,
-                       cw.id AS cal_id, cw.slope, cw.intercept
-                FROM readings r
-                LEFT JOIN LATERAL ({pick}) cw ON true
-                WHERE {selection}
-            ) picked
-            LEFT JOIN standard_curves sc ON sc.id = picked.p_standard_curve_id
-            WHERE tgt.stream_id = picked.p_stream_id
-              AND tgt.time = picked.p_time
-              AND tgt.replicate_index = picked.p_replicate_index{returning}"
-    )
+    let mut update = SeaQuery::update();
+    update
+        .table(readings::Entity.into_table_ref().alias(Alias::new("tgt")))
+        .value(readings::Column::CalibrationId, Expr::cust("picked.cal_id"))
+        .value(readings::Column::CalibratedValue, Expr::cust(value))
+        .from(repoint_source(pick, selection))
+        .and_where(Expr::cust("tgt.stream_id = picked.p_stream_id"))
+        .and_where(Expr::cust("tgt.time = picked.p_time"))
+        .and_where(Expr::cust("tgt.replicate_index = picked.p_replicate_index"));
+    if let Some(returning) = returning {
+        update.returning(returning);
+    }
+    update.take()
+}
+
+/// One row per reading the repoint selects: the key it is found by, the state it is about to leave,
+/// the window curve ranked for it and the standard curve it already names.
+fn repoint_source(pick: SelectStatement, selection: Expr) -> TableRef {
+    let r = Alias::new("r");
+    let picked = SeaQuery::select()
+        .expr_as(Expr::cust("r.stream_id"), Alias::new("p_stream_id"))
+        .expr_as(Expr::cust("r.time"), Alias::new("p_time"))
+        .expr_as(
+            Expr::cust("r.replicate_index"),
+            Alias::new("p_replicate_index"),
+        )
+        .expr_as(
+            Expr::cust("r.calibration_id"),
+            Alias::new("p_was_calibration_id"),
+        )
+        .expr_as(
+            Expr::cust("r.calibrated_value"),
+            Alias::new("p_was_calibrated_value"),
+        )
+        .expr_as(Expr::cust("cw.id"), Alias::new("cal_id"))
+        .expr(Expr::cust("cw.slope"))
+        .expr(Expr::cust("cw.intercept"))
+        .expr_as(Expr::cust("sc.id"), Alias::new("std_id"))
+        .expr_as(Expr::cust("sc.slope"), Alias::new("std_slope"))
+        .expr_as(Expr::cust("sc.intercept"), Alias::new("std_intercept"))
+        .from_as(readings::Entity, r)
+        .join_lateral(
+            JoinType::LeftJoin,
+            pick,
+            Alias::new("cw"),
+            Condition::all().add(Expr::cust("true")),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            standard_curves::Entity,
+            Alias::new("sc"),
+            Condition::all().add(Expr::cust("sc.id = r.standard_curve_id")),
+        )
+        .and_where(selection)
+        .take();
+    TableRef::SubQuery(Box::new(picked), Alias::new("picked").into_iden())
 }
 
 /// Rewrite `calibrated_value` from the curves each row itself names, for a corrected measurement.
@@ -287,13 +376,11 @@ pub async fn recompose_from_own_curves<C: ConnectionTrait>(
     scope_sql: &str,
     params: Vec<sea_orm::Value>,
 ) -> Result<u64, sea_orm::DbErr> {
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &recompose_statement(rows_sql, scope_sql),
-            params,
-        ))
-        .await?;
+    let qualify = own_curve_rows(Expr::cust_with_values(
+        format!("({rows_sql}) AND ({scope_sql})"),
+        params,
+    ));
+    let result = db.execute_raw(build(recompose_statement(qualify))).await?;
     Ok(result.rows_affected())
 }
 
@@ -308,28 +395,14 @@ pub async fn recompose_decided_rows<C: ConnectionTrait>(
     db: &C,
     set_id: uuid::Uuid,
 ) -> Result<u64, sea_orm::DbErr> {
-    let sql = format!(
-        r"UPDATE readings tgt
-          SET calibrated_value = {value}
-          FROM readings r
-          LEFT JOIN sensor_calibrations c ON c.id = r.calibration_id
-          LEFT JOIN standard_curves sc ON sc.id = r.standard_curve_id
-          WHERE tgt.stream_id = r.stream_id
-            AND tgt.time = r.time
-            AND tgt.replicate_index = r.replicate_index
-            AND EXISTS (SELECT 1 FROM reading_decisions d
-                         WHERE d.set_id = $1
-                           AND d.stream_id = r.stream_id AND d.time = r.time
-                           AND d.replicate_index IS NOT DISTINCT FROM r.replicate_index)",
-        value = recomposed_own_curve_value(),
+    let qualify = Expr::cust_with_values(
+        "EXISTS (SELECT 1 FROM reading_decisions d \
+                  WHERE d.set_id = $1 \
+                    AND d.stream_id = r.stream_id AND d.time = r.time \
+                    AND d.replicate_index IS NOT DISTINCT FROM r.replicate_index)",
+        [set_id],
     );
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            [set_id.into()],
-        ))
-        .await?;
+    let result = db.execute_raw(build(recompose_statement(qualify))).await?;
     Ok(result.rows_affected())
 }
 
@@ -379,6 +452,82 @@ pub struct CurveDrift {
     pub touched: Vec<(Uuid, Uuid)>,
 }
 
+/// The columns every ledger insert here names: the decision's own, plus the run that made the move.
+fn decision_columns() -> Vec<Alias> {
+    crate::routes::private::readings::service::DECISION_COLUMNS
+        .split(", ")
+        .chain(std::iter::once("job_id"))
+        .map(Alias::new)
+        .collect()
+}
+
+/// The decision this one supersedes: the newest live decision of the same kind on the same reading.
+fn supersedes(alias: &str, kind: Kind) -> Expr {
+    Expr::cust(format!(
+        "(SELECT p.id FROM reading_decisions p \
+           WHERE p.stream_id = {alias}.stream_id AND p.time = {alias}.time \
+             AND p.replicate_index IS NOT DISTINCT FROM {alias}.replicate_index \
+             AND p.kind = '{kind}' AND p.rolled_back_by IS NULL \
+           ORDER BY p.at DESC, p.id DESC LIMIT 1)",
+        kind = kind.as_str(),
+    ))
+}
+
+/// One `reading_decisions` row per reading a run moved, read from the CTE `source` (as `alias`) the
+/// write returned. `filter` holds the insert to the rows that actually moved; a statement whose
+/// returned rows all moved by construction passes none.
+fn ledger_insert(
+    kind: Kind,
+    origin: Origin,
+    source: &str,
+    alias: &str,
+    old: Expr,
+    new: Expr,
+    filter: Option<Expr>,
+    job_id: Option<Uuid>,
+) -> sea_orm::sea_query::InsertStatement {
+    let mut select = SeaQuery::select();
+    select
+        .expr(Expr::cust(format!("{alias}.stream_id")))
+        .expr(Expr::cust(format!("{alias}.time")))
+        .expr(Expr::cust(format!("{alias}.replicate_index")))
+        .expr(Expr::val(kind.as_str()))
+        .expr(old)
+        .expr(new)
+        .expr(Expr::val("system"))
+        .expr(Expr::val(origin.as_str()))
+        .expr(supersedes(alias, kind))
+        .expr(Expr::val(job_id))
+        .from_as(Alias::new(source), Alias::new(alias));
+    if let Some(filter) = filter {
+        select.and_where(filter);
+    }
+    SeaQuery::insert()
+        .into_table(reading_decisions::Entity)
+        .columns(decision_columns())
+        .select_from(select.take())
+        .expect("the ledger insert names one column per selected expression")
+        .take()
+}
+
+/// The write and its ledger insert as one statement's `WITH` clause, the write first so the insert
+/// reads what it returned.
+fn with_ledger(
+    source: &str,
+    write: UpdateStatement,
+    recorded: sea_orm::sea_query::InsertStatement,
+) -> WithClause {
+    let mut moved = CommonTableExpression::new();
+    moved
+        .table_name(Alias::new(source))
+        .query(SubQueryStatement::UpdateStatement(write));
+    let mut ledger = CommonTableExpression::new();
+    ledger
+        .table_name(Alias::new("recorded"))
+        .query(SubQueryStatement::InsertStatement(recorded));
+    WithClause::new().cte(moved).cte(ledger).to_owned()
+}
+
 /// Rewrite every corrected reading whose stored value is not what its own curves produce.
 ///
 /// Answers self-consistency only, so it needs no window resolution and reaches grabs. A row
@@ -392,52 +541,49 @@ pub async fn sweep_curve_drift(
     db: &DatabaseConnection,
     job_id: Option<Uuid>,
 ) -> crate::error::AppResult<CurveDrift> {
-    let drifted = format!(
+    let drifted = own_curve_rows(Expr::cust(format!(
         "{corrected} AND tgt.calibrated_value IS DISTINCT FROM ({value})",
         corrected = corrected_rows("r"),
         value = recomposed_own_curve_value(),
+    )));
+    let update = recompose_statement(drifted)
+        .returning(ReturningClause::Exprs(vec![Expr::cust(
+            "tgt.stream_id, tgt.time, tgt.replicate_index, tgt.collection_event_id, \
+             tgt.parameter_id, r.calibrated_value AS was, tgt.calibrated_value AS became",
+        )]))
+        .take();
+    let recorded = ledger_insert(
+        Kind::CurveRecompose,
+        Origin::Janitor,
+        "drift",
+        "d",
+        Expr::cust("jsonb_build_object('calibrated_value', to_jsonb(d.was))"),
+        Expr::cust("jsonb_build_object('calibrated_value', to_jsonb(d.became))"),
+        None,
+        job_id,
     );
-    let sql = format!(
-        "WITH drift AS (
-            {update}
-            RETURNING tgt.stream_id, tgt.time, tgt.replicate_index, tgt.collection_event_id,
-                      tgt.parameter_id, r.calibrated_value AS was, tgt.calibrated_value AS became
-          ), recorded AS (
-            INSERT INTO reading_decisions
-                (stream_id, time, replicate_index, kind, old, new, actor, origin, supersedes,
-                 job_id)
-            SELECT d.stream_id, d.time, d.replicate_index, '{kind}',
-                   jsonb_build_object('calibrated_value', to_jsonb(d.was)),
-                   jsonb_build_object('calibrated_value', to_jsonb(d.became)),
-                   'system', '{origin}',
-                   (SELECT p.id FROM reading_decisions p
-                     WHERE p.stream_id = d.stream_id AND p.time = d.time
-                       AND p.replicate_index IS NOT DISTINCT FROM d.replicate_index
-                       AND p.kind = '{kind}' AND p.rolled_back_by IS NULL
-                     ORDER BY p.at DESC, p.id DESC LIMIT 1),
-                   $1
-              FROM drift d
-          )
-          SELECT count(*) AS moved, min(time) AS lo, max(time) AS hi,
-                 (SELECT jsonb_agg(DISTINCT jsonb_build_array(collection_event_id, parameter_id))
-                    FROM drift
-                   WHERE collection_event_id IS NOT NULL AND parameter_id IS NOT NULL) AS touched
-            FROM drift",
-        update = recompose_statement(&drifted, "TRUE"),
-        kind = crate::routes::private::readings::models::Kind::CurveRecompose.as_str(),
-        origin = crate::routes::private::readings::models::Origin::Janitor.as_str(),
-    );
+    let query = SeaQuery::select()
+        .expr_as(Expr::cust("count(*)"), Alias::new("moved"))
+        .expr_as(Expr::cust("min(time)"), Alias::new("lo"))
+        .expr_as(Expr::cust("max(time)"), Alias::new("hi"))
+        .expr_as(
+            Expr::cust(
+                "(SELECT jsonb_agg(DISTINCT jsonb_build_array(collection_event_id, parameter_id)) \
+                    FROM drift \
+                   WHERE collection_event_id IS NOT NULL AND parameter_id IS NOT NULL)",
+            ),
+            Alias::new("touched"),
+        )
+        .from(Alias::new("drift"))
+        .take()
+        .with(with_ledger("drift", update, recorded));
 
     // Drift in a chunk past the compression policy has to decompress, and the roll-up carries its
     // own `RETURNING tgt.time`, so this is `guarded` rather than `guarded_mutation`.
     let row = crate::common::bulk_write::guarded(db, async |txn| {
-        txn.query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            [job_id.into()],
-        ))
-        .await
-        .map_err(crate::error::AppError::Database)
+        txn.query_one_raw(build(query))
+            .await
+            .map_err(crate::error::AppError::Database)
     })
     .await?;
 
@@ -542,6 +688,44 @@ async fn newest_derived_version(
         .await
 }
 
+/// The query behind [`fetch_derived_work_items`].
+fn derived_work_query(site_id: Uuid) -> SelectStatement {
+    let sp = Alias::new("sp");
+    let d = Alias::new("d");
+    let param = Alias::new("p");
+    SeaQuery::select()
+        .column((sp.clone(), site_parameters::Column::Id))
+        .expr_as(
+            Expr::col((d.clone(), calculation_formulas::Column::Id)),
+            Alias::new("derived_definition_id"),
+        )
+        .column((d.clone(), calculation_formulas::Column::Formula))
+        .column((sp.clone(), site_parameters::Column::SiteId))
+        .column((sp.clone(), site_parameters::Column::ParameterId))
+        .expr_as(
+            Expr::col((param.clone(), parameters::Column::Code)),
+            Alias::new("parameter_code"),
+        )
+        .from_as(site_parameters::Entity, sp.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            calculation_formulas::Entity,
+            d.clone(),
+            Expr::col((d, calculation_formulas::Column::OutputParameterId))
+                .equals((sp.clone(), site_parameters::Column::ParameterId)),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            parameters::Entity,
+            param.clone(),
+            Expr::col((param, parameters::Column::Id))
+                .equals((sp.clone(), site_parameters::Column::ParameterId)),
+        )
+        .and_where(Expr::col((sp.clone(), site_parameters::Column::SiteId)).eq(site_id))
+        .and_where(Expr::col((sp, site_parameters::Column::EntryMode)).eq("tool"))
+        .take()
+}
+
 /// The slots this site computes. The producing definition is the one whose output is the slot's
 /// parameter; `entry_mode` is the site's own declaration that it computes the slot rather than
 /// taking it by hand.
@@ -549,22 +733,12 @@ async fn fetch_derived_work_items(
     db: &DatabaseConnection,
     site_id: Uuid,
 ) -> Result<Vec<DerivedWork>, sea_orm::DbErr> {
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT sp.id, d.id AS derived_definition_id, d.formula, sp.site_id, sp.parameter_id,
-                     p.code AS parameter_code
-              FROM site_parameters sp
-              JOIN calculation_formulas d ON d.output_parameter_id = sp.parameter_id
-              JOIN parameters p ON p.id = sp.parameter_id
-              WHERE sp.site_id = $1 AND sp.entry_mode = 'tool'",
-            [site_id.into()],
-        ))
+    let rows = DerivedWorkRow::find_by_statement(build(derived_work_query(site_id)))
+        .all(db)
         .await?;
 
     let mut items = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let row = DerivedWorkRow::from_query_result(row, "")?;
+    for row in rows {
         items.push(DerivedWork {
             site_param_id: row.id,
             derived_definition_id: row.derived_definition_id,
@@ -717,6 +891,55 @@ pub async fn recalculate_derived_at_timestamp(
     Ok(())
 }
 
+/// A built query as the statement sea-orm executes.
+fn build(query: impl sea_orm::sea_query::QueryStatementBuilder) -> Statement {
+    let (sql, values) = query.build_any(&PostgresQueryBuilder);
+    Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values)
+}
+
+/// The value one derived input resolves to at `time`, and the cadence it came from.
+///
+/// Deterministic input pick when a sensor point and a grab share the timestamp: prefer the
+/// continuous reading, then tie-break by stream_id (stable across VACUUM). A withdrawn or flagged
+/// row is not a measurement, and a sample whose members are all gone carries n = 0 with a NULL
+/// mean, so neither may reach the formula.
+fn input_value_query(
+    site_id: Uuid,
+    parameter_id: Uuid,
+    time: chrono::DateTime<chrono::Utc>,
+) -> sea_orm::sea_query::SelectStatement {
+    let r = Alias::new("r");
+    let smp = Alias::new("smp");
+    SeaQuery::select()
+        .expr_as(
+            Expr::cust(
+                "COALESCE(CASE WHEN smp.n > 0 THEN smp.mean END, r.calibrated_value, r.raw_value)",
+            ),
+            Alias::new("val"),
+        )
+        .column((r.clone(), readings::Column::MeasurementType))
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            samples::Entity,
+            smp.clone(),
+            Expr::col((smp, samples::Column::Id)).equals((r.clone(), readings::Column::SampleId)),
+        )
+        .and_where(Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
+        .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).eq(parameter_id))
+        .and_where(Expr::col((r.clone(), readings::Column::Time)).eq(time))
+        .and_where(Expr::col((r.clone(), readings::Column::WithdrawnAt)).is_null())
+        .and_where(Expr::cust("r.is_flagged IS NOT TRUE"))
+        .order_by_expr(
+            Expr::cust("(r.measurement_type IS NOT DISTINCT FROM 'spot')"),
+            Order::Asc,
+        )
+        .order_by((r.clone(), readings::Column::ReplicateIndex), Order::Asc)
+        .order_by((r, readings::Column::StreamId), Order::Asc)
+        .limit(1)
+        .take()
+}
+
 async fn resolve_variables_for_derived(
     db: &DatabaseConnection,
     item: &DerivedWork,
@@ -743,34 +966,16 @@ async fn resolve_variables_for_derived(
             continue;
         };
 
-        // Deterministic input pick when a sensor point and a grab share the timestamp:
-        // prefer the continuous reading, then tie-break by stream_id (stable across VACUUM).
-        // A withdrawn or flagged row is not a measurement, and a sample whose members are all
-        // gone carries n = 0 with a NULL mean, so neither may reach the formula.
-        let value_row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"SELECT COALESCE(CASE WHEN smp.n > 0 THEN smp.mean END,
-                                  r.calibrated_value, r.raw_value) as val,
-                         r.measurement_type
-                  FROM readings r
-                  LEFT JOIN samples smp ON smp.id = r.sample_id
-                  WHERE r.site_id = $1 AND r.parameter_id = $2 AND r.time = $3
-                    AND r.withdrawn_at IS NULL AND r.is_flagged IS NOT TRUE
-                  ORDER BY (r.measurement_type IS NOT DISTINCT FROM 'spot') ASC,
-                           r.replicate_index ASC, r.stream_id
-                  LIMIT 1",
-                [
-                    item.derived_site_id.into(),
-                    source_param_id.into(),
-                    time.into(),
-                ],
-            ))
-            .await?;
+        let value_row = InputRow::find_by_statement(build(input_value_query(
+            item.derived_site_id,
+            source_param_id,
+            time,
+        )))
+        .one(db)
+        .await?;
 
         match value_row {
-            Some(vr) => {
-                let input = InputRow::from_query_result(&vr, "")?;
+            Some(input) => {
                 if input.measurement_type.as_deref() == Some("spot") {
                     tracing::debug!(
                         variable = %var_name,
@@ -787,25 +992,31 @@ async fn resolve_variables_for_derived(
     Ok(Some(Some(variables)))
 }
 
+/// The statement [`unattribute_derived_at`] runs.
+fn unattribute_statement(
+    site_id: Uuid,
+    parameter_id: Uuid,
+    time: chrono::DateTime<chrono::Utc>,
+) -> UpdateStatement {
+    SeaQuery::update()
+        .table(readings::Entity)
+        .value(readings::Column::SiteId, Expr::val(Option::<Uuid>::None))
+        .and_where(readings::Column::SiteId.eq(site_id))
+        .and_where(readings::Column::ParameterId.eq(parameter_id))
+        .and_where(readings::Column::Time.eq(time))
+        .and_where(readings::Column::MeasurementType.eq(DERIVED))
+        .take()
+}
+
 /// Clear the site off a stored derived row, the unattributed state a recalled input leaves it in.
 async fn unattribute_derived_at(
     db: &DatabaseConnection,
     item: &DerivedWork,
     time: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), sea_orm::DbErr> {
-    crate::common::bulk_write::guarded_mutation_sql(
+    crate::common::bulk_write::guarded_mutation(
         db,
-        Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"UPDATE readings SET site_id = NULL
-              WHERE site_id = $1 AND parameter_id = $2 AND time = $3
-                AND measurement_type = 'derived'",
-            [
-                item.derived_site_id.into(),
-                item.derived_parameter_id.into(),
-                time.into(),
-            ],
-        ),
+        unattribute_statement(item.derived_site_id, item.derived_parameter_id, time),
     )
     .await
     .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
@@ -831,16 +1042,17 @@ async fn record_formula_transition(
     result: f64,
     version: Option<Uuid>,
 ) -> Result<bool, sea_orm::DbErr> {
-    let stored = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT raw_value, derived_version_id FROM readings \
-             WHERE stream_id = $1 AND time = $2 AND replicate_index = 0",
-            [stream_id.into(), time.into()],
-        ))
+    let stored = readings::Entity::find()
+        .filter(readings::Column::StreamId.eq(stream_id))
+        .filter(readings::Column::Time.eq(time))
+        .filter(readings::Column::ReplicateIndex.eq(0_i16))
+        .select_only()
+        .column(readings::Column::RawValue)
+        .column(readings::Column::DerivedVersionId)
+        .into_model::<StoredDerived>()
+        .one(db)
         .await?;
-    let Some(row) = stored else { return Ok(true) };
-    let prior = StoredDerived::from_query_result(&row, "")?;
+    let Some(prior) = stored else { return Ok(true) };
     if prior.raw_value == Some(result) && prior.derived_version_id == version {
         return Ok(false);
     }
@@ -866,6 +1078,72 @@ async fn record_formula_transition(
     .await
     .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
     Ok(false)
+}
+
+/// The statement that stores a computed derived value at one slot instant.
+///
+/// `raw_value` is the authoritative column for a derived reading and `calibrated_value` is always
+/// NULL. A derived value is a computed quantity, not an instrument measurement plus a correction:
+/// it has no sensor, no curve and therefore nothing a calibration id could point at, which is
+/// exactly the state this model spells NULL. Every consumer reads
+/// COALESCE(calibrated_value, raw_value), the four continuous aggregates included, so the computed
+/// number is what is served either way, but only this arrangement survives a recomposition pass,
+/// which resolves no curve for a sensor-less row and would otherwise clear the value outright.
+///
+/// The slot is re-asserted on conflict as well as on insert: a row this engine unattributed when
+/// its inputs stopped resolving is the same row it writes when they resolve again, and leaving
+/// `site_id` NULL there would recompute a value nothing serves.
+fn derived_upsert(
+    stream_id: Uuid,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    time: chrono::DateTime<chrono::Utc>,
+    result: f64,
+    version: Option<Uuid>,
+) -> sea_orm::sea_query::InsertStatement {
+    SeaQuery::insert()
+        .into_table(readings::Entity)
+        .columns([
+            readings::Column::StreamId,
+            readings::Column::SiteId,
+            readings::Column::ParameterId,
+            readings::Column::Time,
+            readings::Column::RawValue,
+            readings::Column::CalibratedValue,
+            readings::Column::ReplicateIndex,
+            readings::Column::MeasurementType,
+            readings::Column::ProvenanceKind,
+            readings::Column::DerivedVersionId,
+        ])
+        .values_panic([
+            Expr::val(stream_id),
+            Expr::val(site_id),
+            Expr::val(parameter_id),
+            Expr::val(time),
+            Expr::val(result),
+            Expr::val(Option::<f64>::None),
+            Expr::val(0_i16),
+            Expr::val(DERIVED),
+            Expr::val(DERIVED),
+            Expr::val(version),
+        ])
+        .on_conflict(
+            OnConflict::columns([
+                readings::Column::StreamId,
+                readings::Column::Time,
+                readings::Column::ReplicateIndex,
+            ])
+            .update_columns([
+                readings::Column::RawValue,
+                readings::Column::CalibratedValue,
+                readings::Column::MeasurementType,
+                readings::Column::SiteId,
+                readings::Column::ParameterId,
+                readings::Column::DerivedVersionId,
+            ])
+            .to_owned(),
+        )
+        .take()
 }
 
 async fn evaluate_and_upsert_derived(
@@ -902,37 +1180,15 @@ async fn evaluate_and_upsert_derived(
     // first insert is not a transition, and a pass that changes neither is not a decision.
     let born = record_formula_transition(db, stream_id, time, result, version).await?;
 
-    // The slot is re-asserted on conflict as well as on insert: a row this engine unattributed
-    // when its inputs stopped resolving is the same row it writes when they resolve again, and
-    // leaving `site_id` NULL there would recompute a value nothing serves.
-    //
-    // `raw_value` is the authoritative column for a derived reading and `calibrated_value` is
-    // always NULL. A derived value is a computed quantity, not an instrument measurement plus a
-    // correction: it has no sensor, no curve and therefore nothing a calibration id could point
-    // at, which is exactly the state this model spells NULL. Every consumer reads
-    // COALESCE(calibrated_value, raw_value) — including the four continuous aggregates — so the
-    // computed number is what is served either way, but only this arrangement survives a
-    // recomposition pass, which resolves no curve for a sensor-less row and would otherwise clear
-    // the value outright. Writing both columns also made the upsert lopsided: the previous
-    // ON CONFLICT maintained only `calibrated_value`, so a recomputed row's `raw_value` stayed
-    // frozen at whatever the very first evaluation produced.
-    crate::common::bulk_write::guarded_mutation_sql(
+    crate::common::bulk_write::guarded_mutation(
         db,
-        Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, calibrated_value, replicate_index, measurement_type, provenance_kind, derived_version_id)
-          VALUES ($1, $2, $3, $4, $5, NULL, 0, 'derived', 'derived', $6)
-          ON CONFLICT (stream_id, time, replicate_index) DO UPDATE
-            SET raw_value = $5, calibrated_value = NULL, measurement_type = 'derived',
-                site_id = $2, parameter_id = $3, derived_version_id = $6",
-            [
-                stream_id.into(),
-                item.derived_site_id.into(),
-                item.derived_parameter_id.into(),
-                time.into(),
-                result.into(),
-                version.into(),
-            ],
+        derived_upsert(
+            stream_id,
+            item.derived_site_id,
+            item.derived_parameter_id,
+            time,
+            result,
+            version,
         ),
     )
     .await
@@ -1057,55 +1313,57 @@ pub enum Scope {
 }
 
 impl Scope {
-    fn values(self) -> Vec<sea_orm::Value> {
-        match self {
-            Self::Sensor(sensor_id) => vec![sensor_id.into()],
-            Self::Slot {
-                site_id,
-                parameter_id,
-            } => vec![site_id.into(), parameter_id.into()],
-        }
-    }
-
     /// The readings this run may rewrite, as `r`.
-    fn readings_predicate(self) -> &'static str {
+    fn readings_predicate(self) -> Expr {
         match self {
             // A derived row carries the slot but no instrument, so no window resolves for it and
             // the outer join below would erase the value the cascade wrote. The sensor arm needs no
             // such guard: a derived row names no instrument to be in scope by.
-            Self::Sensor(_) => "r.sensor_id = $1",
-            Self::Slot { .. } => {
+            Self::Sensor(sensor_id) => Expr::cust_with_values("r.sensor_id = $1", [sensor_id]),
+            Self::Slot {
+                site_id,
+                parameter_id,
+            } => Expr::cust_with_values(
                 "r.site_id = $1 AND r.parameter_id = $2 \
-                 AND r.measurement_type IS DISTINCT FROM 'derived'"
-            }
+                 AND r.measurement_type IS DISTINCT FROM 'derived'",
+                [site_id, parameter_id],
+            ),
         }
     }
 
     /// Where the curve pick reads the instrument from: the scope's own on the sensor arm, the row's
     /// (which step 1 has just re-owned) on the slot arm.
-    fn pick_sensor(self) -> &'static str {
+    fn pick_owner(self) -> Expr {
         match self {
-            Self::Sensor(_) => "$1",
-            Self::Slot { .. } => "r.sensor_id",
+            Self::Sensor(sensor_id) => Expr::cust_with_values("c.sensor_id = $1", [sensor_id]),
+            Self::Slot { .. } => Expr::cust("c.sensor_id = r.sensor_id"),
         }
     }
 
     /// The deployments whose windows attribute this run's readings.
-    fn deployments_predicate(self) -> &'static str {
+    fn deployments_predicate(self) -> Expr {
         match self {
-            Self::Sensor(_) => "sensor_id = $1",
-            Self::Slot { .. } => "site_id = $1 AND parameter_id = $2",
+            Self::Sensor(sensor_id) => Expr::cust_with_values("sensor_id = $1", [sensor_id]),
+            Self::Slot {
+                site_id,
+                parameter_id,
+            } => Expr::cust_with_values(
+                "site_id = $1 AND parameter_id = $2",
+                [site_id, parameter_id],
+            ),
         }
     }
 
-    /// The columns the attribution step writes. Only the slot arm re-owns.
-    fn attribution_set(self) -> &'static str {
-        match self {
-            Self::Sensor(_) => "deployment_id = dw.id, site_id = dw.site_id",
-            Self::Slot { .. } => {
-                "sensor_id = dw.sensor_id, deployment_id = dw.id, site_id = dw.site_id"
-            }
+    /// What the attribution step writes onto a reading. Only the slot arm re-owns.
+    fn attribution_values(self) -> Vec<(readings::Column, Expr)> {
+        let mut values = vec![
+            (readings::Column::DeploymentId, Expr::cust("dw.id")),
+            (readings::Column::SiteId, Expr::cust("dw.site_id")),
+        ];
+        if matches!(self, Self::Slot { .. }) {
+            values.insert(0, (readings::Column::SensorId, Expr::cust("dw.sensor_id")));
         }
+        values
     }
 
     /// The reading columns the attribution step writes, which is what its ledger row records.
@@ -1117,18 +1375,23 @@ impl Scope {
     }
 
     /// Which readings the attribution step considers, beyond the window overlap.
-    fn attribution_scope(self) -> &'static str {
+    fn attribution_scope(self) -> Expr {
         match self {
             // A deployment names one parameter, so it claims a row of that parameter or an
             // unpaired one.
-            Self::Sensor(_) => {
-                "r.sensor_id = $1 AND (r.parameter_id IS NULL OR dw.parameter_id = r.parameter_id)"
-            }
+            Self::Sensor(sensor_id) => Expr::cust_with_values(
+                "r.sensor_id = $1 AND (r.parameter_id IS NULL OR dw.parameter_id = r.parameter_id)",
+                [sensor_id],
+            ),
             // Either the row is at the slot, or it belongs to the instrument the slot's deployment
             // names: that second half is what pulls a swapped instrument's readings back in.
-            Self::Slot { .. } => {
-                "r.parameter_id = $2 AND (r.site_id = $1 OR r.sensor_id = dw.sensor_id)"
-            }
+            Self::Slot {
+                site_id,
+                parameter_id,
+            } => Expr::cust_with_values(
+                "r.parameter_id = $2 AND (r.site_id = $1 OR r.sensor_id = dw.sensor_id)",
+                [site_id, parameter_id],
+            ),
         }
     }
 
@@ -1136,11 +1399,12 @@ impl Scope {
     /// first deployment` so readings that predate any deployment keep the site the stream pairing
     /// gave them; an auto-created deployment opens at its stream's first reading, so the floor now
     /// protects hand-dated deployments only.
-    fn recall_predicate(self) -> String {
+    fn recall_predicate(self) -> Expr {
         let windowed = attribution_derivable("r");
         match self {
-            Self::Sensor(_) => format!(
-                r"r.sensor_id = $1
+            Self::Sensor(sensor_id) => Expr::cust_with_values(
+                format!(
+                    r"r.sensor_id = $1
                     AND r.site_id IS NOT NULL
                     AND {windowed}
                     AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments d2
@@ -1153,9 +1417,15 @@ impl Scope {
                           AND r.time >= d.deployed_from
                           AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
                     )"
+                ),
+                [sensor_id],
             ),
-            Self::Slot { .. } => format!(
-                r"r.site_id = $1 AND r.parameter_id = $2
+            Self::Slot {
+                site_id,
+                parameter_id,
+            } => Expr::cust_with_values(
+                format!(
+                    r"r.site_id = $1 AND r.parameter_id = $2
                     AND {windowed}
                     AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments
                                    WHERE site_id = $1 AND parameter_id = $2)
@@ -1165,15 +1435,24 @@ impl Scope {
                           AND r.time >= d.deployed_from
                           AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
                     )"
+                ),
+                [site_id, parameter_id],
             ),
         }
     }
 
     /// The rows whose span the rollup refresh covers.
-    fn refresh_predicate(self) -> &'static str {
+    fn refresh_condition(self) -> sea_orm::Condition {
         match self {
-            Self::Sensor(_) => "sensor_id = $1",
-            Self::Slot { .. } => "site_id = $1 AND parameter_id = $2",
+            Self::Sensor(sensor_id) => {
+                sea_orm::Condition::all().add(readings::Column::SensorId.eq(sensor_id))
+            }
+            Self::Slot {
+                site_id,
+                parameter_id,
+            } => sea_orm::Condition::all()
+                .add(readings::Column::SiteId.eq(site_id))
+                .add(readings::Column::ParameterId.eq(parameter_id)),
         }
     }
 }
@@ -1196,7 +1475,7 @@ fn moved_pairs(was: &str, now: &str, columns: &[&str]) -> String {
 /// cascade follows, and a `was_<col>`/`now_<col>` pair per column in `columns`. A visited row whose
 /// columns all came back the same is not a move and records nothing; the statement still returns
 /// it, so the caller's count and cascade are unchanged.
-fn record_moved(update_sql: &str, columns: &[&str], job_param: usize) -> String {
+fn record_moved(write: UpdateStatement, columns: &[&str], job_id: Option<Uuid>) -> WithQuery {
     let pairs = |side: &str| {
         columns
             .iter()
@@ -1209,31 +1488,22 @@ fn record_moved(update_sql: &str, columns: &[&str], job_param: usize) -> String 
         .map(|c| format!("m.was_{c} IS DISTINCT FROM m.now_{c}"))
         .collect::<Vec<_>>()
         .join(" OR ");
-    format!(
-        r"WITH moved AS (
-            {update_sql}
-          ), recorded AS (
-            INSERT INTO reading_decisions
-                (stream_id, time, replicate_index, kind, old, new, actor, origin, supersedes,
-                 job_id)
-            SELECT m.stream_id, m.time, m.replicate_index, '{kind}',
-                   jsonb_build_object({old}), jsonb_build_object({new}),
-                   'system', '{origin}',
-                   (SELECT p.id FROM reading_decisions p
-                     WHERE p.stream_id = m.stream_id AND p.time = m.time
-                       AND p.replicate_index IS NOT DISTINCT FROM m.replicate_index
-                       AND p.kind = '{kind}' AND p.rolled_back_by IS NULL
-                     ORDER BY p.at DESC, p.id DESC LIMIT 1),
-                   ${job_param}
-              FROM moved m
-             WHERE {changed}
-          )
-          SELECT site_id, time FROM moved",
-        old = pairs("was"),
-        new = pairs("now"),
-        kind = crate::routes::private::readings::models::Kind::Reprocess.as_str(),
-        origin = crate::routes::private::readings::models::Origin::System.as_str(),
-    )
+    let recorded = ledger_insert(
+        Kind::Reprocess,
+        Origin::System,
+        "moved",
+        "m",
+        Expr::cust(format!("jsonb_build_object({})", pairs("was"))),
+        Expr::cust(format!("jsonb_build_object({})", pairs("now"))),
+        Some(Expr::cust(format!("({changed})"))),
+        job_id,
+    );
+    SeaQuery::select()
+        .column(Alias::new("site_id"))
+        .column(Alias::new("time"))
+        .from(Alias::new("moved"))
+        .take()
+        .with(with_ledger("moved", write, recorded))
 }
 
 pub async fn reprocess_sensor_readings(
@@ -1267,6 +1537,137 @@ pub async fn reprocess_site_parameter_readings(
     .await
 }
 
+/// The four writes a reprocess run makes, in the order it runs them. Built without a database, so
+/// what each one selects and writes is readable on its own.
+struct ReprocessStatements {
+    attribution: WithQuery,
+    calibration: WithQuery,
+    spot: WithQuery,
+    recall: WithQuery,
+}
+
+fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatements {
+    // Step 1, attribution. On the slot arm this runs BEFORE the curve resolution and the order is
+    // the contract: step 2 resolves against `r.sensor_id`, so it picks the curves of the owner
+    // step 1 just wrote. Resolving first would stamp the outgoing instrument's curve on a reading
+    // the swap hands to the incoming one, and nothing repairs that afterwards.
+    let deployments = SeaQuery::select()
+        .expr(Expr::cust("id"))
+        .expr(Expr::cust("sensor_id"))
+        .expr(Expr::cust("site_id"))
+        .expr(Expr::cust("parameter_id"))
+        .expr(Expr::cust("deployed_from"))
+        .expr_as(
+            Expr::cust("COALESCE(deployed_until, 'infinity'::timestamptz)"),
+            Alias::new("deployed_until"),
+        )
+        .from(sensor_deployments::Entity)
+        .and_where(scope.deployments_predicate())
+        .take();
+    let mut attribution = SeaQuery::update();
+    attribution.table(readings::Entity.into_table_ref().alias(Alias::new("r")));
+    for (column, value) in scope.attribution_values() {
+        attribution.value(column, value);
+    }
+    let attribution = record_moved(
+        attribution
+            .from(TableRef::SubQuery(
+                Box::new(deployments),
+                Alias::new("dw").into_iden(),
+            ))
+            .from(readings::Entity.into_table_ref().alias(Alias::new("prev")))
+            .and_where(Expr::cust("prev.stream_id = r.stream_id"))
+            .and_where(Expr::cust("prev.time = r.time"))
+            .and_where(Expr::cust("prev.replicate_index = r.replicate_index"))
+            .and_where(scope.attribution_scope())
+            .and_where(Expr::cust(attribution_derivable("r")))
+            .and_where(Expr::cust("r.time >= dw.deployed_from"))
+            .and_where(Expr::cust("r.time < dw.deployed_until"))
+            .returning(ReturningClause::Exprs(vec![Expr::cust(format!(
+                "r.stream_id, r.time, r.replicate_index, r.site_id, {pairs}",
+                pairs = moved_pairs("prev", "r", scope.attribution_columns()),
+            ))]))
+            .take(),
+        scope.attribution_columns(),
+        job_id,
+    );
+
+    // Step 2, the curve. The pick is `resolver::pick_calibration_query_owned`, the same ranking the
+    // write paths resolve with, so a reprocess recomputes the value ingest already stored rather
+    // than a different one. Which rows a window may claim is `window_resolved_rows`; the spot rows
+    // it holds back are step 3's.
+    let calibration = record_moved(
+        repoint_statement(
+            super::resolver::pick_calibration_query_owned(scope.pick_owner(), None),
+            scope
+                .readings_predicate()
+                .and(Expr::cust(calibration_derivable("r")))
+                .and(Expr::cust(format!(
+                    "NOT (cw.id IS NULL AND ({orphaned}))",
+                    orphaned = orphaned_correction_rows("r"),
+                ))),
+            Some(ReturningClause::Exprs(vec![Expr::cust(
+                "tgt.stream_id, tgt.time, tgt.replicate_index, tgt.site_id, \
+                 picked.p_was_calibration_id AS was_calibration_id, \
+                 tgt.calibration_id AS now_calibration_id, \
+                 picked.p_was_calibrated_value AS was_calibrated_value, \
+                 tgt.calibrated_value AS now_calibrated_value",
+            )])),
+        ),
+        &["calibration_id", "calibrated_value"],
+        job_id,
+    );
+
+    // Step 3, the grabs: they keep the curves they were entered against, and their value follows
+    // those curves' current coefficients.
+    let spot = record_moved(
+        recompose_statement(own_curve_rows(
+            Expr::cust("r.measurement_type = 'spot'").and(scope.readings_predicate()),
+        ))
+        .returning(ReturningClause::Exprs(vec![Expr::cust(
+            "tgt.stream_id, tgt.time, tgt.replicate_index, tgt.site_id, \
+             r.calibrated_value AS was_calibrated_value, \
+             tgt.calibrated_value AS now_calibrated_value",
+        )]))
+        .take(),
+        &["calibrated_value"],
+        job_id,
+    );
+
+    // Step 4, the recall. The site it clears is returned from the pre-update snapshot, because the
+    // cascade has to reach the instant a derived value must follow its input out of, and after the
+    // write the row names no site at all.
+    let recall_columns = ["site_id", "deployment_id"];
+    let recall = record_moved(
+        SeaQuery::update()
+            .table(readings::Entity.into_table_ref().alias(Alias::new("r")))
+            .value(readings::Column::SiteId, Expr::val(Option::<Uuid>::None))
+            .value(
+                readings::Column::DeploymentId,
+                Expr::val(Option::<Uuid>::None),
+            )
+            .from(readings::Entity.into_table_ref().alias(Alias::new("prev")))
+            .and_where(Expr::cust("prev.stream_id = r.stream_id"))
+            .and_where(Expr::cust("prev.time = r.time"))
+            .and_where(Expr::cust("prev.replicate_index = r.replicate_index"))
+            .and_where(scope.recall_predicate())
+            .returning(ReturningClause::Exprs(vec![Expr::cust(format!(
+                "r.stream_id, r.time, r.replicate_index, prev.site_id, {pairs}",
+                pairs = moved_pairs("prev", "r", &recall_columns),
+            ))]))
+            .take(),
+        &recall_columns,
+        job_id,
+    );
+
+    ReprocessStatements {
+        attribution,
+        calibration,
+        spot,
+        recall,
+    }
+}
+
 /// Re-derive a scope's readings from the deployment and calibration timelines, then follow the
 /// change out: derived values at the instants it moved, and the rollups over the span it covers.
 ///
@@ -1296,113 +1697,18 @@ pub async fn reprocess(
     scope: Scope,
     job_id: Option<Uuid>,
 ) -> Result<usize, sea_orm::DbErr> {
-    let values = scope.values();
-    // The ledger insert's own bind, after the scope's one or two.
-    let job_param = values.len() + 1;
-    let mut params = values.clone();
-    params.push(job_id.into());
-
-    // Step 1, attribution. On the slot arm this runs BEFORE the curve resolution and the order is
-    // the contract: step 2 resolves against `r.sensor_id`, so it picks the curves of the owner
-    // step 1 just wrote. Resolving first would stamp the outgoing instrument's curve on a reading
-    // the swap hands to the incoming one, and nothing repairs that afterwards.
-    let attribution_sql = record_moved(
-        &format!(
-            r"UPDATE readings r
-            SET {set}
-            FROM (
-                SELECT id, sensor_id, site_id, parameter_id, deployed_from,
-                       COALESCE(deployed_until, 'infinity'::timestamptz) AS deployed_until
-                FROM sensor_deployments
-                WHERE {deployments}
-            ) dw, readings prev
-            WHERE prev.stream_id = r.stream_id
-              AND prev.time = r.time
-              AND prev.replicate_index = r.replicate_index
-              AND {scope_sql}
-              AND {windowed}
-              AND r.time >= dw.deployed_from
-              AND r.time < dw.deployed_until
-            RETURNING r.stream_id, r.time, r.replicate_index, r.site_id, {pairs}",
-            set = scope.attribution_set(),
-            deployments = scope.deployments_predicate(),
-            scope_sql = scope.attribution_scope(),
-            windowed = attribution_derivable("r"),
-            pairs = moved_pairs("prev", "r", scope.attribution_columns()),
-        ),
-        scope.attribution_columns(),
-        job_param,
-    );
-
-    // Step 2, the curve. The pick is `resolver::pick_calibration_lateral`, the same ranking the
-    // write paths resolve with, so a reprocess recomputes the value ingest already stored rather
-    // than a different one. Which rows a window may claim is `window_resolved_rows`; the spot rows
-    // it holds back are step 3's.
-    let calibration_sql = repoint_statement(
-        &super::resolver::pick_calibration_lateral(scope.pick_sensor()),
-        &format!(
-            "{scope_sql} AND {windowed} AND NOT (cw.id IS NULL AND ({orphaned}))",
-            scope_sql = scope.readings_predicate(),
-            windowed = calibration_derivable("r"),
-            orphaned = orphaned_correction_rows("r"),
-        ),
-        r"
-            RETURNING tgt.stream_id, tgt.time, tgt.replicate_index, tgt.site_id,
-                      picked.p_was_calibration_id AS was_calibration_id,
-                      tgt.calibration_id AS now_calibration_id,
-                      picked.p_was_calibrated_value AS was_calibrated_value,
-                      tgt.calibrated_value AS now_calibrated_value",
-    );
-    let calibration_sql = record_moved(
-        &calibration_sql,
-        &["calibration_id", "calibrated_value"],
-        job_param,
-    );
-
-    // Step 3, the grabs: they keep the curves they were entered against, and their value follows
-    // those curves' current coefficients.
-    let spot_sql = record_moved(
-        &format!(
-            r"{} RETURNING tgt.stream_id, tgt.time, tgt.replicate_index, tgt.site_id,
-                      r.calibrated_value AS was_calibrated_value,
-                      tgt.calibrated_value AS now_calibrated_value",
-            recompose_statement("r.measurement_type = 'spot'", scope.readings_predicate())
-        ),
-        &["calibrated_value"],
-        job_param,
-    );
-
-    // Step 4, the recall. The site it clears is returned from the pre-update snapshot, because the
-    // cascade has to reach the instant a derived value must follow its input out of, and after the
-    // write the row names no site at all.
-    let recall_predicate = scope.recall_predicate();
-    let recall_columns = ["site_id", "deployment_id"];
-    let recall_sql = record_moved(
-        &format!(
-            r"UPDATE readings r
-            SET site_id = NULL, deployment_id = NULL
-            FROM readings prev
-            WHERE prev.stream_id = r.stream_id
-              AND prev.time = r.time
-              AND prev.replicate_index = r.replicate_index
-              AND ({recall_predicate})
-            RETURNING r.stream_id, r.time, r.replicate_index, prev.site_id, {pairs}",
-            pairs = moved_pairs("prev", "r", &recall_columns),
-        ),
-        &recall_columns,
-        job_param,
-    );
+    let steps = reprocess_statements(scope, job_id);
 
     let (readings_updated, cascade) = crate::common::bulk_write::guarded(db, async |txn| {
         let mut touched: Vec<(Uuid, DateTime<Utc>)> = Vec::new();
         let mut readings_updated = 0usize;
-        for sql in [&attribution_sql, &calibration_sql, &spot_sql] {
-            readings_updated += write_and_collect(txn, sql, params.clone(), &mut touched).await?;
+        for query in [&steps.attribution, &steps.calibration, &steps.spot] {
+            readings_updated += write_and_collect(txn, query, &mut touched).await?;
         }
 
         // The recall's rows are not part of `readings_updated`: it clears an attribution rather
         // than re-deriving one.
-        write_and_collect(txn, &recall_sql, params.clone(), &mut touched).await?;
+        write_and_collect(txn, &steps.recall, &mut touched).await?;
 
         touched.sort_unstable();
         touched.dedup();
@@ -1425,19 +1731,15 @@ pub async fn reprocess(
         }
     }
 
-    let range = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT MIN(time) AS min_time FROM readings WHERE {}",
-                scope.refresh_predicate()
-            ),
-            values,
-        ))
-        .await?;
-    if let Some(row) = range
-        && let Some(since) = row.try_get::<Option<DateTime<Utc>>>("", "min_time")?
-    {
+    let since = readings::Entity::find()
+        .filter(scope.refresh_condition())
+        .select_only()
+        .expr_as(Func::min(Expr::col(readings::Column::Time)), "min_time")
+        .into_tuple::<Option<DateTime<Utc>>>()
+        .one(db)
+        .await?
+        .flatten();
+    if let Some(since) = since {
         crate::common::aggregates::refresh(db, crate::common::aggregates::Window::Since(since))
             .await
             .map_err(app_error_as_db_err)?;
@@ -1458,17 +1760,10 @@ struct MovedReading {
 
 async fn write_and_collect<C: ConnectionTrait>(
     conn: &C,
-    sql: &str,
-    values: Vec<sea_orm::Value>,
+    query: &WithQuery,
     touched: &mut Vec<(Uuid, DateTime<Utc>)>,
 ) -> Result<usize, sea_orm::DbErr> {
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            values,
-        ))
-        .await?;
+    let rows = conn.query_all_raw(build(query.clone())).await?;
     for row in &rows {
         // `site_id` is nullable on an unpaired reading, which has no slot to touch.
         let moved = MovedReading::from_query_result(row, "")?;

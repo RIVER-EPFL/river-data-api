@@ -22,6 +22,8 @@ use crate::routes::private::sensors::calibrations::model as calibrations_model;
 use crate::routes::private::sensors::deployments;
 use crate::routes::private::sensors::deployments::model as deployments_model;
 use crate::routes::private::sensors::standard_curves::model as standard_curves;
+use crate::routes::private::sync::models::HoldKind;
+use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::private::sync::service as audit;
 use crate::routes::private::{data_streams, sensors};
 
@@ -1400,11 +1402,11 @@ pub async fn raise_source_identity_hold<C: ConnectionTrait>(
         db,
         &audit::Hold {
             key: audit::HoldKey::StreamStanding { stream_id },
-            kind: "source_identity_changed",
+            kind: HoldKind::SourceIdentityChanged,
             expected: serde_json::json!({ "was": stored, "fields": changed }),
             computed: serde_json::json!({ "now": reported }),
             delta: serde_json::json!({}),
-            status: "pending",
+            status: HoldStatus::Pending,
             tool: None,
         },
     )

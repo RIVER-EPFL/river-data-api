@@ -35,6 +35,7 @@ use crate::routes::private::{
     parameters::groups::group_model::ParameterGroup,
     parameters::groups::member_model::ParameterGroupMember,
     projects::subprojects::Subproject,
+    readings::decision_model::ReadingDecision,
     readings::samples::Sample,
     reprocessing_jobs::ReprocessingJob,
     reprocessing_jobs::schedule_model::Schedule,
@@ -43,6 +44,7 @@ use crate::routes::private::{
     sensors::deployments::SensorDeployment,
     sensors::standard_curves::StandardCurve,
     sites::parameters::SiteParameter,
+    sync::hold_model::ReplicateAuditHold,
     sync::models::commands::SyncCommand,
     sync::models::credentials::SyncServiceCredential,
     sync::models::events::SyncEvent,
@@ -189,6 +191,12 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         // A schedule's rows are a projection of the job registry, so the entity mounts read and
         // update only; `run_now` and the edit trail stay their own routes beside it.
         .nest("/schedules", sensor_crud(Schedule::router(db)))
+        // The review queue as rows, read-only: a hold is raised by the path that detects it and
+        // decided through the named transitions under `/sync/replicate_audit_holds`.
+        .nest(
+            "/replicate_audit_holds",
+            sensor_crud(ReplicateAuditHold::router(db)),
+        )
         // Field metadata, not sensor movement: a standard curve affects only the grabs an operator
         // enters against it, so the person entering the plate's readings adds its curve in the same
         // sitting. `sensor_crud` (MANAGER) is the alternative, and would make them wait on a manager.
@@ -238,6 +246,12 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         // One row per calculation run, minted only by `/tools/{name}/calculate` and never edited,
         // which is why it mounts read-only. The provenance panel reads a saved reading's run here.
         .nest("/tool_runs", field_data_crud(ToolRun::router(db)))
+        // The append-only curation ledger, read-only: every writer is a curation path with
+        // its own rules. `GET /readings/decisions` is one reading's history.
+        .nest(
+            "/reading_decisions",
+            field_data_crud(ReadingDecision::router(db)),
+        )
         .nest("/data_streams", admin_write_crud(DataStream::router(db)))
         // One row per committed windowed ingest pass, read-only: the ingest writes them and the
         // janitor's age prune is the only delete. `GET /streams/{id}/receipts` is one stream's.

@@ -399,6 +399,139 @@ pub struct ListHoldsQuery {
     pub page_size: Option<u64>,
 }
 
+/// What a review-queue hold is about. The column is `text` with no CHECK, so the vocabulary lives
+/// here and every SQL predicate over `kind` is written from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldKind {
+    /// A source's own statistics disagree with what its replicates compute to.
+    ReplicateStats,
+    /// A calculation that should have an output at this slot and instant has none.
+    MissingOutput,
+    /// An output is older than an input it was computed from.
+    StaleOutput,
+    /// The chain declined to run a step, and says so itself rather than leaving it to the audit.
+    SkippedOutput,
+    /// The source changed a value river-data had already stored.
+    SourceModified,
+    /// A windowed ingest pass tripped the brake.
+    BrakeFired,
+    /// The device behind a feed is not the one that was there.
+    SourceIdentityChanged,
+    /// A curve claim arrived on a row that may not carry one, and was dropped.
+    CurveClaimStripped,
+    /// A value was entered by hand and nobody has verified it yet.
+    UnverifiedEntry,
+}
+
+impl HoldKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReplicateStats => "replicate_stats",
+            Self::MissingOutput => "missing_output",
+            Self::StaleOutput => "stale_output",
+            Self::SkippedOutput => "skipped_output",
+            Self::SourceModified => "source_modified",
+            Self::BrakeFired => "brake_fired",
+            Self::SourceIdentityChanged => "source_identity_changed",
+            Self::CurveClaimStripped => "curve_claim_stripped",
+            Self::UnverifiedEntry => "unverified_entry",
+        }
+    }
+
+    /// The kinds the event audit and the chain raise, which every reader of calculation findings
+    /// filters on together. A kind added here reaches those readers; one named in their SQL by
+    /// hand does not.
+    pub const EVENT_AUDIT: [Self; 3] = [Self::MissingOutput, Self::StaleOutput, Self::SkippedOutput];
+
+    /// A `kind IN (...)` list for a set of kinds, quoted for SQL.
+    #[must_use]
+    pub fn sql_list(kinds: &[Self]) -> String {
+        let names: Vec<String> = kinds.iter().map(|k| format!("'{}'", k.as_str())).collect();
+        format!("({})", names.join(", "))
+    }
+}
+
+/// Where a hold stands. The table's CHECK is the same list
+/// (`migration/src/m20260905_000001_baseline.rs`), so a value added there is added here and every
+/// predicate over `status` follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldStatus {
+    /// Raised and awaiting review.
+    Pending,
+    /// Raised on a stream nobody has paired yet, so there is no slot to review it against.
+    Deferred,
+    /// Reviewed, and the stored value stands.
+    Acknowledged,
+    /// Reviewed, and something was changed in response.
+    Remediated,
+    /// Overtaken by a later account of the same slot, so there is nothing left to review.
+    Superseded,
+    /// Legacy, kept for history; nothing produces these.
+    UsePortal,
+    UseManual,
+    Consumed,
+}
+
+impl HoldStatus {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Deferred => "deferred",
+            Self::Acknowledged => "acknowledged",
+            Self::Remediated => "remediated",
+            Self::Superseded => "superseded",
+            Self::UsePortal => "use_portal",
+            Self::UseManual => "use_manual",
+            Self::Consumed => "consumed",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
+    }
+
+    /// Every status, which is what the table's CHECK allows.
+    pub const ALL: [Self; 8] = [
+        Self::Pending,
+        Self::Deferred,
+        Self::Acknowledged,
+        Self::Remediated,
+        Self::Superseded,
+        Self::UsePortal,
+        Self::UseManual,
+        Self::Consumed,
+    ];
+
+    /// Still awaiting review. Must match the open-only partial indexes exactly, since the raise
+    /// names them as its conflict target.
+    pub const OPEN: [Self; 2] = [Self::Pending, Self::Deferred];
+
+    /// Past review. A decision or an outcome, never rewritten by a re-detection.
+    pub const RESOLVED: [Self; 6] = [
+        Self::Acknowledged,
+        Self::Remediated,
+        Self::Superseded,
+        Self::UsePortal,
+        Self::UseManual,
+        Self::Consumed,
+    ];
+
+    /// The statuses `reopen` takes a hold back from.
+    pub const REOPENABLE: [Self; 2] = [Self::Acknowledged, Self::Remediated];
+
+    /// A `status IN (...)` list, quoted for SQL.
+    #[must_use]
+    pub fn sql_list(statuses: &[Self]) -> String {
+        let names: Vec<String> = statuses.iter().map(|s| format!("'{}'", s.as_str())).collect();
+        format!("({})", names.join(", "))
+    }
+}
+
 /// One stored value with the replicate index it sits at, which is the source's column position and
 /// the only handle a flag can name. A hold recorded before the index travelled with the value
 /// carries the bare number, and no position in that array stands for an index.
@@ -1244,3 +1377,7 @@ pub mod tokens {
 pub fn is_zero(n: &u64) -> bool {
     *n == 0
 }
+
+#[cfg(test)]
+#[path = "tests/hold_kind.rs"]
+mod hold_kind_tests;

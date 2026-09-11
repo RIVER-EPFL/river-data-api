@@ -649,6 +649,22 @@ fn scoped_site_parameter_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::Sel
         .into_query()
 }
 
+/// The streams serving a slot in the granted projects. A stream with no slot yet belongs to no
+/// project, so a decision on one is not listed for a confined caller, which is the same answer
+/// `data_streams` itself gives.
+fn scoped_stream_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::data_streams;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
+    data_streams::Entity::find()
+        .select_only()
+        .column(data_streams::Column::Id)
+        .filter(
+            data_streams::Column::SiteParameterId
+                .in_subquery(scoped_site_parameter_ids_query(projects)),
+        )
+        .into_query()
+}
+
 /// Which side of a CRUD route [`crud_scope_condition`] is answering for. Almost every entity gives
 /// one answer to all three; the exceptions are the rows whose project is derived from where an
 /// instrument has been deployed, and they are named in the match.
@@ -701,8 +717,9 @@ fn crud_scope_condition(
     use crate::routes::private::{
         alarms::models as alarm_thresholds, alarms::models::alarm_event as alarm_events,
         annotations, data_streams, notes, projects as projects_entity, projects::subprojects,
-        readings::samples, reprocessing_jobs, sensors, sensors::calibrations, sensors::deployments,
-        sensors::standard_curves, sites, sites::parameters as site_parameters,
+        readings::decision_model as reading_decisions, readings::samples, reprocessing_jobs,
+        sensors, sensors::calibrations, sensors::deployments, sensors::standard_curves, sites,
+        sites::parameters as site_parameters, sync::hold_model as holds,
     };
     use sea_orm::{ColumnTrait, Condition};
     let ids = || projects.iter().copied();
@@ -729,6 +746,20 @@ fn crud_scope_condition(
         "samples" => samples::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
         "data_streams" => data_streams::Column::SiteParameterId
             .in_subquery(scoped_site_parameter_ids_query(projects)),
+        // The ledger is keyed by stream, so it is confined the way the streams are. A decision is
+        // never written through CRUD, so the one direction that matters is the read.
+        "reading_decisions" => {
+            reading_decisions::Column::StreamId.in_subquery(scoped_stream_ids_query(projects))
+        }
+        // A hold is keyed by stream or, for a finding no stream produced, by site. Either half
+        // confines it; a hold carrying neither belongs to no project and is not listed.
+        "replicate_audit_holds" => {
+            return Some(
+                Condition::any()
+                    .add(holds::Column::StreamId.in_subquery(scoped_stream_ids_query(projects)))
+                    .add(holds::Column::SiteId.in_subquery(scoped_site_ids_query(projects))),
+            );
+        }
         // The instrument inventory is shared: a sensor row carries no project of its own, and a
         // sensor being added has stood nowhere yet. Reads are confined to where it has been
         // deployed; writes are catalog writes, governed by the caller's role and refused to a

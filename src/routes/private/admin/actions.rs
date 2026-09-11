@@ -32,6 +32,8 @@ use crate::routes::private::sensors::deployments;
 use crate::routes::private::sensors::deployments::slots;
 use crate::routes::private::sensors::standard_curves::model as standard_curves;
 use crate::routes::private::sites::models as sites;
+use crate::routes::private::sync::models::HoldKind;
+use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::private::sites::parameters::models as site_parameters;
 
 /// The rows this file's raw queries return. Derived rather than hand-decoded so a column added to
@@ -408,19 +410,14 @@ pub async fn reprocess_all(
 
     let job_id = match queued {
         Some(id) => id,
-        // `dedupe_key` is a worker-pool column the `reprocessing_jobs` entity does not carry, so
-        // this lookup stays raw until the entity does.
-        None => db
-            .query_one_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT id FROM reprocessing_jobs WHERE dedupe_key = $1",
-                [REPROCESS_ALL_DEDUPE_KEY.into()],
-            ))
+        // The enqueue coalesced onto a run already queued under this key; that run is the answer.
+        None => crate::routes::private::reprocessing_jobs::model::Entity::find()
+            .filter(crate::routes::private::reprocessing_jobs::model::Column::DedupeKey.eq(REPROCESS_ALL_DEDUPE_KEY))
+            .one(db)
             .await
             .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
             .ok_or_else(|| AppError::Internal("failed to enqueue reprocess_all job".to_string()))?
-            .try_get::<Uuid>("", "id")
-            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?,
+            .id,
     };
 
     Ok(Json(ReprocessAllResponse {
@@ -2038,8 +2035,14 @@ pub async fn undeclared_sd_estimators(
             Expr::cust("ds2.id = h.stream_id"),
         )
         .and_where(Expr::cust("ds2.site_parameter_id = sp.id"))
-        .and_where(Expr::cust("h.kind = 'replicate_stats'"))
-        .and_where(Expr::cust("h.status IN ('pending', 'deferred')"))
+        .and_where(Expr::cust(format!(
+            "h.kind = '{}'",
+            HoldKind::ReplicateStats.as_str()
+        )))
+        .and_where(Expr::cust(format!(
+            "h.status IN {}",
+            HoldStatus::sql_list(&HoldStatus::OPEN)
+        )))
         .take();
 
     let mut undeclared_slots = Condition::all()

@@ -750,7 +750,7 @@ async fn holds_open(
             format!(
                 "SELECT kind, COUNT(*)::bigint AS n FROM replicate_audit_holds \
                  WHERE status IN {open} GROUP BY kind ORDER BY kind",
-                open = crate::routes::private::sync::service::OPEN
+                open = *crate::routes::private::sync::service::OPEN
             ),
         ))
         .await?;

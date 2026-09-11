@@ -54,6 +54,25 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     #[crudcrate(sortable, exclude(update, create))]
     pub completed_at: Option<DateTimeWithTimeZone>,
+    /// The worker replica holding the lease, while one does.
+    #[crudcrate(exclude(update, create))]
+    pub owner: Option<String>,
+    /// When the current lease lapses, after which a reaper arm may claim the row again.
+    #[crudcrate(sortable, exclude(update, create))]
+    pub lease_expires_at: Option<DateTimeWithTimeZone>,
+    /// Bumped on every claim, so a lease granted before a takeover cannot write after it.
+    #[crudcrate(exclude(update, create))]
+    pub lease_epoch: i64,
+    /// Set by `POST /reprocessing_jobs/{id}/cancel`; the run stops at its next checkpoint.
+    #[crudcrate(filterable, exclude(update, create))]
+    pub cancel_requested: bool,
+    /// When the row becomes claimable, which a retry pushes out by the backoff.
+    #[crudcrate(sortable, exclude(update, create))]
+    pub next_attempt_at: DateTimeWithTimeZone,
+    /// Coalescing key while a job waits: an enqueue naming one that is already queued creates
+    /// nothing. The claim clears it, so the next enqueue queues a fresh run.
+    #[crudcrate(filterable, exclude(update, create))]
+    pub dedupe_key: Option<String>,
     /// Whether `POST /reprocessing_jobs/{id}/rerun` accepts this row, from the registry's policy.
     #[sea_orm(ignore)]
     #[crudcrate(non_db_attr = true, exclude(update, create))]

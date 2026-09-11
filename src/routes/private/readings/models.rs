@@ -781,27 +781,6 @@ pub(super) struct RecordedSpan {
     pub(super) hi: Option<sea_orm::prelude::DateTimeWithTimeZone>,
 }
 
-/// The stored row, before `kind` and `origin` are parsed into their vocabularies. Decoding is
-/// derived from `ROW_COLUMNS`; the two parses stay here, because a value outside either vocabulary
-/// is a corrupt row rather than a decode failure and says so.
-#[derive(sea_orm::FromQueryResult)]
-pub(super) struct StoredDecision {
-    pub(super) id: Uuid,
-    pub(super) stream_id: Uuid,
-    pub(super) time: sea_orm::prelude::DateTimeWithTimeZone,
-    pub(super) replicate_index: Option<i16>,
-    pub(super) kind: String,
-    pub(super) old: serde_json::Value,
-    pub(super) new: serde_json::Value,
-    pub(super) actor: String,
-    pub(super) at: sea_orm::prelude::DateTimeWithTimeZone,
-    pub(super) reason: Option<String>,
-    pub(super) origin: String,
-    pub(super) supersedes: Option<Uuid>,
-    pub(super) rolled_back_by: Option<Uuid>,
-    pub(super) set_id: Option<Uuid>,
-    pub(super) job_id: Option<Uuid>,
-}
 
 /// One reading key inside an explicit selection.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -998,16 +977,6 @@ pub struct LedgerResponse {
     pub truncated: bool,
 }
 
-#[derive(FromQueryResult)]
-pub(super) struct LedgerDecisionRow {
-    pub(super) id: Uuid,
-    pub(super) kind: String,
-    pub(super) actor: Option<String>,
-    pub(super) at: DateTime<Utc>,
-    pub(super) reason: Option<String>,
-    pub(super) old: Option<serde_json::Value>,
-    pub(super) new: Option<serde_json::Value>,
-}
 
 #[derive(FromQueryResult)]
 pub(super) struct ReceiptRow {

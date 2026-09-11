@@ -633,12 +633,13 @@ pub struct GroupMismatch {
 /// partial index predicate in m20260821_000002 exactly, since the upsert names it as its
 /// conflict target. Everything else is a decision or an outcome and is never rewritten by the
 /// gate.
-pub(crate) const OPEN: &str = "('pending', 'deferred')";
+pub(crate) static OPEN: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| HoldStatus::sql_list(&HoldStatus::OPEN));
 
 /// Everything past review. `use_portal`, `use_manual` and `consumed` are legacy statuses kept
 /// for history; nothing produces them.
-pub(super) const RESOLVED: &str =
-    "('acknowledged', 'remediated', 'superseded', 'use_portal', 'use_manual', 'consumed')";
+pub(super) static RESOLVED: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| HoldStatus::sql_list(&HoldStatus::RESOLVED));
 
 /// The most recent hold for a group, as the ingest gate reads it. Terminal decisions matter to
 /// the gate as much as open holds: a re-detected disagreement must not reopen a group an
@@ -696,11 +697,14 @@ pub async fn latest_holds<C: ConnectionTrait>(
     let rows = conn
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT DISTINCT ON (group_time) id, group_time, status, expected
-             FROM replicate_audit_holds
-             WHERE stream_id = $1 AND group_time >= $2 AND group_time <= $3
-               AND kind = 'replicate_stats'
-             ORDER BY group_time, created_at DESC, id DESC",
+            format!(
+                "SELECT DISTINCT ON (group_time) id, group_time, status, expected
+                 FROM replicate_audit_holds
+                 WHERE stream_id = $1 AND group_time >= $2 AND group_time <= $3
+                   AND kind = '{REPLICATE_STATS}'
+                 ORDER BY group_time, created_at DESC, id DESC",
+                REPLICATE_STATS = HoldKind::ReplicateStats.as_str()
+            ),
             [
                 stream_id.into(),
                 sea_orm::prelude::DateTimeWithTimeZone::from(*lo).into(),
@@ -728,8 +732,12 @@ pub async fn latest_holds<C: ConnectionTrait>(
 /// The status a detection asks for: `pending` on a paired stream (the review queue), `deferred` on
 /// an unpaired one, promoted to pending when the stream is paired.
 #[must_use]
-pub fn status_for(paired: bool) -> &'static str {
-    if paired { "pending" } else { "deferred" }
+pub fn status_for(paired: bool) -> HoldStatus {
+    if paired {
+        HoldStatus::Pending
+    } else {
+        HoldStatus::Deferred
+    }
 }
 
 /// What a hold is keyed by, which is also which open-unique index the upsert conflicts on.
@@ -754,12 +762,12 @@ pub enum HoldKey {
 /// A detection, in the shape every writer states it.
 pub struct Hold<'a> {
     pub key: HoldKey,
-    pub kind: &'a str,
+    pub kind: HoldKind,
     pub expected: serde_json::Value,
     pub computed: serde_json::Value,
     pub delta: serde_json::Value,
     /// `pending` or `deferred`; see [`status_for`].
-    pub status: &'a str,
+    pub status: HoldStatus,
     /// The calculation a finding is about, where one produced it.
     pub tool: Option<&'a str>,
 }
@@ -776,7 +784,7 @@ impl Hold<'_> {
                 group_time,
             } => (
                 "stream_id, group_time",
-                format!("(stream_id, group_time, kind) WHERE status IN {OPEN}"),
+                format!("(stream_id, group_time, kind) WHERE status IN {}", *OPEN),
                 vec![
                     stream_id.into(),
                     sea_orm::prelude::DateTimeWithTimeZone::from(group_time).into(),
@@ -788,7 +796,11 @@ impl Hold<'_> {
                 group_time,
             } => (
                 "site_id, parameter_id, group_time",
-                "(kind, site_id, parameter_id, group_time) WHERE stream_id IS NULL AND status = 'pending'"
+                format!(
+                    "(kind, site_id, parameter_id, group_time) WHERE stream_id IS NULL \
+                     AND status = '{}'",
+                    HoldStatus::Pending.as_str()
+                )
                     .to_string(),
                 vec![
                     site_id.into(),
@@ -798,7 +810,11 @@ impl Hold<'_> {
             ),
             HoldKey::StreamStanding { stream_id } => (
                 "stream_id, group_time",
-                format!("(stream_id) WHERE kind = 'source_identity_changed' AND status IN {OPEN}"),
+                format!(
+                    "(stream_id) WHERE kind = '{}' AND status IN {}",
+                    HoldKind::SourceIdentityChanged.as_str(),
+                    *OPEN
+                ),
                 vec![stream_id.into(), "NOW()".into()],
             ),
         }
@@ -820,11 +836,11 @@ pub fn hold_statement(hold: &Hold) -> Statement {
             .join(", "),
     };
     let n = values.len();
-    values.push(hold.kind.into());
+    values.push(hold.kind.as_str().into());
     values.push(hold.expected.clone().into());
     values.push(hold.computed.clone().into());
     values.push(hold.delta.clone().into());
-    values.push(hold.status.into());
+    values.push(hold.status.as_str().into());
     values.push(hold.tool.into());
     Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
@@ -835,9 +851,11 @@ pub fn hold_statement(hold: &Hold) -> Statement {
              ON CONFLICT {conflict}
              DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed,
                            delta = EXCLUDED.delta, tool = EXCLUDED.tool, created_at = NOW(),
-                           status = CASE WHEN replicate_audit_holds.status = 'deferred'
-                                              AND EXCLUDED.status = 'pending'
-                                         THEN 'pending' ELSE replicate_audit_holds.status END",
+                           status = CASE WHEN replicate_audit_holds.status = '{deferred}'
+                                              AND EXCLUDED.status = '{pending}'
+                                         THEN '{pending}' ELSE replicate_audit_holds.status END",
+            deferred = HoldStatus::Deferred.as_str(),
+            pending = HoldStatus::Pending.as_str(),
             kind = n + 1,
             expected = n + 2,
             computed = n + 3,
@@ -912,7 +930,7 @@ pub async fn upsert_stats_hold<C: ConnectionTrait>(
     conn: &C,
     stream_id: Uuid,
     mismatch: &GroupMismatch,
-    status: &str,
+    status: HoldStatus,
 ) -> AppResult<()> {
     let mut expected = serde_json::json!({
         "mean": mismatch.expected_mean,
@@ -941,7 +959,7 @@ pub async fn upsert_stats_hold<C: ConnectionTrait>(
                 stream_id,
                 group_time: mismatch.time,
             },
-            kind: "replicate_stats",
+            kind: HoldKind::ReplicateStats,
             expected,
             computed,
             delta,
@@ -960,12 +978,12 @@ pub(super) fn delta_of(expected: Option<f64>, computed: Option<f64>) -> Option<f
 pub async fn close_hold<C: ConnectionTrait>(
     conn: &C,
     hold_id: Uuid,
-    terminal_status: &str,
+    terminal_status: HoldStatus,
 ) -> AppResult<()> {
     conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "UPDATE replicate_audit_holds SET status = $2 WHERE id = $1",
-        [hold_id.into(), terminal_status.to_string().into()],
+        [hold_id.into(), terminal_status.as_str().into()],
     ))
     .await?;
     Ok(())
@@ -1366,8 +1384,9 @@ pub(super) async fn refuse_undeclared_estimator(
                  JOIN site_parameters sp ON sp.id = ds.site_parameter_id
                  JOIN sites st ON st.id = sp.site_id
                  JOIN parameters p ON p.id = sp.parameter_id
-                 WHERE h.id = $1 AND h.kind = 'replicate_stats'
-                   AND sp.sd_estimator IS NULL AND ({population_sd})"
+                 WHERE h.id = $1 AND h.kind = '{REPLICATE_STATS}'
+                   AND sp.sd_estimator IS NULL AND ({population_sd})",
+                REPLICATE_STATS = HoldKind::ReplicateStats.as_str()
             ),
             [hold_id.into()],
         ))
@@ -1408,9 +1427,11 @@ pub(super) async fn accept_ours(state: &AppState, id: Uuid, by: &str) -> AppResu
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "UPDATE replicate_audit_holds AS h
-                 SET status = 'acknowledged', resolution = {resolution_sql},
+                 SET status = '{acknowledged}', resolution = {resolution_sql},
                      acknowledged_by = $2, acknowledged_at = NOW()
-                 WHERE id = $1 AND status = 'pending'"
+                 WHERE id = $1 AND status = '{pending}'",
+                acknowledged = HoldStatus::Acknowledged.as_str(),
+                pending = HoldStatus::Pending.as_str()
             ),
             [id.into(), by.into()],
         ))
@@ -1451,8 +1472,12 @@ pub(super) async fn rule_on_entry(
         .db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT site_id, parameter_id, group_time FROM replicate_audit_holds
-             WHERE id = $1 AND kind = 'unverified_entry' AND status IN ('pending', 'deferred')",
+            format!(
+                "SELECT site_id, parameter_id, group_time FROM replicate_audit_holds
+                 WHERE id = $1 AND kind = '{kind}' AND status IN {open}",
+                kind = HoldKind::UnverifiedEntry.as_str(),
+                open = *OPEN
+            ),
             [id.into()],
         ))
         .await?
@@ -2562,11 +2587,13 @@ pub async fn create_plan(
                 "SELECT h.stream_id, count(*) AS holds, \
                         count(*) FILTER (WHERE {}) AS population \
                  FROM replicate_audit_holds h \
-                 WHERE h.kind = 'replicate_stats' \
-                   AND h.status IN ('pending', 'deferred') \
+                 WHERE h.kind = '{REPLICATE_STATS}' \
+                   AND h.status IN {open} \
                    AND h.stream_id = ANY($1) \
                  GROUP BY h.stream_id",
-                *POPULATION_SD_SQL
+                *POPULATION_SD_SQL,
+                REPLICATE_STATS = HoldKind::ReplicateStats.as_str(),
+                open = *OPEN
             ),
             [stream_ids.into()],
         ))

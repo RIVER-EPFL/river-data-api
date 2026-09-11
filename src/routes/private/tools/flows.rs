@@ -29,6 +29,8 @@ use crate::routes::private::readings::models::{
 use crate::routes::private::readings::views::insert_grab_samples;
 use crate::routes::private::reprocessing_jobs::job::Job;
 use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
+use crate::routes::private::sync::models::HoldKind;
+use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::private::sync::service as audit;
 
 /// Run a tool and store the `tool_runs` row that a later save references. Every path that
@@ -629,7 +631,7 @@ pub(super) struct FindingPayload {
 
 pub(super) async fn upsert_finding(
     db: &DatabaseConnection,
-    kind: &str,
+    kind: HoldKind,
     event: &EventContext,
     parameter_id: Uuid,
     tool: &str,
@@ -647,7 +649,7 @@ pub(super) async fn upsert_finding(
             expected: payload.expected,
             computed: payload.computed,
             delta: payload.delta,
-            status: "pending",
+            status: HoldStatus::Pending,
             tool: Some(tool),
         },
     )
@@ -675,10 +677,15 @@ pub(super) async fn record_skip(
         // The absence is now explained, so the audit's account of the same slot gives way to it.
         db.execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "UPDATE replicate_audit_holds SET status = 'superseded'
-             WHERE stream_id IS NULL AND status = 'pending'
-               AND kind IN ('missing_output', 'stale_output')
-               AND site_id = $1 AND parameter_id = $2 AND group_time = $3",
+            format!(
+                "UPDATE replicate_audit_holds SET status = '{superseded}'
+                 WHERE stream_id IS NULL AND status = '{pending}'
+                   AND kind IN {kinds}
+                   AND site_id = $1 AND parameter_id = $2 AND group_time = $3",
+                superseded = HoldStatus::Superseded.as_str(),
+                pending = HoldStatus::Pending.as_str(),
+                kinds = HoldKind::sql_list(&[HoldKind::MissingOutput, HoldKind::StaleOutput])
+            ),
             [
                 event.site_id.into(),
                 (*parameter_id).into(),
@@ -688,7 +695,7 @@ pub(super) async fn record_skip(
         .await?;
         upsert_finding(
             db,
-            "skipped_output",
+            HoldKind::SkippedOutput,
             event,
             *parameter_id,
             tool,
@@ -714,9 +721,13 @@ pub(super) async fn has_pending_skip(
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT 1 AS found FROM replicate_audit_holds
-             WHERE stream_id IS NULL AND status = 'pending' AND kind = 'skipped_output'
-               AND site_id = $1 AND parameter_id = $2 AND group_time = $3",
+            format!(
+                "SELECT 1 AS found FROM replicate_audit_holds
+                 WHERE stream_id IS NULL AND status = '{pending}' AND kind = '{kind}'
+                   AND site_id = $1 AND parameter_id = $2 AND group_time = $3",
+                pending = HoldStatus::Pending.as_str(),
+                kind = HoldKind::SkippedOutput.as_str()
+            ),
             [
                 event.site_id.into(),
                 parameter_id.into(),
@@ -736,9 +747,13 @@ pub(super) async fn supersede_findings(
     let res = db
         .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "UPDATE replicate_audit_holds SET status = 'superseded'
-             WHERE stream_id IS NULL AND status = 'pending'
-               AND site_id = $1 AND parameter_id = $2 AND group_time = $3",
+            format!(
+                "UPDATE replicate_audit_holds SET status = '{superseded}'
+                 WHERE stream_id IS NULL AND status = '{pending}'
+                   AND site_id = $1 AND parameter_id = $2 AND group_time = $3",
+                superseded = HoldStatus::Superseded.as_str(),
+                pending = HoldStatus::Pending.as_str()
+            ),
             [
                 event.site_id.into(),
                 parameter_id.into(),
@@ -962,7 +977,7 @@ pub async fn audit_event(
                             counts.stale += 1;
                             upsert_finding(
                                 &state.db,
-                                "stale_output",
+                                HoldKind::StaleOutput,
                                 event,
                                 parameter_id,
                                 &tool.name,
@@ -986,7 +1001,7 @@ pub async fn audit_event(
                             counts.stale += 1;
                             upsert_finding(
                                 &state.db,
-                                "stale_output",
+                                HoldKind::StaleOutput,
                                 event,
                                 parameter_id,
                                 &tool.name,
@@ -1015,7 +1030,7 @@ pub async fn audit_event(
                         counts.missing += 1;
                         upsert_finding(
                             &state.db,
-                            "missing_output",
+                            HoldKind::MissingOutput,
                             event,
                             parameter_id,
                             &tool.name,
@@ -1044,7 +1059,7 @@ pub async fn audit_event(
                     counts.missing += 1;
                     upsert_finding(
                         &state.db,
-                        "missing_output",
+                        HoldKind::MissingOutput,
                         event,
                         *parameter_id,
                         &tool.name,

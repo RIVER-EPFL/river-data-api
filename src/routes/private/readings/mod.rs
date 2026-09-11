@@ -1,3 +1,4 @@
+pub mod decision_model;
 pub mod flows;
 pub mod models;
 pub mod samples;

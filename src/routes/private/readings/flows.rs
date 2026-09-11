@@ -27,6 +27,7 @@ use crate::routes::private::sensors::calibrations;
 use crate::routes::private::sensors::calibrations::service::Curve;
 use crate::routes::private::sensors::calibrations::service::apply_curves;
 use crate::routes::private::sensors::calibrations::service::recalculate_derived_at_timestamp;
+use crate::routes::private::sync::models::HoldStatus;
 
 /// One staged row, as `csv_import_staging` holds it. The job reads the set four times, so the
 /// columns are named once here rather than in each pass.
@@ -102,7 +103,7 @@ pub(super) async fn displace_spot_tail(
             time,
             serde_json::json!({ "claim": "displaced", "withdrawn": entries }),
             serde_json::json!({ "replicates": count }),
-            "pending",
+            HoldStatus::Pending,
         )
         .await?;
     }

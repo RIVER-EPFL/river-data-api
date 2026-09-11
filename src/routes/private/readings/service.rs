@@ -1,3 +1,4 @@
+use super::decision_model;
 use super::models::*;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -15,7 +16,9 @@ use sea_orm::DatabaseConnection;
 use sea_orm::EntityTrait;
 use sea_orm::ExprTrait;
 use sea_orm::FromQueryResult;
+use sea_orm::NotSet;
 use sea_orm::QueryFilter;
+use sea_orm::QueryOrder;
 use sea_orm::QuerySelect;
 use sea_orm::Set;
 use sea_orm::Statement;
@@ -60,6 +63,8 @@ use crate::routes::private::sensors::standard_curves;
 use crate::routes::private::sites;
 use crate::routes::private::sites::parameters as site_parameters;
 use crate::routes::private::sync::models::GroupAudit;
+use crate::routes::private::sync::models::HoldKind;
+use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::private::sync::service as audit;
 use crate::routes::private::sync::service::GroupStats;
 use crate::routes::private::tools::models::run as tool_run;
@@ -936,6 +941,12 @@ impl Writer {
     }
 }
 
+/// The columns every writer of the ledger names, in the one order they all name them in. A column
+/// added to the table is added here and lands in every INSERT, rather than in the one whose author
+/// noticed it; the per-writer columns (`reason`, `set_id`, `job_id`) follow this list.
+pub const DECISION_COLUMNS: &str =
+    "stream_id, time, replicate_index, kind, old, new, actor, origin, supersedes";
+
 /// The reading, or the whole replicate group, a decision is about.
 #[derive(Debug, Clone, Copy)]
 pub struct DecisionKey {
@@ -957,11 +968,9 @@ pub struct Decision {
     pub set_id: Option<Uuid>,
 }
 
-pub(super) const ROW_COLUMNS: &str = "id, stream_id, time, replicate_index, kind, old, new, actor, at, reason, \
-                           origin, supersedes, rolled_back_by, set_id, job_id";
-
-pub(super) fn row_from(r: &sea_orm::QueryResult) -> AppResult<DecisionRow> {
-    let stored = StoredDecision::from_query_result(r, "")?;
+/// One stored row as the readers expose it. The two vocabularies are parsed here, because a value
+/// outside either is a corrupt row rather than a decode failure and says so.
+pub(super) fn row_from(stored: decision_model::Model) -> AppResult<DecisionRow> {
     let kind = stored.kind;
     let origin = stored.origin;
     let parsed = Kind::parse(&kind)
@@ -1091,20 +1100,21 @@ pub(super) async fn latest_live<C: ConnectionTrait>(
     .filter(|k| k.family() == Some(family))
     .map(|k| k.as_str().to_string())
     .collect();
-    let mut binds = key_binds(key);
-    binds.push(kinds.into());
-    let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id FROM reading_decisions
-             WHERE stream_id = $1 AND time = $2
-               AND replicate_index IS NOT DISTINCT FROM $3
-               AND kind = ANY($4) AND rolled_back_by IS NULL
-             ORDER BY at DESC, id DESC LIMIT 1",
-            binds,
-        ))
+    let index = decision_model::Column::ReplicateIndex;
+    let row = decision_model::Entity::find()
+        .filter(decision_model::Column::StreamId.eq(key.stream_id))
+        .filter(decision_model::Column::Time.eq(key.time))
+        .filter(match key.replicate_index {
+            Some(i) => index.eq(i),
+            None => index.is_null(),
+        })
+        .filter(decision_model::Column::Kind.is_in(kinds))
+        .filter(decision_model::Column::RolledBackBy.is_null())
+        .order_by_desc(decision_model::Column::At)
+        .order_by_desc(decision_model::Column::Id)
+        .one(conn)
         .await?;
-    Ok(row.map(|r| r.try_get("", "id")).transpose()?)
+    Ok(row.map(|r| r.id))
 }
 
 /// Append a decision and, through the table's trigger, project it onto the reading. Runs on the
@@ -1133,29 +1143,26 @@ pub async fn record<C: ConnectionTrait>(conn: &C, d: &Decision) -> AppResult<Uui
         Some(family) => latest_live(conn, &d.key, family).await?,
         None => None,
     };
-    let mut binds = key_binds(&d.key);
-    binds.extend([
-        d.kind.as_str().into(),
-        old.into(),
-        d.new.clone().into(),
-        d.actor.clone().into(),
-        d.reason.clone().into(),
-        d.origin.as_str().into(),
-        supersedes.into(),
-        d.set_id.into(),
-    ]);
-    let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO reading_decisions
-                 (stream_id, time, replicate_index, kind, old, new, actor, reason, origin,
-                  supersedes, set_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-             RETURNING id",
-            binds,
-        ))
-        .await?
-        .ok_or_else(|| AppError::Internal("recording a decision returned no row".to_string()))?;
+    let id = Uuid::new_v4();
+    decision_model::ActiveModel {
+        id: Set(id),
+        stream_id: Set(d.key.stream_id),
+        time: Set(d.key.time.into()),
+        replicate_index: Set(d.key.replicate_index),
+        kind: Set(d.kind.as_str().to_string()),
+        old: Set(old),
+        new: Set(d.new.clone()),
+        actor: Set(d.actor.clone()),
+        at: NotSet,
+        reason: Set(d.reason.clone()),
+        origin: Set(d.origin.as_str().to_string()),
+        supersedes: Set(supersedes),
+        rolled_back_by: Set(None),
+        set_id: Set(d.set_id),
+        job_id: Set(None),
+    }
+    .insert(conn)
+    .await?;
     if d.kind == Kind::ValueCorrection {
         recompose_corrected(
             conn,
@@ -1165,7 +1172,7 @@ pub async fn record<C: ConnectionTrait>(conn: &C, d: &Decision) -> AppResult<Uui
         )
         .await?;
     }
-    Ok(row.try_get("", "id")?)
+    Ok(id)
 }
 
 /// Invert one decision: append a `rollback` carrying the state the decision recorded as `old`,
@@ -1228,30 +1235,32 @@ pub async fn rollback<C: ConnectionTrait>(
             Vec::new()
         },
     };
-    let mut binds = key_binds(&key);
-    binds.extend([
-        current.into(),
-        serde_json::json!({ "columns": restore, "of": decision_id }).into(),
-        actor.into(),
-        reason.into(),
-    ]);
-    let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO reading_decisions
-                 (stream_id, time, replicate_index, kind, old, new, actor, reason, origin)
-             VALUES ($1, $2, $3, 'rollback', $4, $5, $6, $7, 'rollback')
-             RETURNING id",
-            binds,
-        ))
-        .await?
-        .ok_or_else(|| AppError::Internal("recording a rollback returned no row".to_string()))?;
-    let rollback_id: Uuid = row.try_get("", "id")?;
-    conn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "UPDATE reading_decisions SET rolled_back_by = $1 WHERE id = $2",
-        [rollback_id.into(), decision_id.into()],
-    ))
+    let rollback_id = Uuid::new_v4();
+    decision_model::ActiveModel {
+        id: Set(rollback_id),
+        stream_id: Set(key.stream_id),
+        time: Set(key.time.into()),
+        replicate_index: Set(key.replicate_index),
+        kind: Set(Kind::Rollback.as_str().to_string()),
+        old: Set(current),
+        new: Set(serde_json::json!({ "columns": restore, "of": decision_id })),
+        actor: Set(actor.to_string()),
+        at: NotSet,
+        reason: Set(reason.map(ToString::to_string)),
+        origin: Set(Origin::Rollback.as_str().to_string()),
+        supersedes: Set(None),
+        rolled_back_by: Set(None),
+        set_id: Set(None),
+        job_id: Set(None),
+    }
+    .insert(conn)
+    .await?;
+    decision_model::ActiveModel {
+        id: Set(decision_id),
+        rolled_back_by: Set(Some(rollback_id)),
+        ..Default::default()
+    }
+    .update(conn)
     .await?;
     if d.kind == Kind::ValueCorrection {
         recompose_corrected(
@@ -1484,17 +1493,15 @@ pub async fn record_many<C: ConnectionTrait>(
              JOIN data_streams ds ON ds.id = r.stream_id
              WHERE {row_predicate}
          ), ins AS (
-             INSERT INTO reading_decisions
-                 (stream_id, time, replicate_index, kind, old, new, actor, reason, origin,
-                  supersedes, set_id)
+             INSERT INTO reading_decisions ({DECISION_COLUMNS}, reason, set_id)
              SELECT t.stream_id, t.time, t.replicate_index, ${kind_b}, {old_sql}, {new_sql},
-                    ${actor_b}, ${reason_b}, ${origin_b},
+                    ${actor_b}, ${origin_b},
                     (SELECT d.id FROM reading_decisions d
                       WHERE d.stream_id = t.stream_id AND d.time = t.time
                         AND d.replicate_index IS NOT DISTINCT FROM t.replicate_index
                         AND d.kind = ANY(${family_b}) AND d.rolled_back_by IS NULL
                       ORDER BY d.at DESC, d.id DESC LIMIT 1),
-                    ${set_b}
+                    ${reason_b}, ${set_b}
              FROM target t
              RETURNING time
          )
@@ -1586,19 +1593,17 @@ pub async fn record_keyed<C: ConnectionTrait>(
              JOIN readings r ON r.stream_id = $1 AND r.time = k.t AND r.replicate_index = k.ri
              WHERE TRUE{filter}{guard}
          ), ins AS (
-             INSERT INTO reading_decisions
-                 (stream_id, time, replicate_index, kind, old, new, actor, reason, origin,
-                  supersedes, set_id)
+             INSERT INTO reading_decisions ({DECISION_COLUMNS}, reason, set_id)
              SELECT t.stream_id, t.time, t.replicate_index, $5,
                     (SELECT COALESCE(jsonb_object_agg(c, t.state -> c), '{{}}'::jsonb)
                        FROM unnest($9::text[]) AS c),
-                    t.n, $6, $7, $8,
+                    t.n, $6, $8,
                     (SELECT d.id FROM reading_decisions d
                       WHERE d.stream_id = t.stream_id AND d.time = t.time
                         AND d.replicate_index IS NOT DISTINCT FROM t.replicate_index
                         AND d.kind = ANY($10) AND d.rolled_back_by IS NULL
                       ORDER BY d.at DESC, d.id DESC LIMIT 1),
-                    $11
+                    $7, $11
              FROM target t
              RETURNING time
          )
@@ -2539,15 +2544,11 @@ pub async fn output_owner<C: ConnectionTrait>(
 }
 
 pub async fn load<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<DecisionRow> {
-    let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!("SELECT {ROW_COLUMNS} FROM reading_decisions WHERE id = $1"),
-            [id.into()],
-        ))
+    let row = decision_model::Entity::find_by_id(id)
+        .one(conn)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Decision {id} not found")))?;
-    row_from(&row)
+    row_from(row)
 }
 
 /// Every decision on a key, newest first. A group key lists group decisions only; a replicate
@@ -2556,19 +2557,22 @@ pub async fn history<C: ConnectionTrait>(
     conn: &C,
     key: &DecisionKey,
 ) -> AppResult<Vec<DecisionRow>> {
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT {ROW_COLUMNS} FROM reading_decisions
-                 WHERE stream_id = $1 AND time = $2
-                   AND (replicate_index IS NULL OR $3::smallint IS NULL OR replicate_index = $3)
-                 ORDER BY at DESC, id DESC"
-            ),
-            key_binds(key),
-        ))
+    let mut find = decision_model::Entity::find()
+        .filter(decision_model::Column::StreamId.eq(key.stream_id))
+        .filter(decision_model::Column::Time.eq(key.time));
+    if let Some(index) = key.replicate_index {
+        find = find.filter(
+            decision_model::Column::ReplicateIndex
+                .is_null()
+                .or(decision_model::Column::ReplicateIndex.eq(index)),
+        );
+    }
+    let rows = find
+        .order_by_desc(decision_model::Column::At)
+        .order_by_desc(decision_model::Column::Id)
+        .all(conn)
         .await?;
-    rows.iter().map(row_from).collect()
+    rows.into_iter().map(row_from).collect()
 }
 
 /// The default and the ceiling on how much history one read returns. A value with a thousand
@@ -2593,27 +2597,25 @@ pub(super) async fn decisions<C: ConnectionTrait>(
     if streams.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = LedgerDecisionRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT id, kind, actor, at, reason, old, new FROM reading_decisions \
-          WHERE stream_id = ANY($1) AND time = $2 ORDER BY at DESC",
-        [streams.to_vec().into(), time.into()],
-    ))
-    .all(conn)
-    .await?;
+    let rows = decision_model::Entity::find()
+        .filter(decision_model::Column::StreamId.is_in(streams.to_vec()))
+        .filter(decision_model::Column::Time.eq(time))
+        .order_by_desc(decision_model::Column::At)
+        .all(conn)
+        .await?;
     Ok(rows
         .into_iter()
         .map(|r| LedgerEntry {
-            at: r.at,
+            at: r.at.into(),
             source: "decision".to_string(),
             severity: Severity::Info.as_str().to_string(),
-            actor: r.actor,
+            actor: Some(r.actor),
             what: match r.reason {
                 Some(why) if !why.trim().is_empty() => format!("{}: {why}", r.kind),
                 _ => r.kind,
             },
-            old: r.old,
-            new: r.new,
+            old: Some(r.old),
+            new: Some(r.new),
             id: r.id,
         })
         .collect())
@@ -4115,6 +4117,16 @@ pub(super) async fn fetch_covering_receipts(
     Ok(out)
 }
 
+/// The statuses a hold is still live under, as the ledger's "what is open here" readers name it:
+/// awaiting review, or reviewed but not yet acted on.
+fn live_hold_statuses() -> String {
+    HoldStatus::sql_list(&[
+        HoldStatus::Pending,
+        HoldStatus::Deferred,
+        HoldStatus::Acknowledged,
+    ])
+}
+
 /// Replicate-statistics holds keyed by stream at the instant. Terminal holds are left out.
 pub(super) async fn fetch_stream_holds(
     db: &sea_orm::DatabaseConnection,
@@ -4124,11 +4136,14 @@ pub(super) async fn fetch_stream_holds(
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT stream_id, NULL::uuid AS parameter_id, id, kind, status, created_at \
-             FROM replicate_audit_holds \
-             WHERE stream_id = ANY($1) AND group_time = $2 \
-               AND status IN ('pending', 'deferred', 'acknowledged') \
-             ORDER BY created_at DESC",
+            format!(
+                "SELECT stream_id, NULL::uuid AS parameter_id, id, kind, status, created_at \
+                 FROM replicate_audit_holds \
+                 WHERE stream_id = ANY($1) AND group_time = $2 \
+                   AND status IN {live} \
+                 ORDER BY created_at DESC",
+                live = live_hold_statuses()
+            ),
             [stream_ids.to_vec().into(), time.into()],
         ))
         .await?;
@@ -4159,11 +4174,14 @@ pub(super) async fn fetch_slot_holds(
         let found = db
             .query_all_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT NULL::uuid AS stream_id, parameter_id, id, kind, status, created_at \
-                 FROM replicate_audit_holds \
-                 WHERE stream_id IS NULL AND site_id = $1 AND parameter_id = ANY($2) \
-                   AND group_time = $3 AND status IN ('pending', 'deferred', 'acknowledged') \
-                 ORDER BY created_at DESC",
+                format!(
+                    "SELECT NULL::uuid AS stream_id, parameter_id, id, kind, status, created_at \
+                     FROM replicate_audit_holds \
+                     WHERE stream_id IS NULL AND site_id = $1 AND parameter_id = ANY($2) \
+                       AND group_time = $3 AND status IN {live} \
+                     ORDER BY created_at DESC",
+                    live = live_hold_statuses()
+                ),
                 [
                     site_id.into(),
                     parameter_ids.into_iter().collect::<Vec<_>>().into(),
@@ -5939,7 +5957,7 @@ pub(super) async fn upsert_curve_claim_hold<C: ConnectionTrait>(
     stream_id: Uuid,
     group_time: chrono::DateTime<Utc>,
     claims: &[serde_json::Value],
-    status: &str,
+    status: HoldStatus,
 ) -> AppResult<()> {
     audit::upsert_hold(
         conn,
@@ -5948,7 +5966,7 @@ pub(super) async fn upsert_curve_claim_hold<C: ConnectionTrait>(
                 stream_id,
                 group_time,
             },
-            kind: "curve_claim_stripped",
+            kind: HoldKind::CurveClaimStripped,
             expected: serde_json::json!({ "claims": claims }),
             computed: serde_json::json!({ "stored_without_curve": claims.len() }),
             delta: serde_json::json!({}),
@@ -5959,9 +5977,14 @@ pub(super) async fn upsert_curve_claim_hold<C: ConnectionTrait>(
     .await?;
     conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "UPDATE replicate_audit_holds SET status = 'superseded'
-         WHERE stream_id = $1 AND group_time = $2 AND kind = 'replicate_stats'
-           AND status IN ('pending', 'deferred')",
+        format!(
+            "UPDATE replicate_audit_holds SET status = '{superseded}'
+             WHERE stream_id = $1 AND group_time = $2 AND kind = '{kind}'
+               AND status IN {open}",
+            superseded = HoldStatus::Superseded.as_str(),
+            open = *crate::routes::private::sync::service::OPEN,
+            kind = HoldKind::ReplicateStats.as_str()
+        ),
         [
             stream_id.into(),
             sea_orm::prelude::DateTimeWithTimeZone::from(group_time).into(),
@@ -6134,10 +6157,10 @@ pub(super) async fn run_replicate_audit(
             sd_estimator: estimator.to_string(),
             values: values.to_vec(),
         };
-        let hold_status = if paired { "pending" } else { "deferred" };
+        let hold_status = audit::status_for(paired);
         match (agree, holds_by_time.get(&a.time)) {
             (true, Some(hold)) if matches!(hold.status.as_str(), "pending" | "deferred") => {
-                audit::close_hold(txn, hold.id, "superseded").await?;
+                audit::close_hold(txn, hold.id, HoldStatus::Superseded).await?;
             }
             (true, _) => {}
             // The operator's decision stands against re-detection of the SAME disagreement. A
@@ -6891,9 +6914,13 @@ pub async fn open_unverified_holds<C: sea_orm::ConnectionTrait>(
         let updated = conn
             .execute_raw(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "UPDATE replicate_audit_holds SET computed = $4, created_at = NOW() \
-                 WHERE site_id = $1 AND parameter_id = $2 AND group_time = $3 \
-                   AND kind = 'unverified_entry' AND status IN ('pending', 'deferred')",
+                format!(
+                    "UPDATE replicate_audit_holds SET computed = $4, created_at = NOW() \
+                     WHERE site_id = $1 AND parameter_id = $2 AND group_time = $3 \
+                       AND kind = '{kind}' AND status IN {open}",
+                    kind = HoldKind::UnverifiedEntry.as_str(),
+                    open = *crate::routes::private::sync::service::OPEN
+                ),
                 binds,
             ))
             .await?
@@ -6911,11 +6938,11 @@ pub async fn open_unverified_holds<C: sea_orm::ConnectionTrait>(
                     parameter_id: *parameter_id,
                     group_time: *at,
                 },
-                kind: "unverified_entry",
+                kind: HoldKind::UnverifiedEntry,
                 expected: serde_json::json!({ "state": "verified" }),
                 computed: serde_json::json!({ "state": "unverified", "entered_by": actor }),
                 delta: serde_json::json!({}),
-                status: "pending",
+                status: HoldStatus::Pending,
                 tool: None,
             },
         )
@@ -7970,7 +7997,7 @@ pub(crate) async fn upsert_source_modified_hold<C: ConnectionTrait>(
     group_time: DateTime<Utc>,
     expected: serde_json::Value,
     computed: serde_json::Value,
-    status: &str,
+    status: HoldStatus,
 ) -> AppResult<()> {
     audit::upsert_hold(
         conn,
@@ -7979,7 +8006,7 @@ pub(crate) async fn upsert_source_modified_hold<C: ConnectionTrait>(
                 stream_id,
                 group_time,
             },
-            kind: "source_modified",
+            kind: HoldKind::SourceModified,
             expected,
             computed,
             delta: serde_json::json!({}),
@@ -7997,7 +8024,7 @@ pub(super) async fn upsert_brake_hold<C: ConnectionTrait>(
     changed: usize,
     withdrawn: usize,
     stored: usize,
-    status: &str,
+    status: HoldStatus,
 ) -> AppResult<()> {
     audit::upsert_hold(
         conn,
@@ -8006,7 +8033,7 @@ pub(super) async fn upsert_brake_hold<C: ConnectionTrait>(
                 stream_id,
                 group_time: window.from,
             },
-            kind: "brake_fired",
+            kind: HoldKind::BrakeFired,
             expected: serde_json::json!({
                 "window": { "from": window.from, "to": window.to },
                 "would_change": changed,
@@ -8147,9 +8174,13 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
         let release = conn
             .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT id FROM replicate_audit_holds
-                 WHERE stream_id = $1 AND kind = 'brake_fired' AND status = 'acknowledged'
-                 ORDER BY created_at DESC LIMIT 1",
+                format!(
+                    "SELECT id FROM replicate_audit_holds
+                     WHERE stream_id = $1 AND kind = '{kind}' AND status = '{acknowledged}'
+                     ORDER BY created_at DESC LIMIT 1",
+                    acknowledged = HoldStatus::Acknowledged.as_str(),
+                    kind = HoldKind::BrakeFired.as_str()
+                ),
                 [stream_id.into()],
             ))
             .await?;
@@ -8158,8 +8189,12 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
                 let hold_id: Uuid = row.try_get("", "id")?;
                 conn.execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Postgres,
-                    "UPDATE replicate_audit_holds SET status = 'remediated'
-                     WHERE id = $1 AND status = 'acknowledged'",
+                    format!(
+                        "UPDATE replicate_audit_holds SET status = '{remediated}'
+                         WHERE id = $1 AND status = '{acknowledged}'",
+                        remediated = HoldStatus::Remediated.as_str(),
+                        acknowledged = HoldStatus::Acknowledged.as_str()
+                    ),
                     [hold_id.into()],
                 ))
                 .await?;
