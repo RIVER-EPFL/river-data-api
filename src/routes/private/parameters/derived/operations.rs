@@ -3,6 +3,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
     Statement, TransactionTrait,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -12,7 +13,13 @@ use crate::routes::private::constants;
 use crate::routes::private::parameters;
 use crate::routes::private::tools::service::free_identifiers;
 
-/// Maximum allowed derived-from-derived chain depth.
+/// A formula's content hash: sha256 over the text itself, so one text is one version however it
+/// was saved.
+fn formula_hash(formula: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(formula.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
 
 /// Mint a version of a standalone definition's formula, unless the newest one already holds that
 /// text.
@@ -27,9 +34,7 @@ async fn mint_derived_version<C: ConnectionTrait>(
     formula: &str,
     actor: Option<&str>,
 ) -> Result<(), ApiError> {
-    // The same hash the migration computes for the same text, so version 1 and every version
-    // after it are hashed one way.
-    let hash = migration::m20260910_000014_derived_definition_versions::formula_hash(formula);
+    let hash = formula_hash(formula);
     let newest = super::version_model::Entity::find()
         .filter(super::version_model::Column::DefinitionId.eq(definition_id))
         .order_by_desc(super::version_model::Column::VersionNo)

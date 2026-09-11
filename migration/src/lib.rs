@@ -1,60 +1,6 @@
 pub use sea_orm_migration::prelude::*;
 
 mod m20260905_000001_baseline;
-mod m20260905_000002_pairing_plan_version;
-pub mod m20260906_000001_attribute_existing_readings;
-mod m20260906_000002_instrument_required_untyped;
-mod m20260906_000003_note_provenance;
-mod m20260907_000001_full_reassert_per_service;
-pub mod m20260907_000002_backdate_auto_deployments;
-pub mod m20260907_000003_sample_statistics;
-mod m20260907_000004_unverified_entries;
-pub mod m20260907_000005_instrument_kind;
-pub mod m20260907_000006_synthesise_curation_record;
-mod m20260907_000007_meteoswiss_pressure;
-mod m20260908_000001_parameter_groups;
-mod m20260908_000002_calculation_engines;
-mod m20260908_000003_source_identity_hold_uniq;
-mod m20260908_000004_notification_kind_groups;
-mod m20260908_000005_curve_fitted_on;
-pub mod m20260908_000006_one_doc_parameter;
-mod m20260908_000007_seed_portal_parameter_groups;
-pub mod m20260908_000008_channel_health_into_state;
-mod m20260909_000001_seed_metalp_parameter_groups;
-pub mod m20260910_000001_change_audit;
-mod m20260910_000002_parameter_default_thresholds;
-mod m20260910_000003_generated_sample_stdev;
-mod m20260910_000004_rollback_restores_ingested_at;
-pub mod m20260910_000005_source_parameter_instrument_names;
-pub mod m20260910_000006_provenance_kind;
-pub mod m20260910_000007_site_parameter_entry_mode;
-pub mod m20260910_000008_formula_curve_slot;
-mod m20260910_000009_slot_instrument;
-pub mod m20260910_000010_formula_per_replicate;
-mod m20260910_000011_prediction_kind_group;
-pub mod m20260910_000012_drop_subscriber_cache;
-mod m20260910_000013_ingested_at_is_first_arrival;
-pub mod m20260910_000014_derived_definition_versions;
-mod m20260910_000015_entity_change_audit;
-mod m20260910_000016_curve_copied_from;
-pub mod m20260910_000017_rename_calculation_formulas;
-mod m20260910_000018_reading_change_proposals;
-pub mod m20260910_000019_ledger_lookup_indexes;
-mod m20260910_000020_formula_site_source;
-pub mod m20260910_000021_curve_retirement;
-mod m20260910_000022_formula_transition;
-mod m20260910_000023_drop_member_decimal_places;
-mod m20260910_000024_janitor_recompose_decision;
-mod m20260910_000025_derived_computed_decision;
-pub mod m20260910_000026_roll_back_live_pins;
-pub mod m20260910_000027_subscribe_by_channel;
-mod m20260910_000028_reprocess_decision;
-mod m20260910_000029_sync_source_system;
-mod m20260910_000030_plan_accepted_objects;
-pub mod m20260910_000031_stage_unpaired_readings;
-mod m20260910_000032_formula_intermediate;
-mod m20260910_000033_instrument_proposals;
-pub mod m20260910_000034_formula_name_units_not_null;
 
 pub struct Migrator;
 
@@ -63,60 +9,6 @@ impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
         vec![
             Box::new(m20260905_000001_baseline::Migration),
-            Box::new(m20260905_000002_pairing_plan_version::Migration),
-            Box::new(m20260906_000001_attribute_existing_readings::Migration),
-            Box::new(m20260906_000002_instrument_required_untyped::Migration),
-            Box::new(m20260906_000003_note_provenance::Migration),
-            Box::new(m20260907_000001_full_reassert_per_service::Migration),
-            Box::new(m20260907_000002_backdate_auto_deployments::Migration),
-            Box::new(m20260907_000003_sample_statistics::Migration),
-            Box::new(m20260907_000004_unverified_entries::Migration),
-            Box::new(m20260907_000005_instrument_kind::Migration),
-            Box::new(m20260907_000006_synthesise_curation_record::Migration),
-            Box::new(m20260907_000007_meteoswiss_pressure::Migration),
-            Box::new(m20260908_000001_parameter_groups::Migration),
-            Box::new(m20260908_000002_calculation_engines::Migration),
-            Box::new(m20260908_000003_source_identity_hold_uniq::Migration),
-            Box::new(m20260908_000004_notification_kind_groups::Migration),
-            Box::new(m20260908_000005_curve_fitted_on::Migration),
-            Box::new(m20260908_000006_one_doc_parameter::Migration),
-            Box::new(m20260908_000007_seed_portal_parameter_groups::Migration),
-            Box::new(m20260908_000008_channel_health_into_state::Migration),
-            Box::new(m20260909_000001_seed_metalp_parameter_groups::Migration),
-            Box::new(m20260910_000001_change_audit::Migration),
-            Box::new(m20260910_000002_parameter_default_thresholds::Migration),
-            Box::new(m20260910_000003_generated_sample_stdev::Migration),
-            Box::new(m20260910_000004_rollback_restores_ingested_at::Migration),
-            Box::new(m20260910_000005_source_parameter_instrument_names::Migration),
-            Box::new(m20260910_000006_provenance_kind::Migration),
-            Box::new(m20260910_000007_site_parameter_entry_mode::Migration),
-            Box::new(m20260910_000008_formula_curve_slot::Migration),
-            Box::new(m20260910_000009_slot_instrument::Migration),
-            Box::new(m20260910_000010_formula_per_replicate::Migration),
-            Box::new(m20260910_000011_prediction_kind_group::Migration),
-            Box::new(m20260910_000012_drop_subscriber_cache::Migration),
-            Box::new(m20260910_000013_ingested_at_is_first_arrival::Migration),
-            Box::new(m20260910_000014_derived_definition_versions::Migration),
-            Box::new(m20260910_000015_entity_change_audit::Migration),
-            Box::new(m20260910_000016_curve_copied_from::Migration),
-            Box::new(m20260910_000017_rename_calculation_formulas::Migration),
-            Box::new(m20260910_000018_reading_change_proposals::Migration),
-            Box::new(m20260910_000019_ledger_lookup_indexes::Migration),
-            Box::new(m20260910_000020_formula_site_source::Migration),
-            Box::new(m20260910_000021_curve_retirement::Migration),
-            Box::new(m20260910_000022_formula_transition::Migration),
-            Box::new(m20260910_000023_drop_member_decimal_places::Migration),
-            Box::new(m20260910_000024_janitor_recompose_decision::Migration),
-            Box::new(m20260910_000025_derived_computed_decision::Migration),
-            Box::new(m20260910_000026_roll_back_live_pins::Migration),
-            Box::new(m20260910_000027_subscribe_by_channel::Migration),
-            Box::new(m20260910_000028_reprocess_decision::Migration),
-            Box::new(m20260910_000029_sync_source_system::Migration),
-            Box::new(m20260910_000030_plan_accepted_objects::Migration),
-            Box::new(m20260910_000031_stage_unpaired_readings::Migration),
-            Box::new(m20260910_000032_formula_intermediate::Migration),
-            Box::new(m20260910_000033_instrument_proposals::Migration),
-            Box::new(m20260910_000034_formula_name_units_not_null::Migration),
         ]
     }
 }

@@ -2,44 +2,22 @@ use sea_orm_migration::prelude::*;
 
 /// The whole schema in one migration.
 ///
-/// Everything up to and including `m20260904_000002_instrument_per_slot` is folded in here, so a
-/// new database is built once in its final shape rather than assembled and rebuilt: the telegram
-/// tables are never created, the continuous aggregates are defined once instead of three times,
-/// and `standard_curves` is created in the shape it ends up with.
+/// The schema below was generated from a fully migrated database rather than written by hand, and
+/// verified byte-identical to the chain it replaces with `scripts/dbdiff.sh` (public DDL, all 20
+/// TimescaleDB objects, per-table content hashes). It creates the schema and nothing else: a
+/// database starts blank, and every parameter, constant, tool script and instrument arrives
+/// through the plan or the form an operator validates (Q134).
 ///
-/// The schema below was generated from a fully migrated database rather than written by hand. It
-/// creates the schema and nothing else: a database starts blank, and every parameter, constant,
-/// tool script and instrument arrives through the plan or the form an operator validates (Q134).
+/// This is the second flattening. The 55 migrations it folds in are deleted, not kept: they live
+/// in commit 09556d14, the last one registering all of them, and the 99 the first baseline
+/// replaced live in 3b6876a.
 ///
-/// This cannot be applied to a database that already holds rows, and there is no schema-only route
-/// for one: 26 of the migrations it replaces rewrite existing rows, so skipping them leaves the
-/// data loading plausibly and wrong (`sensors` unsplit, api streams unpaired, `collection_events`
-/// never backfilled, identity calibrations never retired). Such a database is carried forward by
-/// the chain this replaces, which is commit 3b6876a, the last one registering all 99:
-///
-/// ```text
-/// git worktree add /tmp/premigrate 3b6876a
-/// cd /tmp/premigrate && cargo build -p migration
-/// ./target/debug/migration up -u postgresql://.../<a copy of the dump>
-/// ```
-///
-/// The chain leaves that copy in this baseline's schema, so the ledger it wrote is replaced by the
-/// one row that describes the same schema and the copy is carried the rest of the way with the
-/// current migrator, which is what applies the migrations added after the flatten to the real
-/// rows. The replacement is required, not tidiness: the migrator refuses to run at all while
-/// `seaql_migrations` names versions whose files are gone.
-///
-/// ```text
-/// psql <copy> -c "DELETE FROM seaql_migrations; \
-///   INSERT INTO seaql_migrations (version, applied_at) \
-///   VALUES ('m20260905_000001_baseline', extract(epoch from now())::bigint)"
-/// cargo run -p migration -- up -u postgresql://.../<copy>
-/// ```
-///
-/// Then dump that copy `--data-only --exclude-table-data='_timescaledb_internal.*'`, build the
-/// target from this baseline and restore. `scripts/dbdiff.sh` compares the result against the carried-forward copy; it
-/// normalises TimescaleDB's internal aggregate numbering and skips `reprocessing_jobs`, which the
-/// split migration queues work into and an empty database has none of.
+/// There is no route from a database holding rows to this schema, and none is wanted. Production
+/// is wiped and rebuilt blank when dev moves to prod (Q138): dump it first, build the new
+/// database from this baseline, let the pairing plans and the sync services mint its sites,
+/// parameters, streams and instruments, then carry the dump's readings, curation ledger and
+/// public API setups across with `cargo run --bin restore_cutover`, whose doc comment carries the
+/// order and what the run reports.
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
@@ -118,10 +96,7 @@ CREATE FUNCTION public.reading_decisions_project() RETURNS trigger
                 ELSIF NEW.kind = 'value_correction' THEN
                     UPDATE readings
                        SET raw_value = (NEW.new ->> 'raw_value')::double precision,
-                           calibrated_value = NULL,
-                           ingested_at = CASE
-                               WHEN raw_value IS DISTINCT FROM (NEW.new ->> 'raw_value')::double precision
-                               THEN NOW() ELSE ingested_at END
+                           calibrated_value = NULL
                      WHERE stream_id = NEW.stream_id AND time = NEW.time
                        AND replicate_index = NEW.replicate_index;
                 ELSIF NEW.kind = 'unverified_entry' THEN
@@ -130,6 +105,10 @@ CREATE FUNCTION public.reading_decisions_project() RETURNS trigger
                        AND (NEW.replicate_index IS NULL OR replicate_index = NEW.replicate_index);
                 ELSIF NEW.kind = 'verify' THEN
                     UPDATE readings SET unverified = FALSE
+                     WHERE stream_id = NEW.stream_id AND time = NEW.time
+                       AND (NEW.replicate_index IS NULL OR replicate_index = NEW.replicate_index);
+                ELSIF NEW.kind = 'curve_retire' THEN
+                    UPDATE readings SET calibration_id = (NEW.new ->> 'calibration_id')::uuid
                      WHERE stream_id = NEW.stream_id AND time = NEW.time
                        AND (NEW.replicate_index IS NULL OR replicate_index = NEW.replicate_index);
                 ELSIF NEW.kind = 'rollback' THEN
@@ -152,12 +131,83 @@ CREATE FUNCTION public.reading_decisions_project() RETURNS trigger
             END;
             $$;
 
+CREATE FUNCTION public.readings_default_provenance_kind() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+            DECLARE origin text;
+            BEGIN
+                IF NEW.provenance_kind IS NOT NULL THEN
+                    RETURN NEW;
+                END IF;
+                IF NEW.measurement_type = 'derived' THEN
+                    NEW.provenance_kind := 'derived';
+                    RETURN NEW;
+                END IF;
+                SELECT source_system INTO origin FROM data_streams WHERE id = NEW.stream_id;
+                NEW.provenance_kind := CASE
+                    WHEN origin = 'grab_sample' THEN 'manual'
+                    WHEN origin = 'api' THEN 'batch'
+                    WHEN origin IS NOT NULL THEN 'sync'
+                    ELSE 'migration'
+                END;
+                RETURN NEW;
+            END;
+            $$;
+
+CREATE FUNCTION public.readings_inherit_stream_instrument() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+            BEGIN
+                IF NEW.sensor_id IS NULL AND NEW.site_id IS NOT NULL
+                   AND NEW.measurement_type IS DISTINCT FROM 'derived' THEN
+                    SELECT sensor_id INTO NEW.sensor_id FROM data_streams WHERE id = NEW.stream_id;
+                END IF;
+                RETURN NEW;
+            END;
+            $$;
+
+CREATE FUNCTION public.record_entity_change() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+        actor  text  := NULLIF(current_setting('river.actor', true), '');
+        kind   text  := lower(TG_ARGV[0]) || '_' || lower(TG_OP);
+        before jsonb := CASE WHEN TG_OP <> 'INSERT' THEN to_jsonb(OLD) END;
+        after  jsonb := CASE WHEN TG_OP <> 'DELETE' THEN to_jsonb(NEW) END;
+        row    jsonb := COALESCE(after, before);
+    BEGIN
+        IF TG_OP = 'UPDATE' AND before IS NOT DISTINCT FROM after THEN
+            RETURN NEW;
+        END IF;
+        INSERT INTO public.change_audit (subject, change, old_value, new_value, changed_by)
+        VALUES (TG_ARGV[0] || ':' || (row->>'id'), kind, before, after, actor);
+        RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+    END;
+    $$;
+
+CREATE FUNCTION public.record_parameter_group_change() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+        actor  text  := NULLIF(current_setting('river.actor', true), '');
+        kind   text  := lower(TG_ARGV[0]) || '_' || lower(TG_OP);
+        before jsonb := CASE WHEN TG_OP <> 'INSERT' THEN to_jsonb(OLD) END;
+        after  jsonb := CASE WHEN TG_OP <> 'DELETE' THEN to_jsonb(NEW) END;
+        row    jsonb := COALESCE(after, before);
+    BEGIN
+        INSERT INTO public.change_audit (subject, change, old_value, new_value, changed_by)
+        VALUES ('parameter_group:' || CASE WHEN TG_ARGV[0] = 'group'
+                                           THEN row->>'id' ELSE row->>'group_id' END,
+                kind, before, after, actor);
+        RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+    END;
+    $$;
+
 CREATE FUNCTION public.refresh_sample_aggregate(target_sample_id uuid) RETURNS void
     LANGUAGE plpgsql
     AS $$
 DECLARE
     total_refs BIGINT;
-    estimator TEXT;
 BEGIN
     IF target_sample_id IS NULL THEN
         RETURN;
@@ -177,23 +227,22 @@ BEGIN
         RETURN;
     END IF;
 
-    SELECT s.sd_estimator INTO estimator
-    FROM samples s
-    WHERE s.id = target_sample_id;
-
     UPDATE samples s
-    SET mean       = a.mean,
-        stdev      = CASE WHEN estimator = 'population'
-                          THEN a.stdev_pop ELSE a.stdev_samp END,
-        n          = COALESCE(a.n, 0),
-        min_value  = a.min_value,
-        max_value  = a.max_value,
-        updated_at = NOW()
+    SET mean             = a.mean,
+        stdev_sample     = a.stdev_samp,
+        stdev_population = a.stdev_pop,
+        median           = a.median,
+        n                = COALESCE(a.n, 0),
+        min_value        = a.min_value,
+        max_value        = a.max_value,
+        updated_at       = NOW()
     FROM (
         SELECT
             AVG(COALESCE(calibrated_value, raw_value))         AS mean,
             STDDEV_SAMP(COALESCE(calibrated_value, raw_value)) AS stdev_samp,
             STDDEV_POP(COALESCE(calibrated_value, raw_value))  AS stdev_pop,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (
+                ORDER BY COALESCE(calibrated_value, raw_value))  AS median,
             COUNT(*)::INTEGER                                   AS n,
             MIN(COALESCE(calibrated_value, raw_value))         AS min_value,
             MAX(COALESCE(calibrated_value, raw_value))         AS max_value
@@ -201,22 +250,11 @@ BEGIN
         WHERE sample_id = target_sample_id
           AND is_flagged IS NOT TRUE
           AND withdrawn_at IS NULL
+          AND unverified IS NOT TRUE
     ) a
     WHERE s.id = target_sample_id;
 END;
 $$;
-
-CREATE FUNCTION public.readings_inherit_stream_instrument() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-            BEGIN
-                IF NEW.sensor_id IS NULL AND NEW.site_id IS NOT NULL
-                   AND NEW.measurement_type IS DISTINCT FROM 'derived' THEN
-                    SELECT sensor_id INTO NEW.sensor_id FROM data_streams WHERE id = NEW.stream_id;
-                END IF;
-                RETURN NEW;
-            END;
-            $$;
 
 CREATE FUNCTION public.samples_on_reading_delete() RETURNS trigger
     LANGUAGE plpgsql
@@ -282,8 +320,11 @@ CREATE TABLE public.readings (
     notes text,
     created_by text,
     unverified boolean DEFAULT false NOT NULL,
-    CONSTRAINT readings_withdrawn_spot_only CHECK (((withdrawn_at IS NULL) OR ((measurement_type)::text = 'spot'::text))),
-    CONSTRAINT readings_instrument_required CHECK (((sensor_id IS NOT NULL) OR (site_id IS NULL) OR ((measurement_type)::text IS NOT DISTINCT FROM 'derived'::text)))
+    provenance_kind text,
+    derived_version_id uuid,
+    CONSTRAINT readings_instrument_required CHECK (((sensor_id IS NOT NULL) OR (site_id IS NULL) OR (NOT ((measurement_type)::text IS DISTINCT FROM 'derived'::text)))),
+    CONSTRAINT readings_provenance_kind_check CHECK ((provenance_kind = ANY (ARRAY['tool_run'::text, 'chain'::text, 'csv_import'::text, 'manual'::text, 'batch'::text, 'sync'::text, 'derived'::text, 'migration'::text]))),
+    CONSTRAINT readings_withdrawn_spot_only CHECK (((withdrawn_at IS NULL) OR ((measurement_type)::text = 'spot'::text)))
 );
 
 CREATE TABLE public.alarm_events (
@@ -362,6 +403,33 @@ CREATE TABLE public.api_tokens (
     rate_limit_per_second integer
 );
 
+CREATE TABLE public.calculation_formulas (
+    id uuid DEFAULT gen_random_uuid() CONSTRAINT derived_parameter_definitions_id_not_null NOT NULL,
+    code character varying(128) CONSTRAINT derived_parameter_definitions_name_not_null NOT NULL,
+    name character varying(256) NOT NULL,
+    units character varying(32) DEFAULT ''::character varying NOT NULL,
+    formula text CONSTRAINT derived_parameter_definitions_formula_not_null NOT NULL,
+    description text,
+    required_parameter_types jsonb,
+    created_at timestamp with time zone DEFAULT now(),
+    output_parameter_id uuid,
+    tool_script_id uuid,
+    ordinal integer DEFAULT 0 CONSTRAINT derived_parameter_definitions_ordinal_not_null NOT NULL,
+    curve_slot character varying(64),
+    per_replicate character varying(64),
+    intermediate boolean DEFAULT false NOT NULL
+);
+
+CREATE TABLE public.change_audit (
+    id uuid DEFAULT gen_random_uuid() CONSTRAINT schedule_audit_id_not_null NOT NULL,
+    changed_by text,
+    old_value jsonb,
+    new_value jsonb,
+    changed_at timestamp with time zone DEFAULT now() CONSTRAINT schedule_audit_changed_at_not_null NOT NULL,
+    subject text NOT NULL,
+    change text NOT NULL
+);
+
 CREATE TABLE public.collection_events (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     site_id uuid NOT NULL,
@@ -417,24 +485,24 @@ CREATE TABLE public.data_streams (
     CONSTRAINT data_streams_measurement_type_check CHECK (measurement_type IN ('continuous', 'spot', 'derived'))
 );
 
-CREATE TABLE public.derived_parameter_definitions (
+CREATE TABLE public.derived_parameter_definition_versions (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
-    code character varying(128) CONSTRAINT derived_parameter_definitions_name_not_null NOT NULL,
-    name character varying(256),
-    units character varying(32),
+    definition_id uuid NOT NULL,
+    version_no integer NOT NULL,
     formula text NOT NULL,
-    description text,
-    required_parameter_types jsonb,
-    created_at timestamp with time zone DEFAULT now(),
-    output_parameter_id uuid
+    content_hash text NOT NULL,
+    created_by text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 CREATE TABLE public.derived_parameter_sources (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     derived_definition_id uuid NOT NULL,
-    parameter_id uuid NOT NULL,
+    parameter_id uuid,
     variable_name character varying(64) NOT NULL,
-    created_at timestamp with time zone DEFAULT now()
+    created_at timestamp with time zone DEFAULT now(),
+    site_property text,
+    CONSTRAINT derived_parameter_sources_one_source CHECK ((num_nonnulls(parameter_id, site_property) = 1))
 );
 
 CREATE TABLE public.ingest_receipts (
@@ -455,7 +523,24 @@ CREATE TABLE public.ingest_receipts (
     changed_keys jsonb,
     braked boolean DEFAULT false NOT NULL,
     brake_threshold real,
+    proposed integer DEFAULT 0 NOT NULL,
     CONSTRAINT receipt_arithmetic_closes CHECK ((submitted = (((new_rows + changed) + unchanged) + rejected_total)))
+);
+
+CREATE TABLE public.instrument_proposals (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    source_system character varying(64) NOT NULL,
+    source_key character varying(255) NOT NULL,
+    name text NOT NULL,
+    serial_number text,
+    manufacturer text,
+    model text,
+    notes text,
+    is_lab_instrument boolean DEFAULT false NOT NULL,
+    data_frequency character varying(16),
+    metadata jsonb,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 CREATE TABLE public.notes (
@@ -465,14 +550,9 @@ CREATE TABLE public.notes (
     verified boolean DEFAULT false NOT NULL,
     created_by character varying(128),
     created_at timestamp with time zone DEFAULT now(),
-    updated_at timestamp with time zone DEFAULT now()
-);
-
-CREATE TABLE public.notification_channel_health (
-    channel text NOT NULL,
-    healthy boolean NOT NULL,
-    detail text,
-    checked_at timestamp with time zone DEFAULT now() NOT NULL
+    updated_at timestamp with time zone DEFAULT now(),
+    source_system text,
+    source_key text
 );
 
 CREATE TABLE public.notification_log (
@@ -499,14 +579,13 @@ CREATE TABLE public.notification_state (
     kind text NOT NULL,
     subject_key text NOT NULL,
     state text DEFAULT 'firing'::text NOT NULL,
-    last_notified_at timestamp with time zone DEFAULT now() NOT NULL
+    last_notified_at timestamp with time zone DEFAULT now() NOT NULL,
+    detail text
 );
 
 CREATE TABLE public.notification_subscribers (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     keycloak_sub text NOT NULL,
-    is_active boolean DEFAULT true NOT NULL,
-    last_verified_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     web_push_enabled boolean DEFAULT true NOT NULL
@@ -520,7 +599,8 @@ CREATE TABLE public.notification_subscriptions (
     parameter_id uuid,
     enabled boolean DEFAULT true NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    channel text DEFAULT 'alarms'::text CONSTRAINT notification_subscriptions_kind_group_not_null NOT NULL
 );
 
 CREATE TABLE public.pairing_plans (
@@ -533,7 +613,33 @@ CREATE TABLE public.pairing_plans (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     applied_at timestamp with time zone,
     apply_result jsonb,
-    curve_assignments jsonb DEFAULT '[]'::jsonb NOT NULL
+    curve_assignments jsonb DEFAULT '[]'::jsonb NOT NULL,
+    version integer DEFAULT 0 NOT NULL,
+    accepted_objects jsonb DEFAULT '[]'::jsonb NOT NULL,
+    instrument_proposals jsonb DEFAULT '[]'::jsonb NOT NULL
+);
+
+CREATE TABLE public.parameter_group_members (
+    id uuid NOT NULL,
+    group_id uuid NOT NULL,
+    parameter_id uuid NOT NULL,
+    ordinal integer DEFAULT 0 NOT NULL,
+    role text NOT NULL,
+    replicates jsonb,
+    label text,
+    units text,
+    description text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT parameter_group_members_role_check CHECK ((role = ANY (ARRAY['measured'::text, 'entry_only'::text, 'output'::text])))
+);
+
+CREATE TABLE public.parameter_groups (
+    id uuid NOT NULL,
+    code text NOT NULL,
+    label text NOT NULL,
+    description text,
+    ordinal integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 CREATE TABLE public.parameters (
@@ -544,10 +650,6 @@ CREATE TABLE public.parameters (
     category character varying(32) DEFAULT 'measurement'::character varying NOT NULL,
     description text,
     aliases text[] DEFAULT '{}'::text[] NOT NULL,
-    default_warning_min double precision,
-    default_warning_max double precision,
-    default_alarm_min double precision,
-    default_alarm_max double precision,
     created_at timestamp with time zone DEFAULT now(),
     needs_review boolean DEFAULT false NOT NULL,
     CONSTRAINT parameters_category_check CHECK (category IN ('measurement', 'device_health'))
@@ -566,6 +668,23 @@ CREATE TABLE public.projects (
     public_contact_email character varying(128),
     created_at timestamp with time zone DEFAULT now(),
     discovered_at timestamp with time zone
+);
+
+CREATE TABLE public.reading_change_proposals (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    stream_id uuid NOT NULL,
+    "time" timestamp with time zone NOT NULL,
+    replicate_index smallint NOT NULL,
+    proposed_raw_value double precision NOT NULL,
+    proposed_standard_curve_id uuid,
+    stored_raw_value double precision NOT NULL,
+    stored_standard_curve_id uuid,
+    status text DEFAULT 'pending'::text NOT NULL,
+    first_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    decided_by text,
+    decided_at timestamp with time zone,
+    CONSTRAINT reading_change_proposals_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))
 );
 
 CREATE TABLE public.reading_decision_sets (
@@ -596,8 +715,9 @@ CREATE TABLE public.reading_decisions (
     supersedes uuid,
     rolled_back_by uuid,
     set_id uuid,
-    CONSTRAINT reading_decisions_kind_check CHECK ((kind = ANY (ARRAY['flag'::text, 'unflag'::text, 'withdraw'::text, 'reassert'::text, 'curve'::text, 'calibration_pin'::text, 'instrument_pin'::text, 'slot_move'::text, 'value_correction'::text, 'unverified_entry'::text, 'verify'::text, 'reject'::text, 'chain'::text, 'detach'::text, 'return'::text, 'rollback'::text]))),
-    CONSTRAINT reading_decisions_origin_check CHECK ((origin = ANY (ARRAY['manual'::text, 'sync'::text, 'csv'::text, 'audit'::text, 'chain'::text, 'rollback'::text, 'migration'::text, 'system'::text])))
+    job_id uuid,
+    CONSTRAINT reading_decisions_kind_check CHECK ((kind = ANY (ARRAY['flag'::text, 'unflag'::text, 'withdraw'::text, 'reassert'::text, 'curve'::text, 'calibration_pin'::text, 'instrument_pin'::text, 'slot_move'::text, 'value_correction'::text, 'unverified_entry'::text, 'verify'::text, 'reject'::text, 'chain'::text, 'detach'::text, 'return'::text, 'curve_retire'::text, 'formula_transition'::text, 'curve_recompose'::text, 'derived_computed'::text, 'reprocess'::text, 'rollback'::text]))),
+    CONSTRAINT reading_decisions_origin_check CHECK ((origin = ANY (ARRAY['manual'::text, 'sync'::text, 'csv'::text, 'audit'::text, 'chain'::text, 'rollback'::text, 'migration'::text, 'system'::text, 'janitor'::text])))
 );
 
 CREATE TABLE public.replicate_audit_holds (
@@ -664,24 +784,22 @@ CREATE TABLE public.samples (
     collected_at timestamp with time zone NOT NULL,
     created_at timestamp with time zone DEFAULT now(),
     mean double precision,
-    stdev double precision,
     n integer DEFAULT 0 NOT NULL,
     min_value double precision,
     max_value double precision,
     updated_at timestamp with time zone,
     sd_estimator text DEFAULT 'sample'::text NOT NULL,
     sd_estimator_source text DEFAULT 'default'::text NOT NULL,
+    median double precision,
+    stdev_sample double precision,
+    stdev_population double precision,
+    stdev double precision GENERATED ALWAYS AS (
+CASE
+    WHEN (sd_estimator = 'population'::text) THEN stdev_population
+    ELSE stdev_sample
+END) STORED,
     CONSTRAINT samples_sd_estimator_check CHECK ((sd_estimator = ANY (ARRAY['sample'::text, 'population'::text]))),
     CONSTRAINT samples_sd_estimator_source_check CHECK ((sd_estimator_source = ANY (ARRAY['default'::text, 'slot'::text, 'sample'::text, 'stream'::text, 'tool'::text])))
-);
-
-CREATE TABLE public.schedule_audit (
-    id uuid DEFAULT gen_random_uuid() NOT NULL,
-    job_name text NOT NULL,
-    changed_by text,
-    old_value jsonb,
-    new_value jsonb,
-    changed_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 CREATE TABLE public.schedules (
@@ -721,7 +839,10 @@ CREATE TABLE public.sensor_calibrations (
     name text,
     parameter_id uuid,
     r_squared double precision,
-    valid_until_explicit boolean DEFAULT false NOT NULL
+    valid_until_explicit boolean DEFAULT false NOT NULL,
+    retired_at timestamp with time zone,
+    retired_by text,
+    retired_reason text
 );
 
 CREATE TABLE public.sensor_deployments (
@@ -752,7 +873,7 @@ CREATE TABLE public.sensors (
     source_key text,
     kind text DEFAULT 'device'::text NOT NULL,
     CONSTRAINT sensors_data_frequency_check CHECK (data_frequency IN ('high', 'low')),
-    CONSTRAINT sensors_kind_check CHECK (kind IN ('device', 'lab', 'source_parameter', 'entry_channel'))
+    CONSTRAINT sensors_kind_check CHECK ((kind = ANY (ARRAY['device'::text, 'lab'::text, 'source_parameter'::text, 'entry_channel'::text])))
 );
 
 CREATE TABLE public.site_parameters (
@@ -769,8 +890,6 @@ CREATE TABLE public.site_parameters (
     channel_id integer,
     sample_interval_sec integer DEFAULT 600,
     is_active boolean DEFAULT true,
-    is_derived boolean DEFAULT false,
-    derived_definition_id uuid,
     variable_mappings jsonb,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
@@ -778,6 +897,9 @@ CREATE TABLE public.site_parameters (
     is_public boolean DEFAULT false NOT NULL,
     needs_review boolean DEFAULT false NOT NULL,
     sd_estimator text,
+    entry_mode text DEFAULT 'manual'::text NOT NULL,
+    instrument_sensor_id uuid,
+    CONSTRAINT site_parameters_entry_mode_check CHECK ((entry_mode = ANY (ARRAY['manual'::text, 'tool'::text]))),
     CONSTRAINT site_parameters_sd_estimator_check CHECK (((sd_estimator IS NULL) OR (sd_estimator = ANY (ARRAY['sample'::text, 'population'::text]))))
 );
 
@@ -791,7 +913,8 @@ CREATE TABLE public.sites (
     public_code character varying(64),
     created_at timestamp with time zone DEFAULT now(),
     discovered_at timestamp with time zone,
-    subproject_id uuid
+    subproject_id uuid,
+    meteoswiss_station_abbr text
 );
 
 CREATE TABLE public.standard_curves (
@@ -805,7 +928,12 @@ CREATE TABLE public.standard_curves (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     created_by text,
     source_system text,
-    source_key text
+    source_key text,
+    fitted_on date,
+    copied_from_id uuid,
+    retired_at timestamp with time zone,
+    retired_by text,
+    retired_reason text
 );
 
 CREATE TABLE public.status_events (
@@ -861,7 +989,8 @@ CREATE TABLE public.sync_service_credentials (
     service_type character varying(64) NOT NULL,
     service_id uuid,
     revoked boolean DEFAULT false NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    source_system character varying(64)
 );
 
 CREATE TABLE public.sync_service_tokens (
@@ -884,7 +1013,9 @@ CREATE TABLE public.sync_services (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     paused boolean DEFAULT false NOT NULL,
-    sync_interval_secs integer
+    sync_interval_secs integer,
+    full_reassert_enabled boolean DEFAULT false NOT NULL,
+    source_system character varying(64)
 );
 
 CREATE TABLE public.tool_runs (
@@ -934,7 +1065,10 @@ CREATE TABLE public.tool_scripts (
     created_by text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    enabled boolean DEFAULT true NOT NULL
+    enabled boolean DEFAULT true NOT NULL,
+    engine text DEFAULT 'script'::text NOT NULL,
+    parameter_group_id uuid,
+    CONSTRAINT tool_scripts_engine_check CHECK ((engine = ANY (ARRAY['script'::text, 'formula'::text])))
 );
 
 CREATE TABLE public.user_project_grants (
@@ -988,10 +1122,16 @@ ALTER TABLE ONLY public.constants
 ALTER TABLE ONLY public.data_streams
     ADD CONSTRAINT data_streams_pkey PRIMARY KEY (id);
 
-ALTER TABLE ONLY public.derived_parameter_definitions
+ALTER TABLE ONLY public.derived_parameter_definition_versions
+    ADD CONSTRAINT derived_parameter_definition_versi_definition_id_version_no_key UNIQUE (definition_id, version_no);
+
+ALTER TABLE ONLY public.derived_parameter_definition_versions
+    ADD CONSTRAINT derived_parameter_definition_versions_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.calculation_formulas
     ADD CONSTRAINT derived_parameter_definitions_name_key UNIQUE (code);
 
-ALTER TABLE ONLY public.derived_parameter_definitions
+ALTER TABLE ONLY public.calculation_formulas
     ADD CONSTRAINT derived_parameter_definitions_pkey PRIMARY KEY (id);
 
 ALTER TABLE ONLY public.derived_parameter_sources
@@ -1003,11 +1143,14 @@ ALTER TABLE ONLY public.sensor_deployments
 ALTER TABLE ONLY public.ingest_receipts
     ADD CONSTRAINT ingest_receipts_pkey PRIMARY KEY (id);
 
+ALTER TABLE ONLY public.instrument_proposals
+    ADD CONSTRAINT instrument_proposals_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.instrument_proposals
+    ADD CONSTRAINT instrument_proposals_provenance UNIQUE (source_system, source_key);
+
 ALTER TABLE ONLY public.notes
     ADD CONSTRAINT notes_pkey PRIMARY KEY (id);
-
-ALTER TABLE ONLY public.notification_channel_health
-    ADD CONSTRAINT notification_channel_health_pkey PRIMARY KEY (channel);
 
 ALTER TABLE ONLY public.notification_log
     ADD CONSTRAINT notification_log_pkey PRIMARY KEY (id);
@@ -1030,11 +1173,29 @@ ALTER TABLE ONLY public.notification_subscriptions
 ALTER TABLE ONLY public.pairing_plans
     ADD CONSTRAINT pairing_plans_pkey PRIMARY KEY (id);
 
+ALTER TABLE ONLY public.parameter_group_members
+    ADD CONSTRAINT parameter_group_members_parameter_id_key UNIQUE (parameter_id);
+
+ALTER TABLE ONLY public.parameter_group_members
+    ADD CONSTRAINT parameter_group_members_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.parameter_groups
+    ADD CONSTRAINT parameter_groups_code_key UNIQUE (code);
+
+ALTER TABLE ONLY public.parameter_groups
+    ADD CONSTRAINT parameter_groups_pkey PRIMARY KEY (id);
+
 ALTER TABLE ONLY public.parameters
     ADD CONSTRAINT parameters_pkey PRIMARY KEY (id);
 
 ALTER TABLE ONLY public.projects
     ADD CONSTRAINT projects_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.reading_change_proposals
+    ADD CONSTRAINT reading_change_proposals_key UNIQUE (stream_id, "time", replicate_index);
+
+ALTER TABLE ONLY public.reading_change_proposals
+    ADD CONSTRAINT reading_change_proposals_pkey PRIMARY KEY (id);
 
 ALTER TABLE ONLY public.reading_decision_sets
     ADD CONSTRAINT reading_decision_sets_pkey PRIMARY KEY (id);
@@ -1060,7 +1221,7 @@ ALTER TABLE ONLY public.reprocessing_jobs
 ALTER TABLE ONLY public.samples
     ADD CONSTRAINT samples_pkey PRIMARY KEY (id);
 
-ALTER TABLE ONLY public.schedule_audit
+ALTER TABLE ONLY public.change_audit
     ADD CONSTRAINT schedule_audit_pkey PRIMARY KEY (id);
 
 ALTER TABLE ONLY public.schedules
@@ -1178,6 +1339,8 @@ CREATE INDEX idx_api_token_audit_token_ts ON public.api_token_audit_log USING bt
 
 CREATE UNIQUE INDEX idx_api_tokens_token_prefix ON public.api_tokens USING btree (token_prefix);
 
+CREATE INDEX idx_change_audit_subject_changed ON public.change_audit USING btree (subject, changed_at DESC);
+
 CREATE INDEX idx_csv_import_staging_token ON public.csv_import_staging USING btree (import_token);
 
 CREATE INDEX idx_data_streams_pairing_plan_id ON public.data_streams USING btree (pairing_plan_id) WHERE (pairing_plan_id IS NOT NULL);
@@ -1188,7 +1351,15 @@ CREATE INDEX idx_data_streams_site_param ON public.data_streams USING btree (sit
 
 CREATE INDEX idx_data_streams_source ON public.data_streams USING btree (source_system);
 
+CREATE INDEX idx_derived_definition_versions_definition ON public.derived_parameter_definition_versions USING btree (definition_id, version_no DESC);
+
+CREATE INDEX idx_derived_definitions_calculation ON public.calculation_formulas USING btree (tool_script_id, ordinal);
+
+CREATE UNIQUE INDEX idx_derived_definitions_output_parameter ON public.calculation_formulas USING btree (output_parameter_id) WHERE (output_parameter_id IS NOT NULL);
+
 CREATE INDEX idx_ingest_receipts_stream ON public.ingest_receipts USING btree (stream_id, at DESC);
+
+CREATE INDEX idx_ingest_receipts_window ON public.ingest_receipts USING btree (stream_id, window_from, window_to);
 
 CREATE INDEX idx_notes_site_id ON public.notes USING btree (site_id);
 
@@ -1200,6 +1371,10 @@ CREATE INDEX idx_pairing_plans_source_system ON public.pairing_plans USING btree
 
 CREATE INDEX idx_pairing_plans_status ON public.pairing_plans USING btree (status);
 
+CREATE INDEX idx_parameter_group_members_group ON public.parameter_group_members USING btree (group_id, ordinal);
+
+CREATE INDEX idx_reading_change_proposals_pending ON public.reading_change_proposals USING btree (stream_id, "time") WHERE (status = 'pending'::text);
+
 CREATE INDEX idx_reading_decisions_key ON public.reading_decisions USING btree (stream_id, "time", replicate_index, at DESC);
 
 CREATE INDEX idx_reading_decisions_set ON public.reading_decisions USING btree (set_id) WHERE (set_id IS NOT NULL);
@@ -1207,6 +1382,8 @@ CREATE INDEX idx_reading_decisions_set ON public.reading_decisions USING btree (
 CREATE INDEX idx_readings_calibration_id ON public.readings USING btree (calibration_id) WHERE (calibration_id IS NOT NULL);
 
 CREATE INDEX idx_readings_collection_event ON public.readings USING btree (collection_event_id) WHERE (collection_event_id IS NOT NULL);
+
+CREATE INDEX idx_readings_derived_version ON public.readings USING btree (derived_version_id) WHERE (derived_version_id IS NOT NULL);
 
 CREATE INDEX idx_readings_flagged_site_param_time ON public.readings USING btree (site_id, parameter_id, "time") WHERE is_flagged;
 
@@ -1242,8 +1419,6 @@ CREATE INDEX idx_reprocessing_jobs_status ON public.reprocessing_jobs USING btre
 
 CREATE INDEX idx_samples_sd_estimator_default ON public.samples USING btree (site_id, parameter_id) WHERE (sd_estimator_source = 'default'::text);
 
-CREATE INDEX idx_schedule_audit_job_changed ON public.schedule_audit USING btree (job_name, changed_at DESC);
-
 CREATE INDEX idx_schedules_due ON public.schedules USING btree (next_run_at) WHERE enabled;
 
 CREATE INDEX idx_seasonal_checks_site ON public.seasonal_checks USING btree (site_id, created_at);
@@ -1262,9 +1437,15 @@ CREATE INDEX idx_sensor_deployments_site_param_time ON public.sensor_deployments
 
 CREATE UNIQUE INDEX idx_sensors_serial_unique ON public.sensors USING btree (serial_number) WHERE (serial_number IS NOT NULL);
 
+CREATE INDEX idx_site_parameters_entry_mode ON public.site_parameters USING btree (entry_mode) WHERE (entry_mode = 'tool'::text);
+
+CREATE INDEX idx_site_parameters_instrument ON public.site_parameters USING btree (instrument_sensor_id) WHERE (instrument_sensor_id IS NOT NULL);
+
 CREATE INDEX idx_site_parameters_parameter_id ON public.site_parameters USING btree (parameter_id);
 
 CREATE INDEX idx_sites_project_id ON public.sites USING btree (project_id);
+
+CREATE INDEX idx_standard_curves_copied_from ON public.standard_curves USING btree (copied_from_id) WHERE (copied_from_id IS NOT NULL);
 
 CREATE INDEX idx_standard_curves_sensor ON public.standard_curves USING btree (sensor_id);
 
@@ -1282,6 +1463,8 @@ CREATE INDEX idx_sync_svc_tokens_service_id ON public.sync_service_tokens USING 
 
 CREATE INDEX idx_sync_tokens_hash ON public.sync_service_tokens USING btree (token_hash);
 
+CREATE INDEX idx_tool_runs_collection_event ON public.tool_runs USING btree (((context ->> 'collection_event_id'::text)), created_at DESC) WHERE (context ? 'collection_event_id'::text);
+
 CREATE INDEX idx_tool_runs_created_at ON public.tool_runs USING btree (created_at);
 
 CREATE INDEX idx_tool_script_activations_script ON public.tool_script_activations USING btree (tool_script_id, activated_at DESC);
@@ -1290,9 +1473,13 @@ CREATE INDEX idx_tool_script_versions_script ON public.tool_script_versions USIN
 
 CREATE UNIQUE INDEX idx_tool_scripts_name ON public.tool_scripts USING btree (lower(name));
 
+CREATE UNIQUE INDEX idx_tool_scripts_parameter_group ON public.tool_scripts USING btree (parameter_group_id) WHERE (parameter_group_id IS NOT NULL);
+
 CREATE INDEX idx_user_project_grants_project ON public.user_project_grants USING btree (project_id);
 
 CREATE INDEX idx_wps_keycloak_sub ON public.web_push_subscriptions USING btree (keycloak_sub);
+
+CREATE UNIQUE INDEX notes_provenance_uniq ON public.notes USING btree (source_system, source_key) WHERE ((source_system IS NOT NULL) AND (source_key IS NOT NULL));
 
 CREATE UNIQUE INDEX parameters_code_lower_idx ON public.parameters USING btree (lower((code)::text));
 
@@ -1303,6 +1490,8 @@ CREATE UNIQUE INDEX projects_public_code_idx ON public.projects USING btree (pub
 CREATE INDEX readings_time_idx ON public.readings USING btree ("time" DESC);
 
 CREATE UNIQUE INDEX replicate_audit_holds_event_live_uniq ON public.replicate_audit_holds USING btree (kind, site_id, parameter_id, group_time) WHERE ((stream_id IS NULL) AND (status = 'pending'::text));
+
+CREATE UNIQUE INDEX replicate_audit_holds_identity_live_uniq ON public.replicate_audit_holds USING btree (stream_id) WHERE ((kind = 'source_identity_changed'::text) AND (status = ANY (ARRAY['pending'::text, 'deferred'::text])));
 
 CREATE UNIQUE INDEX replicate_audit_holds_live_uniq ON public.replicate_audit_holds USING btree (stream_id, group_time, kind) WHERE (status = ANY (ARRAY['pending'::text, 'deferred'::text]));
 
@@ -1332,13 +1521,23 @@ CREATE UNIQUE INDEX uq_alarm_thresh_param_global ON public.alarm_thresholds USIN
 
 CREATE UNIQUE INDEX uq_alarm_thresh_param_site ON public.alarm_thresholds USING btree (parameter_id, site_id) WHERE (site_id IS NOT NULL);
 
+CREATE UNIQUE INDEX uq_derived_site_property ON public.derived_parameter_sources USING btree (derived_definition_id, site_property) WHERE (site_property IS NOT NULL);
+
 CREATE UNIQUE INDEX uq_notification_mutes_slot ON public.notification_mutes USING btree (site_id, parameter_id);
 
-CREATE UNIQUE INDEX uq_notification_subscriptions_scope ON public.notification_subscriptions USING btree (keycloak_sub, COALESCE(project_id, '00000000-0000-0000-0000-000000000000'::uuid), COALESCE(site_id, '00000000-0000-0000-0000-000000000000'::uuid), COALESCE(parameter_id, '00000000-0000-0000-0000-000000000000'::uuid));
+CREATE UNIQUE INDEX uq_notification_subscriptions_scope ON public.notification_subscriptions USING btree (keycloak_sub, channel, COALESCE(project_id, '00000000-0000-0000-0000-000000000000'::uuid), COALESCE(site_id, '00000000-0000-0000-0000-000000000000'::uuid), COALESCE(parameter_id, '00000000-0000-0000-0000-000000000000'::uuid));
 
 CREATE UNIQUE INDEX uq_reprocessing_jobs_dedupe_key ON public.reprocessing_jobs USING btree (dedupe_key) WHERE (dedupe_key IS NOT NULL);
 
+CREATE TRIGGER parameter_group_members_history AFTER INSERT OR DELETE OR UPDATE ON public.parameter_group_members FOR EACH ROW EXECUTE FUNCTION public.record_parameter_group_change('member');
+
+CREATE TRIGGER parameter_groups_history AFTER INSERT OR DELETE OR UPDATE ON public.parameter_groups FOR EACH ROW EXECUTE FUNCTION public.record_parameter_group_change('group');
+
+CREATE TRIGGER parameters_change_audit AFTER INSERT OR DELETE OR UPDATE ON public.parameters FOR EACH ROW EXECUTE FUNCTION public.record_entity_change('parameter');
+
 CREATE TRIGGER projects_default_subproject_trg AFTER INSERT ON public.projects FOR EACH ROW EXECUTE FUNCTION public.projects_default_subproject();
+
+CREATE TRIGGER site_parameters_change_audit AFTER INSERT OR DELETE OR UPDATE ON public.site_parameters FOR EACH ROW EXECUTE FUNCTION public.record_entity_change('site_parameter');
 
 CREATE TRIGGER sites_ensure_subproject_trg BEFORE INSERT OR UPDATE ON public.sites FOR EACH ROW EXECUTE FUNCTION public.sites_ensure_subproject();
 
@@ -1348,13 +1547,15 @@ CREATE TRIGGER trg_inherit_calibration_parameter_id BEFORE INSERT ON public.sens
 
 CREATE TRIGGER trg_reading_decisions_project AFTER INSERT ON public.reading_decisions FOR EACH ROW EXECUTE FUNCTION public.reading_decisions_project();
 
+CREATE TRIGGER trg_readings_default_provenance_kind BEFORE INSERT ON public.readings FOR EACH ROW EXECUTE FUNCTION public.readings_default_provenance_kind();
+
 CREATE TRIGGER trg_readings_inherit_stream_instrument BEFORE INSERT OR UPDATE ON public.readings FOR EACH ROW EXECUTE FUNCTION public.readings_inherit_stream_instrument();
 
 CREATE TRIGGER trg_readings_sample_refresh_del AFTER DELETE ON public.readings FOR EACH ROW WHEN ((old.sample_id IS NOT NULL)) EXECUTE FUNCTION public.samples_on_reading_delete();
 
 CREATE TRIGGER trg_readings_sample_refresh_ins AFTER INSERT ON public.readings FOR EACH ROW WHEN ((new.sample_id IS NOT NULL)) EXECUTE FUNCTION public.samples_on_reading_insert();
 
-CREATE TRIGGER trg_readings_sample_refresh_upd AFTER UPDATE ON public.readings FOR EACH ROW WHEN (((old.sample_id IS DISTINCT FROM new.sample_id) OR (old.raw_value IS DISTINCT FROM new.raw_value) OR (old.calibrated_value IS DISTINCT FROM new.calibrated_value) OR (old.is_flagged IS DISTINCT FROM new.is_flagged) OR (old.withdrawn_at IS DISTINCT FROM new.withdrawn_at))) EXECUTE FUNCTION public.samples_on_reading_update();
+CREATE TRIGGER trg_readings_sample_refresh_upd AFTER UPDATE ON public.readings FOR EACH ROW WHEN (((old.sample_id IS DISTINCT FROM new.sample_id) OR (old.raw_value IS DISTINCT FROM new.raw_value) OR (old.calibrated_value IS DISTINCT FROM new.calibrated_value) OR (old.is_flagged IS DISTINCT FROM new.is_flagged) OR (old.withdrawn_at IS DISTINCT FROM new.withdrawn_at) OR (old.unverified IS DISTINCT FROM new.unverified))) EXECUTE FUNCTION public.samples_on_reading_update();
 
 ALTER TABLE ONLY public.alarm_events
     ADD CONSTRAINT alarm_events_parameter_id_fkey FOREIGN KEY (parameter_id) REFERENCES public.parameters(id);
@@ -1395,11 +1596,17 @@ ALTER TABLE ONLY public.data_streams
 ALTER TABLE ONLY public.data_streams
     ADD CONSTRAINT data_streams_site_parameter_id_fkey FOREIGN KEY (site_parameter_id) REFERENCES public.site_parameters(id);
 
-ALTER TABLE ONLY public.derived_parameter_definitions
+ALTER TABLE ONLY public.derived_parameter_definition_versions
+    ADD CONSTRAINT derived_parameter_definition_versions_definition_id_fkey FOREIGN KEY (definition_id) REFERENCES public.calculation_formulas(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.calculation_formulas
     ADD CONSTRAINT derived_parameter_definitions_output_parameter_id_fkey FOREIGN KEY (output_parameter_id) REFERENCES public.parameters(id);
 
+ALTER TABLE ONLY public.calculation_formulas
+    ADD CONSTRAINT derived_parameter_definitions_tool_script_id_fkey FOREIGN KEY (tool_script_id) REFERENCES public.tool_scripts(id) ON DELETE CASCADE;
+
 ALTER TABLE ONLY public.derived_parameter_sources
-    ADD CONSTRAINT derived_parameter_sources_derived_definition_id_fkey FOREIGN KEY (derived_definition_id) REFERENCES public.derived_parameter_definitions(id);
+    ADD CONSTRAINT derived_parameter_sources_derived_definition_id_fkey FOREIGN KEY (derived_definition_id) REFERENCES public.calculation_formulas(id);
 
 ALTER TABLE ONLY public.derived_parameter_sources
     ADD CONSTRAINT derived_parameter_sources_parameter_id_fkey FOREIGN KEY (parameter_id) REFERENCES public.parameters(id);
@@ -1433,6 +1640,18 @@ ALTER TABLE ONLY public.notification_subscriptions
 
 ALTER TABLE ONLY public.notification_subscriptions
     ADD CONSTRAINT notification_subscriptions_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.parameter_group_members
+    ADD CONSTRAINT parameter_group_members_group_id_fkey FOREIGN KEY (group_id) REFERENCES public.parameter_groups(id) ON DELETE RESTRICT;
+
+ALTER TABLE ONLY public.parameter_group_members
+    ADD CONSTRAINT parameter_group_members_parameter_id_fkey FOREIGN KEY (parameter_id) REFERENCES public.parameters(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.reading_change_proposals
+    ADD CONSTRAINT reading_change_proposals_stream_id_fkey FOREIGN KEY (stream_id) REFERENCES public.data_streams(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.reading_decisions
+    ADD CONSTRAINT reading_decisions_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.reprocessing_jobs(id) ON DELETE SET NULL;
 
 ALTER TABLE ONLY public.reading_decisions
     ADD CONSTRAINT reading_decisions_rolled_back_by_fkey FOREIGN KEY (rolled_back_by) REFERENCES public.reading_decisions(id);
@@ -1504,7 +1723,7 @@ ALTER TABLE ONLY public.sensor_deployments
     ADD CONSTRAINT sensor_deployments_site_id_fkey FOREIGN KEY (site_id) REFERENCES public.sites(id);
 
 ALTER TABLE ONLY public.site_parameters
-    ADD CONSTRAINT site_parameters_derived_definition_id_fkey FOREIGN KEY (derived_definition_id) REFERENCES public.derived_parameter_definitions(id);
+    ADD CONSTRAINT site_parameters_instrument_sensor_id_fkey FOREIGN KEY (instrument_sensor_id) REFERENCES public.sensors(id);
 
 ALTER TABLE ONLY public.site_parameters
     ADD CONSTRAINT site_parameters_parameter_id_fkey FOREIGN KEY (parameter_id) REFERENCES public.parameters(id);
@@ -1517,6 +1736,9 @@ ALTER TABLE ONLY public.sites
 
 ALTER TABLE ONLY public.sites
     ADD CONSTRAINT sites_subproject_id_fkey FOREIGN KEY (subproject_id) REFERENCES public.subprojects(id);
+
+ALTER TABLE ONLY public.standard_curves
+    ADD CONSTRAINT standard_curves_copied_from_id_fkey FOREIGN KEY (copied_from_id) REFERENCES public.standard_curves(id);
 
 ALTER TABLE ONLY public.standard_curves
     ADD CONSTRAINT standard_curves_sensor_id_fkey FOREIGN KEY (sensor_id) REFERENCES public.sensors(id);
@@ -1562,6 +1784,9 @@ ALTER TABLE ONLY public.tool_script_activations
 
 ALTER TABLE ONLY public.tool_script_versions
     ADD CONSTRAINT tool_script_versions_tool_script_id_fkey FOREIGN KEY (tool_script_id) REFERENCES public.tool_scripts(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.tool_scripts
+    ADD CONSTRAINT tool_scripts_parameter_group_id_fkey FOREIGN KEY (parameter_group_id) REFERENCES public.parameter_groups(id);
 
 ALTER TABLE ONLY public.user_project_grants
     ADD CONSTRAINT user_project_grants_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
