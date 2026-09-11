@@ -10,6 +10,7 @@ mod attribute_existing_readings;
 mod backdate_auto_deployments;
 mod blank_database;
 mod change_audit;
+mod cutover_restore;
 mod channel_health_into_state;
 mod derived_definition_versions;
 mod formula_name_units_not_null;
