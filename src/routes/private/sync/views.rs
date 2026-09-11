@@ -1693,11 +1693,14 @@ pub async fn resolve_hold(
                 let flagged = crate::routes::private::readings::service::record_many(
                     txn,
                     crate::routes::private::readings::models::Kind::Flag,
-                    &format!(
-                        "r.stream_id = $1 AND r.time = $2 AND r.replicate_index IN ({index_list}) \
-                         AND r.is_flagged IS NOT TRUE"
+                    crate::routes::private::collection_events::flows::rows_matching(
+                        &format!(
+                            "r.stream_id = $1 AND r.time = $2 \
+                             AND r.replicate_index IN ({index_list}) \
+                             AND r.is_flagged IS NOT TRUE"
+                        ),
+                        vec![stream_id.into(), group_time.into()],
                     ),
-                    vec![stream_id.into(), group_time.into()],
                     crate::routes::private::readings::service::NewValue::Literal(
                         serde_json::json!({ "reason": reason, "hold_id": id }),
                     ),
@@ -2049,11 +2052,14 @@ pub async fn reopen_hold(
             crate::routes::private::readings::service::record_many(
                 txn,
                 crate::routes::private::readings::models::Kind::Unflag,
-                &format!(
-                    "r.stream_id = $1 AND r.time = $2 AND r.replicate_index IN ({index_list}) \
-                     AND r.is_flagged = TRUE AND r.flag_reason = $3"
+                crate::routes::private::collection_events::flows::rows_matching(
+                    &format!(
+                        "r.stream_id = $1 AND r.time = $2 \
+                         AND r.replicate_index IN ({index_list}) \
+                         AND r.is_flagged = TRUE AND r.flag_reason = $3"
+                    ),
+                    vec![stream_id.into(), group_time.into(), reason.clone().into()],
                 ),
-                vec![stream_id.into(), group_time.into(), reason.clone().into()],
                 crate::routes::private::readings::service::NewValue::Literal(
                     serde_json::json!({ "hold_id": id, "reopened": true }),
                 ),

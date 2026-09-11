@@ -224,3 +224,50 @@ fn every_reprocess_step_records_what_it_moved() {
         );
     }
 }
+
+/// A multi-parameter instrument holds one calibration timeline per parameter, so one parameter's
+/// next curve must never truncate another's window, and two curves sharing an instant must still
+/// chain to one answer.
+#[test]
+fn the_calibration_chain_is_per_parameter_and_single_valued() {
+    let sql = rendered(calibration_chain_statement(Uuid::nil()));
+    assert!(
+        sql.contains(r#"PARTITION BY "parameter_id""#),
+        "the chain is per parameter: {sql}"
+    );
+    assert!(
+        sql.contains(r#"ORDER BY "valid_from" ASC, "id" ASC"#),
+        "and single-valued on a shared instant: {sql}"
+    );
+    assert!(
+        sql.contains(r#""retired_at" IS NULL"#),
+        "a retired curve takes no part in the chain: {sql}"
+    );
+    assert!(
+        sql.contains("ordered.next_from > ordered.valid_from"),
+        "and a zero-width window is refused: {sql}"
+    );
+}
+
+/// An operator-written bound is data: the chain may shorten it to keep windows from overlapping,
+/// never extend it. A deployment's end date is always the caller's, so its chain only shortens.
+#[test]
+fn a_chain_written_bound_is_derived_and_an_operator_written_one_is_only_shortened() {
+    let calibration = rendered(calibration_chain_statement(Uuid::nil()));
+    assert!(
+        calibration.contains(
+            "CASE WHEN sc.valid_until_explicit THEN LEAST(sc.valid_until, ordered.next_from)"
+        ),
+        "an explicit bound survives unless the next curve is earlier: {calibration}"
+    );
+    let deployment = rendered(deployment_chain_statement(Uuid::nil()));
+    assert!(
+        deployment.contains("LEAST(COALESCE(deployed_until"),
+        "a deployment's own end date is kept when it is the earlier one: {deployment}"
+    );
+    assert!(
+        deployment
+            .contains("COALESCE(d.deployed_until, 'infinity'::timestamptz) <> ordered.new_until"),
+        "and the write is held to the rows the chain moves: {deployment}"
+    );
+}

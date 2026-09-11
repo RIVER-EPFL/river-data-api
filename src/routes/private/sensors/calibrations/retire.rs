@@ -201,9 +201,14 @@ pub async fn retire_calibration(
         let recorded = service::record_many(
             txn,
             Kind::CurveRetire,
-            &moved_rows_sql(),
-            vec![id.into(), sensor_id.into()],
-            NewValue::Sql(covering_curve_sql_object()),
+            crate::routes::private::collection_events::flows::rows_matching(
+                &moved_rows_sql(),
+                vec![id.into(), sensor_id.into()],
+            ),
+            NewValue::Sql(sea_orm::sea_query::Expr::cust_with_values(
+                covering_curve_sql_object(),
+                [sea_orm::Value::from(id), sea_orm::Value::from(sensor_id)],
+            )),
             &actor,
             req.reason.as_deref(),
             origin,

@@ -26,9 +26,10 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Count the deletes of readings in the non-test part of a source file, over any whitespace,
-/// quoting or case. Both spellings count: `DELETE FROM readings…` as text, and the built form,
-/// whose `from_table` names the entity (`from_table` exists only on a delete, so naming the
-/// readings entity through it is a delete of readings and nothing else).
+/// quoting or case. All three spellings count: `DELETE FROM readings…` as text, the sea-query
+/// form, whose `from_table` names the entity (`from_table` exists only on a delete, so naming the
+/// readings entity through it is a delete of readings and nothing else), and the entity form,
+/// `readings::Entity::delete_many()`.
 fn delete_statements(source: &str) -> usize {
     let live = source.split("#[cfg(test)]").next().unwrap_or("");
     let lowered = live.to_ascii_lowercase();
@@ -44,7 +45,11 @@ fn delete_statements(source: &str) -> usize {
         .windows(2)
         .filter(|w| w[0] == "from_table" && w[1].starts_with("readings"))
         .count();
-    spelled + built
+    let entity = tokens
+        .windows(3)
+        .filter(|w| w[0].starts_with("readings") && w[1] == "entity" && w[2].starts_with("delete"))
+        .count();
+    spelled + built + entity
 }
 
 #[test]
@@ -86,6 +91,21 @@ fn test_delete_statements_counts_across_lines_quoting_and_case() {
         delete_statements("SeaQuery::delete().from_table(samples::Entity)"),
         0,
         "another table's delete is not one of these"
+    );
+    assert_eq!(
+        delete_statements("readings::Entity::delete_many().filter(x)"),
+        1,
+        "the entity form counts too"
+    );
+    assert_eq!(
+        delete_statements("samples::Entity::delete_many().filter(x)"),
+        0,
+        "another table's entity delete is not one of these"
+    );
+    assert_eq!(
+        delete_statements("readings::Entity::find().filter(x)"),
+        0,
+        "a read through the entity is not a delete"
     );
     assert_eq!(delete_statements(r#"r"DELETE FROM readings WHERE""#), 1);
     assert_eq!(delete_statements("DELETE FROM readings_hourly"), 1);

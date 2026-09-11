@@ -1,4 +1,4 @@
-use super::{MIN_REPLICATES, forms_sample, group_select_sql};
+use super::{MIN_REPLICATES, forms_sample, group_select};
 
 #[test]
 fn a_group_is_two_or_more_readings() {
@@ -14,21 +14,24 @@ fn a_group_is_two_or_more_readings() {
 
 #[test]
 fn the_group_query_counts_readings_and_admits_a_late_replicate() {
-    let sql = group_select_sql("r.stream_id = $1");
+    let sql = group_select(
+        sea_orm::Condition::all().add(sea_orm::sea_query::Expr::cust("r.stream_id = $1")),
+    )
+    .to_string(sea_orm::sea_query::PostgresQueryBuilder);
     assert!(
-        sql.contains("HAVING COUNT(*) >= 2"),
+        sql.contains("HAVING (COUNT(*)) >= 2"),
         "the minimum is the one rule, in the query: {sql}"
     );
     assert!(
-        sql.contains("EXISTS (SELECT 1 FROM samples s2"),
+        sql.contains(r#"EXISTS(SELECT 1 FROM "samples" AS "s2""#),
         "a group whose sample exists takes a late replicate of one: {sql}"
     );
     assert!(
-        sql.contains("r.measurement_type = 'spot'"),
+        sql.contains(r#""r"."measurement_type" = 'spot'"#),
         "only spot instants have replicates: {sql}"
     );
     assert!(
-        sql.contains("r.sample_id IS NULL"),
+        sql.contains(r#""r"."sample_id" IS NULL"#),
         "already-stamped readings are not regrouped: {sql}"
     );
     assert!(

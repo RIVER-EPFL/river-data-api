@@ -5,10 +5,13 @@ use chrono::DateTime;
 use chrono::Utc;
 use sea_orm::ActiveModelTrait;
 use sea_orm::ColumnTrait;
+use sea_orm::Condition;
 use sea_orm::EntityTrait;
+use sea_orm::ExprTrait;
 use sea_orm::FromQueryResult;
 use sea_orm::QueryFilter;
 use sea_orm::entity::prelude::*;
+use sea_orm::sea_query::Alias;
 use serde::Deserialize;
 use serde::Serialize;
 use utoipa::IntoParams;
@@ -781,7 +784,6 @@ pub(super) struct RecordedSpan {
     pub(super) hi: Option<sea_orm::prelude::DateTimeWithTimeZone>,
 }
 
-
 /// One reading key inside an explicit selection.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct SelectionKey {
@@ -821,25 +823,22 @@ pub struct Selection {
 }
 
 impl Selection {
-    /// The predicate over `r` this selection names, with its binds. A selection that names
-    /// nothing (no stream, no slot, no keys) is refused: "every reading" is not a selection.
-    pub fn predicate(&self) -> AppResult<(String, Vec<sea_orm::Value>)> {
-        let mut clauses: Vec<String> = Vec::new();
-        let mut binds: Vec<sea_orm::Value> = Vec::new();
+    /// The predicate over `r` this selection names. A selection that names nothing (no stream,
+    /// no slot, no keys) is refused: "every reading" is not a selection.
+    pub fn condition(&self) -> AppResult<Condition> {
+        let col = |c: Column| Expr::col((Alias::new("r"), c));
+        let mut rows = Condition::all();
         if let Some(stream_id) = self.stream_id {
-            binds.push(stream_id.into());
-            clauses.push(format!("r.stream_id = ${}", binds.len()));
+            rows = rows.add(col(Column::StreamId).eq(stream_id));
         }
         if let Some(event_id) = self.collection_event_id {
-            binds.push(event_id.into());
-            clauses.push(format!("r.collection_event_id = ${}", binds.len()));
+            rows = rows.add(col(Column::CollectionEventId).eq(event_id));
         }
         match (self.site_id, self.parameter_id) {
             (Some(site_id), Some(parameter_id)) => {
-                binds.push(site_id.into());
-                clauses.push(format!("r.site_id = ${}", binds.len()));
-                binds.push(parameter_id.into());
-                clauses.push(format!("r.parameter_id = ${}", binds.len()));
+                rows = rows
+                    .add(col(Column::SiteId).eq(site_id))
+                    .add(col(Column::ParameterId).eq(parameter_id));
             }
             (None, None) => {}
             _ => {
@@ -849,32 +848,26 @@ impl Selection {
             }
         }
         if let Some(calibration_id) = self.calibration_id {
-            binds.push(calibration_id.into());
-            clauses.push(format!("r.calibration_id = ${}", binds.len()));
+            rows = rows.add(col(Column::CalibrationId).eq(calibration_id));
         }
         if let Some(from) = self.from {
-            binds.push(sea_orm::prelude::DateTimeWithTimeZone::from(from).into());
-            clauses.push(format!("r.time >= ${}", binds.len()));
+            rows = rows.add(col(Column::Time).gte(DateTimeWithTimeZone::from(from)));
         }
         if let Some(to) = self.to {
-            binds.push(sea_orm::prelude::DateTimeWithTimeZone::from(to).into());
-            clauses.push(format!("r.time <= ${}", binds.len()));
+            rows = rows.add(col(Column::Time).lte(DateTimeWithTimeZone::from(to)));
         }
         if !self.keys.is_empty() {
-            let mut triples = Vec::with_capacity(self.keys.len());
+            let mut keys = Condition::any();
             for k in &self.keys {
-                binds.push(k.stream_id.into());
-                let a = binds.len();
-                binds.push(sea_orm::prelude::DateTimeWithTimeZone::from(k.time).into());
-                let b = binds.len();
-                binds.push(k.replicate_index.into());
-                let c = binds.len();
-                triples.push(format!(
-                    "(r.stream_id = ${a} AND r.time = ${b} \
-                      AND (${c}::smallint IS NULL OR r.replicate_index = ${c}))"
-                ));
+                let mut one = Condition::all()
+                    .add(col(Column::StreamId).eq(k.stream_id))
+                    .add(col(Column::Time).eq(DateTimeWithTimeZone::from(k.time)));
+                if let Some(index) = k.replicate_index {
+                    one = one.add(col(Column::ReplicateIndex).eq(index));
+                }
+                keys = keys.add(one);
             }
-            clauses.push(format!("({})", triples.join(" OR ")));
+            rows = rows.add(keys);
         }
         if self.stream_id.is_none()
             && self.collection_event_id.is_none()
@@ -886,7 +879,7 @@ impl Selection {
                     .to_string(),
             ));
         }
-        Ok((clauses.join(" AND "), binds))
+        Ok(rows)
     }
 }
 
@@ -976,7 +969,6 @@ pub struct LedgerResponse {
     pub entries: Vec<LedgerEntry>,
     pub truncated: bool,
 }
-
 
 #[derive(FromQueryResult)]
 pub(super) struct ReceiptRow {
@@ -1337,6 +1329,12 @@ pub(super) struct SampleStatsRow {
 #[derive(FromQueryResult)]
 pub(super) struct ParameterRow {
     pub(super) parameter_id: Uuid,
+}
+
+/// One decision id, for a read that wants the ledger keys and nothing else.
+#[derive(FromQueryResult)]
+pub(super) struct DecisionIdRow {
+    pub(super) id: Uuid,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

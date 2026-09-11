@@ -7,15 +7,38 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures::FutureExt;
-use sea_orm::{ConnectionTrait, DatabaseConnection, FromQueryResult, Statement};
+use sea_orm::sea_query::{Expr, ExprTrait as _, LockBehavior, LockType, OnConflict};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
+    QueryOrder, QuerySelect, Set, TransactionTrait, TryInsertResult,
+};
 use uuid::Uuid;
 
 use super::job::JobRegistry;
+use super::model::{ActiveModel, Column, Entity};
 use super::lifecycle::{self, JobContext, RetryPolicy};
 
 /// Lease lifetime before the reaper may reclaim a row. Sized well above a plausible GC / k8s
 /// CPU-throttle stall so a slow-but-alive worker is not reaped mid-run.
 pub const LEASE_SECONDS: i64 = 120;
+
+/// When a lease taken now lapses. Server-side `now()`, so a worker whose clock has drifted cannot
+/// hold a row past the reaper's reach or hand it over early.
+/// The ownership guard every write a running worker makes carries: the row, this worker, and the
+/// lease it was granted. A worker reaped out matches no row and its late write is a no-op.
+fn owned_by(job_id: Uuid, worker_id: &str, lease_epoch: i64) -> Expr {
+    Column::Id
+        .eq(job_id)
+        .and(Column::Owner.eq(worker_id))
+        .and(Column::LeaseEpoch.eq(lease_epoch))
+}
+
+fn lease_expiry() -> Expr {
+    Expr::cust_with_values(
+        "now() + (interval '1 second' * $1)",
+        [sea_orm::Value::from(LEASE_SECONDS)],
+    )
+}
 /// Lease-renewal cadence, roughly one third of the lease.
 pub const HEARTBEAT_SECONDS: u64 = 40;
 /// Idle poll cadence when nothing is claimable.
@@ -44,27 +67,33 @@ pub async fn enqueue<C: ConnectionTrait>(
 ) -> Result<Option<Uuid>, sea_orm::DbErr> {
     let id = Uuid::new_v4();
     let category = super::registry::category_for(trigger_type);
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO reprocessing_jobs \
-                 (id, trigger_type, sensor_id, trigger_id, status, category, params, dedupe_key, \
-                  next_attempt_at) \
-             VALUES ($1, $2, $3, $4, 'queued', $5, $6::jsonb, $7, now()) \
-             ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING \
-             RETURNING id",
-            [
-                id.into(),
-                trigger_type.into(),
-                sensor_id.into(),
-                trigger_id.into(),
-                category.into(),
-                params.to_string().into(),
-                dedupe_key.into(),
-            ],
-        ))
-        .await?;
-    row.map(|r| r.try_get("", "id")).transpose()
+    // The conflict target carries the index's own predicate: the unique index on `dedupe_key` is
+    // partial, so naming the column alone matches no index.
+    let inserted = Entity::insert(ActiveModel {
+        id: Set(id),
+        trigger_type: Set(trigger_type.to_string()),
+        sensor_id: Set(sensor_id),
+        trigger_id: Set(trigger_id),
+        status: Set("queued".to_string()),
+        category: Set(category.to_string()),
+        params: Set(params.clone()),
+        dedupe_key: Set(dedupe_key.map(ToString::to_string)),
+        next_attempt_at: Set(chrono::Utc::now().into()),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::column(Column::DedupeKey)
+            .target_and_where(Expr::col(Column::DedupeKey).is_not_null())
+            .do_nothing()
+            .to_owned(),
+    )
+    .try_insert()
+    .exec(db)
+    .await?;
+    Ok(match inserted {
+        TryInsertResult::Inserted(_) => Some(id),
+        TryInsertResult::Conflicted | TryInsertResult::Empty => None,
+    })
 }
 
 /// A row claimed off the queue.
@@ -87,30 +116,48 @@ async fn claim_one(
     db: &DatabaseConnection,
     worker_id: &str,
 ) -> Result<Option<Claimed>, sea_orm::DbErr> {
-    Claimed::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "WITH claimable AS ( \
-                 SELECT id FROM reprocessing_jobs \
-                 WHERE (status = 'queued' AND next_attempt_at <= now()) \
-                    OR (status = 'running' \
-                        AND (lease_expires_at IS NULL OR lease_expires_at < now())) \
-                 ORDER BY next_attempt_at \
-                 FOR UPDATE SKIP LOCKED \
-                 LIMIT 1 \
-             ) \
-             UPDATE reprocessing_jobs j \
-             SET status = 'running', \
-                 owner = $1, \
-                 dedupe_key = NULL, \
-                 lease_epoch = j.lease_epoch + 1, \
-                 lease_expires_at = now() + (interval '1 second' * $2) \
-             FROM claimable c \
-             WHERE j.id = c.id \
-             RETURNING j.id, j.trigger_type, j.lease_epoch, j.params, j.retry_count",
-        [worker_id.into(), LEASE_SECONDS.into()],
-    ))
-    .one(db)
-    .await
+    // The select and the update are one transaction because the row lock is what keeps two
+    // workers off the same row: `SKIP LOCKED` holds it until this transaction commits, so a
+    // second worker's select passes over it rather than waiting for it.
+    let txn = db.begin().await?;
+    let now = || Expr::current_timestamp();
+    let due = Column::Status
+        .eq("queued")
+        .and(Expr::col(Column::NextAttemptAt).lte(now()));
+    let orphaned = Column::Status.eq("running").and(
+        Column::LeaseExpiresAt
+            .is_null()
+            .or(Expr::col(Column::LeaseExpiresAt).lt(now())),
+    );
+    let Some(row) = Entity::find()
+        .filter(due.or(orphaned))
+        .order_by_asc(Column::NextAttemptAt)
+        .limit(1)
+        .lock_with_behavior(LockType::Update, LockBehavior::SkipLocked)
+        .one(&txn)
+        .await?
+    else {
+        txn.commit().await?;
+        return Ok(None);
+    };
+    let lease_epoch = row.lease_epoch + 1;
+    Entity::update_many()
+        .col_expr(Column::Status, Expr::value("running"))
+        .col_expr(Column::Owner, Expr::value(worker_id))
+        .col_expr(Column::DedupeKey, Expr::value(Option::<String>::None))
+        .col_expr(Column::LeaseEpoch, Expr::value(lease_epoch))
+        .col_expr(Column::LeaseExpiresAt, lease_expiry())
+        .filter(Column::Id.eq(row.id))
+        .exec(&txn)
+        .await?;
+    txn.commit().await?;
+    Ok(Some(Claimed {
+        id: row.id,
+        trigger_type: row.trigger_type,
+        lease_epoch,
+        params: row.params,
+        retry_count: row.retry_count,
+    }))
 }
 
 /// Renew the lease on a cadence while the job runs, and observe cross-replica cancellation: if
@@ -127,32 +174,23 @@ async fn heartbeat(
     tick.tick().await; // the immediate first tick, skip it, the claim just set the lease
     loop {
         tick.tick().await;
-        let renewed = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE reprocessing_jobs \
-                 SET lease_expires_at = now() + (interval '1 second' * $1) \
-                 WHERE id = $2 AND owner = $3 AND lease_epoch = $4 \
-                 RETURNING cancel_requested",
-                [
-                    LEASE_SECONDS.into(),
-                    job_id.into(),
-                    worker_id.clone().into(),
-                    lease_epoch.into(),
-                ],
-            ))
+        // Renew and read the cancel flag as two statements: the renewal is what proves ownership,
+        // and cancellation is advisory, re-read on the next tick if this read misses it.
+        let renewed = Entity::update_many()
+            .col_expr(Column::LeaseExpiresAt, lease_expiry())
+            .filter(owned_by(job_id, &worker_id, lease_epoch))
+            .exec(&db)
             .await;
         match renewed {
-            Ok(Some(r)) => match r.try_get::<bool>("", "cancel_requested") {
-                Ok(true) => cancel.store(true, Ordering::Relaxed),
-                Ok(false) => {}
-                // The row matched, so the lease is renewed and ownership is proven whatever the
-                // column decoded to. Cancellation is re-read on the next tick rather than guessed
-                // at here.
-                Err(e) => tracing::warn!(job_id = %job_id, error = %e, "cancel flag unreadable"),
-            },
+            Ok(res) if res.rows_affected > 0 => {
+                match Entity::find_by_id(job_id).one(&db).await {
+                    Ok(Some(row)) if row.cancel_requested => cancel.store(true, Ordering::Relaxed),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(job_id = %job_id, error = %e, "cancel flag unreadable"),
+                }
+            }
             // No row matched → we lost the lease (reclaimed). Stop the job and stop heartbeating.
-            Ok(None) => {
+            Ok(_) => {
                 cancel.store(true, Ordering::Relaxed);
                 break;
             }
@@ -171,24 +209,20 @@ async fn commit_terminal(
     readings_updated: Option<i32>,
     error_message: Option<&str>,
 ) -> Result<bool, sea_orm::DbErr> {
-    let res = db
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE reprocessing_jobs \
-             SET status = $1, readings_updated = $2, error_message = $3, completed_at = now(), \
-                 owner = NULL, lease_expires_at = NULL \
-             WHERE id = $4 AND owner = $5 AND lease_epoch = $6",
-            [
-                status.into(),
-                readings_updated.into(),
-                error_message.into(),
-                claimed.id.into(),
-                worker_id.into(),
-                claimed.lease_epoch.into(),
-            ],
-        ))
+    let res = Entity::update_many()
+        .col_expr(Column::Status, Expr::value(status))
+        .col_expr(Column::ReadingsUpdated, Expr::value(readings_updated))
+        .col_expr(Column::ErrorMessage, Expr::value(error_message))
+        .col_expr(Column::CompletedAt, Expr::current_timestamp())
+        .col_expr(Column::Owner, Expr::value(Option::<String>::None))
+        .col_expr(
+            Column::LeaseExpiresAt,
+            Expr::value(Option::<sea_orm::prelude::DateTimeWithTimeZone>::None),
+        )
+        .filter(owned_by(claimed.id, worker_id, claimed.lease_epoch))
+        .exec(db)
         .await?;
-    Ok(res.rows_affected() > 0)
+    Ok(res.rows_affected > 0)
 }
 
 /// On a retryable failure, durably reschedule (`status='queued'`, future `next_attempt_at` with
@@ -204,31 +238,59 @@ async fn reschedule_or_fail(
 ) -> Result<Option<String>, sea_orm::DbErr> {
     let max_retries = i64::from(policy.max_retries);
     let backoff_base = policy.backoff_base.as_secs() as i64;
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE reprocessing_jobs \
-             SET status = CASE WHEN retry_count < $1 THEN 'queued' ELSE 'failed' END, \
-                 retry_count = retry_count + 1, \
-                 error_message = $2, \
-                 next_attempt_at = CASE WHEN retry_count < $1 \
-                     THEN now() + (interval '1 second' * ($3 * power(2, retry_count))) \
-                     ELSE next_attempt_at END, \
-                 completed_at = CASE WHEN retry_count < $1 THEN NULL ELSE now() END, \
-                 owner = NULL, lease_expires_at = NULL \
-             WHERE id = $4 AND owner = $5 AND lease_epoch = $6 \
-             RETURNING status",
-            [
-                max_retries.into(),
-                error_message.into(),
-                backoff_base.into(),
-                claimed.id.into(),
-                worker_id.into(),
-                claimed.lease_epoch.into(),
-            ],
-        ))
+    // The backoff is read off the row's own `retry_count` rather than the claim's, so a restart
+    // between the claim and the failure still doubles from where the row stands.
+    let retrying = Expr::col(Column::RetryCount).lt(max_retries);
+    let res = Entity::update_many()
+        .col_expr(
+            Column::Status,
+            Expr::case(retrying.clone(), "queued").finally("failed").into(),
+        )
+        .col_expr(
+            Column::RetryCount,
+            Expr::col(Column::RetryCount).add(Expr::value(1)),
+        )
+        .col_expr(Column::ErrorMessage, Expr::value(error_message))
+        .col_expr(
+            Column::NextAttemptAt,
+            Expr::case(
+                retrying.clone(),
+                Expr::cust_with_values(
+                    "now() + (interval '1 second' * ($1 * power(2, retry_count)))",
+                    [sea_orm::Value::from(backoff_base)],
+                ),
+            )
+            .finally(Expr::col(Column::NextAttemptAt))
+            .into(),
+        )
+        .col_expr(
+            Column::CompletedAt,
+            Expr::case(
+                retrying,
+                Expr::value(Option::<sea_orm::prelude::DateTimeWithTimeZone>::None),
+            )
+            .finally(Expr::current_timestamp())
+            .into(),
+        )
+        .col_expr(Column::Owner, Expr::value(Option::<String>::None))
+        .col_expr(
+            Column::LeaseExpiresAt,
+            Expr::value(Option::<sea_orm::prelude::DateTimeWithTimeZone>::None),
+        )
+        .filter(owned_by(claimed.id, worker_id, claimed.lease_epoch))
+        .exec(db)
         .await?;
-    row.map(|r| r.try_get::<String>("", "status")).transpose()
+    if res.rows_affected == 0 {
+        return Ok(None);
+    }
+    Ok(Some(
+        if i64::from(claimed.retry_count) < max_retries {
+            "queued"
+        } else {
+            "failed"
+        }
+        .to_string(),
+    ))
 }
 
 /// Run a single claimed job to its terminal (or rescheduled) state. Separated from [`run`] so tests

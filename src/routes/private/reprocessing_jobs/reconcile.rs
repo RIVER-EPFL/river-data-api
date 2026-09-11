@@ -376,8 +376,10 @@ async fn cutover_family(
 
         crate::routes::private::readings::service::materialise_samples(
             txn,
-            "r.stream_id = $1",
-            vec![pair.new_id.into()],
+            crate::routes::private::collection_events::flows::rows_matching(
+                "r.stream_id = $1",
+                vec![pair.new_id.into()],
+            ),
         )
         .await?;
 

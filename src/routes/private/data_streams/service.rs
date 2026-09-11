@@ -706,8 +706,7 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
         crate::routes::private::readings::service::record_many(
             conn,
             crate::routes::private::readings::models::Kind::SlotMove,
-            row_predicate,
-            values,
+            crate::routes::private::collection_events::flows::rows_matching(row_predicate, values),
             crate::routes::private::readings::service::NewValue::Literal(
                 serde_json::json!({ "parameter_id": target_param }),
             ),

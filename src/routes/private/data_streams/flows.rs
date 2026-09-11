@@ -163,7 +163,7 @@ pub async fn backfill<C: ConnectionTrait>(
 
     // Replicate groups on the newly paired streams (2+ spot readings sharing a slot and timestamp,
     // e.g. migrated NOMIS A/B/C rows) form samples. The row-level triggers populate the statistics.
-    materialise_samples(conn, scope_sql, binds.clone()).await?;
+    materialise_samples(conn, rows_matching(scope_sql, binds.clone())).await?;
 
     // Attribution arriving is what makes these spot readings addressable as visits: attach their
     // collection events now, deriving the source from where each stream came from.

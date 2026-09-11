@@ -257,20 +257,27 @@ fn a_pin_exclusion_names_the_kind_and_covers_group_pins() {
 #[test]
 fn a_selection_names_a_stream_a_slot_or_keys_and_nothing_else() {
     use super::{Selection, SelectionKey};
+    let sql = |selection: &Selection| {
+        sea_orm::sea_query::Query::select()
+            .expr(sea_orm::sea_query::Expr::val(1))
+            .cond_where(selection.condition().unwrap())
+            .to_string(sea_orm::sea_query::PostgresQueryBuilder)
+    };
     let none = Selection::default();
-    assert!(none.predicate().is_err(), "nothing selected is refused");
+    assert!(none.condition().is_err(), "nothing selected is refused");
     let by_stream = Selection {
         stream_id: Some(uuid::Uuid::nil()),
         ..Default::default()
     };
-    let (sql, binds) = by_stream.predicate().unwrap();
-    assert_eq!(sql, "r.stream_id = $1");
-    assert_eq!(binds.len(), 1);
+    assert!(
+        sql(&by_stream)
+            .ends_with(r#"WHERE "r"."stream_id" = '00000000-0000-0000-0000-000000000000'"#)
+    );
     let half_slot = Selection {
         site_id: Some(uuid::Uuid::nil()),
         ..Default::default()
     };
-    assert!(half_slot.predicate().is_err(), "a slot needs both ids");
+    assert!(half_slot.condition().is_err(), "a slot needs both ids");
     let at = chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
         .unwrap()
         .with_timezone(&chrono::Utc);
@@ -281,12 +288,14 @@ fn a_selection_names_a_stream_a_slot_or_keys_and_nothing_else() {
         to: Some(at),
         ..Default::default()
     };
-    let (sql, binds) = slot_window.predicate().unwrap();
-    assert_eq!(
-        sql,
-        "r.site_id = $1 AND r.parameter_id = $2 AND r.time >= $3 AND r.time <= $4"
-    );
-    assert_eq!(binds.len(), 4);
+    let window = sql(&slot_window);
+    assert!(window.contains(r#""r"."site_id" ="#), "{window}");
+    assert!(window.contains(r#""r"."parameter_id" ="#), "{window}");
+    assert!(window.contains(r#""r"."time" >="#), "{window}");
+    assert!(window.contains(r#""r"."time" <="#), "{window}");
+
+    // A key names a replicate or it names the whole group; the group form leaves the index out
+    // rather than matching every index.
     let keys = Selection {
         keys: vec![
             SelectionKey {
@@ -304,10 +313,14 @@ fn a_selection_names_a_stream_a_slot_or_keys_and_nothing_else() {
         ],
         ..Default::default()
     };
-    let (sql, binds) = keys.predicate().unwrap();
-    assert!(sql.contains("r.stream_id = $1 AND r.time = $2"));
-    assert!(sql.contains("$6::smallint IS NULL OR r.replicate_index = $6"));
-    assert_eq!(binds.len(), 6);
+    let keyed = sql(&keys);
+    assert_eq!(keyed.matches(r#""r"."stream_id" ="#).count(), 2, "{keyed}");
+    assert_eq!(
+        keyed.matches(r#""r"."replicate_index" = 1"#).count(),
+        1,
+        "{keyed}"
+    );
+    assert!(keyed.contains(" OR "), "{keyed}");
 }
 
 #[test]
@@ -395,14 +408,22 @@ fn a_per_key_correction_names_the_replicate_each_value_belongs_to() {
 #[test]
 fn a_selection_can_name_one_visit() {
     use super::Selection;
+    let sql = |selection: &Selection| {
+        sea_orm::sea_query::Query::select()
+            .expr(sea_orm::sea_query::Expr::val(1))
+            .cond_where(selection.condition().unwrap())
+            .to_string(sea_orm::sea_query::PostgresQueryBuilder)
+    };
     let event = uuid::Uuid::nil();
     let by_event = Selection {
         collection_event_id: Some(event),
         ..Default::default()
     };
-    let (sql, binds) = by_event.predicate().unwrap();
-    assert_eq!(sql, "r.collection_event_id = $1");
-    assert_eq!(binds.len(), 1);
+    assert!(
+        sql(&by_event).ends_with(
+            r#"WHERE "r"."collection_event_id" = '00000000-0000-0000-0000-000000000000'"#
+        )
+    );
 
     // A visit narrowed to one parameter is still a selection, and the slot rule still holds.
     let one_parameter = Selection {
@@ -411,12 +432,13 @@ fn a_selection_can_name_one_visit() {
         parameter_id: Some(uuid::Uuid::nil()),
         ..Default::default()
     };
-    let (sql, binds) = one_parameter.predicate().unwrap();
-    assert_eq!(
-        sql,
-        "r.collection_event_id = $1 AND r.site_id = $2 AND r.parameter_id = $3"
+    let narrowed = sql(&one_parameter);
+    assert!(
+        narrowed.contains(r#""r"."collection_event_id" ="#),
+        "{narrowed}"
     );
-    assert_eq!(binds.len(), 3);
+    assert!(narrowed.contains(r#""r"."site_id" ="#), "{narrowed}");
+    assert!(narrowed.contains(r#""r"."parameter_id" ="#), "{narrowed}");
 }
 
 #[test]
@@ -679,13 +701,20 @@ fn sync_owns_the_measurement_and_never_a_judgement() {
 
 #[test]
 fn the_judgement_statement_names_every_judged_kind_and_no_other() {
-    let sql = super::live_judgements_sql("r");
+    let sql = sea_orm::sea_query::Query::select()
+        .expr(super::live_judgements("r"))
+        .to_string(sea_orm::sea_query::PostgresQueryBuilder);
     for k in super::ALL_KINDS {
         let named = sql.contains(&format!("'{}'", k.as_str()));
         assert_eq!(named, super::is_judgement(k), "{k:?}");
     }
-    assert!(sql.contains("d.rolled_back_by IS NULL"));
-    assert!(sql.contains("d.replicate_index IS NULL OR d.replicate_index = r.replicate_index"));
+    assert!(sql.contains(r#""d"."rolled_back_by" IS NULL"#), "{sql}");
+    assert!(
+        sql.contains(
+            r#""d"."replicate_index" IS NULL OR "d"."replicate_index" = "r"."replicate_index""#
+        ),
+        "{sql}"
+    );
 }
 
 #[test]
@@ -693,4 +722,21 @@ fn a_value_correction_is_per_row_only() {
     assert!(Kind::ValueCorrection.per_row_only());
     assert!(!Kind::Flag.per_row_only());
     assert!(!Kind::Withdraw.per_row_only());
+}
+
+/// The keyed recorder reads `k.t`, `k.ri` and `k.n`, so the key set has to name them. An
+/// `unnest(...) AS k` with no column list names all three `unnest` instead, and every reference
+/// to them fails.
+#[test]
+fn the_key_set_names_the_column_each_key_is_read_by() {
+    let sql = super::key_set(
+        vec!["2025-06-01T00:00:00Z".to_string()],
+        vec![0],
+        vec!["{}".to_string()],
+    )
+    .to_string(sea_orm::sea_query::PostgresQueryBuilder);
+    for column in [r#"AS "t""#, r#"AS "ri""#, r#"AS "n""#] {
+        assert!(sql.contains(column), "{column} missing from {sql}");
+    }
+    assert_eq!(sql.matches("unnest").count(), 3, "{sql}");
 }

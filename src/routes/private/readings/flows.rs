@@ -1,14 +1,19 @@
 use async_trait::async_trait;
 use sea_orm::ActiveModelTrait;
 use sea_orm::ColumnTrait;
+use sea_orm::Condition;
 use sea_orm::ConnectionTrait;
 use sea_orm::DbErr;
 use sea_orm::EntityTrait;
+use sea_orm::ExprTrait;
 use sea_orm::FromQueryResult;
 use sea_orm::QueryFilter;
+use sea_orm::QueryOrder;
+use sea_orm::QuerySelect;
 use sea_orm::Set;
 use sea_orm::Statement;
 use sea_orm::entity::prelude::*;
+use sea_orm::sea_query::Expr;
 use uuid::Uuid;
 
 use crate::routes::private::data_streams;
@@ -69,34 +74,39 @@ pub(super) async fn displace_spot_tail(
     count: i16,
 ) -> crate::error::AppResult<()> {
     let time_value = sea_orm::prelude::DateTimeWithTimeZone::from(time);
-    let curated = txn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT replicate_index, \
-                    CASE WHEN is_flagged IS TRUE THEN 'flagged' ELSE 'standard_curve' END AS reason \
-             FROM readings \
-             WHERE stream_id = $1 AND time = $2 AND replicate_index >= $3 \
-               AND measurement_type = 'spot' AND withdrawn_at IS NULL \
-               AND (is_flagged IS TRUE OR standard_curve_id IS NOT NULL) \
-             ORDER BY replicate_index",
-            [
-                stream_id.into(),
-                time_value.into(),
-                count.into(),
-            ],
-        ))
+    // Withdrawn rows are already excluded, so a survivor is kept for a flag or a hand curve.
+    let reason: Expr = sea_orm::sea_query::CaseStatement::new()
+        .case(Expr::cust("is_flagged IS TRUE"), "flagged")
+        .finally("standard_curve")
+        .into();
+    let curated = readings::Entity::find()
+        .select_only()
+        .column(readings::Column::ReplicateIndex)
+        .column_as(reason, "reason")
+        .filter(readings::Column::StreamId.eq(stream_id))
+        .filter(readings::Column::Time.eq(time_value.clone()))
+        .filter(readings::Column::ReplicateIndex.gte(count))
+        .filter(readings::Column::MeasurementType.eq("spot"))
+        .filter(readings::Column::WithdrawnAt.is_null())
+        .filter(
+            Condition::any()
+                .add(Expr::cust("is_flagged IS TRUE"))
+                .add(readings::Column::StandardCurveId.is_not_null()),
+        )
+        .order_by_asc(readings::Column::ReplicateIndex)
+        .into_model::<CuratedRow>()
+        .all(txn)
         .await?;
     if !curated.is_empty() {
         let entries = curated
             .iter()
             .map(|row| {
-                let row = CuratedRow::from_query_result(row, "")?;
-                Ok(serde_json::json!({
+                serde_json::json!({
                     "replicate_index": row.replicate_index,
                     "reason": row.reason,
-                }))
+                })
             })
-            .collect::<Result<Vec<_>, DbErr>>()?;
+            .collect::<Vec<_>>();
         crate::routes::private::readings::service::upsert_source_modified_hold(
             txn,
             stream_id,
@@ -112,13 +122,17 @@ pub(super) async fn displace_spot_tail(
     use super::models::Kind;
     use super::models::Origin;
     use super::service::NewValue;
+    use super::service::r;
     use super::service::record_many;
     record_many(
         txn,
         Kind::Withdraw,
-        "r.stream_id = $1 AND r.time = $2 AND r.replicate_index >= $3 \
-         AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL",
-        vec![stream_id.into(), time_value.clone().into(), count.into()],
+        Condition::all()
+            .add(r(readings::Column::StreamId).eq(stream_id))
+            .add(r(readings::Column::Time).eq(time_value.clone()))
+            .add(r(readings::Column::ReplicateIndex).gte(count))
+            .add(r(readings::Column::MeasurementType).eq("spot"))
+            .add(r(readings::Column::WithdrawnAt).is_null()),
         NewValue::Literal(serde_json::json!({ "reason": "displaced_by_overwrite" })),
         "csv_import",
         Some("displaced_by_overwrite"),
@@ -132,9 +146,11 @@ pub(super) async fn displace_spot_tail(
     record_many(
         txn,
         Kind::Reassert,
-        "r.stream_id = $1 AND r.time = $2 AND r.replicate_index < $3 \
-         AND r.withdrawn_reason = 'displaced_by_overwrite'",
-        vec![stream_id.into(), time_value.into(), count.into()],
+        Condition::all()
+            .add(r(readings::Column::StreamId).eq(stream_id))
+            .add(r(readings::Column::Time).eq(time_value))
+            .add(r(readings::Column::ReplicateIndex).lt(count))
+            .add(r(readings::Column::WithdrawnReason).eq("displaced_by_overwrite")),
         NewValue::Literal(serde_json::json!({})),
         "csv_import",
         Some("re-asserted by the file"),
@@ -531,8 +547,10 @@ impl CsvImport {
             let stream_ids_for_events = stream_ids.clone();
             crate::routes::private::readings::service::materialise_samples(
                 ctx.db(),
-                &row_predicate,
-                vec![stream_ids.clone().into()],
+                crate::routes::private::collection_events::flows::rows_matching(
+                    &row_predicate,
+                    vec![stream_ids.clone().into()],
+                ),
             )
             .await
             .map_err(as_db_err)?;

@@ -129,8 +129,29 @@ async fn hold_the_database(url: &str) {
         .await;
 }
 
+/// Send the server's own `tracing` output to the test's stderr, once per binary.
+///
+/// A handler that fails logs what failed and answers `{"error":"Database error"}`; with no
+/// subscriber installed the log goes nowhere, so a 500 in a test is a body with nothing behind
+/// it. `RUST_LOG` selects what is shown and `--nocapture` is what lets it reach the terminal.
+pub fn show_server_logs() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("river_db=error"));
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_test_writer())
+            .try_init();
+    });
+}
+
 pub async fn setup_test_db() -> DatabaseConnection {
     dotenvy::dotenv().ok();
+    show_server_logs();
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
     hold_the_database(&url).await;
 

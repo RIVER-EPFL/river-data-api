@@ -1510,8 +1510,10 @@ pub(super) async fn rule_on_entry(
         let recorded = record_many(
             txn,
             kind,
-            "r.site_id = $1 AND r.parameter_id = $2 AND r.time = $3 AND r.unverified IS TRUE",
-            vec![site_id.into(), parameter_id.into(), group_time.into()],
+            crate::routes::private::collection_events::flows::rows_matching(
+                "r.site_id = $1 AND r.parameter_id = $2 AND r.time = $3 AND r.unverified IS TRUE",
+                vec![site_id.into(), parameter_id.into(), group_time.into()],
+            ),
             NewValue::Literal(new),
             by,
             Some(&reason),

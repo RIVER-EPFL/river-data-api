@@ -126,3 +126,52 @@ fn test_project_filter_sql_binds_an_empty_set_for_a_member_with_no_grants() {
     );
     assert_eq!(values.len(), 1);
 }
+
+/// Scenario: a restricted caller's project filter goes into a sea-query statement rather than
+/// into a string the caller assembles.
+///
+/// Expected behaviour: it renders as a predicate Postgres accepts. `= ANY(...)` is one operator
+/// and a parenthesised right-hand side is a syntax error, which is what the built form produced
+/// while every caller was still assembling the text by hand.
+#[test]
+fn test_the_project_filter_renders_a_predicate_postgres_parses() {
+    use sea_orm::sea_query::{PostgresQueryBuilder, Query};
+    let predicate = project_filter(&granted(), sea_orm::sea_query::Alias::new("project_id"))
+        .expect("a restricted caller has a filter");
+    let (sql, _) = Query::select()
+        .expr(sea_orm::sea_query::Expr::cust("1"))
+        .from(sea_orm::sea_query::Alias::new("sites"))
+        .and_where(predicate)
+        .build(PostgresQueryBuilder);
+    assert!(
+        !sql.contains("(ANY("),
+        "Postgres rejects a parenthesised ANY on the right of `=`: {sql}"
+    );
+    assert!(
+        sql.contains("\"project_id\" IN ("),
+        "the caller's projects confine the column: {sql}"
+    );
+}
+
+/// Scenario: a caller with the role but no grant at all.
+///
+/// Expected behaviour: the filter still renders, and it matches nothing. Failing open here is
+/// the whole surface, so the empty set is the case worth pinning rather than the populated one.
+#[test]
+fn test_a_caller_with_no_grants_is_filtered_to_nothing() {
+    use sea_orm::sea_query::{PostgresQueryBuilder, Query};
+    let predicate = project_filter(&no_grants(), sea_orm::sea_query::Alias::new("project_id"))
+        .expect("a caller with no grants is still restricted");
+    let (sql, values) = Query::select()
+        .expr(sea_orm::sea_query::Expr::cust("1"))
+        .from(sea_orm::sea_query::Alias::new("sites"))
+        .and_where(predicate)
+        .build(PostgresQueryBuilder);
+    // The builder writes an empty `IN` as a bound contradiction rather than as `IN ()`, which
+    // is not valid SQL. Either way the query returns nothing, which is the direction to fail in.
+    assert_eq!(
+        format!("{values:?}"),
+        "Values([Int(Some(1)), Int(Some(2))])",
+        "an empty grant set is a contradiction, not an open filter: {sql} {values:?}"
+    );
+}

@@ -10,10 +10,13 @@ use axum::extract::State;
 use chrono::Utc;
 use sea_orm::ActiveModelTrait;
 use sea_orm::ColumnTrait;
+use sea_orm::Condition;
 use sea_orm::ConnectionTrait;
 use sea_orm::EntityTrait;
 use sea_orm::FromQueryResult;
 use sea_orm::QueryFilter;
+use sea_orm::QueryOrder;
+use sea_orm::QuerySelect;
 use sea_orm::Set;
 use sea_orm::Statement;
 use sea_orm::entity::prelude::*;
@@ -33,6 +36,7 @@ use crate::routes::private::data_streams;
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
 use crate::routes::private::parameters;
 use crate::routes::private::readings;
+use crate::routes::private::readings::decision_model;
 use crate::routes::private::readings::models::ConflictMode;
 use crate::routes::private::readings::models::Kind;
 use crate::routes::private::readings::models::Origin;
@@ -84,50 +88,29 @@ pub async fn sample_preview(
 ) -> AppResult<Json<SamplePreviewResponse>> {
     let estimator = crate::routes::private::readings::service::parse_opt(q.estimator.as_deref())?;
     let time = sea_orm::prelude::DateTimeWithTimeZone::from(q.time);
+    let find = preview_rows().filter(readings::Column::Time.eq(time));
     let rows = match (q.stream_id, q.site_id, q.parameter_id) {
-        (Some(stream_id), _, _) => {
-            state
-                .db
-                .query_all_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT site_id, parameter_id, replicate_index,
-                            COALESCE(calibrated_value, raw_value) AS value,
-                            is_flagged IS TRUE AS flagged, withdrawn_at IS NOT NULL AS withdrawn
-                     FROM readings WHERE stream_id = $1 AND time = $2
-                     ORDER BY replicate_index",
-                    [stream_id.into(), time.into()],
-                ))
-                .await?
-        }
-        (None, Some(site_id), Some(parameter_id)) => {
-            state
-                .db
-                .query_all_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT site_id, parameter_id, replicate_index,
-                            COALESCE(calibrated_value, raw_value) AS value,
-                            is_flagged IS TRUE AS flagged, withdrawn_at IS NOT NULL AS withdrawn
-                     FROM readings
-                     WHERE site_id = $1 AND parameter_id = $2 AND time = $3
-                       AND measurement_type = 'spot'
-                     ORDER BY replicate_index",
-                    [site_id.into(), parameter_id.into(), time.into()],
-                ))
-                .await?
-        }
+        (Some(stream_id), _, _) => find.filter(readings::Column::StreamId.eq(stream_id)),
+        (None, Some(site_id), Some(parameter_id)) => find
+            .filter(readings::Column::SiteId.eq(site_id))
+            .filter(readings::Column::ParameterId.eq(parameter_id))
+            .filter(readings::Column::MeasurementType.eq("spot")),
         _ => {
             return Err(AppError::BadRequest(
                 "Provide either stream_id or both site_id and parameter_id".to_string(),
             ));
         }
-    };
+    }
+    .order_by_asc(readings::Column::ReplicateIndex)
+    .into_model::<PreviewRow>()
+    .all(&state.db)
+    .await?;
     if rows.is_empty() {
         return Err(AppError::NotFound("No reading at that instant".to_string()));
     }
     let mut replicates = Vec::with_capacity(rows.len());
     let mut slot: Option<(Uuid, Uuid)> = None;
     for row in &rows {
-        let row = PreviewRow::from_query_result(row, "")?;
         if let (Some(s), Some(p)) = (row.site_id, row.parameter_id) {
             slot.get_or_insert((s, p));
         }
@@ -614,18 +597,18 @@ pub async fn preview(
     let (_, option) = req.decision.assertion_over(kind, &req.selection)?;
     authorise(&auth, option)?;
     refuse_unrouted(&state.db, &req.selection, option).await?;
-    let (predicate, binds) = req.selection.predicate()?;
-    let parameters = touched_parameters(&state.db, &predicate, binds.clone()).await?;
+    let rows_where = req.selection.condition()?;
+    let parameters = touched_parameters(&state.db, rows_where.clone()).await?;
 
     // The transaction is the preview: the decision is applied, the numbers are read back from the
     // rows the trigger just rewrote, and the whole thing is undone. Nothing recomputes the
     // arithmetic a second time, so the preview cannot disagree with the write.
     let (rows, samples) = crate::common::bulk_write::guarded_rollback(&state.db, async |txn| {
-        let before_rows = row_states(txn, &predicate, binds.clone()).await?;
-        let before_samples = sample_states(txn, &predicate, binds.clone()).await?;
+        let before_rows = row_states(txn, rows_where.clone()).await?;
+        let before_samples = sample_states(txn, rows_where.clone()).await?;
         apply(txn, &req.selection, &req.decision, &actor, auth.origin()).await?;
-        let after_rows = row_states(txn, &predicate, binds.clone()).await?;
-        let after_samples = sample_states(txn, &predicate, binds.clone()).await?;
+        let after_rows = row_states(txn, rows_where.clone()).await?;
+        let after_samples = sample_states(txn, rows_where.clone()).await?;
         let rows: Vec<MovedRow> = before_rows
             .into_iter()
             .zip(after_rows)
@@ -715,33 +698,10 @@ pub async fn commit(
 
     propagate(&state, &recorded, &actor).await?;
 
-    let (predicate, binds) = req.selection.predicate()?;
-    let ids = state
-        .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT d.id FROM reading_decisions d
-                  WHERE d.rolled_back_by IS NULL AND d.kind = '{kind}'
-                    AND EXISTS (SELECT 1 FROM readings r
-                                  JOIN data_streams ds ON ds.id = r.stream_id
-                                 WHERE {predicate} AND r.stream_id = d.stream_id
-                                   AND r.time = d.time
-                                   AND (d.replicate_index IS NULL
-                                        OR d.replicate_index = r.replicate_index))
-                  ORDER BY d.at DESC, d.id DESC LIMIT $%LIMIT%",
-                kind = kind.as_str()
-            )
-            .replace("$%LIMIT%", &recorded.rows.max(1).to_string()),
-            binds,
-        ))
-        .await?;
+    let ids = decisions_recorded(&state.db, &req.selection, kind, recorded.rows).await?;
     Ok(Json(EditResponse {
         rows_decided: recorded.rows,
-        decision_ids: ids
-            .iter()
-            .map(|r| r.try_get("", "id"))
-            .collect::<Result<_, _>>()?,
+        decision_ids: ids,
         set_id,
     }))
 }
@@ -1562,7 +1522,11 @@ pub async fn insert_batch_readings(
             .await?;
             // A replicate landing beside one already stored makes the instant a group, whichever
             // path wrote either row, so the batch goes through the one materialiser too.
-            crate::routes::private::readings::service::materialise_samples(txn, row_predicate, binds.clone()).await?;
+            crate::routes::private::readings::service::materialise_samples(
+                txn,
+                flows::rows_matching(row_predicate, binds.clone()),
+            )
+            .await?;
             let mut instants = spot_times.clone();
             instants.sort_unstable();
             instants.dedup();
@@ -2350,8 +2314,10 @@ pub async fn ingest_readings(
                     ];
                     crate::routes::private::readings::service::materialise_samples_with_estimator(
                         txn,
-                        "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
-                        binds.clone(),
+                        flows::rows_matching(
+                            "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
+                            binds.clone(),
+                        ),
                         stream_sd_estimator.as_deref(),
                     )
                     .await?;
@@ -2691,18 +2657,15 @@ pub async fn ingest_status_events(
     // nothing new: the series keeps its first value and its transitions, and stops accreting one
     // "still the same" row per poll. Events at or before the stored tip are backfill and insert
     // as before; the primary key already collapses exact duplicates.
-    let tip = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT time, value FROM status_events WHERE stream_id = $1 ORDER BY time DESC LIMIT 1",
-            [payload.stream_id.into()],
-        ))
+    let tip = status_events::Entity::find()
+        .select_only()
+        .column(status_events::Column::Time)
+        .column(status_events::Column::Value)
+        .filter(status_events::Column::StreamId.eq(payload.stream_id))
+        .order_by_desc(status_events::Column::Time)
+        .into_model::<StatusTip>()
+        .one(db)
         .await?;
-    // The tip decides which events are new and which are a repeat of the stored value, so a row
-    // that will not decode is an error: reading it as "no tip" would re-admit everything.
-    let tip = tip
-        .map(|r| StatusTip::from_query_result(&r, ""))
-        .transpose()?;
     let tip_time: Option<chrono::DateTime<Utc>> = tip.as_ref().map(|t| t.time.with_timezone(&Utc));
     let mut last_value: Option<String> = tip.and_then(|t| t.value);
     payload.events.sort_by_key(|e| e.time);
@@ -3214,29 +3177,30 @@ pub async fn insert_grab_samples(
                         .await?;
                     }
                     for (parameter_id, time) in &groups {
-                        if let Some(row) = txn
-                            .query_one_raw(sea_orm::Statement::from_sql_and_values(
-                                sea_orm::DatabaseBackend::Postgres,
-                                r"SELECT label, notes, created_by, provenance, provenance_kind FROM readings
-                              WHERE site_id = $1 AND parameter_id = $2 AND time = $3
-                                AND measurement_type = 'spot'
-                                AND (label IS NOT NULL OR notes IS NOT NULL
-                                     OR created_by IS NOT NULL OR provenance IS NOT NULL)
-                              ORDER BY replicate_index LIMIT 1",
-                                [
-                                    payload.site_id.into(),
-                                    (*parameter_id).into(),
-                                    (*time).into(),
-                                ],
-                            ))
+                        if let Some(row) = readings::Entity::find()
+                            .select_only()
+                            .column(readings::Column::Label)
+                            .column(readings::Column::Notes)
+                            .column(readings::Column::CreatedBy)
+                            .column(readings::Column::Provenance)
+                            .column(readings::Column::ProvenanceKind)
+                            .filter(readings::Column::SiteId.eq(payload.site_id))
+                            .filter(readings::Column::ParameterId.eq(*parameter_id))
+                            .filter(readings::Column::Time.eq(*time))
+                            .filter(readings::Column::MeasurementType.eq("spot"))
+                            .filter(
+                                Condition::any()
+                                    .add(readings::Column::Label.is_not_null())
+                                    .add(readings::Column::Notes.is_not_null())
+                                    .add(readings::Column::CreatedBy.is_not_null())
+                                    .add(readings::Column::Provenance.is_not_null()),
+                            )
+                            .order_by_asc(readings::Column::ReplicateIndex)
+                            .into_model::<PriorFactsRow>()
+                            .one(txn)
                             .await?
                         {
-                            prior_facts.insert(
-                                (*parameter_id, *time),
-                                PriorFactsRow::from_query_result(&row, "")
-                                    .map(Into::into)
-                                    .unwrap_or_default(),
-                            );
+                            prior_facts.insert((*parameter_id, *time), row.into());
                         }
                     }
                     // The delete is scoped to the grab stream: another source's rows at the same
@@ -3252,33 +3216,28 @@ pub async fn insert_grab_samples(
                                 && r.time == *time
                                 && p.standard_curve.is_some()
                         });
-                        let kept = txn
-                            .query_all_raw(sea_orm::Statement::from_sql_and_values(
-                                sea_orm::DatabaseBackend::Postgres,
-                                r"SELECT replicate_index,
-                                     CASE WHEN is_flagged IS TRUE THEN 'flagged'
-                                          WHEN withdrawn_at IS NOT NULL THEN 'withdrawn'
-                                          ELSE 'standard_curve' END AS reason
-                              FROM readings
-                              WHERE stream_id = $1 AND time = $2 AND measurement_type = 'spot'
-                                AND (is_flagged IS TRUE OR withdrawn_at IS NOT NULL
-                                     OR (NOT $3 AND standard_curve_id IS NOT NULL))
-                              ORDER BY replicate_index",
-                                [stream_id.into(), (*time).into(), supplies_curve.into()],
-                            ))
+                        let kept = readings::Entity::find()
+                            .select_only()
+                            .column(readings::Column::ReplicateIndex)
+                            .column_as(kept_reason(), "reason")
+                            .filter(readings::Column::StreamId.eq(stream_id))
+                            .filter(readings::Column::Time.eq(*time))
+                            .filter(readings::Column::MeasurementType.eq("spot"))
+                            .filter(curated_or_curved(supplies_curve))
+                            .order_by_asc(readings::Column::ReplicateIndex)
+                            .into_model::<KeptRow>()
+                            .all(txn)
                             .await?;
                         if !kept.is_empty() {
                             let entries = kept
                                 .iter()
-                                .map(|row| {
-                                    KeptRow::from_query_result(row, "").map(|r| {
-                                        serde_json::json!({
-                                            "replicate_index": r.replicate_index,
-                                            "reason": r.reason,
-                                        })
+                                .map(|r| {
+                                    serde_json::json!({
+                                        "replicate_index": r.replicate_index,
+                                        "reason": r.reason,
                                     })
                                 })
-                                .collect::<Result<Vec<_>, sea_orm::DbErr>>()?;
+                                .collect::<Vec<_>>();
                             crate::routes::private::readings::service::upsert_source_modified_hold(
                                 txn,
                                 stream_id,
@@ -3290,17 +3249,20 @@ pub async fn insert_grab_samples(
                             .await?;
                             kept_total += kept.len();
                         }
-                        let res = txn
-                            .execute_raw(sea_orm::Statement::from_sql_and_values(
-                                sea_orm::DatabaseBackend::Postgres,
-                                r"DELETE FROM readings
-                              WHERE stream_id = $1 AND time = $2 AND measurement_type = 'spot'
-                                AND is_flagged IS NOT TRUE AND withdrawn_at IS NULL
-                                AND ($3 OR standard_curve_id IS NULL)",
-                                [stream_id.into(), (*time).into(), supplies_curve.into()],
-                            ))
+                        let res = readings::Entity::delete_many()
+                            .filter(readings::Column::StreamId.eq(stream_id))
+                            .filter(readings::Column::Time.eq(*time))
+                            .filter(readings::Column::MeasurementType.eq("spot"))
+                            .filter(Expr::cust("is_flagged IS NOT TRUE"))
+                            .filter(readings::Column::WithdrawnAt.is_null())
+                            .filter(if supplies_curve {
+                                Condition::all()
+                            } else {
+                                Condition::all().add(readings::Column::StandardCurveId.is_null())
+                            })
+                            .exec(txn)
                             .await?;
-                        removed += res.rows_affected();
+                        removed += res.rows_affected;
                     }
                     (usize::try_from(removed).unwrap_or(usize::MAX), kept_total)
                 } else {
@@ -3376,11 +3338,18 @@ pub async fn insert_grab_samples(
                 }
             };
             // A curve chosen with the entry is a claim, recorded once (ADR 0008).
-            crate::routes::private::readings::service::record_curve_claims(txn, &models, &actor, crate::routes::private::readings::models::Origin::Manual).await?;
+            crate::routes::private::readings::service::record_curve_claims(
+                txn,
+                &models,
+                &actor,
+                crate::routes::private::readings::models::Origin::Manual,
+            )
+            .await?;
 
             // An intern's entry lands pending: the record carries it, the columns project it and
             // the review queue lists it until a manager verifies or rejects (Q21, M44).
-            if entry_state == Some(crate::routes::private::readings::models::Kind::UnverifiedEntry) {
+            if entry_state == Some(crate::routes::private::readings::models::Kind::UnverifiedEntry)
+            {
                 crate::routes::private::readings::service::record_unverified_entries(
                     txn,
                     &models,
@@ -3400,25 +3369,40 @@ pub async fn insert_grab_samples(
                 if stored.is_empty() {
                     continue;
                 }
-                txn.execute_raw(sea_orm::Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    r"UPDATE readings
-                         SET label = COALESCE($4, label),
-                             notes = COALESCE($5, notes),
-                             created_by = COALESCE($6, created_by),
-                             provenance = COALESCE($7, provenance)
-                       WHERE stream_id = $1 AND time = $2 AND replicate_index = $3",
-                    [
-                        stream_cache[&r.parameter_id].into(),
-                        r.time.into(),
-                        p.replicate_index.into(),
-                        stored.label.clone().into(),
-                        stored.notes.clone().into(),
-                        stored.created_by.clone().into(),
-                        stored.provenance.clone().into(),
-                    ],
-                ))
-                .await?;
+                let keep = |column: readings::Column, value: sea_orm::Value| {
+                    Expr::expr(sea_orm::sea_query::Func::coalesce([
+                        Expr::val(value),
+                        Expr::col(column),
+                    ]))
+                };
+                readings::Entity::update_many()
+                    .col_expr(
+                        readings::Column::Label,
+                        keep(readings::Column::Label, stored.label.clone().into()),
+                    )
+                    .col_expr(
+                        readings::Column::Notes,
+                        keep(readings::Column::Notes, stored.notes.clone().into()),
+                    )
+                    .col_expr(
+                        readings::Column::CreatedBy,
+                        keep(
+                            readings::Column::CreatedBy,
+                            stored.created_by.clone().into(),
+                        ),
+                    )
+                    .col_expr(
+                        readings::Column::Provenance,
+                        keep(
+                            readings::Column::Provenance,
+                            stored.provenance.clone().into(),
+                        ),
+                    )
+                    .filter(readings::Column::StreamId.eq(stream_cache[&r.parameter_id]))
+                    .filter(readings::Column::Time.eq(r.time))
+                    .filter(readings::Column::ReplicateIndex.eq(p.replicate_index))
+                    .exec(txn)
+                    .await?;
             }
 
             // The statistics row, for the groups that now hold two or more replicates.

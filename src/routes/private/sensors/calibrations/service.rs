@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::{
     Alias, CommonTableExpression, Condition, Expr, ExprTrait as _, Func, IntoIden, IntoTableRef,
-    JoinType, OnConflict, Order, PostgresQueryBuilder, Query as SeaQuery, ReturningClause,
-    SelectStatement, SubQueryStatement, TableRef, UpdateStatement, WithClause, WithQuery,
+    JoinType, OnConflict, Order, OrderedStatement as _, PostgresQueryBuilder, Query as SeaQuery,
+    ReturningClause, SelectStatement, SubQueryStatement, TableRef, UpdateStatement,
+    WindowStatement, WithClause, WithQuery,
 };
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
@@ -1210,8 +1211,10 @@ async fn record_derived_arrival(
     crate::routes::private::readings::service::record_many(
         db,
         crate::routes::private::readings::models::Kind::DerivedComputed,
-        "r.stream_id = $1 AND r.time = $2 AND r.replicate_index = 0",
-        vec![stream_id.into(), time.into()],
+        crate::routes::private::collection_events::flows::rows_matching(
+            "r.stream_id = $1 AND r.time = $2 AND r.replicate_index = 0",
+            vec![stream_id.into(), time.into()],
+        ),
         crate::routes::private::readings::service::NewValue::Born,
         "system",
         None,
@@ -1223,77 +1226,138 @@ async fn record_derived_arrival(
     .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))
 }
 
+/// The window chain each of a sensor's calibrations is bounded by.
+///
+/// Windows chain within a (sensor, parameter): a multi-parameter instrument holds one calibration
+/// timeline per parameter, so `LEAD` partitions by `parameter_id`, never letting one parameter's
+/// next calibration truncate another's window. Instant curves (grab curves) are matched by
+/// `calibration_id` and never windowed, so they take no part.
+///
+/// `id` breaks a tie on `valid_from` so the chain is single-valued, and the guard refuses to write
+/// a zero-width `valid_until = valid_from` window, which would leave a curve the operator can see
+/// applying to nothing. Duplicate instants are refused at create (`SensorCalibrationOperations`);
+/// the guard covers rows loaded outside the API.
+///
+/// A chain-written bound is derived state and is rebuilt from scratch each time. An
+/// operator-written one (`valid_until_explicit`) is data, so it is only ever shortened, and then
+/// only far enough to keep windows non-overlapping, because the resolver depends on at most one
+/// curve covering an instant. `LEAST` ignores a NULL `next_from`, so an explicit bound on the
+/// newest curve survives. This is the same policy [`deployment_chain_statement`] applies to a
+/// deployment's end date.
+fn calibration_chain_statement(sensor_id: Uuid) -> UpdateStatement {
+    let ordered = SeaQuery::select()
+        .column(super::model::Column::Id)
+        .column(super::model::Column::ValidFrom)
+        .expr_window_as(
+            Expr::cust("LEAD(valid_from)"),
+            WindowStatement::partition_by(super::model::Column::ParameterId)
+                .order_by(super::model::Column::ValidFrom, Order::Asc)
+                .order_by(super::model::Column::Id, Order::Asc)
+                .take(),
+            Alias::new("next_from"),
+        )
+        .from(super::model::Entity)
+        .and_where(super::model::Column::SensorId.eq(sensor_id))
+        .and_where(super::model::Column::RetiredAt.is_null())
+        .take();
+    SeaQuery::update()
+        .table(
+            super::model::Entity
+                .into_table_ref()
+                .alias(Alias::new("sc")),
+        )
+        .value(
+            super::model::Column::ValidUntil,
+            Expr::cust(
+                "CASE WHEN sc.valid_until_explicit \
+                      THEN LEAST(sc.valid_until, ordered.next_from) \
+                      ELSE ordered.next_from END",
+            ),
+        )
+        .from(TableRef::SubQuery(
+            Box::new(ordered),
+            Alias::new("ordered").into_iden(),
+        ))
+        .and_where(Expr::cust("sc.id = ordered.id"))
+        .and_where(Expr::cust_with_values("sc.sensor_id = $1", [sensor_id]))
+        .and_where(Expr::cust(
+            "(ordered.next_from IS NULL OR ordered.next_from > ordered.valid_from)",
+        ))
+        .take()
+}
+
 pub async fn recompute_valid_until<C: ConnectionTrait>(
     db: &C,
     sensor_id: Uuid,
 ) -> Result<(), sea_orm::DbErr> {
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        // Windows chain within a (sensor, parameter): a multi-parameter instrument holds one
-        // calibration timeline per parameter, so LEAD must partition by parameter_id (never let one
-        // parameter's next calibration truncate another's window). Instant curves (grab curves) are
-        // matched by calibration_id, never windowed, so they are excluded from the chain.
-        //
-        // `, id` breaks a tie on valid_from so the chain is single-valued, and the guard refuses to
-        // write a zero-width `valid_until = valid_from` window, which would leave a curve the
-        // operator can see applying to nothing. Duplicate instants are refused at create
-        // (`SensorCalibrationOperations`); the guard covers rows loaded outside the API.
-        //
-        // A chain-written bound is derived state and is rebuilt from scratch each time. An
-        // operator-written one (`valid_until_explicit`) is data, so it is only ever shortened, and
-        // then only far enough to keep windows non-overlapping, because the resolver depends on at
-        // most one curve covering an instant. `LEAST` ignores a NULL `next_from`, so an explicit
-        // bound on the newest curve survives. This is the same policy
-        // `recompute_deployed_until` applies to a deployment's end date.
-        r"WITH ordered AS (
-            SELECT id, valid_from,
-                   LEAD(valid_from) OVER (PARTITION BY parameter_id ORDER BY valid_from, id) AS next_from
-            FROM sensor_calibrations
-            WHERE sensor_id = $1 AND retired_at IS NULL
-        )
-        UPDATE sensor_calibrations sc
-        SET valid_until = CASE
-                WHEN sc.valid_until_explicit THEN LEAST(sc.valid_until, ordered.next_from)
-                ELSE ordered.next_from
-            END
-        FROM ordered
-        WHERE sc.id = ordered.id AND sc.sensor_id = $1
-          AND (ordered.next_from IS NULL OR ordered.next_from > ordered.valid_from)",
-        [sensor_id.into()],
-    ))
-    .await?;
+    db.execute_raw(build(calibration_chain_statement(sensor_id)))
+        .await?;
     Ok(())
 }
 
-/// Twin of [`recompute_valid_until`] for the deployment timeline: chain each of a sensor's
-/// deployments' `deployed_until` down to the next deployment's `deployed_from`. A deployment's end
-/// date is always caller-settable, so this only ever *shortens* a window to remove overlap
-/// (`LEAST` keeps an existing earlier bound) and never extends one; a calibration's is
-/// chain-written unless an operator set it, and shortens only in that case. Shortening can't create
-/// an overlap, so the result always satisfies the per-(site, parameter) exclusion constraint.
+/// Twin of [`calibration_chain_statement`] for the deployment timeline: chain each of a sensor's
+/// deployments' `deployed_until` down to the next deployment's `deployed_from`.
+///
+/// A deployment's end date is always caller-settable, so this only ever shortens a window to remove
+/// overlap (`LEAST` keeps an existing earlier bound) and never extends one; a calibration's is
+/// chain-written unless an operator set it, and shortens only in that case. Shortening cannot
+/// create an overlap, so the result always satisfies the per-(site, parameter) exclusion
+/// constraint. The final predicate holds the write to the rows the chain actually moves.
+fn deployment_chain_statement(sensor_id: Uuid) -> UpdateStatement {
+    let ordered = SeaQuery::select()
+        .column(sensor_deployments::Column::Id)
+        .expr_as(
+            Expr::cust(
+                "LEAST(COALESCE(deployed_until, 'infinity'::timestamptz), \
+                       COALESCE(next_from, 'infinity'::timestamptz))",
+            ),
+            Alias::new("new_until"),
+        )
+        .from_subquery(
+            SeaQuery::select()
+                .column(sensor_deployments::Column::Id)
+                .column(sensor_deployments::Column::DeployedUntil)
+                .expr_window_as(
+                    Expr::cust("LEAD(deployed_from)"),
+                    WindowStatement::partition_by(sensor_deployments::Column::ParameterId)
+                        .order_by(sensor_deployments::Column::DeployedFrom, Order::Asc)
+                        .take(),
+                    Alias::new("next_from"),
+                )
+                .from(sensor_deployments::Entity)
+                .and_where(sensor_deployments::Column::SensorId.eq(sensor_id))
+                .take(),
+            Alias::new("chained"),
+        )
+        .take();
+    SeaQuery::update()
+        .table(
+            sensor_deployments::Entity
+                .into_table_ref()
+                .alias(Alias::new("d")),
+        )
+        .value(
+            sensor_deployments::Column::DeployedUntil,
+            Expr::cust("NULLIF(ordered.new_until, 'infinity'::timestamptz)"),
+        )
+        .from(TableRef::SubQuery(
+            Box::new(ordered),
+            Alias::new("ordered").into_iden(),
+        ))
+        .and_where(Expr::cust("d.id = ordered.id"))
+        .and_where(Expr::cust_with_values("d.sensor_id = $1", [sensor_id]))
+        .and_where(Expr::cust(
+            "COALESCE(d.deployed_until, 'infinity'::timestamptz) <> ordered.new_until",
+        ))
+        .take()
+}
+
 pub async fn recompute_deployed_until<C: ConnectionTrait>(
     db: &C,
     sensor_id: Uuid,
 ) -> Result<(), sea_orm::DbErr> {
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        r"WITH ordered AS (
-            SELECT id,
-                   LEAST(
-                       COALESCE(deployed_until, 'infinity'::timestamptz),
-                       COALESCE(LEAD(deployed_from) OVER (PARTITION BY parameter_id ORDER BY deployed_from), 'infinity'::timestamptz)
-                   ) AS new_until
-            FROM sensor_deployments
-            WHERE sensor_id = $1
-        )
-        UPDATE sensor_deployments d
-        SET deployed_until = NULLIF(ordered.new_until, 'infinity'::timestamptz)
-        FROM ordered
-        WHERE d.id = ordered.id AND d.sensor_id = $1
-          AND COALESCE(d.deployed_until, 'infinity'::timestamptz) <> ordered.new_until",
-        [sensor_id.into()],
-    ))
-    .await?;
+    db.execute_raw(build(deployment_chain_statement(sensor_id)))
+        .await?;
     Ok(())
 }
 

@@ -503,16 +503,17 @@ pub async fn recompute_event(
                 crate::routes::private::readings::service::record_many(
                     txn,
                     crate::routes::private::readings::models::Kind::Withdraw,
-                    &format!(
+                    crate::routes::private::collection_events::flows::rows_matching(
                         "r.site_id = $1 AND r.parameter_id = $2 AND r.time = $3 \
-                         AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL AND {free}",
-                        free = crate::routes::private::readings::service::unjudged_sql("r")
-                    ),
-                    vec![
-                        event.site_id.into(),
-                        (*parameter_id).into(),
-                        sea_orm::prelude::DateTimeWithTimeZone::from(event.collected_at).into(),
-                    ],
+                         AND r.measurement_type = 'spot' AND r.withdrawn_at IS NULL",
+                        vec![
+                            event.site_id.into(),
+                            (*parameter_id).into(),
+                            sea_orm::prelude::DateTimeWithTimeZone::from(event.collected_at).into(),
+                        ],
+                    )
+                    // A row somebody has ruled on is not the recompute's to retract.
+                    .add(crate::routes::private::readings::service::unjudged("r")),
                     crate::routes::private::readings::service::NewValue::Literal(
                         serde_json::json!({ "reason": "the calculation now yields no value" }),
                     ),
