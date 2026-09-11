@@ -168,6 +168,12 @@
             "lab_co2_ch4_dry": [0.134949, 0.179342],
             "CH4_umol_L_avg": [5.71465, 7.59476]
           }
+        },
+        {
+          "name": "VAD 2022-09-22 (row 38), no lab temperature and no lab pressure recorded, so both fall back to the constant",
+          "inputs": {"WTW_Temp_degC_1": 5.3, "Field_BP": 808, "Field_BP_altitude": 799},
+          "replicates": {"lab_co2_co2ppm": [346, 352], "lab_co2_h2o": [1.308, 1.647], "lab_co2_ch4": [0.189, 0.18]},
+          "expected": {"CO2_HS_Um_avg": [25.7062, 26.152], "pCO2_HS_uatm_avg": [427.787, 435.206], "pCO2_HS_P1_uatm_avg": [341.132, 347.048], "pCO2_HS_P2_uatm_avg": [536.455, 545.758], "lab_co2_ch4_dry": [0.192049, 0.183658]}
         }
       ]
     },
@@ -198,6 +204,12 @@
             "lab_dic_SA_added": [46, 45], "lab_dic_co2_dry": [559.4, 785.5], "lab_dic_delta_13co2": [-4.987, -5.416]
           },
           "expected": {"DIC_avg": [0.644071, 0.793345], "d13C_DIC_avg": [-5.1537, -5.59569]}
+        },
+        {
+          "name": "VAD 2021-08-11 (row 30), no lab air temperature recorded, so the constant stands in",
+          "inputs": {},
+          "replicates": {"lab_dic_acid_wght": [13.54, 13.33], "lab_dic_acid_sample_wght": [16.6, 16.19], "lab_dic_vol_overpressure": [3, 3], "lab_dic_SA_added": [46, 46], "lab_dic_co2_dry": [665, 562], "lab_dic_delta_13co2": [-5.847, -5.768]},
+          "expected": {"DIC_avg": [0.638854, 0.570772], "d13C_DIC_avg": [-6.05, -5.95747]}
         }
       ]
     }

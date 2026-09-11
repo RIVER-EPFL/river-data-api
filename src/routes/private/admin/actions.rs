@@ -26,7 +26,8 @@ use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::samples::models as samples;
 use crate::routes::private::sensor_calibrations;
 use crate::routes::private::sensor_calibrations::service::{
-    evaluate_formula, recompute_deployed_until,
+    bind_derived_variables, constants_named_by, evaluate_formula, recompute_deployed_until,
+    site_property_values,
 };
 use crate::routes::private::sensor_deployments as deployments;
 use crate::routes::private::sensor_deployments::flows as slots;
@@ -847,6 +848,21 @@ pub async fn preview_derived(
         }
     }
 
+    // A name that is not a slot at this site is a constant or a column of the site's row, bound
+    // the way the continuous path binds them.
+    let declared: Vec<String> = param_info.iter().map(|(name, ..)| name.clone()).collect();
+    let constants = constants_named_by(db, &payload.formula, &declared)
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    let properties: Vec<(String, String)> = var_names
+        .iter()
+        .filter(|name| !declared.contains(name) && !constants.contains_key(name.as_str()))
+        .map(|name| (name.clone(), name.clone()))
+        .collect();
+    let site_properties = site_property_values(db, payload.site_id, &properties)
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
     // Fetch readings for all resolved parameters within time range
     let mut all_times: Vec<chrono::DateTime<chrono::Utc>> = Vec::new();
     let mut source_data: HashMap<String, HashMap<i64, f64>> = HashMap::new();
@@ -939,28 +955,20 @@ pub async fn preview_derived(
     let mut derived_errors: Vec<Option<String>> = Vec::with_capacity(times.len());
 
     for ms in &time_set {
-        let mut vars = HashMap::new();
-        let mut all_present = true;
-
-        for var_name in &var_names {
-            if let Some(data) = source_data.get(var_name) {
-                if let Some(&val) = data.get(ms) {
-                    vars.insert(var_name.clone(), val);
-                } else {
-                    all_present = false;
-                    break;
-                }
-            } else {
-                all_present = false;
-                break;
-            }
-        }
-
-        if !all_present {
+        let parameters: Vec<(String, Option<f64>)> = declared
+            .iter()
+            .map(|name| {
+                let value = source_data.get(name).and_then(|data| data.get(ms)).copied();
+                (name.clone(), value)
+            })
+            .collect();
+        let Ok(vars) =
+            bind_derived_variables(&payload.formula, &parameters, &site_properties, &constants)
+        else {
             derived_values.push(None);
             derived_errors.push(None);
             continue;
-        }
+        };
 
         match evaluate_formula(&payload.formula, &vars) {
             Ok(val) if val.is_finite() => {

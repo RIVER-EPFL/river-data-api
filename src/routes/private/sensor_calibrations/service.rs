@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::models::SensorCalibration;
+use crate::routes::private::constants::models as constants;
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::derived_parameters::models::definition as calculation_formulas;
 use crate::routes::private::derived_parameters::models::source as derived_sources;
@@ -26,7 +27,9 @@ use crate::routes::private::readings::models::{Kind, Origin};
 use crate::routes::private::readings::samples::models as samples;
 use crate::routes::private::sensor_deployments::models as sensor_deployments;
 use crate::routes::private::site_parameters::models as site_parameters;
+use crate::routes::private::sites;
 use crate::routes::private::standard_curves::models as standard_curves;
+use crate::routes::private::tools::service::{free_identifiers, read_only_through_guards};
 
 /// The reprocess engines are driven by `Job::run`, whose error type is `DbErr`. The shared bulk-write
 /// and aggregate-refresh primitives report `AppError`; carrying the message through keeps a failed
@@ -949,11 +952,12 @@ async fn resolve_variables_for_derived(
     item: &DerivedWork,
     time: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<Option<HashMap<String, f64>>>, sea_orm::DbErr> {
-    let mapping_rows: Vec<(String, Option<Uuid>)> = derived_sources::Entity::find()
+    let mapping_rows: Vec<(String, Option<Uuid>, Option<String>)> = derived_sources::Entity::find()
         .filter(derived_sources::Column::DerivedDefinitionId.eq(item.derived_definition_id))
         .select_only()
         .column(derived_sources::Column::VariableName)
         .column(derived_sources::Column::ParameterId)
+        .column(derived_sources::Column::SiteProperty)
         .into_tuple()
         .all(db)
         .await?;
@@ -964,36 +968,128 @@ async fn resolve_variables_for_derived(
         return Ok(Some(None));
     }
 
-    let mut variables = HashMap::new();
-    for (var_name, source_param_id) in mapping_rows {
-        let Some(source_param_id) = source_param_id else {
-            continue;
-        };
-
-        let value_row = InputRow::find_by_statement(build(input_value_query(
-            item.derived_site_id,
-            source_param_id,
-            time,
-        )))
-        .one(db)
-        .await?;
-
-        match value_row {
-            Some(input) => {
-                if input.measurement_type.as_deref() == Some("spot") {
-                    tracing::debug!(
-                        variable = %var_name,
-                        parameter_id = %source_param_id,
-                        time = %time,
-                        "Derived input resolved from a grab (spot) reading"
-                    );
-                }
-                variables.insert(var_name, input.val)
+    let mut parameters = Vec::new();
+    let mut properties = Vec::new();
+    for (var_name, source_param_id, site_property) in mapping_rows {
+        if let Some(source_param_id) = source_param_id {
+            let value_row = InputRow::find_by_statement(build(input_value_query(
+                item.derived_site_id,
+                source_param_id,
+                time,
+            )))
+            .one(db)
+            .await?;
+            if let Some(input) = &value_row
+                && input.measurement_type.as_deref() == Some("spot")
+            {
+                tracing::debug!(
+                    variable = %var_name,
+                    parameter_id = %source_param_id,
+                    time = %time,
+                    "Derived input resolved from a grab (spot) reading"
+                );
             }
-            None => return Ok(None),
-        };
+            parameters.push((var_name, value_row.map(|input| input.val)));
+        } else if let Some(property) = site_property {
+            properties.push((var_name, property));
+        }
     }
-    Ok(Some(Some(variables)))
+    let site_properties = site_property_values(db, item.derived_site_id, &properties).await?;
+    let declared: Vec<String> = parameters
+        .iter()
+        .chain(&site_properties)
+        .map(|(variable, _)| variable.clone())
+        .collect();
+    let constants = constants_named_by(db, &item.formula, &declared).await?;
+    match bind_derived_variables(&item.formula, &parameters, &site_properties, &constants) {
+        Ok(variables) => Ok(Some(Some(variables))),
+        Err(reason) => {
+            tracing::debug!(
+                definition_id = %item.derived_definition_id,
+                time = %time,
+                reason,
+                "Derived formula skipped at this instant"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// The variables a derived formula binds at one instant, or why the instant is skipped.
+///
+/// A constant is bound by name. A parameter or site property the instant does not hold is NaN
+/// where the formula reads it only through a guard (`coalesce`, `is_missing`, a comparison), so
+/// the portal's fallback takes its other arm, and a skip where it is read anywhere else. The same
+/// binding a formula set gets in `tools::service::evaluate_set`.
+pub(crate) fn bind_derived_variables(
+    formula: &str,
+    parameters: &[(String, Option<f64>)],
+    site_properties: &[(String, Option<f64>)],
+    constants: &HashMap<String, f64>,
+) -> Result<HashMap<String, f64>, String> {
+    let mut variables = constants.clone();
+    for (variable, value) in parameters.iter().chain(site_properties) {
+        match value {
+            Some(value) => {
+                variables.insert(variable.clone(), *value);
+            }
+            None if read_only_through_guards(formula, variable) => {
+                variables.insert(variable.clone(), f64::NAN);
+            }
+            None => return Err(format!("no value for {variable}")),
+        }
+    }
+    Ok(variables)
+}
+
+/// The constants a formula names, read from the constants table: every free identifier that is
+/// not one of its declared variables. A name that is neither is left unbound, so the evaluation
+/// reports it rather than a silent zero.
+pub(crate) async fn constants_named_by<C: ConnectionTrait>(
+    db: &C,
+    formula: &str,
+    declared: &[String],
+) -> Result<HashMap<String, f64>, sea_orm::DbErr> {
+    let names: Vec<String> = free_identifiers(formula)
+        .into_iter()
+        .filter(|name| !declared.contains(name))
+        .collect();
+    if names.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = constants::Entity::find()
+        .filter(constants::Column::Name.is_in(names))
+        .all(db)
+        .await?;
+    Ok(rows.into_iter().map(|c| (c.name, c.value)).collect())
+}
+
+/// The value of each `(variable, site column)` on the site's own row, `None` where the column is
+/// null or not a number.
+pub(crate) async fn site_property_values<C: ConnectionTrait>(
+    db: &C,
+    site_id: Uuid,
+    properties: &[(String, String)],
+) -> Result<Vec<(String, Option<f64>)>, sea_orm::DbErr> {
+    if properties.is_empty() {
+        return Ok(Vec::new());
+    }
+    let site = sites::Entity::find_by_id(site_id)
+        .one(db)
+        .await?
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+    Ok(properties
+        .iter()
+        .map(|(variable, property)| {
+            let value = site
+                .as_ref()
+                .and_then(|row| row.get(property))
+                .and_then(serde_json::Value::as_f64);
+            (variable.clone(), value)
+        })
+        .collect())
 }
 
 /// The statement [`unattribute_derived_at`] runs.
@@ -1166,8 +1262,18 @@ async fn evaluate_and_upsert_derived(
         return Ok(());
     };
 
-    let Ok(result) = evaluate_formula(&item.formula, &variables) else {
-        return Ok(());
+    let result = match evaluate_formula(&item.formula, &variables) {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::warn!(
+                definition_id = %item.derived_definition_id,
+                formula = %item.formula,
+                time = %time,
+                error,
+                "Derived formula failed to evaluate"
+            );
+            return Ok(());
+        }
     };
     if !result.is_finite() {
         return Ok(());

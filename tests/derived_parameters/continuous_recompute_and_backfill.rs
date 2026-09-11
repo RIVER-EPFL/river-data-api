@@ -236,3 +236,93 @@ async fn test_recompute_endpoint_backfills_historical_gap() {
         "recompute should have backfilled a derived reading at {seeded_source_time}"
     );
 }
+
+/// Scenario: a standalone definition names a constant beside its source parameter, the shape the
+/// portal's "constant when the visit holds none" fallback takes.
+///
+/// Expected behaviour: the constant is bound from the constants table and the derived reading
+/// appears, rather than the evaluation failing on an unknown variable and writing nothing.
+#[tokio::test]
+#[serial]
+async fn test_continuous_derived_binds_a_constant_by_name() {
+    let (db, app, token) = setup().await;
+    let site_id = Uuid::parse_str(crate::common::SITE1_ID).unwrap();
+
+    crate::common::exec(
+        &db,
+        "INSERT INTO constants (id, name, value, units, description) \
+         VALUES (gen_random_uuid(), 'do_scale_factor', 0.032, 'mg/L per uM', \
+         'Continuous derived constant fixture') \
+         ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .await;
+
+    let derived_name = format!("do_scaled_{}", Uuid::new_v4().simple());
+    let (status, def_json) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/derived_parameters",
+        &serde_json::json!({
+            "code": derived_name,
+            "name": "Test DO scaled by constant",
+            "units": "mg/L",
+            "formula": "coalesce(Dissolved_O2, do_scale_factor) * do_scale_factor",
+        }),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "create derived ({status}): {def_json}"
+    );
+    let output_parameter_id = def_json["output_parameter_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let derived_param_uuid = Uuid::parse_str(&output_parameter_id).unwrap();
+
+    let (status, sp_text) = crate::common::post_json_with_token(
+        &app,
+        "/api/site_parameters",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "parameter_id": output_parameter_id,
+            "name": derived_name,
+            "sensor_type": "derived",
+            "entry_mode": "tool",
+            "display_units": "mg/L",
+        }),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "assign site_parameter ({status}): {sp_text}"
+    );
+
+    let t: DateTime<Utc> = Utc::now() - Duration::hours(30);
+    let t = t - Duration::nanoseconds(i64::from(t.timestamp_subsec_nanos()));
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        "/api/readings/batch",
+        &serde_json::json!({
+            "readings": [{
+                "site_id": crate::common::SITE1_ID,
+                "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
+                "time": t.to_rfc3339(),
+                "raw_value": 250.0,
+            }]
+        }),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "ingest source ({status}): {text}"
+    );
+
+    // 250.0 * 0.032
+    let got = poll_for_derived(&db, site_id, derived_param_uuid, t, POLL_DEADLINE_SECS)
+        .await
+        .expect("derived reading naming a constant did not appear");
+    assert!((got - 8.0).abs() < 1e-6, "expected 8.0, got {got}");
+}

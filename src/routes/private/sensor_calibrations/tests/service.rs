@@ -271,3 +271,52 @@ fn a_chain_written_bound_is_derived_and_an_operator_written_one_is_only_shortene
         "and the write is held to the rows the chain moves: {deployment}"
     );
 }
+
+/// A continuous derived formula binds what a formula set binds: a constant by name, a site column
+/// from the site's row, and a guarded absent input as NaN so `coalesce` takes its other arm.
+#[test]
+fn a_derived_formula_binds_constants_site_properties_and_guarded_gaps() {
+    let constants = HashMap::from([("lab_temp_avg_degC".to_string(), 22.5)]);
+    let parameters = vec![("WTW_Temp_degC_1".to_string(), Some(8.7))];
+    let site = vec![("altitude_m".to_string(), Some(801.0))];
+    let vars = bind_derived_variables(
+        "WTW_Temp_degC_1 * altitude_m + lab_temp_avg_degC",
+        &parameters,
+        &site,
+        &constants,
+    )
+    .unwrap();
+    assert_eq!(vars["lab_temp_avg_degC"], 22.5);
+    assert_eq!(vars["altitude_m"], 801.0);
+    assert_eq!(vars["WTW_Temp_degC_1"], 8.7);
+
+    let absent = vec![("lab_co2_lab_temp".to_string(), None)];
+    let vars = bind_derived_variables(
+        "coalesce(lab_co2_lab_temp, lab_temp_avg_degC) + 273.15",
+        &absent,
+        &[],
+        &constants,
+    )
+    .unwrap();
+    assert!(vars["lab_co2_lab_temp"].is_nan());
+    // 22.5 + 273.15
+    let value = evaluate_formula(
+        "coalesce(lab_co2_lab_temp, lab_temp_avg_degC) + 273.15",
+        &vars,
+    )
+    .unwrap();
+    assert!((value - 295.65).abs() < 1e-9);
+}
+
+/// An input read outside every guard skips the instant rather than computing over NaN, and the
+/// reason names the variable.
+#[test]
+fn an_unguarded_absent_input_skips_the_instant() {
+    let absent = vec![("Dissolved_O2".to_string(), None)];
+    let skipped = bind_derived_variables("Dissolved_O2 * 0.032", &absent, &[], &HashMap::new());
+    assert_eq!(skipped, Err("no value for Dissolved_O2".to_string()));
+
+    let site = vec![("altitude_m".to_string(), None)];
+    let skipped = bind_derived_variables("altitude_m / 2", &[], &site, &HashMap::new());
+    assert_eq!(skipped, Err("no value for altitude_m".to_string()));
+}
