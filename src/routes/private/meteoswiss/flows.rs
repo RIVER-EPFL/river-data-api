@@ -11,9 +11,7 @@ use super::service::{
     recent_url, series, subscribers,
 };
 use crate::config::Config;
-use crate::routes::private::reprocessing_jobs::job::Job;
-use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
-use crate::routes::private::reprocessing_jobs::schedule::Schedule;
+use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport, Schedule};
 
 /// Pull each declared station's recent file and land its pressure at every site that named it.
 pub struct MeteoswissSync {

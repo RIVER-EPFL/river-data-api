@@ -1,4 +1,3 @@
-pub mod admin;
 pub mod alarms;
 pub mod annotations;
 pub mod api_tokens;
@@ -21,9 +20,9 @@ pub mod search;
 pub mod sensor_calibrations;
 pub mod sensor_deployments;
 pub mod sensors;
-pub mod standard_curves;
 pub mod site_parameters;
 pub mod sites;
+pub mod standard_curves;
 pub mod sync;
 pub mod tools;
 pub mod wire;

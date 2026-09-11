@@ -1,5 +1,13 @@
+//! The token row and its audit row, plus the Keycloak directory shapes the user routes answer
+//! with. Only the first two are tables.
+
 use crudcrate::EntityToModels;
+use sea_orm::FromQueryResult;
 use sea_orm::entity::prelude::*;
+use serde::Deserialize;
+use serde::Serialize;
+use utoipa::ToSchema;
+use uuid::Uuid;
 
 use super::service::ApiTokenOperations;
 
@@ -112,4 +120,102 @@ pub mod audit_log {
     pub enum Relation {}
 
     impl ActiveModelBehavior for ActiveModel {}
+}
+
+// --- The Keycloak directory's wire shapes ---
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct ListQuery {
+    /// React-admin style range, e.g. "[0,9]"
+    pub range: Option<String>,
+    /// React-admin style filter, e.g. {"q":"john"}
+    pub filter: Option<String>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize, ToSchema)]
+pub struct KeycloakRole {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AssignRolesRequest {
+    pub roles: Vec<String>,
+}
+
+/// A realm user as this API reports one: the fields the dashboard renders, plus the realm roles
+/// that decide what they may do. The names are Keycloak's own, so a caller reading the directory
+/// and a caller reading this see one shape.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct KeycloakUser {
+    #[schema(required)]
+    pub id: Option<String>,
+    #[schema(required)]
+    pub username: Option<String>,
+    #[schema(required)]
+    pub email: Option<String>,
+    #[serde(rename = "firstName")]
+    #[schema(required)]
+    pub first_name: Option<String>,
+    #[serde(rename = "lastName")]
+    #[schema(required)]
+    pub last_name: Option<String>,
+    #[schema(required)]
+    pub enabled: Option<bool>,
+    #[serde(rename = "createdTimestamp")]
+    #[schema(required)]
+    pub created_timestamp: Option<i64>,
+    pub roles: Vec<String>,
+}
+
+/// The id of a user this request removed.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct DeletedUser {
+    pub id: String,
+}
+
+/// A role assignment that took effect. The roles themselves are read back through the user.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct RolesAssigned {
+    pub success: bool,
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct SearchQuery {
+    /// Search string matched by Keycloak against username, email, first and last name.
+    pub q: String,
+}
+
+/// Outcome of the startup realm check. `Missing` is authoritative (Keycloak answered, and the
+/// roles are not there); `Unavailable` means the realm could not be asked, which is retryable.
+#[derive(Debug)]
+pub enum RealmRoleCheck {
+    Satisfied,
+    Missing(Vec<&'static str>),
+    Unavailable(String),
+}
+
+/// Replace the project visibility grants for a user (`user_project_grants`). Body is the full new
+/// set, this overwrites, not appends, mirroring `assign_roles`. Requires `require_admin`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetGrantsRequest {
+    /// The complete set of project ids the user may see. An empty array revokes all access.
+    pub project_ids: Vec<uuid::Uuid>,
+}
+
+/// List the projects a user is granted, with names. Administrators are unrestricted (they are never
+/// granted rows); this reflects only the stored grant set. Requires `require_admin`.
+/// One project a user holds a grant on.
+#[derive(FromQueryResult)]
+pub(crate) struct GrantRow {
+    pub(crate) id: uuid::Uuid,
+    pub(crate) name: String,
+}
+
+/// Replace a user's project grants transactionally and bust their grants cache so the change takes
+/// What a grant write left behind: the number of projects the user may now see.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SetGrantsResponse {
+    pub success: bool,
+    pub count: usize,
 }

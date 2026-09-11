@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use river_db::routes::private::reprocessing_jobs::worker;
+use river_db::routes::private::reprocessing_jobs::service as jobs;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 
@@ -52,7 +52,7 @@ async fn shutdown_lets_the_claimed_job_finish() {
 
     let events = tokio::sync::broadcast::channel(16).0;
     let registry = Arc::new(registry_of(job));
-    let job_id = worker::enqueue(&db, "test_retry", None, None, &serde_json::json!({}), None)
+    let job_id = jobs::enqueue(&db, "test_retry", None, None, &serde_json::json!({}), None)
         .await
         .unwrap()
         .expect("a fresh enqueue inserts a row");
@@ -61,7 +61,7 @@ async fn shutdown_lets_the_claimed_job_finish() {
     let worker_task = tokio::spawn({
         let db = db.clone();
         async move {
-            worker::run(db, events, registry, async move {
+            jobs::run_workers(db, events, registry, async move {
                 let _ = stop_rx.await;
             })
             .await;

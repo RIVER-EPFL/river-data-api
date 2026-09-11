@@ -39,8 +39,8 @@ use crate::routes::private::sensors::service::{
     create_sensor_for_stream, upsert_source_instrument,
 };
 use crate::routes::private::{
-    annotations, data_streams, data_streams::pairing_plans, parameters, projects,
-    standard_curves, sites, site_parameters as site_parameters,
+    annotations, data_streams, data_streams::pairing_plans, parameters, projects, site_parameters,
+    sites, standard_curves,
 };
 use crate::routes::private::{collection_events, readings};
 
@@ -801,7 +801,7 @@ impl Hold<'_> {
                      AND status = '{}'",
                     HoldStatus::Pending.as_str()
                 )
-                    .to_string(),
+                .to_string(),
                 vec![
                     site_id.into(),
                     parameter_id.into(),
@@ -2905,11 +2905,8 @@ pub(super) async fn assign_plan_curves<C: ConnectionTrait>(
                 intent.curve_id, intent.instrument_source_key
             )));
         };
-        if crate::routes::private::standard_curves::views::curve_is_used(
-            txn,
-            intent.curve_id,
-        )
-        .await?
+        if crate::routes::private::standard_curves::views::curve_is_used(txn, intent.curve_id)
+            .await?
         {
             return Err(AppError::BadRequest(format!(
                 "curve {} has already been applied to readings, so its instrument is fixed; \
@@ -3024,7 +3021,7 @@ pub fn refuse_unchecked_entries(entries: &[PlanEntry]) -> AppResult<()> {
 pub async fn apply_plan(
     db: &sea_orm::DatabaseConnection,
     plan_id: Uuid,
-    progress: Option<&crate::routes::private::reprocessing_jobs::lifecycle::JobContext>,
+    progress: Option<&crate::routes::private::reprocessing_jobs::service::JobContext>,
 ) -> AppResult<ApplyResult> {
     let plan = pairing_plans::Entity::find_by_id(plan_id)
         .one(db)
@@ -3207,7 +3204,7 @@ pub async fn apply_plan(
     // Re-derivation runs as tracked jobs so a failure is visible and rerunnable rather than a log
     // line lost on restart.
     for (site_id, parameter_id) in slots {
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
+        crate::routes::private::reprocessing_jobs::service::enqueue(
             db,
             "pairing_backfill",
             None,
@@ -3217,7 +3214,7 @@ pub async fn apply_plan(
         )
         .await?;
     }
-    crate::routes::private::reprocessing_jobs::worker::enqueue(
+    crate::routes::private::reprocessing_jobs::service::enqueue(
         db,
         "refresh_aggregates",
         None,
@@ -4882,11 +4879,8 @@ pub(super) async fn apply_curve_updates(
                 update.curve_id
             )));
         }
-        if crate::routes::private::standard_curves::views::curve_is_used(
-            db,
-            update.curve_id,
-        )
-        .await?
+        if crate::routes::private::standard_curves::views::curve_is_used(db, update.curve_id)
+            .await?
         {
             return Err(AppError::BadRequest(format!(
                 "standard curve {} has already been applied to readings, so its instrument is \
@@ -5061,10 +5055,7 @@ pub(super) async fn apply_instrument_updates(
         // corrects with rather than only its name.
         let repointed_curves = match &repointed {
             Some(sensor) => crate::routes::private::standard_curves::Entity::find()
-                .filter(
-                    crate::routes::private::standard_curves::Column::SensorId
-                        .eq(sensor.id),
-                )
+                .filter(crate::routes::private::standard_curves::Column::SensorId.eq(sensor.id))
                 .all(&state.db)
                 .await?
                 .into_iter()

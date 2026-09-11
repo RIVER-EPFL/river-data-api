@@ -1,7 +1,4 @@
-use super::super::lifecycle::JobContext;
-use super::super::registry;
-use super::super::schedule::Schedule;
-use super::{Job, JobRegistry};
+use super::*;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -46,15 +43,15 @@ fn register_and_lookup() {
 fn category_delegates_to_registry_table() {
     assert_eq!(
         dummy("janitor_service", None).category(),
-        registry::CATEGORY_MAINTENANCE
+        CATEGORY_MAINTENANCE
     );
     assert_eq!(
         dummy("manual_reprocess", None).category(),
-        registry::CATEGORY_OPERATOR
+        CATEGORY_OPERATOR
     );
     assert_eq!(
         dummy("calibration_create", None).category(),
-        registry::CATEGORY_METADATA
+        CATEGORY_METADATA
     );
 }
 
@@ -76,20 +73,20 @@ fn default_schedules_lists_only_recurring_services() {
 /// written for, and nothing else reports it.
 #[test]
 fn every_policy_name_is_a_registered_job() {
-    let r = super::build_registry();
+    let r = build_registry();
     // The recurring services need a Config to build; `register_scheduled_services` asserts it
     // registered exactly the names below, so taking them from the const is not taking them on
     // trust.
     let registered: std::collections::HashSet<&str> = r
         .names()
-        .chain(registry::SCHEDULED_SERVICE_NAMES.iter().copied())
+        .chain(SCHEDULED_SERVICE_NAMES.iter().copied())
         .collect();
 
-    let policy_names = registry::MAINTENANCE
+    let policy_names = MAINTENANCE
         .iter()
-        .chain(registry::METADATA)
-        .chain(registry::RERUNNABLE)
-        .chain(registry::CANCELLABLE);
+        .chain(METADATA)
+        .chain(RERUNNABLE)
+        .chain(CANCELLABLE);
     for name in policy_names {
         assert!(
             registered.contains(name),

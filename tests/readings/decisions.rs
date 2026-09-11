@@ -677,9 +677,9 @@ async fn a_merge_moves_every_reading_as_a_slot_move_and_deletes_none() {
         ),
     )
     .await;
-    let result = river_db::routes::private::admin::merge_services::merge_site_parameters(
+    let result = river_db::routes::private::site_parameters::service::merge_site_parameters(
         &f.db,
-        &river_db::routes::private::admin::merge_services::MergeSiteParametersRequest {
+        &river_db::routes::private::site_parameters::service::MergeSiteParametersRequest {
             source_site_parameter_id: crate::common::PARAM_S1_TEMP_ID.parse().unwrap(),
             target_site_parameter_id: crate::common::PARAM_S1_DO_ID.parse().unwrap(),
         },

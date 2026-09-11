@@ -1,15 +1,25 @@
-use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use sea_orm::sea_query;
 use sea_orm::sea_query::{
     Alias, Expr, Func, JoinType, Order, PostgresQueryBuilder, Query as SeaQuery, SelectStatement,
 };
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, ExprTrait, FromQueryResult,
-    QueryFilter, QueryOrder, QuerySelect, QueryTrait, Statement,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, ExprTrait,
+    FromQueryResult, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Statement,
 };
 use uuid::Uuid;
 
+use crate::common::sync_state;
 use crate::routes::private::readings;
-use crate::routes::private::reprocessing_jobs::model as jobs;
+use crate::routes::private::reprocessing_jobs::flows::{
+    as_db_err, build, optional_uuid, required_uuid,
+};
+use crate::routes::private::reprocessing_jobs::models::job as jobs;
+use crate::routes::private::reprocessing_jobs::service::Job;
+use crate::routes::private::reprocessing_jobs::service::{JobContext, JobReport};
+use crate::routes::private::sensor_calibrations::service::recalculate_derived_at_timestamp;
 use crate::routes::private::site_parameters::models as site_parameters;
 
 use super::models::{definition, source};
@@ -306,6 +316,487 @@ async fn run_delete(
     }
 }
 
+/// One instant of one site's derived work.
+#[derive(FromQueryResult)]
+struct DerivedInstant {
+    site_id: Uuid,
+    time: chrono::DateTime<chrono::FixedOffset>,
+}
+/// One instant, where the site is already known.
+#[derive(FromQueryResult)]
+struct InstantRow {
+    time: chrono::DateTime<chrono::FixedOffset>,
+}
+/// Parse a `params` array of RFC 3339 strings into UTC timestamps (skipping unparseable entries).
+fn parse_timestamps(value: Option<&serde_json::Value>) -> Vec<chrono::DateTime<chrono::Utc>> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|s| {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .ok()
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+/// Recompute derived values from their source readings, then refresh continuous aggregates. Backs
+/// the `derived_recompute` trigger, in either of two scopes: one derived parameter definition over
+/// its whole history (`derived_definition_id`), or every definition reading a given slot over a
+/// window (`site_ids`, `parameter_ids`, `start`, `end`), which is what a curation decision leaves
+/// behind.
+pub struct DerivedRecompute;
+
+/// The `(site, time)` instants a derived recompute covers: every reading of a parameter some
+/// calculation reads, at a site whose slot for that calculation's output is tool-entered.
+fn derived_instants(
+    scope: sea_query::Condition,
+    join_definition_on: Option<Uuid>,
+) -> sea_query::SelectStatement {
+    let r = sea_query::Alias::new("r");
+    let d = sea_query::Alias::new("d");
+    let dps = sea_query::Alias::new("dps");
+    let sp = sea_query::Alias::new("sp");
+
+    let mut query = sea_query::Query::select();
+    query
+        .distinct()
+        .column((r.clone(), readings::Column::SiteId))
+        .column((r.clone(), readings::Column::Time))
+        .from_as(readings::Entity, r.clone());
+
+    match join_definition_on {
+        // One calculation: the definition is the given row, and the sources join to it.
+        Some(definition_id) => {
+            query
+                .join_as(
+                    sea_query::JoinType::Join,
+                    definition::Entity,
+                    d.clone(),
+                    sea_query::Expr::col((d.clone(), definition::Column::Id)).eq(definition_id),
+                )
+                .join_as(
+                    sea_query::JoinType::Join,
+                    source::Entity,
+                    dps.clone(),
+                    sea_query::Condition::all()
+                        .add(
+                            sea_query::Expr::col((
+                                dps.clone(),
+                                source::Column::DerivedDefinitionId,
+                            ))
+                            .equals((d.clone(), definition::Column::Id)),
+                        )
+                        .add(
+                            sea_query::Expr::col((dps.clone(), source::Column::ParameterId))
+                                .equals((r.clone(), readings::Column::ParameterId)),
+                        ),
+                );
+        }
+        // Every calculation that reads the parameter this reading carries.
+        None => {
+            query
+                .join_as(
+                    sea_query::JoinType::Join,
+                    source::Entity,
+                    dps.clone(),
+                    sea_query::Expr::col((dps.clone(), source::Column::ParameterId))
+                        .equals((r.clone(), readings::Column::ParameterId)),
+                )
+                .join_as(
+                    sea_query::JoinType::Join,
+                    definition::Entity,
+                    d.clone(),
+                    sea_query::Expr::col((d.clone(), definition::Column::Id))
+                        .equals((dps.clone(), source::Column::DerivedDefinitionId)),
+                );
+        }
+    }
+
+    query
+        .join_as(
+            sea_query::JoinType::Join,
+            site_parameters::Entity,
+            sp.clone(),
+            sea_query::Condition::all()
+                .add(
+                    sea_query::Expr::col((sp.clone(), site_parameters::Column::SiteId))
+                        .equals((r.clone(), readings::Column::SiteId)),
+                )
+                .add(
+                    sea_query::Expr::col((sp.clone(), site_parameters::Column::EntryMode))
+                        .eq("tool"),
+                )
+                .add(
+                    sea_query::Expr::col((sp, site_parameters::Column::ParameterId))
+                        .equals((d, definition::Column::OutputParameterId)),
+                ),
+        )
+        .cond_where(scope)
+        .order_by((r.clone(), readings::Column::SiteId), sea_query::Order::Asc)
+        .order_by((r, readings::Column::Time), sea_query::Order::Asc)
+        .to_owned()
+}
+
+/// The instants at one site where a calculation's inputs were recorded.
+fn instants_a_calculation_reads(definition_id: Uuid, site_id: Uuid) -> sea_query::SelectStatement {
+    let r = sea_query::Alias::new("r");
+    let dps = sea_query::Alias::new("dps");
+    sea_query::Query::select()
+        .distinct()
+        .column((r.clone(), readings::Column::Time))
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            sea_query::JoinType::Join,
+            source::Entity,
+            dps.clone(),
+            sea_query::Expr::col((dps.clone(), source::Column::ParameterId))
+                .equals((r.clone(), readings::Column::ParameterId)),
+        )
+        .and_where(
+            sea_query::Expr::col((dps, source::Column::DerivedDefinitionId)).eq(definition_id),
+        )
+        .and_where(sea_query::Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
+        .order_by((r, readings::Column::Time), sea_query::Order::Asc)
+        .to_owned()
+}
+
+/// The `(site, time)` instants a `derived_recompute` run must recompute, in either scope.
+fn derived_recompute_instants(params: &serde_json::Value) -> Result<Statement, DbErr> {
+    if params.get("derived_definition_id").is_some() {
+        let derived_id = required_uuid(params, "derived_definition_id")?;
+        return Ok(build(&derived_instants(
+            sea_query::Condition::all(),
+            Some(derived_id),
+        )));
+    }
+
+    let uuids = |key: &str| -> Result<Vec<Uuid>, DbErr> {
+        params
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().and_then(|s| Uuid::parse_str(s).ok()))
+                    .collect()
+            })
+            .ok_or_else(|| DbErr::Custom(format!("derived_recompute: missing {key}")))
+    };
+    let time = |key: &str| -> Result<chrono::DateTime<chrono::Utc>, DbErr> {
+        params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .ok_or_else(|| DbErr::Custom(format!("derived_recompute: missing {key}")))
+    };
+
+    let r = sea_query::Alias::new("r");
+    let window = sea_query::Condition::all()
+        .add(sea_query::Expr::col((r.clone(), readings::Column::SiteId)).is_in(uuids("site_ids")?))
+        .add(
+            sea_query::Expr::col((r.clone(), readings::Column::ParameterId))
+                .is_in(uuids("parameter_ids")?),
+        )
+        .add(sea_query::Expr::col((r.clone(), readings::Column::Time)).gte(time("start")?))
+        .add(sea_query::Expr::col((r, readings::Column::Time)).lte(time("end")?));
+    Ok(build(&derived_instants(window, None)))
+}
+
+#[async_trait]
+impl Job for DerivedRecompute {
+    fn name(&self) -> &'static str {
+        "derived_recompute"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let instants = derived_recompute_instants(ctx.params())?;
+        let work = async {
+            tracing::info!(job_id = %ctx.job_id(), "Recomputing derived parameters");
+            let rows = ctx.db().query_all_raw(instants).await?;
+
+            let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
+            ctx.set_progress(0, Some(total)).await;
+
+            let mut filled: i32 = 0;
+            let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
+            let mut filled_sites: std::collections::BTreeSet<Uuid> =
+                std::collections::BTreeSet::new();
+            for (i, row) in rows.iter().enumerate() {
+                if ctx.is_cancelled() {
+                    break;
+                }
+                let instant = DerivedInstant::from_query_result(row, "")?;
+                let site_id = instant.site_id;
+                let utc_time = instant.time.with_timezone(&chrono::Utc);
+                match recalculate_derived_at_timestamp(ctx.db(), site_id, utc_time).await {
+                    Ok(()) => {
+                        filled += 1;
+                        min_filled = Some(min_filled.map_or(utc_time, |m| Ord::min(m, utc_time)));
+                        filled_sites.insert(site_id);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, time = %utc_time, "Failed to recompute derived value")
+                    }
+                }
+                if (i + 1) % 500 == 0 {
+                    ctx.set_progress(i as i32 + 1, Some(total)).await;
+                }
+            }
+
+            if let Some(since) = min_filled {
+                tracing::info!(%since, "Refreshing continuous aggregates after derived recompute");
+                sync_state::refresh_continuous_aggregates(ctx.db(), since)
+                    .await
+                    .map_err(as_db_err)?;
+                for site_id in filled_sites {
+                    announce_derived_write(&ctx, site_id, filled);
+                }
+            }
+            ctx.set_progress(total, Some(total)).await;
+            ctx.report(
+                JobReport::new()
+                    .scope_opt(
+                        "derived_definition_id",
+                        ctx.params()
+                            .get("derived_definition_id")
+                            .and_then(|v| v.as_str().map(str::to_string)),
+                    )
+                    .scope_opt("earliest_filled", min_filled.map(|t| t.to_rfc3339()))
+                    .count("timestamps", total)
+                    .count("filled", filled),
+            )
+            .await;
+            tracing::info!(total, filled, "Derived parameter recomputation complete");
+            Ok::<i64, DbErr>(i64::from(filled))
+        };
+
+        match tokio::time::timeout(Duration::from_secs(600), work).await {
+            Ok(res) => res,
+            Err(_) => Err(DbErr::Custom("Timed out after 10 minutes".to_string())),
+        }
+    }
+}
+/// Backfill derived values for the readings already present at a site when a derived
+/// `site_parameter` is assigned, then refresh continuous aggregates. Backs the `derived_assignment`
+/// trigger. Reads `derived_definition_id` and `site_id` from params.
+pub struct DerivedAssignment;
+
+#[async_trait]
+impl Job for DerivedAssignment {
+    fn name(&self) -> &'static str {
+        "derived_assignment"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let def_id = required_uuid(ctx.params(), "derived_definition_id")?;
+        let site_id = required_uuid(ctx.params(), "site_id")?;
+        tracing::info!(%def_id, %site_id, "Computing derived values after site assignment");
+        ctx.set_site(site_id).await;
+
+        let rows = ctx
+            .db()
+            .query_all_raw(build(&instants_a_calculation_reads(def_id, site_id)))
+            .await?;
+
+        let mut filled = 0i64;
+        let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+        for row in &rows {
+            if ctx.is_cancelled() {
+                break;
+            }
+            let utc = InstantRow::from_query_result(row, "")?
+                .time
+                .with_timezone(&chrono::Utc);
+            if recalculate_derived_at_timestamp(ctx.db(), site_id, utc)
+                .await
+                .is_ok()
+            {
+                filled += 1;
+                earliest = Some(earliest.map_or(utc, |e| Ord::min(e, utc)));
+            }
+        }
+
+        if let Some(since) = earliest {
+            sync_state::refresh_continuous_aggregates(ctx.db(), since)
+                .await
+                .map_err(as_db_err)?;
+            announce_derived_write(&ctx, site_id, i32::try_from(filled).unwrap_or(i32::MAX));
+        }
+
+        ctx.report(
+            JobReport::new()
+                .scope("derived_definition_id", def_id.to_string())
+                .scope("site_id", site_id.to_string())
+                .scope_opt("earliest_filled", earliest.map(|t| t.to_rfc3339()))
+                .count("timestamps", rows.len())
+                .count("filled", filled),
+        )
+        .await;
+        tracing::info!(%def_id, %site_id, filled, "Derived assignment backfill completed");
+        Ok(filled)
+    }
+}
+/// Compute and upsert derived parameter values for an explicit list of `(site, timestamps)` pairs,
+/// then refresh continuous aggregates from the earliest timestamp. Backs `compute_derived` (the
+/// operator action) and `batch_derived` (auto-compute after a batch insert). Reads `site_timestamps`
+/// (array of `{ site_id, timestamps[] }`) from params.
+pub struct SiteTimestampsDerived {
+    name: &'static str,
+}
+
+impl SiteTimestampsDerived {
+    #[must_use]
+    pub fn new(name: &'static str) -> Self {
+        Self { name }
+    }
+}
+#[async_trait]
+impl Job for SiteTimestampsDerived {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let groups = ctx
+            .params()
+            .get("site_timestamps")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut work: Vec<(Uuid, Vec<chrono::DateTime<chrono::Utc>>)> = Vec::new();
+        for group in &groups {
+            let Some(site_id) = optional_uuid(group, "site_id") else {
+                continue;
+            };
+            work.push((site_id, parse_timestamps(group.get("timestamps"))));
+        }
+
+        let total =
+            i32::try_from(work.iter().map(|(_, ts)| ts.len()).sum::<usize>()).unwrap_or(i32::MAX);
+        ctx.set_progress(0, Some(total)).await;
+
+        let mut progress = 0i32;
+        let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+        'outer: for (site_id, timestamps) in &work {
+            for time in timestamps {
+                if ctx.is_cancelled() {
+                    break 'outer;
+                }
+                if let Err(e) = recalculate_derived_at_timestamp(ctx.db(), *site_id, *time).await {
+                    tracing::warn!(error = %e, site_id = %site_id, time = %time, "Failed to compute derived values");
+                } else {
+                    earliest = Some(earliest.map_or(*time, |e| Ord::min(e, *time)));
+                }
+                progress += 1;
+                if progress % 500 == 0 {
+                    ctx.set_progress(progress, Some(total)).await;
+                }
+            }
+        }
+
+        if let Some(since) = earliest {
+            tracing::info!(%since, "Refreshing continuous aggregates after derived computation");
+            sync_state::refresh_continuous_aggregates(ctx.db(), since)
+                .await
+                .map_err(as_db_err)?;
+            for (site_id, timestamps) in &work {
+                announce_derived_write(
+                    &ctx,
+                    *site_id,
+                    i32::try_from(timestamps.len()).unwrap_or(i32::MAX),
+                );
+            }
+        }
+        ctx.set_progress(progress, Some(total)).await;
+        ctx.report(
+            JobReport::new()
+                .scope("sites", work.len())
+                .scope_opt("earliest_computed", earliest.map(|t| t.to_rfc3339()))
+                .count("timestamps", total)
+                .count("computed", progress),
+        )
+        .await;
+        tracing::info!(computed = progress, "Derived computation complete");
+        Ok(i64::from(progress))
+    }
+}
+/// A derived value is a served value, so a job that writes one announces it: `DataIngested` naming
+/// the site is what drops that site's cached responses (`common/cache.rs:17-18`).
+fn announce_derived_write(ctx: &JobContext, site_id: Uuid, count: i32) {
+    let _ = ctx.events().send(crate::common::AppEvent::DataIngested {
+        site_id: Some(site_id),
+        parameter_id: None,
+        stream_id: None,
+        count: usize::try_from(count).unwrap_or(0),
+    });
+}
+/// Auto-compute derived values for one site's newly ingested timestamps. Backs the `ingest_derived`
+/// trigger fired after a single-stream ingest. Reads `site_id`, `stream_id`, and `timestamps[]` from
+/// params.
+pub struct IngestDerived;
+
+#[async_trait]
+impl Job for IngestDerived {
+    fn name(&self) -> &'static str {
+        "ingest_derived"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let site_id = required_uuid(ctx.params(), "site_id")?;
+        let stream_id = optional_uuid(ctx.params(), "stream_id");
+        let timestamps = parse_timestamps(ctx.params().get("timestamps"));
+        let total = i32::try_from(timestamps.len()).unwrap_or(i32::MAX);
+
+        ctx.set_site(site_id).await;
+        ctx.report(
+            JobReport::new()
+                .scope("site_id", site_id.to_string())
+                .scope_opt("stream_id", stream_id.map(|id| id.to_string()))
+                .count("timestamps", total),
+        )
+        .await;
+        ctx.set_progress(0, Some(total)).await;
+
+        let mut progress = 0i32;
+        let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+        for time in timestamps {
+            if ctx.is_cancelled() {
+                break;
+            }
+            if let Err(e) = recalculate_derived_at_timestamp(ctx.db(), site_id, time).await {
+                tracing::warn!(error = %e, site_id = %site_id, time = %time, "Failed to auto-compute derived values after ingest");
+            } else {
+                earliest = Some(
+                    earliest.map_or(time, |e: chrono::DateTime<chrono::Utc>| Ord::min(e, time)),
+                );
+            }
+            progress += 1;
+            if progress % 500 == 0 {
+                ctx.set_progress(progress, Some(total)).await;
+            }
+        }
+
+        if let Some(since) = earliest {
+            sync_state::refresh_continuous_aggregates(ctx.db(), since)
+                .await
+                .map_err(as_db_err)?;
+            announce_derived_write(&ctx, site_id, progress);
+        }
+        ctx.set_progress(progress, Some(total)).await;
+        Ok(i64::from(progress))
+    }
+}
+
 #[cfg(test)]
 #[path = "tests/flows_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/derived_instants.rs"]
+mod derived_instants_tests;

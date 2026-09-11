@@ -1,47 +1,86 @@
-use axum::{
-    Json, Router, middleware,
-    extract::{Path, Query, State},
-    http::{StatusCode, header::HeaderMap},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-};
-use chrono::{DateTime, Utc};
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter,
-    QueryOrder, Set, Statement,
-};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
+use axum::Json;
+use axum::Router;
+use axum::extract::Path;
+use axum::extract::Query;
+use axum::extract::Request;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::http::header::HeaderMap;
+use axum::middleware;
+use axum::middleware::Next;
+use axum::response::IntoResponse;
+use axum::response::Response;
+use axum::routing::get;
+use axum::routing::post;
+use chrono::DateTime;
+use chrono::Utc;
+use sea_orm::ActiveModelTrait;
+use sea_orm::ColumnTrait;
+use sea_orm::ConnectionTrait;
+use sea_orm::EntityTrait;
+use sea_orm::FromQueryResult;
+use sea_orm::QueryFilter;
+use sea_orm::QueryOrder;
+use sea_orm::Set;
+use sea_orm::Statement;
+use serde::Deserialize;
+use serde::Serialize;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use axum::extract::Request;
-use axum::middleware::Next;
-
+use super::models::AcknowledgedAlarmResponse;
+use super::models::ActiveAlarm;
+use super::models::ActiveAlarmsResponse;
+use super::models::AlarmEventResponse;
+use super::models::AlarmEventsQuery;
+use super::models::AlarmEventsResponse;
+use super::models::AlarmSeverityCounts;
+use super::models::AlarmSiteSummary;
+use super::models::AlarmSummaryResponse;
+use super::models::AlarmViolationsResponse;
+use super::models::ParameterViolationData;
+use super::models::SiteAlarmsQuery;
+use super::models::ThresholdWithValue;
+use super::models::ThresholdsQuery;
+use super::models::alarm_event;
+use super::service::ActiveAlarmRow;
+use super::service::AlarmEventRow;
+use super::service::ParameterWithThreshold;
+use super::service::ViolationRow;
+use super::service::cadence_label;
+use super::service::confine_alarm_event;
+use super::service::fetch_active_alarm_rows;
+use super::service::fetch_last_alarm_warning_times;
+use super::service::fetch_latest_reading_times;
+use super::service::fetch_open_events;
+use super::service::violations_query;
 use crate::common::AppState;
 use crate::common::bulk;
-use crate::common::middleware::{AuthContext, ProjectScope};
+use crate::common::middleware::AuthContext;
+use crate::common::middleware::ProjectScope;
 use crate::common::paging::Window;
 use crate::common::scope::project_filter_sql;
-use crate::common::series::{self, Cells, Table};
-use crate::error::{AppError, AppResult};
+use crate::common::scope::require_named_target;
+use crate::common::scope::require_sites_in_scope;
+use crate::common::series;
+use crate::common::series::Cells;
+use crate::common::series::Table;
+use crate::error::AppError;
+use crate::error::AppResult;
+use crate::routes::cache;
+use crate::routes::private::reprocessing_jobs::models::QueuedJobResponse;
 use crate::routes::private::site_parameters;
-use crate::routes::{cache, resolve_site_with_project, validate_time_range};
+use crate::routes::private::sites::models::ProjectRef;
+use crate::routes::private::sites::models::SiteRef;
+use crate::routes::resolve_site_with_project;
+use crate::routes::validate_time_range;
 
-use super::models::alarm_event;
-use super::models::{
-    AcknowledgedAlarmResponse, ActiveAlarm, ActiveAlarmsResponse, AlarmEventResponse,
-    AlarmEventsQuery, AlarmEventsResponse, AlarmSeverityCounts, AlarmSiteSummary,
-    AlarmSummaryResponse, AlarmViolationsResponse, ParameterViolationData, SiteAlarmsQuery,
-    ThresholdWithValue, ThresholdsQuery,
-};
-use super::service::{
-    ActiveAlarmRow, AlarmEventRow, ParameterWithThreshold, ViolationRow, cadence_label,
-    confine_alarm_event, fetch_active_alarm_rows, fetch_last_alarm_warning_times,
-    fetch_latest_reading_times, fetch_open_events, violations_query,
-};
-use crate::routes::private::sites::models::{ProjectRef, SiteRef};
 /// The violations export, built from the same structs the JSON body serialises. A parameter that
 /// did not violate at a timestamp has no value and no severity there, in every format.
 fn alarms_table(times: &[DateTime<Utc>], params: &[ParameterViolationData]) -> Table {
@@ -795,4 +834,118 @@ pub fn write_routes() -> Router<AppState> {
         .layer(middleware::from_fn(
             crate::common::middleware::require_write_data,
         ))
+}
+
+/// What one reconciliation pass changed.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReconcileAlarmsResponse {
+    pub opened: usize,
+    pub updated: usize,
+    pub resolved: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+pub struct RebuildAlarmEventsRequest {
+    /// Restrict to one site (default: every active site).
+    #[serde(default)]
+    pub site_id: Option<Uuid>,
+    /// Restrict to one parameter (default: every parameter at the targeted sites).
+    #[serde(default)]
+    pub parameter_id: Option<Uuid>,
+    /// Window start (ISO 8601). Defaults per-slot to the slot's earliest reading.
+    #[serde(default)]
+    pub start: Option<chrono::DateTime<chrono::Utc>>,
+    /// Window end (ISO 8601). Defaults per-slot to the slot's latest reading.
+    #[serde(default)]
+    pub end: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Reconstruct persisted alarm events from the actual readings, for the targeted slots and window.
+/// Walks the readings, collapses consecutive out-of-range readings into resolved breach episodes,
+/// and writes them to `alarm_events` (idempotently). This is the on-demand twin of the automatic
+/// backfill that fires after a CSV import / batch ingest; the live 60s sweeper still owns currently
+/// open breaches. Tracked as a `reprocessing_jobs` row (`trigger_type = 'alarm_backfill'`); returns
+/// the job id immediately. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/api/actions/rebuild_alarm_events",
+    request_body = RebuildAlarmEventsRequest,
+    responses(
+        (status = 200, description = "Rebuild triggered", body = QueuedJobResponse),
+        (status = 403, description = "The named site is outside the caller's projects, or no site was named"),
+    ),
+    tag = "actions"
+)]
+pub async fn rebuild_alarm_events(
+    State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    Json(payload): Json<RebuildAlarmEventsRequest>,
+) -> AppResult<Json<QueuedJobResponse>> {
+    let RebuildAlarmEventsRequest {
+        site_id,
+        parameter_id,
+        start,
+        end,
+    } = payload;
+
+    require_named_target(&scope, site_id.is_some(), "site")?;
+    if let Some(site_id) = site_id {
+        require_sites_in_scope(&app_state.db, &scope, &[site_id]).await?;
+    }
+
+    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
+        &app_state.db,
+        "alarm_backfill",
+        None,
+        None,
+        &serde_json::json!({
+            "site_id": site_id,
+            "parameter_id": parameter_id,
+            "start": start,
+            "end": end,
+        }),
+        None,
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(QueuedJobResponse::queued(job_id)))
+}
+
+/// Force a full open-alarm reconcile right now, instead of waiting for the periodic backstop
+/// sweep. Runs the same single tick the sweeper runs (open new breaches, refresh still-breaching,
+/// auto-resolve returned-to-range) across every active slot, synchronously, the post-LATERAL
+/// breach query is O(active slots), so this returns in well under a second. Operator escape hatch
+/// for "I changed something and want the alarm state correct immediately". Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/api/actions/reconcile_alarms",
+    responses(
+        (
+            status = 200,
+            description = "Reconcile complete; counts of opened/updated/resolved events",
+            body = ReconcileAlarmsResponse
+        ),
+    ),
+    tag = "actions"
+)]
+pub async fn reconcile_alarms(
+    State(app_state): State<AppState>,
+) -> AppResult<Json<ReconcileAlarmsResponse>> {
+    let stats = crate::routes::private::alarms::flows::evaluate_alarm_events(&app_state.db).await?;
+
+    if stats.opened > 0 || stats.resolved > 0 {
+        let _ = app_state
+            .events
+            .send(crate::common::AppEvent::AlarmStateChanged {
+                opened: stats.opened,
+                resolved: stats.resolved,
+            });
+    }
+
+    Ok(Json(ReconcileAlarmsResponse {
+        opened: stats.opened,
+        updated: stats.updated,
+        resolved: stats.resolved,
+    }))
 }

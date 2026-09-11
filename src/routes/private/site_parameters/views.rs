@@ -12,27 +12,66 @@
 //! and enqueueing the tracked `sd_estimator_retag` in the same breath, exactly as the audit
 //! resolution's slot scope does.
 
-use axum::{
-    Json,
-    extract::{Path, State},
-};
-use sea_orm::sea_query::{Alias, Expr, ExprTrait, PostgresQueryBuilder, Query as SeaQuery};
-use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
-};
+use axum::Json;
+use axum::extract::Path;
+use axum::extract::State;
+use sea_orm::ActiveModelTrait;
+use sea_orm::ActiveValue::Set;
+use sea_orm::ColumnTrait;
+use sea_orm::ConnectionTrait;
+use sea_orm::EntityTrait;
+use sea_orm::FromQueryResult;
+use sea_orm::Order;
+use sea_orm::PaginatorTrait;
+use sea_orm::QueryFilter;
+use sea_orm::QueryOrder;
+use sea_orm::QuerySelect;
+use sea_orm::Statement;
+use sea_orm::TransactionTrait;
+use sea_orm::sea_query::Alias;
+use sea_orm::sea_query::Condition;
+use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::ExprTrait;
+use sea_orm::sea_query::JoinType;
+use sea_orm::sea_query::PostgresQueryBuilder;
+use sea_orm::sea_query::Query as SeaQuery;
+use serde::Serialize;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
-use super::models::{
-    ActiveModel, AppliedSlot, ApplyGroupRequest, ApplyGroupResponse, Column,
-    DeclareSdEstimatorRequest, DeclareSdEstimatorResponse, Entity, GroupMember, RetagCounts,
-    RetagSdEstimatorRequest, RetagSdEstimatorResponse, UndeclaredRow,
-};
-use super::service::{partition_members, slot_scope};
-use crate::common::state::AppState;
-use crate::error::{AppError, AppResult};
+use super::models::ActiveModel;
+use super::models::AppliedSlot;
+use super::models::ApplyGroupRequest;
+use super::models::ApplyGroupResponse;
+use super::models::Column;
+use super::models::DeclareSdEstimatorRequest;
+use super::models::DeclareSdEstimatorResponse;
+use super::models::Entity;
+use super::models::GroupMember;
+use super::models::RetagCounts;
+use super::models::RetagSdEstimatorRequest;
+use super::models::RetagSdEstimatorResponse;
+use super::models::UndeclaredRow;
+use super::service::MergeSiteParametersRequest;
+use super::service::MergeSiteParametersResponse;
+use super::service::partition_members;
+use super::service::slot_scope;
+use crate::common::AppState;
+use crate::common::middleware::ProjectScope;
+use crate::common::scope::Unowned;
+use crate::common::scope::project_filter_sql;
+use crate::common::scope::project_of_site_parameter;
+use crate::common::scope::require_target_in_scope;
+use crate::error::AppError;
+use crate::error::AppResult;
+use crate::routes::private::data_streams;
 use crate::routes::private::parameter_groups::member_model;
+use crate::routes::private::parameters;
 use crate::routes::private::readings::samples;
+use crate::routes::private::site_parameters;
+use crate::routes::private::sites;
+use crate::routes::private::sync::models::HoldKind;
+use crate::routes::private::sync::models::HoldStatus;
 
 #[utoipa::path(
     post,
@@ -111,7 +150,7 @@ pub async fn declare_sd_estimator(
     let job_id = if let Some(est) = &estimator
         && affected > 0
     {
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
+        crate::routes::private::reprocessing_jobs::service::enqueue(
             &state.db,
             "sd_estimator_retag",
             None,
@@ -261,7 +300,7 @@ pub async fn retag_sd_estimator(
         if let Some(end) = payload.end {
             params["end"] = end.to_rfc3339().into();
         }
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
+        crate::routes::private::reprocessing_jobs::service::enqueue(
             db,
             "sd_estimator_retag",
             None,
@@ -404,4 +443,277 @@ pub async fn apply_group(
         created,
         existing: already.iter().map(|m| slot(m, None)).collect(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Undeclared sd estimators
+
+#[derive(Debug, Serialize, ToSchema, sea_orm::FromQueryResult)]
+pub struct UndeclaredEstimatorSlot {
+    pub site_id: Uuid,
+    pub parameter_id: Uuid,
+    pub site_name: String,
+    pub parameter_name: String,
+    pub parameter_code: String,
+    pub site_parameter_id: Uuid,
+    /// Samples at this slot computed under no declaration, ie. `sd_estimator_source = 'default'`.
+    pub undeclared_samples: i64,
+    /// Whether any stream feeding the slot ships a precomputed sd column. A slot whose source
+    /// states an sd is one whose convention is answerable from the evidence; one that does not is
+    /// a choice about what this lab publishes.
+    pub source_reports_sd: bool,
+    /// Every stream feeding the slot, as `source_system/source_key`.
+    pub streams: serde_json::Value,
+    /// Open holds at this slot, and how many carry the population-divisor signature. That second
+    /// number is the evidence for the decision; this report states it and rules on nothing.
+    pub open_holds: i64,
+    pub population_signature_holds: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UndeclaredEstimatorsResponse {
+    pub total_slots: usize,
+    pub total_undeclared_samples: i64,
+    /// Open holds across these slots that the population divisor would explain. Every one of them
+    /// is blocked from plain acknowledgement until its slot declares an estimator.
+    pub total_population_signature_holds: i64,
+    pub slots: Vec<UndeclaredEstimatorSlot>,
+}
+
+/// Slots serving replicate statistics under no declared sd estimator.
+///
+/// The sources stored both divisors over the years, row by row within one stream, so the
+/// convention cannot be inferred and is declared per slot instead. Until a slot declares one, its
+/// samples are computed with the sample divisor and stamped `default`, which is what this lists.
+/// No write path can notice this shape on its own: every ingest is individually valid, and the gap
+/// is in what nobody stated.
+///
+/// Read-only. Which divisor a slot publishes is a question about this lab's practice and the
+/// source's, so nothing here decides one.
+#[utoipa::path(
+    get,
+    path = "/api/actions/undeclared_sd_estimators",
+    responses((status = 200, description = "Slots with no declared sd estimator", body = UndeclaredEstimatorsResponse)),
+    tag = "actions"
+)]
+pub async fn undeclared_sd_estimators(
+    State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+) -> AppResult<Json<UndeclaredEstimatorsResponse>> {
+    use sea_orm::{FromQueryResult, Statement};
+
+    let population_sd = &*crate::routes::private::sync::service::POPULATION_SD_SQL;
+    let sp = Alias::new("sp");
+    let st = Alias::new("st");
+    let p = Alias::new("p");
+    let u = Alias::new("u");
+    let s_ = Alias::new("s");
+    let h = Alias::new("h");
+    let sm = Alias::new("sm");
+    let ds = Alias::new("ds");
+    let ds2 = Alias::new("ds2");
+    let hold = Alias::new("h");
+
+    let undeclared = SeaQuery::select()
+        .expr_as(
+            Expr::cust("COUNT(*)::bigint"),
+            Alias::new("undeclared_samples"),
+        )
+        .from_as(samples::Entity, sm.clone())
+        .and_where(Expr::cust("sm.site_id = sp.site_id"))
+        .and_where(Expr::cust("sm.parameter_id = sp.parameter_id"))
+        .and_where(Expr::col((sm.clone(), samples::Column::SdEstimatorSource)).eq("default"))
+        .take();
+
+    let sources = SeaQuery::select()
+        .expr_as(
+            Expr::cust("bool_or(ds.metadata #>> '{replicates,portal_sd_column}' IS NOT NULL)"),
+            Alias::new("source_reports_sd"),
+        )
+        .expr_as(
+            Expr::cust(
+                "jsonb_agg(jsonb_build_object('stream_id', ds.id, 'source_system', \
+                 ds.source_system, 'source_key', ds.source_key))",
+            ),
+            Alias::new("streams"),
+        )
+        .from_as(data_streams::Entity, ds.clone())
+        .and_where(Expr::cust("ds.site_parameter_id = sp.id"))
+        .take();
+
+    let holds = SeaQuery::select()
+        .expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("open_holds"))
+        .expr_as(
+            Expr::cust(format!("COUNT(*) FILTER (WHERE {population_sd})::bigint")),
+            Alias::new("population_signature_holds"),
+        )
+        .from_as(Alias::new("replicate_audit_holds"), hold.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            data_streams::Entity,
+            ds2.clone(),
+            Expr::cust("ds2.id = h.stream_id"),
+        )
+        .and_where(Expr::cust("ds2.site_parameter_id = sp.id"))
+        .and_where(Expr::cust(format!(
+            "h.kind = '{}'",
+            HoldKind::ReplicateStats.as_str()
+        )))
+        .and_where(Expr::cust(format!(
+            "h.status IN {}",
+            HoldStatus::sql_list(&HoldStatus::OPEN)
+        )))
+        .take();
+
+    let mut undeclared_slots = Condition::all()
+        .add(Expr::col((sp.clone(), site_parameters::Column::SdEstimator)).is_null());
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    if let Some(predicate) = project_filter_sql(&scope, "st.project_id", &mut values) {
+        undeclared_slots = undeclared_slots.add(Expr::cust_with_values(predicate, values));
+    }
+
+    let on_true = || Condition::all().add(Expr::cust("true"));
+    let (sql, values) = SeaQuery::select()
+        .columns([
+            (sp.clone(), site_parameters::Column::SiteId),
+            (sp.clone(), site_parameters::Column::ParameterId),
+        ])
+        .expr_as(
+            Expr::col((sp.clone(), site_parameters::Column::Id)),
+            Alias::new("site_parameter_id"),
+        )
+        .expr_as(
+            Expr::col((st.clone(), sites::Column::Name)),
+            Alias::new("site_name"),
+        )
+        .expr_as(
+            Expr::col((p.clone(), parameters::Column::Name)),
+            Alias::new("parameter_name"),
+        )
+        .expr_as(
+            Expr::col((p.clone(), parameters::Column::Code)),
+            Alias::new("parameter_code"),
+        )
+        .column((u.clone(), Alias::new("undeclared_samples")))
+        .expr_as(
+            Expr::cust("COALESCE(s.source_reports_sd, false)"),
+            Alias::new("source_reports_sd"),
+        )
+        .expr_as(
+            Expr::cust("COALESCE(s.streams, '[]'::jsonb)"),
+            Alias::new("streams"),
+        )
+        .expr_as(
+            Expr::cust("COALESCE(h.open_holds, 0)"),
+            Alias::new("open_holds"),
+        )
+        .expr_as(
+            Expr::cust("COALESCE(h.population_signature_holds, 0)"),
+            Alias::new("population_signature_holds"),
+        )
+        .from_as(site_parameters::Entity, sp.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            sites::Entity,
+            st.clone(),
+            Expr::col((st.clone(), sites::Column::Id))
+                .equals((sp.clone(), site_parameters::Column::SiteId)),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            parameters::Entity,
+            p.clone(),
+            Expr::col((p.clone(), parameters::Column::Id))
+                .equals((sp.clone(), site_parameters::Column::ParameterId)),
+        )
+        .join_lateral(
+            JoinType::InnerJoin,
+            undeclared,
+            u.clone(),
+            Condition::all().add(Expr::cust("u.undeclared_samples > 0")),
+        )
+        .join_lateral(JoinType::LeftJoin, sources, s_.clone(), on_true())
+        .join_lateral(JoinType::LeftJoin, holds, h.clone(), on_true())
+        .cond_where(undeclared_slots)
+        .order_by_expr(
+            Expr::cust("COALESCE(h.population_signature_holds, 0)"),
+            Order::Desc,
+        )
+        .order_by_expr(Expr::cust("u.undeclared_samples"), Order::Desc)
+        .take()
+        .build(PostgresQueryBuilder);
+
+    let slots = UndeclaredEstimatorSlot::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+        values,
+    ))
+    .all(&app_state.db)
+    .await?;
+
+    Ok(Json(UndeclaredEstimatorsResponse {
+        total_slots: slots.len(),
+        total_undeclared_samples: slots.iter().map(|s| s.undeclared_samples).sum(),
+        total_population_signature_holds: slots.iter().map(|s| s.population_signature_holds).sum(),
+        slots,
+    }))
+}
+
+// --- The slot merge action ---
+
+/// Merge two `site_parameters`, absorb `source` into `target`. Moves every slot-keyed table's rows
+/// (readings, status events, samples, annotations) and the streams feeding the slot, then deletes
+/// the source row. All or nothing: the whole move is one transaction. Requires `write_metadata`.
+///
+/// Refused with 409 when source and target both hold a grab sample at the same instant: merging two
+/// separately collected groups would rewrite the survivor's stored mean, sd and n.
+#[utoipa::path(
+    post,
+    path = "/api/actions/merge_site_parameters",
+    request_body = MergeSiteParametersRequest,
+    responses(
+        (status = 200, description = "Counts of moved rows and source deletion status", body = MergeSiteParametersResponse),
+        (status = 403, description = "Either slot is outside the caller's projects"),
+        (status = 404, description = "Source or target not found"),
+        (status = 409, description = "Source and target hold a sample at the same instant"),
+    ),
+    tag = "actions"
+)]
+pub async fn merge_site_parameters_handler(
+    State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
+    ProjectScope(scope): ProjectScope,
+    Json(payload): Json<MergeSiteParametersRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    // Both slots must be in scope: absorbing one slot into another is a write to both sides, so a
+    // merge spanning two projects is a cross-project write even when one side is granted. Refuse
+    // before enqueueing, otherwise a refused request leaves a job that performs the merge anyway.
+    for site_parameter_id in [
+        payload.source_site_parameter_id,
+        payload.target_site_parameter_id,
+    ] {
+        let row = project_of_site_parameter(&state.db, site_parameter_id).await?;
+        require_target_in_scope(&scope, &row, Unowned::Deny, "site parameter")?;
+    }
+
+    // Background the multi-table move on the worker pool; the job's `detail` carries the counts the
+    // UI used to read synchronously. Alarm reconcile runs on job completion (central lifecycle).
+    let trigger_id = payload.source_site_parameter_id;
+    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
+        &state.db,
+        "merge_site_parameters",
+        None,
+        Some(trigger_id),
+        &serde_json::json!({
+            "source_site_parameter_id": payload.source_site_parameter_id,
+            "target_site_parameter_id": payload.target_site_parameter_id,
+            "actor": crate::common::actor::label(&auth),
+            "origin": auth.origin().as_str(),
+        }),
+        None,
+    )
+    .await?;
+    Ok(Json(
+        serde_json::json!({ "job_id": job_id, "status": "queued" }),
+    ))
 }

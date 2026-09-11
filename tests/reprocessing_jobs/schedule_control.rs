@@ -22,10 +22,10 @@ use axum::Router;
 use axum::body::Body;
 use chrono::Utc;
 use http_body_util::BodyExt;
-use river_db::routes::private::reprocessing_jobs::job::{Job, JobRegistry};
-use river_db::routes::private::reprocessing_jobs::lifecycle::JobContext;
-use river_db::routes::private::reprocessing_jobs::schedule::Schedule;
-use river_db::routes::private::reprocessing_jobs::scheduler;
+use river_db::routes::private::reprocessing_jobs::service::{Job, JobRegistry};
+use river_db::routes::private::reprocessing_jobs::service::JobContext;
+use river_db::routes::private::reprocessing_jobs::service::Schedule;
+use river_db::routes::private::reprocessing_jobs::service as jobs;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -92,7 +92,7 @@ async fn seed_probe(db: &DatabaseConnection, name: &'static str) -> Arc<JobRegis
         interval_secs: PROBE_INTERVAL,
     }));
     let registry = Arc::new(registry);
-    scheduler::seed_default_schedules(db, &registry)
+    jobs::seed_default_schedules(db, &registry)
         .await
         .expect("seed the probe's schedule row");
     registry
@@ -405,7 +405,7 @@ async fn allow_concurrent_lets_a_due_slot_enqueue_while_a_run_is_in_flight() {
 
     set_slot(&db, OVERLAP_PROBE, MISSED_SLOT).await;
     assert_eq!(
-        scheduler::tick(&db, &registry).await.expect("tick"),
+        jobs::tick(&db, &registry).await.expect("tick"),
         0,
         "the seeded skip_if_running policy suppresses the enqueue while a run is in flight"
     );
@@ -447,7 +447,7 @@ async fn allow_concurrent_lets_a_due_slot_enqueue_while_a_run_is_in_flight() {
 
     set_slot(&db, OVERLAP_PROBE, MISSED_SLOT).await;
     assert_eq!(
-        scheduler::tick(&db, &registry).await.expect("tick"),
+        jobs::tick(&db, &registry).await.expect("tick"),
         1,
         "allow_concurrent enqueues the due slot even though the earlier run is still active"
     );
@@ -550,7 +550,7 @@ async fn catchup_skip_is_persisted_audited_and_suppresses_a_missed_slot() {
 
     set_slot(&db, CATCHUP_PROBE, MISSED_SLOT).await;
     assert_eq!(
-        scheduler::tick(&db, &registry).await.expect("tick"),
+        jobs::tick(&db, &registry).await.expect("tick"),
         0,
         "catchup_policy 'skip' waits for the next scheduled slot instead of firing the missed one"
     );
@@ -592,7 +592,7 @@ async fn disabling_a_schedule_halts_the_tick_and_re_enabling_resets_the_grid() {
 
     set_slot(&db, ENABLED_PROBE, MISSED_SLOT).await;
     assert_eq!(
-        scheduler::tick(&db, &registry).await.expect("tick"),
+        jobs::tick(&db, &registry).await.expect("tick"),
         0,
         "a disabled schedule is never claimed, however overdue its slot is"
     );
@@ -622,7 +622,7 @@ async fn disabling_a_schedule_halts_the_tick_and_re_enabling_resets_the_grid() {
         "the resumed slot is one interval out from now (got {resumed}, expected about {expected})"
     );
     assert_eq!(
-        scheduler::tick(&db, &registry).await.expect("tick"),
+        jobs::tick(&db, &registry).await.expect("tick"),
         0,
         "so nothing is due in the instant after the re-enable"
     );

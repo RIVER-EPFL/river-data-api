@@ -20,7 +20,7 @@ use crate::error::AppResult;
 use crate::routes::private::collection_events::models as events;
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::readings::models as readings;
-use crate::routes::private::reprocessing_jobs::worker;
+use crate::routes::private::reprocessing_jobs::service as jobs;
 use crate::routes::private::tools::service as tool_service;
 
 /// A visit a write touched, with the parameters it touched there.
@@ -159,7 +159,7 @@ pub async fn enqueue_for(
             continue;
         }
         let key = dedupe_key(event.id);
-        if let Some(id) = worker::enqueue(
+        if let Some(id) = jobs::enqueue(
             db,
             "event_recompute",
             None,

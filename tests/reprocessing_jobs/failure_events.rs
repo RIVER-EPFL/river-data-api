@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use river_db::common::AppEvent;
-use river_db::routes::private::reprocessing_jobs::lifecycle::RetryPolicy;
-use river_db::routes::private::reprocessing_jobs::worker;
+use river_db::routes::private::reprocessing_jobs::service::RetryPolicy;
+use river_db::routes::private::reprocessing_jobs::service as jobs;
 use sea_orm::DbErr;
 use serial_test::serial;
 use tokio::sync::broadcast::error::TryRecvError;
@@ -44,13 +44,13 @@ async fn failing_run_announces_retrying_then_failed() {
     let registry = registry_of(job);
     let events = tokio::sync::broadcast::channel::<AppEvent>(64).0;
     let mut rx = events.subscribe();
-    let wid = worker::worker_id();
-    let job_id = worker::enqueue(&db, "test_retry", None, None, &serde_json::json!({}), None)
+    let wid = jobs::worker_id();
+    let job_id = jobs::enqueue(&db, "test_retry", None, None, &serde_json::json!({}), None)
         .await
         .unwrap()
         .expect("a fresh enqueue inserts a row");
 
-    while worker::run_one_with_policy(&db, &events, &registry, &wid, IMMEDIATE)
+    while jobs::run_one_with_policy(&db, &events, &registry, &wid, IMMEDIATE)
         .await
         .unwrap()
     {}
@@ -92,8 +92,8 @@ async fn unregistered_trigger_type_announces_failed() {
     let registry = registry_of(ClosureJob::new("test_retry", |_ctx| async { Ok(0) }));
     let events = tokio::sync::broadcast::channel::<AppEvent>(64).0;
     let mut rx = events.subscribe();
-    let wid = worker::worker_id();
-    let job_id = worker::enqueue(
+    let wid = jobs::worker_id();
+    let job_id = jobs::enqueue(
         &db,
         "test_unknown",
         None,
@@ -105,7 +105,7 @@ async fn unregistered_trigger_type_announces_failed() {
     .unwrap()
     .expect("a fresh enqueue inserts a row");
 
-    worker::run_one_with_policy(&db, &events, &registry, &wid, IMMEDIATE)
+    jobs::run_one_with_policy(&db, &events, &registry, &wid, IMMEDIATE)
         .await
         .unwrap();
 

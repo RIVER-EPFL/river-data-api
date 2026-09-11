@@ -4,8 +4,8 @@
 //!
 //! Run: cargo test --test reprocessing_jobs worker_timeline -- --test-threads=1
 
-use river_db::routes::private::reprocessing_jobs::job::Job;
-use river_db::routes::private::reprocessing_jobs::worker;
+use river_db::routes::private::reprocessing_jobs::service::Job;
+use river_db::routes::private::reprocessing_jobs::service as jobs;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 
@@ -18,12 +18,12 @@ fn events() -> river_db::common::EventSender {
 async fn run_job(db: &DatabaseConnection, job: ClosureJob) {
     let trigger_type = job.name();
     let registry = registry_of(job);
-    worker::enqueue(db, trigger_type, None, None, &serde_json::json!({}), None)
+    jobs::enqueue(db, trigger_type, None, None, &serde_json::json!({}), None)
         .await
         .unwrap()
         .expect("a fresh enqueue inserts a row");
     assert!(
-        worker::run_one(db, &events(), &registry, &worker::worker_id())
+        jobs::run_one(db, &events(), &registry, &jobs::worker_id())
             .await
             .unwrap(),
         "the worker claims the enqueued job"

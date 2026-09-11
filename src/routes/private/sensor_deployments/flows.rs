@@ -1,4 +1,5 @@
-//! Who holds a `(site, parameter)` deployment slot over a time window.
+//! Who holds a `(site, parameter)` deployment slot over a time window, and the tracked jobs a
+//! deployment change enqueues.
 //!
 //! `excl_deployment_site_param_slot` is the atomic backstop: one sensor per `(site, parameter)` at
 //! any instant, enforced by an `EXCLUDE USING gist` constraint with no sensor term. Every path that
@@ -11,12 +12,21 @@
 //! another instrument's. A check filtered on `sensor_id <> incoming` misses exactly that case, which
 //! is why the exclusion here is by pending recall rather than by sensor.
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, Statement,
 };
 use uuid::Uuid;
+
+use crate::routes::private::reprocessing_jobs::flows::{
+    SlotOutcome, required_uuid, uuid_pair_array,
+};
+use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport};
+use crate::routes::private::sensor_calibrations::service::{
+    reprocess_sensor_readings, reprocess_site_parameter_readings,
+};
 
 /// The window a caller is about to claim, and what the write will do to the slot before claiming it.
 #[derive(Debug, Clone, Copy)]
@@ -81,7 +91,6 @@ pub async fn find_occupant<C: ConnectionTrait>(
             ],
         ))
         .await?;
-
     let Some(row) = row else {
         return Ok(None);
     };
@@ -211,6 +220,112 @@ pub async fn follow_forward_move<C: ConnectionTrait>(
 pub fn is_slot_conflict(err: &DbErr) -> bool {
     let msg = err.to_string();
     msg.contains("excl_deployment_site_param_slot") || msg.contains("23P01")
+}
+
+/// Re-derive readings for a sensor's deployment slot. Derives the slot parameter from the sensor,
+/// then re-derives the (site, parameter) slot and the sensor. Backs the deployment-change triggers.
+pub struct ReprocessDeployment {
+    name: &'static str,
+}
+
+impl ReprocessDeployment {
+    #[must_use]
+    pub fn new(name: &'static str) -> Self {
+        Self { name }
+    }
+}
+
+#[async_trait]
+impl Job for ReprocessDeployment {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let sensor_id = required_uuid(ctx.params(), "sensor_id")?;
+        let site_id = required_uuid(ctx.params(), "site_id")?;
+        // The deployment's parameter is carried in the job params (spawn_slot_reprocess). Fall back to
+        // the sensor's deployment at this site for jobs queued before the parameter was passed through.
+        let parameter_id: Option<Uuid> = match ctx
+            .params()
+            .get("parameter_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+        {
+            Some(p) => Some(p),
+            None => ctx
+                .db()
+                .query_one_raw(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT parameter_id FROM sensor_deployments \
+                     WHERE sensor_id = $1 AND site_id = $2 \
+                     ORDER BY (deployed_until IS NULL) DESC, deployed_from DESC LIMIT 1",
+                    [sensor_id.into(), site_id.into()],
+                ))
+                .await?
+                .map(|r| r.try_get::<Option<Uuid>>("", "parameter_id"))
+                .transpose()?
+                .flatten(),
+        };
+        let count = if let Some(parameter_id) = parameter_id {
+            reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id, Some(ctx.job_id()))
+                .await? as i64
+        } else {
+            0
+        };
+        reprocess_sensor_readings(ctx.db(), sensor_id, Some(ctx.job_id())).await?;
+        ctx.set_site(site_id).await;
+        ctx.report(
+            JobReport::new()
+                .scope("sensor_id", sensor_id.to_string())
+                .scope("site_id", site_id.to_string())
+                .count("readings_updated", count),
+        )
+        .await;
+        Ok(count)
+    }
+}
+/// Window-reprocess the slots whose open deployments the handler just backdated, so the
+/// previously-unattributed readings are stamped with `sensor_id`/`deployment_id`/`calibration_id`.
+/// The slot set is carried in `params.slots` (the handler owns the pre-mutation that picked them).
+/// Backs the `backfill_attribution` operator action. A failed slot logs and continues.
+pub struct BackfillAttribution;
+
+#[async_trait]
+impl Job for BackfillAttribution {
+    fn name(&self) -> &'static str {
+        "backfill_attribution"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let slots = uuid_pair_array(ctx.params(), "slots");
+        let mut results = Vec::with_capacity(slots.len());
+        for (site_id, parameter_id) in slots {
+            let moved = reprocess_site_parameter_readings(
+                ctx.db(),
+                site_id,
+                parameter_id,
+                Some(ctx.job_id()),
+            )
+            .await
+            .map(|n| n as i64);
+            results.push((
+                serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
+                moved,
+            ));
+        }
+        let outcome = SlotOutcome::from(results);
+        let total = outcome.readings;
+        let report = outcome
+            .record(&ctx, JobReport::new().count("readings_updated", total))
+            .await;
+        ctx.report(report).await;
+        if outcome.all_failed() {
+            return Err(outcome.error());
+        }
+        tracing::info!(readings_updated = total, "backfill_attribution complete");
+        Ok(total)
+    }
 }
 
 #[cfg(test)]

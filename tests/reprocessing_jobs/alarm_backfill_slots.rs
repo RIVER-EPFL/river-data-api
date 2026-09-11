@@ -1,12 +1,12 @@
 //! The `alarm_backfill` job's slot-list shape: when `params.slots` carries `[site_id, parameter_id]`
 //! pairs, the job loops `evaluate_alarm_episodes` over each pair with the shared `start`/`end`
 //! window, the per-slot path the inline batch/CSV ingest spawns used before they were flipped to
-//! `worker::enqueue`.
+//! `jobs::enqueue`.
 //!
 //! Run: cargo test --test reprocessing_jobs -- --test-threads=1
 
 use river_db::common::AppEvent;
-use river_db::routes::private::reprocessing_jobs::{job, worker};
+use river_db::routes::private::reprocessing_jobs::service as jobs;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;
@@ -72,8 +72,8 @@ async fn alarm_backfill_with_slots_reconstructs_episodes_per_pair() {
     // Seeds SITE1/Turbidity site_parameter + the global threshold (warning > 100, alarm > 500).
     crate::common::seed_test_data(&db).await;
     let ev = events();
-    let registry = job::build_registry();
-    let wid = worker::worker_id();
+    let registry = jobs::build_registry();
+    let wid = jobs::worker_id();
 
     // ok → warning → ok (resolves) → alarm → ok (resolves): two resolved episodes.
     let stream_id = make_stream(&db).await;
@@ -89,7 +89,7 @@ async fn alarm_backfill_with_slots_reconstructs_episodes_per_pair() {
         "no episodes before the backfill"
     );
 
-    let id = worker::enqueue(
+    let id = jobs::enqueue(
         &db,
         "alarm_backfill",
         None,
@@ -105,7 +105,7 @@ async fn alarm_backfill_with_slots_reconstructs_episodes_per_pair() {
     .unwrap()
     .expect("enqueue inserts a row");
 
-    worker::drain(&db, &ev, &registry, &wid).await.unwrap();
+    jobs::drain(&db, &ev, &registry, &wid).await.unwrap();
 
     let row = db
         .query_one_raw(Statement::from_string(
@@ -131,11 +131,11 @@ async fn alarm_backfill_with_slots_requires_window() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     let ev = events();
-    let registry = job::build_registry();
-    let wid = worker::worker_id();
+    let registry = jobs::build_registry();
+    let wid = jobs::worker_id();
 
     // slots present but no start/end → the job errors (the inline path always passed a window).
-    let id = worker::enqueue(
+    let id = jobs::enqueue(
         &db,
         "alarm_backfill",
         None,
@@ -149,7 +149,7 @@ async fn alarm_backfill_with_slots_requires_window() {
     .unwrap()
     .unwrap();
 
-    worker::drain(&db, &ev, &registry, &wid).await.unwrap();
+    jobs::drain(&db, &ev, &registry, &wid).await.unwrap();
 
     let status: String = db
         .query_one_raw(Statement::from_string(

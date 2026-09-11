@@ -1,5 +1,3 @@
-use super::models::*;
-use super::service::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -19,19 +17,25 @@ use sea_orm::QueryOrder;
 use sea_orm::QuerySelect;
 use sea_orm::Set;
 use sea_orm::Statement;
-use sea_orm::entity::prelude::*;
+use sea_orm::sea_query::Expr;
+use serde::Deserialize;
+use serde::Serialize;
+use tower_http::limit::RequestBodyLimitLayer;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use tower_http::limit::RequestBodyLimitLayer;
-
+use super::models::*;
+use super::service::*;
 use crate::common::AppState;
 use crate::common::actor::label;
 use crate::common::middleware::AuthContext;
 use crate::common::middleware::IsSyncService;
 use crate::common::middleware::ProjectScope;
 use crate::common::middleware::enforce_project_scope_for_sites;
-use crate::common::middleware::{require_admin, require_read_data, require_write_data};
+use crate::common::middleware::require_admin;
+use crate::common::middleware::require_read_data;
+use crate::common::middleware::require_write_data;
+use crate::common::scope::project_filter_sql;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::routes::private::collection_events::flows;
@@ -39,7 +43,6 @@ use crate::routes::private::data_streams;
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
 use crate::routes::private::parameters;
 use crate::routes::private::readings;
-use crate::routes::private::readings::decision_model;
 use crate::routes::private::readings::models::ConflictMode;
 use crate::routes::private::readings::models::Kind;
 use crate::routes::private::readings::models::Origin;
@@ -53,7 +56,6 @@ use crate::routes::private::readings::service::readings_upsert;
 use crate::routes::private::readings::service::rows_at;
 use crate::routes::private::readings::service::run_id_of;
 use crate::routes::private::readings::status_events;
-use crate::routes::private::reprocessing_jobs::job::Job;
 use crate::routes::private::sensor_calibrations;
 use crate::routes::private::sensor_calibrations::resolver;
 use crate::routes::private::sensor_calibrations::service::Curve;
@@ -61,16 +63,18 @@ use crate::routes::private::sensor_calibrations::service::apply_curves;
 use crate::routes::private::sensors::models::ResolvedOwner;
 use crate::routes::private::sensors::service::resolve_slot_owner_for_times;
 use crate::routes::private::sensors::service::resolve_windows_for_times;
-use crate::routes::private::standard_curves;
-use crate::routes::private::sites;
 use crate::routes::private::site_parameters;
+use crate::routes::private::sites;
+use crate::routes::private::standard_curves;
 use crate::routes::private::sync::models::GroupAudit;
 use crate::routes::private::sync::models::HoldKind;
 use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::private::sync::service as audit;
 use crate::routes::private::tools::models::run as tool_run;
 use crate::routes::resolve_site_with_project;
-use crate::routes::service::{ACTION_BODY_LIMIT, DATA_BODY_LIMIT, IMPORT_BODY_LIMIT};
+use crate::routes::service::ACTION_BODY_LIMIT;
+use crate::routes::service::DATA_BODY_LIMIT;
+use crate::routes::service::IMPORT_BODY_LIMIT;
 
 /// Preview a replicate group's statistics after flagging, restoring or switching the sd divisor.
 /// Nothing is written. Requires `read_data`.
@@ -1622,7 +1626,7 @@ pub async fn insert_batch_readings(
                     serde_json::json!({ "site_id": site_id, "timestamps": timestamps })
                 })
                 .collect();
-            crate::routes::private::reprocessing_jobs::worker::enqueue(
+            crate::routes::private::reprocessing_jobs::service::enqueue(
                 &state.db,
                 "batch_derived",
                 None,
@@ -2557,7 +2561,7 @@ pub async fn ingest_readings(
         unique_timestamps.dedup();
         let source_stream = payload.stream_id;
 
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
+        crate::routes::private::reprocessing_jobs::service::enqueue(
             db,
             "ingest_derived",
             None,
@@ -4214,7 +4218,7 @@ pub async fn import_csv(
             "measurement_type": req.measurement_type.as_deref(),
         });
 
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
+        crate::routes::private::reprocessing_jobs::service::enqueue(
             &state.db,
             "csv_import",
             None,
@@ -4320,4 +4324,108 @@ pub fn readings_admin_routes(state: &AppState) -> axum::Router {
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(axum::middleware::from_fn(require_admin))
         .with_state(state.clone())
+}
+
+/// One reading whose curation columns are not the fold of its live decisions.
+#[derive(Debug, Serialize, ToSchema, sea_orm::FromQueryResult)]
+pub struct CurationDriftRow {
+    pub stream_id: Uuid,
+    pub time: chrono::DateTime<chrono::FixedOffset>,
+    pub replicate_index: i16,
+    #[schema(required)]
+    pub site_id: Option<Uuid>,
+    #[schema(required)]
+    pub parameter_id: Option<Uuid>,
+    /// The curation columns the reading holds.
+    #[schema(value_type = Object)]
+    pub stored: serde_json::Value,
+    /// What the reading's live decisions fold to. A column absent from it is one no decision
+    /// asserts, which is not a disagreement.
+    #[schema(value_type = Object)]
+    pub folded: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CurationDriftResponse {
+    /// Every disagreeing reading, not only the ones listed below.
+    pub total: i64,
+    /// The first `limit` of them, newest first, so a person can open one.
+    pub rows: Vec<CurationDriftRow>,
+}
+
+/// Readings whose curation columns disagree with the decisions recorded against them.
+///
+/// The columns are the projection of the record, written by the same trigger in the writer's
+/// transaction, so a disagreement means something wrote a column without recording the decision,
+/// or a decision failed to project. Read-only: which side is wrong is itself a decision, a
+/// rollback or a fresh decision, so nothing here picks one.
+#[utoipa::path(
+    get,
+    path = "/api/actions/curation_drift",
+    params(("limit" = Option<u32>, Query, description = "How many rows to list, default 50, max 500")),
+    responses((status = 200, description = "Readings that disagree with their decision record", body = CurationDriftResponse)),
+    tag = "actions"
+)]
+pub async fn curation_drift(
+    State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    Query(params): Query<CurationDriftQuery>,
+) -> AppResult<Json<CurationDriftResponse>> {
+    use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
+
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    // A reading outside the token's projects is not this caller's to see, and an unpaired one
+    // belongs to no project at all, so a scoped caller is shown neither.
+    let project_filter = project_filter_sql(&scope, "st.project_id", &mut values)
+        .map(|predicate| format!("WHERE {predicate}"))
+        .unwrap_or_default();
+    values.push(i64::from(limit).into());
+    let limit_param = values.len();
+
+    // Still spelled: the drift definition it reads from is `inconsistent_rows_sql`, a CTE with
+    // nested laterals over a VALUES list, and a subquery in `FROM` takes a built statement or
+    // nothing. It converts when that fragment does (C223).
+    let sql = format!(
+        r"SELECT d.stream_id, d.time, d.replicate_index, r.site_id, r.parameter_id,
+                 jsonb_strip_nulls(jsonb_build_object(
+                     'is_flagged', d.is_flagged, 'flag_reason', d.flag_reason,
+                     'withdrawn_at', d.withdrawn_at, 'withdrawn_reason', d.withdrawn_reason,
+                     'unverified', d.unverified, 'standard_curve_id', d.standard_curve_id,
+                     'calibration_id', d.calibration_id, 'sensor_id', d.sensor_id,
+                     'raw_value', d.raw_value)) AS stored,
+                 COALESCE(d.folded, '{{}}'::jsonb) AS folded
+          FROM ({drift}) d
+          JOIN readings r ON r.stream_id = d.stream_id AND r.time = d.time
+                         AND r.replicate_index = d.replicate_index
+          LEFT JOIN sites st ON st.id = r.site_id
+          {project_filter}
+          ORDER BY d.time DESC
+          LIMIT ${limit_param}",
+        drift = crate::routes::private::readings::service::inconsistent_rows_sql(),
+    );
+
+    let rows = app_state
+        .db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await?
+        .iter()
+        .map(|row| CurationDriftRow::from_query_result(row, ""))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(CurationDriftResponse {
+        total: crate::routes::private::readings::service::curation_drift_count(&app_state.db)
+            .await?,
+        rows,
+    }))
+}
+
+/// How many drift rows to list beside the count.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct CurationDriftQuery {
+    pub limit: Option<u32>,
 }

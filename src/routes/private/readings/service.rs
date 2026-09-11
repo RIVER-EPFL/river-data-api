@@ -34,7 +34,6 @@ use sea_orm::sea_query::PostgresQueryBuilder;
 use sea_orm::sea_query::Query;
 use sea_orm::sea_query::WithClause;
 use sea_orm::sea_query::extension::postgres::PgBinOper;
-use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppEvent;
@@ -66,13 +65,12 @@ use crate::routes::private::readings::models::Owner;
 use crate::routes::private::readings::models::ProvenanceQuery;
 use crate::routes::private::readings::models::Selection;
 use crate::routes::private::readings::samples;
-use crate::routes::private::reprocessing_jobs::job::Job;
-use crate::routes::private::sensors;
 use crate::routes::private::sensor_calibrations;
 use crate::routes::private::sensor_deployments as deployments;
-use crate::routes::private::standard_curves;
-use crate::routes::private::sites;
+use crate::routes::private::sensors;
 use crate::routes::private::site_parameters;
+use crate::routes::private::sites;
+use crate::routes::private::standard_curves;
 use crate::routes::private::sync::models::GroupAudit;
 use crate::routes::private::sync::models::HoldKind;
 use crate::routes::private::sync::models::HoldStatus;
@@ -2761,7 +2759,7 @@ pub async fn enqueue_attribution_pin(
     }
     let mut jobs = Vec::new();
     for (site_id, parameter_id) in slots_of(db, rows).await? {
-        if let Some(job) = crate::routes::private::reprocessing_jobs::worker::enqueue(
+        if let Some(job) = crate::routes::private::reprocessing_jobs::service::enqueue(
             db,
             "attribution_pin",
             sensor_id,
@@ -4373,13 +4371,14 @@ pub async fn assemble_records(
         .into_iter()
         .map(|d| (d.id, d))
         .collect();
-    let calibration_map: HashMap<Uuid, sensor_calibrations::Model> = sensor_calibrations::Entity::find()
-        .filter(sensor_calibrations::Column::Id.is_in(collect(|r| r.calibration_id)))
-        .all(db)
-        .await?
-        .into_iter()
-        .map(|c| (c.id, c))
-        .collect();
+    let calibration_map: HashMap<Uuid, sensor_calibrations::Model> =
+        sensor_calibrations::Entity::find()
+            .filter(sensor_calibrations::Column::Id.is_in(collect(|r| r.calibration_id)))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|c| (c.id, c))
+            .collect();
     let curve_map: HashMap<Uuid, standard_curves::Model> = standard_curves::Entity::find()
         .filter(standard_curves::Column::Id.is_in(collect(|r| r.standard_curve_id)))
         .all(db)
@@ -5896,7 +5895,7 @@ pub async fn run<'a>(
                     .filter_map(|s| s.slot())
                     .map(|(site_id, parameter_id)| serde_json::json!([site_id, parameter_id]))
                     .collect();
-                crate::routes::private::reprocessing_jobs::worker::enqueue(
+                crate::routes::private::reprocessing_jobs::service::enqueue(
                     sink.db,
                     "alarm_backfill",
                     None,
@@ -5917,7 +5916,7 @@ pub async fn run<'a>(
     if let (false, Some((lo, hi))) = (plan.recompute_derived.is_empty(), plan.episode_span) {
         let sites: BTreeSet<Uuid> = plan.recompute_derived.iter().map(|(s, _)| *s).collect();
         let parameters: BTreeSet<Uuid> = plan.recompute_derived.iter().map(|(_, p)| *p).collect();
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
+        crate::routes::private::reprocessing_jobs::service::enqueue(
             sink.db,
             "derived_recompute",
             None,

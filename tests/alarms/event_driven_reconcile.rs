@@ -643,7 +643,7 @@ async fn merge_reconciles_source_and_target_slots() {
 #[tokio::test]
 #[serial]
 async fn tracked_job_completion_reconciles_alarms() {
-    use river_db::routes::private::reprocessing_jobs::worker;
+    use river_db::routes::private::reprocessing_jobs::service as jobs;
 
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
@@ -672,7 +672,7 @@ async fn tracked_job_completion_reconciles_alarms() {
             Ok(1)
         },
     ));
-    let job_id = worker::enqueue(
+    let job_id = jobs::enqueue(
         &db,
         "manual_reprocess",
         None,
@@ -684,7 +684,7 @@ async fn tracked_job_completion_reconciles_alarms() {
     .unwrap()
     .expect("a fresh enqueue inserts a row");
     assert!(
-        worker::run_one(&db, &events, &registry, &worker::worker_id())
+        jobs::run_one(&db, &events, &registry, &jobs::worker_id())
             .await
             .unwrap(),
         "the worker claims the enqueued job"

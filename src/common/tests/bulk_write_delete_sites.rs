@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 /// code counts.
 const ALLOWED: &[(&str, usize)] = &[
     ("src/routes/private/readings/views.rs", 1),
-    ("src/routes/private/reprocessing_jobs/reconcile.rs", 1),
+    ("src/routes/private/sync/flows.rs", 1),
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {

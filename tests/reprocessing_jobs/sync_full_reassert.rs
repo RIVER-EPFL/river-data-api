@@ -3,7 +3,7 @@
 //!
 //! Run: cargo test --test reprocessing_jobs -- sync_full_reassert --test-threads=1
 
-use river_db::routes::private::reprocessing_jobs::{job, worker};
+use river_db::routes::private::reprocessing_jobs::service as jobs;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;
@@ -36,7 +36,7 @@ async fn only_the_enabled_service_is_queued() {
     let enabled = live_service(&db, "cnet-1", true).await;
     let _disabled = live_service(&db, "metalp-1", false).await;
 
-    let job_id = worker::enqueue(
+    let job_id = jobs::enqueue(
         &db,
         "sync_full_reassert",
         None,
@@ -48,12 +48,12 @@ async fn only_the_enabled_service_is_queued() {
     .unwrap()
     .expect("the re-assert is enqueued");
     let registry = {
-        let mut registry = job::build_registry();
-        job::register_scheduled_services(&mut registry, &crate::common::test_config());
+        let mut registry = jobs::build_registry();
+        jobs::register_scheduled_services(&mut registry, &crate::common::test_config());
         registry
     };
     assert!(
-        worker::run_one(&db, &events(), &registry, &worker::worker_id())
+        jobs::run_one(&db, &events(), &registry, &jobs::worker_id())
             .await
             .unwrap(),
         "the worker claims the re-assert"
@@ -111,7 +111,7 @@ async fn a_paused_service_is_not_queued() {
     )
     .await;
 
-    worker::enqueue(
+    jobs::enqueue(
         &db,
         "sync_full_reassert",
         None,
@@ -123,12 +123,12 @@ async fn a_paused_service_is_not_queued() {
     .unwrap()
     .expect("the re-assert is enqueued");
     let registry = {
-        let mut registry = job::build_registry();
-        job::register_scheduled_services(&mut registry, &crate::common::test_config());
+        let mut registry = jobs::build_registry();
+        jobs::register_scheduled_services(&mut registry, &crate::common::test_config());
         registry
     };
     assert!(
-        worker::run_one(&db, &events(), &registry, &worker::worker_id())
+        jobs::run_one(&db, &events(), &registry, &jobs::worker_id())
             .await
             .unwrap()
     );

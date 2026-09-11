@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use river_db::routes::private::reprocessing_jobs::lifecycle::RetryPolicy;
-use river_db::routes::private::reprocessing_jobs::worker;
+use river_db::routes::private::reprocessing_jobs::service::RetryPolicy;
+use river_db::routes::private::reprocessing_jobs::service as jobs;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement};
 use serial_test::serial;
 
@@ -51,12 +51,12 @@ async fn enqueue_and_drain(
 ) -> uuid::Uuid {
     let registry = registry_of(job);
     let ev = events();
-    let wid = worker::worker_id();
-    let job_id = worker::enqueue(db, "test_retry", None, None, &serde_json::json!({}), None)
+    let wid = jobs::worker_id();
+    let job_id = jobs::enqueue(db, "test_retry", None, None, &serde_json::json!({}), None)
         .await
         .unwrap()
         .expect("a fresh enqueue inserts a row");
-    while worker::run_one_with_policy(db, &ev, &registry, &wid, policy)
+    while jobs::run_one_with_policy(db, &ev, &registry, &wid, policy)
         .await
         .unwrap()
     {}

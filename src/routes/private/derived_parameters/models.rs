@@ -11,7 +11,13 @@ pub mod definition {
     use super::super::service::CalculationFormulaOperations;
 
     #[derive(
-        Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
+        Clone,
+        Debug,
+        PartialEq,
+        DeriveEntityModel,
+        serde::Serialize,
+        serde::Deserialize,
+        EntityToModels,
     )]
     #[sea_orm(table_name = "calculation_formulas")]
     #[crudcrate(
@@ -89,7 +95,13 @@ pub mod source {
     use sea_orm::entity::prelude::*;
 
     #[derive(
-        Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
+        Clone,
+        Debug,
+        PartialEq,
+        DeriveEntityModel,
+        serde::Serialize,
+        serde::Deserialize,
+        EntityToModels,
     )]
     #[sea_orm(table_name = "derived_parameter_sources")]
     #[crudcrate(
@@ -161,7 +173,13 @@ pub mod version {
     use sea_orm::entity::prelude::*;
 
     #[derive(
-        Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
+        Clone,
+        Debug,
+        PartialEq,
+        DeriveEntityModel,
+        serde::Serialize,
+        serde::Deserialize,
+        EntityToModels,
     )]
     #[sea_orm(table_name = "derived_parameter_definition_versions")]
     #[crudcrate(

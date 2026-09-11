@@ -67,11 +67,12 @@ pub async fn stop_test_workers() {
 fn spawn_test_worker(state: &AppState) {
     let db = state.db.clone();
     let events = state.events.clone();
-    let registry =
-        std::sync::Arc::new(river_db::routes::private::reprocessing_jobs::job::build_registry());
+    let registry = std::sync::Arc::new(
+        river_db::routes::private::reprocessing_jobs::service::build_registry(),
+    );
     let (shutdown, mut stopped) = tokio::sync::watch::channel(false);
     let handle = tokio::spawn(async move {
-        river_db::routes::private::reprocessing_jobs::worker::run(
+        river_db::routes::private::reprocessing_jobs::service::run_workers(
             db,
             events,
             registry,

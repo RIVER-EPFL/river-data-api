@@ -247,3 +247,55 @@ async fn resolve(db: &DatabaseConnection, sql: &str, id: Uuid) -> AppResult<RowP
 #[cfg(test)]
 #[path = "tests/scope.rs"]
 mod tests;
+
+// --- Project scope on the operator actions ---
+//
+// Three rules, applied by every operator action:
+//
+// 1. A named site is confined with `require_sites_in_scope` (403), matching `preview_derived` and
+//    the ingestion write paths.
+// 2. A named row (a sensor, a deployment) is confined with `confine_target` (404 when no such row,
+//    403 when it exists outside the caller's grants).
+// 3. An action that names nothing runs against every project, so a restricted caller must name a
+//    target: `require_named_target` refuses it. Administrators, unscoped tokens and sync tokens are
+//    unrestricted and unaffected.
+//
+// `refresh_aggregates` and `reconcile_alarms` are the two exceptions to rule 3, and the reason is
+// what they write: neither takes a target because neither touches stored measurements or history.
+// They recompute derived state (the rollups, the open-alarm set) that the scheduler already
+// recomputes on its own cadence, so a member triggering one changes nothing they could not obtain
+// by waiting.
+//
+// `deny_scoped_token` on the route group stops a project-scoped API TOKEN before any of this; it
+// was never a check on granted members, who reach these handlers as `AccessScope::Projects`.
+
+/// Confine an action's named row to the caller's projects.
+///
+/// A row that does not exist is 404 for everyone, including an administrator: the action has
+/// nothing to act on. A row outside a restricted caller's grants is 403, the same answer the route
+/// already gives a project-scoped token, and the enumerations that could hand out such an id are
+/// confined by the same scope.
+pub fn confine_target(
+    scope: &AccessScope,
+    row: &RowProject,
+    unowned: Unowned,
+    what: &str,
+) -> AppResult<()> {
+    if matches!(row, RowProject::Missing) {
+        return Err(AppError::NotFound(format!("{what} not found")));
+    }
+    require_target_in_scope(scope, row, unowned, what)
+}
+
+/// Refuse an untargeted run to a restricted caller: with nothing named, the action reaches every
+/// project. `named` is whether the request identified something narrower than the whole
+/// installation; `what` names what to pass instead. A request that names nothing *and* asks for
+/// nothing keeps its existing 400, which is a bad request rather than a scope answer.
+pub fn require_named_target(scope: &AccessScope, named: bool, what: &str) -> AppResult<()> {
+    if named || !scope.is_restricted() {
+        return Ok(());
+    }
+    Err(AppError::Forbidden(format!(
+        "Name the {what} this action should touch; an unnamed target is not confined to your projects"
+    )))
+}

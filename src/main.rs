@@ -116,8 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = shutdown_tx.send(true);
     });
 
-    river_db::routes::private::reprocessing_jobs::lifecycle::set_job_retry_policy(
-        river_db::routes::private::reprocessing_jobs::lifecycle::RetryPolicy {
+    river_db::routes::private::reprocessing_jobs::service::set_job_retry_policy(
+        river_db::routes::private::reprocessing_jobs::service::RetryPolicy {
             max_retries: config.job_max_retries,
             backoff_base: Duration::from_secs(config.job_retry_backoff_seconds),
         },
@@ -128,14 +128,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // scheduler: each fires as a Job claimed by exactly one replica per scheduled tick, so they no
     // longer double-fire at 2-3 k8s replicas. The registry carries their cadence from Config; the
     // scheduler seeds a `schedules` row per Service on first start and ticks them thereafter.
-    let mut registry = river_db::routes::private::reprocessing_jobs::job::build_registry();
-    river_db::routes::private::reprocessing_jobs::job::register_scheduled_services(
+    let mut registry = river_db::routes::private::reprocessing_jobs::service::build_registry();
+    river_db::routes::private::reprocessing_jobs::service::register_scheduled_services(
         &mut registry,
         &config,
     );
     let registry = std::sync::Arc::new(registry);
 
-    if let Err(e) = river_db::routes::private::reprocessing_jobs::scheduler::seed_default_schedules(
+    if let Err(e) = river_db::routes::private::reprocessing_jobs::service::seed_default_schedules(
         &db, &registry,
     )
     .await
@@ -151,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let registry = registry.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
-            river_db::routes::private::reprocessing_jobs::worker::run(
+            river_db::routes::private::reprocessing_jobs::service::run_workers(
                 db,
                 events,
                 registry,
@@ -169,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let registry = registry.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
-            river_db::routes::private::reprocessing_jobs::scheduler::run(
+            river_db::routes::private::reprocessing_jobs::service::run_scheduler(
                 db,
                 registry,
                 async move {
@@ -210,7 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let bucket = chrono::Utc::now().timestamp() / 5;
                             for job in ["alarm_sweep", "dispatch_notifications"] {
                                 let key = format!("{job}:wake:{bucket}");
-                                if let Err(e) = river_db::routes::private::reprocessing_jobs::worker::enqueue(
+                                if let Err(e) = river_db::routes::private::reprocessing_jobs::service::enqueue(
                                     &db, job, None, None, &serde_json::json!({ "trigger": "alarm_state_changed" }), Some(&key),
                                 ).await {
                                     tracing::warn!(error = %e, job, "failed to enqueue on alarm-state broadcast");
@@ -258,7 +258,8 @@ const REALM_CHECK_DELAY: Duration = Duration::from_secs(5);
 /// 0, and `list_roles` filters the absent names out of the picker, so nothing in a running system
 /// reports the gap.
 async fn verify_keycloak_realm_roles(state: &AppState) {
-    use river_db::routes::private::admin::users::{RealmRoleCheck, check_realm_roles};
+    use river_db::routes::private::api_tokens::models::RealmRoleCheck;
+    use river_db::routes::private::api_tokens::service::check_realm_roles;
 
     if state.config.keycloak_url.is_none() || state.config.keycloak_realm.is_none() {
         return;

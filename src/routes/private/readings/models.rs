@@ -3,13 +3,10 @@ use std::collections::HashMap;
 
 use chrono::DateTime;
 use chrono::Utc;
-use sea_orm::ActiveModelTrait;
-use sea_orm::ColumnTrait;
 use sea_orm::Condition;
 use sea_orm::EntityTrait;
 use sea_orm::ExprTrait;
 use sea_orm::FromQueryResult;
-use sea_orm::QueryFilter;
 use sea_orm::entity::prelude::*;
 use sea_orm::sea_query::Alias;
 use serde::Deserialize;
@@ -20,7 +17,6 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::error::AppResult;
-use crate::routes::private::reprocessing_jobs::job::Job;
 
 pub use river_data_core::models::IngestReading;
 pub use river_data_core::models::IngestStatusEvent;

@@ -7,7 +7,7 @@
 //! Run: cargo test --test reprocessing_jobs replicate_reconciliation -- --test-threads=1
 
 use river_db::common::AppEvent;
-use river_db::routes::private::reprocessing_jobs::{job, worker};
+use river_db::routes::private::reprocessing_jobs::service as jobs;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;
@@ -98,9 +98,9 @@ async fn setup() -> (DatabaseConnection, Family) {
 
 async fn run_job(db: &DatabaseConnection, trigger: &str, dry_run: bool) -> Uuid {
     let ev = events();
-    let registry = job::build_registry();
-    let wid = worker::worker_id();
-    let id = worker::enqueue(
+    let registry = jobs::build_registry();
+    let wid = jobs::worker_id();
+    let id = jobs::enqueue(
         db,
         trigger,
         None,
@@ -111,7 +111,7 @@ async fn run_job(db: &DatabaseConnection, trigger: &str, dry_run: bool) -> Uuid 
     .await
     .unwrap()
     .expect("enqueue inserts a row");
-    worker::drain(db, &ev, &registry, &wid).await.unwrap();
+    jobs::drain(db, &ev, &registry, &wid).await.unwrap();
     id
 }
 

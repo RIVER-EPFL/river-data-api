@@ -1,4 +1,4 @@
-use river_db::routes::private::admin::merge_services::{MergeParametersRequest, merge_parameters};
+use river_db::routes::private::parameters::service::{MergeParametersRequest, merge_parameters};
 use sea_orm::DatabaseConnection;
 use serial_test::serial;
 

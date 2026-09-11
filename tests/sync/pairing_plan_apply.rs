@@ -356,7 +356,7 @@ async fn a_replayed_apply_reports_a_replay_instead_of_failing() {
         "completed"
     );
 
-    let replay = river_db::routes::private::reprocessing_jobs::worker::enqueue(
+    let replay = river_db::routes::private::reprocessing_jobs::service::enqueue(
         &db,
         "plan_apply",
         None,

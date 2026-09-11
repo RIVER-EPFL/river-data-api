@@ -3,8 +3,8 @@ use sea_orm::sea_query::Expr;
 use sea_orm::{ConnectionTrait, EntityTrait, Statement, TransactionTrait};
 use uuid::Uuid;
 
-use super::models::SensorDeployment;
 use super::flows::{self as slots, SlotRequest};
+use super::models::SensorDeployment;
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::sensor_calibrations::service::recompute_deployed_until;
 
@@ -39,7 +39,7 @@ async fn spawn_slot_reprocess<C: ConnectionTrait>(
     trigger_type: &str,
     trigger_id: Uuid,
 ) -> Result<(), sea_orm::DbErr> {
-    crate::routes::private::reprocessing_jobs::worker::enqueue(
+    crate::routes::private::reprocessing_jobs::service::enqueue(
         db,
         trigger_type,
         Some(sensor_id),

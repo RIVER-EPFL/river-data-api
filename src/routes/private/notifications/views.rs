@@ -2,9 +2,10 @@
 //! `/notifications/me` handler a subscriber manages their own channels through.
 
 use axum::{
-    Extension, Json, Router, middleware,
+    Extension, Json, Router,
     extract::{Query, State},
     http::StatusCode,
+    middleware,
     routing::{get, post, put},
 };
 use sea_orm::sea_query::OnConflict;

@@ -7,9 +7,9 @@
 
 use async_trait::async_trait;
 use river_db::common::AppEvent;
-use river_db::routes::private::reprocessing_jobs::job::{Job, JobRegistry};
-use river_db::routes::private::reprocessing_jobs::lifecycle::JobContext;
-use river_db::routes::private::reprocessing_jobs::worker;
+use river_db::routes::private::reprocessing_jobs::service::{Job, JobRegistry};
+use river_db::routes::private::reprocessing_jobs::service::JobContext;
+use river_db::routes::private::reprocessing_jobs::service as jobs;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use std::sync::Arc;
@@ -109,9 +109,9 @@ async fn claims_and_runs_to_completion() {
         count: 7,
         runs: runs.clone(),
     }));
-    let wid = worker::worker_id();
+    let wid = jobs::worker_id();
 
-    let id = worker::enqueue(
+    let id = jobs::enqueue(
         &db,
         "test_complete",
         None,
@@ -123,7 +123,7 @@ async fn claims_and_runs_to_completion() {
     .unwrap()
     .expect("a fresh enqueue inserts a row");
 
-    assert!(worker::run_one(&db, &ev, &reg, &wid).await.unwrap());
+    assert!(jobs::run_one(&db, &ev, &reg, &wid).await.unwrap());
     assert_eq!(runs.load(Ordering::Relaxed), 1);
 
     let row = job_row(&db, id).await;
@@ -133,7 +133,7 @@ async fn claims_and_runs_to_completion() {
     assert!(row.completed);
 
     assert!(
-        !worker::run_one(&db, &ev, &reg, &wid).await.unwrap(),
+        !jobs::run_one(&db, &ev, &reg, &wid).await.unwrap(),
         "queue is now empty"
     );
 }
@@ -156,7 +156,7 @@ async fn reaper_reclaims_a_running_row_with_no_lease() {
         count: 1,
         runs: runs.clone(),
     }));
-    let wid = worker::worker_id();
+    let wid = jobs::worker_id();
 
     let id = Uuid::new_v4();
     crate::common::exec(
@@ -170,7 +170,7 @@ async fn reaper_reclaims_a_running_row_with_no_lease() {
     .await;
 
     assert!(
-        worker::run_one(&db, &ev, &reg, &wid).await.unwrap(),
+        jobs::run_one(&db, &ev, &reg, &wid).await.unwrap(),
         "a running row with no lease is unreachable by nothing else, so the reaper must take it"
     );
     assert_eq!(runs.load(Ordering::Relaxed), 1);
@@ -192,7 +192,7 @@ async fn reaper_reclaims_expired_lease() {
         count: 3,
         runs: runs.clone(),
     }));
-    let wid = worker::worker_id();
+    let wid = jobs::worker_id();
 
     // A row stranded 'running' by a dead worker, lease long expired.
     let id = Uuid::new_v4();
@@ -208,7 +208,7 @@ async fn reaper_reclaims_expired_lease() {
     .await;
 
     assert!(
-        worker::run_one(&db, &ev, &reg, &wid).await.unwrap(),
+        jobs::run_one(&db, &ev, &reg, &wid).await.unwrap(),
         "reaper should reclaim and run the expired-lease job"
     );
     assert_eq!(runs.load(Ordering::Relaxed), 1);
@@ -231,7 +231,7 @@ async fn skip_locked_gives_exclusive_claim() {
         runs: runs.clone(),
     }));
 
-    let id = worker::enqueue(
+    let id = jobs::enqueue(
         &db,
         "test_complete",
         None,
@@ -243,11 +243,11 @@ async fn skip_locked_gives_exclusive_claim() {
     .unwrap()
     .unwrap();
 
-    let w1 = worker::worker_id();
-    let w2 = worker::worker_id();
+    let w1 = jobs::worker_id();
+    let w2 = jobs::worker_id();
     let (r1, r2) = tokio::join!(
-        worker::run_one(&db, &ev, &reg, &w1),
-        worker::run_one(&db, &ev, &reg, &w2),
+        jobs::run_one(&db, &ev, &reg, &w1),
+        jobs::run_one(&db, &ev, &reg, &w2),
     );
     let (r1, r2) = (r1.unwrap(), r2.unwrap());
     assert!(
@@ -266,14 +266,14 @@ async fn failure_records_error_and_releases_lease() {
     let ev = events();
     let mut reg = JobRegistry::new();
     reg.register(Arc::new(FailingJob));
-    let wid = worker::worker_id();
+    let wid = jobs::worker_id();
 
-    let id = worker::enqueue(&db, "test_fail", None, None, &serde_json::json!({}), None)
+    let id = jobs::enqueue(&db, "test_fail", None, None, &serde_json::json!({}), None)
         .await
         .unwrap()
         .unwrap();
 
-    assert!(worker::run_one(&db, &ev, &reg, &wid).await.unwrap());
+    assert!(jobs::run_one(&db, &ev, &reg, &wid).await.unwrap());
     let row = job_row(&db, id).await;
     // `run_one` runs under the process-wide policy, which no test sets: no retries, so the failure
     // is terminal. The retry arm is `retry_backoff.rs`.
@@ -297,9 +297,9 @@ async fn handler_panic_fails_job_and_worker_survives() {
         count: 9,
         runs: runs.clone(),
     }));
-    let wid = worker::worker_id();
+    let wid = jobs::worker_id();
 
-    let panic_id = worker::enqueue(&db, "test_panic", None, None, &serde_json::json!({}), None)
+    let panic_id = jobs::enqueue(&db, "test_panic", None, None, &serde_json::json!({}), None)
         .await
         .unwrap()
         .unwrap();
@@ -307,7 +307,7 @@ async fn handler_panic_fails_job_and_worker_survives() {
     // The panic is caught inside the worker: `run_one` returns normally (no unwind through it), so a
     // panicking handler can't take down the replica's only worker task.
     assert!(
-        worker::run_one(&db, &ev, &reg, &wid).await.unwrap(),
+        jobs::run_one(&db, &ev, &reg, &wid).await.unwrap(),
         "the panicking job is claimed and handled without unwinding the worker"
     );
     let row = job_row(&db, panic_id).await;
@@ -325,7 +325,7 @@ async fn handler_panic_fails_job_and_worker_survives() {
     assert!(row.owner_is_null, "lease released after a panic");
 
     // The same worker claims and runs the next job, proof the loop wasn't killed.
-    let ok_id = worker::enqueue(
+    let ok_id = jobs::enqueue(
         &db,
         "test_complete",
         None,
@@ -336,7 +336,7 @@ async fn handler_panic_fails_job_and_worker_survives() {
     .await
     .unwrap()
     .unwrap();
-    assert!(worker::run_one(&db, &ev, &reg, &wid).await.unwrap());
+    assert!(jobs::run_one(&db, &ev, &reg, &wid).await.unwrap());
     assert_eq!(
         runs.load(Ordering::Relaxed),
         1,

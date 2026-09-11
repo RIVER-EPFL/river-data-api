@@ -1,20 +1,43 @@
+//! Minting, hashing and verifying a bearer token, and the Keycloak admin client the user routes
+//! read and write the realm through.
+
 use std::time::Duration;
 
-use argon2::password_hash::{
-    PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
-};
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::Algorithm;
+use argon2::Argon2;
+use argon2::Params;
+use argon2::Version;
+use argon2::password_hash::PasswordHash;
+use argon2::password_hash::PasswordHasher;
+use argon2::password_hash::PasswordVerifier;
+use argon2::password_hash::SaltString;
+use argon2::password_hash::rand_core::OsRng;
 use chrono::Utc;
-use crudcrate::{ApiError, CRUDOperations, CRUDResource};
+use crudcrate::ApiError;
+use crudcrate::CRUDOperations;
+use crudcrate::CRUDResource;
 use moka::future::Cache;
 use rand::Rng;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    Set, TransactionTrait,
-};
-use sha2::{Digest, Sha256};
+use sea_orm::ActiveModelTrait;
+use sea_orm::ColumnTrait;
+use sea_orm::ConnectionTrait;
+use sea_orm::DatabaseConnection;
+use sea_orm::EntityTrait;
+use sea_orm::QueryFilter;
+use sea_orm::Set;
+use sea_orm::TransactionTrait;
+use serde::Deserialize;
+use sha2::Digest;
+use sha2::Sha256;
 
-use super::models::{self as model, ApiToken};
+use super::models as model;
+use super::models::ApiToken;
+use super::models::*;
+use crate::common::AppState;
+use crate::common::authz::RIVER_ROLE_NAMES;
+use crate::common::state::KeycloakAdmin;
+use crate::error::AppError;
+use crate::error::AppResult;
 
 /// Cache of validated API tokens. Key: SHA-256 of the raw bearer token (in-memory only, never
 /// stored), Value: token model. Short TTL so expirations take effect quickly; revocation/rotation
@@ -301,6 +324,530 @@ impl CRUDOperations for ApiTokenOperations {
     }
 }
 
+// --- The Keycloak admin client ---
+//
+// The realm is the directory; river-data stores no user row. These wrap the admin REST API the
+// user routes read and write through.
+
+/// Anti-backdoor hook: a user's cached access must not outlive their real access. On any change to
+/// a user's roles, enabled flag or existence, drop their cached role and their cached project
+/// grants so both re-resolve on the next request rather than waiting for a sweep.
+pub(crate) async fn invalidate_cached_access(state: &AppState, sub: &str) {
+    state.authorizer.invalidate(sub).await;
+    state.grants_cache.invalidate(sub).await;
+}
+
+pub(crate) async fn get_admin_token(state: &AppState) -> AppResult<String> {
+    let admin = state
+        .keycloak_admin
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("Keycloak admin not configured".to_string()))?;
+
+    // Check cache (reuse if >30s before expiry)
+    {
+        let cache = admin.token_cache.lock().await;
+        if let Some((token, expiry)) = cache.as_ref()
+            && *expiry > Utc::now() + chrono::Duration::seconds(30)
+        {
+            return Ok(token.clone());
+        }
+    }
+
+    let url = format!(
+        "{}/realms/{}/protocol/openid-connect/token",
+        state
+            .config
+            .keycloak_url
+            .as_ref()
+            .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))?,
+        state
+            .config
+            .keycloak_realm
+            .as_ref()
+            .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))?,
+    );
+
+    let resp = admin
+        .http_client
+        .post(&url)
+        .form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", &admin.client_id),
+            ("client_secret", &admin.client_secret),
+        ])
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Keycloak token request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "Keycloak token request failed ({status}): {body}"
+        )));
+    }
+
+    #[derive(Deserialize)]
+    struct TokenResponse {
+        access_token: String,
+        expires_in: i64,
+    }
+
+    let token_resp: TokenResponse = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse token response: {e}")))?;
+
+    let expiry = Utc::now() + chrono::Duration::seconds(token_resp.expires_in);
+    let token = token_resp.access_token.clone();
+
+    {
+        let mut cache = admin.token_cache.lock().await;
+        *cache = Some((token_resp.access_token, expiry));
+    }
+
+    Ok(token)
+}
+
+pub(crate) fn admin_base_url(state: &AppState) -> AppResult<String> {
+    Ok(format!(
+        "{}/admin/realms/{}",
+        state
+            .config
+            .keycloak_url
+            .as_ref()
+            .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))?,
+        state
+            .config
+            .keycloak_realm
+            .as_ref()
+            .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))?,
+    ))
+}
+
+pub(crate) fn admin_client(state: &AppState) -> AppResult<&KeycloakAdmin> {
+    state
+        .keycloak_admin
+        .as_ref()
+        .ok_or_else(|| AppError::ServiceUnavailable("Keycloak not configured".to_string()))
+}
+
+/// Transform a Keycloak user JSON into our simplified format.
+pub(crate) fn simplify_user(u: &serde_json::Value, roles: Vec<String>) -> KeycloakUser {
+    KeycloakUser {
+        id: u["id"].as_str().map(str::to_string),
+        username: u["username"].as_str().map(str::to_string),
+        email: u["email"].as_str().map(str::to_string),
+        first_name: u["firstName"].as_str().map(str::to_string),
+        last_name: u["lastName"].as_str().map(str::to_string),
+        enabled: u["enabled"].as_bool(),
+        created_timestamp: u["createdTimestamp"].as_i64(),
+        roles,
+    }
+}
+
+/// The `RIVER_ROLE_NAMES` absent from a realm's role list.
+fn missing_role_names(present: &[String]) -> Vec<&'static str> {
+    RIVER_ROLE_NAMES
+        .into_iter()
+        .filter(|want| !present.iter().any(|have| have == want))
+        .collect()
+}
+
+/// Ask the realm which roles exist. Every level in `RIVER_ROLE_NAMES` must be present, otherwise
+/// users of that level authenticate but resolve to level 0 and are refused at the door, and the
+/// role picker silently offers fewer levels than the authorization matrix defines. Neither
+/// failure is visible from inside a running API, so it is checked once at startup.
+pub async fn check_realm_roles(state: &AppState) -> RealmRoleCheck {
+    let token = match get_admin_token(state).await {
+        Ok(t) => t,
+        Err(e) => return RealmRoleCheck::Unavailable(format!("admin token request failed: {e}")),
+    };
+    let (client, base) = match (admin_client(state), admin_base_url(state)) {
+        (Ok(c), Ok(b)) => (c, b),
+        _ => return RealmRoleCheck::Unavailable("Keycloak admin not configured".to_string()),
+    };
+
+    let resp = match client
+        .http_client
+        .get(format!("{base}/roles"))
+        .bearer_auth(&token)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return RealmRoleCheck::Unavailable(format!("realm roles request failed: {e}")),
+    };
+
+    // A 403 here means the service account lacks `view-realm`. That is a misconfiguration rather
+    // than an outage, but it is reported as unavailable because the roles themselves are unknown:
+    // refusing to start on an unverifiable realm is the same call either way.
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return RealmRoleCheck::Unavailable(format!(
+            "realm roles request failed ({status}): {body}"
+        ));
+    }
+
+    let roles: Vec<KeycloakRole> = match resp.json().await {
+        Ok(r) => r,
+        Err(e) => return RealmRoleCheck::Unavailable(format!("failed to parse realm roles: {e}")),
+    };
+
+    let present: Vec<String> = roles.into_iter().map(|r| r.name).collect();
+    match missing_role_names(&present) {
+        m if m.is_empty() => RealmRoleCheck::Satisfied,
+        m => RealmRoleCheck::Missing(m),
+    }
+}
+
+/// Page size for the Keycloak admin listings; every listing here is walked to its end.
+const KC_PAGE: usize = 100;
+
+/// GET a Keycloak admin listing page by page until a short page. A 404 is an empty listing (a
+/// role or endpoint the realm does not have); any other failure propagates.
+async fn fetch_all_pages(
+    client: &KeycloakAdmin,
+    token: &str,
+    url: &str,
+    what: &str,
+) -> AppResult<Vec<serde_json::Value>> {
+    let mut out = Vec::new();
+    let mut first = 0usize;
+    loop {
+        let resp = client
+            .http_client
+            .get(url)
+            .bearer_auth(token)
+            .query(&[("first", first.to_string()), ("max", KC_PAGE.to_string())])
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!("Keycloak {what} request error: {e}");
+                AppError::Internal(format!("Keycloak {what} request failed: {e}"))
+            })?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(out);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!("Keycloak {what} request failed ({status}): {body}");
+            return Err(AppError::Internal(format!(
+                "Keycloak {what} request failed ({status}): {body}"
+            )));
+        }
+        let page: Vec<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to parse {what}: {e}")))?;
+        let n = page.len();
+        out.extend(page);
+        if n < KC_PAGE {
+            return Ok(out);
+        }
+        first += n;
+    }
+}
+
+/// The users directly mapped to a realm role, every page of them.
+async fn fetch_role_users(
+    client: &KeycloakAdmin,
+    token: &str,
+    base: &str,
+    role_name: &str,
+) -> AppResult<Vec<serde_json::Value>> {
+    let users = fetch_all_pages(
+        client,
+        token,
+        &format!("{base}/roles/{role_name}/users"),
+        "role users",
+    )
+    .await?;
+    tracing::debug!("Got {} users with role {role_name}", users.len());
+    Ok(users)
+}
+
+fn river_role_names(roles: &[serde_json::Value]) -> Vec<String> {
+    roles
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .filter(|n| RIVER_ROLE_NAMES.contains(n))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `(river role, members)` from every path a realm role reaches a user: a direct mapping, a
+/// composite role that contains it, and a group (or an ancestor group) that maps it. Access is
+/// decided from the JWT, which carries all three, so the list has to see all three.
+pub(crate) async fn effective_role_members(
+    client: &KeycloakAdmin,
+    token: &str,
+    base: &str,
+) -> AppResult<Vec<(String, Vec<serde_json::Value>)>> {
+    let mut out = Vec::new();
+    let direct = futures::future::join_all(
+        RIVER_ROLE_NAMES
+            .iter()
+            .map(|role| fetch_role_users(client, token, base, role)),
+    )
+    .await;
+    for (role, members) in RIVER_ROLE_NAMES.iter().zip(direct) {
+        out.push(((*role).to_string(), members?));
+    }
+
+    // Composite roles: every realm role whose expansion contains a river level.
+    let all_roles = fetch_all_pages(client, token, &format!("{base}/roles"), "roles").await?;
+    for role in &all_roles {
+        let Some(name) = role["name"].as_str() else {
+            continue;
+        };
+        if role["composite"].as_bool() != Some(true) || RIVER_ROLE_NAMES.contains(&name) {
+            continue;
+        }
+        let expanded = fetch_all_pages(
+            client,
+            token,
+            &format!("{base}/roles/{name}/composites/realm"),
+            "role composites",
+        )
+        .await?;
+        let contained = river_role_names(&expanded);
+        if contained.is_empty() {
+            continue;
+        }
+        let members = fetch_role_users(client, token, base, name).await?;
+        for level in contained {
+            out.push((level, members.clone()));
+        }
+    }
+
+    // Groups: a group's effective realm mappings (composites expanded) plus what it inherits
+    // from its ancestors, applied to its direct members; children walked with that inheritance.
+    let top = fetch_all_pages(client, token, &format!("{base}/groups"), "groups").await?;
+    let mut stack: Vec<(serde_json::Value, Vec<String>)> =
+        top.into_iter().map(|g| (g, Vec::new())).collect();
+    while let Some((group, inherited)) = stack.pop() {
+        let Some(id) = group["id"].as_str() else {
+            continue;
+        };
+        let mapped = fetch_all_pages(
+            client,
+            token,
+            &format!("{base}/groups/{id}/role-mappings/realm/composite"),
+            "group role mappings",
+        )
+        .await?;
+        let mut levels = inherited;
+        for level in river_role_names(&mapped) {
+            if !levels.contains(&level) {
+                levels.push(level);
+            }
+        }
+        if !levels.is_empty() {
+            let members = fetch_all_pages(
+                client,
+                token,
+                &format!("{base}/groups/{id}/members"),
+                "group members",
+            )
+            .await?;
+            for level in &levels {
+                out.push((level.clone(), members.clone()));
+            }
+        }
+        let children = fetch_all_pages(
+            client,
+            token,
+            &format!("{base}/groups/{id}/children"),
+            "group children",
+        )
+        .await?;
+        stack.extend(children.into_iter().map(|c| (c, levels.clone())));
+    }
+    Ok(out)
+}
+
+/// A user's effective riverdata access roles, composites and group mappings expanded, which is
+/// what their JWT carries. Only the four canonical levels are returned so every endpoint reports
+/// the same `roles` shape as `list_users`.
+pub(crate) async fn fetch_user_roles(
+    client: &KeycloakAdmin,
+    token: &str,
+    base: &str,
+    user_id: &str,
+) -> AppResult<Vec<String>> {
+    let resp = client
+        .http_client
+        .get(format!(
+            "{base}/users/{user_id}/role-mappings/realm/composite"
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Keycloak role mappings request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "Keycloak role mappings request failed ({status}): {body}"
+        )));
+    }
+
+    let roles: Vec<KeycloakRole> = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse role mappings: {e}")))?;
+    Ok(roles
+        .into_iter()
+        .map(|r| r.name)
+        .filter(|n| RIVER_ROLE_NAMES.contains(&n.as_str()))
+        .collect())
+}
+
+/// Reject role assignments that name a role the realm does not have, or a role that is not one of
+/// the river access levels. Checked before any mapping is removed.
+fn validate_requested_roles(role_names: &[String], all_roles: &[KeycloakRole]) -> AppResult<()> {
+    let join = |names: Vec<&String>| {
+        names
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let outside: Vec<&String> = role_names
+        .iter()
+        .filter(|name| !RIVER_ROLE_NAMES.contains(&name.as_str()))
+        .collect();
+    if !outside.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "Not a river access role: {}",
+            join(outside)
+        )));
+    }
+    let unknown: Vec<&String> = role_names
+        .iter()
+        .filter(|name| !all_roles.iter().any(|r| &r.name == *name))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "Unknown realm role(s): {}",
+            join(unknown)
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) async fn set_user_roles(
+    client: &KeycloakAdmin,
+    token: &str,
+    base: &str,
+    user_id: &str,
+    role_names: &[String],
+) -> AppResult<()> {
+    // Get all realm roles to map names to full representations
+    let all_roles_resp = client
+        .http_client
+        .get(format!("{base}/roles"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to fetch roles: {e}")))?;
+
+    if !all_roles_resp.status().is_success() {
+        let status = all_roles_resp.status();
+        let body = all_roles_resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "Failed to fetch roles ({status}): {body}"
+        )));
+    }
+    let all_roles: Vec<KeycloakRole> = all_roles_resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse roles: {e}")))?;
+
+    validate_requested_roles(role_names, &all_roles)?;
+
+    // Remove current realm role mappings
+    let current_resp = client
+        .http_client
+        .get(format!("{base}/users/{user_id}/role-mappings/realm"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to fetch current roles: {e}")))?;
+
+    if !current_resp.status().is_success() {
+        let status = current_resp.status();
+        let body = current_resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "Failed to fetch current roles ({status}): {body}"
+        )));
+    }
+    let current_roles: Vec<KeycloakRole> = current_resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse current roles: {e}")))?;
+
+    // Only river access levels are removable; roles granted for other applications stay.
+    let removable: Vec<&KeycloakRole> = current_roles
+        .iter()
+        .filter(|r| RIVER_ROLE_NAMES.contains(&r.name.as_str()))
+        .collect();
+
+    if !removable.is_empty() {
+        let resp = client
+            .http_client
+            .delete(format!("{base}/users/{user_id}/role-mappings/realm"))
+            .bearer_auth(token)
+            .json(&removable)
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to remove roles: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "Failed to remove roles ({status}): {body}"
+            )));
+        }
+    }
+
+    // Assign requested roles
+    let to_assign: Vec<&KeycloakRole> = all_roles
+        .iter()
+        .filter(|r| role_names.contains(&r.name))
+        .collect();
+
+    if !to_assign.is_empty() {
+        let resp = client
+            .http_client
+            .post(format!("{base}/users/{user_id}/role-mappings/realm"))
+            .bearer_auth(token)
+            .json(&to_assign)
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to assign roles: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "Failed to assign roles ({status}): {body}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "tests/service.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/keycloak_roles.rs"]
+mod keycloak_roles_tests;

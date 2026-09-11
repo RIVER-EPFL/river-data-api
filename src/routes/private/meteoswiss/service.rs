@@ -13,9 +13,7 @@ use sea_orm::{
 use uuid::Uuid;
 
 use super::models::{Point, Series, Subscriber};
-use crate::routes::private::{
-    data_streams, parameters, readings, sensors, site_parameters as site_parameters,
-};
+use crate::routes::private::{data_streams, parameters, readings, sensors, site_parameters};
 
 /// The catalog parameter the feed lands on, seeded by `m20260907_000007_meteoswiss_pressure`.
 pub(super) const PARAMETER_CODE: &str = "barometric_pressure";

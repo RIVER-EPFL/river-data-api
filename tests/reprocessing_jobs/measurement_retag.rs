@@ -6,7 +6,7 @@
 //! Run: cargo test --test reprocessing_jobs -- --test-threads=1
 
 use river_db::common::AppEvent;
-use river_db::routes::private::reprocessing_jobs::{job, worker};
+use river_db::routes::private::reprocessing_jobs::service as jobs;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;
@@ -83,8 +83,8 @@ async fn retag_job_moves_scope_out_of_aggregates_and_reruns_idempotently() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     let ev = events();
-    let registry = job::build_registry();
-    let wid = worker::worker_id();
+    let registry = jobs::build_registry();
+    let wid = jobs::worker_id();
 
     let stream_id = make_stream(&db, "labimport").await;
     insert_paired_reading(&db, stream_id, "2025-03-01T00:00:00Z", 10.0, None).await;
@@ -107,7 +107,7 @@ async fn retag_job_moves_scope_out_of_aggregates_and_reruns_idempotently() {
         "continuous rows roll up before the retag"
     );
 
-    let id = worker::enqueue(
+    let id = jobs::enqueue(
         &db,
         "measurement_retag",
         None,
@@ -118,7 +118,7 @@ async fn retag_job_moves_scope_out_of_aggregates_and_reruns_idempotently() {
     .await
     .unwrap()
     .expect("enqueue inserts a row");
-    worker::drain(&db, &ev, &registry, &wid).await.unwrap();
+    jobs::drain(&db, &ev, &registry, &wid).await.unwrap();
 
     assert_eq!(job_status(&db, id).await, "completed");
     assert_eq!(
@@ -137,7 +137,7 @@ async fn retag_job_moves_scope_out_of_aggregates_and_reruns_idempotently() {
     );
 
     // Idempotent rerun: nothing left to retag, still completes.
-    let rerun = worker::enqueue(
+    let rerun = jobs::enqueue(
         &db,
         "measurement_retag",
         None,
@@ -148,7 +148,7 @@ async fn retag_job_moves_scope_out_of_aggregates_and_reruns_idempotently() {
     .await
     .unwrap()
     .expect("rerun enqueues");
-    worker::drain(&db, &ev, &registry, &wid).await.unwrap();
+    jobs::drain(&db, &ev, &registry, &wid).await.unwrap();
     assert_eq!(job_status(&db, rerun).await, "completed");
 }
 
@@ -162,8 +162,8 @@ async fn a_stored_retag_row_cannot_move_a_family_off_spot() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     let ev = events();
-    let registry = job::build_registry();
-    let wid = worker::worker_id();
+    let registry = jobs::build_registry();
+    let wid = jobs::worker_id();
 
     let family = Uuid::new_v4();
     crate::common::exec(
@@ -192,7 +192,7 @@ async fn a_stored_retag_row_cannot_move_a_family_off_spot() {
         .await;
     }
 
-    let id = worker::enqueue(
+    let id = jobs::enqueue(
         &db,
         "measurement_retag",
         None,
@@ -203,7 +203,7 @@ async fn a_stored_retag_row_cannot_move_a_family_off_spot() {
     .await
     .unwrap()
     .expect("enqueue inserts a row");
-    worker::drain(&db, &ev, &registry, &wid).await.unwrap();
+    jobs::drain(&db, &ev, &registry, &wid).await.unwrap();
 
     let row = db
         .query_one_raw(Statement::from_string(
@@ -293,8 +293,8 @@ async fn sensors_retag_frequency_endpoint_updates_and_enqueues() {
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
     let ev = events();
-    let registry = job::build_registry();
-    let wid = worker::worker_id();
+    let registry = jobs::build_registry();
+    let wid = jobs::worker_id();
 
     let sensor_id = Uuid::new_v4();
     crate::common::exec(
@@ -330,7 +330,7 @@ async fn sensors_retag_frequency_endpoint_updates_and_enqueues() {
         .unwrap();
     assert_eq!(row.try_get::<String>("", "data_frequency").unwrap(), "low");
 
-    worker::drain(&db, &ev, &registry, &wid).await.unwrap();
+    jobs::drain(&db, &ev, &registry, &wid).await.unwrap();
     assert_eq!(
         count_where(
             &db,
@@ -360,8 +360,8 @@ async fn streams_retag_endpoint_by_source_system() {
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
     let ev = events();
-    let registry = job::build_registry();
-    let wid = worker::worker_id();
+    let registry = jobs::build_registry();
+    let wid = jobs::worker_id();
 
     let s1 = make_stream(&db, "portalx").await;
     let s2 = make_stream(&db, "portalx").await;
@@ -392,7 +392,7 @@ async fn streams_retag_endpoint_by_source_system() {
         "stream classification stored for future ingestion"
     );
 
-    worker::drain(&db, &ev, &registry, &wid).await.unwrap();
+    jobs::drain(&db, &ev, &registry, &wid).await.unwrap();
     assert_eq!(
         count_where(
             &db,
@@ -411,8 +411,8 @@ async fn retag_job_source_system_scope_flips_readings_and_refreshes_aggregates()
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     let ev = events();
-    let registry = job::build_registry();
-    let wid = worker::worker_id();
+    let registry = jobs::build_registry();
+    let wid = jobs::worker_id();
 
     let s1 = make_stream(&db, "portaly").await;
     let s2 = make_stream(&db, "portaly").await;
@@ -437,7 +437,7 @@ async fn retag_job_source_system_scope_flips_readings_and_refreshes_aggregates()
         "all three roll up before the retag"
     );
 
-    let id = worker::enqueue(
+    let id = jobs::enqueue(
         &db,
         "measurement_retag",
         None,
@@ -448,7 +448,7 @@ async fn retag_job_source_system_scope_flips_readings_and_refreshes_aggregates()
     .await
     .unwrap()
     .expect("enqueue inserts a row");
-    worker::drain(&db, &ev, &registry, &wid).await.unwrap();
+    jobs::drain(&db, &ev, &registry, &wid).await.unwrap();
     assert_eq!(job_status(&db, id).await, "completed");
 
     assert_eq!(

@@ -4,9 +4,9 @@
 //!
 //! Run: cargo test --test reprocessing_jobs -- --test-threads=1
 
-use river_db::routes::private::reprocessing_jobs::job::Job;
-use river_db::routes::private::reprocessing_jobs::lifecycle::JobReport;
-use river_db::routes::private::reprocessing_jobs::worker;
+use river_db::routes::private::reprocessing_jobs::service::Job;
+use river_db::routes::private::reprocessing_jobs::service::JobReport;
+use river_db::routes::private::reprocessing_jobs::service as jobs;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use uuid::Uuid;
@@ -33,12 +33,12 @@ async fn scalar_string(db: &DatabaseConnection, sql: &str) -> String {
 async fn run_job(db: &DatabaseConnection, job: ClosureJob) -> Uuid {
     let trigger_type = job.name();
     let registry = registry_of(job);
-    let job_id = worker::enqueue(db, trigger_type, None, None, &serde_json::json!({}), None)
+    let job_id = jobs::enqueue(db, trigger_type, None, None, &serde_json::json!({}), None)
         .await
         .unwrap()
         .expect("a fresh enqueue inserts a row");
     assert!(
-        worker::run_one(db, &events(), &registry, &worker::worker_id())
+        jobs::run_one(db, &events(), &registry, &jobs::worker_id())
             .await
             .unwrap(),
         "the worker claims the enqueued job"
@@ -148,7 +148,7 @@ async fn a_merge_reports_numeric_counts_and_carries_source_deleted_in_scope() {
 
     let source = Uuid::parse_str(crate::common::GLOBAL_PARAM_DEPTH_ID).unwrap();
     let target = Uuid::parse_str(crate::common::GLOBAL_PARAM_TEMP_ID).unwrap();
-    let job_id = worker::enqueue(
+    let job_id = jobs::enqueue(
         &db,
         "merge_parameters",
         None,
@@ -160,9 +160,9 @@ async fn a_merge_reports_numeric_counts_and_carries_source_deleted_in_scope() {
     .unwrap()
     .expect("the merge is enqueued");
 
-    let registry = river_db::routes::private::reprocessing_jobs::job::build_registry();
+    let registry = river_db::routes::private::reprocessing_jobs::service::build_registry();
     assert!(
-        worker::run_one(&db, &events(), &registry, &worker::worker_id())
+        jobs::run_one(&db, &events(), &registry, &jobs::worker_id())
             .await
             .unwrap(),
         "the worker claims the merge"
@@ -202,7 +202,7 @@ async fn a_job_row_carries_the_params_it_was_enqueued_with() {
     let app = crate::common::build_test_app(db.clone());
 
     let params = serde_json::json!({ "target": "spot", "retag_existing": true });
-    let job_id = worker::enqueue(&db, "measurement_retag", None, None, &params, None)
+    let job_id = jobs::enqueue(&db, "measurement_retag", None, None, &params, None)
         .await
         .unwrap()
         .expect("the retag is enqueued");

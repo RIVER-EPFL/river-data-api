@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::models::{Column, Entity, Model};
 use crate::error::AppResult;
-use crate::routes::private::{data_streams, site_parameters as site_parameters};
+use crate::routes::private::{data_streams, site_parameters};
 
 /// `(site_id, parameter_id)` per paired stream. A stream with no pairing is absent, which is what
 /// the caller reports as `unpaired`.

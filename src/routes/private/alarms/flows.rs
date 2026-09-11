@@ -19,12 +19,11 @@ use crate::common::{AppEvent, EventSender};
 use crate::config::Config;
 use crate::error::AppResult;
 use crate::routes::private::readings::models as readings;
-use crate::routes::private::reprocessing_jobs::job::Job;
-use crate::routes::private::reprocessing_jobs::jobs::{
+use crate::routes::private::reprocessing_jobs::flows::{
     SlotOutcome, optional_datetime, optional_uuid, uuid_pair_array,
 };
-use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
-use crate::routes::private::reprocessing_jobs::schedule::Schedule;
+use crate::routes::private::reprocessing_jobs::service::Job;
+use crate::routes::private::reprocessing_jobs::service::{JobContext, JobReport, Schedule};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

@@ -1,4 +1,4 @@
-//! Integration tests for the admin theme. Each submodule is one behaviour suite;
+//! Integration tests for the operator actions. Each submodule is one behaviour suite;
 //! run the whole theme with `cargo test --test admin` or one suite with
 //! `cargo test --test admin <module>`.
 

@@ -11,9 +11,8 @@
 
 use axum::extract::{Query, State};
 use river_db::common::AppState;
-use river_db::routes::private::admin::users::{
-    AssignRolesRequest, ListQuery, assign_roles, list_users,
-};
+use river_db::routes::private::api_tokens::models::{AssignRolesRequest, ListQuery};
+use river_db::routes::private::api_tokens::views::{assign_roles, list_users};
 use serial_test::serial;
 
 use crate::common::keycloak::{

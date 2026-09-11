@@ -7,7 +7,7 @@
 //! Run: cargo test --test admin slot_keyed_merge -- --test-threads=1
 
 use river_db::error::AppError;
-use river_db::routes::private::admin::merge_services::{
+use river_db::routes::private::site_parameters::service::{
     MergeSiteParametersRequest, merge_site_parameters,
 };
 use serial_test::serial;

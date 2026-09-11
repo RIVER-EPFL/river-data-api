@@ -95,7 +95,10 @@ pub async fn acknowledge_plan(app: &Router, token: &str, plan_id: &str) {
 pub async fn confirm_plan_instruments(app: &Router, token: &str, plan_id: &str) {
     let (status, plan) =
         super::get_json_with_token(app, &format!("/api/sync/pairing-plans/{plan_id}"), token).await;
-    assert_eq!(status, 200, "reading the plan to confirm its instruments: {plan}");
+    assert_eq!(
+        status, 200,
+        "reading the plan to confirm its instruments: {plan}"
+    );
     let updates: Vec<serde_json::Value> = plan["entries"]
         .as_array()
         .map(|entries| {

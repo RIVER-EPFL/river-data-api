@@ -34,6 +34,7 @@
 /change_proposals => deny_scoped_token+require_manage_sensors
 /change_proposals/decide => deny_scoped_token+require_manage_sensors
 /collection_events/stage => require_write_data
+/collection_events/stage_many => require_write_data
 /collection_events/{id}/detail => require_read_data
 /collection_events/{id}/recompute => require_write_data
 /commands => require_read_metadata

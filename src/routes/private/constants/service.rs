@@ -3,7 +3,7 @@ use sea_orm::{ConnectionTrait, EntityTrait, TransactionTrait};
 use uuid::Uuid;
 
 use super::models::Constant;
-use crate::routes::private::reprocessing_jobs::worker;
+use crate::routes::private::reprocessing_jobs::service as jobs;
 
 /// A constant is an input to every calculation that declares it, so changing its value changes what
 /// every stored output would produce today. Nothing is rewritten by the save: the edit enqueues the
@@ -48,7 +48,7 @@ impl CRUDOperations for ConstantOperations {
         }
         let name = data.name.clone().flatten().unwrap_or(stored_name);
         let key = audit_dedupe_key(&name);
-        if let Err(e) = worker::enqueue(
+        if let Err(e) = jobs::enqueue(
             db,
             "event_audit",
             None,

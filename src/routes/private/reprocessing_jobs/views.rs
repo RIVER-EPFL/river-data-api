@@ -1,19 +1,37 @@
-//! Custom (non-CrudCrate) endpoints for tracked jobs. Today: the per-job timeline feed.
+//! The tracked-job endpoints that are not generated CRUD: the per-job timeline, cancel and rerun,
+//! and the two schedule actions (fire a job now, read the edit trail).
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::Path;
+use axum::extract::Query;
+use axum::extract::State;
+use sea_orm::ColumnTrait;
+use sea_orm::ConnectionTrait;
+use sea_orm::EntityTrait;
+use sea_orm::FromQueryResult;
+use sea_orm::QueryFilter;
+use sea_orm::Statement;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, Statement};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
-use super::model::{Column, Entity};
+use super::models::job;
+use super::models::job::Column;
+use super::models::job::Entity;
+use super::models::schedule;
+use super::service;
+use super::service::JobRegistry;
 use crate::common::AppState;
 use crate::common::authz::AccessScope;
 use crate::common::middleware::ProjectScope;
-use crate::common::scope::{self, RowProject, Unowned};
-use crate::error::{AppError, AppResult};
-
+use crate::common::scope;
+use crate::common::scope::RowProject;
+use crate::common::scope::Unowned;
+use crate::error::AppError;
+use crate::error::AppResult;
+use crate::routes::private::reprocessing_jobs::models::QueuedJobResponse;
 
 /// The statuses a job can still be cancelled or found in flight from: not yet finished, whoever
 /// holds it. `pending` and `retrying` are historical and still on rows.
@@ -122,13 +140,13 @@ pub async fn cancel_job(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<CancelResponse>> {
     confine_job(&state, &scope, id).await?;
-    let row = super::model::Entity::find_by_id(id)
+    let row = job::Entity::find_by_id(id)
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("job {id} not found")))?;
 
     let trigger_type = row.trigger_type;
-    if !super::registry::is_cancellable(&trigger_type) {
+    if !service::is_cancellable(&trigger_type) {
         return Err(AppError::Conflict(format!(
             "jobs of type '{trigger_type}' cannot be cancelled once running"
         )));
@@ -195,12 +213,12 @@ pub async fn rerun_job(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<RerunResponse>> {
     confine_job(&state, &scope, id).await?;
-    let row = super::model::Entity::find_by_id(id)
+    let row = job::Entity::find_by_id(id)
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("job {id} not found")))?;
 
-    let super::model::Model {
+    let job::Model {
         trigger_type,
         sensor_id,
         trigger_id,
@@ -208,7 +226,7 @@ pub async fn rerun_job(
         ..
     } = row;
 
-    if !super::registry::is_rerunnable(&trigger_type) {
+    if !service::is_rerunnable(&trigger_type) {
         return Err(AppError::Conflict(format!(
             "jobs of type '{trigger_type}' cannot be rerun"
         )));
@@ -248,7 +266,7 @@ pub async fn rerun_job(
     // Replay the original job from its persisted params: the row already carries the exact
     // `trigger_type`/`sensor_id`/`trigger_id`/`params` the first run used, so first-run and rerun
     // share the single leased `enqueue` path (no separate reconstruction, no inline spawn).
-    let new_id = super::worker::enqueue(
+    let new_id = service::enqueue(
         &state.db,
         &trigger_type,
         sensor_id,
@@ -263,4 +281,143 @@ pub async fn rerun_job(
         job_id: new_id,
         status: "queued".to_string(),
     }))
+}
+
+// --- Schedule actions ---
+//
+// Listing, inspecting and editing a schedule are the generated entity routes
+// (`super::models::schedule`), with the rules an edit must satisfy in `super::service`. These two
+// are actions on a schedule rather than reads or writes of one: `run_now` enqueues a job, and the
+// trail lives in `change_audit` under the subject `schedule:{job_name}`.
+
+/// Build the full job registry (on-demand jobs + the recurring Services with their cadence) for the
+/// handlers' tunables validation and run-now existence check. Stateless and cheap; rebuilt per call
+/// rather than threaded through `AppState` so the worker/scheduler's registry stays the single
+/// source the brief's fallback allows. The scheduled-Service set is what carries `validate`/cadence.
+fn full_registry(state: &AppState) -> JobRegistry {
+    let mut registry = service::build_registry();
+    service::register_scheduled_services(&mut registry, &state.config);
+    registry
+}
+
+/// `POST /api/schedules/{job_name}/run_now` response: the enqueued job id (None on a dedupe
+/// collision, an identical run_now in the same second) and whether one was created.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct RunNowResponse {
+    #[schema(required)]
+    pub job_id: Option<Uuid>,
+    pub enqueued: bool,
+}
+
+/// `POST /api/schedules/{job_name}/run_now`, fire one off-cadence run with the schedule's current
+/// tunables snapshot. 404 if `job_name` is not a known job. Requires `write_metadata` (+ non-scoped
+/// token).
+#[utoipa::path(
+    post,
+    path = "/api/schedules/{job_name}/run_now",
+    params(("job_name" = String, Path, description = "Registered job name")),
+    responses(
+        (status = 200, description = "The enqueued run", body = RunNowResponse),
+        (status = 404, description = "No job of that name is registered"),
+    ),
+    tag = "schedules"
+)]
+pub async fn run_now(
+    State(state): State<AppState>,
+    Path(job_name): Path<String>,
+) -> AppResult<Json<RunNowResponse>> {
+    if full_registry(&state).get(&job_name).is_none() {
+        return Err(AppError::NotFound(format!(
+            "no job named '{job_name}' is registered"
+        )));
+    }
+
+    // Snapshot the schedule's tunables so a manual run mirrors a scheduled one; no row → `{}`.
+    let tunables = schedule::Entity::find()
+        .filter(schedule::Column::JobName.eq(job_name.clone()))
+        .one(&state.db)
+        .await?
+        .map_or_else(|| serde_json::json!({}), |row| row.tunables);
+
+    // Per-second dedupe key so an accidental double-click collapses to one run; a deliberate second
+    // run in a later second is allowed.
+    let dedupe_key = format!("{job_name}:run_now:{}", chrono::Utc::now().timestamp());
+    let job_id = service::enqueue(
+        &state.db,
+        &job_name,
+        None,
+        None,
+        &serde_json::json!({ "trigger": "run_now", "tunables": tunables }),
+        Some(&dedupe_key),
+    )
+    .await?;
+
+    Ok(Json(RunNowResponse {
+        enqueued: job_id.is_some(),
+        job_id,
+    }))
+}
+
+/// `GET /api/schedules/{job_name}/audit`, up to the 100 newest edits for one schedule, newest
+/// first. Returns an empty list for an unknown/never-edited job. Requires `read_metadata`.
+///
+/// A schedule's trail is one subject in `change_audit`, so this is the general reader keyed for
+/// this caller rather than a second query over the same table.
+#[utoipa::path(
+    get,
+    path = "/api/schedules/{job_name}/audit",
+    params(("job_name" = String, Path, description = "Registered job name")),
+    responses((status = 200, description = "The schedule's edit trail, newest first", body = Vec<crate::routes::private::change_audit::models::ChangeEntry>)),
+    tag = "schedules"
+)]
+pub async fn get_schedule_audit(
+    State(state): State<AppState>,
+    Path(job_name): Path<String>,
+) -> AppResult<Json<Vec<crate::routes::private::change_audit::models::ChangeEntry>>> {
+    Ok(Json(
+        crate::routes::private::change_audit::service::entries_for(
+            &state.db,
+            &format!("schedule:{job_name}"),
+        )
+        .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RefreshAggregatesRequest {
+    /// Rematerialise only from this instant to now. Omitted, the whole history is rematerialised,
+    /// which is the repair for a database edited out of band; the open bucket is served from the
+    /// raw rows and each policy already covers the rest.
+    #[serde(default)]
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Refresh of TimescaleDB continuous aggregates, tracked as a `reprocessing_jobs` row.
+/// Returns immediately with the job id; the refresh runs in a background task with a
+/// 10-minute timeout (a timeout marks the job `failed`). Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/api/actions/refresh_aggregates",
+    request_body = RefreshAggregatesRequest,
+    responses(
+        (status = 200, description = "Refresh triggered", body = QueuedJobResponse),
+    ),
+    tag = "actions"
+)]
+pub async fn refresh_aggregates(
+    State(app_state): State<AppState>,
+    Json(payload): Json<RefreshAggregatesRequest>,
+) -> AppResult<Json<QueuedJobResponse>> {
+    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
+        &app_state.db,
+        "refresh_aggregates",
+        None,
+        None,
+        &serde_json::json!({ "since": payload.since.map(|t| t.to_rfc3339()) }),
+        None,
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(QueuedJobResponse::queued(job_id)))
 }

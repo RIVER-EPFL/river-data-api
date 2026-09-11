@@ -129,9 +129,9 @@ async fn merge_preserves_conflicting_readings() {
     assert_eq!(count_before, 3, "Should have 3 readings before merge");
 
     // Perform merge: source → target
-    let merge_result = river_db::routes::private::admin::merge_services::merge_site_parameters(
+    let merge_result = river_db::routes::private::site_parameters::service::merge_site_parameters(
         &db,
-        &river_db::routes::private::admin::merge_services::MergeSiteParametersRequest {
+        &river_db::routes::private::site_parameters::service::MergeSiteParametersRequest {
             source_site_parameter_id: crate::common::PARAM_S1_TEMP_ID.parse().unwrap(),
             target_site_parameter_id: crate::common::PARAM_S1_DO_ID.parse().unwrap(),
         },

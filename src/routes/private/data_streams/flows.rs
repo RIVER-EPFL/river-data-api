@@ -10,8 +10,9 @@
 //! general the one covering a given reading's time, so which curve corrects a reading is left to
 //! the slot reprocess every caller enqueues post-commit.
 
+use async_trait::async_trait;
 use sea_orm::sea_query::{Alias, Expr, Func, PostgresQueryBuilder, Query, UpdateStatement};
-use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DbErr, EntityTrait, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use super::models::{Backfilled, SlotScope};
@@ -24,6 +25,8 @@ use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::service::materialise_samples;
 use crate::routes::private::readings::status_events::models as status_events;
+use crate::routes::private::reprocessing_jobs::flows::required_uuid;
+use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport};
 use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::sync::service::{HoldScope, repoint_holds};
 
@@ -221,7 +224,7 @@ pub async fn retire_slot<C: ConnectionTrait + TransactionTrait>(
         let trigger_id = match scope {
             SlotScope::Stream(id) | SlotScope::SiteParameter(id) => id,
         };
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
+        crate::routes::private::reprocessing_jobs::service::enqueue(
             db,
             "refresh_aggregates",
             None,
@@ -233,6 +236,108 @@ pub async fn retire_slot<C: ConnectionTrait + TransactionTrait>(
         .map_err(|e| AppError::Internal(e.to_string()))?;
     }
     Ok(touched)
+}
+
+/// The status a guarded plan job's work leaves behind, read before it runs.
+///
+/// A lease lost after the run committed is reclaimed by the reaper and the job runs again. The
+/// guard inside `apply_plan`/`revert_plan` then refuses the plan for being past its starting
+/// status, which the worker records as a failure over work that in fact succeeded, so the replay
+/// is recognised here and reported instead.
+async fn plan_status<C: ConnectionTrait>(db: &C, plan_id: Uuid) -> Result<Option<String>, DbErr> {
+    Ok(
+        crate::routes::private::data_streams::pairing_plans::Entity::find_by_id(plan_id)
+            .one(db)
+            .await?
+            .map(|p| p.status),
+    )
+}
+
+/// Apply a pairing plan: resolve entities, execute pairings, backfill readings, mark the plan
+/// `applied`. The status transition is guarded (only a `draft` plan applies), and a re-execution
+/// after a lost lease finds the plan already applied and reports a replay; not offered as a rerun. Backs the `apply_pairing_plan`
+/// operator action.
+pub struct PlanApply;
+
+#[async_trait]
+impl Job for PlanApply {
+    fn name(&self) -> &'static str {
+        "plan_apply"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let plan_id = required_uuid(ctx.params(), "plan_id")?;
+        if plan_status(ctx.db(), plan_id).await?.as_deref() == Some("applied") {
+            ctx.report(JobReport::new().scope("plan_id", plan_id.to_string()))
+                .await;
+            ctx.info("Plan is already applied; this run is a replay and changed nothing")
+                .await;
+            return Ok(0);
+        }
+        let result =
+            crate::routes::private::sync::service::apply_plan(ctx.db(), plan_id, Some(&ctx))
+                .await
+                .map_err(|e| DbErr::Custom(e.to_string()))?;
+        // Every counter the apply produced, so a reader of the run knows what it created as well
+        // as what it paired; the plan's own `apply_result` records the same nine numbers.
+        ctx.report(
+            JobReport::new()
+                .scope("plan_id", plan_id.to_string())
+                .count("projects_created", result.projects_created)
+                .count("sites_created", result.sites_created)
+                .count("parameters_created", result.parameters_created)
+                .count("site_parameters_created", result.site_parameters_created)
+                .count("streams_paired", result.streams_paired)
+                .count("streams_skipped", result.streams_skipped)
+                .count("instruments_created", result.instruments_created)
+                .count("curves_assigned", result.curves_assigned)
+                .count("readings_backfilled", result.readings_backfilled),
+        )
+        .await;
+        ctx.info(&format!(
+            "Applied plan: {} streams paired, {} readings backfilled",
+            result.streams_paired, result.readings_backfilled
+        ))
+        .await;
+        Ok(i64::try_from(result.readings_backfilled).unwrap_or(i64::MAX))
+    }
+}
+
+/// Revert an applied pairing plan: unpair every stream it touched, restoring the prior state, and
+/// mark the plan `reverted`. The status transition is guarded (only an `applied` plan reverts), and
+/// a re-execution after a lost lease finds the plan already reverted and reports a replay; not
+/// offered as a rerun. Backs the
+/// `revert_pairing_plan` operator action.
+pub struct PlanRevert;
+
+#[async_trait]
+impl Job for PlanRevert {
+    fn name(&self) -> &'static str {
+        "plan_revert"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let plan_id = required_uuid(ctx.params(), "plan_id")?;
+        if plan_status(ctx.db(), plan_id).await?.as_deref() == Some("reverted") {
+            ctx.report(JobReport::new().scope("plan_id", plan_id.to_string()))
+                .await;
+            ctx.info("Plan is already reverted; this run is a replay and changed nothing")
+                .await;
+            return Ok(0);
+        }
+        let reverted = crate::routes::private::sync::service::revert_plan(ctx.db(), plan_id)
+            .await
+            .map_err(|e| DbErr::Custom(e.to_string()))?;
+        ctx.report(
+            JobReport::new()
+                .scope("plan_id", plan_id.to_string())
+                .count("reverted", reverted),
+        )
+        .await;
+        ctx.info(&format!("Reverted plan: {reverted} streams unpaired"))
+            .await;
+        Ok(i64::from(reverted))
+    }
 }
 
 #[cfg(test)]

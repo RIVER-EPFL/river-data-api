@@ -62,7 +62,7 @@ pub async fn recompute_collection_event(
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Collection event {id} not found")))?;
-    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
+    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
         &state.db,
         "event_recompute",
         None,
@@ -219,7 +219,7 @@ pub async fn run_event_recompute(
     {
         return Err(AppError::NotFound(format!("Site {site_id} not found")));
     }
-    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
+    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
         &state.db,
         "event_recompute",
         None,
@@ -259,7 +259,7 @@ pub async fn run_event_audit(
             "Collection event {id} not found"
         )));
     }
-    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
+    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
         &state.db,
         "event_audit",
         None,

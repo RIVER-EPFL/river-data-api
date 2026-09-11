@@ -16,14 +16,18 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult, Order,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, sensor_in_scope};
 use crate::common::scope;
+use crate::common::scope::{Unowned, confine_target, project_of_sensor, require_named_target};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::models as readings;
+use crate::routes::private::reprocessing_jobs::models::QueuedJobResponse;
 use crate::routes::private::sensor_calibrations;
 use crate::routes::private::sensor_calibrations::service::recompute_deployed_until;
 use crate::routes::private::sensor_deployments as deployments;
@@ -328,7 +332,7 @@ pub async fn adopt_sensor(
     // deployed_from stamps the sensor onto previously unattributed (sensor_id NULL) history. The
     // per-sensor pass then reconciles the sensor's own rows at any vacated slot.
     let adopt_site_id = payload.site_id;
-    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
+    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
         db,
         "manual_adopt",
         Some(sensor_id),
@@ -570,7 +574,7 @@ pub async fn swap_sensors(
     // deployment window covers each time, so the outgoing sensor's post-swap readings re-attribute
     // to the incoming sensor (a per-sensor reprocess can't, since those rows still carry sensor A).
     let site_id = payload.site_id;
-    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
+    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
         db,
         "sensor_swap",
         None,
@@ -1756,7 +1760,7 @@ pub async fn retag_frequency(
             MeasurementType::Continuous
         }
         .as_str();
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
+        crate::routes::private::reprocessing_jobs::service::enqueue(
             &state.db,
             "measurement_retag",
             None,
@@ -1996,4 +2000,137 @@ async fn resolve_parameter_ids<C: sea_orm::ConnectionTrait>(
     ids.sort_unstable();
     ids.dedup();
     Ok(ids)
+}
+
+// --- Re-deriving a sensor's readings ---
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ReprocessSensorRequest {
+    pub sensor_id: Uuid,
+}
+
+/// Re-derive `calibration_id`, `deployment_id`/`site_id`, and `calibrated_value` for every
+/// reading owned by a sensor from its calibration and deployment windows, cascade to derived
+/// parameters, and refresh aggregates. Tracked as a `reprocessing_jobs` row; returns the job
+/// id immediately. Requires `write_metadata`.
+#[utoipa::path(
+    post,
+    path = "/api/actions/reprocess",
+    request_body = ReprocessSensorRequest,
+    responses(
+        (status = 200, description = "Reprocessing triggered", body = QueuedJobResponse),
+        (status = 403, description = "The sensor is deployed only outside the caller's projects"),
+        (status = 404, description = "No such sensor"),
+    ),
+    tag = "actions"
+)]
+pub async fn reprocess_sensor(
+    State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    Json(payload): Json<ReprocessSensorRequest>,
+) -> AppResult<Json<QueuedJobResponse>> {
+    let sensor_id = payload.sensor_id;
+    // A sensor that has never been deployed belongs to no project, and neither do its readings, so
+    // it stays reachable: an instrument sits in inventory before anyone decides where it goes.
+    let target = project_of_sensor(&app_state.db, sensor_id).await?;
+    confine_target(&scope, &target, Unowned::Allow, "sensor")?;
+
+    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
+        &app_state.db,
+        "manual_reprocess",
+        Some(sensor_id),
+        None,
+        &serde_json::json!({ "sensor_id": sensor_id }),
+        None,
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(QueuedJobResponse::queued(job_id)))
+}
+
+/// One backdate is in flight at a time, so every request carries the same key.
+const REPROCESS_ALL_DEDUPE_KEY: &str = "reprocess_all";
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReprocessAllResponse {
+    pub job_id: Uuid,
+    pub status: String,
+    /// Number of (site, parameter) slots queued for re-derivation.
+    pub slots: usize,
+}
+
+/// Re-derive `sensor_id`/`deployment_id`/`site_id`/`calibrated_value` for ALL historical readings
+/// from the current deployment + calibration timelines, across every `(site, parameter)` slot that
+/// has a deployment. Use after correcting deployment/calibration windows in bulk (the backdate of
+/// historical attribution). Each slot is reprocessed via the decompression-safe
+/// `reprocess_site_parameter_readings`; runs as one tracked job. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/api/actions/reprocess_all",
+    responses(
+        (status = 200, description = "Backdate reprocessing triggered; returns job_id and slot count", body = ReprocessAllResponse),
+        (status = 403, description = "The backdate names no target, so a caller confined to a project set is refused"),
+    ),
+    tag = "actions"
+)]
+pub async fn reprocess_all(
+    State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+) -> AppResult<Json<ReprocessAllResponse>> {
+    // The backdate has no target field at all: it re-derives every slot in the installation.
+    require_named_target(&scope, false, "sensor (POST /actions/reprocess)")?;
+
+    let db = &app_state.db;
+    // Count the slots only to report it back synchronously; the job re-reads `sensor_deployments`
+    // itself, so a rerun reflects the current topology.
+    let slot_count = deployments::Entity::find()
+        .select_only()
+        .column(deployments::Column::SiteId)
+        .column(deployments::Column::ParameterId)
+        .distinct()
+        .into_tuple::<(Uuid, Uuid)>()
+        .all(db)
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
+        .len();
+
+    // One backdate at a time: a second request while one is queued joins it rather than starting a
+    // concurrent pass over every slot. The claim releases the key, so a run already under way still
+    // gets one follow-up.
+    let queued = crate::routes::private::reprocessing_jobs::service::enqueue(
+        db,
+        "reprocess_all",
+        None,
+        None,
+        &serde_json::json!({}),
+        Some(REPROCESS_ALL_DEDUPE_KEY),
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let job_id = match queued {
+        Some(id) => id,
+        // The enqueue coalesced onto a run already queued under this key; that run is the answer.
+        None => {
+            crate::routes::private::reprocessing_jobs::models::job::Entity::find()
+                .filter(
+                    crate::routes::private::reprocessing_jobs::models::job::Column::DedupeKey
+                        .eq(REPROCESS_ALL_DEDUPE_KEY),
+                )
+                .one(db)
+                .await
+                .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
+                .ok_or_else(|| {
+                    AppError::Internal("failed to enqueue reprocess_all job".to_string())
+                })?
+                .id
+        }
+    };
+
+    Ok(Json(ReprocessAllResponse {
+        job_id,
+        status: "queued".to_string(),
+        slots: slot_count,
+    }))
 }

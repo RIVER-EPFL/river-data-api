@@ -296,7 +296,7 @@ async fn the_sweep_leaves_a_correction_no_curve_accounts_for() {
 #[tokio::test]
 #[serial]
 async fn the_janitor_job_runs_the_sweep_and_the_sample_stats_follow() {
-    use river_db::routes::private::reprocessing_jobs::{job, worker};
+    use river_db::routes::private::reprocessing_jobs::service as jobs;
 
     let (db, app, token) = setup().await;
     let (sensor, calibration) = deployed_lab_sensor(&db, 2.0, 1.0).await;
@@ -353,11 +353,11 @@ async fn the_janitor_job_runs_the_sweep_and_the_sample_stats_follow() {
     )
     .await;
 
-    let mut registry = job::build_registry();
-    job::register_scheduled_services(&mut registry, &crate::common::cached_test_config());
+    let mut registry = jobs::build_registry();
+    jobs::register_scheduled_services(&mut registry, &crate::common::cached_test_config());
     let ev: river_db::common::EventSender = tokio::sync::broadcast::channel(64).0;
-    let wid = worker::worker_id();
-    let id = worker::enqueue(
+    let wid = jobs::worker_id();
+    let id = jobs::enqueue(
         &db,
         "janitor_service",
         None,
@@ -368,7 +368,7 @@ async fn the_janitor_job_runs_the_sweep_and_the_sample_stats_follow() {
     .await
     .unwrap()
     .expect("enqueue inserts a row");
-    worker::drain(&db, &ev, &registry, &wid).await.unwrap();
+    jobs::drain(&db, &ev, &registry, &wid).await.unwrap();
 
     let status_row = db
         .query_one_raw(Statement::from_string(

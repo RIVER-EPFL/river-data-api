@@ -27,8 +27,7 @@ use crate::routes::private::readings::models::{
     GrabSampleReading, GrabSampleRequest, GrabWriteMode,
 };
 use crate::routes::private::readings::views::insert_grab_samples;
-use crate::routes::private::reprocessing_jobs::job::Job;
-use crate::routes::private::reprocessing_jobs::lifecycle::{JobContext, JobReport};
+use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport};
 use crate::routes::private::sync::models::HoldKind;
 use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::private::sync::service as audit;

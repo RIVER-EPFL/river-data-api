@@ -40,8 +40,8 @@ use crate::common::AppState;
 use crate::common::middleware::{AuthContext, ProjectScope};
 use crate::common::paging::{Window, content_range};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::reprocessing_jobs::reconcile;
 use crate::routes::private::sensors;
+use crate::routes::private::sync::flows as reconcile;
 
 use super::flows;
 use super::models::*;
@@ -1916,7 +1916,7 @@ async fn declare_estimator(
     // The slot's existing samples are brought into line by the tracked job, so a long history is
     // visible and rerunnable rather than held open in this request.
     let job_id = if scope == "slot" && affected > 0 {
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
+        crate::routes::private::reprocessing_jobs::service::enqueue(
             &state.db,
             "sd_estimator_retag",
             None,
@@ -2804,7 +2804,7 @@ pub async fn apply_pairing_plan(
     crate::routes::private::sync::service::refuse_unconfirmed_instruments(&entries)?;
     crate::routes::private::sync::service::refuse_unchecked_entries(&entries)?;
 
-    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
+    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
         &state.db,
         "plan_apply",
         None,
@@ -2842,7 +2842,7 @@ pub async fn revert_pairing_plan(
             "Plan is '{status}', can only revert 'applied' plans"
         )));
     }
-    let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
+    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
         &state.db,
         "plan_revert",
         None,

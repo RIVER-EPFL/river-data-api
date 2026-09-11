@@ -25,8 +25,8 @@ use crate::common::served::{self};
 use crate::error::AppResult;
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::samples::models as samples;
-use crate::routes::private::sites::models as sites;
 use crate::routes::private::site_parameters::models as site_parameters;
+use crate::routes::private::sites::models as sites;
 /// site if needed.
 pub fn severity_case(val: &str, wmin: &str, wmax: &str, amin: &str, amax: &str) -> String {
     format!(

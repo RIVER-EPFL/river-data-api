@@ -5,8 +5,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use river_db::routes::private::reprocessing_jobs::job::{Job, JobRegistry};
-use river_db::routes::private::reprocessing_jobs::lifecycle::JobContext;
+use river_db::routes::private::reprocessing_jobs::service::JobContext;
+use river_db::routes::private::reprocessing_jobs::service::{Job, JobRegistry};
 use sea_orm::DbErr;
 
 type Work =

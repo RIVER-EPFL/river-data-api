@@ -2017,7 +2017,7 @@ async fn reprocess_after_calibration_write<C: ConnectionTrait>(
         .await
         .map_err(ApiError::database)?;
 
-    crate::routes::private::reprocessing_jobs::worker::enqueue(
+    crate::routes::private::reprocessing_jobs::service::enqueue(
         db,
         trigger,
         Some(sensor_id),

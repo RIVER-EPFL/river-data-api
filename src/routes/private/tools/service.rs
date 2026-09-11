@@ -37,9 +37,9 @@ use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::parameter_groups::service::rules;
 use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::sensor_calibrations::service::evaluate_formula;
-use crate::routes::private::standard_curves::models as standard_curves;
-use crate::routes::private::sites::models as sites;
 use crate::routes::private::site_parameters::models as site_parameters;
+use crate::routes::private::sites::models as sites;
+use crate::routes::private::standard_curves::models as standard_curves;
 use crate::routes::private::sync::service as replicate_audit;
 
 #[derive(Debug, Clone, sea_orm::FromQueryResult)]
@@ -3017,7 +3017,7 @@ pub fn audit_dedupe_key(name: &str) -> String {
 /// applies to a constant edit, which is the same kind of change.
 pub async fn audit_after_activation<C: ConnectionTrait>(db: &C, name: &str) {
     let key = audit_dedupe_key(name);
-    if let Err(e) = crate::routes::private::reprocessing_jobs::worker::enqueue(
+    if let Err(e) = crate::routes::private::reprocessing_jobs::service::enqueue(
         db,
         "event_audit",
         None,

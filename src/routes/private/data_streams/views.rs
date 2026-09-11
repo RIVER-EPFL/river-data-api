@@ -1,6 +1,7 @@
 use axum::{
-    Json, Router, middleware,
+    Json, Router,
     extract::{Path, Query, State},
+    middleware,
     routing::{get, post},
 };
 use chrono::Utc;
@@ -29,13 +30,13 @@ use crate::common::paging::Window;
 use crate::common::scope;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::DataStream;
-use crate::routes::private::sensors;
 use crate::routes::private::sensor_calibrations;
+use crate::routes::private::sensors;
 use crate::routes::private::sensors::service::{
     close_sensor_deployment, create_sensor_for_stream, extract_vaisala_device_serial,
 };
 use crate::routes::private::sync::service as sync_service;
-use crate::routes::private::{data_streams, site_parameters as site_parameters};
+use crate::routes::private::{data_streams, site_parameters};
 
 /// The most recent instants a stream holds, as the replicate rows they will be served as.
 ///
@@ -522,7 +523,8 @@ pub async fn import_stream(
     // Each reading takes the curve whose window covers its OWN time, not the sensor's newest one,
     // so an import of deep history does not stamp today's curve across all of it.
     let attributed =
-        sensor_calibrations::resolver::attribute_stream_by_window(db, stream_id, ctx.sensor_id).await?;
+        sensor_calibrations::resolver::attribute_stream_by_window(db, stream_id, ctx.sensor_id)
+            .await?;
 
     let updated = data_streams::Entity::find_by_id(stream_id)
         .one(db)
@@ -688,7 +690,7 @@ pub async fn pair_stream(
     if backfilled > 0 || has_readings {
         let slot_site = sp_site_id;
         let slot_param = sp_parameter_id;
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
+        crate::routes::private::reprocessing_jobs::service::enqueue(
             db,
             "pairing_backfill",
             None,
@@ -842,7 +844,7 @@ pub async fn retag_streams(
         };
 
     let job_id = if req.retag_existing {
-        crate::routes::private::reprocessing_jobs::worker::enqueue(
+        crate::routes::private::reprocessing_jobs::service::enqueue(
             &state.db,
             "measurement_retag",
             None,

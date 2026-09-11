@@ -21,7 +21,7 @@ use chrono::{DateTime, Utc};
 use sea_orm::Order;
 use sea_orm::sea_query::{
     Alias, Condition, Expr, ExprTrait as _, IntoIden, IntoTableRef, JoinType, PostgresQueryBuilder,
-    Query as SeaQuery, QueryStatementWriter, SelectStatement, TableRef, UpdateStatement,
+    Query as SeaQuery, SelectStatement, TableRef, UpdateStatement,
 };
 
 use super::models as model;

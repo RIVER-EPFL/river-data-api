@@ -10,10 +10,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use river_db::routes::private::reprocessing_jobs::job::{Job, JobRegistry};
-use river_db::routes::private::reprocessing_jobs::lifecycle::JobContext;
-use river_db::routes::private::reprocessing_jobs::schedule::Schedule;
-use river_db::routes::private::reprocessing_jobs::scheduler;
+use river_db::routes::private::reprocessing_jobs::service::{Job, JobRegistry};
+use river_db::routes::private::reprocessing_jobs::service::JobContext;
+use river_db::routes::private::reprocessing_jobs::service::Schedule;
+use river_db::routes::private::reprocessing_jobs::service as jobs;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 
@@ -90,8 +90,8 @@ async fn seed_inserts_one_row_per_service_idempotently() {
     crate::common::cleanup_test_db(&db).await;
     let reg = registry_with("sched_seed_probe", 300);
 
-    scheduler::seed_default_schedules(&db, &reg).await.unwrap();
-    scheduler::seed_default_schedules(&db, &reg).await.unwrap();
+    jobs::seed_default_schedules(&db, &reg).await.unwrap();
+    jobs::seed_default_schedules(&db, &reg).await.unwrap();
 
     let n: i64 = db
         .query_one_raw(Statement::from_string(
@@ -116,11 +116,11 @@ async fn due_service_enqueues_once_and_advances_next_run() {
     crate::common::cleanup_test_db(&db).await;
     let reg = registry_with("sched_due_probe", 300);
 
-    scheduler::seed_default_schedules(&db, &reg).await.unwrap();
+    jobs::seed_default_schedules(&db, &reg).await.unwrap();
     force_due(&db, "sched_due_probe").await;
 
     let before = next_run_at(&db, "sched_due_probe").await;
-    let enqueued = scheduler::tick(&db, &reg).await.unwrap();
+    let enqueued = jobs::tick(&db, &reg).await.unwrap();
     assert_eq!(enqueued, 1, "the due service is enqueued exactly once");
     assert_eq!(count_queued(&db, "sched_due_probe").await, 1);
 
@@ -142,7 +142,7 @@ async fn second_tick_same_slot_does_not_double_enqueue() {
     crate::common::cleanup_test_db(&db).await;
     let reg = registry_with("sched_dedupe_probe", 300);
 
-    scheduler::seed_default_schedules(&db, &reg).await.unwrap();
+    jobs::seed_default_schedules(&db, &reg).await.unwrap();
 
     // Pin the schedule to a fixed past scheduled time so BOTH ticks compute the same dedupe key
     // (job_name + scheduled epoch). The first advances next_run_at; we reset it back to the same slot
@@ -152,14 +152,14 @@ async fn second_tick_same_slot_does_not_double_enqueue() {
         "UPDATE schedules SET next_run_at = '2020-01-01T00:00:00Z' WHERE job_name = 'sched_dedupe_probe'",
     )
     .await;
-    let enq1 = scheduler::tick(&db, &reg).await.unwrap();
+    let enq1 = jobs::tick(&db, &reg).await.unwrap();
 
     crate::common::exec(
         &db,
         "UPDATE schedules SET next_run_at = '2020-01-01T00:00:00Z' WHERE job_name = 'sched_dedupe_probe'",
     )
     .await;
-    let enq2 = scheduler::tick(&db, &reg).await.unwrap();
+    let enq2 = jobs::tick(&db, &reg).await.unwrap();
 
     assert_eq!(enq1, 1, "first tick enqueues the slot");
     assert_eq!(
@@ -180,9 +180,9 @@ async fn not_yet_due_service_is_left_alone() {
     crate::common::cleanup_test_db(&db).await;
     let reg = registry_with("sched_future_probe", 300);
 
-    scheduler::seed_default_schedules(&db, &reg).await.unwrap();
+    jobs::seed_default_schedules(&db, &reg).await.unwrap();
     // Seed sets next_run_at one interval out, already in the future, so nothing is due.
-    let enqueued = scheduler::tick(&db, &reg).await.unwrap();
+    let enqueued = jobs::tick(&db, &reg).await.unwrap();
     assert_eq!(enqueued, 0, "a future schedule is not enqueued");
     assert_eq!(count_queued(&db, "sched_future_probe").await, 0);
 }
@@ -194,7 +194,7 @@ async fn skip_if_running_suppresses_enqueue_while_active() {
     crate::common::cleanup_test_db(&db).await;
     let reg = registry_with("sched_overlap_probe", 300);
 
-    scheduler::seed_default_schedules(&db, &reg).await.unwrap();
+    jobs::seed_default_schedules(&db, &reg).await.unwrap();
     // A prior run of this service is still in flight.
     crate::common::exec(
         &db,
@@ -208,7 +208,7 @@ async fn skip_if_running_suppresses_enqueue_while_active() {
     force_due(&db, "sched_overlap_probe").await;
 
     let before = next_run_at(&db, "sched_overlap_probe").await;
-    let enqueued = scheduler::tick(&db, &reg).await.unwrap();
+    let enqueued = jobs::tick(&db, &reg).await.unwrap();
     assert_eq!(
         enqueued, 0,
         "overlap=skip_if_running suppresses the enqueue while a run is active"

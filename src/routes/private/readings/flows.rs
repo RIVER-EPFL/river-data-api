@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use sea_orm::ActiveModelTrait;
 use sea_orm::ColumnTrait;
 use sea_orm::Condition;
 use sea_orm::ConnectionTrait;
@@ -13,6 +12,7 @@ use sea_orm::QuerySelect;
 use sea_orm::Set;
 use sea_orm::Statement;
 use sea_orm::entity::prelude::*;
+use sea_orm::sea_query;
 use sea_orm::sea_query::Expr;
 use uuid::Uuid;
 
@@ -21,13 +21,10 @@ use crate::routes::private::readings;
 use crate::routes::private::readings::models::ConflictMode;
 use crate::routes::private::readings::service::BATCH_SIZE as CSV_BATCH_SIZE;
 use crate::routes::private::readings::service::readings_on_conflict;
-use crate::routes::private::reprocessing_jobs::job::Job;
-use crate::routes::private::reprocessing_jobs::jobs::as_db_err;
-use crate::routes::private::reprocessing_jobs::jobs::optional_datetime;
-use crate::routes::private::reprocessing_jobs::jobs::required_uuid;
-use crate::routes::private::reprocessing_jobs::jobs::uuid_pair_array;
-use crate::routes::private::reprocessing_jobs::lifecycle::JobContext;
-use crate::routes::private::reprocessing_jobs::lifecycle::JobReport;
+use crate::routes::private::reprocessing_jobs::flows::{
+    as_db_err, optional_datetime, required_uuid, uuid_array, uuid_pair_array,
+};
+use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport};
 use crate::routes::private::sensor_calibrations;
 use crate::routes::private::sensor_calibrations::service::Curve;
 use crate::routes::private::sensor_calibrations::service::apply_curves;
@@ -669,3 +666,231 @@ impl CsvImport {
         ))
     }
 }
+
+/// A stream named by its source pair.
+#[derive(FromQueryResult)]
+struct StreamRef {
+    source_system: String,
+    source_key: String,
+}
+/// Retag readings.measurement_type for a sensor/stream scope, then refresh continuous aggregates
+/// over the affected window. Backs the bulk reclassification actions (mark sensors low/high
+/// frequency, classify sensorless streams): the classification columns (`sensors.data_frequency`,
+/// `data_streams.measurement_type`) are updated synchronously by the endpoint; this job makes the
+/// existing rows agree. Rerunnable (idempotent, the UPDATE skips rows already at the target).
+/// Decompression-safe: portal/lab history lives in compressed (>30-day) chunks.
+pub struct MeasurementRetag;
+
+/// The rewrite a `measurement_retag` run makes. `target` is the classification every reading in
+/// scope takes; `None` is the 'declared' arm, which joins each reading to its stream and takes the
+/// stream's own. The scope also matches by stream ownership: a reading ingested before attribution
+/// backfill carries `sensor_id` NULL and belongs to the sensor's streams all the same.
+fn retag_readings(
+    target: Option<&str>,
+    sensor_ids: &[Uuid],
+    stream_ids: &[Uuid],
+    source_system: Option<&str>,
+) -> sea_query::UpdateStatement {
+    use crate::routes::private::data_streams::models as data_streams;
+    use crate::routes::private::readings::models as readings;
+    use sea_orm::sea_query::ExprTrait;
+
+    let r = sea_query::Alias::new("readings");
+    let ds = sea_query::Alias::new("data_streams");
+    let col = |alias: &sea_query::Alias, column: readings::Column| {
+        sea_query::Expr::col((alias.clone(), column))
+    };
+
+    let streams_of = |predicate: sea_query::Expr| {
+        sea_query::Query::select()
+            .column(data_streams::Column::Id)
+            .from(data_streams::Entity)
+            .and_where(predicate)
+            .to_owned()
+    };
+    let mut scope = sea_query::Condition::any()
+        .add(col(&r, readings::Column::SensorId).is_in(sensor_ids.to_vec()))
+        .add(col(&r, readings::Column::StreamId).is_in(stream_ids.to_vec()))
+        .add(col(&r, readings::Column::StreamId).in_subquery(streams_of(
+            sea_query::Expr::col(data_streams::Column::SensorId).is_in(sensor_ids.to_vec()),
+        )));
+    if let Some(system) = source_system {
+        scope = scope.add(col(&r, readings::Column::StreamId).in_subquery(streams_of(
+            sea_query::Expr::col(data_streams::Column::SourceSystem).eq(system),
+        )));
+    }
+
+    let mut update = sea_query::Query::update();
+    update.table(readings::Entity);
+    match target {
+        Some(value) => {
+            update
+                .value(readings::Column::MeasurementType, value)
+                // sea-query has no IS DISTINCT FROM, and a NULL measurement_type reads as
+                // continuous, so the comparison cannot be a plain inequality.
+                .and_where(sea_query::Expr::cust(format!(
+                    r#""readings"."measurement_type" IS DISTINCT FROM '{value}'"#
+                )));
+        }
+        None => {
+            update
+                .value(
+                    readings::Column::MeasurementType,
+                    sea_query::Expr::col((ds.clone(), data_streams::Column::MeasurementType)),
+                )
+                .from(data_streams::Entity)
+                .and_where(
+                    col(&r, readings::Column::StreamId)
+                        .equals((ds.clone(), data_streams::Column::Id)),
+                )
+                .and_where(
+                    sea_query::Expr::col((ds.clone(), data_streams::Column::MeasurementType))
+                        .is_not_null(),
+                )
+                .and_where(sea_query::Expr::cust(
+                    r#""readings"."measurement_type" IS DISTINCT FROM "data_streams"."measurement_type""#,
+                ));
+        }
+    }
+    update.cond_where(scope);
+    update.to_owned()
+}
+
+#[async_trait]
+impl Job for MeasurementRetag {
+    fn name(&self) -> &'static str {
+        "measurement_retag"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let params = ctx.params();
+        let target = params
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .filter(|t| {
+                crate::routes::private::readings::service::retag_target_rejection(t).is_none()
+            })
+            .ok_or_else(|| DbErr::Custom("measurement_retag needs target".to_string()))?
+            .to_string();
+        // 'declared' aligns each reading with its own stream's classification, for source systems
+        // that mix grab and logger columns.
+        let declared = target == crate::routes::private::readings::service::RETAG_DECLARED;
+        let sensor_ids = uuid_array(params, "sensor_ids");
+        let stream_ids = uuid_array(params, "stream_ids");
+        let source_system = params
+            .get("source_system")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if sensor_ids.is_empty() && stream_ids.is_empty() && source_system.is_none() {
+            return Err(DbErr::Custom(
+                "measurement_retag needs sensor_ids, stream_ids, or source_system".to_string(),
+            ));
+        }
+
+        // The family guard holds here, not only on the HTTP routes: a stored job row is replayed
+        // by rerun with its params verbatim, so a route-only guard is bypassed by replaying a row
+        // that predates it. 'spot' is what a family already is, and 'declared' realigns readings
+        // with the stream's own declaration, which every write path holds at 'spot'.
+        if matches!(target.as_str(), "continuous" | "derived") {
+            let families =
+                crate::routes::private::data_streams::service::family_keys_in_retag_scope(
+                    ctx.db(),
+                    &sensor_ids,
+                    &stream_ids,
+                    source_system.as_deref(),
+                )
+                .await
+                .map_err(|e| DbErr::Custom(e.to_string()))?;
+            crate::routes::private::data_streams::service::refuse_family_retag(&families, &target)
+                .map_err(|e| DbErr::Custom(e.to_string()))?;
+        }
+
+        // A stream declaring a different classification will keep writing its own value on
+        // ingest, so the retag would drift back; surface the conflict in the job timeline.
+        if !declared {
+            let conflicting = ctx
+                .db()
+                .query_all_raw(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT source_system, source_key FROM data_streams \
+                     WHERE measurement_type IS NOT NULL AND measurement_type <> $1 \
+                       AND (sensor_id = ANY($2) OR id = ANY($3) \
+                            OR ($4::text IS NOT NULL AND source_system = $4))",
+                    [
+                        target.clone().into(),
+                        sensor_ids.clone().into(),
+                        stream_ids.clone().into(),
+                        source_system.clone().into(),
+                    ],
+                ))
+                .await?;
+            for row in &conflicting {
+                let StreamRef {
+                    source_system: system,
+                    source_key: key,
+                } = StreamRef::from_query_result(row, "")?;
+                ctx.log(
+                    "warn",
+                    &format!(
+                        "Stream {system}/{key} declares a different measurement_type; future ingest will keep writing its declared value. Retag the stream too or use target 'declared'."
+                    ),
+                    serde_json::json!({}),
+                )
+                .await;
+            }
+        }
+
+        ctx.info(&format!("Retagging readings in scope to '{target}'"))
+            .await;
+        let touched = crate::common::bulk_write::guarded_mutation(
+            ctx.db(),
+            retag_readings(
+                declared
+                    .then_some(())
+                    .map_or(Some(target.as_str()), |()| None),
+                &sensor_ids,
+                &stream_ids,
+                source_system.as_deref(),
+            ),
+        )
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
+        let retagged = touched.rows;
+
+        // Membership in the rollups changed (spot and derived are excluded), so every aggregate is
+        // refreshed over what the rewrite touched. A failure here leaves the rollups holding the
+        // old membership, so it fails the job rather than being logged.
+        let Some((lo, hi)) = touched.span() else {
+            ctx.info("Nothing to retag, every reading in scope already matches")
+                .await;
+            return Ok(0);
+        };
+        crate::common::aggregates::refresh(
+            ctx.db(),
+            crate::common::aggregates::Window::Range(lo, hi),
+        )
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
+
+        // Reclassified rows change what bounded cached responses would serve.
+        if retagged > 0
+            && let Some(state) = crate::common::global_app_state()
+        {
+            state.response_cache.invalidate_all();
+        }
+
+        ctx.report(
+            JobReport::new()
+                .scope("target", target)
+                .scope("from", lo.to_rfc3339())
+                .scope("until", hi.to_rfc3339())
+                .count("readings_retagged", retagged),
+        )
+        .await;
+        Ok(retagged.try_into().unwrap_or(i64::MAX))
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/retag_rewrite.rs"]
+mod retag_rewrite_tests;

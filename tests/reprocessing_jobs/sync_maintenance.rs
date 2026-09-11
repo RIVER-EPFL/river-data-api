@@ -5,8 +5,8 @@
 //! Run: cargo test --test reprocessing_jobs -- --test-threads=1
 
 use river_db::common::AppEvent;
-use river_db::routes::private::reprocessing_jobs::job::{Job, JobRegistry};
-use river_db::routes::private::reprocessing_jobs::worker;
+use river_db::routes::private::reprocessing_jobs::service::{Job, JobRegistry};
+use river_db::routes::private::reprocessing_jobs::service as jobs;
 use river_db::routes::private::sync::flows::{SyncFullReassert, SyncLedgerRetention};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
@@ -34,14 +34,14 @@ async fn run_job(db: &DatabaseConnection, job: Arc<dyn Job>) -> i64 {
     let name = job.name();
     let mut registry = JobRegistry::new();
     registry.register(job);
-    let job_id = worker::enqueue(db, name, None, None, &serde_json::json!({}), None)
+    let job_id = jobs::enqueue(db, name, None, None, &serde_json::json!({}), None)
         .await
         .unwrap()
         .expect("a fresh enqueue inserts a row");
     let ev = events();
-    let wid = worker::worker_id();
+    let wid = jobs::worker_id();
     assert!(
-        worker::run_one(db, &ev, &registry, &wid).await.unwrap(),
+        jobs::run_one(db, &ev, &registry, &wid).await.unwrap(),
         "{name} was claimed and run"
     );
     let row = db

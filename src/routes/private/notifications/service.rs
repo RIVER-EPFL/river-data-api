@@ -22,7 +22,7 @@ use crate::common::middleware::AuthContext;
 use crate::common::paging::{Page, Window};
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::admin::users;
+use crate::routes::private::api_tokens::service as users;
 
 pub(super) const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 

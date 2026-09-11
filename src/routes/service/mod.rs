@@ -3,7 +3,7 @@ use axum::{
     extract::{Request, State},
     middleware,
     response::Response,
-    routing::{get, post, put},
+    routing::{get, post},
 };
 use tower_http::limit::RequestBodyLimitLayer;
 use utoipa_axum::router::OpenApiRouter;
@@ -27,23 +27,23 @@ use crate::routes::private::{
     data_streams::DataStream,
     data_streams::models::receipts::IngestReceipt,
     data_streams::pairing_plans::PairingPlan,
-    notes::Note,
-    notifications::{NotificationLog, NotificationMute},
-    parameters::Parameter,
     derived_parameters::models::definition::CalculationFormula,
     derived_parameters::models::source::DerivedParameterSource,
+    notes::Note,
+    notifications::{NotificationLog, NotificationMute},
     parameter_groups::group_model::ParameterGroup,
     parameter_groups::member_model::ParameterGroupMember,
+    parameters::Parameter,
     projects::subprojects::Subproject,
     readings::decision_model::ReadingDecision,
     readings::samples::Sample,
     reprocessing_jobs::ReprocessingJob,
-    reprocessing_jobs::schedule_model::Schedule,
-    sensors::Sensor,
+    reprocessing_jobs::models::schedule::Schedule,
     sensor_calibrations::SensorCalibration,
     sensor_deployments::SensorDeployment,
-    standard_curves::StandardCurve,
+    sensors::Sensor,
     site_parameters::SiteParameter,
+    standard_curves::StandardCurve,
     sync::hold_model::ReplicateAuditHold,
     sync::models::commands::SyncCommand,
     sync::models::credentials::SyncServiceCredential,
@@ -291,14 +291,14 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .split_for_parts();
 
     use crate::routes::private::{
-        admin::{actions, calibrations, derived, merge, public_config, users},
-        alarms::views as alarm_views,
-        data_streams::views as stream_views,
-        readings::status_events::views as status_events_batch,
-        readings::views as readings_views,
-        search,
-        sync::views as sync_views,
-        tools,
+        alarms::views as alarm_views, api_tokens::views as access_views,
+        data_streams::views as stream_views, derived_parameters::views as derived_views,
+        parameters::views as parameter_views, projects::views as project_views,
+        readings::status_events::views as status_events_batch, readings::views as readings_views,
+        reprocessing_jobs::views as job_views, search,
+        sensor_calibrations::views as calibration_views,
+        sensor_deployments::views as deployment_views, sensors::views as sensor_views,
+        site_parameters::views as site_parameter_views, sync::views as sync_views, tools,
     };
 
     let stream_read_routes = stream_views::read_routes().with_state(state.clone());
@@ -351,7 +351,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         // takes rather than the weaker write_data the other operator actions carry.
         .route(
             "/actions/rollback_deployment",
-            post(actions::rollback_deployment),
+            post(deployment_views::rollback_deployment),
         )
         .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_manage_sensors))
@@ -409,22 +409,28 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     let data_action_routes = Router::new()
         .route(
             "/actions/refresh_aggregates",
-            post(actions::refresh_aggregates),
+            post(job_views::refresh_aggregates),
         )
-        .route("/actions/compute_derived", post(actions::compute_derived))
-        .route("/actions/reprocess_all", post(actions::reprocess_all))
+        .route(
+            "/actions/compute_derived",
+            post(derived_views::compute_derived),
+        )
+        .route("/actions/reprocess_all", post(sensor_views::reprocess_all))
         .route(
             "/actions/rebuild_alarm_events",
-            post(actions::rebuild_alarm_events),
+            post(alarm_views::rebuild_alarm_events),
         )
-        .route("/actions/reconcile_alarms", post(actions::reconcile_alarms))
+        .route(
+            "/actions/reconcile_alarms",
+            post(alarm_views::reconcile_alarms),
+        )
         .route(
             "/actions/backfill_attribution",
-            post(actions::backfill_attribution),
+            post(deployment_views::backfill_attribution),
         )
         .route(
             "/actions/backfill_calibrations",
-            post(actions::backfill_calibrations),
+            post(calibration_views::backfill_calibrations),
         )
         .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_write_data))
@@ -434,11 +440,14 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     let alarm_write_routes = alarm_views::write_routes().with_state(state.clone());
 
     let data_read_routes = Router::new()
-        .route("/actions/preview_derived", post(actions::preview_derived))
+        .route(
+            "/actions/preview_derived",
+            post(derived_views::preview_derived),
+        )
         .route("/events", get(crate::routes::private::events::event_stream))
         .route(
             "/reprocessing_jobs/{id}/logs",
-            get(crate::routes::private::reprocessing_jobs::routes::get_job_logs),
+            get(crate::routes::private::reprocessing_jobs::views::get_job_logs),
         )
         .route("/tools", get(tools::views::list_tools))
         .route(
@@ -466,7 +475,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             get(crate::routes::private::collection_events::views::get_event_detail),
         )
         // The rows carry a reading's stored value, so this is data rather than metadata.
-        .route("/actions/curation_drift", get(actions::curation_drift))
+        .route(
+            "/actions/curation_drift",
+            get(readings_views::curation_drift),
+        )
         .layer(middleware::from_fn(require_read_data))
         .with_state(state.clone());
 
@@ -475,15 +487,15 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .route("/version", get(crate::routes::version::get_version))
         .route(
             "/actions/backfill_candidates",
-            get(actions::backfill_candidates),
+            get(deployment_views::backfill_candidates),
         )
         .route(
             "/actions/calibration_candidates",
-            get(actions::calibration_candidates),
+            get(calibration_views::calibration_candidates),
         )
         .route(
             "/actions/undeclared_sd_estimators",
-            get(actions::undeclared_sd_estimators),
+            get(site_parameter_views::undeclared_sd_estimators),
         )
         .route(
             "/parameter_groups/{id}/definition",
@@ -491,7 +503,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         .route(
             "/schedules/{job_name}/audit",
-            get(crate::routes::private::reprocessing_jobs::schedule_routes::get_schedule_audit),
+            get(crate::routes::private::reprocessing_jobs::views::get_schedule_audit),
         )
         .route(
             "/change_audit",
@@ -511,9 +523,9 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         .route(
             "/actions/sensor_calibrations/{id}/recalculate",
-            post(calibrations::recalculate_calibration),
+            post(calibration_views::recalculate_calibration),
         )
-        .route("/actions/reprocess", post(actions::reprocess_sensor))
+        .route("/actions/reprocess", post(sensor_views::reprocess_sensor))
         .route(
             "/sensor_calibrations/{id}/retire",
             post(crate::routes::private::sensor_calibrations::views::retire_calibration),
@@ -532,23 +544,23 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         .route(
             "/actions/derived_parameters/{id}/recompute",
-            post(derived::recompute_derived),
+            post(derived_views::recompute_derived),
         )
         .route(
             "/actions/invalidate_public_config/{code}",
-            post(public_config::invalidate_public_config),
+            post(project_views::invalidate_public_config),
         )
         .route(
             "/reprocessing_jobs/{id}/rerun",
-            post(crate::routes::private::reprocessing_jobs::routes::rerun_job),
+            post(crate::routes::private::reprocessing_jobs::views::rerun_job),
         )
         .route(
             "/reprocessing_jobs/{id}/cancel",
-            post(crate::routes::private::reprocessing_jobs::routes::cancel_job),
+            post(crate::routes::private::reprocessing_jobs::views::cancel_job),
         )
         .route(
             "/schedules/{job_name}/run_now",
-            post(crate::routes::private::reprocessing_jobs::schedule_routes::run_now),
+            post(crate::routes::private::reprocessing_jobs::views::run_now),
         )
         // A declaration change recomputes the slot's stored samples, the same act as the audit
         // resolution's slot scope, so it carries the same MANAGER gate rather than catalog CRUD.
@@ -580,11 +592,11 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     let catalog_merge_routes = Router::new()
         .route(
             "/actions/merge_parameters",
-            post(merge::merge_parameters_handler),
+            post(parameter_views::merge_parameters_handler),
         )
         .route(
             "/actions/merge_site_parameters",
-            post(merge::merge_site_parameters_handler),
+            post(site_parameter_views::merge_site_parameters_handler),
         )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))
@@ -620,8 +632,8 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     // even one with full permissions, can pass require_admin.
     let user_routes = state.keycloak_admin.as_ref().map(|_| {
         Router::new()
-            .nest("/users", users::router())
-            .route("/roles", get(users::list_roles))
+            .nest("/users", access_views::router())
+            .route("/roles", get(access_views::list_roles))
             .layer(middleware::from_fn(require_admin))
             .with_state(state.clone())
     });

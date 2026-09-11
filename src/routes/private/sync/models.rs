@@ -443,7 +443,8 @@ impl HoldKind {
     /// The kinds the event audit and the chain raise, which every reader of calculation findings
     /// filters on together. A kind added here reaches those readers; one named in their SQL by
     /// hand does not.
-    pub const EVENT_AUDIT: [Self; 3] = [Self::MissingOutput, Self::StaleOutput, Self::SkippedOutput];
+    pub const EVENT_AUDIT: [Self; 3] =
+        [Self::MissingOutput, Self::StaleOutput, Self::SkippedOutput];
 
     /// A `kind IN (...)` list for a set of kinds, quoted for SQL.
     #[must_use]
@@ -527,7 +528,10 @@ impl HoldStatus {
     /// A `status IN (...)` list, quoted for SQL.
     #[must_use]
     pub fn sql_list(statuses: &[Self]) -> String {
-        let names: Vec<String> = statuses.iter().map(|s| format!("'{}'", s.as_str())).collect();
+        let names: Vec<String> = statuses
+            .iter()
+            .map(|s| format!("'{}'", s.as_str()))
+            .collect();
         format!("({})", names.join(", "))
     }
 }

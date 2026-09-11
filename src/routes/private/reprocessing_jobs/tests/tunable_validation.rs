@@ -1,6 +1,6 @@
 use super::JanitorRun;
 use crate::routes::private::alarms::flows::AlarmSweep;
-use crate::routes::private::reprocessing_jobs::job::{Job, TunableKind};
+use crate::routes::private::reprocessing_jobs::service::{Job, TunableKind};
 
 fn janitor() -> JanitorRun {
     JanitorRun {
@@ -54,7 +54,7 @@ fn a_job_with_no_tunables_refuses_every_key() {
 /// value outside a spec's range.
 #[test]
 fn every_job_accepts_its_own_defaults_and_refuses_an_out_of_range_value() {
-    let registry = crate::routes::private::reprocessing_jobs::job::build_registry();
+    let registry = crate::routes::private::reprocessing_jobs::service::build_registry();
     for name in registry.names() {
         let handler = registry.get(name).expect("a listed name is registered");
         let specs = handler.tunables();

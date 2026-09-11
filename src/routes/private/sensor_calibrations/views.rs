@@ -7,29 +7,65 @@
 //! move is recorded as one `reading_decisions` set of `curve_retire` decisions, so what changed is
 //! readable per reading and the whole retirement is reversible.
 
-use axum::{
-    Json,
-    extract::{Path, State},
-};
-use chrono::{DateTime, Utc};
-use sea_orm::sea_query::{
-    Alias, Condition, Expr, Func, PostgresQueryBuilder, Query as SeaQuery, SelectStatement,
-    SimpleExpr, SubQueryStatement, UnionType,
-};
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, Order, QueryFilter,
-    QueryOrder, QuerySelect, Statement,
-};
-use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
+use axum::Json;
+use axum::extract::Path;
+use axum::extract::Query;
+use axum::extract::State;
+use chrono::DateTime;
+use chrono::Utc;
+use sea_orm::ColumnTrait;
+use sea_orm::ConnectionTrait;
+use sea_orm::EntityTrait;
+use sea_orm::ExprTrait;
+use sea_orm::FromQueryResult;
+use sea_orm::Order;
+use sea_orm::QueryFilter;
+use sea_orm::QueryOrder;
+use sea_orm::QuerySelect;
+use sea_orm::Statement;
+use sea_orm::sea_query::Alias;
+use sea_orm::sea_query::Condition;
+use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::Func;
+use sea_orm::sea_query::JoinType;
+use sea_orm::sea_query::PostgresQueryBuilder;
+use sea_orm::sea_query::Query as SeaQuery;
+use sea_orm::sea_query::SelectStatement;
+use sea_orm::sea_query::SimpleExpr;
+use sea_orm::sea_query::SubQueryStatement;
+use sea_orm::sea_query::UnionType;
+use serde::Deserialize;
+use serde::Serialize;
+use utoipa::IntoParams;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::common::middleware::{AuthContext, ProjectScope, sensor_in_scope};
-use crate::error::{AppError, AppResult};
-use crate::routes::private::readings::models::{self as readings, Kind, Selection, decision_set};
-use crate::routes::private::readings::service::{self, NewValue, not_pinned_sql};
-use crate::routes::private::sites::models as sites;
+use crate::common::authz::AccessScope;
+use crate::common::middleware::AuthContext;
+use crate::common::middleware::DenyScoped;
+use crate::common::middleware::ProjectScope;
+use crate::common::middleware::sensor_in_scope;
+use crate::common::scope::Unowned;
+use crate::common::scope::confine_target;
+use crate::common::scope::project_filter_sql;
+use crate::common::scope::project_of_sensor;
+use crate::common::scope::require_named_target;
+use crate::error::AppError;
+use crate::error::AppResult;
+use crate::routes::private::data_streams;
+use crate::routes::private::readings;
+use crate::routes::private::readings::models::Kind;
+use crate::routes::private::readings::models::Selection;
+use crate::routes::private::readings::models::decision_set;
+use crate::routes::private::readings::service;
+use crate::routes::private::readings::service::NewValue;
+use crate::routes::private::readings::service::not_pinned_sql;
+use crate::routes::private::sensor_calibrations;
+use crate::routes::private::sites;
+use crate::routes::private::standard_curves;
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -246,7 +282,7 @@ pub async fn retire_calibration(
     // A retired curve no longer bounds its neighbours' windows, so the chain is rebuilt before the
     // slots reprocess under it.
     super::service::recompute_valid_until(&state.db, sensor_id).await?;
-    crate::routes::private::reprocessing_jobs::worker::enqueue(
+    crate::routes::private::reprocessing_jobs::service::enqueue(
         &state.db,
         "calibration_retire",
         Some(sensor_id),
@@ -345,7 +381,7 @@ pub async fn unretire_calibration(
     .await?;
 
     super::service::recompute_valid_until(&state.db, sensor_id).await?;
-    crate::routes::private::reprocessing_jobs::worker::enqueue(
+    crate::routes::private::reprocessing_jobs::service::enqueue(
         &state.db,
         "calibration_unretire",
         Some(sensor_id),
@@ -648,4 +684,671 @@ struct WindowPointRow {
     raw_value: f64,
     calibrated_value: Option<f64>,
     is_flagged: Option<bool>,
+}
+
+#[derive(FromQueryResult)]
+struct CandidateRow {
+    sensor_id: Uuid,
+    uncalibrated_count: i64,
+    target_from: chrono::DateTime<chrono::FixedOffset>,
+}
+
+#[derive(FromQueryResult)]
+struct ForeignCurveRow {
+    sensor_id: Option<Uuid>,
+    standard_curve_id: Uuid,
+    curve_sensor_id: Uuid,
+    curve_name: Option<String>,
+    site_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
+    n: i64,
+    first_time: chrono::DateTime<chrono::FixedOffset>,
+    last_time: chrono::DateTime<chrono::FixedOffset>,
+}
+
+// ---------------------------------------------------------------------------
+// Calibration backfill
+// ---------------------------------------------------------------------------
+
+// A reading no curve covers is not an anomaly: an instrument nobody has calibrated yet, and a gap
+// between two calibration campaigns, are ordinary states, and the readings in them are served raw.
+// What these two queries surface is the narrower set of rows the stored state cannot explain.
+//
+// Both read the readings hypertable without an index that fits them. `calibration_id IS NULL` is
+// not served by `idx_readings_calibration_id`, which is partial on `IS NOT NULL`, and the
+// orphaned-correction predicate compares two columns of the same row, which no index can answer.
+// Each therefore reads every reading in its window, and since the auto-minted identity curves were
+// retired `calibration_id IS NULL` is the ordinary state of an uncorrected reading rather than a
+// rarity, so the rows that survive the predicate are many. A time floor is what holds that cost
+// still while the hypertable grows: it is the one bound TimescaleDB can turn into chunk exclusion,
+// so the chunks below it are never opened at all.
+
+/// How much of the readings history the anomaly report reads when the caller names no floor.
+///
+/// Measured back from the newest reading rather than from `now()`: an installation whose ingestion
+/// has stalled would otherwise report on an empty window and read as clean.
+const CANDIDATE_SCAN_DAYS: i64 = 90;
+
+/// The default floor: [`CANDIDATE_SCAN_DAYS`] before the newest reading in the database, or `None`
+/// when there are no readings, where a floor would make no difference.
+///
+/// The newest reading is taken across the whole table rather than the caller's projects, so two
+/// callers reading the same report read the same window.
+async fn default_scan_floor(
+    db: &sea_orm::DatabaseConnection,
+) -> AppResult<Option<chrono::DateTime<chrono::Utc>>> {
+    // The stream ingest cursors carry the newest instant without touching the hypertable: an
+    // unbounded MAX(time) over readings pays a planning cost proportional to the chunk count.
+    // A batch-written reading newer than every cursor at most shifts the floor slightly later,
+    // which the `since` parameter can always widen past. The unbounded probe remains only as
+    // the fallback for a database with readings but no cursors at all.
+    let mut newest: Option<chrono::DateTime<chrono::FixedOffset>> =
+        crate::routes::private::data_streams::Entity::find()
+            .select_only()
+            .column_as(data_streams::Column::LastDataTime.max(), "newest")
+            .into_tuple::<Option<chrono::DateTime<chrono::FixedOffset>>>()
+            .one(db)
+            .await
+            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
+            .flatten();
+    if newest.is_none() {
+        newest = readings::Entity::find()
+            .select_only()
+            .column_as(readings::Column::Time.max(), "newest")
+            .into_tuple::<Option<chrono::DateTime<chrono::FixedOffset>>>()
+            .one(db)
+            .await
+            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
+            .flatten();
+    }
+    Ok(newest.map(|t| t.with_timezone(&chrono::Utc) - chrono::Duration::days(CANDIDATE_SCAN_DAYS)))
+}
+
+/// The caller's projects, reached through the sensor's deployments: an instrument deployed
+/// nowhere resolves to no project and does not appear in a restricted caller's enumeration.
+fn deployed_in_scope(scope: &AccessScope) -> Option<Expr> {
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let predicate = project_filter_sql(scope, "s.project_id", &mut values)?;
+    Some(Expr::cust_with_values(
+        format!(
+            "EXISTS (SELECT 1 FROM sensor_deployments d \
+             JOIN sites s ON s.id = d.site_id \
+             WHERE d.sensor_id = r.sensor_id AND {predicate})"
+        ),
+        values,
+    ))
+}
+
+/// The caller's projects, reached through the reading's own site.
+fn site_in_scope(scope: &AccessScope) -> Option<Expr> {
+    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let predicate = project_filter_sql(scope, "s.project_id", &mut values)?;
+    Some(Expr::cust_with_values(
+        format!("EXISTS (SELECT 1 FROM sites s WHERE s.id = r.site_id AND {predicate})"),
+        values,
+    ))
+}
+
+/// The floor a scan reads from, or no condition at all for an unbounded scan.
+fn scan_floor(since: Option<chrono::DateTime<chrono::Utc>>) -> Condition {
+    match since {
+        Some(t) => {
+            Condition::all().add(Expr::col((Alias::new("r"), readings::Column::Time)).gte(t))
+        }
+        None => Condition::all(),
+    }
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct CalibrationCandidatesQuery {
+    /// Read only readings at or after this instant (ISO 8601). Defaults to 90 days before the
+    /// newest reading; pass an earlier instant to widen the report, which costs a proportionally
+    /// longer read of the hypertable. Whatever is used comes back as `scanned_from`.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize, ToSchema, Clone)]
+pub struct CalibrationBackfillCandidate {
+    pub sensor_id: Uuid,
+    /// Readings whose time falls inside one of this sensor's calibration windows, yet which carry
+    /// no `calibration_id`. A reprocess resolves every one of them.
+    pub uncalibrated_count: i64,
+    pub target_from: chrono::DateTime<chrono::Utc>,
+    #[schema(required)]
+    pub earliest_calibration_from: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Readings carrying a correction no curve accounts for: neither a calibration nor a standard
+/// curve is named, yet `calibrated_value` differs from `raw_value`. Reported, never rewritten,
+/// the stored number is somebody's measurement and this code cannot know how it was produced.
+///
+/// The reprocess engines hold the same rows back (`service::orphaned_correction_rows`, the shared
+/// definition this query uses), so nothing an operator can trigger overwrites one either.
+#[derive(Debug, Serialize, ToSchema, Clone)]
+pub struct OrphanedCorrection {
+    #[schema(required)]
+    pub sensor_id: Option<Uuid>,
+    #[schema(required)]
+    pub site_id: Option<Uuid>,
+    #[schema(required)]
+    pub parameter_id: Option<Uuid>,
+    pub count: i64,
+    pub first_time: chrono::DateTime<chrono::Utc>,
+    pub last_time: chrono::DateTime<chrono::Utc>,
+}
+
+/// Readings corrected by a curve their own instrument does not own, grouped by the pair.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ForeignCurveUse {
+    /// The instrument the readings name.
+    #[schema(required)]
+    pub sensor_id: Option<Uuid>,
+    /// The curve they are corrected by, which belongs to `curve_sensor_id`.
+    pub standard_curve_id: Uuid,
+    pub curve_sensor_id: Uuid,
+    #[schema(required)]
+    pub curve_name: Option<String>,
+    #[schema(required)]
+    pub site_id: Option<Uuid>,
+    #[schema(required)]
+    pub parameter_id: Option<Uuid>,
+    pub count: i64,
+    pub first_time: chrono::DateTime<chrono::Utc>,
+    pub last_time: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CalibrationBackfillCandidatesResponse {
+    /// Readings corrected by a curve their own instrument does not own. Report-only.
+    pub foreign_curve_uses: Vec<ForeignCurveUse>,
+    pub total_foreign_curve_uses: i64,
+    pub candidates: Vec<CalibrationBackfillCandidate>,
+    pub total_candidates: usize,
+    pub total_uncalibrated: i64,
+    pub orphaned_corrections: Vec<OrphanedCorrection>,
+    pub total_orphaned_corrections: i64,
+    /// The earliest reading this report read. Every count in it is over `[scanned_from, ∞)` alone,
+    /// so it is a floor and not a total: an anomaly in older data is not absent, it was not looked
+    /// at. Widen the window with `since`. `null` means the whole history was read, which is also
+    /// what an empty database reports.
+    #[schema(required)]
+    pub scanned_from: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Sensors carrying readings a calibration window covers but whose `calibration_id` was never
+/// stamped. Repairable: `backfill_calibrations` reprocesses them against the windows that already
+/// exist, and nothing is created.
+///
+/// Confined to the caller's projects by the sensor's deployments, the same rule the `sensors` CRUD
+/// read applies. A sensor never deployed anywhere resolves to no project and so does not appear in
+/// a restricted caller's enumeration, while `backfill_calibrations` still accepts it by name: an
+/// instrument in inventory is nobody's project, and the enumeration is what must not leak.
+///
+/// `since` bounds the read, and with it the counts: `None` reads the whole history, which is what
+/// `backfill_calibrations` asks for because the sensors it selects have to be all of them.
+async fn fetch_calibration_candidates(
+    db: &sea_orm::DatabaseConnection,
+    scope: &AccessScope,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> AppResult<Vec<CalibrationBackfillCandidate>> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let r = Alias::new("r");
+    let cw = Alias::new("cw");
+    let mut scanned = scan_floor(since)
+        .add(Expr::col((r.clone(), readings::Column::SensorId)).is_not_null())
+        .add(Expr::col((r.clone(), readings::Column::CalibrationId)).is_null())
+        .add(Expr::col((cw.clone(), Alias::new("id"))).is_not_null())
+        .add(Expr::cust(
+            crate::routes::private::sensor_calibrations::service::window_resolved_rows("r"),
+        ));
+    if let Some(predicate) = deployed_in_scope(scope) {
+        scanned = scanned.add(predicate);
+    }
+    // The lateral is the same window pick the reprocess engine runs, so `cw.id IS NOT NULL` means
+    // exactly "a reprocess would stamp a curve here". Grabs resolve their curves by hand at entry
+    // and are never windowed, hence `window_resolved_rows`. It runs once per row the scan keeps, so
+    // the floor is what decides how often: every other predicate here is a filter, not a lookup.
+    let pick = crate::routes::private::sensor_calibrations::resolver::pick_calibration_query(
+        "r.sensor_id",
+    );
+    let (sql, values) = SeaQuery::select()
+        .column((r.clone(), readings::Column::SensorId))
+        .expr_as(Expr::cust("COUNT(*)"), Alias::new("uncalibrated_count"))
+        .expr_as(
+            Func::min(Expr::col((r.clone(), readings::Column::Time))),
+            Alias::new("target_from"),
+        )
+        .from_as(readings::Entity, r.clone())
+        .join_lateral(
+            JoinType::LeftJoin,
+            pick,
+            cw.clone(),
+            Condition::all().add(Expr::cust("true")),
+        )
+        .cond_where(scanned)
+        .add_group_by([Expr::col((r.clone(), readings::Column::SensorId)).into()])
+        .order_by_expr(Expr::cust("COUNT(*)"), Order::Desc)
+        .take()
+        .build(PostgresQueryBuilder);
+
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+    let mut candidates = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let CandidateRow {
+            sensor_id,
+            uncalibrated_count,
+            target_from,
+        } = CandidateRow::from_query_result(row, "")?;
+
+        let earliest_calibration_from = sensor_calibrations::Entity::find()
+            .select_only()
+            .column(sensor_calibrations::Column::ValidFrom)
+            .filter(sensor_calibrations::Column::SensorId.eq(sensor_id))
+            .order_by_asc(sensor_calibrations::Column::ValidFrom)
+            .into_tuple::<chrono::DateTime<chrono::FixedOffset>>()
+            .one(db)
+            .await
+            .map_err(|e| AppError::Internal(format!("DB error: {e}")))?
+            .map(|vf| vf.with_timezone(&chrono::Utc));
+
+        candidates.push(CalibrationBackfillCandidate {
+            sensor_id,
+            uncalibrated_count,
+            target_from: target_from.with_timezone(&chrono::Utc),
+            earliest_calibration_from,
+        });
+    }
+
+    Ok(candidates)
+}
+
+/// Readings holding a correction with no curve behind it. Grouped by `(sensor, site, parameter)`
+/// so an operator can see where they came from.
+///
+/// Derived readings are excluded by definition: a computed quantity is not an instrument
+/// measurement plus a correction, so it names no curve on purpose. Confined to the caller's
+/// projects through the reading's own site, which also drops site-less rows from a restricted
+/// caller's enumeration.
+///
+/// `since` bounds the read, and with it the counts. This half has no selective predicate at all,
+/// so it reads its whole window whether or not anything is wrong; the floor is the only thing
+/// keeping that off the rest of the history.
+/// Readings whose standard curve belongs to another instrument. Read-only: which side is wrong is
+/// a judgement (the reading was split, or the curve was), and the repair is the pin's own
+/// `curves` choice.
+async fn fetch_foreign_curve_uses(
+    db: &sea_orm::DatabaseConnection,
+    scope: &AccessScope,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> AppResult<Vec<ForeignCurveUse>> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let r = Alias::new("r");
+    let sc = Alias::new("sc");
+    let mut scanned = scan_floor(since).add(Expr::cust(
+        crate::routes::private::sensor_calibrations::service::foreign_curve_rows("r", "sc"),
+    ));
+    if let Some(predicate) = site_in_scope(scope) {
+        scanned = scanned.add(predicate);
+    }
+    let (sql, values) = SeaQuery::select()
+        .column((r.clone(), readings::Column::SensorId))
+        .expr_as(
+            Expr::col((sc.clone(), standard_curves::Column::Id)),
+            Alias::new("standard_curve_id"),
+        )
+        .expr_as(
+            Expr::col((sc.clone(), standard_curves::Column::SensorId)),
+            Alias::new("curve_sensor_id"),
+        )
+        .expr_as(
+            Expr::col((sc.clone(), standard_curves::Column::Name)),
+            Alias::new("curve_name"),
+        )
+        .column((r.clone(), readings::Column::SiteId))
+        .column((r.clone(), readings::Column::ParameterId))
+        .expr_as(Expr::cust("COUNT(*)"), Alias::new("n"))
+        .expr_as(
+            Func::min(Expr::col((r.clone(), readings::Column::Time))),
+            Alias::new("first_time"),
+        )
+        .expr_as(
+            Func::max(Expr::col((r.clone(), readings::Column::Time))),
+            Alias::new("last_time"),
+        )
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            standard_curves::Entity,
+            sc.clone(),
+            Expr::col((sc.clone(), standard_curves::Column::Id))
+                .equals((r.clone(), readings::Column::StandardCurveId)),
+        )
+        .cond_where(scanned)
+        .add_group_by([
+            Expr::col((r.clone(), readings::Column::SensorId)).into(),
+            Expr::col((sc.clone(), standard_curves::Column::Id)).into(),
+            Expr::col((sc.clone(), standard_curves::Column::SensorId)).into(),
+            Expr::col((sc.clone(), standard_curves::Column::Name)).into(),
+            Expr::col((r.clone(), readings::Column::SiteId)).into(),
+            Expr::col((r.clone(), readings::Column::ParameterId)).into(),
+        ])
+        .order_by_expr(Expr::cust("COUNT(*)"), Order::Desc)
+        .take()
+        .build(PostgresQueryBuilder);
+
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+    rows.iter()
+        .map(|r| {
+            let row = ForeignCurveRow::from_query_result(r, "")?;
+            Ok(ForeignCurveUse {
+                sensor_id: row.sensor_id,
+                standard_curve_id: row.standard_curve_id,
+                curve_sensor_id: row.curve_sensor_id,
+                curve_name: row.curve_name,
+                site_id: row.site_id,
+                parameter_id: row.parameter_id,
+                count: row.n,
+                first_time: row.first_time.with_timezone(&chrono::Utc),
+                last_time: row.last_time.with_timezone(&chrono::Utc),
+            })
+        })
+        .collect()
+}
+
+async fn fetch_orphaned_corrections(
+    db: &sea_orm::DatabaseConnection,
+    scope: &AccessScope,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> AppResult<Vec<OrphanedCorrection>> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let r = Alias::new("r");
+    let mut scanned = scan_floor(since)
+        .add(Expr::cust(
+            crate::routes::private::sensor_calibrations::service::orphaned_correction_rows("r"),
+        ))
+        .add(Expr::cust("r.measurement_type IS DISTINCT FROM 'derived'"));
+    if let Some(predicate) = site_in_scope(scope) {
+        scanned = scanned.add(predicate);
+    }
+    let (sql, values) = SeaQuery::select()
+        .column((r.clone(), readings::Column::SensorId))
+        .column((r.clone(), readings::Column::SiteId))
+        .column((r.clone(), readings::Column::ParameterId))
+        .expr_as(Expr::cust("COUNT(*)"), Alias::new("orphan_count"))
+        .expr_as(
+            Func::min(Expr::col((r.clone(), readings::Column::Time))),
+            Alias::new("first_time"),
+        )
+        .expr_as(
+            Func::max(Expr::col((r.clone(), readings::Column::Time))),
+            Alias::new("last_time"),
+        )
+        .from_as(readings::Entity, r.clone())
+        .cond_where(scanned)
+        .add_group_by([
+            Expr::col((r.clone(), readings::Column::SensorId)).into(),
+            Expr::col((r.clone(), readings::Column::SiteId)).into(),
+            Expr::col((r.clone(), readings::Column::ParameterId)).into(),
+        ])
+        .order_by_expr(Expr::cust("COUNT(*)"), Order::Desc)
+        .take()
+        .build(PostgresQueryBuilder);
+
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+
+    rows.iter()
+        .map(|r| {
+            let row = OrphanedCorrectionRow::from_query_result(r, "")?;
+            Ok(OrphanedCorrection {
+                sensor_id: row.sensor_id,
+                site_id: row.site_id,
+                parameter_id: row.parameter_id,
+                count: row.orphan_count,
+                first_time: row.first_time.with_timezone(&chrono::Utc),
+                last_time: row.last_time.with_timezone(&chrono::Utc),
+            })
+        })
+        .collect()
+}
+
+/// List calibration anomalies: readings a window covers but that carry no `calibration_id`, and
+/// readings carrying a correction no curve accounts for. Requires `read_metadata`.
+///
+/// Both halves read the readings hypertable with no index behind them, so the report covers the
+/// most recent 90 days of data unless `since` names an earlier floor. It is a report on a window,
+/// not a census: `scanned_from` carries the floor that was used and every count is a floor for that
+/// window alone. `backfill_calibrations` is not bounded this way, so a widened report and the
+/// backfill it feeds agree on which sensors are repairable.
+#[utoipa::path(
+    get,
+    path = "/api/actions/calibration_candidates",
+    params(CalibrationCandidatesQuery),
+    responses((status = 200, description = "Calibration backfill candidates", body = CalibrationBackfillCandidatesResponse)),
+    tag = "actions"
+)]
+pub async fn calibration_candidates(
+    State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    _: DenyScoped,
+    Query(query): Query<CalibrationCandidatesQuery>,
+) -> AppResult<Json<CalibrationBackfillCandidatesResponse>> {
+    let scanned_from = match query.since {
+        Some(since) => Some(since),
+        None => default_scan_floor(&app_state.db).await?,
+    };
+    let candidates = fetch_calibration_candidates(&app_state.db, &scope, scanned_from).await?;
+    let orphaned_corrections =
+        fetch_orphaned_corrections(&app_state.db, &scope, scanned_from).await?;
+    let foreign_curve_uses = fetch_foreign_curve_uses(&app_state.db, &scope, scanned_from).await?;
+    let total_uncalibrated: i64 = candidates.iter().map(|c| c.uncalibrated_count).sum();
+    let total_orphaned_corrections: i64 = orphaned_corrections.iter().map(|c| c.count).sum();
+    let total_foreign_curve_uses: i64 = foreign_curve_uses.iter().map(|c| c.count).sum();
+    Ok(Json(CalibrationBackfillCandidatesResponse {
+        total_candidates: candidates.len(),
+        total_uncalibrated,
+        candidates,
+        total_orphaned_corrections,
+        orphaned_corrections,
+        total_foreign_curve_uses,
+        foreign_curve_uses,
+        scanned_from,
+    }))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BackfillCalibrationsRequest {
+    #[serde(default)]
+    pub all: bool,
+    pub sensor_id: Option<Uuid>,
+    #[serde(default)]
+    pub sensor_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BackfillCalibrationsResponse {
+    pub job_id: Uuid,
+    pub status: String,
+    pub sensors_updated: usize,
+    pub estimated_readings: i64,
+}
+
+/// Reprocess the sensors whose readings a calibration window covers but whose `calibration_id` was
+/// never stamped, so each row picks up the curve that already covers it. No calibration is created:
+/// a reading no window covers stays uncorrected, which is what it is. Runs as one tracked job.
+/// Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/api/actions/backfill_calibrations",
+    request_body = BackfillCalibrationsRequest,
+    responses(
+        (status = 200, description = "Calibration backfill triggered", body = BackfillCalibrationsResponse),
+        (status = 403, description = "A named sensor is outside the caller's projects, or no sensor was named"),
+        (status = 404, description = "No such sensor"),
+    ),
+    tag = "actions"
+)]
+pub async fn backfill_calibrations(
+    State(app_state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    Json(payload): Json<BackfillCalibrationsRequest>,
+) -> AppResult<Json<BackfillCalibrationsResponse>> {
+    let db = &app_state.db;
+
+    // Named instruments are confined one by one, including inventory (`Unowned::Allow`): a sensor
+    // with no deployment belongs to no project, and refusing it would put a newly imported
+    // instrument out of reach of every member. `all` names nothing, so a restricted caller may not
+    // use it.
+    let named: Vec<Uuid> = payload
+        .sensor_id
+        .into_iter()
+        .chain(payload.sensor_ids.iter().copied())
+        .collect();
+    require_named_target(&scope, !named.is_empty() || !payload.all, "sensor")?;
+    for sensor_id in &named {
+        let target = project_of_sensor(db, *sensor_id).await?;
+        confine_target(&scope, &target, Unowned::Allow, "sensor")?;
+    }
+
+    // With instruments named, each was confined just above and the selection below keeps only
+    // those, so the candidate query runs unfiltered and inventory stays reachable. With nothing
+    // named the caller is unrestricted (`require_named_target`), and the query is unfiltered too.
+    //
+    // Unbounded in time as well, unlike the report: this selects the work rather than describing
+    // it, and a sensor whose only unstamped readings are older than the report's window still has
+    // to be repaired. One operator action pays for the whole-history read; the reads the dashboard
+    // makes on every page load do not.
+    let all_candidates = fetch_calibration_candidates(db, &AccessScope::Unrestricted, None).await?;
+    let id_filter: HashSet<Uuid> = payload.sensor_ids.iter().copied().collect();
+    let selected: Vec<CalibrationBackfillCandidate> = all_candidates
+        .into_iter()
+        .filter(|c| {
+            if !id_filter.is_empty() {
+                id_filter.contains(&c.sensor_id)
+            } else if let Some(sid) = payload.sensor_id {
+                c.sensor_id == sid
+            } else {
+                payload.all
+            }
+        })
+        .collect();
+
+    if selected.is_empty() {
+        return Err(AppError::BadRequest(
+            "No matching calibration backfill candidates (pass all=true, a sensor_id, or sensor_ids)".to_string(),
+        ));
+    }
+
+    let estimated_readings: i64 = selected.iter().map(|c| c.uncalibrated_count).sum();
+    // The candidate query is the whole selection: every sensor in it has readings an existing
+    // window covers, so the reprocess alone resolves them. Orphaned corrections are reported by
+    // `calibration_candidates` and are deliberately not enqueued here, a value nobody can trace to
+    // a curve is an operator's question, not something to overwrite.
+    let sensor_ids_touched: Vec<Uuid> = selected.iter().map(|c| c.sensor_id).collect();
+
+    let sensors_updated = sensor_ids_touched.len();
+    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
+        db,
+        "backfill_calibrations",
+        None,
+        None,
+        &serde_json::json!({ "sensors": sensor_ids_touched }),
+        None,
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?
+    .ok_or_else(|| AppError::Internal("failed to enqueue backfill_calibrations job".to_string()))?;
+
+    Ok(Json(BackfillCalibrationsResponse {
+        job_id,
+        status: "queued".to_string(),
+        sensors_updated,
+        estimated_readings,
+    }))
+}
+
+#[derive(FromQueryResult)]
+struct OrphanedCorrectionRow {
+    sensor_id: Option<Uuid>,
+    site_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
+    orphan_count: i64,
+    first_time: chrono::DateTime<chrono::FixedOffset>,
+    last_time: chrono::DateTime<chrono::FixedOffset>,
+}
+
+// --- Recalculate one curve's readings ---
+
+/// The job a recalculation enqueued.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct RecalculateResponse {
+    pub job_id: Uuid,
+}
+
+/// Reprocess readings for the sensor owning a specific calibration.
+/// Enqueues a tracked worker job and returns immediately.
+#[utoipa::path(
+    post,
+    path = "/api/actions/sensor_calibrations/{id}/recalculate",
+    params(("id" = Uuid, Path, description = "Calibration UUID")),
+    responses(
+        (status = 200, description = "Reprocessing job spawned", body = RecalculateResponse),
+        (status = 404, description = "Calibration not found"),
+    ),
+    tag = "actions"
+)]
+pub async fn recalculate_calibration(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<RecalculateResponse>> {
+    let row = crate::routes::private::sensor_calibrations::Entity::find_by_id(id)
+        .one(&state.db)
+        .await
+        .map_err(|e| crate::error::AppError::Internal(e.to_string()))?;
+
+    let Some(row) = row else {
+        return Err(crate::error::AppError::NotFound(format!(
+            "sensor_calibration {id} not found"
+        )));
+    };
+    let sensor_id = row.sensor_id;
+
+    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
+        &state.db,
+        "calibration_recalculate",
+        Some(sensor_id),
+        Some(id),
+        &serde_json::json!({ "sensor_id": sensor_id }),
+        None,
+    )
+    .await
+    .map_err(|e| crate::error::AppError::Internal(e.to_string()))?
+    .ok_or_else(|| crate::error::AppError::Internal("enqueue returned no id".into()))?;
+
+    Ok(Json(RecalculateResponse { job_id }))
 }
