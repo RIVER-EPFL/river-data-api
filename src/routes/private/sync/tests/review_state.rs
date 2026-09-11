@@ -43,3 +43,36 @@ fn test_compute_summary_counts_the_three_states_over_pairing_entries_only() {
         "every pairing entry is in exactly one state"
     );
 }
+
+#[test]
+fn test_apply_is_refused_while_a_pairing_row_still_needs_checking() {
+    use super::refuse_unchecked_entries;
+
+    // A row that resolved cleanly is still a row nobody looked at (Q155).
+    let clean = [
+        plan_entry("FP1", "Depth", "exact", 0),
+        plan_entry("FP1", "CDOM", "exact", 0),
+    ];
+    let message = refuse_unchecked_entries(&clean).unwrap_err().to_string();
+    assert!(message.contains("2 row(s) still to tick"), "{message}");
+
+    let unmatched = [
+        plan_entry("FP1", "Depth", "exact", 0),
+        plan_entry("FP2", "Turbidity", "none", 0),
+    ];
+    let message = refuse_unchecked_entries(&unmatched)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("2 row(s) still to tick"), "{message}");
+    assert!(message.contains("FP2"), "{message}");
+
+    // A tick is what clears it, which is the only thing the review can do to a warned row.
+    let mut acknowledged = plan_entry("FP2", "Turbidity", "none", 2);
+    acknowledged.acknowledged = true;
+    assert!(refuse_unchecked_entries(&[acknowledged]).is_ok());
+
+    // A skipped row is not paired, so it is not asked about.
+    let mut skipped = plan_entry("FP2", "Turbidity", "none", 1);
+    skipped.action = "skip".to_string();
+    assert!(refuse_unchecked_entries(&[skipped]).is_ok());
+}

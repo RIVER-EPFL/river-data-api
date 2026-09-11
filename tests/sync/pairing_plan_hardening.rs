@@ -62,6 +62,9 @@ async fn apply_and_wait(
     token: &str,
     plan_id: Uuid,
 ) {
+    // The review gate wants every row ticked before an apply; these tests are about what the apply
+    // then does.
+    crate::common::plans::acknowledge_plan(app, token, &plan_id.to_string()).await;
     let (status, text) =
         crate::common::post_plan_action_with_token(app, &plan_id.to_string(), "apply", token).await;
     assert!(
@@ -339,6 +342,7 @@ async fn pair_action_on_empty_parameter_name_is_rejected() {
         "parameter": { "id": null, "name": "", "create": true, "units": "", "group_key": null, "original_names": [] },
         "confidence": "none",
         "warnings": [],
+        "acknowledged": true,
         "original_parameter_name": null
     }]))
     .await;
@@ -1417,6 +1421,99 @@ async fn two_new_slots_sharing_a_name_and_units_both_apply() {
     )
     .await;
     assert_eq!(names, 3, "each slot at the site should carry its own name");
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// A gate only the browser holds is advisory: the apply route is reachable by curl, by a stale tab
+/// and by a second client, and Q133 decided a plan is not applied until every row has been looked
+/// at.
+#[tokio::test]
+#[serial]
+async fn apply_is_refused_while_a_row_still_needs_checking() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let plan_id = Uuid::new_v4();
+    let stream_id = Uuid::new_v4();
+    let unchecked = serde_json::json!([{
+        "stream_id": stream_id,
+        "source_key": "HARD:Turbidity",
+        "source_name": "Turbidity",
+        "action": "pair",
+        "project": { "id": null, "name": "Hardening", "create": true },
+        "site": { "id": null, "name": "Nowhere", "create": true, "latitude": null, "longitude": null, "altitude_m": null },
+        "parameter": { "id": null, "name": "Turbidity", "label": null, "create": true, "units": "NTU", "group_key": null, "original_names": [] },
+        "confidence": "none",
+        "warnings": [],
+        "acknowledged": false,
+    }]);
+    insert_plan(&db, plan_id, &unchecked).await;
+
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
+            .await;
+    assert_eq!(status, 400, "an unchecked row is not appliable: {text}");
+    assert!(text.contains("HARD:Turbidity"), "names the row: {text}");
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE pairing_plans SET entries = jsonb_set(entries, '{{0,acknowledged}}', 'true') \
+             WHERE id = '{plan_id}'"
+        ),
+    )
+    .await;
+
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
+            .await;
+    assert!(
+        (200..300).contains(&status),
+        "a ticked row applies: {status} {text}"
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// A row that matched exactly with no warning is still a row nobody looked at: Q155 decided the
+/// tick records a look, not an override, so the apply waits for it too.
+#[tokio::test]
+#[serial]
+async fn apply_is_refused_while_a_self_validated_row_is_unticked() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let plan_id = Uuid::new_v4();
+    let stream_id = Uuid::new_v4();
+    let clean = serde_json::json!([{
+        "stream_id": stream_id,
+        "source_key": "HARD:Depth",
+        "source_name": "Depth",
+        "action": "pair",
+        "project": { "id": null, "name": "Hardening", "create": true },
+        "site": { "id": null, "name": "Nowhere", "create": true, "latitude": null, "longitude": null, "altitude_m": null },
+        "parameter": { "id": null, "name": "Depth", "label": null, "create": true, "units": "m", "group_key": null, "original_names": [] },
+        "confidence": "exact",
+        "warnings": [],
+        "acknowledged": false,
+    }]);
+    insert_plan(&db, plan_id, &clean).await;
+
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
+            .await;
+    assert_eq!(
+        status, 400,
+        "a clean but unticked row is not appliable: {text}"
+    );
+    assert!(text.contains("HARD:Depth"), "names the row: {text}");
 
     crate::common::cleanup_test_db(&db).await;
 }

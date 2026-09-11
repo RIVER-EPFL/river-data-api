@@ -1,8 +1,9 @@
 //! The component's HTTP surface.
 
 use axum::{
-    Json, Router, middleware,
+    Json, Router,
     extract::{Path, Query, State},
+    middleware,
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
@@ -26,11 +27,9 @@ use crate::routes::private::readings::models as readings;
 use crate::routes::private::sensor_calibrations;
 use crate::routes::private::sensor_calibrations::service::recompute_deployed_until;
 use crate::routes::private::sensor_deployments as deployments;
-use crate::routes::private::standard_curves;
 use crate::routes::private::sites::service::{bucket_interval, resolution_of};
-use crate::routes::private::{
-    data_streams, parameters, sensors, sites, site_parameters as site_parameters,
-};
+use crate::routes::private::standard_curves;
+use crate::routes::private::{data_streams, parameters, sensors, site_parameters, sites};
 
 use super::models::*;
 use super::service::*;
@@ -1800,6 +1799,7 @@ pub fn read_routes() -> Router<AppState> {
         )
         .route("/sensors/{id}/curve_usage", get(get_sensor_curve_usage))
         .route("/instruments/overview", get(get_instruments_overview))
+        .route("/sensors/last_used", get(last_used_instruments))
         .route("/standard_curves/{id}/usage", get(get_curve_usage))
         .layer(middleware::from_fn(
             crate::common::middleware::require_read_data,
@@ -1809,7 +1809,10 @@ pub fn read_routes() -> Router<AppState> {
 /// What an instrument could adopt, before adopting it.
 pub fn adopt_read_routes() -> Router<AppState> {
     Router::new()
-        .route("/sensors/{sensor_id}/adopt_suggestions", get(adopt_suggestions))
+        .route(
+            "/sensors/{sensor_id}/adopt_suggestions",
+            get(adopt_suggestions),
+        )
         .layer(middleware::from_fn(
             crate::common::middleware::require_read_metadata,
         ))
@@ -1833,4 +1836,164 @@ pub fn adopt_write_routes() -> Router<AppState> {
         .layer(middleware::from_fn(
             crate::common::middleware::require_manage_sensors,
         ))
+}
+
+/// `GET /sensors/last_used`, the instruments that recorded these parameters, most recently first.
+///
+/// Field instruments record `spot` readings, which the rollups exclude, so the answer lives in
+/// `readings` and nowhere else. The ordering is done in SQL over
+/// `idx_readings_spot_param_sensor_time` rather than by annotating a page that has already been
+/// selected, which is what `enrich` does and why it cannot order (M204).
+#[utoipa::path(
+    get,
+    path = "/api/sensors/last_used",
+    params(LastUsedQuery),
+    responses(
+        (status = 200, description = "Instruments by last use", body = LastUsedResponse),
+        (status = 400, description = "Neither parameter_ids nor parameter_codes given"),
+    ),
+    tag = "sensors"
+)]
+pub async fn last_used_instruments(
+    State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    Query(query): Query<LastUsedQuery>,
+) -> AppResult<Json<LastUsedResponse>> {
+    let db = &state.db;
+    let parameter_ids = resolve_parameter_ids(db, &query).await?;
+    if parameter_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "Name the parameters to rank by, as parameter_ids or parameter_codes".to_string(),
+        ));
+    }
+    let limit = query.limit.unwrap_or(20).clamp(1, 200);
+
+    let mut conditions = Condition::all()
+        .add(Expr::col(readings::Column::MeasurementType).eq("spot"))
+        .add(Expr::col(readings::Column::SensorId).is_not_null())
+        .add(Expr::col(readings::Column::ParameterId).is_in(parameter_ids));
+    if let Some(site_id) = query.site_id {
+        conditions = conditions.add(Expr::col(readings::Column::SiteId).eq(site_id));
+    }
+    // A project-scoped caller ranks only what its own sites recorded.
+    if let Some(predicate) = crate::common::scope::project_filter(
+        &scope,
+        (
+            crate::routes::private::sites::models::Entity,
+            crate::routes::private::sites::models::Column::ProjectId,
+        ),
+    ) {
+        conditions = conditions.add(
+            Expr::col(readings::Column::SiteId).in_subquery(
+                SeaQuery::select()
+                    .column(crate::routes::private::sites::models::Column::Id)
+                    .from(crate::routes::private::sites::models::Entity)
+                    .cond_where(predicate)
+                    .take(),
+            ),
+        );
+    }
+
+    // One row per (parameter, instrument) from the index, then the newest per instrument. The
+    // group key leads with the index's own leading columns, so this is an index-only scan.
+    let (sql, values) = SeaQuery::select()
+        .column(readings::Column::SensorId)
+        .column(readings::Column::ParameterId)
+        .expr_as(
+            Func::max(Expr::col(readings::Column::Time)),
+            Alias::new("last_used_at"),
+        )
+        .from(readings::Entity)
+        .cond_where(conditions)
+        .add_group_by([
+            Expr::col(readings::Column::SensorId),
+            Expr::col(readings::Column::ParameterId),
+        ])
+        .order_by(Alias::new("last_used_at"), Order::Desc)
+        .build(PostgresQueryBuilder);
+
+    #[derive(FromQueryResult)]
+    struct Row {
+        sensor_id: Uuid,
+        parameter_id: Uuid,
+        last_used_at: DateTime<Utc>,
+    }
+    let rows = Row::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+        values,
+    ))
+    .all(db)
+    .await?;
+
+    // An instrument appears once, under whichever of the asked-about parameters it recorded most
+    // recently; the rows arrive newest first, so the first one wins.
+    let mut seen: HashMap<Uuid, (Uuid, DateTime<Utc>)> = HashMap::new();
+    let mut order: Vec<Uuid> = Vec::new();
+    for row in rows {
+        if seen.contains_key(&row.sensor_id) {
+            continue;
+        }
+        seen.insert(row.sensor_id, (row.parameter_id, row.last_used_at));
+        order.push(row.sensor_id);
+        if order.len() as u64 >= limit {
+            break;
+        }
+    }
+
+    let named: HashMap<Uuid, (Option<String>, Option<String>)> = sensors::Entity::find()
+        .filter(sensors::Column::Id.is_in(order.clone()))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|s| (s.id, (s.serial_number, s.name)))
+        .collect();
+
+    let instruments = order
+        .into_iter()
+        .map(|sensor_id| {
+            let (parameter_id, last_used_at) = seen[&sensor_id];
+            let (serial_number, name) = named.get(&sensor_id).cloned().unwrap_or((None, None));
+            LastUsedInstrument {
+                sensor_id,
+                serial_number,
+                name,
+                parameter_id,
+                last_used_at,
+            }
+        })
+        .collect();
+    Ok(Json(LastUsedResponse { instruments }))
+}
+
+/// The parameters the caller named, by id or by code. Neither given is an empty list, which the
+/// handler refuses rather than ranking every instrument in the catalog.
+async fn resolve_parameter_ids<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    query: &LastUsedQuery,
+) -> AppResult<Vec<Uuid>> {
+    let mut ids: Vec<Uuid> = query
+        .parameter_ids
+        .iter()
+        .flat_map(|list| list.split(','))
+        .filter_map(|part| Uuid::parse_str(part.trim()).ok())
+        .collect();
+    let codes: Vec<String> = query
+        .parameter_codes
+        .iter()
+        .flat_map(|list| list.split(','))
+        .map(|part| part.trim().to_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect();
+    if !codes.is_empty() {
+        use crate::routes::private::parameters;
+        let found = parameters::Entity::find()
+            .filter(Expr::expr(Func::lower(Expr::col(parameters::Column::Code))).is_in(codes))
+            .all(db)
+            .await?;
+        ids.extend(found.into_iter().map(|p| p.id));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
 }

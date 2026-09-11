@@ -9474,6 +9474,59 @@
         ],
         "type": "object"
       },
+      "LastUsedInstrument": {
+        "description": "One instrument and when it last recorded one of the parameters asked about.",
+        "properties": {
+          "last_used_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parameter_id": {
+            "description": "The parameter whose reading is the newest of the ones asked about.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "sensor_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "serial_number": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "sensor_id",
+          "serial_number",
+          "name",
+          "parameter_id",
+          "last_used_at"
+        ],
+        "type": "object"
+      },
+      "LastUsedResponse": {
+        "description": "The ranking, most recently used first.",
+        "properties": {
+          "instruments": {
+            "items": {
+              "$ref": "#/components/schemas/LastUsedInstrument"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "instruments"
+        ],
+        "type": "object"
+      },
       "LedgerEntry": {
         "description": "One thing that happened, in the one shape every source answers in.",
         "properties": {
@@ -39604,6 +39657,84 @@
           }
         },
         "summary": "Create many sensors"
+      }
+    },
+    "/api/sensors/last_used": {
+      "get": {
+        "description": "Field instruments record `spot` readings, which the rollups exclude, so the answer lives in\n`readings` and nowhere else. The ordering is done in SQL over\n`idx_readings_spot_param_sensor_time` rather than by annotating a page that has already been\nselected, which is what `enrich` does and why it cannot order (M204).",
+        "operationId": "last_used_instruments",
+        "parameters": [
+          {
+            "description": "The parameters an instrument must have recorded, as a comma-separated list of ids. An\ninstrument is ranked by the newest spot reading it took of any of them.",
+            "in": "query",
+            "name": "parameter_ids",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "The same by catalog code, for a caller that holds the code rather than the id.",
+            "in": "query",
+            "name": "parameter_codes",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Only instruments used at this site.",
+            "in": "query",
+            "name": "site_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "How many to return. Default 20, capped at 200.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LastUsedResponse"
+                }
+              }
+            },
+            "description": "Instruments by last use"
+          },
+          "400": {
+            "description": "Neither parameter_ids nor parameter_codes given"
+          }
+        },
+        "summary": "`GET /sensors/last_used`, the instruments that recorded these parameters, most recently first.",
+        "tags": [
+          "sensors"
+        ]
       }
     },
     "/api/sensors/proposals": {

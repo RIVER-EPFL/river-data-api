@@ -2793,15 +2793,16 @@ pub async fn apply_pairing_plan(
     if version != req.expected_version {
         return Err(stale_plan(version));
     }
-    // Unconfirmed instruments are the operator's decision, so the refusal belongs in the response
-    // rather than in a failed job they have to go and read. `apply_plan` checks again: the job is
-    // reachable on its own.
+    // An unconfirmed instrument and an unchecked row are both the operator's decision, so the
+    // refusal belongs in the response rather than in a failed job they have to go and read.
+    // `apply_plan` checks both again: the job is reachable on its own.
     let plan = crate::routes::private::data_streams::pairing_plans::Entity::find_by_id(id)
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound("Plan not found".to_string()))?;
     let entries: Vec<crate::routes::private::sync::service::PlanEntry> = plan.entries.0;
     crate::routes::private::sync::service::refuse_unconfirmed_instruments(&entries)?;
+    crate::routes::private::sync::service::refuse_unchecked_entries(&entries)?;
 
     let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         &state.db,

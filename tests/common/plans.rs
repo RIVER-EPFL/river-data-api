@@ -53,6 +53,75 @@ pub fn find_entry<'a>(plan: &'a serde_json::Value, stream_id: &str) -> &'a serde
         .unwrap_or_else(|| panic!("entry for stream {stream_id} missing: {plan}"))
 }
 
+/// Tick every entry of a plan, which is what the review does before an apply is allowed.
+///
+/// Q133 gated the apply on `needs_checking == 0`, so a plan drafted over unknown sites or
+/// parameters is refused until a person has agreed to each row. A test whose subject is what the
+/// apply then does says so here rather than carrying the gate's refusal into its own assertions;
+/// the gate itself is exercised by `apply_is_refused_while_a_row_still_needs_checking`.
+pub async fn acknowledge_plan(app: &Router, token: &str, plan_id: &str) {
+    let (status, plan) =
+        super::get_json_with_token(app, &format!("/api/sync/pairing-plans/{plan_id}"), token).await;
+    assert_eq!(status, 200, "reading the plan to tick it: {plan}");
+    let updates: Vec<serde_json::Value> = plan["entries"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|e| e["acknowledged"] != json!(true))
+                .map(|e| json!({ "stream_id": e["stream_id"], "acknowledged": true }))
+                .collect()
+        })
+        .unwrap_or_default();
+    if updates.is_empty() {
+        return;
+    }
+    let (status, text) = super::patch_json_with_token(
+        app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &json!({ "expected_version": plan["version"], "updates": updates }),
+        token,
+    )
+    .await;
+    assert_eq!(status, 200, "ticking the plan's rows: {text}");
+}
+
+/// Agree to every instrument the plan would create, which is what an operator does before an apply.
+///
+/// Registration mints nothing (M172), so a stream naming a curve column that resolves to no
+/// instrument reaches the plan as a proposal, and `refuse_unconfirmed_instruments` refuses the
+/// apply while one stands. A story about what the apply then does says so here; the refusal itself
+/// is exercised by `portal_curve_instrument`.
+pub async fn confirm_plan_instruments(app: &Router, token: &str, plan_id: &str) {
+    let (status, plan) =
+        super::get_json_with_token(app, &format!("/api/sync/pairing-plans/{plan_id}"), token).await;
+    assert_eq!(status, 200, "reading the plan to confirm its instruments: {plan}");
+    let updates: Vec<serde_json::Value> = plan["entries"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|e| {
+                    e["instrument"]["create"] == json!(true)
+                        && e["instrument"]["confirmed"] != json!(true)
+                })
+                .map(|e| json!({ "stream_id": e["stream_id"], "instrument_confirmed": true }))
+                .collect()
+        })
+        .unwrap_or_default();
+    if updates.is_empty() {
+        return;
+    }
+    let (status, text) = super::patch_json_with_token(
+        app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &json!({ "expected_version": plan["version"], "updates": updates }),
+        token,
+    )
+    .await;
+    assert_eq!(status, 200, "confirming the plan's instruments: {text}");
+}
+
 /// Post `apply`/`revert` on a plan, wait for its job to reach `completed`, and return the job's
 /// `detail.counts`. The pairing, the backfill and the plan's status transition all happen in that
 /// job, so a fact read from the database is only true once this has returned.
@@ -62,6 +131,9 @@ pub async fn run_plan_action(
     plan_id: &str,
     action: &str,
 ) -> serde_json::Value {
+    if action == "apply" {
+        acknowledge_plan(app, token, plan_id).await;
+    }
     let (status, res) =
         super::post_plan_action_parse_with_token(app, &plan_id.to_string(), action, token).await;
     assert_eq!(status, 200, "{action} ({status}): {res}");

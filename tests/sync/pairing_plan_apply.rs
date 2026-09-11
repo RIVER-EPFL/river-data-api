@@ -94,6 +94,7 @@ async fn apply_then_revert_pairing_plan_via_jobs() {
     .await;
 
     // Apply, returns a job id immediately; the backfill runs in the job.
+    crate::common::plans::acknowledge_plan(&app, &token, &plan_id.to_string()).await;
     let (status, text) =
         crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
             .await;
@@ -217,6 +218,7 @@ async fn apply_attaches_collection_events_for_spot_readings() {
         "parameter": { "id": crate::common::GLOBAL_PARAM_TEMP_ID, "name": "Temperature", "create": false, "units": "C", "group_key": null, "original_names": [] },
         "confidence": "exact",
         "warnings": [],
+        "acknowledged": true,
         "original_parameter_name": null
     }]);
     let plan_id = Uuid::new_v4();
@@ -344,6 +346,7 @@ async fn a_replayed_apply_reports_a_replay_instead_of_failing() {
     )
     .await;
 
+    crate::common::plans::acknowledge_plan(&app, &token, &plan_id.to_string()).await;
     let (status, text) =
         crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
             .await;
@@ -438,6 +441,7 @@ async fn apply_reports_its_progress_over_the_plan_s_entries() {
     )
     .await;
 
+    crate::common::plans::acknowledge_plan(&app, &token, &plan_id.to_string()).await;
     let (status, text) =
         crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
             .await;
@@ -535,6 +539,7 @@ async fn apply_creates_the_group_the_source_registry_names() {
     assert_eq!(group["create"], serde_json::json!(true), "{group}");
 
     let plan_id = plan["id"].as_str().expect("plan id").to_string();
+    crate::common::plans::acknowledge_plan(&app, &token, &plan_id).await;
     let (status, text) =
         crate::common::post_plan_action_with_token(&app, &plan_id, "apply", &token).await;
     assert!((200..300).contains(&status), "apply ({status}): {text}");
@@ -666,6 +671,7 @@ async fn the_source_register_becomes_instruments_only_when_a_plan_admits_it() {
     .await;
     assert!((200..300).contains(&status), "decline ({status}): {body}");
 
+    crate::common::plans::acknowledge_plan(&app, &token, &plan_id).await;
     let (status, text) =
         crate::common::post_plan_action_with_token(&app, &plan_id, "apply", &token).await;
     assert!((200..300).contains(&status), "apply ({status}): {text}");

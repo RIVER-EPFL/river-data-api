@@ -120,6 +120,9 @@ async fn register_stream(
 
 /// Apply runs as a tracked job; the counts live on the finished job, not the response.
 async fn apply_plan(app: &Router, jwt: &str, plan_id: &str) -> serde_json::Value {
+    // The review gate wants every row ticked; this story is about the curves and instruments the
+    // apply binds.
+    crate::common::plans::acknowledge_plan(app, jwt, plan_id).await;
     let (status, res) =
         crate::common::post_plan_action_parse_with_token(app, &plan_id.to_string(), "apply", jwt)
             .await;
@@ -219,21 +222,25 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
         "a proposal is not an agreement: {xyz_instrument}",
     );
 
-    // Every stream carries an instrument from registration, so the entry reports one rather than
-    // nothing. What a stream with no curve column still says is that no curve is applied per
-    // reading and that nothing is being created for it.
+    // Registration mints nothing (M172), so a stream with no curve column is proposed one under
+    // the source's own parameter key, pre-agreed: the review defaults to the suggestion rather
+    // than asking a question nobody has evidence to answer differently.
     let plain_instrument = &entry_for(&plan, &plain)["instrument"];
     assert_eq!(
-        plain_instrument["resolved_by"], "stream",
-        "the instrument the stream already carries: {plain_instrument}",
+        plain_instrument["resolved_by"], "parameter",
+        "the source's instrument for the parameter it carries: {plain_instrument}",
     );
-    assert_eq!(plain_instrument["create"], false, "{plain_instrument}");
+    assert_eq!(plain_instrument["create"], true, "{plain_instrument}");
+    assert_eq!(
+        plain_instrument["confirmed"], true,
+        "nothing else carries that name, so the suggestion stands: {plain_instrument}",
+    );
     assert_eq!(
         plain_instrument["stamps_readings"], false,
         "no curve column, so no curve is stored per reading: {plain_instrument}",
     );
     assert_eq!(
-        plan["summary"]["instruments_to_create"], 1,
+        plan["summary"]["instruments_to_create"], 2,
         "counted by identity, not by stream: {}",
         plan["summary"],
     );
@@ -266,15 +273,16 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
     let before_apply = count(&db, "SELECT COUNT(*) FROM sensors").await;
     let counts = apply_plan(&app, &admin, &plan_id).await;
     assert_eq!(
-        counts["instruments_created"], 1,
-        "one instrument for the confirmed column, not one per stream: {counts}",
+        counts["instruments_created"], 2,
+        "one for the confirmed curve column and one for the parameter, not one per stream: \
+         {counts}",
     );
     assert_eq!(counts["streams_paired"], 3, "{counts}");
 
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM sensors").await,
-        before_apply + 1,
-        "the apply creates the one instrument the operator confirmed, and nothing else",
+        before_apply + 2,
+        "the apply creates the two the plan named, and nothing else",
     );
     assert_eq!(
         count(
@@ -285,8 +293,8 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
         )
         .await,
         1,
-        "a stream with no curve column keeps the instrument registration minted for it: no \
-         measurement without one, and the plan asks nothing about it",
+        "a stream with no curve column reaches its slot with an instrument all the same: no \
+         measurement without one",
     );
     assert_eq!(
         count(
@@ -426,12 +434,12 @@ async fn an_instrument_is_attached_to_streams_whose_source_names_no_curve() {
     assert_eq!(
         groups.len(),
         3,
-        "each stream's own registration instrument is reported, one per parameter: {view}",
+        "each stream's own proposal is reported, one per parameter: {view}",
     );
     assert!(
         groups
             .iter()
-            .all(|g| g["resolved_by"] == "stream" && g["instrument_id"] != instrument_id),
+            .all(|g| g["resolved_by"] == "parameter" && g["instrument_id"] != instrument_id),
         "none of them is the fluorometer, which is the gap the operator closes below: {view}",
     );
     assert!(

@@ -4,9 +4,10 @@
 //! Scenario: two CNET-shaped stations register a `DOC_avg_ppb` replicate family, an operator
 //! builds a pairing plan over the source, applies it, and the portal sends a group at each site.
 //!
-//! Expected behaviour: one instrument serves the analyte at both stations, its name says which
-//! source and analyte rather than which station, the key the plan proposes is the key registration
-//! already minted, and the readings that arrive after the apply are attributed to the paired slots.
+//! Expected behaviour: registration mints nothing, the plan proposes one instrument for the
+//! analyte at both stations under the source's own key, the apply mints exactly that one, its name
+//! says which source and analyte rather than which station, and the readings that arrive after the
+//! apply are attributed to the paired slots.
 //!
 //! Run: cargo test --test e2e portal_import_to_paired -- --test-threads=1
 
@@ -109,28 +110,14 @@ async fn a_portal_import_reaches_paired_attributed_readings_under_one_instrument
         ids
     };
 
-    // Registration mints the source's parameter instrument, and the analyte is one instrument
-    // carried between stations rather than one per station.
-    let instruments = instruments_of_source(&db).await;
-    assert_eq!(
-        instruments.len(),
-        1,
-        "one instrument spans both stations: {instruments:?}"
+    // Registration mints nothing (M172): which instrument produced a feed is the plan's question.
+    assert!(
+        instruments_of_source(&db).await.is_empty(),
+        "registration mints no instrument"
     );
-    let (instrument_id, instrument_name, instrument_key) = instruments[0].clone();
-    assert_eq!(
-        instrument_key,
-        format!("{SOURCE}:{MEAN_COLUMN}"),
-        "the key is the source and its column"
-    );
-    for station in STATIONS {
-        assert!(
-            !instrument_name.contains(station),
-            "a lab instrument is carried to every station, so its name names none: {instrument_name}"
-        );
-    }
 
-    // The plan proposes what registration already did: same instrument, same key, nothing to create.
+    // The plan proposes one instrument for the analyte, keyed to the source and its column, and
+    // both stations are offered the same one rather than one each.
     let (status, plan) = crate::common::post_json_parse_with_token(
         &app,
         "/api/sync/pairing-plans",
@@ -151,16 +138,23 @@ async fn a_portal_import_reaches_paired_attributed_readings_under_one_instrument
         );
         assert_eq!(
             instrument["id"],
-            json!(instrument_id),
-            "the plan reports the existing instrument rather than proposing a second: {entry}"
+            json!(null),
+            "nothing exists under that key yet: {entry}"
         );
         assert_eq!(
             instrument["create"],
-            json!(false),
-            "nothing is created for an instrument that exists: {entry}"
+            json!(true),
+            "the apply is what mints it: {entry}"
         );
+        for station in STATIONS {
+            assert!(
+                !instrument["name"].as_str().unwrap_or_default().contains(station),
+                "a lab instrument is carried to every station, so its name names none: {entry}"
+            );
+        }
     }
 
+    crate::common::plans::acknowledge_plan(&app, &token, &plan_id).await;
     let (status, applied) =
         crate::common::post_plan_action_parse_with_token(&app, &plan_id, "apply", &token).await;
     assert_eq!(status, 200, "apply ({status}): {applied}");
@@ -183,6 +177,27 @@ async fn a_portal_import_reaches_paired_attributed_readings_under_one_instrument
         2,
         "both stations are paired by the apply"
     );
+
+    // The apply mints it once: the analyte is one instrument carried between stations rather than
+    // one per station.
+    let instruments = instruments_of_source(&db).await;
+    assert_eq!(
+        instruments.len(),
+        1,
+        "one instrument spans both stations: {instruments:?}"
+    );
+    let (instrument_id, instrument_name, instrument_key) = instruments[0].clone();
+    assert_eq!(
+        instrument_key,
+        format!("{SOURCE}:{MEAN_COLUMN}"),
+        "the key is the source and its column"
+    );
+    for station in STATIONS {
+        assert!(
+            !instrument_name.contains(station),
+            "its name names no station: {instrument_name}"
+        );
+    }
 
     // The portal sends a group at each station; what it lands on is the paired slot.
     for stream_id in &streams {

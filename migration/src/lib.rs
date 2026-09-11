@@ -2,6 +2,7 @@ pub use sea_orm_migration::prelude::*;
 
 mod m20260905_000001_baseline;
 mod m20260911_000001_realtime_rollup_head;
+mod m20260911_000002_spot_param_sensor_index;
 
 pub struct Migrator;
 
@@ -11,6 +12,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20260905_000001_baseline::Migration),
             Box::new(m20260911_000001_realtime_rollup_head::Migration),
+            Box::new(m20260911_000002_spot_param_sensor_index::Migration),
         ]
     }
 }

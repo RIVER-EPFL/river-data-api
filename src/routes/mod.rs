@@ -261,6 +261,7 @@ pub fn validate_optional_time_range(
         private::standard_curves::views::register_standard_curve,
         private::standard_curves::views::last_used_curve,
         private::sensors::views::get_instruments_overview,
+        private::sensors::views::last_used_instruments,
         private::sensors::views::get_curve_usage,
         private::sensors::views::get_sensor_curve_usage,
         private::annotations::views::register_annotations,

@@ -118,6 +118,7 @@
 /sensor_calibrations/{id}/retire => deny_scoped_token+require_manage_sensors
 /sensor_calibrations/{id}/unretire => deny_scoped_token+require_manage_sensors
 /sensor_calibrations/{id}/window => require_read_data
+/sensors/last_used => require_read_data
 /sensors/proposals => deny_scoped_token+require_admin_or_token_write_metadata
 /sensors/register => deny_scoped_token+require_admin_or_token_write_metadata
 /sensors/retag_frequency => deny_scoped_token+require_manage_sensors

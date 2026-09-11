@@ -608,3 +608,36 @@ pub mod proposal {
 #[cfg(test)]
 #[path = "tests/models.rs"]
 mod tests;
+
+/// Which instruments to rank, and how far back to look.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct LastUsedQuery {
+    /// The parameters an instrument must have recorded, as a comma-separated list of ids. An
+    /// instrument is ranked by the newest spot reading it took of any of them.
+    pub parameter_ids: Option<String>,
+    /// The same by catalog code, for a caller that holds the code rather than the id.
+    pub parameter_codes: Option<String>,
+    /// Only instruments used at this site.
+    pub site_id: Option<Uuid>,
+    /// How many to return. Default 20, capped at 200.
+    pub limit: Option<u64>,
+}
+
+/// One instrument and when it last recorded one of the parameters asked about.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LastUsedInstrument {
+    pub sensor_id: Uuid,
+    #[schema(required)]
+    pub serial_number: Option<String>,
+    #[schema(required)]
+    pub name: Option<String>,
+    /// The parameter whose reading is the newest of the ones asked about.
+    pub parameter_id: Uuid,
+    pub last_used_at: DateTime<Utc>,
+}
+
+/// The ranking, most recently used first.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LastUsedResponse {
+    pub instruments: Vec<LastUsedInstrument>,
+}

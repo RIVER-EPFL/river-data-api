@@ -146,6 +146,8 @@ async fn apply_and_wait(
     token: &str,
     plan_id: &str,
 ) {
+    // The review gate wants every row ticked; these tests are about the instruments the apply binds.
+    crate::common::plans::acknowledge_plan(app, token, plan_id).await;
     let (status, text) =
         crate::common::post_plan_action_with_token(app, &plan_id.to_string(), "apply", token).await;
     assert!((200..300).contains(&status), "apply ({status}): {text}");

@@ -2993,6 +2993,33 @@ pub fn refuse_unconfirmed_instruments(entries: &[PlanEntry]) -> AppResult<()> {
     )))
 }
 
+/// A plan is applied once, and rectifying it afterwards costs more than reviewing it did (Q133),
+/// so the apply waits until every pairing row has been ticked: a tick records that a person
+/// looked, and a row that resolved cleanly is looked at like any other (Q155). Enforced here
+/// rather than only on the button: a route reachable by curl, by a stale tab or by a second
+/// client is a gate nobody holds. `review_state` is the same rule the review reads.
+pub fn refuse_unchecked_entries(entries: &[PlanEntry]) -> AppResult<()> {
+    let unchecked: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.action == "pair")
+        .filter(|e| review_state(e) != ReviewState::Acknowledged)
+        .map(|e| e.source_key.as_str())
+        .collect();
+    if unchecked.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(format!(
+        "{} row(s) still to tick before this plan can be applied: {}",
+        unchecked.len(),
+        unchecked
+            .iter()
+            .take(5)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", "),
+    )))
+}
+
 /// Apply a pairing plan: create entities, pair streams, backfill readings.
 pub async fn apply_plan(
     db: &sea_orm::DatabaseConnection,
@@ -3015,6 +3042,7 @@ pub async fn apply_plan(
     let curve_intents = plan_curve_intents(&plan)?;
 
     refuse_unconfirmed_instruments(&entries)?;
+    refuse_unchecked_entries(&entries)?;
     if let Some(reason) =
         crate::routes::private::data_streams::service::pairing_refusal(&plan.source_system)
     {
