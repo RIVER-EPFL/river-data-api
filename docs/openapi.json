@@ -7155,6 +7155,13 @@
             "description": "Outputs the run did not produce, each with its reason.",
             "items": {},
             "type": "array"
+          },
+          "trace": {
+            "description": "Each formula as it was evaluated, with the values it read per cell.",
+            "items": {
+              "$ref": "#/components/schemas/TraceStep"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -7165,7 +7172,8 @@
           "constants",
           "curves",
           "site_inputs",
-          "event_inputs"
+          "event_inputs",
+          "trace"
         ],
         "type": "object"
       },
@@ -23849,6 +23857,13 @@
           "tool_version": {
             "$ref": "#/components/schemas/ToolVersionRef",
             "description": "The exact script version and runtime that produced these numbers; goes into the\nprovenance blob on save."
+          },
+          "trace": {
+            "description": "Each formula as it was evaluated, with the values it read per cell. Absent for a script\nrun, which returns only what the script returns.",
+            "items": {
+              "$ref": "#/components/schemas/TraceStep"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -24298,6 +24313,83 @@
           "content_hash",
           "runner_image",
           "r_version"
+        ],
+        "type": "object"
+      },
+      "TraceCell": {
+        "description": "What one evaluation of a formula read and produced. `bindings` is keyed by the variable name\nas the formula spells it; a value bound as not-a-number serialises as null.",
+        "properties": {
+          "bindings": {
+            "additionalProperties": {
+              "format": "double",
+              "type": "number"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "index": {
+            "description": "The replicate index, absent for a scalar formula.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped": {
+            "type": "string"
+          },
+          "value": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "value",
+          "bindings"
+        ],
+        "type": "object"
+      },
+      "TraceStep": {
+        "description": "One formula of a run as it was evaluated: the text, and per cell the value it produced and\nthe variables it read. A scalar formula has one cell; a per-replicate one has one per index.",
+        "properties": {
+          "cells": {
+            "items": {
+              "$ref": "#/components/schemas/TraceCell"
+            },
+            "type": "array"
+          },
+          "code": {
+            "type": "string"
+          },
+          "formula": {
+            "type": "string"
+          },
+          "intermediate": {
+            "type": "boolean"
+          },
+          "label": {
+            "type": "string"
+          },
+          "per_replicate": {
+            "type": "boolean"
+          },
+          "units": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "code",
+          "label",
+          "units",
+          "formula",
+          "intermediate",
+          "per_replicate",
+          "cells"
         ],
         "type": "object"
       },

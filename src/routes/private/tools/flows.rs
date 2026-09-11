@@ -132,6 +132,7 @@ pub(super) async fn store_run(
         event_inputs: outcome.event_inputs,
         tool_version,
         run_id,
+        trace: outcome.trace,
     })
 }
 

@@ -253,6 +253,10 @@ pub struct ToolResult {
     /// The stored `tool_runs` row for this calculation. A grab save names it as `tool_run_id`
     /// and the server builds the provenance blob from that row, never from the client.
     pub run_id: Uuid,
+    /// Each formula as it was evaluated, with the values it read per cell. Absent for a script
+    /// run, which returns only what the script returns.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub trace: Vec<TraceStep>,
 }
 
 /// The closed `kind` vocabulary. `enum:` carries its variants after the colon.
@@ -1491,6 +1495,8 @@ pub struct RunOutcome {
     /// The calculation context the request declared, echoed for the stored run.
     pub site_id: Option<Uuid>,
     pub collected_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Each formula as it was evaluated, in order. Empty for a script run.
+    pub trace: Vec<TraceStep>,
 }
 
 /// What the runner reports about itself. It cannot change without the container restarting, so
@@ -1663,6 +1669,40 @@ pub struct Evaluated {
     pub value: Option<f64>,
     pub curve_slot: Option<String>,
     pub skipped: Option<String>,
+    /// The variables the formula read, by name, in the order the formula names them. Empty when
+    /// the formula was skipped.
+    pub bindings: Vec<(String, f64)>,
+}
+
+/// One formula of a run as it was evaluated: the text, and per cell the value it produced and
+/// the variables it read. A scalar formula has one cell; a per-replicate one has one per index.
+#[derive(Clone, Debug, PartialEq, Serialize, ToSchema)]
+pub struct TraceStep {
+    pub code: String,
+    pub label: String,
+    #[schema(required)]
+    pub units: Option<String>,
+    pub formula: String,
+    pub intermediate: bool,
+    pub per_replicate: bool,
+    pub cells: Vec<TraceCell>,
+}
+
+/// What one evaluation of a formula read and produced. `bindings` is keyed by the variable name
+/// as the formula spells it; a value bound as not-a-number serialises as null.
+#[derive(Clone, Debug, PartialEq, Serialize, ToSchema)]
+pub struct TraceCell {
+    /// The replicate index, absent for a scalar formula.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub index: Option<usize>,
+    #[schema(required)]
+    pub value: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub skipped: Option<String>,
+    #[schema(value_type = std::collections::HashMap<String, f64>)]
+    pub bindings: std::collections::BTreeMap<String, f64>,
 }
 
 /// What a calculation produced for one output: one number, or one per replicate index.
@@ -1977,6 +2017,8 @@ pub struct FormulaDraftRunResults {
     pub site_inputs: Vec<serde_json::Value>,
     /// The visit's stored values the run read, as `{param, parameter_code, parameter_id, value}`.
     pub event_inputs: Vec<serde_json::Value>,
+    /// Each formula as it was evaluated, with the values it read per cell.
+    pub trace: Vec<TraceStep>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2121,16 +2163,14 @@ impl RecomputeScope {
             sql.push_str(&format!(" AND ce.collected_at <= ${}", binds.len()));
         }
         if self.only_findings {
-            sql.push_str(
-                &format!(
-                    " AND EXISTS (SELECT 1 FROM replicate_audit_holds h \
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM replicate_audit_holds h \
                       WHERE h.stream_id IS NULL AND h.status = '{pending}' \
                         AND h.kind IN {kinds} \
                         AND h.site_id = ce.site_id AND h.group_time = ce.collected_at)",
-                    pending = HoldStatus::Pending.as_str(),
-                    kinds = HoldKind::sql_list(&HoldKind::EVENT_AUDIT)
-                ),
-            );
+                pending = HoldStatus::Pending.as_str(),
+                kinds = HoldKind::sql_list(&HoldKind::EVENT_AUDIT)
+            ));
         }
         sql.push_str(" ORDER BY ce.collected_at");
         (sql, binds)

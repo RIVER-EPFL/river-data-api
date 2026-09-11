@@ -27,7 +27,8 @@ use super::models::{
     ManifestOutput, ManifestParam, ManifestSiteInput, MissingConstant, ParamWhen, ParseCheck,
     ParseError, PinnedFormula, Produced, ResolvedBy, ResolvedCurve, ResolvedParameter, RunOutcome,
     RunnerRuntime, ScannedName, ScriptInspection, ScriptScan, SlotCoverage, StoredVersionContent,
-    Subject, ToolScriptOperations, ValidateResponse, kind_accepts, parse_manifest,
+    Subject, ToolScriptOperations, TraceCell, TraceStep, ValidateResponse, kind_accepts,
+    parse_manifest,
 };
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
@@ -1045,6 +1046,7 @@ pub async fn execute_resolved(
     // The engine decides only how the arithmetic is done. Everything after this point, the
     // cleared outputs, the manifest aggregates, the inputs the run records, is one path.
     let mut skipped: Vec<serde_json::Value> = Vec::new();
+    let mut trace: Vec<TraceStep> = Vec::new();
     let raw = if tool.engine == Engine::Formula {
         let numbers: std::collections::HashMap<String, f64> = effective_inputs
             .iter()
@@ -1076,7 +1078,7 @@ pub async fn execute_resolved(
                     ))
                 })
                 .collect();
-        let produced = evaluate_over_replicates(
+        let (produced, steps) = evaluate_with_trace(
             &tool.formulas,
             &numbers,
             &replicate_values,
@@ -1088,6 +1090,7 @@ pub async fn execute_resolved(
             call: None,
             traceback: Vec::new(),
         })?;
+        trace = steps;
         let mut results = serde_json::Map::new();
         for entry in produced {
             match entry {
@@ -1182,6 +1185,7 @@ pub async fn execute_resolved(
         event_inputs,
         site_id,
         collected_at,
+        trace,
     })
 }
 
@@ -2046,11 +2050,16 @@ pub(super) fn evaluate_set(
                 value: None,
                 curve_slot: formula.curve_slot.clone(),
                 skipped: Some(reason),
+                bindings: Vec::new(),
             });
             continue;
         }
         let value = evaluate_formula(&formula.formula, &variables)
             .map_err(|e| format!("formula {}: {e}", formula.code))?;
+        let bindings = free_identifiers(&formula.formula)
+            .into_iter()
+            .filter_map(|name| variables.get(&name).map(|v| (name, *v)))
+            .collect();
         // NaN is the portal's NA: computed, and not a number. It clears the stored value rather
         // than feeding the next formula, which would turn one NA into a whole calculation of them.
         // A per-replicate value is one repeat, so it travels only to a later per-replicate formula
@@ -2075,6 +2084,7 @@ pub(super) fn evaluate_set(
             value: (!value.is_nan()).then_some(value),
             curve_slot: formula.curve_slot.clone(),
             skipped: None,
+            bindings,
         });
     }
     Ok(results)
@@ -2139,6 +2149,19 @@ pub fn evaluate_over_replicates(
     constants: &HashMap<String, f64>,
     curves: &HashMap<String, Curve>,
 ) -> Result<Vec<Produced>, String> {
+    evaluate_with_trace(formulas, inputs, replicates, constants, curves).map(|(p, _)| p)
+}
+
+/// [`evaluate_over_replicates`], also returning each formula as it was evaluated: its text and,
+/// per cell, the value and the variables it read. A scalar formula is one cell with no index; a
+/// per-replicate one is a cell per index.
+pub fn evaluate_with_trace(
+    formulas: &[PinnedFormula],
+    inputs: &HashMap<String, f64>,
+    replicates: &HashMap<String, Vec<Option<f64>>>,
+    constants: &HashMap<String, f64>,
+    curves: &HashMap<String, Curve>,
+) -> Result<(Vec<Produced>, Vec<TraceStep>), String> {
     let ordered = in_order(formulas)?;
     let width = replicate_width(&ordered, replicates);
     let mut per_index: Vec<Vec<Evaluated>> = Vec::with_capacity(width);
@@ -2159,22 +2182,44 @@ pub fn evaluate_over_replicates(
         per_index.push(evaluate_set(formulas, &at_index, constants, curves, true)?);
     }
 
+    let cell = |index: Option<usize>, evaluated: &Evaluated| TraceCell {
+        index,
+        value: evaluated.value,
+        skipped: evaluated.skipped.clone(),
+        bindings: evaluated.bindings.iter().cloned().collect(),
+    };
     let mut produced = Vec::with_capacity(ordered.len());
+    let mut trace = Vec::with_capacity(ordered.len());
     for (position, formula) in ordered.iter().enumerate() {
-        if formula.per_replicate.is_none() {
+        let cells = if formula.per_replicate.is_none() {
             produced.push(Produced::Scalar(per_index[0][position].clone()));
-            continue;
-        }
-        produced.push(Produced::PerReplicate {
-            code: formula.code.clone(),
-            values: per_index
+            vec![cell(None, &per_index[0][position])]
+        } else {
+            produced.push(Produced::PerReplicate {
+                code: formula.code.clone(),
+                values: per_index
+                    .iter()
+                    .map(|results| results[position].value)
+                    .collect(),
+                curve_slot: formula.curve_slot.clone(),
+            });
+            per_index
                 .iter()
-                .map(|results| results[position].value)
-                .collect(),
-            curve_slot: formula.curve_slot.clone(),
+                .enumerate()
+                .map(|(i, results)| cell(Some(i), &results[position]))
+                .collect()
+        };
+        trace.push(TraceStep {
+            code: formula.code.clone(),
+            label: formula.label.clone(),
+            units: formula.units.clone(),
+            formula: formula.formula.clone(),
+            intermediate: formula.intermediate,
+            per_replicate: formula.per_replicate.is_some(),
+            cells,
         });
     }
-    Ok(produced)
+    Ok((produced, trace))
 }
 
 /// The global parameters a subject moves.

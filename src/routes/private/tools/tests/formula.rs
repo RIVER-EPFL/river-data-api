@@ -951,3 +951,92 @@ fn test_a_per_replicate_formula_reads_an_earlier_one_at_its_own_index() {
         other => panic!("the second stage is one value per index: {other:?}"),
     }
 }
+
+/// Scenario: pCO2's shape, a scalar step feeding a per-replicate stage that a second
+/// per-replicate stage reads at its own index.
+/// Expected behaviour: the trace names, per cell, the formula and the values it read, so the
+/// stage-2 cell at index 1 shows the stage-1 value at index 1 and the scalar, never index 0.
+#[test]
+fn test_the_trace_records_what_each_cell_read() {
+    let mut bp = formula("bp", 1, "field_bp * 1.0", None, &[("field_bp", "Field_BP")]);
+    bp.intermediate = true;
+    let formulas = [
+        bp,
+        per_replicate(
+            "stage1",
+            2,
+            "peak * bp",
+            Some("S1"),
+            &[("peak", "Peak")],
+            "peak",
+        ),
+        per_replicate("stage2", 3, "s1 + k", Some("S2"), &[("s1", "S1")], "s1"),
+    ];
+    let (produced, trace) = evaluate_with_trace(
+        &formulas,
+        &HashMap::from([("field_bp".to_string(), 2.0)]),
+        &replicates(&[("peak", &[Some(1.0), Some(3.0)])]),
+        &constants(&[("k", 10.0)]),
+        &HashMap::new(),
+    )
+    .expect("evaluates");
+    assert_eq!(produced.len(), 3);
+    assert_eq!(trace.len(), 3, "one step per formula, in order");
+
+    let step = &trace[0];
+    assert!(step.intermediate);
+    assert!(!step.per_replicate);
+    assert_eq!(step.formula, "field_bp * 1.0");
+    assert_eq!(step.cells.len(), 1, "a scalar formula is one cell");
+    assert_eq!(step.cells[0].index, None);
+    assert_eq!(step.cells[0].value, Some(2.0));
+    assert_eq!(step.cells[0].bindings.get("field_bp"), Some(&2.0));
+
+    let stage2 = &trace[2];
+    assert!(stage2.per_replicate);
+    assert_eq!(stage2.cells.len(), 2, "one cell per index");
+    let at_b = &stage2.cells[1];
+    assert_eq!(at_b.index, Some(1));
+    // 3 * 2 + 10
+    assert_eq!(at_b.value, Some(16.0));
+    assert_eq!(
+        at_b.bindings.get("s1"),
+        Some(&6.0),
+        "the stage-1 value at the same index"
+    );
+    assert_eq!(at_b.bindings.get("k"), Some(&10.0));
+    assert_eq!(
+        at_b.bindings.len(),
+        2,
+        "only what the formula names: {:?}",
+        at_b.bindings
+    );
+}
+
+/// A skipped cell carries its reason and no bindings.
+#[test]
+fn test_a_skipped_cell_traces_its_reason() {
+    let formulas = [per_replicate(
+        "stage1",
+        1,
+        "peak * 2",
+        Some("S1"),
+        &[("peak", "Peak")],
+        "peak",
+    )];
+    let (_, trace) = evaluate_with_trace(
+        &formulas,
+        &HashMap::new(),
+        &replicates(&[("peak", &[Some(1.0), None])]),
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .expect("evaluates");
+    let gap = &trace[0].cells[1];
+    assert_eq!(gap.value, None);
+    assert!(
+        gap.skipped.as_deref().is_some_and(|r| r.contains("peak")),
+        "{gap:?}"
+    );
+    assert!(gap.bindings.is_empty());
+}

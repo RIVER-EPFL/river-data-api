@@ -38,9 +38,7 @@ use super::service::{
 use crate::common::AppState;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::derived_parameters::service::{
-    resolve_identifiers, validate_formula,
-};
+use crate::routes::private::derived_parameters::service::{resolve_identifiers, validate_formula};
 
 /// List the active analytical tools with their full input/output manifests.
 ///
@@ -530,6 +528,7 @@ pub async fn draft_run_formulas(
                 curves: outcome.curves,
                 site_inputs: outcome.site_inputs,
                 event_inputs: outcome.event_inputs,
+                trace: outcome.trace,
             }),
             None,
         ),
@@ -814,10 +813,7 @@ pub fn script_routes() -> Router<AppState> {
         )
         .route("/tool_scripts/inspect", post(inspect_script))
         .route("/tool_scripts/{id}/versions", post(create_version))
-        .route(
-            "/tool_scripts/{id}/versions/{version_id}",
-            get(get_version),
-        )
+        .route("/tool_scripts/{id}/versions/{version_id}", get(get_version))
         .route(
             "/tool_scripts/{id}/versions/{version_id}/validate",
             post(validate_version),
