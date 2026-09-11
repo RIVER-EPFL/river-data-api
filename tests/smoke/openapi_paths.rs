@@ -169,7 +169,7 @@ fn every_registered_route_is_documented() {
         ("src/routes/private/sync/views.rs", "/api/sync"),
         ("src/routes/private/projects/views.rs", "/api/projects"),
         ("src/routes/private/sites/views.rs", "/api/sites"),
-        ("src/routes/private/admin/users.rs", "/api/users"),
+        ("src/routes/private/api_tokens/views.rs", "/api"),
     ];
 
     let mut undocumented = Vec::new();

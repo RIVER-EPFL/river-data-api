@@ -18,11 +18,11 @@
 //! or `-`, and fails here.
 //!
 //! `-` means the declaring block applies no layer of its own. It does NOT mean unauthenticated,
-//! and three things can put a guard somewhere this scan does not look: the whole `/api` router is
-//! mounted behind `service_auth_middleware` at the mount point, a component nested by
-//! `service/mod.rs` may be guarded at its nest site (`admin/users.rs` is the last one, and it
-//! moves with C191), and a handler may refuse a caller itself (`/me` refuses an API token, which
-//! has no user sub). The genuinely open surface is `/healthz`, `/readyz`, `/enroll`, which
+//! and two things can put a guard somewhere this scan does not look: the whole `/api` router is
+//! mounted behind `service_auth_middleware` at the mount point, and a handler may refuse a caller
+//! itself (`/me` refuses an API token, which has no user sub). Every component that owns routes
+//! now carries their layers in the block that declares them, so a guard applied at a nest site is
+//! no longer one of them. The genuinely open surface is `/healthz`, `/readyz`, `/enroll`, which
 //! authenticates on body credentials, and the public API under `/{project_code}`.
 //!
 //! A path can hold more than one row: the table is keyed on the path as declared, so `/services`

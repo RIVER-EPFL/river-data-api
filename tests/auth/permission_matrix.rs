@@ -1229,13 +1229,6 @@ async fn scope_confinement_denies_another_projects_row() {
 /// here instead of going unprobed.
 #[test]
 fn every_registered_route_has_a_row() {
-    let sources: [(&str, &str); 5] = [
-        ("src/routes/service/mod.rs", "/api"),
-        ("src/routes/private/sync/views.rs", "/api/sync"),
-        ("src/routes/private/projects/views.rs", "/api/projects"),
-        ("src/routes/private/sites/views.rs", "/api/sites"),
-        ("src/routes/private/admin/users.rs", "/api/users"),
-    ];
     // Routes whose absence from the table is deliberate, with the reason.
     let exempt = [
         // Mounted under /api/sync by the sync control plane, whose auth is the enrollment
@@ -1255,28 +1248,15 @@ fn every_registered_route_has_a_row() {
 
     let declared: std::collections::HashSet<String> =
         table().0.iter().map(|r| r.declared.to_string()).collect();
-    let mut missing = Vec::new();
-    for (file, prefix) in sources {
-        let text = std::fs::read_to_string(file).unwrap_or_else(|e| {
-            panic!(
-                "read {file}: {e}\nThis file holds the `.route` literals for {prefix}. A component \
-                 collapse that moves them moves this entry too."
-            )
-        });
-        for path in route_literals(&text) {
-            let full = if path == "/" {
-                prefix.to_string()
-            } else {
-                format!("{prefix}{path}")
-            };
-            if exempt.contains(&full.as_str()) {
-                continue;
-            }
-            // /api/users/ is declared as "/" under its nest.
-            let normalised = full.trim_end_matches('/').to_string();
-            if !declared.contains(&full) && !declared.contains(&normalised) {
-                missing.push(format!("{file}: {full}"));
-            }
+    let (routes, mut missing) = registered_routes(&ROUTE_SOURCES);
+    for (file, full) in routes {
+        if exempt.contains(&full.as_str()) {
+            continue;
+        }
+        // /api/users/ is declared as "/" under its nest.
+        let normalised = full.trim_end_matches('/').to_string();
+        if !declared.contains(&full) && !declared.contains(&normalised) {
+            missing.push(format!("{file}: {full}"));
         }
     }
     assert!(
@@ -1314,29 +1294,9 @@ fn every_nested_entity_has_a_row() {
 /// are checked here.
 #[test]
 fn every_row_names_a_route_that_still_exists() {
-    let sources: [(&str, &str); 5] = [
-        ("src/routes/service/mod.rs", "/api"),
-        ("src/routes/private/sync/views.rs", "/api/sync"),
-        ("src/routes/private/projects/views.rs", "/api/projects"),
-        ("src/routes/private/sites/views.rs", "/api/sites"),
-        ("src/routes/private/admin/users.rs", "/api/users"),
-    ];
-    let mut registered: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (file, prefix) in sources {
-        let text = std::fs::read_to_string(file).unwrap_or_else(|e| {
-            panic!(
-                "read {file}: {e}\nThis file holds the `.route` literals for {prefix}. A component \
-                 collapse that moves them moves this entry too."
-            )
-        });
-        for path in route_literals(&text) {
-            registered.insert(if path == "/" {
-                prefix.to_string()
-            } else {
-                format!("{prefix}{path}")
-            });
-        }
-    }
+    let (routes, drift) = registered_routes(&ROUTE_SOURCES);
+    let registered: std::collections::HashSet<String> =
+        routes.into_iter().map(|(_, full)| full).collect();
     // Only the sync surface is checked: every other prefix is served by nested routers whose paths
     // are not route literals in these files, so their absence here means nothing.
     let gone: Vec<&str> = table()
@@ -1354,10 +1314,72 @@ fn every_row_names_a_route_that_still_exists() {
             .contains(d)
         })
         .collect();
+    let findings: Vec<String> = drift
+        .into_iter()
+        .chain(gone.iter().map(|d| (*d).to_string()))
+        .collect();
     assert!(
-        gone.is_empty(),
+        findings.is_empty(),
         "rows in the permission matrix whose route is gone:\n  {}",
-        gone.join("\n  ")
+        findings.join("\n  ")
+    );
+}
+
+/// The source files whose `.route("…")` literals the two coverage scans read, each with the prefix
+/// it is mounted under. A component collapse that moves the literals moves the entry here too.
+const ROUTE_SOURCES: [(&str, &str); 5] = [
+    ("src/routes/service/mod.rs", "/api"),
+    ("src/routes/private/sync/views.rs", "/api/sync"),
+    ("src/routes/private/projects/views.rs", "/api/projects"),
+    ("src/routes/private/sites/views.rs", "/api/sites"),
+    ("src/routes/private/api_tokens/views.rs", "/api"),
+];
+
+/// Every route [`ROUTE_SOURCES`] declares, paired with the file it came from, and the entries that
+/// could not be read. A moved file is drift in this test's own data, so it is returned as a finding
+/// beside the missing rows rather than ending the scan: a scan that stops at the first unreadable
+/// entry reports nothing about the routes it did read, and every route added meanwhile goes
+/// unprobed without the suite saying so.
+fn registered_routes(sources: &[(&str, &str)]) -> (Vec<(String, String)>, Vec<String>) {
+    let mut routes = Vec::new();
+    let mut drift = Vec::new();
+    for (file, prefix) in sources {
+        let Ok(text) = std::fs::read_to_string(file) else {
+            drift.push(format!(
+                "{file}: unreadable, and it holds the `.route` literals for {prefix}"
+            ));
+            continue;
+        };
+        for path in route_literals(&text) {
+            let full = if path == "/" {
+                (*prefix).to_string()
+            } else {
+                format!("{prefix}{path}")
+            };
+            routes.push(((*file).to_string(), full));
+        }
+    }
+    (routes, drift)
+}
+
+/// A source entry that no longer resolves is drift in the table's own data, so the scan reports it
+/// and keeps reading the rest. It used to panic on the first one, which left every route in the
+/// remaining files unchecked for as long as the entry stood.
+#[test]
+fn test_a_moved_source_is_reported_as_drift_and_stops_no_other_scan() {
+    let sources = [
+        ("src/routes/private/admin/users.rs", "/api/users"),
+        ("src/routes/service/mod.rs", "/api"),
+    ];
+    let (routes, drift) = registered_routes(&sources);
+    assert_eq!(drift.len(), 1, "{drift:?}");
+    assert!(
+        drift[0].starts_with("src/routes/private/admin/users.rs:"),
+        "{drift:?}"
+    );
+    assert!(
+        routes.iter().any(|(_, full)| full == "/api/version"),
+        "the readable source is still scanned"
     );
 }
 

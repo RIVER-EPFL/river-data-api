@@ -627,16 +627,12 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .nest("/sync", sync_views::admin_routes())
         .with_state(state.clone());
 
-    // Keycloak user management proxy. Conditional, only mounted if AppState has
-    // admin client credentials configured. Strictly Keycloak admin: NO API token,
-    // even one with full permissions, can pass require_admin.
-    let user_routes = state.keycloak_admin.as_ref().map(|_| {
-        Router::new()
-            .nest("/users", access_views::router())
-            .route("/roles", get(access_views::list_roles))
-            .layer(middleware::from_fn(require_admin))
-            .with_state(state.clone())
-    });
+    // Keycloak user management proxy, mounted only when AppState holds admin client credentials.
+    // The component carries its own `require_admin` layer.
+    let user_routes = state
+        .keycloak_admin
+        .as_ref()
+        .map(|_| access_views::realm_routes().with_state(state.clone()));
 
     let tool_script_routes =
         crate::routes::private::tools::views::script_routes().with_state(state.clone());

@@ -9,8 +9,9 @@ use axum::Router;
 use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::State;
+use axum::middleware;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use chrono::DateTime;
 use chrono::Utc;
 use sea_orm::ActiveModelTrait;
@@ -35,6 +36,7 @@ use super::service::*;
 use crate::common::AppState;
 use crate::common::authz::RIVER_ROLE_NAMES;
 use crate::common::authz::Role;
+use crate::common::middleware::require_admin;
 use crate::common::paging::Window;
 use crate::common::paging::content_range;
 use crate::error::AppError;
@@ -687,11 +689,24 @@ pub async fn set_user_grants(
     }))
 }
 
-pub fn router() -> Router<AppState> {
+/// The realm's users and roles, and the per-project grants keyed by a Keycloak `sub`.
+///
+/// Strictly Keycloak Administrator: no API token, however permissive, passes `require_admin`, so
+/// a token can neither enumerate the directory nor grant itself a project. The caller mounts this
+/// only when the process holds admin client credentials.
+pub fn realm_routes() -> Router<AppState> {
     Router::new()
-        .route("/", get(list_users))
-        .route("/search", get(search_users))
-        .route("/{id}", get(get_user).put(update_user).delete(delete_user))
-        .route("/{id}/roles", axum::routing::post(assign_roles))
-        .route("/{id}/grants", get(list_user_grants).put(set_user_grants))
+        .route("/users", get(list_users))
+        .route("/users/search", get(search_users))
+        .route(
+            "/users/{id}",
+            get(get_user).put(update_user).delete(delete_user),
+        )
+        .route("/users/{id}/roles", post(assign_roles))
+        .route(
+            "/users/{id}/grants",
+            get(list_user_grants).put(set_user_grants),
+        )
+        .route("/roles", get(list_roles))
+        .layer(middleware::from_fn(require_admin))
 }
