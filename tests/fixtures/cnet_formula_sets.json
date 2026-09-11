@@ -69,11 +69,10 @@
           "expected": {"Field_BP_altitude": 801, "Vaisala_CO2_min_corr": 276.957, "Vaisala_CO2_avg_corr": 280.463, "Vaisala_CO2_max_corr": 283.969}
         },
         {
-          "name": "VAD 2016-10-27 (row 1), no field pressure: the altitude pressure is what the R falls back to, and the engine skips instead",
+          "name": "VAD 2016-10-27 (row 1), no field pressure: the altitude pressure is what the range guard falls back to",
           "inputs": {"WTW_Temp_degC_1": 3.6, "altitude_m": 1936},
           "curves": {"vaisala": [1, 0]},
-          "expected": {"Field_BP_altitude": 798},
-          "skipped": ["bp"]
+          "expected": {"Field_BP_altitude": 798, "bp": 798}
         }
       ]
     },

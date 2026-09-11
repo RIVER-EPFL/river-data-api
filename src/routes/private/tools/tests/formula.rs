@@ -538,6 +538,62 @@ fn test_a_missing_field_pressure_falls_to_the_altitude_rather_than_selecting_a_g
     assert!((results[0].value.unwrap() - 880.0).abs() < 1e-12);
 }
 
+/// Scenario: the visit holds no field pressure at all, rather than a null cell bound as NaN.
+/// Expected behaviour: the variable is read only through guards, so it binds as NaN and the
+/// selection falls to the altitude instead of the formula skipping.
+#[test]
+fn test_an_absent_field_pressure_falls_to_the_altitude() {
+    let results = run(&pressure_selection(), &inputs(&[("alt_bp", 880.0)]));
+    assert_eq!(results[0].skipped, None);
+    assert!((results[0].value.unwrap() - 880.0).abs() < 1e-12);
+}
+
+/// pCO2's `labTemp` default: the visit's lab temperature, the constant where the visit holds none.
+#[test]
+fn test_an_absent_coalesce_argument_takes_the_second() {
+    let lab_temp = vec![formula(
+        "lab_temp_k",
+        1,
+        "coalesce(lab_co2_lab_temp, lab_temp_avg_degC) + 273.15",
+        Some("lab_temp_k"),
+        &[("lab_co2_lab_temp", "lab_co2_lab_temp")],
+    )];
+    let results = evaluate(
+        &lab_temp,
+        &inputs(&[]),
+        &constants(&[("lab_temp_avg_degC", 22.5)]),
+        &curves(&[]),
+    )
+    .expect("the set evaluates");
+    assert_eq!(results[0].skipped, None);
+    assert!((results[0].value.unwrap() - 295.65).abs() < 1e-12);
+}
+
+/// A source read outside every guard still skips: the formula has no arithmetic to do without it.
+#[test]
+fn test_an_absent_unguarded_source_still_skips() {
+    let suva = vec![formula(
+        "suva",
+        1,
+        "a254 * 1000 / doc",
+        Some("suva"),
+        &[("a254", "a254"), ("doc", "doc_avg_ppb")],
+    )];
+    let results = run(&suva, &inputs(&[("a254", 2.0)]));
+    assert_eq!(results[0].value, None);
+    assert!(results[0].skipped.as_deref().unwrap().contains("doc"));
+}
+
+#[test]
+fn test_a_variable_read_both_inside_and_outside_a_guard_is_not_guarded() {
+    assert!(read_only_through_guards("coalesce(a / 1013.25, b)", "a"));
+    assert!(read_only_through_guards("if(is_missing(a), b, a)", "a"));
+    assert!(!read_only_through_guards("coalesce(a, b) + a", "a"));
+    assert!(!read_only_through_guards("a * coalesce(b, 1)", "a"));
+    assert!(!read_only_through_guards("round(a)", "a"));
+    assert!(!read_only_through_guards("coalesce(b, 1)", "a"));
+}
+
 /// Alkalinity's `calcEquals`: the measured pH, or the initial one where nothing was measured.
 #[test]
 fn test_coalesce_takes_the_second_value_only_when_the_first_is_missing() {

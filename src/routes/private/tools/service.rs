@@ -1598,6 +1598,69 @@ pub const FORMULA_BUILTINS: &[&str] = &[
     "na",
 ];
 
+/// The guard functions a missing value may pass through. Each is total over NaN: a variable read
+/// only inside their arguments selects another arm or yields NA, and never leaves the expression
+/// unevaluable.
+const NAN_TOLERANT_GUARDS: &[&str] = &[
+    "if",
+    "and",
+    "or",
+    "not",
+    "lt",
+    "le",
+    "gt",
+    "ge",
+    "eq",
+    "ne",
+    "coalesce",
+    "is_missing",
+];
+
+/// Whether every read of `variable` in `formula` sits inside the arguments of a guard function.
+/// A visit holding no value for such a variable binds it as NaN, the way `coalesce` takes its
+/// second argument and a comparison against NA is false; any read outside a guard skips the
+/// formula instead.
+pub fn read_only_through_guards(formula: &str, variable: &str) -> bool {
+    let chars: Vec<char> = formula.chars().collect();
+    let mut guarded: Vec<bool> = Vec::new();
+    let mut pending: Option<String> = None;
+    let mut read = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_alphanumeric() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            pending = Some(chars[start..i].iter().collect());
+            continue;
+        }
+        if c == '(' {
+            // The identifier before a parenthesis names the call, not a value read.
+            let call = pending.take();
+            let inside = guarded.last().copied().unwrap_or(false)
+                || call.is_some_and(|name| NAN_TOLERANT_GUARDS.contains(&name.as_str()));
+            guarded.push(inside);
+        } else {
+            if pending.take().is_some_and(|name| name == variable) {
+                if !guarded.last().copied().unwrap_or(false) {
+                    return false;
+                }
+                read = true;
+            }
+            if c == ')' {
+                guarded.pop();
+            }
+        }
+        i += 1;
+    }
+    if pending.is_some_and(|name| name == variable) {
+        return false;
+    }
+    read
+}
+
 /// Every identifier a formula names that the language does not define itself, in the order they
 /// appear. Sources, constants and curve coefficients are all in here; which is which is decided
 /// by the caller against what it holds.
@@ -1887,6 +1950,10 @@ pub fn parse_pinned(body: &str) -> Result<Vec<PinnedFormula>, String> {
 /// warns and moves to the next calculation rather than losing the row. A formula reading a
 /// skipped formula's output skips in turn. Only an unevaluable expression is fatal, because that
 /// is the definition being wrong rather than the visit being incomplete.
+///
+/// A source the formula reads only through a guard function is bound as NaN rather than skipped,
+/// so the portal's defaults and its comparisons against a missing value take the arm they take
+/// there ([`read_only_through_guards`]).
 pub fn evaluate(
     formulas: &[PinnedFormula],
     inputs: &HashMap<String, f64>,
@@ -1936,6 +2003,9 @@ pub(super) fn evaluate_set(
                 Some(value) => {
                     variables.insert(variable.clone(), value);
                 }
+                None if read_only_through_guards(&formula.formula, variable) => {
+                    variables.insert(variable.clone(), f64::NAN);
+                }
                 None => {
                     skipped = Some(format!("no value for {variable} ({parameter_code})"));
                     break;
@@ -1948,6 +2018,9 @@ pub(super) fn evaluate_set(
                 match inputs.get(variable) {
                     Some(value) => {
                         variables.insert(variable.clone(), *value);
+                    }
+                    None if read_only_through_guards(&formula.formula, variable) => {
+                        variables.insert(variable.clone(), f64::NAN);
                     }
                     None => {
                         skipped = Some(format!("no value for {variable} (site {property})"));
