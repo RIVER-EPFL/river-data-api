@@ -2,8 +2,9 @@
 
 use async_trait::async_trait;
 use axum::Json;
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use sea_orm::Order;
+use sea_orm::sea_query::extension::postgres::PgBinOper;
 use sea_orm::sea_query::{
     Alias, CommonTableExpression, Condition, Expr, ExprTrait as _, JoinType, PostgresQueryBuilder,
     Query as SeaQuery, WithClause,
@@ -39,23 +40,38 @@ pub(super) fn days_ago(days: u32) -> sea_orm::prelude::DateTimeWithTimeZone {
     (chrono::Utc::now() - chrono::Duration::days(i64::from(days))).into()
 }
 
+/// What the sweeper writes into a closed row's `errors`, so the sweep and anything reading the
+/// reason cannot drift apart.
+pub(super) const SWEPT_REASON: &str = "Closed by sweeper: service stopped reporting";
+
+/// A cycle still reporting `running` whose start is older than the threshold. The cut-off is
+/// computed here rather than left to the statement, so the window is a typed instant.
+pub(super) fn stale_running(cutoff: DateTime<Utc>) -> Condition {
+    Condition::all()
+        .add(events::Column::Status.eq("running"))
+        .add(events::Column::StartedAt.lt(cutoff))
+}
+
 /// Close 'running' sync_events older than the staleness threshold; returns the row count.
 pub async fn sweep_stale_sync_events(
     db: &sea_orm::DatabaseConnection,
     stale_after_seconds: u64,
 ) -> Result<u64, DbErr> {
-    let res = db
-        .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE sync_events
-             SET status = 'failed',
-                 completed_at = NOW(),
-                 errors = COALESCE(errors, '[]'::jsonb) || '[\"Closed by sweeper: service stopped reporting\"]'::jsonb
-             WHERE status = 'running' AND started_at < NOW() - ($1 || ' seconds')::interval",
-            [stale_after_seconds.to_string().into()],
-        ))
+    let cutoff = Utc::now() - Duration::seconds(i64::try_from(stale_after_seconds).unwrap_or(i64::MAX));
+    let appended = Expr::col(events::Column::Errors)
+        .if_null(Expr::val(serde_json::json!([])))
+        .binary(
+            PgBinOper::Concatenate,
+            Expr::val(serde_json::json!([SWEPT_REASON])),
+        );
+    let res = events::Entity::update_many()
+        .col_expr(events::Column::Status, Expr::value("failed"))
+        .col_expr(events::Column::CompletedAt, Expr::current_timestamp())
+        .col_expr(events::Column::Errors, appended)
+        .filter(stale_running(cutoff))
+        .exec(db)
         .await?;
-    Ok(res.rows_affected())
+    Ok(res.rows_affected)
 }
 
 pub(super) async fn enqueue_reconciliation(
@@ -430,7 +446,7 @@ fn comparison_ctes(old_id: Uuid, new_id: Uuid) -> WithClause {
         )
         .and_where(Expr::col((r.clone(), readings::Column::StreamId)).eq(new_id))
         .and_where(Expr::cust("r.is_flagged IS NOT TRUE"))
-        .add_group_by([Expr::col((r, readings::Column::Time)).into()])
+        .add_group_by([Expr::col((r, readings::Column::Time))])
         .take();
 
     let cte = |name: &str, query: sea_orm::sea_query::SelectStatement| {
@@ -989,3 +1005,7 @@ impl Job for ReplicateReconciliationDelete {
         Ok(deleted_readings)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/flows.rs"]
+mod tests;

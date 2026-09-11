@@ -1,3 +1,5 @@
+use sea_orm::QueryTrait;
+
 use super::*;
 
 fn occupant(sensor: Uuid, until: Option<DateTime<Utc>>) -> SlotOccupant {
@@ -59,4 +61,21 @@ fn only_the_exclusion_constraint_reads_as_a_slot_conflict() {
     assert!(!is_slot_conflict(&DbErr::Custom(
         "duplicate key value violates unique constraint \"sensors_pkey\"".to_string()
     )));
+}
+
+/// The open deployment first, else the most recent: the rule that decides which slot a reprocess
+/// rewrites when its job names no parameter.
+#[test]
+fn a_reprocess_prefers_the_open_deployment_then_the_most_recent() {
+    let sql = current_deployment(Uuid::from_u128(1), Uuid::from_u128(2))
+        .build(sea_orm::DatabaseBackend::Postgres)
+        .to_string();
+    assert!(
+        sql.contains(
+            "ORDER BY \"deployed_until\" IS NULL DESC, \"sensor_deployments\".\"deployed_from\" DESC"
+        ),
+        "{sql}"
+    );
+    assert!(sql.contains("\"sensor_id\" = "), "{sql}");
+    assert!(sql.contains("\"site_id\" = "), "{sql}");
 }

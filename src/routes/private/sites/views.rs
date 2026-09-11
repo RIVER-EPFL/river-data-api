@@ -1077,11 +1077,11 @@ pub async fn get_site_aggregates(
         .and_where(Expr::col(readings::Column::ReplicateIndex).eq(0))
         .and_where(Expr::cust("measurement_type IS DISTINCT FROM 'spot'"))
         .add_group_by([
-            Expr::col(Alias::new("bucket")).into(),
-            Expr::col(readings::Column::ParameterId).into(),
+            Expr::col(Alias::new("bucket")),
+            Expr::col(readings::Column::ParameterId),
         ]);
     if split {
-        flagged.add_group_by([Expr::col(readings::Column::SensorId).into()]);
+        flagged.add_group_by([Expr::col(readings::Column::SensorId)]);
     }
     let (flagged_sql, flagged_values) = flagged.take().build(PostgresQueryBuilder);
 
@@ -1519,7 +1519,7 @@ pub async fn get_site_export_summary(
         .and_where(Expr::col((a.clone(), annotations::Column::SiteId)).eq(site.id))
         .and_where(Expr::col((a.clone(), annotations::Column::EndTime)).gte(start))
         .and_where(Expr::col((a.clone(), annotations::Column::StartTime)).lte(end))
-        .add_group_by([Expr::col((a.clone(), annotations::Column::ParameterId)).into()])
+        .add_group_by([Expr::col((a.clone(), annotations::Column::ParameterId))])
         .take()
         .build(PostgresQueryBuilder);
     let rows = state
@@ -1554,7 +1554,7 @@ pub async fn get_site_export_summary(
         .and_where(Expr::col(readings::Column::Time).lte(end))
         .and_where(Expr::col(readings::Column::WithdrawnAt).is_null())
         .and_where(Expr::cust("(is_flagged = TRUE OR replicate_index > 0)"))
-        .add_group_by([Expr::col(readings::Column::ParameterId).into()])
+        .add_group_by([Expr::col(readings::Column::ParameterId)])
         .take()
         .build(PostgresQueryBuilder);
     let rows = state
@@ -1757,11 +1757,11 @@ pub async fn get_site_statistics(
         )
         .and_where(Expr::col((p.clone(), parameters::Column::Id)).is_in(parameter_ids.clone()))
         .add_group_by([
-            Expr::col((p.clone(), parameters::Column::Id)).into(),
-            Expr::col((p.clone(), parameters::Column::Code)).into(),
-            Expr::col((p.clone(), parameters::Column::Name)).into(),
-            Expr::col(Alias::new("units")).into(),
-            Expr::col((sp.clone(), site_parameters::Column::DecimalPlaces)).into(),
+            Expr::col((p.clone(), parameters::Column::Id)),
+            Expr::col((p.clone(), parameters::Column::Code)),
+            Expr::col((p.clone(), parameters::Column::Name)),
+            Expr::col(Alias::new("units")),
+            Expr::col((sp.clone(), site_parameters::Column::DecimalPlaces)),
         ])
         .order_by((p.clone(), parameters::Column::Code), Order::Asc)
         .take()
@@ -2063,9 +2063,9 @@ pub async fn get_sensor_vs_grab(
         .and_where(Expr::col((r_.clone(), readings::Column::ParameterId)).eq(query.parameter_id))
         .cond_where(served::served_spot_at(&r_))
         .add_group_by([
-            Expr::col((r_.clone(), readings::Column::SiteId)).into(),
-            Expr::col((r_.clone(), readings::Column::ParameterId)).into(),
-            Expr::col((r_.clone(), readings::Column::Time)).into(),
+            Expr::col((r_.clone(), readings::Column::SiteId)),
+            Expr::col((r_.clone(), readings::Column::ParameterId)),
+            Expr::col((r_.clone(), readings::Column::Time)),
         ])
         .take();
     // Continuous = anything that is not a grab ('spot') or derived reading; `IS DISTINCT FROM`

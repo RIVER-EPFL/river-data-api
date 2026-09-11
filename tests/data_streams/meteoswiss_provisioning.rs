@@ -207,3 +207,62 @@ async fn a_site_with_no_station_is_not_a_subscriber() {
         "a blank declaration is not a declaration"
     );
 }
+
+/// Scenario: instruments registered by serial carry no provenance, and two MeteoSwiss stations
+/// are declared.
+/// Expected behaviour: the station registration is keyed on `(source_system, source_key)`, which
+/// is unique only where both are set, so the rows with neither are not the same row as each other
+/// and are left where they are. One row per station, registered twice or once.
+#[tokio::test]
+#[serial]
+async fn a_station_registers_once_and_leaves_the_provenance_less_instruments_alone() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+
+    crate::common::exec(
+        &db,
+        "INSERT INTO sensors (id, serial_number, kind, data_frequency) VALUES \
+         (gen_random_uuid(), 'BENCH-1', 'device', 'low'), \
+         (gen_random_uuid(), 'BENCH-2', 'device', 'low')",
+    )
+    .await;
+    let bench_before = scalar_i64(
+        &db,
+        "SELECT COUNT(*) AS n FROM sensors WHERE source_system IS NULL AND source_key IS NULL",
+    )
+    .await;
+    assert_eq!(bench_before, 2, "both serial instruments are stored");
+
+    let first = instrument(&db, STATION).await.expect("register the station");
+    let again = instrument(&db, STATION)
+        .await
+        .expect("register the same station again");
+    assert_eq!(first, again, "the station registers onto its own row");
+
+    let other = instrument(&db, "PAY")
+        .await
+        .expect("register a second station");
+    assert_ne!(other, first, "a different station is a different row");
+
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) AS n FROM sensors WHERE source_system = 'meteoswiss'",
+        )
+        .await,
+        2,
+        "two stations, two rows, three registrations",
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) AS n FROM sensors WHERE source_system IS NULL AND source_key IS NULL",
+        )
+        .await,
+        bench_before,
+        "the instruments with no provenance are untouched",
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}

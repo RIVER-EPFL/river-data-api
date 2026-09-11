@@ -30,7 +30,7 @@ use crate::routes::private::{
     derived_parameters::models::definition::CalculationFormula,
     derived_parameters::models::source::DerivedParameterSource,
     notes::Note,
-    notifications::{NotificationLog, NotificationMute},
+    notifications::{NotificationLog, NotificationMute, NotificationState},
     parameter_groups::group_model::ParameterGroup,
     parameter_groups::member_model::ParameterGroupMember,
     parameters::Parameter,
@@ -38,6 +38,7 @@ use crate::routes::private::{
     readings::decision_model::ReadingDecision,
     readings::samples::Sample,
     reprocessing_jobs::ReprocessingJob,
+    reprocessing_jobs::models::job_log::ReprocessingJobLog,
     reprocessing_jobs::models::schedule::Schedule,
     sensor_calibrations::SensorCalibration,
     sensor_deployments::SensorDeployment,
@@ -269,6 +270,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/notification_logs",
             admin_only_crud(NotificationLog::router(db)),
         )
+        .nest(
+            "/notification_states",
+            admin_only_crud(NotificationState::router(db)),
+        )
         .nest("/annotations", field_data_crud(Annotation::router(db)))
         .nest("/constants", catalog_crud(Constant::router(db)))
         .nest("/samples", field_data_crud(Sample::router(db)))
@@ -279,6 +284,12 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .nest(
             "/reprocessing_jobs",
             admin_write_crud(ReprocessingJob::router(db)),
+        )
+        // Append-only, written only by a running job, so the generated read routes are the whole
+        // surface. `GET /reprocessing_jobs/{id}/logs` is one job's timeline, tailed by `seq`.
+        .nest(
+            "/reprocessing_job_logs",
+            admin_write_crud(ReprocessingJobLog::router(db)),
         )
         .nest("/sync_services", admin_only_crud(SyncService::router(db)))
         .nest("/sync_commands", admin_only_crud(SyncCommand::router(db)))

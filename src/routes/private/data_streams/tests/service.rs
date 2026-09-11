@@ -1,5 +1,6 @@
 use super::*;
 use crate::routes::private::data_streams::models::ColumnAssignment;
+use sea_orm::QueryTrait;
 
 #[test]
 fn nomis_is_refused_and_says_why() {
@@ -173,4 +174,32 @@ mod stream_reads {
             "{sql}"
         );
     }
+}
+
+/// Scenario: two requests pair the same stream.
+/// Expected behaviour: the write carries `site_parameter_id IS NULL`, so the second affects no row
+/// and is refused instead of repointing a stream whose readings are already attributed.
+#[test]
+fn the_pairing_claim_only_applies_while_the_stream_is_unpaired() {
+    let sql = claim_stream(Uuid::nil(), Uuid::nil(), chrono::Utc::now().into())
+        .build(sea_orm::DatabaseBackend::Postgres)
+        .to_string();
+
+    assert!(sql.contains(r#"UPDATE "data_streams""#), "{sql}");
+    assert!(sql.contains(r#""site_parameter_id" IS NULL"#), "{sql}");
+    assert!(sql.contains(r#""id" ="#), "{sql}");
+    assert!(sql.contains(r#""paired_at" ="#), "{sql}");
+    assert!(sql.contains(r#""updated_at" ="#), "{sql}");
+}
+
+/// A source that re-publishes an older instant must not drag the cursor backwards.
+#[test]
+fn the_cursor_advance_never_moves_the_cursor_back() {
+    let sql = advance_cursor(Uuid::nil(), chrono::Utc::now().into())
+        .build(sea_orm::DatabaseBackend::Postgres)
+        .to_string();
+
+    assert!(sql.contains("GREATEST(COALESCE("), "{sql}");
+    assert!(sql.contains(r#""last_data_time""#), "{sql}");
+    assert!(sql.contains(r#""id" ="#), "{sql}");
 }

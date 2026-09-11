@@ -562,7 +562,7 @@ pub async fn swap_sensors(
         )
         .col_expr(
             data_streams::models::Column::UpdatedAt,
-            Expr::current_timestamp().into(),
+            Expr::current_timestamp(),
         )
         .filter(data_streams::models::Column::SiteParameterId.eq(site_parameter_id))
         .exec(&txn)
@@ -682,7 +682,7 @@ pub async fn get_instruments_overview(
         )
         .from(readings::Entity)
         .and_where(Expr::col(readings::Column::StandardCurveId).is_not_null())
-        .add_group_by([Expr::col(readings::Column::StandardCurveId).into()])
+        .add_group_by([Expr::col(readings::Column::StandardCurveId)])
         .take()
         .build(PostgresQueryBuilder);
     for row in db
@@ -961,7 +961,7 @@ pub async fn get_sensor_curve_usage(
                 .equals((c.clone(), standard_curves::Column::Id)),
         )
         .and_where(Expr::col((c.clone(), standard_curves::Column::SensorId)).eq(sensor_id))
-        .add_group_by([Expr::col((c, standard_curves::Column::Id)).into()])
+        .add_group_by([Expr::col((c, standard_curves::Column::Id))])
         .take()
         .build(PostgresQueryBuilder);
     let usage = db
@@ -1298,7 +1298,7 @@ pub async fn get_sensor_readings(
             )
             // By ordinal: `time` is both the bucket's alias and a base column, and Postgres
             // resolves the bare name to the column, which groups nothing.
-            .add_group_by([Expr::cust("1").into()])
+            .add_group_by([Expr::cust("1")])
             .order_by_expr(Expr::cust("1"), Order::Asc);
         agg.take()
     } else {

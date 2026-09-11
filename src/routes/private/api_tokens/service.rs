@@ -247,10 +247,11 @@ fn is_expired(token: &model::Model) -> bool {
         .is_some_and(|e| e.with_timezone(&Utc) < Utc::now())
 }
 
-/// Fire-and-forget write to the API-token audit log (forensic trail for the public key surface).
-/// Best-effort: spawned off the request path and errors are ignored, so it never blocks or fails a
-/// request. Captures the token, the request method+path, the response status, and the token's
-/// project scope, including the 403s a scoped key earns on a cross-project attempt.
+/// Append to the API-token audit log (forensic trail for the public key surface). Spawned off the
+/// request path so it never blocks or fails a request; a failed append is logged at `warn`, since
+/// a trail that stops growing silently is the one failure the trail exists to catch. Captures the
+/// token, the request method+path, the response status, and the token's project scope, including
+/// the 403s a scoped key earns on a cross-project attempt.
 pub fn record_token_use(
     db: &DatabaseConnection,
     token_id: uuid::Uuid,
@@ -259,31 +260,20 @@ pub fn record_token_use(
     path: &str,
     status: u16,
 ) {
-    use sea_orm::{ConnectionTrait, Statement};
     let db = db.clone();
-    let method = method.to_string();
-    let path = path.to_string();
-    let scope_val = match scope {
-        Some(u) => sea_orm::Value::from(u),
-        None => sea_orm::Value::Uuid(None),
+    let row = super::audit_log::ActiveModel {
+        id: Set(uuid::Uuid::new_v4()),
+        token_id: Set(token_id),
+        method: Set(method.to_string()),
+        path: Set(path.to_string()),
+        status_code: Set(i32::from(status)),
+        project_scope: Set(scope),
+        created_at: Set(Utc::now().into()),
     };
     tokio::spawn(async move {
-        let _ = db
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "INSERT INTO api_token_audit_log \
-                 (id, token_id, method, path, status_code, project_scope) \
-                 VALUES ($1, $2, $3, $4, $5, $6)",
-                [
-                    uuid::Uuid::new_v4().into(),
-                    token_id.into(),
-                    method.into(),
-                    path.into(),
-                    i32::from(status).into(),
-                    scope_val,
-                ],
-            ))
-            .await;
+        if let Err(e) = row.insert(&db).await {
+            tracing::warn!(error = %e, token_id = %token_id, "Failed to append api token audit log");
+        }
     });
 }
 

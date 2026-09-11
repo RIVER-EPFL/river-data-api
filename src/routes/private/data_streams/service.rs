@@ -2,12 +2,13 @@
 //! lookups, and the row moves a slot's retirement and reassignment run.
 
 use crudcrate::{ApiError, CRUDOperations};
+use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{
     Alias, Condition, Expr, JoinType, PostgresQueryBuilder, Query as SeaQuery, SelectStatement,
 };
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, ExprTrait, FromQueryResult,
-    Order, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    Order, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait, UpdateMany,
 };
 use uuid::Uuid;
 
@@ -685,10 +686,9 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
     actor: &str,
     origin: crate::routes::private::readings::models::Origin,
 ) -> AppResult<SlotMove> {
-    // $1 is the target parameter, $2 the source, $3 the site when the scope names one.
-    let (predicate, site) = match scope {
-        MoveScope::EverySite => ("parameter_id = $2", None),
-        MoveScope::Site(site_id) => ("parameter_id = $2 AND site_id = $3", Some(site_id)),
+    let site = match scope {
+        MoveScope::EverySite => None,
+        MoveScope::Site(site_id) => Some(site_id),
     };
     let mut moved = SlotMove::default();
 
@@ -699,6 +699,7 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
         if let Some(site_id) = site {
             values.push(site_id.into());
         }
+        // $1 is the target parameter, $2 the source, $3 the site when the scope names one.
         let row_predicate = match scope {
             MoveScope::EverySite => "r.parameter_id = $2",
             MoveScope::Site(_) => "r.parameter_id = $2 AND r.site_id = $3",
@@ -898,7 +899,7 @@ pub(super) async fn release_slot_rows<C: ConnectionTrait>(
                 models::Column::PairedAt,
                 Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
             )
-            .col_expr(models::Column::UpdatedAt, Expr::current_timestamp().into())
+            .col_expr(models::Column::UpdatedAt, Expr::current_timestamp())
             .filter(models::Column::SiteParameterId.eq(sp_id))
             .exec(conn)
             .await?;
@@ -931,6 +932,46 @@ async fn referenced_ids<C: ConnectionTrait>(
         .iter()
         .map(|row| row.try_get::<Uuid>("", "id"))
         .collect::<Result<Vec<_>, _>>()?)
+}
+
+/// The claim a pairing makes on a stream.
+///
+/// `site_parameter_id IS NULL` is what makes it a claim rather than an overwrite: of two requests
+/// pairing one stream, only the first affects a row, and the loser reads `rows_affected() == 0`
+/// and is refused. The predicate is a filter rather than a string so that dropping it, or renaming
+/// the column, is a compile error.
+pub fn claim_stream(
+    stream_id: Uuid,
+    site_parameter_id: Uuid,
+    now: DateTimeWithTimeZone,
+) -> UpdateMany<models::Entity> {
+    models::Entity::update_many()
+        .col_expr(
+            models::Column::SiteParameterId,
+            Expr::value(Some(site_parameter_id)),
+        )
+        .col_expr(models::Column::PairedAt, Expr::value(Some(now)))
+        .col_expr(models::Column::UpdatedAt, Expr::value(now))
+        .filter(models::Column::Id.eq(stream_id))
+        .filter(models::Column::SiteParameterId.is_null())
+}
+
+/// Move a stream's ingest cursor forward, never back: a source that re-publishes an older instant
+/// leaves the cursor where it is.
+pub fn advance_cursor(stream_id: Uuid, newest: DateTimeWithTimeZone) -> UpdateMany<models::Entity> {
+    models::Entity::update_many()
+        .col_expr(
+            models::Column::LastDataTime,
+            Expr::cust_with_exprs(
+                "GREATEST(COALESCE($1, $2), $2)",
+                [
+                    Expr::col(models::Column::LastDataTime),
+                    Expr::value(newest),
+                ],
+            ),
+        )
+        .col_expr(models::Column::UpdatedAt, Expr::current_timestamp())
+        .filter(models::Column::Id.eq(stream_id))
 }
 
 #[cfg(test)]

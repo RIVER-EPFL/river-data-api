@@ -3,14 +3,16 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use crudcrate::{UpsertStatus, upsert};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
-    QueryFilter, QuerySelect, Statement,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait,
+    FromQueryResult, QueryFilter, QuerySelect, Set, Statement, TransactionSession,
+    TransactionTrait,
 };
-use std::collections::HashSet;
 use uuid::Uuid;
 
 use super::models::alarm_event;
+use super::models::alarm_event::AlarmEvent;
 use super::service::{
     EpisodeRow, ExtentRow, SlotRow, fetch_active_alarm_rows, fetch_episodes, resolve_threshold,
     severity_case,
@@ -50,14 +52,16 @@ pub struct SweepStats {
 
 /// One reconciliation tick. Idempotent: safe to call repeatedly (the partial unique index on open
 /// events makes open-or-update a no-op when nothing changed).
-pub async fn evaluate_alarm_events<C: ConnectionTrait>(db: &C) -> AppResult<SweepStats> {
+pub async fn evaluate_alarm_events<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+) -> AppResult<SweepStats> {
     reconcile(db, None).await
 }
 
 /// Scoped reconcile for just the given `(site_id, parameter_id)` slots, the event-driven entry
 /// point (ingest / threshold / config change). Only opens/updates/resolves events within these
 /// slots; alarms outside them are never touched (so it's safe to fire on a partial change).
-pub async fn reconcile_open_alarms<C: ConnectionTrait>(
+pub async fn reconcile_open_alarms<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     slots: &[(Uuid, Uuid)],
 ) -> AppResult<SweepStats> {
@@ -68,7 +72,7 @@ pub async fn reconcile_open_alarms<C: ConnectionTrait>(
 /// if anything opened or resolved (mirroring the periodic tick). Never fails the caller, it logs
 /// and swallows errors, so wiring it into a write/config path can never break that path. The
 /// periodic backstop still reconciles everything regardless.
-pub async fn reconcile_and_notify<C: ConnectionTrait>(
+pub async fn reconcile_and_notify<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     events: &EventSender,
     slots: &[(Uuid, Uuid)],
@@ -93,7 +97,10 @@ pub async fn reconcile_and_notify<C: ConnectionTrait>(
 /// slots (derived recompute, calibration/deployment reprocess) where enumerating the exact affected
 /// slots isn't worth it. Reconciles every active slot, cheap (O(active slots) index lookups), and
 /// emits SSE on change. Error-safe.
-pub async fn reconcile_all_and_notify<C: ConnectionTrait>(db: &C, events: &EventSender) {
+pub async fn reconcile_all_and_notify<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    events: &EventSender,
+) {
     match evaluate_alarm_events(db).await {
         Ok(stats) => {
             if stats.opened > 0 || stats.resolved > 0 {
@@ -112,14 +119,14 @@ pub async fn reconcile_all_and_notify<C: ConnectionTrait>(db: &C, events: &Event
 /// anywhere else it reconciles on the spot. Uses the process-global event sender; a missing sender
 /// (some unit tests) just skips the SSE. Never returns an error, a failed reconcile must not fail
 /// the CRUD operation that triggered it.
-pub async fn reconcile_all_from_hook<C: ConnectionTrait>(db: &C) {
+pub async fn reconcile_all_from_hook<C: ConnectionTrait + TransactionTrait>(db: &C) {
     if record_owed() {
         return;
     }
     reconcile_all_now(db).await;
 }
 
-pub(super) async fn reconcile_all_now<C: ConnectionTrait>(db: &C) {
+pub(super) async fn reconcile_all_now<C: ConnectionTrait + TransactionTrait>(db: &C) {
     match crate::common::global_event_sender() {
         Some(events) => reconcile_all_and_notify(db, &events).await,
         None => {
@@ -133,7 +140,7 @@ pub(super) async fn reconcile_all_now<C: ConnectionTrait>(db: &C) {
 /// One reconciliation tick. `slots = None` reconciles every active slot (backstop); `slots = Some`
 /// restricts every step to those slots. Idempotent: the partial unique index on open events makes
 /// open-or-update a no-op when nothing changed.
-async fn reconcile<C: ConnectionTrait>(
+async fn reconcile<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     slots: Option<&[(Uuid, Uuid)]>,
 ) -> AppResult<SweepStats> {
@@ -153,14 +160,7 @@ async fn reconcile<C: ConnectionTrait>(
     Ok(stats)
 }
 
-/// The slot an open alarm event stands on.
-#[derive(FromQueryResult)]
-struct OpenAlarmSlot {
-    site_id: Uuid,
-    parameter_id: Uuid,
-}
-
-async fn reconcile_cadence<C: ConnectionTrait>(
+async fn reconcile_cadence<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     slots: Option<&[(Uuid, Uuid)]>,
     spot: bool,
@@ -175,79 +175,41 @@ async fn reconcile_cadence<C: ConnectionTrait>(
     )
     .await?;
 
-    // Pairs that already have an open event (within scope), so we can count opened vs updated.
-    let (open_keys_sql, open_keys_values): (String, Vec<sea_orm::Value>) = match slots {
-        Some(s) => {
-            let pairs: Vec<String> = (0..s.len())
-                .map(|i| format!("(${},${})", i * 2 + 1, i * 2 + 2))
-                .collect();
-            let vals = s
-                .iter()
-                .flat_map(|(a, b)| [(*a).into(), (*b).into()])
-                .collect();
-            (
-                format!(
-                    "SELECT site_id, parameter_id FROM alarm_events \
-                     WHERE resolved_at IS NULL AND measurement_type = '{cadence}' \
-                       AND (site_id, parameter_id) IN ({})",
-                    pairs.join(",")
-                ),
-                vals,
-            )
-        }
-        None => (
-            format!(
-                "SELECT site_id, parameter_id FROM alarm_events \
-                 WHERE resolved_at IS NULL AND measurement_type = '{cadence}'"
-            ),
-            Vec::new(),
-        ),
-    };
-    let mut open_keys: HashSet<(Uuid, Uuid)> = HashSet::new();
-    for row in db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &open_keys_sql,
-            open_keys_values,
-        ))
-        .await?
-    {
-        let slot = OpenAlarmSlot::from_query_result(&row, "")?;
-        open_keys.insert((slot.site_id, slot.parameter_id));
-    }
-
+    // Open-or-update each current breach as one registration of the open episode: the status
+    // says whether it opened or joined one. `max_severity` is entity-managed, so the registration
+    // leaves it and the sweeper advances it here, in the same transaction.
     let mut stats = SweepStats::default();
-
-    // Open-or-update each current breach.
+    let txn = db.begin().await?;
     for b in &breaches {
-        let is_new = !open_keys.contains(&(b.site_id, b.parameter_id));
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO alarm_events \
-                (site_id, parameter_id, measurement_type, severity, max_severity, started_at, value_at_start, last_seen_at, last_value) \
-             VALUES ($1, $2, $6, $3, $3, $4, $5, $4, $5) \
-             ON CONFLICT (site_id, parameter_id, measurement_type) WHERE resolved_at IS NULL \
-             DO UPDATE SET severity = EXCLUDED.severity, \
-                           max_severity = GREATEST(alarm_events.max_severity, EXCLUDED.severity), \
-                           last_seen_at = EXCLUDED.last_seen_at, \
-                           last_value = EXCLUDED.last_value, \
-                           updated_at = NOW()",
-            [
-                b.site_id.into(),
-                b.parameter_id.into(),
-                b.severity.into(),
-                b.time.into(),
-                b.current_value.into(),
-                cadence.into(),
-            ],
-        ))
-        .await?;
-        if is_new {
-            stats.opened += 1;
-        } else {
-            stats.updated += 1;
+        let sent = alarm_event::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            site_id: Set(b.site_id),
+            parameter_id: Set(b.parameter_id),
+            measurement_type: Set(cadence.to_string()),
+            severity: Set(b.severity),
+            max_severity: Set(b.severity),
+            started_at: Set(b.time.with_timezone(&Utc)),
+            value_at_start: Set(b.current_value),
+            last_seen_at: Set(b.time.with_timezone(&Utc)),
+            last_value: Set(b.current_value),
+            ..Default::default()
+        };
+        let (episode, status) = upsert::<AlarmEvent, _>(&txn, sent).await?;
+        match status {
+            UpsertStatus::Created => stats.opened += 1,
+            UpsertStatus::Updated | UpsertStatus::Unchanged => stats.updated += 1,
+        }
+        if b.severity > episode.max_severity {
+            alarm_event::ActiveModel {
+                id: Set(episode.id),
+                max_severity: Set(b.severity),
+                ..Default::default()
+            }
+            .update(&txn)
+            .await?;
         }
     }
+    txn.commit().await?;
 
     // Resolve open events no longer in the current breach set; stamp the latest reading as the
     // resolving value. When scoped, restrict to the scoped slots so events outside this trigger are
@@ -341,7 +303,6 @@ pub async fn evaluate_alarm_episodes(
 
     // Sensor and grab series form separate episode streams: a grab breach must not be
     // "resolved" by the next in-range sonde point (or vice versa).
-    let mut written = 0i64;
     let mut all_episodes: Vec<(&'static str, Vec<EpisodeRow>)> = Vec::new();
     for spot in [false, true] {
         let episodes = fetch_episodes(
@@ -370,31 +331,29 @@ pub async fn evaluate_alarm_episodes(
         .exec(db)
         .await?;
 
-    for (cadence, episodes) in &all_episodes {
-        for ep in episodes {
-            db.execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "INSERT INTO alarm_events \
-                    (site_id, parameter_id, measurement_type, severity, max_severity, started_at, \
-                     value_at_start, last_seen_at, last_value, resolved_at, resolved_value) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-                [
-                    site_id.into(),
-                    parameter_id.into(),
-                    (*cadence).into(),
-                    ep.severity.into(),
-                    ep.max_severity.into(),
-                    ep.started_at.with_timezone(&Utc).into(),
-                    ep.value_at_start.into(),
-                    ep.last_seen_at.with_timezone(&Utc).into(),
-                    ep.last_value.into(),
-                    ep.resolved_at.map(|t| t.with_timezone(&Utc)).into(),
-                    ep.resolved_value.into(),
-                ],
-            ))
-            .await?;
-            written += 1;
-        }
+    let rows: Vec<alarm_event::ActiveModel> = all_episodes
+        .iter()
+        .flat_map(|(cadence, episodes)| {
+            episodes.iter().map(|ep| alarm_event::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                site_id: Set(site_id),
+                parameter_id: Set(parameter_id),
+                measurement_type: Set((*cadence).to_string()),
+                severity: Set(ep.severity),
+                max_severity: Set(ep.max_severity),
+                started_at: Set(ep.started_at.with_timezone(&Utc)),
+                value_at_start: Set(ep.value_at_start),
+                last_seen_at: Set(ep.last_seen_at.with_timezone(&Utc)),
+                last_value: Set(ep.last_value),
+                resolved_at: Set(ep.resolved_at.map(|t| t.with_timezone(&Utc))),
+                resolved_value: Set(ep.resolved_value),
+                ..Default::default()
+            })
+        })
+        .collect();
+    let written = rows.len() as i64;
+    if !rows.is_empty() {
+        alarm_event::Entity::insert_many(rows).exec(db).await?;
     }
 
     Ok(written)

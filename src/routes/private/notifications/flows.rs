@@ -14,7 +14,9 @@ use sea_orm::{
 use super::models::*;
 use super::service::*;
 use crate::common::AppState;
+use crate::routes::private::alarms::models::alarm_event;
 use crate::config::Config;
+use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::service as readings_service;
@@ -95,11 +97,7 @@ async fn process_pending(
         return Ok(());
     }
 
-    let column = if opened {
-        "notified_at"
-    } else {
-        "resolution_notified_at"
-    };
+    let column = claim_column(opened);
 
     // A muted slot is suppressed inside `deliver`, which reports success, so the claim below
     // stands and neither this replica nor a peer re-picks the event.
@@ -368,13 +366,11 @@ async fn stale_data(
 
     // Subject keys gained a cadence suffix; the pre-suffix rows are unreachable, so drop them
     // rather than leave a firing state nothing can ever resolve.
-    db.execute_raw(Statement::from_string(
-        PG,
-        "DELETE FROM notification_state \
-         WHERE kind = 'stale_data' AND subject_key NOT LIKE '%:%:%'"
-            .to_string(),
-    ))
-    .await?;
+    state::Entity::delete_many()
+        .filter(state::Column::Kind.eq("stale_data"))
+        .filter(state::Column::SubjectKey.not_like("%:%:%"))
+        .exec(db)
+        .await?;
 
     // The dispatcher wakes on every alarm-state broadcast, so each lookup is a backward walk of
     // idx_readings_site_param_time stopping at the first match, never an aggregate over the slot.
@@ -664,14 +660,24 @@ async fn streams_unpaired(
 
     // A stream that was paired, deactivated or deleted is no longer waiting: drop its row so that
     // an unpairing later reads as a fresh discovery.
-    db.execute_raw(Statement::from_string(
-        PG,
-        "DELETE FROM notification_state ns WHERE ns.kind = 'streams_unpaired' \
-         AND NOT EXISTS (SELECT 1 FROM data_streams ds WHERE ds.id::text = ns.subject_key \
-                         AND ds.site_parameter_id IS NULL AND ds.is_active)"
-            .to_string(),
-    ))
-    .await?;
+    let still_waiting = Query::select()
+        .expr(Expr::value(1))
+        .from(data_streams::Entity)
+        .and_where(
+            Expr::col((data_streams::Entity, data_streams::Column::Id))
+                .cast_as(Alias::new("text"))
+                .eq(Expr::col((state::Entity, state::Column::SubjectKey))),
+        )
+        .and_where(
+            Expr::col((data_streams::Entity, data_streams::Column::SiteParameterId)).is_null(),
+        )
+        .and_where(Expr::col((data_streams::Entity, data_streams::Column::IsActive)).eq(true))
+        .to_owned();
+    state::Entity::delete_many()
+        .filter(state::Column::Kind.eq("streams_unpaired"))
+        .filter(Expr::exists(still_waiting).not())
+        .exec(db)
+        .await?;
 
     // `last_data_time` is the stream's cursor, so it is set exactly when readings have landed.
     let rows = db
@@ -1251,6 +1257,16 @@ impl Job for DispatchNotifications {
             .await;
         dispatch_once(&state, &channels).await;
         Ok(0)
+    }
+}
+
+/// The sent-marker an episode's claim stamps: the opening notice and the resolution notice are
+/// claimed independently, so each has its own column.
+pub(super) fn claim_column(opened: bool) -> alarm_event::Column {
+    if opened {
+        alarm_event::Column::NotifiedAt
+    } else {
+        alarm_event::Column::ResolutionNotifiedAt
     }
 }
 

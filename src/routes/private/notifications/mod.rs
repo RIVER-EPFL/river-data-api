@@ -10,3 +10,4 @@ pub mod views;
 
 pub use models::log::NotificationLog;
 pub use models::mutes::NotificationMute;
+pub use models::state::NotificationState;

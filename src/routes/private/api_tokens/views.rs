@@ -15,10 +15,12 @@ use axum::routing::{get, post};
 use chrono::DateTime;
 use chrono::Utc;
 use sea_orm::ActiveModelTrait;
+use sea_orm::ColumnTrait;
 use sea_orm::ConnectionTrait;
 use sea_orm::EntityTrait;
 use sea_orm::FromQueryResult;
 use sea_orm::IntoActiveModel;
+use sea_orm::QueryFilter;
 use sea_orm::QueryOrder;
 use sea_orm::QuerySelect;
 use sea_orm::Set;
@@ -29,6 +31,7 @@ use uuid::Uuid;
 
 use super::models as model;
 use super::models::ApiToken;
+use super::models::grant;
 use super::models::*;
 use super::service::invalidate_token_cache;
 use super::service::mint_api_token;
@@ -612,29 +615,28 @@ pub async fn list_user_grants(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Vec<crate::routes::private::me::GrantedProject>>> {
-    let rows = state
-        .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT p.id, p.name FROM user_project_grants g \
-             JOIN projects p ON p.id = g.project_id \
-             WHERE g.user_sub = $1 ORDER BY p.name",
-            [id.into()],
-        ))
+    let rows = grant::Entity::find()
+        .filter(grant::Column::UserSub.eq(id))
+        .find_also_related(crate::routes::private::projects::Entity)
+        .order_by_asc(crate::routes::private::projects::Column::Name)
+        .all(&state.db)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    // A row that will not decode is an error: silently dropping it would answer with a shorter
-    // grant list than the user holds.
+    // A grant whose project will not load is an error: silently dropping it would answer with a
+    // shorter grant list than the user holds.
     let grants = rows
-        .iter()
-        .map(|r| GrantRow::from_query_result(r, ""))
-        .collect::<Result<Vec<GrantRow>, _>>()?
         .into_iter()
-        .map(|g| crate::routes::private::me::GrantedProject {
-            project_id: g.id,
-            name: g.name,
+        .map(|(g, project)| {
+            project
+                .map(|p| crate::routes::private::me::GrantedProject {
+                    project_id: p.id,
+                    name: p.name,
+                })
+                .ok_or_else(|| {
+                    AppError::Internal(format!("grant on {} names no project", g.project_id))
+                })
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(grants))
 }
 
@@ -660,22 +662,32 @@ pub async fn set_user_grants(
         .begin()
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    txn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "DELETE FROM user_project_grants WHERE user_sub = $1",
-        [id.clone().into()],
-    ))
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-    for project_id in &req.project_ids {
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO user_project_grants (user_sub, project_id, granted_by) VALUES ($1, $2, $3) \
-             ON CONFLICT (user_sub, project_id) DO NOTHING",
-            [id.clone().into(), (*project_id).into(), granted_by.clone().into()],
-        ))
+    grant::Entity::delete_many()
+        .filter(grant::Column::UserSub.eq(id.clone()))
+        .exec(&txn)
         .await
-        .map_err(|e| AppError::BadRequest(format!("grant insert failed (unknown project?): {e}")))?;
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if !req.project_ids.is_empty() {
+        let rows = req.project_ids.iter().map(|project_id| grant::ActiveModel {
+            user_sub: Set(id.clone()),
+            project_id: Set(*project_id),
+            granted_by: Set(Some(granted_by.clone())),
+            ..Default::default()
+        });
+        grant::Entity::insert_many(rows)
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::columns([
+                    grant::Column::UserSub,
+                    grant::Column::ProjectId,
+                ])
+                .do_nothing()
+                .to_owned(),
+            )
+            .exec_without_returning(&txn)
+            .await
+            .map_err(|e| {
+                AppError::BadRequest(format!("grant insert failed (unknown project?): {e}"))
+            })?;
     }
     txn.commit()
         .await

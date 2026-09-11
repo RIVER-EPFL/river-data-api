@@ -2715,33 +2715,7 @@ pub async fn ingest_status_events(
         .collect();
 
     let total = models.len();
-    let mut inserted = 0usize;
-
-    for chunk in models.chunks(BATCH_SIZE) {
-        match status_events::Entity::insert_many(chunk.to_vec())
-            .on_conflict(
-                sea_orm::sea_query::OnConflict::columns([
-                    status_events::Column::StreamId,
-                    status_events::Column::Time,
-                ])
-                .do_nothing()
-                .to_owned(),
-            )
-            .exec_without_returning(db)
-            .await
-        {
-            Ok(rows) => inserted += rows as usize,
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("None of the records") {
-                    // All duplicates
-                } else {
-                    tracing::warn!(error = %e, batch_size = chunk.len(), "Failed to insert status event batch");
-                    return Err(AppError::Database(e));
-                }
-            }
-        }
-    }
+    let inserted = status_events::service::insert_ignoring_duplicates(db, models).await?;
 
     tracing::debug!(total, inserted, skipped, deduplicated, stream_id = %payload.stream_id, paired, "Status events ingest complete");
     Ok(Json(IngestStatusEventsResponse {

@@ -8,8 +8,10 @@ use axum::extract::State;
 use sea_orm::ColumnTrait;
 use sea_orm::ConnectionTrait;
 use sea_orm::EntityTrait;
-use sea_orm::FromQueryResult;
 use sea_orm::QueryFilter;
+use sea_orm::QueryOrder;
+use sea_orm::QuerySelect;
+use sea_orm::Select;
 use sea_orm::Statement;
 use sea_orm::sea_query::Expr;
 use serde::Deserialize;
@@ -18,6 +20,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use super::models::job;
+use super::models::job_log;
 use super::models::job::Column;
 use super::models::job::Entity;
 use super::models::schedule;
@@ -69,13 +72,34 @@ pub struct JobLogsQuery {
     pub limit: Option<u64>,
 }
 
-#[derive(Debug, Serialize, utoipa::ToSchema, FromQueryResult)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct JobLogLine {
     pub seq: i64,
     pub ts: chrono::DateTime<chrono::Utc>,
     pub level: String,
     pub message: String,
     pub context: serde_json::Value,
+}
+
+impl From<job_log::Model> for JobLogLine {
+    fn from(m: job_log::Model) -> Self {
+        Self {
+            seq: m.seq,
+            ts: m.ts.into(),
+            level: m.level,
+            message: m.message,
+            context: m.context,
+        }
+    }
+}
+
+/// One job's timeline from `after_seq` onwards, oldest first, at most `limit` lines.
+fn timeline(job_id: Uuid, after_seq: i64, limit: u64) -> Select<job_log::Entity> {
+    job_log::Entity::find()
+        .filter(job_log::Column::JobId.eq(job_id))
+        .filter(job_log::Column::Seq.gt(after_seq))
+        .order_by_asc(job_log::Column::Seq)
+        .limit(limit)
 }
 
 /// `GET /api/reprocessing_jobs/{id}/logs`, the ordered timeline for one job. Paginated by `seq`
@@ -97,19 +121,15 @@ pub async fn get_job_logs(
     Query(q): Query<JobLogsQuery>,
 ) -> AppResult<Json<Vec<JobLogLine>>> {
     confine_job(&state, &scope, id).await?;
-    let limit = i64::try_from(q.limit.unwrap_or(1000).min(5000)).unwrap_or(1000);
+    let limit = q.limit.unwrap_or(1000).min(5000);
     let after = q.after_seq.unwrap_or(-1);
 
-    let out = JobLogLine::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT seq, ts, level, message, context \
-             FROM reprocessing_job_logs \
-             WHERE job_id = $1 AND seq > $2 \
-             ORDER BY seq ASC LIMIT $3",
-        [id.into(), after.into(), limit.into()],
-    ))
-    .all(&state.db)
-    .await?;
+    let out = timeline(id, after, limit)
+        .all(&state.db)
+        .await?
+        .into_iter()
+        .map(JobLogLine::from)
+        .collect();
     Ok(Json(out))
 }
 
@@ -421,3 +441,7 @@ pub async fn refresh_aggregates(
 
     Ok(Json(QueuedJobResponse::queued(job_id)))
 }
+
+#[cfg(test)]
+#[path = "tests/job_timeline.rs"]
+mod tests;

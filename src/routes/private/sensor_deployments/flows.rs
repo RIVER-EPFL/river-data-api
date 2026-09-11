@@ -14,9 +14,10 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, Statement,
+    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
+    Select, Statement,
 };
 use uuid::Uuid;
 
@@ -222,6 +223,16 @@ pub fn is_slot_conflict(err: &DbErr) -> bool {
     msg.contains("excl_deployment_site_param_slot") || msg.contains("23P01")
 }
 
+/// The deployment a reprocess re-derives when its job names no parameter: the sensor's open
+/// deployment at the site, else its most recent one there.
+pub fn current_deployment(sensor_id: Uuid, site_id: Uuid) -> Select<super::models::Entity> {
+    super::models::Entity::find()
+        .filter(super::models::Column::SensorId.eq(sensor_id))
+        .filter(super::models::Column::SiteId.eq(site_id))
+        .order_by_desc(Expr::col(super::models::Column::DeployedUntil).is_null())
+        .order_by_desc(super::models::Column::DeployedFrom)
+}
+
 /// Re-derive readings for a sensor's deployment slot. Derives the slot parameter from the sensor,
 /// then re-derives the (site, parameter) slot and the sensor. Backs the deployment-change triggers.
 pub struct ReprocessDeployment {
@@ -253,19 +264,10 @@ impl Job for ReprocessDeployment {
             .and_then(|s| Uuid::parse_str(s).ok())
         {
             Some(p) => Some(p),
-            None => ctx
-                .db()
-                .query_one_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT parameter_id FROM sensor_deployments \
-                     WHERE sensor_id = $1 AND site_id = $2 \
-                     ORDER BY (deployed_until IS NULL) DESC, deployed_from DESC LIMIT 1",
-                    [sensor_id.into(), site_id.into()],
-                ))
+            None => current_deployment(sensor_id, site_id)
+                .one(ctx.db())
                 .await?
-                .map(|r| r.try_get::<Option<Uuid>>("", "parameter_id"))
-                .transpose()?
-                .flatten(),
+                .map(|d| d.parameter_id),
         };
         let count = if let Some(parameter_id) = parameter_id {
             reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id, Some(ctx.job_id()))

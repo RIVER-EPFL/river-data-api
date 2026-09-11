@@ -68,3 +68,28 @@ fn defaults_are_skip_if_running_and_run_once() {
     assert_eq!(s.overlap, OverlapPolicy::SkipIfRunning);
     assert_eq!(s.catchup, CatchupPolicy::RunOnce);
 }
+
+/// The claim is what keeps two replicas off one slot, so the query it emits is asserted rather than
+/// described: enabled rows only, due only, soonest first, and one row locked and skipped by a peer.
+#[test]
+fn due_schedules_claims_one_due_enabled_row_and_skips_a_peers() {
+    use sea_orm::QueryTrait;
+    let sql = due_schedules()
+        .into_query()
+        .to_string(sea_orm::sea_query::PostgresQueryBuilder);
+    assert!(sql.contains(r#""schedules"."enabled" = TRUE"#), "{sql}");
+    assert!(
+        sql.contains(r#""schedules"."next_run_at" IS NOT NULL"#),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(r#""next_run_at" <= CURRENT_TIMESTAMP"#),
+        "{sql}"
+    );
+    assert!(
+        sql.contains(r#"ORDER BY "schedules"."next_run_at" ASC"#),
+        "{sql}"
+    );
+    assert!(sql.contains("LIMIT 1"), "{sql}");
+    assert!(sql.contains("FOR UPDATE SKIP LOCKED"), "{sql}");
+}

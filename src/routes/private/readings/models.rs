@@ -1000,14 +1000,6 @@ pub(super) struct JobRow {
 }
 
 #[derive(FromQueryResult)]
-pub(super) struct JobLogRow {
-    pub(super) job_id: Uuid,
-    pub(super) level: String,
-    pub(super) message: String,
-    pub(super) ts: DateTime<Utc>,
-}
-
-#[derive(FromQueryResult)]
 pub(super) struct ChangeRow {
     pub(super) id: Uuid,
     pub(super) change: String,
@@ -2691,6 +2683,111 @@ pub mod seasonal_check {
 /// One set-level curation decision: an edit over a selection, materialised as the per-row
 /// `reading_decisions` rows that carry its `set_id`. A set is reached through those rows and by the
 /// rollback that names it, never listed, so no router.
+/// A value the source changed after river-data stored it, awaiting a person (Q84). One live row
+/// per `(stream_id, time, replicate_index)`, which is the table's unique key rather than its
+/// primary one.
+///
+/// No router: whether the review queue becomes this entity's generated list or keeps its
+/// three-table join is Q150, and C215 is that work.
+/// One parsed CSV row, held only for the length of an import. `(import_token, seq)` is the key:
+/// the importer numbers `seq` from zero within each token and the worker reads the set back in
+/// that order.
+///
+/// No router: the table is the import job's own scratch space, written by the upload handler and
+/// deleted by the job when it finishes or fails.
+pub mod import_staging {
+    use crudcrate::EntityToModels;
+    use sea_orm::entity::prelude::*;
+
+    #[derive(
+        Clone,
+        Debug,
+        PartialEq,
+        DeriveEntityModel,
+        serde::Serialize,
+        serde::Deserialize,
+        EntityToModels,
+    )]
+    #[sea_orm(table_name = "csv_import_staging")]
+    #[crudcrate(
+        api_struct = "CsvImportStagingRow",
+        name_singular = "csv_import_staging_row",
+        name_plural = "csv_import_staging_rows"
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key)]
+        pub import_token: Uuid,
+        /// The row's position in the uploaded file, which is what makes replicate numbering
+        /// deterministic.
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key)]
+        pub seq: i64,
+        pub stream_id: Uuid,
+        pub site_id: Option<Uuid>,
+        pub parameter_id: Option<Uuid>,
+        pub time: chrono::DateTime<chrono::FixedOffset>,
+        pub raw_value: f64,
+        pub sensor_id: Option<Uuid>,
+        pub calibration_id: Option<Uuid>,
+        pub deployment_id: Option<Uuid>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod change_proposal {
+    use crudcrate::EntityToModels;
+    use sea_orm::entity::prelude::*;
+
+    #[derive(
+        Clone,
+        Debug,
+        PartialEq,
+        DeriveEntityModel,
+        serde::Serialize,
+        serde::Deserialize,
+        EntityToModels,
+    )]
+    #[sea_orm(table_name = "reading_change_proposals")]
+    #[crudcrate(
+        api_struct = "ReadingChangeProposal",
+        name_singular = "reading_change_proposal",
+        name_plural = "reading_change_proposals"
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
+        pub id: Uuid,
+        #[crudcrate(filterable)]
+        pub stream_id: Uuid,
+        #[crudcrate(sortable)]
+        pub time: chrono::DateTime<chrono::Utc>,
+        pub replicate_index: i16,
+        pub proposed_raw_value: f64,
+        pub proposed_standard_curve_id: Option<Uuid>,
+        pub stored_raw_value: f64,
+        pub stored_standard_curve_id: Option<Uuid>,
+        /// `pending` | `accepted` | `rejected`, a table CHECK.
+        #[crudcrate(filterable)]
+        pub status: String,
+        #[crudcrate(exclude(create, update), sortable)]
+        pub first_seen_at: chrono::DateTime<chrono::Utc>,
+        #[crudcrate(exclude(create, update), sortable)]
+        pub last_seen_at: chrono::DateTime<chrono::Utc>,
+        pub decided_by: Option<String>,
+        pub decided_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod decision_set {
     use crudcrate::EntityToModels;
     use sea_orm::entity::prelude::*;

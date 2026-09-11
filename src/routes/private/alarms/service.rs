@@ -812,8 +812,8 @@ pub(super) async fn fetch_latest_reading_times(
         )
         .cond_where(scoped)
         .add_group_by([
-            Expr::col((s_.clone(), sites::Column::Id)).into(),
-            Expr::col((s_.clone(), sites::Column::Name)).into(),
+            Expr::col((s_.clone(), sites::Column::Id)),
+            Expr::col((s_.clone(), sites::Column::Name)),
         ])
         .take()
         .build(PostgresQueryBuilder);
@@ -875,7 +875,7 @@ pub(super) async fn fetch_last_alarm_warning_times(
                 .equals((ae.clone(), alarm_event::Column::SiteId)),
         )
         .cond_where(scoped)
-        .add_group_by([Expr::col((s_.clone(), sites::Column::Id)).into()])
+        .add_group_by([Expr::col((s_.clone(), sites::Column::Id))])
         .take()
         .build(PostgresQueryBuilder);
 

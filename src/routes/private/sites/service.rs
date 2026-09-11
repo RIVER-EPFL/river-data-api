@@ -820,8 +820,8 @@ pub(super) fn value_source(
                 .or(Expr::col((r.clone(), readings::Column::IsFlagged)).is_null()),
         )
         .add_group_by([
-            Expr::col((r.clone(), readings::Column::ParameterId)).into(),
-            Expr::col((r.clone(), readings::Column::Time)).into(),
+            Expr::col((r.clone(), readings::Column::ParameterId)),
+            Expr::col((r.clone(), readings::Column::Time)),
         ]);
     if measurement_type == "spot" {
         let smp = Alias::new("smp");

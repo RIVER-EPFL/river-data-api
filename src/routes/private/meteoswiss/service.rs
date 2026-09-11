@@ -112,41 +112,34 @@ pub async fn parameter_id<C: ConnectionTrait>(db: &C) -> Result<Option<Uuid>, Db
 }
 
 /// The station as an instrument: one row per station, shared by every site that reads it.
-pub async fn instrument<C: ConnectionTrait>(db: &C, station: &str) -> Result<Uuid, DbErr> {
-    let existing = sensors::Entity::find()
-        .filter(sensors::Column::SourceSystem.eq(SOURCE_SYSTEM))
-        .filter(sensors::Column::SourceKey.eq(station))
-        .one(db)
-        .await?;
-    if let Some(sensor) = existing {
-        return Ok(sensor.id);
-    }
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO sensors (name, manufacturer, model, source_system, source_key, kind,
-                                  data_frequency, metadata)
-             VALUES ($1, 'MeteoSwiss', 'SMN', $2, $3, 'device', 'high',
-                     jsonb_build_object('station_abbr', $3::text, 'variable', $4::text))
-             ON CONFLICT (source_system, source_key)
-               WHERE source_system IS NOT NULL AND source_key IS NOT NULL
-               DO UPDATE SET source_key = EXCLUDED.source_key
-             RETURNING id",
-            [
-                format!("MeteoSwiss {station}").into(),
-                SOURCE_SYSTEM.into(),
-                station.into(),
-                VARIABLE.into(),
-            ],
-        ))
-        .await?
-        .ok_or_else(|| DbErr::Custom("Failed to mint the MeteoSwiss station instrument".into()))?;
-    row.try_get("", "id")
+///
+/// Registered on `(source_system, source_key)`, which is unique only where both are set: an
+/// instrument named by serial carries neither, and the registration's predicate is what keeps
+/// every one of those from reading as the same row.
+pub async fn instrument<C: ConnectionTrait + sea_orm::TransactionTrait>(db: &C, station: &str) -> Result<Uuid, DbErr> {
+    let mut mint = sensors::ActiveModel {
+        name: Set(Some(format!("MeteoSwiss {station}"))),
+        manufacturer: Set(Some("MeteoSwiss".to_string())),
+        model: Set(Some("SMN".to_string())),
+        kind: Set("device".to_string()),
+        data_frequency: Set("high".to_string()),
+        metadata: Set(Some(serde_json::json!({
+            "station_abbr": station,
+            "variable": VARIABLE,
+        }))),
+        ..Default::default()
+    };
+    mint.source_system = Set(Some(SOURCE_SYSTEM.to_string()));
+    mint.source_key = Set(Some(station.to_string()));
+    let (sensor, _) = crudcrate::upsert::<sensors::Sensor, _>(db, mint)
+        .await
+        .map_err(|e| DbErr::Custom(format!("Failed to mint the MeteoSwiss station instrument: {e}")))?;
+    Ok(sensor.id)
 }
 
 /// The site's pressure slot and the stream feeding it, created on first sync. Declaring the station
 /// on the site is the whole operator action; the slot and the stream follow from it.
-pub async fn provision<C: ConnectionTrait>(
+pub async fn provision<C: ConnectionTrait + sea_orm::TransactionTrait>(
     db: &C,
     site: &Subscriber,
     parameter_id: Uuid,
@@ -176,31 +169,37 @@ pub async fn provision<C: ConnectionTrait>(
     };
 
     let source_key = format!("{}:{VARIABLE}:{}", site.station, site.site_id);
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO data_streams
-                 (source_system, source_key, source_name, site_parameter_id, measurement_type,
-                  paired_at, metadata)
-             VALUES ($1, $2, $3, $4, 'continuous', NOW(),
-                     jsonb_build_object('station', $5::text, 'variable', $6::text,
-                                        'decimal_places', 1))
-             ON CONFLICT (source_system, source_key) DO UPDATE
-                SET site_parameter_id = EXCLUDED.site_parameter_id,
-                    paired_at = COALESCE(data_streams.paired_at, EXCLUDED.paired_at)
-             RETURNING id",
-            [
-                SOURCE_SYSTEM.into(),
-                source_key.into(),
-                format!("{} {VARIABLE}", site.station).into(),
-                site_parameter_id.into(),
-                site.station.clone().into(),
-                VARIABLE.into(),
-            ],
-        ))
-        .await?
-        .ok_or_else(|| DbErr::Custom("Failed to register the MeteoSwiss stream".into()))?;
-    row.try_get("", "id")
+    let mut register = data_streams::ActiveModel {
+        source_name: Set(Some(format!("{} {VARIABLE}", site.station))),
+        site_parameter_id: Set(Some(site_parameter_id)),
+        measurement_type: Set(Some("continuous".to_string())),
+        metadata: Set(serde_json::json!({
+            "station": site.station,
+            "variable": VARIABLE,
+            "decimal_places": 1,
+        })),
+        ..Default::default()
+    };
+    register.source_system = Set(SOURCE_SYSTEM.to_string());
+    register.source_key = Set(source_key);
+    let (stream, _) = crudcrate::upsert::<data_streams::DataStream, _>(db, register)
+        .await
+        .map_err(|e| DbErr::Custom(format!("Failed to register the MeteoSwiss stream: {e}")))?;
+
+    // `paired_at` records when the stream first gained its slot, so it is stamped once and never
+    // moved. Leaving it off the registration is what keeps a later pass from re-stamping it.
+    if stream.paired_at.is_none() {
+        data_streams::Entity::update_many()
+            .col_expr(
+                data_streams::Column::PairedAt,
+                sea_orm::sea_query::Expr::current_timestamp(),
+            )
+            .filter(data_streams::Column::Id.eq(stream.id))
+            .filter(data_streams::Column::PairedAt.is_null())
+            .exec(db)
+            .await?;
+    }
+    Ok(stream.id)
 }
 
 pub async fn cursor<C: ConnectionTrait>(
@@ -219,14 +218,9 @@ pub async fn advance_cursor<C: ConnectionTrait>(
     stream_id: Uuid,
     newest: DateTime<Utc>,
 ) -> Result<(), DbErr> {
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "UPDATE data_streams
-            SET last_data_time = GREATEST(COALESCE(last_data_time, $2), $2), updated_at = NOW()
-          WHERE id = $1",
-        [stream_id.into(), newest.into()],
-    ))
-    .await?;
+    crate::routes::private::data_streams::service::advance_cursor(stream_id, newest.into())
+        .exec(db)
+        .await?;
     Ok(())
 }
 

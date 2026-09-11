@@ -8,8 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use moka::future::Cache;
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
 use uuid::Uuid;
+
+use crate::routes::private::api_tokens::grant;
 
 /// Cache of `sub → granted project ids`. Cheap to clone (an `Arc<HashSet>`), so callers hold the
 /// `Arc` directly on the `AuthContext`.
@@ -42,14 +44,12 @@ pub async fn load_grants(
 }
 
 async fn query_grants(db: &DatabaseConnection, sub: &str) -> Result<HashSet<Uuid>, sea_orm::DbErr> {
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            "SELECT project_id FROM user_project_grants WHERE user_sub = $1",
-            [sub.into()],
-        ))
+    let ids = grant::Entity::find()
+        .filter(grant::Column::UserSub.eq(sub))
+        .select_only()
+        .column(grant::Column::ProjectId)
+        .into_tuple::<Uuid>()
+        .all(db)
         .await?;
-    rows.iter()
-        .map(|r| Ok(r.try_get::<Uuid>("", "project_id")?))
-        .collect()
+    Ok(ids.into_iter().collect())
 }

@@ -1,16 +1,34 @@
+use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
+/// A non-numeric time-series row: a device status string at an instant on a stream. The key is
+/// the pair, so no route addresses one row by its id (Q153); rows arrive in batches through the
+/// ingest and batch routes and are read per site.
+#[derive(
+    Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize, EntityToModels,
+)]
 #[sea_orm(table_name = "status_events")]
+#[crudcrate(
+    api_struct = "StatusEvent",
+    name_singular = "status_event",
+    name_plural = "status_events",
+    derive_partial_eq
+)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
+    #[crudcrate(primary_key, exclude(update), filterable)]
     pub stream_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
+    #[crudcrate(primary_key, exclude(update), filterable, sortable)]
     pub time: DateTimeWithTimeZone,
+    #[crudcrate(filterable)]
     pub site_id: Option<Uuid>,
+    #[crudcrate(filterable)]
     pub parameter_id: Option<Uuid>,
+    #[crudcrate(filterable)]
     pub value: String,
+    #[crudcrate(filterable)]
     pub sensor_id: Option<Uuid>,
 }
 

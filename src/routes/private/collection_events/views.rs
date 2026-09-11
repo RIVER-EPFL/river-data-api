@@ -551,8 +551,8 @@ pub async fn list_site_visits(
             ))
             .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).is_not_null())
             .add_group_by([
-                Expr::col((r.clone(), readings::Column::CollectionEventId)).into(),
-                Expr::col((r.clone(), readings::Column::ParameterId)).into(),
+                Expr::col((r.clone(), readings::Column::CollectionEventId)),
+                Expr::col((r.clone(), readings::Column::ParameterId)),
             ])
             .take();
         let (cell_sql, cell_values) = cell_query.build(PostgresQueryBuilder);

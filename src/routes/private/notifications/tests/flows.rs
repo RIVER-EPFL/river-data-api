@@ -67,3 +67,31 @@ fn test_battery_trend_query_reads_the_night_window_only() {
         "{sql}"
     );
 }
+
+/// The claim and its release both interpolate the column's name, so the name the enum renders has
+/// to be the table's own, and each notice has to claim its own marker.
+mod claim_column {
+    use super::super::claim_column;
+    use crate::routes::private::alarms::models::alarm_event;
+
+    #[test]
+    fn test_claim_column_is_per_notice() {
+        assert!(matches!(
+            claim_column(true),
+            alarm_event::Column::NotifiedAt
+        ));
+        assert!(matches!(
+            claim_column(false),
+            alarm_event::Column::ResolutionNotifiedAt
+        ));
+    }
+
+    #[test]
+    fn test_claim_column_renders_the_table_s_own_name() {
+        assert_eq!(sea_orm::Iden::to_string(&claim_column(true)), "notified_at");
+        assert_eq!(
+            sea_orm::Iden::to_string(&claim_column(false)),
+            "resolution_notified_at"
+        );
+    }
+}

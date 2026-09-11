@@ -42,6 +42,7 @@ fn test_the_entities_with_no_project_dimension_are_the_ones_a_scoped_token_is_re
             "standard_curves",
             "sensors",
             "reprocessing_jobs",
+            "reprocessing_job_logs",
             "parameters",
             "constants",
             "schedules",

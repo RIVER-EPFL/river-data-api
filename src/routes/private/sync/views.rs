@@ -42,6 +42,7 @@ use crate::common::paging::{Window, content_range};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors;
 use crate::routes::private::sync::flows as reconcile;
+use crate::routes::private::sync::hold_model;
 
 use super::flows;
 use super::models::*;
@@ -1213,7 +1214,7 @@ pub async fn duplicate_slots(
                                 Expr::col(readings::Column::ParameterId).eq(slot.parameter_id),
                             )
                             .and_where(Expr::col(readings::Column::WithdrawnAt).is_null())
-                            .add_group_by([Expr::col(readings::Column::Time).into()])
+                            .add_group_by([Expr::col(readings::Column::Time)])
                             .and_having(Expr::cust("COUNT(DISTINCT stream_id) > 1"))
                             .take(),
                         Alias::new("t"),
@@ -1527,6 +1528,7 @@ pub async fn acknowledge_hold(
     Ok(Json(AcknowledgeResponse {
         acknowledged: 1,
         skipped_undeclared_estimator: 0,
+        skipped_no_stream: 0,
     }))
 }
 
@@ -2219,6 +2221,7 @@ pub async fn acknowledge_holds_bulk(
             binds.len()
         ));
     }
+    let stream_scoped = payload.stream_id.is_some() || payload.source_system.is_some();
     if let Some(stream_id) = payload.stream_id {
         binds.push(stream_id.into());
         bounds.push_str(&format!(" AND h.stream_id = ${}", binds.len()));
@@ -2274,6 +2277,27 @@ pub async fn acknowledge_holds_bulk(
         ))
         .await?
         .map_or(Ok(0_i64), |row| row.try_get::<i64>("", "n"))?;
+
+    // Holds carrying no stream are out of the acknowledging statement's reach: it joins
+    // `data_streams`, and every filter this route takes is a replicate-statistics threshold. Count
+    // them so a sweep states what it passed over instead of returning a total that reads as the
+    // whole queue (B262). A call naming a stream or a source system asked for streams, so nothing
+    // was passed over; only the instant bounds narrow the rest.
+    let skipped_no_stream = if stream_scoped {
+        0
+    } else {
+        use sea_orm::PaginatorTrait as _;
+        let mut stream_less = hold_model::Entity::find()
+            .filter(hold_model::Column::Status.eq(HoldStatus::Pending.as_str()))
+            .filter(hold_model::Column::StreamId.is_null());
+        if let Some(start) = payload.start {
+            stream_less = stream_less.filter(hold_model::Column::GroupTime.gte(start));
+        }
+        if let Some(end) = payload.end {
+            stream_less = stream_less.filter(hold_model::Column::GroupTime.lte(end));
+        }
+        stream_less.count(&state.db).await?
+    };
 
     let resolution_sql = accept_ours_resolution_sql("$1");
     let acknowledged = state
@@ -2334,6 +2358,7 @@ pub async fn acknowledge_holds_bulk(
     Ok(Json(AcknowledgeResponse {
         acknowledged,
         skipped_undeclared_estimator: u64::try_from(skipped).unwrap_or(0),
+        skipped_no_stream,
     }))
 }
 
@@ -3198,7 +3223,7 @@ pub async fn plan_instruments(
                 .expr_as(Expr::cust("COUNT(*)"), Alias::new("n"))
                 .from(readings::Entity)
                 .and_where(Expr::col(readings::Column::StandardCurveId).is_not_null())
-                .add_group_by([Expr::col(readings::Column::StandardCurveId).into()])
+                .add_group_by([Expr::col(readings::Column::StandardCurveId)])
                 .take(),
         ))
         .await?

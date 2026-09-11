@@ -672,6 +672,11 @@ pub struct AcknowledgeResponse {
     /// decision about which formula this slot publishes without anyone having made one.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub skipped_undeclared_estimator: u64,
+    /// Pending holds this call could not reach: a hold with no stream is keyed on its slot rather
+    /// than a stream, and the sweep's statement and every filter it takes are about streams. The
+    /// count is what keeps `acknowledged` from reading as the whole queue.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skipped_no_stream: u64,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

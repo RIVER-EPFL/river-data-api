@@ -5,7 +5,7 @@ use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::sea_query::{Alias, Expr, Func, JoinType, Order, PostgresQueryBuilder, Query};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
-    FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
+    FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use sea_orm_migration::sea_orm::DbErr;
 
@@ -2871,18 +2871,11 @@ pub(super) async fn load_calculation<C: ConnectionTrait>(
     db: &C,
     script_id: Uuid,
 ) -> AppResult<Option<CalculationRow>> {
-    let Some(row) = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT name, label, description, engine, active_version_id \
-               FROM tool_scripts WHERE id = $1",
-            [script_id.into()],
-        ))
-        .await?
-    else {
+    let Some(row) = script::Entity::find_by_id(script_id).one(db).await? else {
         return Ok(None);
     };
-    let row = StoredCalculation::from_query_result(&row, "")?;
+    // An engine outside the vocabulary is a calculation this executor runs as a script, not a
+    // decode failure.
     Ok(Some(CalculationRow {
         name: row.name,
         label: row.label,
@@ -2890,17 +2883,6 @@ pub(super) async fn load_calculation<C: ConnectionTrait>(
         engine: Engine::parse(&row.engine).unwrap_or(Engine::Script),
         active_version_id: row.active_version_id,
     }))
-}
-
-/// A calculation as its row stands, with `engine` left as the stored word: an engine outside the
-/// vocabulary is a calculation this executor runs as a script, not a decode failure.
-#[derive(FromQueryResult)]
-pub(super) struct StoredCalculation {
-    name: String,
-    label: String,
-    description: Option<String>,
-    engine: String,
-    active_version_id: Option<Uuid>,
 }
 
 /// Mint and activate a version for a formula calculation whose formula set has changed. A script
@@ -3038,22 +3020,19 @@ pub(super) async fn activate<C: ConnectionTrait>(
     to: Uuid,
     actor: Option<&str>,
 ) -> AppResult<()> {
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO tool_script_activations \
-             (tool_script_id, from_version_id, to_version_id, activated_by) \
-         VALUES ($1, $2, $3, $4)",
-        [
-            script_id.into(),
-            from.into(),
-            to.into(),
-            actor.map(str::to_string).into(),
-        ],
-    ))
+    super::models::activation::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tool_script_id: Set(script_id),
+        from_version_id: Set(from),
+        to_version_id: Set(to),
+        activated_by: Set(actor.map(str::to_string)),
+        activated_at: Set(chrono::Utc::now()),
+    }
+    .insert(db)
     .await?;
     script::Entity::update_many()
         .col_expr(script::Column::ActiveVersionId, Expr::value(to))
-        .col_expr(script::Column::UpdatedAt, Expr::current_timestamp().into())
+        .col_expr(script::Column::UpdatedAt, Expr::current_timestamp())
         .filter(script::Column::Id.eq(script_id))
         .exec(db)
         .await?;

@@ -31,8 +31,6 @@ pub struct BatchStatusEventsResponse {
     pub inserted: usize,
 }
 
-const BATCH_SIZE: usize = 1000;
-
 /// Batch insert non-numeric device status events (e.g. "low_battery", "offline").
 /// Auto-creates "api" streams as needed. 10MB body limit. Requires `write_data`.
 #[utoipa::path(
@@ -91,34 +89,7 @@ pub async fn insert_batch_status_events(
         .collect();
 
     let total = models.len();
-    let mut inserted = 0usize;
-
-    for chunk in models.chunks(BATCH_SIZE) {
-        match status_events::Entity::insert_many(chunk.to_vec())
-            .on_conflict(
-                sea_orm::sea_query::OnConflict::columns([
-                    status_events::Column::StreamId,
-                    status_events::Column::Time,
-                ])
-                .do_nothing()
-                .to_owned(),
-            )
-            .exec_without_returning(&state.db)
-            .await
-        {
-            Ok(rows) => inserted += rows as usize,
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("None of the records") {
-                    // All duplicates in this chunk
-                } else {
-                    tracing::warn!(error = %e, batch_size = chunk.len(), "Failed to insert status event batch");
-                    return Err(crate::error::AppError::Database(e));
-                }
-            }
-        }
-    }
-
+    let inserted = status_events::service::insert_ignoring_duplicates(&state.db, models).await?;
     tracing::info!(total, inserted, "Batch status events insert complete");
     Ok(Json(BatchStatusEventsResponse { inserted }))
 }

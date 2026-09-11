@@ -6,16 +6,18 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, ExprTrait, OnConflict};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, QueryOrder, Statement,
+    ActiveValue, ActiveValue::NotSet, ActiveValue::Set, ColumnTrait, ConnectionTrait,
+    DatabaseConnection, DbErr, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter,
+    QueryOrder, Statement, TryInsertResult,
 };
 use std::fmt::Write as _;
 use uuid::Uuid;
 
 use super::models::*;
 use crate::common::AppState;
+use crate::routes::private::alarms::models::alarm_event;
 use crate::common::authz::Role;
 use crate::common::grants::load_grants;
 use crate::common::middleware::AuthContext;
@@ -210,21 +212,24 @@ pub async fn probe_once(db: &DatabaseConnection, config: &Config) -> usize {
             Ok(d) => (true, d),
             Err(e) => (false, e),
         };
-        let res = db
-            .execute_raw(Statement::from_sql_and_values(
-                PG,
-                "INSERT INTO notification_state (kind, subject_key, state, last_notified_at, \
-                     detail) \
-                 VALUES ($1, $2, $3, NOW(), $4) \
-                 ON CONFLICT (kind, subject_key) DO UPDATE SET state = EXCLUDED.state, \
-                     detail = EXCLUDED.detail, last_notified_at = EXCLUDED.last_notified_at",
-                [
-                    CHANNEL_HEALTH_KIND.into(),
-                    ch.name().into(),
-                    if healthy { "healthy" } else { "unhealthy" }.into(),
-                    detail.into(),
-                ],
-            ))
+        let row = state::ActiveModel {
+            kind: ActiveValue::Set(CHANNEL_HEALTH_KIND.to_string()),
+            subject_key: ActiveValue::Set(ch.name().to_string()),
+            state: ActiveValue::Set(if healthy { "healthy" } else { "unhealthy" }.to_string()),
+            last_notified_at: ActiveValue::Set(Utc::now()),
+            detail: ActiveValue::Set(Some(detail)),
+        };
+        let res = state::Entity::insert(row)
+            .on_conflict(
+                OnConflict::columns([state::Column::Kind, state::Column::SubjectKey])
+                    .update_columns([
+                        state::Column::State,
+                        state::Column::Detail,
+                        state::Column::LastNotifiedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec(db)
             .await;
         if let Err(e) = res {
             tracing::warn!(error = %e, channel = ch.name(), "failed to upsert channel health");
@@ -237,14 +242,10 @@ pub(super) async fn read_health(db: &DatabaseConnection, config: &Config) -> Not
     let known = [("web_push", config.web_push_configured())];
     let mut channels = Vec::with_capacity(known.len());
     for (name, available) in known {
-        let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                PG,
-                "SELECT state = 'healthy' AS healthy, detail, last_notified_at AS checked_at \
-                   FROM notification_state \
-                  WHERE kind = $1 AND subject_key = $2",
-                [CHANNEL_HEALTH_KIND.into(), name.into()],
-            ))
+        let row = state::Entity::find()
+            .filter(state::Column::Kind.eq(CHANNEL_HEALTH_KIND))
+            .filter(state::Column::SubjectKey.eq(name))
+            .one(db)
             .await
             .ok()
             .flatten();
@@ -252,9 +253,9 @@ pub(super) async fn read_health(db: &DatabaseConnection, config: &Config) -> Not
         // state is unknown, which is what `None` says on every one of these three.
         let (healthy, detail, checked_at) = match row {
             Some(r) => (
-                r.try_get::<bool>("", "healthy").ok(),
-                r.try_get::<Option<String>>("", "detail").ok().flatten(),
-                r.try_get::<DateTime<Utc>>("", "checked_at").ok(),
+                Some(r.state == "healthy"),
+                r.detail,
+                Some(r.last_notified_at),
             ),
             None => (None, None, None),
         };
@@ -618,7 +619,7 @@ pub(super) async fn stamp_success(db: &DatabaseConnection, id: Uuid) {
     let _ = push_subscription::Entity::update_many()
         .col_expr(
             push_subscription::Column::LastSuccessAt,
-            Expr::current_timestamp().into(),
+            Expr::current_timestamp(),
         )
         .filter(push_subscription::Column::Id.eq(id))
         .exec(db)
@@ -962,12 +963,17 @@ pub(super) async fn log_delivery(
 
 /// Atomically claim one outbox event by stamping its sent-marker column iff still NULL. The single
 /// replica whose UPDATE flips it from NULL wins (gets a RETURNING row) and sends; a peer that lost the
-/// race gets no row and skips. `column` is an internal literal, never user input.
+/// race gets no row and skips.
+///
+/// Raw because the claim is the `WHERE ... IS NULL` read back through `RETURNING`: the statement
+/// decides the winner, and no generated writer spells that (M206). The column is the entity's own,
+/// so the only names this can interpolate are the table's.
 pub(super) async fn claim_event(
     db: &DatabaseConnection,
-    column: &str,
+    column: alarm_event::Column,
     id: Uuid,
 ) -> Result<bool, DbErr> {
+    let column = sea_orm::Iden::to_string(&column);
     let sql = format!(
         "UPDATE alarm_events SET {column} = NOW(), updated_at = NOW() \
          WHERE id = $1 AND {column} IS NULL RETURNING id"
@@ -985,16 +991,17 @@ pub(super) async fn claim_event(
 /// Release a claim after an all-channel send failure so the next tick retries it (at-least-once).
 pub(super) async fn release_claim(
     db: &DatabaseConnection,
-    column: &str,
+    column: alarm_event::Column,
     id: Uuid,
 ) -> Result<(), DbErr> {
-    let sql = format!("UPDATE alarm_events SET {column} = NULL WHERE id = $1");
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        &sql,
-        [id.into()],
-    ))
-    .await?;
+    alarm_event::Entity::update_many()
+        .col_expr(
+            column,
+            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+        )
+        .filter(alarm_event::Column::Id.eq(id))
+        .exec(db)
+        .await?;
     Ok(())
 }
 
@@ -1186,30 +1193,17 @@ pub(super) async fn send_to_user(
 }
 
 /// A notification's stored state and when it last fired.
-#[derive(FromQueryResult)]
-pub(super) struct StoredState {
-    state: String,
-    last_notified_at: DateTime<Utc>,
-}
-
 pub(super) async fn state_get(
     db: &DatabaseConnection,
     kind: &str,
     key: &str,
 ) -> Result<Option<(String, DateTime<Utc>)>, DbErr> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            PG,
-            "SELECT state, last_notified_at FROM notification_state \
-             WHERE kind = $1 AND subject_key = $2",
-            [kind.into(), key.into()],
-        ))
-        .await?;
-    row.map(|r| {
-        let stored = StoredState::from_query_result(&r, "")?;
-        Ok((stored.state, stored.last_notified_at))
-    })
-    .transpose()
+    Ok(state::Entity::find()
+        .filter(state::Column::Kind.eq(kind))
+        .filter(state::Column::SubjectKey.eq(key))
+        .one(db)
+        .await?
+        .map(|r| (r.state, r.last_notified_at)))
 }
 
 pub(super) async fn state_upsert(
@@ -1235,99 +1229,99 @@ pub(super) async fn state_clear(
     kind: &str,
     key: &str,
 ) -> Result<(), DbErr> {
-    db.execute_raw(Statement::from_sql_and_values(
-        PG,
-        "DELETE FROM notification_state WHERE kind = $1 AND subject_key = $2",
-        [kind.into(), key.into()],
-    ))
-    .await?;
+    state::Entity::delete_many()
+        .filter(state::Column::Kind.eq(kind))
+        .filter(state::Column::SubjectKey.eq(key))
+        .exec(db)
+        .await?;
     Ok(())
 }
 
 // Multi-replica claims: each transition is committed to `notification_state` BEFORE the send so that
-// at 2-3 replicas exactly one replica sends. The unique (kind, subject_key) key arbitrates the race,
-// the single winner gets a RETURNING row, losers get none and skip.
+// at 2-3 replicas exactly one replica sends. The unique (kind, subject_key) key arbitrates the race:
+// the conflict action's own `WHERE` decides the winner, and an insert that neither stored nor
+// updated a row is the loser's answer (`TryInsertResult::Conflicted`).
+
+fn firing(kind: &str, key: &str, at: DateTime<Utc>) -> state::ActiveModel {
+    state::ActiveModel {
+        kind: Set(kind.to_string()),
+        subject_key: Set(key.to_string()),
+        state: Set("firing".to_string()),
+        last_notified_at: Set(at),
+        detail: NotSet,
+    }
+}
+
+/// Whether the insert stored or updated a row: the claim was won.
+async fn claim_won(
+    db: &DatabaseConnection,
+    insert: sea_orm::Insert<state::ActiveModel>,
+) -> Result<bool, DbErr> {
+    Ok(matches!(
+        insert.try_insert().exec(db).await?,
+        TryInsertResult::Inserted(_)
+    ))
+}
 
 /// Claim a fresh firing transition: insert the dedup row iff absent. Winner sends.
-pub(super) async fn claim_insert(
-    db: &DatabaseConnection,
-    kind: &str,
-    key: &str,
-) -> Result<bool, DbErr> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            PG,
-            "INSERT INTO notification_state (kind, subject_key, state, last_notified_at) \
-             VALUES ($1, $2, 'firing', NOW()) \
-             ON CONFLICT (kind, subject_key) DO NOTHING RETURNING 1 AS one",
-            [kind.into(), key.into()],
-        ))
-        .await?;
-    Ok(row.is_some())
+pub async fn claim_insert(db: &DatabaseConnection, kind: &str, key: &str) -> Result<bool, DbErr> {
+    let insert = state::Entity::insert(firing(kind, key, Utc::now())).on_conflict(
+        OnConflict::columns([state::Column::Kind, state::Column::SubjectKey])
+            .do_nothing()
+            .to_owned(),
+    );
+    claim_won(db, insert).await
 }
 
 /// Claim a resolve transition: delete the dedup row. Winner sends the recovery message.
-pub(super) async fn claim_clear(
-    db: &DatabaseConnection,
-    kind: &str,
-    key: &str,
-) -> Result<bool, DbErr> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            PG,
-            "DELETE FROM notification_state WHERE kind = $1 AND subject_key = $2 RETURNING 1 AS one",
-            [kind.into(), key.into()],
-        ))
+pub async fn claim_clear(db: &DatabaseConnection, kind: &str, key: &str) -> Result<bool, DbErr> {
+    let res = state::Entity::delete_many()
+        .filter(state::Column::Kind.eq(kind))
+        .filter(state::Column::SubjectKey.eq(key))
+        .exec(db)
         .await?;
-    Ok(row.is_some())
+    Ok(res.rows_affected > 0)
 }
 
 /// Claim a (re-)notify with a suppression window: win iff there is no prior alert or the last one was
 /// more than `within_hours` ago. Atomically advances the timestamp so a single replica re-notifies.
-pub(super) async fn claim_renotify(
+pub async fn claim_renotify(
     db: &DatabaseConnection,
     kind: &str,
     key: &str,
     within_hours: i64,
 ) -> Result<bool, DbErr> {
-    let sql = format!(
-        "INSERT INTO notification_state (kind, subject_key, state, last_notified_at) \
-         VALUES ($1, $2, 'firing', NOW()) \
-         ON CONFLICT (kind, subject_key) DO UPDATE SET last_notified_at = NOW(), state = 'firing' \
-         WHERE notification_state.last_notified_at < NOW() - INTERVAL '{within_hours} hours' \
-         RETURNING 1 AS one"
+    let now = Utc::now();
+    let insert = state::Entity::insert(firing(kind, key, now)).on_conflict(
+        OnConflict::columns([state::Column::Kind, state::Column::SubjectKey])
+            .update_columns([state::Column::LastNotifiedAt, state::Column::State])
+            .action_and_where(
+                Expr::col((state::Entity, state::Column::LastNotifiedAt))
+                    .lt(now - chrono::Duration::hours(within_hours)),
+            )
+            .to_owned(),
     );
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            PG,
-            &sql,
-            [kind.into(), key.into()],
-        ))
-        .await?;
-    Ok(row.is_some())
+    claim_won(db, insert).await
 }
 
 /// Claim by advancing a watermark: win iff the stored timestamp still equals `expected` (the value
 /// just read), or the row is absent. A replica that already advanced it wins the compare-and-swap and
 /// the loser skips, so a digest is sent once.
-pub(super) async fn claim_cas(
+pub async fn claim_cas(
     db: &DatabaseConnection,
     kind: &str,
     key: &str,
     expected: DateTime<Utc>,
 ) -> Result<bool, DbErr> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            PG,
-            "INSERT INTO notification_state (kind, subject_key, state, last_notified_at) \
-             VALUES ($1, $2, 'firing', NOW()) \
-             ON CONFLICT (kind, subject_key) DO UPDATE SET last_notified_at = NOW(), state = 'firing' \
-             WHERE notification_state.last_notified_at = $3 \
-             RETURNING 1 AS one",
-            [kind.into(), key.into(), expected.into()],
-        ))
-        .await?;
-    Ok(row.is_some())
+    let insert = state::Entity::insert(firing(kind, key, Utc::now())).on_conflict(
+        OnConflict::columns([state::Column::Kind, state::Column::SubjectKey])
+            .update_columns([state::Column::LastNotifiedAt, state::Column::State])
+            .action_and_where(
+                Expr::col((state::Entity, state::Column::LastNotifiedAt)).eq(expected),
+            )
+            .to_owned(),
+    );
+    claim_won(db, insert).await
 }
 
 /// Readings each sync service reported bringing in since `since`, from the per-cycle count the

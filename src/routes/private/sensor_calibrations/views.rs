@@ -262,7 +262,7 @@ pub async fn retire_calibration(
         super::models::Entity::update_many()
             .col_expr(
                 super::models::Column::RetiredAt,
-                Expr::current_timestamp().into(),
+                Expr::current_timestamp(),
             )
             .col_expr(
                 super::models::Column::RetiredBy,
@@ -591,7 +591,7 @@ pub async fn get_calibration_window(
     ];
     let flag = || {
         Func::coalesce([
-            Expr::col(readings::Column::IsFlagged).into(),
+            Expr::col(readings::Column::IsFlagged),
             Expr::value(false),
         ])
     };
@@ -927,7 +927,7 @@ async fn fetch_calibration_candidates(
             Condition::all().add(Expr::cust("true")),
         )
         .cond_where(scanned)
-        .add_group_by([Expr::col((r.clone(), readings::Column::SensorId)).into()])
+        .add_group_by([Expr::col((r.clone(), readings::Column::SensorId))])
         .order_by_expr(Expr::cust("COUNT(*)"), Order::Desc)
         .take()
         .build(PostgresQueryBuilder);
@@ -1035,12 +1035,12 @@ async fn fetch_foreign_curve_uses(
         )
         .cond_where(scanned)
         .add_group_by([
-            Expr::col((r.clone(), readings::Column::SensorId)).into(),
-            Expr::col((sc.clone(), standard_curves::Column::Id)).into(),
-            Expr::col((sc.clone(), standard_curves::Column::SensorId)).into(),
-            Expr::col((sc.clone(), standard_curves::Column::Name)).into(),
-            Expr::col((r.clone(), readings::Column::SiteId)).into(),
-            Expr::col((r.clone(), readings::Column::ParameterId)).into(),
+            Expr::col((r.clone(), readings::Column::SensorId)),
+            Expr::col((sc.clone(), standard_curves::Column::Id)),
+            Expr::col((sc.clone(), standard_curves::Column::SensorId)),
+            Expr::col((sc.clone(), standard_curves::Column::Name)),
+            Expr::col((r.clone(), readings::Column::SiteId)),
+            Expr::col((r.clone(), readings::Column::ParameterId)),
         ])
         .order_by_expr(Expr::cust("COUNT(*)"), Order::Desc)
         .take()
@@ -1105,9 +1105,9 @@ async fn fetch_orphaned_corrections(
         .from_as(readings::Entity, r.clone())
         .cond_where(scanned)
         .add_group_by([
-            Expr::col((r.clone(), readings::Column::SensorId)).into(),
-            Expr::col((r.clone(), readings::Column::SiteId)).into(),
-            Expr::col((r.clone(), readings::Column::ParameterId)).into(),
+            Expr::col((r.clone(), readings::Column::SensorId)),
+            Expr::col((r.clone(), readings::Column::SiteId)),
+            Expr::col((r.clone(), readings::Column::ParameterId)),
         ])
         .order_by_expr(Expr::cust("COUNT(*)"), Order::Desc)
         .take()

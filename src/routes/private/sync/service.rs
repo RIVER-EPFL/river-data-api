@@ -7,7 +7,7 @@ use axum::http::request::Parts;
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
 use sea_orm::sea_query::{
-    Alias, Expr, ExprTrait as _, JoinType, PostgresQueryBuilder, Query as SeaQuery,
+    Alias, Expr, ExprTrait as _, Func, JoinType, PostgresQueryBuilder, Query as SeaQuery,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
@@ -2087,7 +2087,7 @@ pub async fn load_instrument_catalog(
         .filter(|row| {
             row.metadata
                 .as_ref()
-                .and_then(|m| m.get("minted_from_stream"))
+                .and_then(|m| m.get(sensors::models::MINTED_FROM_STREAM))
                 .is_some()
         })
         .map(|row| row.id)
@@ -3697,13 +3697,20 @@ pub(super) async fn mint_plan_instruments<C: ConnectionTrait>(
         // upsert resolved to that row rather than creating one. It is the default the review exists
         // to answer, so it takes the name the operator gave and stops being a default; without this
         // the name is silently discarded and the plan reports a creation that did not happen.
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE sensors SET name = $2, metadata = metadata - 'minted_from_stream' \
-             WHERE id = $1 AND metadata ? 'minted_from_stream'",
-            [id.into(), want.name.clone().into()],
-        ))
-        .await?;
+        sensors::Entity::update_many()
+            .col_expr(sensors::Column::Name, Expr::value(Some(want.name.clone())))
+            .col_expr(
+                sensors::Column::Metadata,
+                Expr::col(sensors::Column::Metadata).sub(sensors::models::MINTED_FROM_STREAM),
+            )
+            .filter(sensors::Column::Id.eq(id))
+            .filter(Expr::expr(
+                Func::cust(Alias::new("jsonb_exists"))
+                    .arg(Expr::col(sensors::Column::Metadata))
+                    .arg(sensors::models::MINTED_FROM_STREAM),
+            ))
+            .exec(txn)
+            .await?;
         minted.insert(source_key.to_string(), id);
     }
     Ok(minted)
@@ -4321,8 +4328,8 @@ pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityC
         .from(readings::models::Entity)
         .and_where(Expr::col(readings::models::Column::ParameterId).is_not_null())
         .add_group_by([
-            Expr::col(readings::models::Column::SiteId).into(),
-            Expr::col(readings::models::Column::ParameterId).into(),
+            Expr::col(readings::models::Column::SiteId),
+            Expr::col(readings::models::Column::ParameterId),
         ])
         .take();
     let (sql, values) = SeaQuery::select()
@@ -4350,7 +4357,7 @@ pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityC
                         .equals((sp.clone(), site_parameters::Column::SiteId)),
                 ),
         )
-        .add_group_by([Expr::col((sp, site_parameters::Column::ParameterId)).into()])
+        .add_group_by([Expr::col((sp, site_parameters::Column::ParameterId))])
         .take()
         .build(PostgresQueryBuilder);
     for row in db
@@ -4925,7 +4932,7 @@ pub(super) fn is_minted_default(sensor: &sensors::Model) -> bool {
     sensor
         .metadata
         .as_ref()
-        .and_then(|m| m.get("minted_from_stream"))
+        .and_then(|m| m.get(sensors::models::MINTED_FROM_STREAM))
         .is_some()
 }
 

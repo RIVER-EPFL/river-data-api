@@ -241,6 +241,10 @@ async fn insert_curve<C: ConnectionTrait>(
     sensor_id: Uuid,
 ) -> AppResult<Uuid> {
     let id = Uuid::new_v4();
+    // Raw for its `DO NOTHING`: a stored curve is never rewritten, and an edited one is superseded
+    // by the caller above rather than updated in place. crudcrate's registration has no
+    // insert-only arm, so `upsert` here would overwrite the coefficients readings were made with
+    // (M208).
     conn.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO standard_curves

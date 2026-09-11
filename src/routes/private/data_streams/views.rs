@@ -600,21 +600,12 @@ pub async fn pair_stream(
                 return Err(AppError::BadRequest(reason));
             }
 
-            let claimed = txn
-                .execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "UPDATE data_streams \
-                 SET site_parameter_id = $1, paired_at = $2, updated_at = $2 \
-                 WHERE id = $3 AND site_parameter_id IS NULL",
-                    [
-                        payload.site_parameter_id.into(),
-                        now.into(),
-                        stream_id.into(),
-                    ],
-                ))
-                .await
-                .map_err(claim_error)?
-                .rows_affected();
+            let claimed =
+                super::service::claim_stream(stream_id, payload.site_parameter_id, now.into())
+                    .exec(txn)
+                    .await
+                    .map_err(claim_error)?
+                    .rows_affected;
 
             let stream = data_streams::Entity::find_by_id(stream_id)
                 .one(txn)

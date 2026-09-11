@@ -688,6 +688,48 @@ pub mod mutes {
     }
 }
 
+/// The dispatcher's dedup and claim rows, keyed `(kind, subject_key)`: one row per condition
+/// currently announced, plus the health of each delivery channel under `channel_health`.
+///
+/// Read-only as an entity (`routes(read)`): every writer is the dispatcher claiming or clearing a
+/// transition, never a person. The key is composite, so no single-row route is mounted (Q153).
+pub mod state {
+    use crudcrate::EntityToModels;
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(
+        Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize, EntityToModels,
+    )]
+    #[sea_orm(table_name = "notification_state")]
+    #[crudcrate(
+        api_struct = "NotificationState",
+        name_singular = "notification_state",
+        name_plural = "notification_states",
+        generate_router,
+        routes(read)
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key, filterable, sortable, exclude(update, create))]
+        pub kind: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key, filterable, sortable, exclude(update, create))]
+        pub subject_key: String,
+        #[crudcrate(filterable, exclude(update, create))]
+        pub state: String,
+        #[crudcrate(sortable, exclude(update, create))]
+        pub last_notified_at: chrono::DateTime<chrono::Utc>,
+        #[crudcrate(exclude(update, create))]
+        pub detail: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 #[cfg(test)]
 #[path = "tests/models.rs"]
 mod tests;

@@ -12,8 +12,8 @@ use crate::common::*;
 use serial_test::serial;
 
 /// The CRUD routes whose entity declares `operations`, minus `/tokens`, which is admin-only and
-/// admits no API token.
-const BATCHED: [&str; 13] = [
+/// admits no API token, and `/reprocessing_jobs`, which mounts its read routes only.
+const BATCHED: [&str; 12] = [
     "/api/parameters",
     "/api/site_parameters",
     "/api/sensors",
@@ -26,7 +26,6 @@ const BATCHED: [&str; 13] = [
     "/api/alarm_thresholds",
     "/api/data_streams",
     "/api/collection_events",
-    "/api/reprocessing_jobs",
 ];
 
 #[tokio::test]

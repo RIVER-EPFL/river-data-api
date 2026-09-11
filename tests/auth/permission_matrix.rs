@@ -367,17 +367,37 @@ fn entities() -> Vec<Entity> {
         catalog("alarm_thresholds", CrudScope::ProjectBound),
         admin_only("tokens"),
         admin_only("sync_service_credentials"),
-        admin_only("api_token_audit_logs"),
+        // The forensic trail: every API-token request appends one row, nothing else writes one.
+        Entity {
+            families: &["read"],
+            ..admin_only("api_token_audit_logs")
+        },
         admin_write("data_streams", CrudScope::ProjectBound),
         field("subprojects", CrudScope::ProjectBound),
         field("notes", CrudScope::ProjectBound),
         catalog("notification_mutes", CrudScope::Global),
         admin_only("notification_logs"),
+        // Channel health, `routes(read)`: the sweeper writes it, nothing else, so read is the
+        // whole surface.
+        Entity {
+            families: &["read"],
+            ..admin_only("notification_states")
+        },
         field_data("annotations", CrudScope::ProjectBound),
         catalog("constants", CrudScope::Global),
         field_data("samples", CrudScope::ProjectBound),
         field_data("collection_events", CrudScope::Global),
-        admin_write("reprocessing_jobs", CrudScope::Global),
+        // A job is enqueued by the worker and driven by the rerun and cancel actions below; the
+        // CRUD surface is the queue's read side.
+        Entity {
+            families: &["read"],
+            ..admin_write("reprocessing_jobs", CrudScope::Global)
+        },
+        // The job timeline: a running job appends, nothing else writes one.
+        Entity {
+            families: &["read"],
+            ..admin_write("reprocessing_job_logs", CrudScope::ProjectBound)
+        },
         admin_only("sync_services"),
         admin_only("sync_commands"),
         admin_only("sync_events"),
@@ -985,7 +1005,7 @@ async fn status_of(
     response.status().as_u16()
 }
 
-fn check(route: &Route, caller: Caller, actual: u16) {
+fn check(route: &Route, caller: Caller, actual: u16, crashes: &mut Vec<String>) {
     let want = expected(route, caller);
     let label = format!("{} {} as {}", route.method, route.path, caller.name());
     match want {
@@ -1003,11 +1023,26 @@ fn check(route: &Route, caller: Caller, actual: u16) {
         }
         Outcome::Forbidden => assert_eq!(actual, 403, "[{label}] expected 403, got {actual}"),
         // An admitted caller may still fail for a non-auth reason (400 on a junk body, 404 on a
-        // missing row). Only the auth boundary is under test.
-        Outcome::Allowed => assert!(
-            !(401..=403).contains(&actual),
-            "[{label}] expected to pass the gate, got {actual}"
-        ),
+        // missing row). Only the auth boundary is under test, but a 500 is not a refusal and not
+        // an answer: it is the handler crashing on an admitted caller, which this table is the
+        // one place to see.
+        Outcome::Allowed => {
+            assert!(
+                !(401..=403).contains(&actual),
+                "[{label}] expected to pass the gate, got {actual}"
+            );
+            // The tool run answers 503 when the R runner is unreachable, which is the deliberate
+            // answer under a profile that excludes the runner rather than a crash.
+            let runner_excluded = actual == 503
+                && route.declared == "/api/tools/{tool_name}/calculate"
+                && !crate::common::profile::selected()
+                    .covers(crate::common::profile::Service::ToolsRunner);
+            if actual >= 500 && !runner_excluded {
+                crashes.push(format!(
+                    "[{label}] passed the gate and crashed with {actual}"
+                ));
+            }
+        }
     }
 }
 
@@ -1091,6 +1126,7 @@ async fn every_route_answers_every_caller_as_the_policy_says() {
     let app = build_test_app_with_keycloak_admin(db.clone()).await;
     let callers = principals(&db, with_keycloak).await;
 
+    let mut crashes = Vec::new();
     for route in &table().0 {
         for (caller, token) in &callers {
             if caller.needs_keycloak() && !with_keycloak {
@@ -1104,9 +1140,14 @@ async fn every_route_answers_every_caller_as_the_policy_says() {
                 token.as_deref(),
             )
             .await;
-            check(route, *caller, actual);
+            check(route, *caller, actual, &mut crashes);
         }
     }
+    assert!(
+        crashes.is_empty(),
+        "routes that crash for an admitted caller:\n  {}",
+        crashes.join("\n  ")
+    );
 }
 
 /// The second row of every project-bound route: the same request against a project the caller was

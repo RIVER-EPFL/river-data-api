@@ -857,7 +857,7 @@ pub async fn resolve_or_mint_stream_instrument<C: ConnectionTrait>(
         // read as one by `resolve_measurement_type`. 'high' leaves that rung silent, so only a
         // declaration or a real device moves a stream to spot.
         "high",
-        Some(serde_json::json!({ "minted_from_stream": stream.source_key })),
+        Some(serde_json::json!({ super::models::MINTED_FROM_STREAM: stream.source_key })),
     )
     .await?;
     link_stream_to_sensor(db, stream, sensor_id).await?;

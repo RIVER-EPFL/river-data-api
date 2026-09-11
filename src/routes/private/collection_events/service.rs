@@ -140,8 +140,8 @@ pub async fn attach_collection_events<C: ConnectionTrait>(
         )
         .cond_where(attributed_spot(row_predicate.to_string(), binds.clone()))
         .add_group_by([
-            Expr::col((r(), readings::Column::SiteId)).into(),
-            Expr::col((r(), readings::Column::Time)).into(),
+            Expr::col((r(), readings::Column::SiteId)),
+            Expr::col((r(), readings::Column::Time)),
         ]);
     let mut insert = SeaQuery::insert();
     insert

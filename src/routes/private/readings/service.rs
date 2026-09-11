@@ -24,7 +24,11 @@ use sea_orm::QuerySelect;
 use sea_orm::Set;
 use sea_orm::Statement;
 use sea_orm::entity::prelude::*;
+use sea_orm::ActiveValue;
+use sea_orm::Value;
 use sea_orm::sea_query::Alias;
+use sea_orm::sea_query::OnConflict;
+use sea_orm::sea_query::SimpleExpr;
 use sea_orm::sea_query::CommonTableExpression;
 use sea_orm::sea_query::Expr;
 use sea_orm::sea_query::Func;
@@ -2678,17 +2682,17 @@ pub async fn rollback_set<C: ConnectionTrait>(
             "Decision set {set_id} was already rolled back"
         )));
     }
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id FROM reading_decisions WHERE set_id = $1 AND rolled_back_by IS NULL",
-            [set_id.into()],
-        ))
+    let live: Vec<Uuid> = decision_model::Entity::find()
+        .select_only()
+        .column(decision_model::Column::Id)
+        .filter(decision_model::Column::SetId.eq(set_id))
+        .filter(decision_model::Column::RolledBackBy.is_null())
+        .into_tuple()
+        .all(conn)
         .await?;
     let mut n = 0usize;
     let mut recorded = Recorded::default();
-    for row in &rows {
-        let id: Uuid = row.try_get("", "id")?;
+    for id in live {
         let (_, one) = rollback(conn, id, actor, reason).await?;
         recorded.rows += one.rows;
         recorded.span = match (recorded.span, one.span) {
@@ -3262,18 +3266,17 @@ pub(super) async fn job_logs<C: ConnectionTrait>(
     if jobs.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = JobLogRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT job_id, level, message, ts FROM reprocessing_job_logs \
-          WHERE job_id = ANY($1) AND level <> 'info' ORDER BY ts DESC",
-        [jobs.to_vec().into()],
-    ))
-    .all(conn)
-    .await?;
+    use crate::routes::private::reprocessing_jobs::models::job_log;
+    let rows = job_log::Entity::find()
+        .filter(job_log::Column::JobId.is_in(jobs.to_vec()))
+        .filter(job_log::Column::Level.ne("info"))
+        .order_by_desc(job_log::Column::Ts)
+        .all(conn)
+        .await?;
     Ok(rows
         .into_iter()
         .map(|r| LedgerEntry {
-            at: r.ts,
+            at: r.ts.into(),
             source: "job_log".to_string(),
             severity: Severity::job_log(&r.level).as_str().to_string(),
             actor: None,
@@ -3808,6 +3811,34 @@ pub(super) async fn propagate(state: &AppState, recorded: &Recorded, actor: &str
 /// Returns whether this pass raised a *new* proposal, which is what stops the pass counting as
 /// clean: a decision already taken on this exact number stands, and only a number nobody has seen
 /// resets the row to `pending`.
+/// The same predicate as SQL, over the conflicting row and the one being inserted. The upsert has
+/// to decide this inside the statement: whether a decision survives is read and written in one
+/// place, and a read-then-write would let a concurrent pass reopen a row a person just decided.
+///
+/// `IS DISTINCT FROM` is named as text because sea_query has no operator for it; both sides are
+/// the entity's own columns, so no column name is spelled.
+fn distinct_from(column: change_proposal::Column) -> SimpleExpr {
+    Expr::cust_with_exprs(
+        "$1 IS DISTINCT FROM $2",
+        [
+            Expr::col((change_proposal::Entity, column)),
+            Expr::col((Alias::new("excluded"), column)),
+        ],
+    )
+}
+
+fn reopens_expr() -> SimpleExpr {
+    distinct_from(change_proposal::Column::ProposedRawValue)
+        .or(distinct_from(change_proposal::Column::ProposedStandardCurveId))
+}
+
+/// Keep the conflicting row's value where the proposal is unchanged, reset it where it is not.
+fn kept_unless_reopened(column: change_proposal::Column, reset_to: Value) -> SimpleExpr {
+    Expr::case(reopens_expr(), reset_to)
+        .finally(Expr::col((change_proposal::Entity, column)))
+        .into()
+}
+
 pub async fn propose<C: ConnectionTrait>(
     conn: &C,
     stream_id: Uuid,
@@ -3815,49 +3846,46 @@ pub async fn propose<C: ConnectionTrait>(
     proposed: (f64, Option<Uuid>),
     stored: (f64, Option<Uuid>),
 ) -> AppResult<bool> {
-    let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            // A row whose proposed value is unchanged keeps its status and its decision, and only
-            // its `last_seen_at` moves: the source is still asserting the number that was ruled on.
-            r"INSERT INTO reading_change_proposals
-                  (stream_id, time, replicate_index, proposed_raw_value, proposed_standard_curve_id,
-                   stored_raw_value, stored_standard_curve_id)
-              VALUES ($1, $2, $3, $4, $5, $6, $7)
-              ON CONFLICT (stream_id, time, replicate_index) DO UPDATE
-                 SET last_seen_at = now(),
-                     stored_raw_value = EXCLUDED.stored_raw_value,
-                     stored_standard_curve_id = EXCLUDED.stored_standard_curve_id,
-                     proposed_raw_value = EXCLUDED.proposed_raw_value,
-                     proposed_standard_curve_id = EXCLUDED.proposed_standard_curve_id,
-                     status = CASE
-                         WHEN reading_change_proposals.proposed_raw_value IS DISTINCT FROM EXCLUDED.proposed_raw_value
-                           OR reading_change_proposals.proposed_standard_curve_id IS DISTINCT FROM EXCLUDED.proposed_standard_curve_id
-                         THEN 'pending' ELSE reading_change_proposals.status END,
-                     decided_by = CASE
-                         WHEN reading_change_proposals.proposed_raw_value IS DISTINCT FROM EXCLUDED.proposed_raw_value
-                           OR reading_change_proposals.proposed_standard_curve_id IS DISTINCT FROM EXCLUDED.proposed_standard_curve_id
-                         THEN NULL ELSE reading_change_proposals.decided_by END,
-                     decided_at = CASE
-                         WHEN reading_change_proposals.proposed_raw_value IS DISTINCT FROM EXCLUDED.proposed_raw_value
-                           OR reading_change_proposals.proposed_standard_curve_id IS DISTINCT FROM EXCLUDED.proposed_standard_curve_id
-                         THEN NULL ELSE reading_change_proposals.decided_at END
-              RETURNING status = 'pending' AND decided_at IS NULL AS awaiting",
-            [
-                stream_id.into(),
-                key.0.into(),
-                key.1.into(),
-                proposed.0.into(),
-                proposed.1.into(),
-                stored.0.into(),
-                stored.1.into(),
-            ],
-        ))
+    let row = change_proposal::ActiveModel {
+        id: ActiveValue::Set(Uuid::new_v4()),
+        stream_id: ActiveValue::Set(stream_id),
+        time: ActiveValue::Set(key.0),
+        replicate_index: ActiveValue::Set(key.1),
+        proposed_raw_value: ActiveValue::Set(proposed.0),
+        proposed_standard_curve_id: ActiveValue::Set(proposed.1),
+        stored_raw_value: ActiveValue::Set(stored.0),
+        stored_standard_curve_id: ActiveValue::Set(stored.1),
+        ..Default::default()
+    };
+    let written = change_proposal::Entity::insert(row)
+        .on_conflict(proposal_conflict())
+        .exec_with_returning(conn)
         .await?;
-    Ok(row
-        .map(|r| r.try_get::<bool>("", "awaiting"))
-        .transpose()?
-        .unwrap_or(false))
+    Ok(written.status == "pending" && written.decided_at.is_none())
+}
+
+/// The conflict arm: the source's latest numbers always land, and the decision columns survive
+/// unless the proposal itself changed.
+pub(super) fn proposal_conflict() -> OnConflict {
+    use change_proposal::Column as P;
+    OnConflict::columns([P::StreamId, P::Time, P::ReplicateIndex])
+        .update_columns([
+            P::StoredRawValue,
+            P::StoredStandardCurveId,
+            P::ProposedRawValue,
+            P::ProposedStandardCurveId,
+        ])
+        .value(P::LastSeenAt, Expr::current_timestamp())
+        .value(P::Status, kept_unless_reopened(P::Status, "pending".into()))
+        .value(
+            P::DecidedBy,
+            kept_unless_reopened(P::DecidedBy, Value::String(None)),
+        )
+        .value(
+            P::DecidedAt,
+            kept_unless_reopened(P::DecidedAt, Value::ChronoDateTimeUtc(None)),
+        )
+        .to_owned()
 }
 
 pub(super) const SELECT: &str = r"SELECT p.id, p.stream_id, ds.source_system, ds.source_key,
@@ -7699,50 +7727,20 @@ pub(super) async fn stage_import_rows(
     import_token: Uuid,
     rows: &[StagedRow],
 ) -> AppResult<()> {
-    let mut seq: i64 = 0;
-    for chunk in rows.chunks(BATCH_SIZE) {
-        let mut sql = String::from(
-            "INSERT INTO csv_import_staging \
-             (import_token, stream_id, site_id, parameter_id, time, raw_value, \
-              sensor_id, calibration_id, deployment_id, seq) VALUES ",
-        );
-        let mut values: Vec<sea_orm::Value> = Vec::with_capacity(chunk.len() * 10);
-        for (i, r) in chunk.iter().enumerate() {
-            let base = i * 10;
-            if i > 0 {
-                sql.push(',');
-            }
-            sql.push_str(&format!(
-                "(${},${},${},${},${},${},${},${},${},${})",
-                base + 1,
-                base + 2,
-                base + 3,
-                base + 4,
-                base + 5,
-                base + 6,
-                base + 7,
-                base + 8,
-                base + 9,
-                base + 10,
-            ));
-            values.push(import_token.into());
-            values.push(r.stream_id.into());
-            values.push(r.site_id.into());
-            values.push(r.parameter_id.into());
-            values.push(sea_orm::prelude::DateTimeWithTimeZone::from(r.time).into());
-            values.push(r.raw_value.into());
-            values.push(r.sensor_id.into());
-            values.push(r.calibration_id.into());
-            values.push(r.deployment_id.into());
-            values.push(seq.into());
-            seq += 1;
-        }
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            values,
-        ))
-        .await?;
+    for (chunk_index, chunk) in rows.chunks(BATCH_SIZE).enumerate() {
+        let staged = chunk.iter().enumerate().map(|(i, r)| import_staging::ActiveModel {
+            import_token: ActiveValue::Set(import_token),
+            seq: ActiveValue::Set((chunk_index * BATCH_SIZE + i) as i64),
+            stream_id: ActiveValue::Set(r.stream_id),
+            site_id: ActiveValue::Set(Some(r.site_id)),
+            parameter_id: ActiveValue::Set(Some(r.parameter_id)),
+            time: ActiveValue::Set(r.time.into()),
+            raw_value: ActiveValue::Set(r.raw_value),
+            sensor_id: ActiveValue::Set(r.sensor_id),
+            calibration_id: ActiveValue::Set(r.calibration_id),
+            deployment_id: ActiveValue::Set(r.deployment_id),
+        });
+        import_staging::Entity::insert_many(staged).exec(db).await?;
     }
     Ok(())
 }

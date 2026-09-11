@@ -382,7 +382,9 @@ pub mod alarm_event {
         name_singular = "alarm_event",
         name_plural = "alarm_events",
         generate_router,
-        routes(read)
+        routes(read),
+        upsert_key(site_id, parameter_id, measurement_type),
+        upsert_where = Column::ResolvedAt.is_null()
     )]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
@@ -395,11 +397,14 @@ pub mod alarm_event {
         /// 1 = warning, 2 = alarm; what the episode reads as now.
         #[crudcrate(filterable, sortable)]
         pub severity: i16,
-        /// The worst it has been, which is what the history is ranked by.
-        #[crudcrate(filterable, sortable)]
+        /// The worst it has been, which is what the history is ranked by. Set when the episode
+        /// opens and advanced by the sweeper, never overwritten by a registration.
+        #[crudcrate(filterable, sortable, exclude(create, update))]
         pub max_severity: i16,
-        #[crudcrate(sortable)]
+        /// Fixed when the episode opens: a later breach of the same open episode leaves it.
+        #[crudcrate(sortable, exclude(create, update))]
         pub started_at: chrono::DateTime<chrono::Utc>,
+        #[crudcrate(exclude(create, update))]
         pub value_at_start: f64,
         #[crudcrate(sortable)]
         pub last_seen_at: chrono::DateTime<chrono::Utc>,
@@ -414,7 +419,7 @@ pub mod alarm_event {
         pub resolved_value: Option<f64>,
         #[crudcrate(exclude(create, update), sortable)]
         pub created_at: chrono::DateTime<chrono::Utc>,
-        #[crudcrate(exclude(create, update))]
+        #[crudcrate(exclude(create, update), on_update = chrono::Utc::now())]
         pub updated_at: chrono::DateTime<chrono::Utc>,
         /// When the subscribers were told the episode opened.
         pub notified_at: Option<chrono::DateTime<chrono::Utc>>,

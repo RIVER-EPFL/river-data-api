@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use sea_orm::sea_query::{Alias, Expr, Order, Query};
 use sea_orm::{
     ActiveModelTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
-    Set, Statement,
+    QueryFilter, Set, Statement,
 };
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -28,6 +28,7 @@ use crate::routes::private::readings::models::{
 };
 use crate::routes::private::readings::views::insert_grab_samples;
 use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport};
+use crate::routes::private::sync::hold_model;
 use crate::routes::private::sync::models::HoldKind;
 use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::private::sync::service as audit;
@@ -676,23 +677,16 @@ pub(super) async fn record_skip(
             continue;
         }
         // The absence is now explained, so the audit's account of the same slot gives way to it.
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "UPDATE replicate_audit_holds SET status = '{superseded}'
-                 WHERE stream_id IS NULL AND status = '{pending}'
-                   AND kind IN {kinds}
-                   AND site_id = $1 AND parameter_id = $2 AND group_time = $3",
-                superseded = HoldStatus::Superseded.as_str(),
-                pending = HoldStatus::Pending.as_str(),
-                kinds = HoldKind::sql_list(&[HoldKind::MissingOutput, HoldKind::StaleOutput])
+        supersede(
+            db,
+            hold_model::of_kinds(
+                hold_model::in_status(
+                    hold_model::slot(event.site_id, *parameter_id, event.collected_at),
+                    HoldStatus::Pending,
+                ),
+                &[HoldKind::MissingOutput, HoldKind::StaleOutput],
             ),
-            [
-                event.site_id.into(),
-                (*parameter_id).into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(event.collected_at).into(),
-            ],
-        ))
+        )
         .await?;
         upsert_finding(
             db,
@@ -719,24 +713,30 @@ pub(super) async fn has_pending_skip(
     event: &EventContext,
     parameter_id: Uuid,
 ) -> AppResult<bool> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT 1 AS found FROM replicate_audit_holds
-                 WHERE stream_id IS NULL AND status = '{pending}' AND kind = '{kind}'
-                   AND site_id = $1 AND parameter_id = $2 AND group_time = $3",
-                pending = HoldStatus::Pending.as_str(),
-                kind = HoldKind::SkippedOutput.as_str()
+    let found = hold_model::Entity::find()
+        .filter(hold_model::of_kinds(
+            hold_model::in_status(
+                hold_model::slot(event.site_id, parameter_id, event.collected_at),
+                HoldStatus::Pending,
             ),
-            [
-                event.site_id.into(),
-                parameter_id.into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(event.collected_at).into(),
-            ],
+            &[HoldKind::SkippedOutput],
         ))
+        .one(db)
         .await?;
-    Ok(row.is_some())
+    Ok(found.is_some())
+}
+
+/// Mark every finding the condition selects superseded, and say how many moved.
+async fn supersede(db: &DatabaseConnection, condition: sea_orm::Condition) -> AppResult<u64> {
+    let res = hold_model::Entity::update_many()
+        .col_expr(
+            hold_model::Column::Status,
+            Expr::value(HoldStatus::Superseded.as_str()),
+        )
+        .filter(condition)
+        .exec(db)
+        .await?;
+    Ok(res.rows_affected)
 }
 
 /// Close open findings for slots the current audit found in agreement (or now populated).
@@ -745,24 +745,14 @@ pub(super) async fn supersede_findings(
     event: &EventContext,
     parameter_id: Uuid,
 ) -> AppResult<u64> {
-    let res = db
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "UPDATE replicate_audit_holds SET status = '{superseded}'
-                 WHERE stream_id IS NULL AND status = '{pending}'
-                   AND site_id = $1 AND parameter_id = $2 AND group_time = $3",
-                superseded = HoldStatus::Superseded.as_str(),
-                pending = HoldStatus::Pending.as_str()
-            ),
-            [
-                event.site_id.into(),
-                parameter_id.into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(event.collected_at).into(),
-            ],
-        ))
-        .await?;
-    Ok(res.rows_affected())
+    supersede(
+        db,
+        hold_model::in_status(
+            hold_model::slot(event.site_id, parameter_id, event.collected_at),
+            HoldStatus::Pending,
+        ),
+    )
+    .await
 }
 
 /// The pinned script version a blob names, rebuilt as a runnable tool. `None` when the blob names

@@ -1,6 +1,7 @@
-//! The two tables the job machinery owns: a tracked job row and the cadence row that enqueues one.
+//! The three tables the job machinery owns: a tracked job row, its timeline, and the cadence row
+//! that enqueues one.
 //!
-//! One file, two modules, because each is a SeaORM entity and an entity owns the names `Model`,
+//! One file, three modules, because each is a SeaORM entity and an entity owns the names `Model`,
 //! `Entity` and `Column`.
 //!
 //! `QueuedJobResponse` is the shape every route that enqueues a job answers with, wherever that
@@ -48,6 +49,7 @@ pub mod job {
         name_singular = "reprocessing_job",
         name_plural = "reprocessing_jobs",
         generate_router,
+        routes(read),
         operations = ReprocessingJobOperations
     )]
     pub struct Model {
@@ -212,6 +214,68 @@ pub mod schedule {
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// A timeline entry as an entity.
+///
+/// `reprocessing_job_logs` is append-only and written only by a running job, so reads are the whole
+/// surface (`routes(read)`). Its key is `(job_id, seq)`: the job the line belongs to, and its
+/// position in that job's ordered timeline.
+pub mod job_log {
+    use crudcrate::EntityToModels;
+    use sea_orm::entity::prelude::*;
+
+    #[derive(
+        Clone,
+        Debug,
+        PartialEq,
+        DeriveEntityModel,
+        serde::Serialize,
+        serde::Deserialize,
+        EntityToModels,
+    )]
+    #[sea_orm(table_name = "reprocessing_job_logs")]
+    #[crudcrate(
+        api_struct = "ReprocessingJobLog",
+        name_singular = "reprocessing_job_log",
+        name_plural = "reprocessing_job_logs",
+        generate_router,
+        routes(read)
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key, filterable, sortable, exclude(create, update))]
+        pub job_id: Uuid,
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key, filterable, sortable, exclude(create, update))]
+        pub seq: i64,
+        #[crudcrate(filterable, sortable, exclude(create, update))]
+        pub ts: DateTimeWithTimeZone,
+        #[crudcrate(filterable, sortable, exclude(create, update))]
+        pub level: String,
+        #[crudcrate(exclude(create, update))]
+        pub message: String,
+        #[crudcrate(exclude(create, update))]
+        pub context: serde_json::Value,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "super::job::Entity",
+            from = "Column::JobId",
+            to = "super::job::Column::Id"
+        )]
+        Job,
+    }
+
+    impl Related<super::job::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::Job.def()
+        }
+    }
 
     impl ActiveModelBehavior for ActiveModel {}
 }

@@ -637,6 +637,32 @@ fn scoped_sensor_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectState
         .into_query()
 }
 
+/// Subquery selecting the job ids a restricted principal may read, on the same rule the
+/// `reprocessing_jobs` condition states: a job belongs to its site, else to the projects its sensor
+/// is deployed into, and one targeting neither is global. Used to confine `reprocessing_job_logs`,
+/// whose only scoping column is the job it belongs to.
+fn scoped_job_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::reprocessing_jobs;
+    use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
+    reprocessing_jobs::Entity::find()
+        .select_only()
+        .column(reprocessing_jobs::Column::Id)
+        .filter(
+            Condition::any()
+                .add(reprocessing_jobs::Column::SiteId.in_subquery(scoped_site_ids_query(projects)))
+                .add(
+                    reprocessing_jobs::Column::SensorId
+                        .in_subquery(scoped_sensor_ids_query(projects)),
+                )
+                .add(
+                    Condition::all()
+                        .add(reprocessing_jobs::Column::SiteId.is_null())
+                        .add(reprocessing_jobs::Column::SensorId.is_null()),
+                ),
+        )
+        .into_query()
+}
+
 /// Subquery selecting the site_parameter ids within a restricted principal's project set. Used to
 /// confine `data_streams`, whose scoping column is `site_parameter_id`.
 fn scoped_site_parameter_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
@@ -804,6 +830,10 @@ fn crud_scope_condition(
                     ),
             );
         }
+        // A timeline entry is confined the way the job it belongs to is, through the same
+        // subquery, so a line cannot be read where its job cannot.
+        "reprocessing_job_logs" => reprocessing_jobs::models::job_log::Column::JobId
+            .in_subquery(scoped_job_ids_query(projects)),
         _ => return None,
     };
     Some(Condition::all().add(expr))

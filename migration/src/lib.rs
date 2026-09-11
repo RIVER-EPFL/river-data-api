@@ -3,6 +3,7 @@ pub use sea_orm_migration::prelude::*;
 mod m20260905_000001_baseline;
 mod m20260911_000001_realtime_rollup_head;
 mod m20260911_000002_spot_param_sensor_index;
+mod m20260911_000003_csv_staging_key;
 
 pub struct Migrator;
 
@@ -13,6 +14,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260905_000001_baseline::Migration),
             Box::new(m20260911_000001_realtime_rollup_head::Migration),
             Box::new(m20260911_000002_spot_param_sensor_index::Migration),
+            Box::new(m20260911_000003_csv_staging_key::Migration),
         ]
     }
 }

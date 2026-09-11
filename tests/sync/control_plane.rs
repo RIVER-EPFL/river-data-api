@@ -756,6 +756,17 @@ async fn stale_running_sync_events_are_swept() {
         1,
         "fresh event untouched"
     );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) AS c FROM sync_events \
+             WHERE status = 'failed' AND completed_at IS NOT NULL \
+               AND errors @> '[\"Closed by sweeper: service stopped reporting\"]'::jsonb"
+        )
+        .await,
+        1,
+        "the closed row says who closed it and when"
+    );
 }
 
 /// The session token cache is a process-global `LazyLock`, so a rotation that appears to work

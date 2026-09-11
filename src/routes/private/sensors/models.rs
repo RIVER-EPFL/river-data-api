@@ -2,12 +2,17 @@
 
 use chrono::{DateTime, Utc};
 use crudcrate::EntityToModels;
+use sea_orm::ExprTrait;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use super::service::SensorOperations;
+
+/// The metadata key marking an instrument the stream registration minted as a default, not one an
+/// operator named. A review's name takes the row and removes the key.
+pub const MINTED_FROM_STREAM: &str = "minted_from_stream";
 
 #[derive(Clone, Debug, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels)]
 #[sea_orm(table_name = "sensors")]
@@ -16,7 +21,11 @@ use super::service::SensorOperations;
     name_singular = "sensor",
     name_plural = "sensors",
     generate_router,
-    operations = SensorOperations
+    operations = SensorOperations,
+    upsert_key(source_system, source_key),
+    upsert_where = Column::SourceSystem
+        .is_not_null()
+        .and(Column::SourceKey.is_not_null())
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]

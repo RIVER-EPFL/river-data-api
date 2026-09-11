@@ -22,6 +22,7 @@ use sea_orm::{
 use uuid::Uuid;
 
 use super::models::job::{ActiveModel, Column, Entity, ReprocessingJob};
+use super::models::schedule;
 
 // --- Job policy tables ---
 //
@@ -634,20 +635,16 @@ impl JobContext {
     /// `GET /api/jobs/{id}/logs`. Best-effort, a logging failure must never fail the job.
     pub async fn log(&self, level: &str, message: &str, context: serde_json::Value) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = self
-            .db
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "INSERT INTO reprocessing_job_logs (job_id, seq, level, message, context) \
-                 VALUES ($1, $2, $3, $4, $5::jsonb)",
-                [
-                    self.job_id.into(),
-                    seq.into(),
-                    level.into(),
-                    message.into(),
-                    context.to_string().into(),
-                ],
-            ))
+        let line = super::models::job_log::ActiveModel {
+            job_id: Set(self.job_id),
+            seq: Set(seq),
+            level: Set(level.to_string()),
+            message: Set(message.to_string()),
+            context: Set(context.clone()),
+            ..Default::default()
+        };
+        if let Err(e) = super::models::job_log::Entity::insert(line)
+            .exec(&self.db)
             .await
         {
             tracing::warn!(error = %e, job_id = %self.job_id, "Failed to append job log line");
@@ -958,21 +955,19 @@ pub async fn seed_default_schedules(
     for (job_name, sched) in registry.default_schedules() {
         let interval_seconds = Ord::max(sched.interval.num_seconds(), 1);
         let next_run_at = now + sched.interval;
-        db.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO schedules \
-                 (job_name, enabled, next_run_at, interval_seconds, overlap_policy, catchup_policy) \
-             VALUES ($1, true, $2, $3, $4, $5) \
-             ON CONFLICT (job_name) DO NOTHING",
-            [
-                job_name.into(),
-                next_run_at.into(),
-                interval_seconds.into(),
-                sched.overlap.as_str().into(),
-                sched.catchup.as_str().into(),
-            ],
-        ))
-        .await?;
+        let row = schedule::ActiveModel {
+            job_name: Set(job_name.to_string()),
+            enabled: Set(true),
+            next_run_at: Set(Some(next_run_at)),
+            interval_seconds: Set(Some(interval_seconds)),
+            overlap_policy: Set(Some(sched.overlap.as_str().to_string())),
+            catchup_policy: Set(Some(sched.catchup.as_str().to_string())),
+            ..Default::default()
+        };
+        schedule::Entity::insert(row)
+            .on_conflict_do_nothing()
+            .exec(db)
+            .await?;
     }
     Ok(())
 }
@@ -1031,22 +1026,25 @@ struct ClaimedSchedule {
     tunables: Option<serde_json::Value>,
 }
 
+/// The enabled schedules whose slot has come due, soonest first, one row locked for this claim and
+/// skipped by any peer already holding it.
+fn due_schedules() -> sea_orm::Select<schedule::Entity> {
+    schedule::Entity::find()
+        .filter(schedule::Column::Enabled.eq(true))
+        .filter(schedule::Column::NextRunAt.is_not_null())
+        .filter(Expr::col(schedule::Column::NextRunAt).lte(Expr::current_timestamp()))
+        .order_by_asc(schedule::Column::NextRunAt)
+        .lock_with_behavior(LockType::Update, LockBehavior::SkipLocked)
+        .limit(1)
+}
+
 async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, sea_orm::DbErr> {
     let txn = db.begin().await?;
-    let row = txn
-        .query_one_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, job_name, next_run_at, interval_seconds, overlap_policy, catchup_policy, tunables \
-             FROM schedules \
-             WHERE enabled AND next_run_at IS NOT NULL AND next_run_at <= now() \
-             ORDER BY next_run_at \
-             FOR UPDATE SKIP LOCKED \
-             LIMIT 1"
-                .to_string(),
-        ))
-        .await?;
-
-    let Some(row) = row else {
+    let Some(row) = due_schedules()
+        .into_model::<ClaimedSchedule>()
+        .one(&txn)
+        .await?
+    else {
         txn.commit().await?;
         return Ok(None);
     };
@@ -1059,7 +1057,7 @@ async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, s
         overlap_policy,
         catchup_policy,
         tunables,
-    } = ClaimedSchedule::from_query_result(&row, "")?;
+    } = row;
     // A cadence of zero would fire in a tight loop, the two policies read their own vocabularies,
     // and `tunables` is `NOT NULL DEFAULT '{}'`, so a hand-edited null takes an empty object.
     let interval_seconds = Ord::max(interval_seconds.unwrap_or(0), 1);
@@ -1080,7 +1078,7 @@ async fn claim_one_due(db: &DatabaseConnection) -> Result<Option<DueSchedule>, s
         )
         .col_expr(
             super::models::schedule::Column::LastEnqueuedAt,
-            sea_orm::sea_query::Expr::current_timestamp().into(),
+            sea_orm::sea_query::Expr::current_timestamp(),
         )
         .filter(super::models::schedule::Column::Id.eq(id))
         .exec(&txn)
@@ -1916,15 +1914,20 @@ impl CRUDOperations for ScheduleOperations {
             handler.validate(&tunables).map_err(ApiError::bad_request)?;
         }
 
-        let Some(before) = Stored::find_by_statement(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT enabled, interval_seconds, overlap_policy, catchup_policy, tunables \
-             FROM schedules WHERE job_name = $1",
-            [job_name.clone().into()],
-        ))
-        .one(db)
-        .await
-        .map_err(ApiError::database)?
+        let Some(before) = schedule::Entity::find()
+            .select_only()
+            .columns([
+                schedule::Column::Enabled,
+                schedule::Column::IntervalSeconds,
+                schedule::Column::OverlapPolicy,
+                schedule::Column::CatchupPolicy,
+                schedule::Column::Tunables,
+            ])
+            .filter(schedule::Column::JobName.eq(job_name.clone()))
+            .into_model::<Stored>()
+            .one(db)
+            .await
+            .map_err(ApiError::database)?
         else {
             return Ok(());
         };
@@ -1953,18 +1956,19 @@ impl CRUDOperations for ScheduleOperations {
         let interval_changed = interval.is_some_and(|n| Some(n) != before.interval_seconds);
         let being_enabled = enabled && !before.enabled;
         if interval_changed || being_enabled {
-            db.execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "UPDATE schedules \
-                    SET next_run_at = now() + (interval '1 second' * GREATEST($2, 1)) \
-                  WHERE job_name = $1",
-                [
-                    job_name.clone().into(),
-                    interval_seconds.unwrap_or(1).into(),
-                ],
-            ))
-            .await
-            .map_err(ApiError::database)?;
+            let seconds = Ord::max(interval_seconds.unwrap_or(1), 1);
+            schedule::Entity::update_many()
+                .col_expr(
+                    schedule::Column::NextRunAt,
+                    Expr::current_timestamp().add(Expr::cust_with_values(
+                        "interval '1 second' * $1",
+                        [seconds],
+                    )),
+                )
+                .filter(schedule::Column::JobName.eq(job_name.clone()))
+                .exec(db)
+                .await
+                .map_err(ApiError::database)?;
         }
 
         crate::routes::private::change_audit::service::record(

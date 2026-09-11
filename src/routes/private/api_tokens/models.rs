@@ -2,7 +2,6 @@
 //! with. Only the first two are tables.
 
 use crudcrate::EntityToModels;
-use sea_orm::FromQueryResult;
 use sea_orm::entity::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
@@ -83,11 +82,10 @@ pub mod audit_log {
     use sea_orm::entity::prelude::*;
     use serde::{Deserialize, Serialize};
 
-    /// Read-only CrudCrate view over the `api_token_audit_log` forensic table (written fire-and-forget on
-    /// every API-token request, see `api_tokens::service::record_token_use`). All fields are
-    /// `exclude(create, update)`, the table is append-only and the generated mutation routes are unused.
-    /// Mounted behind `require_admin` (no API token can read the audit trail); the UI surfaces it in the
-    /// System → Logs hub with filtering/sorting/pagination for free.
+    /// Read-only CrudCrate view over the `api_token_audit_log` forensic table (appended off the
+    /// request path by `api_tokens::service::record_token_use`). The table is append-only, so only
+    /// the read routes are mounted. Mounted behind `require_admin` (no API token can read the audit
+    /// trail); the UI surfaces it in the System → Logs hub with filtering/sorting/pagination.
     #[derive(
         Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize, EntityToModels,
     )]
@@ -96,7 +94,8 @@ pub mod audit_log {
         api_struct = "ApiTokenAuditLog",
         name_singular = "api_token_audit_log",
         name_plural = "api_token_audit_logs",
-        generate_router
+        generate_router,
+        routes(read)
     )]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
@@ -118,6 +117,56 @@ pub mod audit_log {
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// A project a Keycloak member may see and act in. The key is the pair itself: a member holds a
+/// project once or not at all, and nothing addresses one grant by a URL, so no router is mounted
+/// (Q153). Read on every non-admin request through `common::grants`, written whole per user by
+/// `set_user_grants`.
+pub mod grant {
+    use crudcrate::EntityToModels;
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(
+        Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize, EntityToModels,
+    )]
+    #[sea_orm(table_name = "user_project_grants")]
+    #[crudcrate(
+        api_struct = "UserProjectGrant",
+        name_singular = "user_project_grant",
+        name_plural = "user_project_grants"
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key, exclude(update), filterable)]
+        pub user_sub: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key, exclude(update), filterable)]
+        pub project_id: Uuid,
+        #[crudcrate(exclude(update))]
+        pub granted_by: Option<String>,
+        #[crudcrate(exclude(create, update), sortable)]
+        pub created_at: DateTimeWithTimeZone,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "crate::routes::private::projects::Entity",
+            from = "Column::ProjectId",
+            to = "crate::routes::private::projects::Column::Id"
+        )]
+        Project,
+    }
+
+    impl Related<crate::routes::private::projects::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::Project.def()
+        }
+    }
 
     impl ActiveModelBehavior for ActiveModel {}
 }
@@ -201,15 +250,6 @@ pub enum RealmRoleCheck {
 pub struct SetGrantsRequest {
     /// The complete set of project ids the user may see. An empty array revokes all access.
     pub project_ids: Vec<uuid::Uuid>,
-}
-
-/// List the projects a user is granted, with names. Administrators are unrestricted (they are never
-/// granted rows); this reflects only the stored grant set. Requires `require_admin`.
-/// One project a user holds a grant on.
-#[derive(FromQueryResult)]
-pub(crate) struct GrantRow {
-    pub(crate) id: uuid::Uuid,
-    pub(crate) name: String,
 }
 
 /// Replace a user's project grants transactionally and bust their grants cache so the change takes

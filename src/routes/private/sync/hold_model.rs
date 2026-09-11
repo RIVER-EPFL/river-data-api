@@ -71,3 +71,46 @@ pub struct Model {
 pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
+
+/// Every finding standing against one calculation slot: raised by the audit or the chain, so it
+/// carries no stream and is keyed on the site, the parameter and the instant instead.
+///
+/// The probe and the two supersedes in the chain executor share this predicate, so what "the same
+/// slot" means is stated once. A status or a kind is bound as a value through the entity's own
+/// columns rather than pasted into the statement, which is what makes a renamed variant a compile
+/// error instead of a supersede that matches no row.
+#[must_use]
+pub fn slot(
+    site_id: Uuid,
+    parameter_id: Uuid,
+    at: chrono::DateTime<chrono::Utc>,
+) -> sea_orm::Condition {
+    sea_orm::Condition::all()
+        .add(Column::StreamId.is_null())
+        .add(Column::SiteId.eq(site_id))
+        .add(Column::ParameterId.eq(parameter_id))
+        .add(Column::GroupTime.eq(DateTimeWithTimeZone::from(at)))
+}
+
+/// Narrow a slot predicate to the findings in one status.
+#[must_use]
+pub fn in_status(
+    condition: sea_orm::Condition,
+    status: super::models::HoldStatus,
+) -> sea_orm::Condition {
+    condition.add(Column::Status.eq(status.as_str()))
+}
+
+/// Narrow a slot predicate to a set of kinds.
+#[must_use]
+pub fn of_kinds(
+    condition: sea_orm::Condition,
+    kinds: &[super::models::HoldKind],
+) -> sea_orm::Condition {
+    let names: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+    condition.add(Column::Kind.is_in(names))
+}
+
+#[cfg(test)]
+#[path = "tests/hold_slot.rs"]
+mod tests;

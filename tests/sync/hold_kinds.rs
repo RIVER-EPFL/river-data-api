@@ -334,3 +334,58 @@ async fn the_list_breaks_pending_holds_down_by_kind() {
         "a kind with nothing pending is absent, not zero: {by_kind}"
     );
 }
+
+/// Scenario: a manager sweeps the queue with no filters, so the call reads as "accept everything
+/// pending", and one of the pending holds is an event finding with no stream.
+///
+/// Expected behaviour: the sweep says what it could not reach. It acknowledges the stream holds
+/// and leaves the stream-less one, and the response counts it rather than returning a total that
+/// cannot be told apart from one covering the whole queue.
+#[tokio::test]
+#[serial]
+async fn a_sweep_counts_the_holds_it_could_not_reach() {
+    let (db, app, token) = setup().await;
+    let event_hold = insert_event_finding(&db).await;
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/replicate_audit_holds/acknowledge_bulk",
+        &json!({}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "bulk acknowledge ({status}): {body}");
+    assert_eq!(
+        body["skipped_no_stream"], 1,
+        "the sweep says the stream-less hold was passed over: {body}"
+    );
+
+    let status_now: String = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("SELECT status FROM replicate_audit_holds WHERE id = '{event_hold}'"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "status")
+        .unwrap();
+    assert_eq!(
+        status_now, "pending",
+        "and left it where a person can still rule on it"
+    );
+
+    // A sweep that named a stream asked for streams, so it passed nothing over.
+    let (status, scoped) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/replicate_audit_holds/acknowledge_bulk",
+        &json!({"source_system": "cnet"}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "stream-scoped sweep ({status}): {scoped}");
+    assert!(
+        scoped["skipped_no_stream"].is_null(),
+        "a sweep scoped to streams reports no skip: {scoped}"
+    );
+}

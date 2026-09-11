@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::routes::private::data_streams;
 use crate::routes::private::readings;
+use crate::routes::private::readings::models::import_staging;
 use crate::routes::private::readings::models::ConflictMode;
 use crate::routes::private::readings::service::BATCH_SIZE as CSV_BATCH_SIZE;
 use crate::routes::private::readings::service::readings_on_conflict;
@@ -31,9 +32,22 @@ use crate::routes::private::sensor_calibrations::service::apply_curves;
 use crate::routes::private::sensor_calibrations::service::recalculate_derived_at_timestamp;
 use crate::routes::private::sync::models::HoldStatus;
 
+/// Take an import's staged rows out of the way, whether it finished or failed. There is no
+/// janitor for this table, so every exit from the job goes through here.
+pub(super) async fn drop_staged<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    import_token: Uuid,
+) -> Result<(), DbErr> {
+    import_staging::Entity::delete_many()
+        .filter(import_staging::Column::ImportToken.eq(import_token))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
 /// One staged row, as `csv_import_staging` holds it. The job reads the set four times, so the
 /// columns are named once here rather than in each pass.
-#[derive(Debug, Clone, Copy, FromQueryResult)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct StagedRow {
     pub(super) stream_id: Uuid,
     pub(super) site_id: Option<Uuid>,
@@ -43,6 +57,21 @@ pub(super) struct StagedRow {
     pub(super) sensor_id: Option<Uuid>,
     pub(super) calibration_id: Option<Uuid>,
     pub(super) deployment_id: Option<Uuid>,
+}
+
+impl From<import_staging::Model> for StagedRow {
+    fn from(row: import_staging::Model) -> Self {
+        Self {
+            stream_id: row.stream_id,
+            site_id: row.site_id,
+            parameter_id: row.parameter_id,
+            time: row.time,
+            raw_value: row.raw_value,
+            sensor_id: row.sensor_id,
+            calibration_id: row.calibration_id,
+            deployment_id: row.deployment_id,
+        }
+    }
 }
 
 /// A curated replicate an overwrite is about to displace, and what makes it curated.
@@ -178,14 +207,7 @@ impl Job for CsvImport {
         if outcome.is_err() {
             // Success deletes the staging rows below; a mid-run error would otherwise orphan them
             // (there is no janitor for csv_import_staging), so drop them on the failure path too.
-            let _ = ctx
-                .db()
-                .execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "DELETE FROM csv_import_staging WHERE import_token = $1",
-                    [import_token.into()],
-                ))
-                .await;
+            let _ = drop_staged(ctx.db(), import_token).await;
         }
         outcome
     }
@@ -223,19 +245,14 @@ impl CsvImport {
         // Read the staged rows back and rebuild the readings, re-applying the constant fields.
         // Decoded once here: the rows are read four times below, and a column named in one place
         // and not another is exactly the drift the derive removes.
-        let mut staged = ctx
-            .db()
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT stream_id, site_id, parameter_id, time, raw_value, \
-                        sensor_id, calibration_id, deployment_id \
-                 FROM csv_import_staging WHERE import_token = $1 ORDER BY seq",
-                [import_token.into()],
-            ))
+        let mut staged: Vec<StagedRow> = import_staging::Entity::find()
+            .filter(import_staging::Column::ImportToken.eq(import_token))
+            .order_by_asc(import_staging::Column::Seq)
+            .all(ctx.db())
             .await?
-            .iter()
-            .map(|row| StagedRow::from_query_result(row, ""))
-            .collect::<Result<Vec<_>, _>>()?;
+            .into_iter()
+            .map(StagedRow::from)
+            .collect();
 
         // The import handler refuses rows targeting a replicate-family stream before staging, and
         // the same rule holds here so no staging row, however it got there, mints replicate
@@ -645,13 +662,7 @@ impl CsvImport {
         }
 
         // The staging source has served its purpose, drop it (makes this job non-rerunnable).
-        ctx.db()
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "DELETE FROM csv_import_staging WHERE import_token = $1",
-                [import_token.into()],
-            ))
-            .await?;
+        drop_staged(ctx.db(), import_token).await?;
 
         ctx.report(
             JobReport::new()

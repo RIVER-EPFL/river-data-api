@@ -424,3 +424,67 @@ async fn a_block_mixing_valued_and_unvalued_keys_is_refused() {
     .await;
     assert_eq!(status, 400, "{body}");
 }
+
+/// Scenario: one cell of a block is rolled back on its own, then the whole set is.
+/// Expected behaviour: the set rollback names only the decisions still live, so the row already
+/// undone is not undone twice and the count reports what it actually moved.
+#[tokio::test]
+#[serial]
+async fn a_set_rollback_skips_a_decision_already_rolled_back() {
+    let f = setup(&[10.0, 12.0, 14.0]).await;
+    let selection = json!({
+        "keys": [
+            { "stream_id": f.stream, "time": AT, "replicate_index": 0, "value": 20.0 },
+            { "stream_id": f.stream, "time": AT, "replicate_index": 2, "value": 24.0 },
+        ]
+    });
+    let decision = json!({ "kind": "value_correction", "reason": "pasted block" });
+
+    let (status, preview) = post(
+        &f,
+        "/api/readings/edits/preview",
+        &json!({ "selection": selection, "decision": decision }),
+    )
+    .await;
+    assert_eq!(status, 200, "preview: {preview}");
+    let (status, committed) = post(
+        &f,
+        "/api/readings/edits",
+        &json!({
+            "selection": selection,
+            "decision": decision,
+            "preview_id": preview["preview_id"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "commit: {committed}");
+
+    let ids = committed["decision_ids"]
+        .as_array()
+        .expect("the commit names its decisions");
+    assert_eq!(ids.len(), 2, "two cells, two decisions: {committed}");
+    let first = ids[0].as_str().expect("a decision id");
+
+    let (status, rolled_one) = post(
+        &f,
+        &format!("/api/readings/edits/{first}/rollback"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "single rollback: {rolled_one}");
+
+    let set_id = committed["set_id"].as_str().expect("one set for the block");
+    let (status, rolled) = post(
+        &f,
+        &format!("/api/readings/edits/sets/{set_id}/rollback"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "set rollback: {rolled}");
+    assert_eq!(
+        rolled["rolled_back"], 1,
+        "only the decision still live is rolled back: {rolled}"
+    );
+    assert_eq!(stored(&f, 0).await.0, 10.0, "both cells are back");
+    assert_eq!(stored(&f, 2).await.0, 14.0);
+}

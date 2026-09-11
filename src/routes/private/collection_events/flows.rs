@@ -78,8 +78,8 @@ pub async fn touched_events<C: ConnectionTrait>(
         )
         .cond_where(rows)
         .add_group_by([
-            Expr::col((ce.clone(), events::Column::Id)).into(),
-            Expr::col((ce.clone(), events::Column::Source)).into(),
+            Expr::col((ce.clone(), events::Column::Id)),
+            Expr::col((ce.clone(), events::Column::Source)),
         ])
         .take()
         .build(PostgresQueryBuilder);
