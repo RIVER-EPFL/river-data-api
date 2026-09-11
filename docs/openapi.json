@@ -21582,6 +21582,34 @@
         ],
         "type": "object"
       },
+      "StageEventsRequest": {
+        "additionalProperties": false,
+        "description": "A trip: one visit per site named, all at one instant.",
+        "properties": {
+          "collected_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "notes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "site_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "site_ids",
+          "collected_at"
+        ],
+        "type": "object"
+      },
       "StagedEvent": {
         "properties": {
           "collected_at": {
@@ -28612,6 +28640,46 @@
           }
         },
         "summary": "Stage a field visit: the portal's New Entry, made idempotent. A visit already standing at\n`(site_id, collected_at)` is returned as it is, so two tools entering the same visit land on\none row instead of racing the unique key. Requires `write_data`.",
+        "tags": [
+          "collection_events"
+        ]
+      }
+    },
+    "/api/collection_events/stage_many": {
+      "post": {
+        "operationId": "stage_collection_events",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StageEventsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/StagedEvent"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The staged visits, one per site in the order named"
+          },
+          "400": {
+            "description": "No site named"
+          },
+          "404": {
+            "description": "Unknown site"
+          }
+        },
+        "summary": "Stage a trip: one visit per site named, all at `collected_at`, in one transaction. A site\nnamed twice is staged once; an unknown site refuses the whole trip, so no partial trip lands.\nEach visit is find-or-create exactly as `/collection_events/stage`. Requires `write_data`.",
         "tags": [
           "collection_events"
         ]

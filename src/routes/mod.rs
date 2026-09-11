@@ -228,6 +228,7 @@ pub fn validate_optional_time_range(
         private::readings::views::insert_grab_samples,
         private::readings::views::seasonal_check,
         private::collection_events::views::stage_collection_event,
+        private::collection_events::views::stage_collection_events,
         private::collection_events::views::recompute_collection_event,
         private::collection_events::views::run_event_audit,
         private::collection_events::views::run_event_recompute,

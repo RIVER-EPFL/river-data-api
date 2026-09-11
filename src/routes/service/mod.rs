@@ -379,6 +379,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             post(crate::routes::private::collection_events::views::stage_collection_event),
         )
         .route(
+            "/collection_events/stage_many",
+            post(crate::routes::private::collection_events::views::stage_collection_events),
+        )
+        .route(
             "/collection_events/{id}/recompute",
             post(crate::routes::private::collection_events::views::recompute_collection_event),
         )

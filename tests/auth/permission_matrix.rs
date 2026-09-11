@@ -584,6 +584,7 @@ fn table() -> Table {
             ("POST", "/api/status_events/batch"),
             ("POST", "/api/readings/import_csv"),
             ("POST", "/api/collection_events/stage"),
+            ("POST", "/api/collection_events/stage_many"),
             ("POST", "/api/collection_events/{id}/recompute"),
             ("POST", "/api/actions/event_audit"),
             ("POST", "/api/actions/event_recompute"),

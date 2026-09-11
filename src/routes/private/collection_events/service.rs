@@ -16,7 +16,7 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
-use super::models::CollectionEvent;
+use super::models::{CollectionEvent, StagedEvent};
 use crate::common::bulk_write;
 use crate::common::paging::Window;
 use crate::error::{AppError, AppResult};
@@ -207,6 +207,63 @@ pub async fn attach_collection_events<C: ConnectionTrait>(
 /// The per-visit counts, computed the same way on the site grid and the cross-site list. A
 /// hold is keyed on the slot (an event-audit finding) or on the stream that raised it, so the
 /// stream's pairing resolves the site.
+/// Find or create the visit at `(site_id, collected_at)`: the portal's New Entry, made
+/// idempotent. A visit already standing is returned as it is, `created` false, so two tools
+/// entering the same visit land on one row instead of racing the unique key.
+pub async fn stage_visit<C: ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+    collected_at: DateTime<Utc>,
+    actor: &str,
+    notes: Option<&str>,
+) -> AppResult<StagedEvent> {
+    let collected_at = sea_orm::prelude::DateTimeWithTimeZone::from(collected_at);
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "WITH staged AS (
+                 INSERT INTO collection_events (site_id, collected_at, source, created_by, notes)
+                 VALUES ($1, $2, 'manual', $3, $4)
+                 ON CONFLICT (site_id, collected_at) DO NOTHING
+                 RETURNING id, site_id, collected_at, source, created_by, notes, true AS created
+             )
+             SELECT * FROM staged
+             UNION ALL
+             SELECT id, site_id, collected_at, source, created_by, notes, false AS created
+             FROM collection_events
+             WHERE site_id = $1 AND collected_at = $2 AND NOT EXISTS (SELECT 1 FROM staged)",
+            vec![
+                site_id.into(),
+                collected_at.into(),
+                actor.into(),
+                notes.into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| AppError::Internal("Staging returned no visit".to_string()))?;
+    Ok(StagedEvent::from_query_result(&row, "")?)
+}
+
+/// The ids among `site_ids` that name no site, in the order given.
+pub async fn missing_sites<C: ConnectionTrait>(
+    conn: &C,
+    site_ids: &[Uuid],
+) -> AppResult<Vec<Uuid>> {
+    use crate::routes::private::sites::{Column, Entity};
+    let found: Vec<Uuid> = Entity::find()
+        .filter(Column::Id.is_in(site_ids.iter().copied()))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    Ok(site_ids
+        .iter()
+        .filter(|id| !found.contains(id))
+        .copied()
+        .collect())
+}
+
 pub(super) fn visit_count_columns() -> String {
     let filled = SeaQuery::select()
         .expr(Expr::col((r(), readings::Column::ParameterId)).count_distinct())

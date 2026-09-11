@@ -73,6 +73,16 @@ pub struct StageEventRequest {
     pub notes: Option<String>,
 }
 
+/// A trip: one visit per site named, all at one instant.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StageEventsRequest {
+    pub site_ids: Vec<Uuid>,
+    pub collected_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
 #[derive(Debug, Serialize, ToSchema, sea_orm::FromQueryResult)]
 pub struct StagedEvent {
     pub id: Uuid,

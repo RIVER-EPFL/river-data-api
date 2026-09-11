@@ -21,7 +21,8 @@ use uuid::Uuid;
 use super::models::{
     CellFinding, CellReplicate, CellSample, EnqueuedJobResponse, Entity, EventAuditRequest,
     EventCell, EventDetailResponse, EventRecomputeRequest, ExpectedParameter, StageEventRequest,
-    StagedEvent, VisitCell, VisitListQuery, VisitListRow, VisitRow, VisitsQuery, VisitsResponse,
+    StageEventsRequest, StagedEvent, VisitCell, VisitListQuery, VisitListRow, VisitRow,
+    VisitsQuery, VisitsResponse,
 };
 use super::service::{
     self, limit_clause, paging, range_clause, visit_count_columns, visit_list_order,
@@ -94,47 +95,84 @@ pub async fn stage_collection_event(
     axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(req): Json<StageEventRequest>,
 ) -> AppResult<Json<StagedEvent>> {
-    use sea_orm::ConnectionTrait;
-
-    if crate::routes::private::sites::Entity::find_by_id(req.site_id)
-        .one(&state.db)
+    if !service::missing_sites(&state.db, &[req.site_id])
         .await?
-        .is_none()
+        .is_empty()
     {
         return Err(AppError::NotFound(format!(
             "Site {} not found",
             req.site_id
         )));
     }
-
     let actor = crate::common::actor::label(&auth);
-    let collected_at = sea_orm::prelude::DateTimeWithTimeZone::from(req.collected_at);
-    let row = state
-        .db
-        .query_one_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "WITH staged AS (
-                 INSERT INTO collection_events (site_id, collected_at, source, created_by, notes)
-                 VALUES ($1, $2, 'manual', $3, $4)
-                 ON CONFLICT (site_id, collected_at) DO NOTHING
-                 RETURNING id, site_id, collected_at, source, created_by, notes, true AS created
-             )
-             SELECT * FROM staged
-             UNION ALL
-             SELECT id, site_id, collected_at, source, created_by, notes, false AS created
-             FROM collection_events
-             WHERE site_id = $1 AND collected_at = $2 AND NOT EXISTS (SELECT 1 FROM staged)",
-            vec![
-                req.site_id.into(),
-                collected_at.into(),
-                actor.into(),
-                req.notes.into(),
-            ],
-        ))
-        .await?
-        .ok_or_else(|| AppError::Internal("Staging returned no visit".to_string()))?;
+    let staged = service::stage_visit(
+        &state.db,
+        req.site_id,
+        req.collected_at,
+        &actor,
+        req.notes.as_deref(),
+    )
+    .await?;
+    Ok(Json(staged))
+}
 
-    Ok(Json(StagedEvent::from_query_result(&row, "")?))
+/// Stage a trip: one visit per site named, all at `collected_at`, in one transaction. A site
+/// named twice is staged once; an unknown site refuses the whole trip, so no partial trip lands.
+/// Each visit is find-or-create exactly as `/collection_events/stage`. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/api/collection_events/stage_many",
+    request_body = StageEventsRequest,
+    responses(
+        (status = 200, description = "The staged visits, one per site in the order named", body = Vec<StagedEvent>),
+        (status = 400, description = "No site named"),
+        (status = 404, description = "Unknown site"),
+    ),
+    tag = "collection_events"
+)]
+pub async fn stage_collection_events(
+    State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
+    Json(req): Json<StageEventsRequest>,
+) -> AppResult<Json<Vec<StagedEvent>>> {
+    use sea_orm::TransactionTrait;
+
+    let mut site_ids: Vec<Uuid> = Vec::with_capacity(req.site_ids.len());
+    for id in req.site_ids {
+        if !site_ids.contains(&id) {
+            site_ids.push(id);
+        }
+    }
+    if site_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "A trip names at least one site".to_string(),
+        ));
+    }
+    let missing = service::missing_sites(&state.db, &site_ids).await?;
+    if !missing.is_empty() {
+        let names: Vec<String> = missing.iter().map(Uuid::to_string).collect();
+        return Err(AppError::NotFound(format!(
+            "Site {} not found",
+            names.join(", ")
+        )));
+    }
+    let actor = crate::common::actor::label(&auth);
+    let txn = state.db.begin().await?;
+    let mut staged = Vec::with_capacity(site_ids.len());
+    for site_id in site_ids {
+        staged.push(
+            service::stage_visit(
+                &txn,
+                site_id,
+                req.collected_at,
+                &actor,
+                req.notes.as_deref(),
+            )
+            .await?,
+        );
+    }
+    txn.commit().await?;
+    Ok(Json(staged))
 }
 
 /// The scoped apply (ADR 0007): run the chain over every manual visit in a site and/or time

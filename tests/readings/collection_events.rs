@@ -319,6 +319,80 @@ async fn staging_a_new_instant_creates_the_visit() {
     assert_eq!(status, 404, "{body}");
 }
 
+/// Scenario: an operator visits two stations on one morning and stages the trip in one call.
+///
+/// Expected behaviour: one visit per station, in the order named, each find-or-create as the
+/// single stage is; a station named twice is staged once; an unknown station refuses the whole
+/// trip and stages nothing; a trip naming no station is refused.
+#[tokio::test]
+#[serial]
+async fn a_trip_is_staged_in_one_call() {
+    let (db, app, token) = setup().await;
+    let site2 = crate::common::SITE2_ID;
+
+    let (status, staged) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/collection_events/stage_many",
+        &json!({ "site_ids": [SITE1_ID, site2, SITE1_ID], "collected_at": T1, "notes": "trip" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{staged}");
+    let staged = staged.as_array().expect("a list");
+    assert_eq!(
+        staged.len(),
+        2,
+        "a site named twice is staged once: {staged:?}"
+    );
+    assert_eq!(staged[0]["site_id"], SITE1_ID);
+    assert_eq!(staged[1]["site_id"], site2);
+    assert!(
+        staged
+            .iter()
+            .all(|e| e["created"] == true && e["notes"] == "trip")
+    );
+    assert_ne!(staged[0]["id"], staged[1]["id"]);
+
+    let (status, again) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/collection_events/stage_many",
+        &json!({ "site_ids": [site2, SITE1_ID], "collected_at": T1 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{again}");
+    let again = again.as_array().expect("a list");
+    assert_eq!(
+        again[0]["id"], staged[1]["id"],
+        "the trip joins the visits that stand"
+    );
+    assert_eq!(again[1]["id"], staged[0]["id"]);
+    assert!(again.iter().all(|e| e["created"] == false));
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/collection_events/stage_many",
+        &json!({ "site_ids": [SITE1_ID, Uuid::new_v4()], "collected_at": "2025-06-03T08:00:00Z" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) AS n FROM collection_events").await,
+        2,
+        "an unknown station stages nothing"
+    );
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/collection_events/stage_many",
+        &json!({ "site_ids": [], "collected_at": T1 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+}
+
 #[tokio::test]
 #[serial]
 async fn continuous_readings_get_no_event() {
