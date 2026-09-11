@@ -255,50 +255,42 @@ impl Job for ReprocessSensor {
     }
 }
 
-/// Refresh continuous aggregates, incremental (recent window) or full. Single bounded statement.
-pub struct RefreshAggregates {
-    name: &'static str,
-    full: bool,
-}
-
-impl RefreshAggregates {
-    #[must_use]
-    pub fn incremental() -> Self {
-        Self {
-            name: "refresh_aggregates",
-            full: false,
-        }
-    }
-
-    #[must_use]
-    pub fn full() -> Self {
-        Self {
-            name: "refresh_aggregates_full",
-            full: true,
-        }
-    }
-}
+/// Refresh the rollups over the window a caller states, so a change it already committed is
+/// visible before the hourly policy would carry it: `from` and `until` for a range, `since` for
+/// everything after an instant. A run naming no window rematerialises the whole history, which is
+/// the repair for a database edited out of band and the only thing left that the policies and the
+/// real-time head do not do by themselves.
+pub struct RefreshAggregates;
 
 #[async_trait]
 impl Job for RefreshAggregates {
     fn name(&self) -> &'static str {
-        self.name
+        "refresh_aggregates"
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let instant = |key: &str| {
+            ctx.params()
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&chrono::Utc))
+        };
+        let window = match (instant("from"), instant("until"), instant("since")) {
+            (Some(from), Some(until), _) => crate::common::aggregates::Window::Range(from, until),
+            (_, _, Some(since)) => crate::common::aggregates::Window::Since(since),
+            _ => crate::common::aggregates::Window::Full,
+        };
         // A refresh that could not run must fail the job: reporting `completed` while the rollups
         // still serve the old numbers is the failure this job exists to make visible.
-        let outcome = tokio::time::timeout(Duration::from_secs(600), async {
-            if self.full {
-                sync_state::refresh_continuous_aggregates_full(ctx.db()).await
-            } else {
-                sync_state::refresh_continuous_aggregates(ctx.db(), None).await
-            }
-        })
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(600),
+            crate::common::aggregates::refresh(ctx.db(), window),
+        )
         .await;
         match outcome {
             Ok(Ok(())) => {
-                ctx.report(JobReport::new().scope("full_refresh", self.full))
+                ctx.report(JobReport::new().scope("window", format!("{window:?}")))
                     .await;
                 Ok(0)
             }
@@ -633,7 +625,7 @@ impl Job for DerivedRecompute {
 
             if let Some(since) = min_filled {
                 tracing::info!(%since, "Refreshing continuous aggregates after derived recompute");
-                sync_state::refresh_continuous_aggregates(ctx.db(), Some(since))
+                sync_state::refresh_continuous_aggregates(ctx.db(), since)
                     .await
                     .map_err(as_db_err)?;
                 for site_id in filled_sites {
@@ -706,7 +698,7 @@ impl Job for DerivedAssignment {
         }
 
         if let Some(since) = earliest {
-            sync_state::refresh_continuous_aggregates(ctx.db(), Some(since))
+            sync_state::refresh_continuous_aggregates(ctx.db(), since)
                 .await
                 .map_err(as_db_err)?;
             announce_derived_write(&ctx, site_id, i32::try_from(filled).unwrap_or(i32::MAX));
@@ -825,7 +817,7 @@ impl Job for SiteTimestampsDerived {
 
         if let Some(since) = earliest {
             tracing::info!(%since, "Refreshing continuous aggregates after derived computation");
-            sync_state::refresh_continuous_aggregates(ctx.db(), Some(since))
+            sync_state::refresh_continuous_aggregates(ctx.db(), since)
                 .await
                 .map_err(as_db_err)?;
             for (site_id, timestamps) in &work {
@@ -907,7 +899,7 @@ impl Job for IngestDerived {
         }
 
         if let Some(since) = earliest {
-            sync_state::refresh_continuous_aggregates(ctx.db(), Some(since))
+            sync_state::refresh_continuous_aggregates(ctx.db(), since)
                 .await
                 .map_err(as_db_err)?;
             announce_derived_write(&ctx, site_id, progress);
@@ -1299,8 +1291,14 @@ impl Job for JanitorRun {
 
         // 1. Fill derived gaps, reporting into this job and refreshing aggregates back to the
         //    earliest filled timestamp. Scoped to twice the cadence, so an hourly tick probes an
-        //    index range instead of hashing the whole hypertable; the full-refresh tick runs it
-        //    unbounded, which is what covers drift older than that window.
+        //    index range instead of hashing the whole hypertable; each `full_refresh_seconds`
+        //    period one tick runs it unbounded, which is what covers drift older than that
+        //    window. The tick that carries it is the one whose scheduled slot falls in the first
+        //    cadence window of the period, and the cadence is the `schedules` row's, not the
+        //    process's: the scheduler stamps both the slot and the interval it fired on into the
+        //    job params, so an operator cadence change cannot leave the unbounded scan
+        //    unreachable. A `run_now` carries neither and falls back to the wall clock and the
+        //    configured interval.
         let since = (!do_full)
             .then(|| chrono::Utc::now() - chrono::Duration::seconds((cadence_seconds * 2) as i64));
         janitor::run_once(db, Some(&ctx), since).await?;
@@ -1370,26 +1368,6 @@ impl Job for JanitorRun {
             Err(e) => tracing::warn!(error = %e, "Janitor: curve drift sweep failed"),
         }
 
-        // 3. A full continuous-aggregate refresh opens each `full_refresh_seconds` period and an
-        //    incremental one runs otherwise. The tick that carries it is the one whose scheduled
-        //    slot falls in the first cadence window of the period, and the cadence is the
-        //    `schedules` row's, not the process's: the scheduler stamps both the slot and the
-        //    interval it fired on into the job params, so an operator cadence change cannot leave
-        //    the full refresh unreachable. A `run_now` carries neither and falls back to the
-        //    wall clock and the configured interval. A cadence longer than `full_refresh_seconds`
-        //    makes every tick a full refresh, which is the safe direction but is a real cost on a
-        //    large database.
-        if do_full {
-            tracing::info!("Derived janitor: running scheduled full continuous aggregate refresh");
-            sync_state::refresh_continuous_aggregates_full(db)
-                .await
-                .map_err(as_db_err)?;
-        } else {
-            sync_state::refresh_continuous_aggregates(db, None)
-                .await
-                .map_err(as_db_err)?;
-        }
-
         // 3. Tiered tracked-job retention (cheap deletes; idempotent to run every tick).
         let pruned = janitor::prune_tracked_jobs(
             db,
@@ -1403,7 +1381,7 @@ impl Job for JanitorRun {
         // in its logs.
         ctx.report(
             JobReport::new()
-                .scope("full_refresh", do_full)
+                .scope("full_scan", do_full)
                 .count("recomposed", recomposed)
                 .count("pruned", pruned),
         )

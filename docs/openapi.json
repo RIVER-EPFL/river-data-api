@@ -15927,9 +15927,13 @@
       },
       "RefreshAggregatesRequest": {
         "properties": {
-          "full": {
-            "description": "If true, refresh ALL continuous aggregates (slow). If false, incremental refresh.",
-            "type": "boolean"
+          "since": {
+            "description": "Rematerialise only from this instant to now. Omitted, the whole history is rematerialised,\nwhich is the repair for a database edited out of band; the open bucket is served from the\nraw rows and each policy already covers the rest.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "type": "object"

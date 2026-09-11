@@ -323,7 +323,7 @@ async fn unpairing_a_stream_clears_readings_in_compressed_chunks() {
     assert!(
         e2e::count(
             &db,
-            "SELECT count(*) FROM reprocessing_jobs WHERE trigger_type = 'refresh_aggregates_full'"
+            "SELECT count(*) FROM reprocessing_jobs WHERE trigger_type = 'refresh_aggregates'"
         )
         .await
             >= 1,

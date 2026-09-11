@@ -3,7 +3,7 @@
 //! by a merge or a slot delete.
 //!
 //! Scenario: an operator lands data, then reshapes the catalog underneath it (merge two slots,
-//! delete one, edit the janitor's cadence) or asks for a refresh.
+//! delete one) or asks for a refresh.
 //! Expected behaviour: every rollup the change invalidates is recomputed, every row the change
 //! orphans travels with it, and a refresh that cannot run says so.
 //!
@@ -14,9 +14,7 @@
 //! Every fixture timestamp is in the past, since the refresh window is `[since, NOW()]`. Suites own
 //! distinct months (2026-01 to 2026-05) so no two materialise the same bucket.
 //!
-//! These run as real Keycloak users, under a profile covering Keycloak. The janitor cadence
-//! suite is the exception: it needs a worker whose registry carries the recurring Services (the
-//! shared builders register only the on-demand jobs) and so builds its own app with an API token.
+//! These run as real Keycloak users, under a profile covering Keycloak.
 //!
 //! Run: cargo test --test sites refresh_gaps -- --test-threads=1
 
@@ -235,162 +233,6 @@ async fn list_len(app: &Router, jwt: &str, path: &str, field: &str, value: &str)
     body.as_array()
         .unwrap_or_else(|| panic!("GET {uri} returns an array: {body}"))
         .len()
-}
-
-/// with the janitor on a 6-hourly operator cadence, the full aggregate refresh must fire on
-/// exactly one of the day's four slots, not on none of them (or all four).
-#[tokio::test]
-#[serial]
-async fn janitor_full_refresh_follows_the_operator_cadence() {
-    use river_db::common::AppState;
-    use river_db::routes::private::reprocessing_jobs::{job, scheduler, worker};
-
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-
-    // The shared builders spawn a worker over `build_registry()` alone, which has no handler for
-    // `janitor_service`: a job enqueued for it would be failed as unregistered. This app carries
-    // the recurring Services, exactly as `main.rs` assembles them.
-    let config = river_db::config::Config {
-        cache_ttl_seconds: 0,
-        cache_max_bytes: 0,
-        ..crate::common::cached_test_config()
-    };
-    let mut registry = job::build_registry();
-    job::register_scheduled_services(&mut registry, &config);
-    let registry = Arc::new(registry);
-    let state = AppState::new(db.clone(), config, None);
-    let app = river_db::routes::build_router(state.clone());
-    tokio::spawn({
-        let db = db.clone();
-        let events = state.events.clone();
-        let registry = registry.clone();
-        async move {
-            worker::run(db, events, registry, std::future::pending::<()>()).await;
-        }
-    });
-    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
-
-    scheduler::seed_default_schedules(&db, &registry)
-        .await
-        .expect("seed the recurring-service schedules");
-
-    let (status, schedules) =
-        crate::common::get_json_with_token(&app, "/api/schedules", &token).await;
-    assert_eq!(status, 200, "GET /api/schedules ({status}): {schedules}");
-    let names: Vec<String> = schedules
-        .as_array()
-        .unwrap_or_else(|| panic!("schedules list is an array: {schedules}"))
-        .iter()
-        .filter_map(|s| s["job_name"].as_str().map(str::to_string))
-        .collect();
-    assert!(
-        names.iter().any(|n| n == "janitor_service"),
-        "the janitor seeds a schedule row: {schedules}"
-    );
-    for name in names.iter().filter(|n| *n != "janitor_service") {
-        let (status, body) = crate::common::put_json_with_token(
-            &app,
-            &format!("/api/schedules/{name}"),
-            &json!({ "enabled": false }),
-            &token,
-        )
-        .await;
-        assert_eq!(status, 200, "disable schedule {name} ({status}): {body}");
-    }
-
-    let (status, patched) = crate::common::put_json_with_token(
-        &app,
-        "/api/schedules/janitor_service",
-        &json!({ "interval_seconds": 21_600 }),
-        &token,
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "set the janitor to a 6-hourly cadence ({status}): {patched}"
-    );
-    let view: Value = serde_json::from_str(&patched).unwrap_or(Value::Null);
-    assert_eq!(
-        view["interval_seconds"], 21_600,
-        "the cadence is stored: {patched}"
-    );
-
-    let track = tracks::onboard_csv_track(&app, &token).await;
-    let parameter_id = track.parameter_id("TrkCsvDepth").to_string();
-    assert!(
-        jobs_settled(&db, 60).await,
-        "provisioning settles before the fixtures land"
-    );
-
-    // One 6-hourly slot per iteration, over a past UTC day: 00:00 opens a full-refresh period, the
-    // other three do not. Each slot gets its own reading, seven months old so no incremental
-    // refresh (hourly window `NOW() - 24h`) can reach it: a materialised bucket therefore means a
-    // full refresh ran on that slot and nothing else.
-    let slots = [
-        "2026-08-01T00:00:00Z",
-        "2026-08-01T06:00:00Z",
-        "2026-08-01T12:00:00Z",
-        "2026-08-01T18:00:00Z",
-    ];
-    let mut refreshed_on: Vec<&str> = Vec::new();
-    for (i, slot) in slots.into_iter().enumerate() {
-        let at = format!("2026-01-15T{i:02}:00:00Z");
-        let value = 110.0 + i as f64;
-        let row = reading(&track.site_id, &parameter_id, &at, value);
-        write_readings(&app, &token, vec![row]).await;
-        assert!(
-            jobs_settled(&db, 60).await,
-            "the batch's follow-on jobs settle before the tick"
-        );
-        assert!(
-            e2e::hourly_bucket(&app, &token, &track.site_id, &parameter_id, instant(&at))
-                .await
-                .is_none(),
-            "the {at} bucket is unmaterialised before the {slot} janitor run"
-        );
-
-        // No endpoint places a schedule on a chosen slot (PATCH always recomputes `next_run_at` off
-        // now), and the slot is precisely the input under test.
-        crate::common::exec(
-            &db,
-            &format!(
-                "UPDATE schedules SET next_run_at = '{slot}' \
-                 WHERE job_name = 'janitor_service'"
-            ),
-        )
-        .await;
-        let enqueued = scheduler::tick(&db, &registry)
-            .await
-            .expect("scheduler tick");
-        assert_eq!(
-            enqueued, 1,
-            "the due janitor slot {slot} enqueues exactly one run"
-        );
-        assert!(
-            e2e::wait_for_jobs_by_trigger(&db, "janitor_service", 90).await,
-            "the janitor run for slot {slot} completes"
-        );
-
-        let bucket =
-            e2e::hourly_bucket(&app, &token, &track.site_id, &parameter_id, instant(&at)).await;
-        if let Some((mean, count)) = bucket {
-            assert!(
-                (mean - value).abs() < 1e-9 && count == 1,
-                "slot {slot} materialised {at} as ({mean}, {count}), expected ({value}, 1)"
-            );
-            refreshed_on.push(slot);
-        }
-    }
-
-    assert_eq!(
-        refreshed_on.len(),
-        1,
-        "a 6-hourly janitor must run its full aggregate refresh once per 24h period, on the slot \
-         that opens it; slots that ran it: {refreshed_on:?}"
-    );
-
-    crate::common::cleanup_test_db(&db).await;
 }
 
 /// merging two site parameters moves the readings, so the survivor's rollups must move with

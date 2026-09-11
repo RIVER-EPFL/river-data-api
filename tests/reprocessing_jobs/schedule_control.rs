@@ -795,11 +795,11 @@ async fn run_now_dedupes_within_the_second_snapshots_empty_tunables_and_writes_n
 /// genuine worker transition emits, for a run an operator asked for over HTTP, on data onboarded
 /// through the sensor-flow track.
 ///
-/// `refresh_aggregates_full` is the job under test because its effect is checkable: the incremental
-/// variant only covers the last 24 hours, and the track's readings are past-dated.
+/// `refresh_aggregates` is the job under test: a run naming no window rematerialises every
+/// rollup over its whole history, which is the one thing an operator still asks for by hand.
 #[tokio::test]
 #[serial]
-async fn sse_streams_the_completion_of_an_operator_run_that_did_real_work() {
+async fn sse_streams_the_completion_of_an_operator_requested_run() {
     let Some((db, app)) = setup("sse_streams_a_real_completion").await else {
         return;
     };
@@ -846,12 +846,6 @@ async fn sse_streams_the_completion_of_an_operator_run_that_did_real_work() {
     let bucket_at: chrono::DateTime<Utc> = format!("{}T00:00:00Z", tracks::FLOW_BASE_DAY)
         .parse()
         .expect("the track's base day parses");
-    assert!(
-        crate::common::e2e::hourly_bucket(&app, &admin, &track.site_id, &parameter_id, bucket_at)
-            .await
-            .is_none(),
-        "the hourly bucket holds nothing until something refreshes it"
-    );
 
     // The feed is opened as an administrator: job events carry no project, so `event_stream` only
     // forwards them to an unrestricted principal.
@@ -872,7 +866,7 @@ async fn sse_streams_the_completion_of_an_operator_run_that_did_real_work() {
 
     let (status, run) = crate::common::post_json_parse_with_token(
         &app,
-        "/api/schedules/refresh_aggregates_full/run_now",
+        "/api/schedules/refresh_aggregates/run_now",
         &json!({}),
         &manager,
     )
@@ -929,12 +923,11 @@ async fn sse_streams_the_completion_of_an_operator_run_that_did_real_work() {
         "the stored row and the streamed frame agree: {job}"
     );
     assert_eq!(
-        job["trigger_type"], "refresh_aggregates_full",
+        job["trigger_type"], "refresh_aggregates",
         "the row is the run the operator asked for: {job}"
     );
 
-    // A completed status is not evidence a refresh happened: aggregate refresh failures are only
-    // warn-logged (common/sync_state.rs). The bucket's values are.
+    // A completed status is not evidence the rollups are right; the bucket's values are.
     let bucket =
         crate::common::e2e::hourly_bucket(&app, &admin, &track.site_id, &parameter_id, bucket_at)
             .await;

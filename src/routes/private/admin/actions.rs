@@ -32,9 +32,9 @@ use crate::routes::private::sensors::deployments;
 use crate::routes::private::sensors::deployments::slots;
 use crate::routes::private::sensors::standard_curves::model as standard_curves;
 use crate::routes::private::sites::models as sites;
+use crate::routes::private::sites::parameters::models as site_parameters;
 use crate::routes::private::sync::models::HoldKind;
 use crate::routes::private::sync::models::HoldStatus;
-use crate::routes::private::sites::parameters::models as site_parameters;
 
 /// The rows this file's raw queries return. Derived rather than hand-decoded so a column added to
 /// a query and not to its reader is a compile error rather than a field silently left behind.
@@ -147,9 +147,11 @@ fn require_named_target(scope: &AccessScope, named: bool, what: &str) -> AppResu
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RefreshAggregatesRequest {
-    /// If true, refresh ALL continuous aggregates (slow). If false, incremental refresh.
+    /// Rematerialise only from this instant to now. Omitted, the whole history is rematerialised,
+    /// which is the repair for a database edited out of band; the open bucket is served from the
+    /// raw rows and each policy already covers the rest.
     #[serde(default)]
-    pub full: bool,
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Refresh of TimescaleDB continuous aggregates, tracked as a `reprocessing_jobs` row.
@@ -168,18 +170,12 @@ pub async fn refresh_aggregates(
     State(app_state): State<AppState>,
     Json(payload): Json<RefreshAggregatesRequest>,
 ) -> AppResult<Json<QueuedJobResponse>> {
-    let trigger_type = if payload.full {
-        "refresh_aggregates_full"
-    } else {
-        "refresh_aggregates"
-    };
-
     let job_id = crate::routes::private::reprocessing_jobs::worker::enqueue(
         &app_state.db,
-        trigger_type,
+        "refresh_aggregates",
         None,
         None,
-        &serde_json::json!({ "full": payload.full }),
+        &serde_json::json!({ "since": payload.since.map(|t| t.to_rfc3339()) }),
         None,
     )
     .await

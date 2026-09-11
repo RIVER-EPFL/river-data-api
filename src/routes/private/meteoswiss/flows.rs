@@ -146,7 +146,7 @@ impl Job for MeteoswissSync {
         // A pressure series rolls up like any other continuous parameter, so the rollups have to
         // see what just landed or the site charts serve a gap.
         if let Some(since) = earliest {
-            crate::common::sync_state::refresh_continuous_aggregates(ctx.db(), Some(since))
+            crate::common::sync_state::refresh_continuous_aggregates(ctx.db(), since)
                 .await
                 .map_err(|e| DbErr::Custom(format!("Aggregate refresh failed: {e}")))?;
         }

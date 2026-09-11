@@ -198,9 +198,10 @@ pub async fn backfill<C: ConnectionTrait>(
 /// pointing at it last. Unpair, and a `site_parameters` delete, are the same operation over
 /// different scopes.
 ///
-/// The rollups are rebuilt by a tracked `refresh_aggregates_full` job rather than inline: a
-/// teardown can span a stream's whole history, and a refresh that fails then belongs in `/jobs`,
-/// where it is visible and rerunnable, not as a 500 on an operation that already committed.
+/// The rollups are refreshed over what the teardown touched by a tracked `refresh_aggregates`
+/// job rather than inline: a teardown can span a stream's whole history, and a refresh that fails
+/// then belongs in `/jobs`, where it is visible and rerunnable, not as a 500 on an operation that
+/// already committed.
 ///
 /// A slot the scope cannot resolve reports an empty range rather than an error, so retiring a row
 /// that is already gone is not a failure.
@@ -216,16 +217,16 @@ pub async fn retire_slot<C: ConnectionTrait + TransactionTrait>(
     })
     .await?;
 
-    if !touched.is_empty() {
+    if let Some((from, until)) = touched.span() {
         let trigger_id = match scope {
             SlotScope::Stream(id) | SlotScope::SiteParameter(id) => id,
         };
         crate::routes::private::reprocessing_jobs::worker::enqueue(
             db,
-            "refresh_aggregates_full",
+            "refresh_aggregates",
             None,
             Some(trigger_id),
-            &serde_json::json!({ "full": true }),
+            &serde_json::json!({ "from": from.to_rfc3339(), "until": until.to_rfc3339() }),
             None,
         )
         .await

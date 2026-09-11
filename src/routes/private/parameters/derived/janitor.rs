@@ -202,7 +202,7 @@ pub async fn run_once(
 
     if let Some(since) = min_filled {
         tracing::info!(%since, filled, "Derived janitor: refreshing continuous aggregates after backfill");
-        crate::common::sync_state::refresh_continuous_aggregates(db, Some(since))
+        crate::common::sync_state::refresh_continuous_aggregates(db, since)
             .await
             .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
     }

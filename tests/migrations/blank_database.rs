@@ -7,9 +7,10 @@
 //!
 //! Run: cargo test --test migrations blank_database -- --test-threads=1
 
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
-use sea_orm_migration::MigratorTrait;
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
+
+use crate::common::scratch;
 
 /// The tables an operator fills, in the order a reader would ask about them.
 const MUST_BE_EMPTY: &[&str] = &[
@@ -36,16 +37,6 @@ async fn count(db: &DatabaseConnection, table: &str) -> i64 {
     .expect("n")
 }
 
-/// The URL with its database name replaced, so the scratch database is made on the same server.
-fn url_for(base: &str, database: &str) -> String {
-    let cut = base.rfind('/').expect("a database name in DATABASE_URL");
-    let query = base[cut..]
-        .find('?')
-        .map(|q| &base[cut + q..])
-        .unwrap_or("");
-    format!("{}/{database}{query}", &base[..cut])
-}
-
 #[tokio::test]
 #[serial]
 async fn a_migrated_database_holds_no_rows_nobody_asked_for() {
@@ -53,24 +44,10 @@ async fn a_migrated_database_holds_no_rows_nobody_asked_for() {
     let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
     // Its own database: the shared one carries the reference rows the suites install, which is
     // exactly the state this test exists to distinguish from what the migrations build.
-    let scratch = format!("river_blank_{}", std::process::id());
+    let name = format!("river_blank_{}", std::process::id());
 
-    let admin = Database::connect(url_for(&base, "postgres"))
-        .await
-        .expect("connect to the server");
-    let drop = format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)");
-    admin.execute_unprepared(&drop).await.expect("drop");
-    admin
-        .execute_unprepared(&format!("CREATE DATABASE {scratch}"))
-        .await
-        .expect("create the scratch database");
-
-    let db = Database::connect(url_for(&base, &scratch))
-        .await
-        .expect("connect to the scratch database");
-    migration::Migrator::up(&db, None)
-        .await
-        .expect("the migrations build a database of their own");
+    let server = scratch::server(&base).await;
+    let db = scratch::build(&base, &server, &name).await;
 
     let mut filled = Vec::new();
     for table in MUST_BE_EMPTY {
@@ -82,7 +59,7 @@ async fn a_migrated_database_holds_no_rows_nobody_asked_for() {
     let filled_report = filled.join(", ");
 
     db.close().await.expect("close the scratch connection");
-    admin.execute_unprepared(&drop).await.expect("drop");
+    scratch::discard(&server, &name).await;
 
     assert!(
         filled.is_empty(),

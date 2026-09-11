@@ -35,7 +35,6 @@ pub const MAINTENANCE: &[&str] = &[
     "ingest_derived",
     "batch_derived",
     "refresh_aggregates",
-    "refresh_aggregates_full",
     "alarm_backfill",
     "meteoswiss_sync",
 ];
@@ -81,7 +80,6 @@ pub const RERUNNABLE: &[&str] = &[
     "attribution_pin",
     "sensor_swap",
     "refresh_aggregates",
-    "refresh_aggregates_full",
     "derived_recompute",
     "measurement_retag",
     "sd_estimator_retag",

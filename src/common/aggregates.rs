@@ -14,16 +14,18 @@
 //!
 //! The procedure has its own transaction control, so it cannot run inside a transaction block: pass
 //! a `DatabaseConnection`, after any guarded write has committed.
+//!
+//! Nothing here fills the head of a rollup or repairs its history on a schedule. The views are
+//! real-time, so the open bucket is read from the raw rows, and each policy starts at NULL, so a
+//! change to an old reading is materialised again by the next tick. A refresh here is a caller
+//! making its own change visible before that tick, or an operator repairing a database that was
+//! edited out of band.
 
 use chrono::{DateTime, Datelike, Duration, DurationRound, Months, Utc, Weekday};
-use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
-    QueryFilter, QuerySelect, Statement,
-};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 
 use super::bulk_write::TouchedRange;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::readings::models as readings;
 
 /// A rollup view and its bucket width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,25 +95,16 @@ impl Resolution {
                 .ok_or_else(|| AppError::Internal(format!("no monthly bucket after {start}"))),
         }
     }
-
-    /// How far back a refresh with no stated window reaches for this view.
-    fn default_lookback(self) -> Duration {
-        match self {
-            Resolution::Hourly => Duration::hours(24),
-            Resolution::Daily => Duration::days(7),
-            Resolution::Weekly => Duration::days(14),
-            Resolution::Monthly => Duration::days(62),
-        }
-    }
 }
 
-/// What a refresh should cover.
+/// What a refresh should cover. The head of every rollup is served from the raw rows and each
+/// view's policy starts at NULL, so a window here is only about making a change visible before
+/// the next tick would carry it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Window {
-    /// The whole history of every view (`NULL, NULL`). The repair backstop; expensive.
+    /// The whole history of every view (`NULL, NULL`). Nothing schedules this: it is the operator
+    /// repair for a database edited out of band, where waiting for the policy is not an answer.
     Full,
-    /// The rolling per-view defaults (24h hourly, 7d daily, 14d weekly, 62d monthly).
-    Recent,
     /// From an instant that changed up to now.
     Since(DateTime<Utc>),
     /// An explicit range of changed instants. Bounds may arrive in either order.
@@ -125,11 +118,11 @@ impl Window {
         touched.span().map(|(lo, hi)| Window::Range(lo, hi))
     }
 
-    /// The raw instants this window covers, before per-view bucket alignment.
+    /// The raw instants this window covers, before per-view bucket alignment. `None` is the whole
+    /// history, which needs no alignment.
     fn bounds(self, now: DateTime<Utc>) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
         match self {
             Window::Full => None,
-            Window::Recent => Some((now, now)),
             Window::Since(since) => Some((since, now.max(since))),
             Window::Range(a, b) => Some((a.min(b), a.max(b))),
         }
@@ -147,34 +140,8 @@ pub async fn refresh(db: &DatabaseConnection, window: Window) -> AppResult<()> {
     let mut first_error = None;
     let mut failed = 0;
 
-    // A view recreated WITH NO DATA holds only what the rolling window has touched since, and
-    // materialized-only reads serve that absence as data. The scheduled Recent refresh is where
-    // that state gets noticed: any view whose earliest bucket does not reach the earliest
-    // qualifying reading escalates to a full refresh here, so a rebuilt rollup heals on the next
-    // tick. A failed probe refreshes normally rather than blocking.
-    let escalated: Vec<Resolution> = if matches!(window, Window::Recent) {
-        match views_missing_history(db).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "Aggregate coverage probe failed; refreshing the rolling window only");
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
     for resolution in Resolution::ALL {
-        let view_window = if escalated.contains(&resolution) {
-            tracing::warn!(
-                view = resolution.view(),
-                "Rollup is missing its history; running a full refresh"
-            );
-            Window::Full
-        } else {
-            window
-        };
-        let statement = refresh_statement(resolution, view_window, now)?;
+        let statement = refresh_statement(resolution, window, now)?;
         match db.execute_raw(statement).await {
             Ok(_) => tracing::debug!(view = resolution.view(), "Continuous aggregate refreshed"),
             Err(e) => {
@@ -196,56 +163,6 @@ pub async fn refresh(db: &DatabaseConnection, window: Window) -> AppResult<()> {
     }
 }
 
-/// The rollups whose earliest bucket does not reach the earliest reading their shared population
-/// filter admits. Empty when every view covers its history (the steady state, two cheap MIN
-/// probes per tick).
-async fn views_missing_history(db: &DatabaseConnection) -> AppResult<Vec<Resolution>> {
-    let earliest = readings::Entity::find()
-        .select_only()
-        .column_as(readings::Column::Time.min(), "t")
-        .filter(readings::Column::SiteId.is_not_null())
-        .filter(readings::Column::ReplicateIndex.eq(0))
-        .filter(
-            Condition::any()
-                .add(readings::Column::IsFlagged.eq(false))
-                .add(readings::Column::IsFlagged.is_null()),
-        )
-        .filter(
-            Condition::any()
-                .add(readings::Column::MeasurementType.ne("spot"))
-                .add(readings::Column::MeasurementType.is_null()),
-        )
-        .into_tuple::<Option<sea_orm::prelude::DateTimeWithTimeZone>>()
-        .one(db)
-        .await?
-        .flatten();
-    let Some(earliest) = earliest else {
-        return Ok(Vec::new());
-    };
-    let earliest: DateTime<Utc> = earliest.with_timezone(&Utc);
-
-    let mut missing = Vec::new();
-    for resolution in Resolution::ALL {
-        let min_bucket = db
-            .query_one_raw(Statement::from_string(
-                DatabaseBackend::Postgres,
-                format!("SELECT MIN(bucket) AS b FROM {}", resolution.view()),
-            ))
-            .await?
-            .and_then(|row| {
-                row.try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", "b")
-                    .ok()
-                    .flatten()
-            });
-        let floor = resolution.floor(earliest)?;
-        let covered = min_bucket.is_some_and(|b| b.with_timezone(&Utc) <= floor);
-        if !covered {
-            missing.push(resolution);
-        }
-    }
-    Ok(missing)
-}
-
 /// The `CALL` for one view, with the window aligned to that view's buckets.
 fn refresh_statement(
     resolution: Resolution,
@@ -253,27 +170,19 @@ fn refresh_statement(
     now: DateTime<Utc>,
 ) -> AppResult<Statement> {
     let view = resolution.view();
-    Ok(match window.bounds(now) {
-        None => Statement::from_string(
+    let Some((lo, hi)) = window.bounds(now) else {
+        return Ok(Statement::from_string(
             DatabaseBackend::Postgres,
             format!("CALL refresh_continuous_aggregate('{view}', NULL, NULL)"),
-        ),
-        Some((lo, hi)) => {
-            let lo = match window {
-                Window::Recent => lo - resolution.default_lookback(),
-                _ => lo,
-            };
-            let start = resolution.floor(lo)?;
-            let end = resolution.bucket_end(hi.max(lo))?;
-            Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                format!(
-                    "CALL refresh_continuous_aggregate('{view}', $1::timestamptz, $2::timestamptz)"
-                ),
-                [start.into(), end.into()],
-            )
-        }
-    })
+        ));
+    };
+    let start = resolution.floor(lo)?;
+    let end = resolution.bucket_end(hi.max(lo))?;
+    Ok(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        format!("CALL refresh_continuous_aggregate('{view}', $1::timestamptz, $2::timestamptz)"),
+        [start.into(), end.into()],
+    ))
 }
 
 #[cfg(test)]

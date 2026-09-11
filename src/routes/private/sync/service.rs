@@ -3189,10 +3189,10 @@ pub async fn apply_plan(
     }
     crate::routes::private::reprocessing_jobs::worker::enqueue(
         db,
-        "refresh_aggregates_full",
+        "refresh_aggregates",
         None,
         None,
-        &serde_json::json!({ "full": true }),
+        &serde_json::json!({}),
         None,
     )
     .await?;
@@ -3896,7 +3896,7 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
     let event_ids =
         plan_reading_references(&txn, plan_id, readings::models::Column::CollectionEventId).await?;
 
-    bulk_write::mutation(
+    let unattributed = bulk_write::mutation(
         &txn,
         unattribute_plan_rows(
             readings::models::Entity,
@@ -3988,8 +3988,12 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
 
     txn.commit().await?;
 
-    // Refresh aggregates synchronously so callers see consistent state
-    crate::common::sync_state::refresh_continuous_aggregates_full(db).await?;
+    // The readings that left the rollups did so over the span the unattribution touched, and the
+    // policy would carry it on its next tick; refreshing it here is so the caller sees consistent
+    // state now.
+    if let Some(window) = crate::common::aggregates::Window::touched(&unattributed) {
+        crate::common::aggregates::refresh(db, window).await?;
+    }
 
     tracing::info!(plan_id = %plan_id, reverted, "Pairing plan reverted");
     Ok(reverted)

@@ -1,5 +1,6 @@
 //! `dry_run: true` on `/readings/flag_range` and `/readings/unflag_range` returns the count the
-//! write would report and changes nothing: no flag, no decision row, no aggregate refresh.
+//! write would report and changes nothing: no flag, no decision row, and nothing the rollups
+//! serve.
 //!
 //! Run: cargo test --test readings flag_range_dry_run -- --test-threads=1
 
@@ -78,9 +79,9 @@ async fn flag_range_dry_run_counts_without_writing() {
         "a dry run records no decision"
     );
     assert_eq!(
-        count(&db, &format!("SELECT COUNT(*) FROM readings_hourly WHERE {slot} AND bucket = '2025-06-15T10:00:00Z'")).await,
-        0,
-        "a dry run refreshes no aggregate: the bucket is not materialised"
+        count(&db, &format!("SELECT sum(count)::bigint FROM readings_hourly WHERE {slot} AND bucket = '2025-06-15T10:00:00Z'")).await,
+        5,
+        "a dry run changes nothing the rollup serves: all five readings are still counted"
     );
 
     // The write reports the number the dry run promised.

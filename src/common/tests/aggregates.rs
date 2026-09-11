@@ -234,19 +234,6 @@ fn test_since_covers_the_current_bucket() {
 }
 
 #[test]
-fn test_recent_reaches_each_views_lookback() {
-    let now = t("2026-08-12T14:22:00Z");
-    let (hourly_start, _) = window_of(Resolution::Hourly, Window::Recent, now);
-    assert_eq!(hourly_start, t("2026-08-11T14:00:00Z"));
-    let (daily_start, _) = window_of(Resolution::Daily, Window::Recent, now);
-    assert_eq!(daily_start, t("2026-08-05T00:00:00Z"));
-    let (weekly_start, _) = window_of(Resolution::Weekly, Window::Recent, now);
-    assert_eq!(weekly_start, t("2026-07-27T00:00:00Z"));
-    let (monthly_start, _) = window_of(Resolution::Monthly, Window::Recent, now);
-    assert_eq!(monthly_start, t("2026-06-01T00:00:00Z"));
-}
-
-#[test]
 fn test_full_binds_no_values() {
     let statement = refresh_statement(Resolution::Hourly, Window::Full, Utc::now()).unwrap();
     assert!(statement.sql.contains("NULL, NULL"));

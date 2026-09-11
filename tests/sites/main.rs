@@ -12,7 +12,6 @@ mod aggregate_refresh_windows;
 mod aggregate_sensor_split;
 mod data_endpoints;
 mod export_double_roundtrip;
-mod head_bucket_refresh;
 mod origin_filter;
 mod parameter_extents;
 mod parameter_frequency;

@@ -9,9 +9,10 @@
 //!
 //! Run: cargo test --test migrations cutover_restore -- --test-threads=1
 
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
-use sea_orm_migration::MigratorTrait;
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
+
+use crate::common::scratch;
 
 /// What a rebuild mints before anything is carried into it: both databases run this, so every id
 /// the restore resolves differs between them.
@@ -154,16 +155,6 @@ const ROWS: &[(&str, &str)] = &[
     ),
 ];
 
-/// The URL with its database name replaced, so the scratch databases are made on the same server.
-fn url_for(base: &str, database: &str) -> String {
-    let cut = base.rfind('/').expect("a database name in DATABASE_URL");
-    let query = base[cut..]
-        .find('?')
-        .map(|q| &base[cut + q..])
-        .unwrap_or("");
-    format!("{}/{database}{query}", &base[..cut])
-}
-
 async fn rows(db: &DatabaseConnection, statement: &str) -> Vec<String> {
     let mut found: Vec<String> = db
         .query_all_raw(Statement::from_string(
@@ -179,21 +170,9 @@ async fn rows(db: &DatabaseConnection, statement: &str) -> Vec<String> {
     found
 }
 
-async fn build(base: &str, admin: &DatabaseConnection, name: &str) -> DatabaseConnection {
-    admin
-        .execute_unprepared(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-        .await
-        .expect("drop");
-    admin
-        .execute_unprepared(&format!("CREATE DATABASE {name}"))
-        .await
-        .expect("create");
-    let db = Database::connect(url_for(base, name))
-        .await
-        .expect("connect to the scratch database");
-    migration::Migrator::up(&db, None)
-        .await
-        .expect("the baseline builds the database");
+/// A migrated database carrying the reference rows both sides of the comparison need.
+async fn build(base: &str, server: &DatabaseConnection, name: &str) -> DatabaseConnection {
+    let db = scratch::build(base, server, name).await;
     db.execute_unprepared(METADATA).await.expect("the metadata");
     db
 }
@@ -209,11 +188,9 @@ async fn a_dump_and_a_rebuilt_database_hold_the_same_curated_state() {
         format!("river_cutover_dst_{pid}"),
     );
 
-    let admin = Database::connect(url_for(&base, "postgres"))
-        .await
-        .expect("connect to the server");
-    let source = build(&base, &admin, &source_name).await;
-    let target = build(&base, &admin, &target_name).await;
+    let server = scratch::server(&base).await;
+    let source = build(&base, &server, &source_name).await;
+    let target = build(&base, &server, &target_name).await;
     source.execute_unprepared(CURATED).await.expect("the dump");
 
     let report = river_db::restore::restore(&source, &target)
@@ -245,10 +222,7 @@ async fn a_dump_and_a_rebuilt_database_hold_the_same_curated_state() {
     source.close().await.expect("close the source");
     target.close().await.expect("close the target");
     for name in [&source_name, &target_name] {
-        admin
-            .execute_unprepared(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
-            .await
-            .expect("drop");
+        scratch::discard(&server, name).await;
     }
 
     assert!(
