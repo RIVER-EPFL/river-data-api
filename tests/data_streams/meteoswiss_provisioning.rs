@@ -5,10 +5,12 @@
 //! Run with: cargo test --test data_streams meteoswiss
 
 use chrono::{DateTime, TimeZone, Utc};
+use river_db::routes::private::meteoswiss::models::StationRow;
 use river_db::routes::private::meteoswiss::models::subscription::MeteoswissSubscriptionCreate;
 use river_db::routes::private::meteoswiss::models::{Point, Subscriber};
 use river_db::routes::private::meteoswiss::service::{
-    MeteoswissSubscriptionOperations, advance_cursor, cursor, instrument, provision, subscribers,
+    MeteoswissSubscriptionOperations, advance_cursor, cursor, instrument, provision,
+    search_stations, store_stations, subscribers,
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
@@ -401,4 +403,112 @@ async fn a_second_fetch_is_conditional_and_a_304_reads_as_unchanged() {
     );
 
     server.abort();
+}
+
+fn station(abbr: &str, name: &str, barometer: Option<f64>) -> StationRow {
+    StationRow {
+        abbr: abbr.to_string(),
+        name: name.to_string(),
+        data_since: chrono::NaiveDate::from_ymd_opt(1906, 3, 1),
+        height_masl: Some(839.0),
+        height_barometer_masl: barometer,
+        latitude: Some(46.071019),
+        longitude: Some(7.225272),
+    }
+}
+
+/// Scenario: MeteoSwiss re-publish the station list every day, and the job reads it every pass.
+/// Expected behaviour: a station already held is updated where it moved, not duplicated, so the
+/// abbreviation a subscription names keeps meaning one row.
+#[tokio::test]
+#[serial]
+async fn the_station_list_is_maintained_rather_than_appended_to() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::exec(&db, "DELETE FROM meteoswiss_stations").await;
+
+    store_stations(
+        &db,
+        &[
+            station(STATION, "Montagnier, Bagnes", Some(840.0)),
+            station("AEG", "Oberägeri", None),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        scalar_i64(&db, "SELECT count(*) AS n FROM meteoswiss_stations").await,
+        2
+    );
+
+    store_stations(
+        &db,
+        &[station(STATION, "Montagnier, Bagnes (VS)", Some(841.0))],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        scalar_i64(&db, "SELECT count(*) AS n FROM meteoswiss_stations").await,
+        2,
+        "a re-published station is the same row"
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT count(*) AS n FROM meteoswiss_stations \
+                  WHERE station_abbr = '{STATION}' AND name = 'Montagnier, Bagnes (VS)' \
+                    AND height_barometer_masl = 841.0"
+            )
+        )
+        .await,
+        1
+    );
+    // A station the list no longer carries is left alone: a subscription naming it still resolves.
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT count(*) AS n FROM meteoswiss_stations WHERE station_abbr = 'AEG' \
+               AND height_barometer_masl IS NULL"
+        )
+        .await,
+        1
+    );
+}
+
+/// Scenario: an operator types into the station picker in whatever case comes to hand.
+/// Expected behaviour: the abbreviation and the name both match regardless of case, and a term
+/// matching nothing returns nothing rather than the whole list.
+#[tokio::test]
+#[serial]
+async fn the_station_search_matches_an_abbreviation_or_a_name_in_any_case() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::exec(&db, "DELETE FROM meteoswiss_stations").await;
+    store_stations(
+        &db,
+        &[
+            station(STATION, "Montagnier, Bagnes", Some(840.0)),
+            station("SIO", "Sion", Some(483.0)),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let by_abbr = search_stations(&db, Some("mob")).await.unwrap();
+    assert_eq!(by_abbr.len(), 1);
+    assert_eq!(by_abbr[0].station_abbr, STATION);
+
+    let by_name = search_stations(&db, Some("BAGNES")).await.unwrap();
+    assert_eq!(by_name.len(), 1);
+    assert_eq!(by_name[0].station_abbr, STATION);
+
+    assert_eq!(
+        search_stations(&db, Some("Nowhere")).await.unwrap().len(),
+        0
+    );
+    // A picker opened before anything is typed offers everything.
+    assert_eq!(search_stations(&db, None).await.unwrap().len(), 2);
+    assert_eq!(search_stations(&db, Some("  ")).await.unwrap().len(), 2);
 }

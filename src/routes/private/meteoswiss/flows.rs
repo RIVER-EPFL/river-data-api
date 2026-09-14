@@ -1,4 +1,5 @@
-//! The scheduled fetch: one pass over every declared station, landing what each site named.
+//! The scheduled fetches: the ten-minute pass over the all-stations latest-values file, and the
+//! daily pass over each subscribed station's recent archive that fills what downtime missed.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -7,14 +8,104 @@ use std::collections::BTreeMap;
 
 use super::models::{Fetched, Point, Subscriber};
 use super::service::{
-    advance_cursor, cursor, fetch, insert, instrument, provision, recent_url, series, subscribers,
+    advance_cursor, cursor, fetch, insert, instrument, latest, provision, recent_url, series,
+    stations, stations_url, store_stations, subscribers,
 };
 use crate::config::Config;
 use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport, Schedule};
 
-/// Pull each declared station's recent file and land its pressure at every site that named it.
+/// What a pass landed, so the two jobs report the same numbers under the same names.
+#[derive(Default)]
+struct Landed {
+    inserted: usize,
+    earliest: Option<DateTime<Utc>>,
+}
+
+impl Landed {
+    fn saw(&mut self, oldest: Option<DateTime<Utc>>) {
+        self.earliest = match (self.earliest, oldest) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
+}
+
+/// The subscriptions of one pass, grouped station then variable: one fetch per station in the
+/// archive pass, and one lookup per station in the latest pass.
+type ByStation = BTreeMap<String, BTreeMap<String, Vec<Subscriber>>>;
+
+fn by_station(subscribers: Vec<Subscriber>) -> ByStation {
+    let mut grouped: ByStation = BTreeMap::new();
+    for subscriber in subscribers {
+        grouped
+            .entry(subscriber.station.clone())
+            .or_default()
+            .entry(subscriber.variable.clone())
+            .or_default()
+            .push(subscriber);
+    }
+    grouped
+}
+
+fn http_client(timeout_seconds: u64) -> Result<reqwest::Client, DbErr> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_seconds.max(1)))
+        .build()
+        .map_err(|e| DbErr::Custom(format!("Failed to build the MeteoSwiss client: {e}")))
+}
+
+/// Land the points a pass read for one subscription, from its stream's cursor forward.
+async fn land(
+    ctx: &JobContext,
+    site: &Subscriber,
+    station: &str,
+    points: &[Point],
+    landed: &mut Landed,
+) -> Result<(), DbErr> {
+    let stream_id = provision(ctx.db(), site, site.parameter_id).await?;
+    let cursor = cursor(ctx.db(), stream_id).await?;
+    let fresh: Vec<&Point> = points
+        .iter()
+        .filter(|p| cursor.is_none_or(|c| p.time > c))
+        .collect();
+    if fresh.is_empty() {
+        return Ok(());
+    }
+    let sensor_id = instrument(ctx.db(), station).await?;
+    landed.inserted += insert(
+        ctx.db(),
+        stream_id,
+        site.site_id,
+        site.parameter_id,
+        sensor_id,
+        &fresh,
+    )
+    .await?;
+    landed.saw(fresh.iter().map(|p| p.time).min());
+    if let Some(newest) = fresh.iter().map(|p| p.time).max() {
+        advance_cursor(ctx.db(), stream_id, newest).await?;
+    }
+    Ok(())
+}
+
+/// A pressure series rolls up like any other continuous parameter, so a pass makes what it landed
+/// visible over the span it moved.
+async fn refresh(ctx: &JobContext, landed: &Landed) -> Result<(), DbErr> {
+    if let Some(since) = landed.earliest {
+        crate::common::sync_state::refresh_continuous_aggregates(ctx.db(), since)
+            .await
+            .map_err(|e| DbErr::Custom(format!("Aggregate refresh failed: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Read the all-stations latest-values file and land the newest interval at every subscribed site.
+///
+/// One conditional request covers every station, so the cadence is the file's own: it is
+/// republished every ten minutes, and a tick that finds the same ETag costs nothing.
 pub struct MeteoswissSync {
     base_url: String,
+    latest_url: String,
     interval_seconds: u64,
     timeout_seconds: u64,
 }
@@ -24,8 +115,55 @@ impl MeteoswissSync {
     pub fn from_config(config: &Config) -> Self {
         Self {
             base_url: config.meteoswiss_base_url.clone(),
+            latest_url: config.meteoswiss_latest_url.clone(),
             interval_seconds: config.meteoswiss_interval_seconds,
             timeout_seconds: config.meteoswiss_timeout_seconds,
+        }
+    }
+}
+
+impl MeteoswissSync {
+    /// Pull the published station list and maintain the table from it. A failure here is logged
+    /// and does not stop the pass: the list is what a station is chosen out of, not what a
+    /// subscribed station is read with.
+    async fn refresh_stations(&self, ctx: &JobContext, client: &reqwest::Client) -> usize {
+        let url = stations_url(&self.base_url);
+        let body = match fetch(ctx.db(), client, &url).await {
+            Ok(Fetched::Body(body)) => body,
+            Ok(Fetched::Unchanged) => return 0,
+            Err(e) => {
+                ctx.log(
+                    "warn",
+                    "Could not read the MeteoSwiss station list",
+                    serde_json::json!({ "url": url, "error": e }),
+                )
+                .await;
+                return 0;
+            }
+        };
+        let rows = match stations(&body) {
+            Ok(rows) => rows,
+            Err(e) => {
+                ctx.log(
+                    "warn",
+                    "Could not read the MeteoSwiss station list",
+                    serde_json::json!({ "url": url, "error": e }),
+                )
+                .await;
+                return 0;
+            }
+        };
+        match store_stations(ctx.db(), &rows).await {
+            Ok(stored) => stored,
+            Err(e) => {
+                ctx.log(
+                    "warn",
+                    "Could not store the MeteoSwiss station list",
+                    serde_json::json!({ "error": e.to_string() }),
+                )
+                .await;
+                0
+            }
         }
     }
 }
@@ -38,52 +176,156 @@ impl Job for MeteoswissSync {
 
     fn default_schedule(&self) -> Option<Schedule> {
         Some(Schedule::every_secs(
-            i64::try_from(self.interval_seconds.max(1)).unwrap_or(3600),
+            i64::try_from(self.interval_seconds.max(1)).unwrap_or(600),
         ))
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        let subscribers = subscribers(ctx.db()).await?;
-        if subscribers.is_empty() {
+        let client = http_client(self.timeout_seconds)?;
+
+        // The list is refreshed before the subscriptions are read, and whether or not there are
+        // any: it is what a station is chosen out of, so a database with no subscription yet is
+        // exactly the one that needs it.
+        let stations_stored = self.refresh_stations(&ctx, &client).await;
+
+        let subscriptions = subscribers(ctx.db()).await?;
+        if subscriptions.is_empty() {
+            ctx.report(
+                JobReport::new()
+                    .count("stations", 0usize)
+                    .count("stations_listed", stations_stored),
+            )
+            .await;
+            return Ok(0);
+        }
+        let body = match fetch(ctx.db(), &client, &self.latest_url).await {
+            Ok(Fetched::Body(body)) => body,
+            // The file has not been republished since the last tick, so every station still holds
+            // the interval already landed.
+            Ok(Fetched::Unchanged) => {
+                ctx.report(
+                    JobReport::new()
+                        .count("unchanged", 1usize)
+                        .count("stations_listed", stations_stored),
+                )
+                .await;
+                return Ok(0);
+            }
+            Err(e) => return Err(DbErr::Custom(format!("MeteoSwiss latest values: {e}"))),
+        };
+
+        let mut landed = Landed::default();
+        let mut stations_read = 0usize;
+        let mut absent = 0usize;
+        let mut variables_failed = 0usize;
+
+        for (station, by_variable) in by_station(subscriptions) {
+            if ctx.is_cancelled() {
+                break;
+            }
+            stations_read += 1;
+            for (variable, sites) in by_variable {
+                let reported = match latest(&body, &variable) {
+                    Ok(reported) => reported,
+                    Err(e) => {
+                        variables_failed += 1;
+                        ctx.log(
+                            "warn",
+                            "Could not read a MeteoSwiss variable",
+                            serde_json::json!({ "variable": variable, "error": e }),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let Some(point) = reported.get(&station) else {
+                    absent += 1;
+                    continue;
+                };
+                for site in sites {
+                    land(
+                        &ctx,
+                        &site,
+                        &station,
+                        std::slice::from_ref(point),
+                        &mut landed,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        refresh(&ctx, &landed).await?;
+        ctx.report(
+            JobReport::new()
+                .scope_opt("since", landed.earliest.map(|t| t.to_rfc3339()))
+                .count("stations", stations_read)
+                .count("stations_listed", stations_stored)
+                .count("stations_absent", absent)
+                .count("variables_failed", variables_failed)
+                .count("readings_inserted", landed.inserted),
+        )
+        .await;
+        Ok(i64::try_from(landed.inserted).unwrap_or(i64::MAX))
+    }
+}
+
+/// Read each subscribed station's recent archive and land what the ten-minute pass missed.
+///
+/// The archive is 4.2 MB per station and republished twice a day, so it is read once a day and
+/// conditionally: it is the gap filler after downtime, not the feed.
+pub struct MeteoswissRecent {
+    base_url: String,
+    interval_seconds: u64,
+    timeout_seconds: u64,
+}
+
+impl MeteoswissRecent {
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            base_url: config.meteoswiss_base_url.clone(),
+            interval_seconds: config.meteoswiss_recent_interval_seconds,
+            timeout_seconds: config.meteoswiss_timeout_seconds,
+        }
+    }
+}
+
+#[async_trait]
+impl Job for MeteoswissRecent {
+    fn name(&self) -> &'static str {
+        "meteoswiss_recent"
+    }
+
+    fn default_schedule(&self) -> Option<Schedule> {
+        Some(Schedule::every_secs(
+            i64::try_from(self.interval_seconds.max(1)).unwrap_or(86_400),
+        ))
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let subscriptions = subscribers(ctx.db()).await?;
+        if subscriptions.is_empty() {
             ctx.report(JobReport::new().count("stations", 0usize)).await;
             return Ok(0);
         }
+        let client = http_client(self.timeout_seconds)?;
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(self.timeout_seconds.max(1)))
-            .build()
-            .map_err(|e| DbErr::Custom(format!("Failed to build the MeteoSwiss client: {e}")))?;
-
-        // One fetch per station, however many sites and variables read it: the published file
-        // carries every variable the station reports, so the variables are read out of one body.
-        let mut by_station: BTreeMap<String, BTreeMap<String, Vec<Subscriber>>> = BTreeMap::new();
-        for subscriber in subscribers {
-            by_station
-                .entry(subscriber.station.clone())
-                .or_default()
-                .entry(subscriber.variable.clone())
-                .or_default()
-                .push(subscriber);
-        }
-
-        let mut inserted = 0usize;
+        let mut landed = Landed::default();
         let mut stations_read = 0usize;
         let mut stations_failed = 0usize;
         let mut unchanged = 0usize;
         let mut variables_failed = 0usize;
         let mut blank = 0usize;
         let mut unreadable = 0usize;
-        let mut earliest: Option<DateTime<Utc>> = None;
 
-        for (station, by_variable) in by_station {
+        for (station, by_variable) in by_station(subscriptions) {
             if ctx.is_cancelled() {
                 break;
             }
             let url = recent_url(&self.base_url, &station);
             let body = match fetch(ctx.db(), &client, &url).await {
                 Ok(Fetched::Body(body)) => body,
-                // The source holds what the last tick landed, so there is nothing to read out of
-                // it and nothing to report against the station.
                 Ok(Fetched::Unchanged) => {
                     unchanged += 1;
                     continue;
@@ -117,64 +359,25 @@ impl Job for MeteoswissSync {
                 };
                 blank += series.blank;
                 unreadable += series.unreadable;
-
                 for site in sites {
-                    let parameter_id = site.parameter_id;
-                    let stream_id = provision(ctx.db(), &site, parameter_id).await?;
-                    let cursor = cursor(ctx.db(), stream_id).await?;
-                    let fresh: Vec<&Point> = series
-                        .points
-                        .iter()
-                        .filter(|p| cursor.is_none_or(|c| p.time > c))
-                        .collect();
-                    if fresh.is_empty() {
-                        continue;
-                    }
-                    let sensor_id = instrument(ctx.db(), &station).await?;
-                    let written = insert(
-                        ctx.db(),
-                        stream_id,
-                        site.site_id,
-                        parameter_id,
-                        sensor_id,
-                        &fresh,
-                    )
-                    .await?;
-                    inserted += written;
-
-                    let newest = fresh.iter().map(|p| p.time).max();
-                    let oldest = fresh.iter().map(|p| p.time).min();
-                    earliest = match (earliest, oldest) {
-                        (Some(a), Some(b)) => Some(a.min(b)),
-                        (a, b) => a.or(b),
-                    };
-                    if let Some(newest) = newest {
-                        advance_cursor(ctx.db(), stream_id, newest).await?;
-                    }
+                    land(&ctx, &site, &station, &series.points, &mut landed).await?;
                 }
             }
         }
 
-        // A pressure series rolls up like any other continuous parameter, so the rollups have to
-        // see what just landed or the site charts serve a gap.
-        if let Some(since) = earliest {
-            crate::common::sync_state::refresh_continuous_aggregates(ctx.db(), since)
-                .await
-                .map_err(|e| DbErr::Custom(format!("Aggregate refresh failed: {e}")))?;
-        }
-
+        refresh(&ctx, &landed).await?;
         ctx.report(
             JobReport::new()
-                .scope_opt("since", earliest.map(|t| t.to_rfc3339()))
+                .scope_opt("since", landed.earliest.map(|t| t.to_rfc3339()))
                 .count("stations", stations_read)
                 .count("stations_failed", stations_failed)
                 .count("stations_unchanged", unchanged)
                 .count("variables_failed", variables_failed)
-                .count("readings_inserted", inserted)
+                .count("readings_inserted", landed.inserted)
                 .count("blank_cells", blank)
                 .count("unreadable_rows", unreadable),
         )
         .await;
-        Ok(i64::try_from(inserted).unwrap_or(i64::MAX))
+        Ok(i64::try_from(landed.inserted).unwrap_or(i64::MAX))
     }
 }

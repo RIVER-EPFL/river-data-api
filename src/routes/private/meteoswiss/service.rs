@@ -5,7 +5,9 @@
 //! reports, one row per ten-minute interval. `reference_timestamp` is `DD.MM.YYYY HH:MM` in UTC,
 //! and a variable the station did not report at that interval is an empty cell.
 
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use std::collections::HashMap;
+
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult,
@@ -13,7 +15,9 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
-use super::models::{Fetched, Point, Series, Subscriber};
+use super::models::{
+    ExternalSource, Fetched, Point, Series, StationCandidate, StationRow, Subscriber, subscription,
+};
 use crate::routes::private::{data_streams, parameters, readings, sensors, site_parameters};
 
 const SOURCE_SYSTEM: &str = "meteoswiss";
@@ -52,6 +56,12 @@ const CHUNK: usize = 500;
 
 const TIMESTAMP_COLUMN: &str = "reference_timestamp";
 const TIMESTAMP_FORMAT: &str = "%d.%m.%Y %H:%M";
+
+/// The all-stations latest-values file names its station and instant differently from the
+/// per-station archives, and writes a missing value as a dash.
+const LATEST_STATION_COLUMN: &str = "Station/Location";
+const LATEST_TIMESTAMP_COLUMN: &str = "Date";
+const LATEST_TIMESTAMP_FORMAT: &str = "%Y%m%d%H%M";
 
 /// Read one variable out of an SMN CSV. Errors only when the file cannot name the columns asked
 /// for, which is a changed publication format rather than a gap in the data.
@@ -94,6 +104,55 @@ pub fn series(csv: &str, variable: &str) -> Result<Series, String> {
     Ok(series)
 }
 
+/// Read one variable out of the all-stations latest-values file: the newest interval every station
+/// reported, keyed by station abbreviation.
+///
+/// One file covers every station a site subscribes to, so a tick is one request however many
+/// stations are read.
+pub fn latest(csv: &str, variable: &str) -> Result<HashMap<String, Point>, String> {
+    let mut lines = csv.lines().filter(|l| !l.trim().is_empty());
+    let header = lines.next().ok_or("file is empty")?;
+    let header = header.strip_prefix('\u{feff}').unwrap_or(header);
+
+    let columns: Vec<&str> = header.split(';').map(str::trim).collect();
+    let station_at = column(&columns, LATEST_STATION_COLUMN)?;
+    let time_at = column(&columns, LATEST_TIMESTAMP_COLUMN)?;
+    let value_at = column(&columns, variable)?;
+
+    let mut points: HashMap<String, Point> = HashMap::new();
+    for line in lines {
+        let cells: Vec<&str> = line.split(';').map(str::trim).collect();
+        let (Some(station), Some(raw_time), Some(raw_value)) = (
+            cells.get(station_at),
+            cells.get(time_at),
+            cells.get(value_at),
+        ) else {
+            continue;
+        };
+        // A station that did not report the variable at this interval writes a dash.
+        if raw_value.is_empty() || *raw_value == "-" {
+            continue;
+        }
+        let (Ok(naive), Ok(value)) = (
+            NaiveDateTime::parse_from_str(raw_time, LATEST_TIMESTAMP_FORMAT),
+            raw_value.parse::<f64>(),
+        ) else {
+            continue;
+        };
+        if !value.is_finite() {
+            continue;
+        }
+        points.insert(
+            station.to_uppercase(),
+            Point {
+                time: Utc.from_utc_datetime(&naive),
+                value,
+            },
+        );
+    }
+    Ok(points)
+}
+
 fn column(columns: &[&str], name: &str) -> Result<usize, String> {
     columns
         .iter()
@@ -109,6 +168,228 @@ pub fn recent_url(base: &str, station_abbr: &str) -> String {
         "{}/{station}/ogd-smn_{station}_t_recent.csv",
         base.trim_end_matches('/')
     )
+}
+
+/// The published path for the station metadata, the list every subscription names a station out of.
+#[must_use]
+pub fn stations_url(base: &str) -> String {
+    format!("{}/ogd-smn_meta_stations.csv", base.trim_end_matches('/'))
+}
+
+const STATION_DATE_FORMAT: &str = "%d.%m.%Y";
+
+/// Read the published station metadata. Errors only when the file cannot name the abbreviation and
+/// the name, which is a changed publication format; a row missing either is skipped.
+pub fn stations(csv: &str) -> Result<Vec<StationRow>, String> {
+    let mut lines = csv.lines().filter(|l| !l.trim().is_empty());
+    let header = lines.next().ok_or("file is empty")?;
+    let header = header.strip_prefix('\u{feff}').unwrap_or(header);
+
+    let columns: Vec<&str> = header.split(';').map(str::trim).collect();
+    let abbr_at = column(&columns, "station_abbr")?;
+    let name_at = column(&columns, "station_name")?;
+    let since_at = column(&columns, "station_data_since").ok();
+    let height_at = column(&columns, "station_height_masl").ok();
+    let barometer_at = column(&columns, "station_height_barometer_masl").ok();
+    let lat_at = column(&columns, "station_coordinates_wgs84_lat").ok();
+    let lon_at = column(&columns, "station_coordinates_wgs84_lon").ok();
+
+    let mut rows = Vec::new();
+    for line in lines {
+        let cells: Vec<&str> = line.split(';').map(str::trim).collect();
+        let (Some(abbr), Some(name)) = (cells.get(abbr_at), cells.get(name_at)) else {
+            continue;
+        };
+        if abbr.is_empty() || name.is_empty() {
+            continue;
+        }
+        rows.push(StationRow {
+            abbr: abbr.to_uppercase(),
+            name: (*name).to_string(),
+            data_since: since_at
+                .and_then(|at| cells.get(at))
+                .and_then(|cell| NaiveDate::parse_from_str(cell, STATION_DATE_FORMAT).ok()),
+            height_masl: number(&cells, height_at),
+            height_barometer_masl: number(&cells, barometer_at),
+            latitude: number(&cells, lat_at),
+            longitude: number(&cells, lon_at),
+        });
+    }
+    Ok(rows)
+}
+
+/// A finite number out of an optional column, which a station leaves blank where it has none.
+fn number(cells: &[&str], at: Option<usize>) -> Option<f64> {
+    at.and_then(|at| cells.get(at))
+        .and_then(|cell| cell.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+}
+
+/// Rows per station INSERT. Seven placeholders a row keeps the whole published list in one pass.
+const STATION_CHUNK: usize = 200;
+
+/// Maintain the station list from what the metadata file yielded, keyed on the abbreviation.
+/// MeteoSwiss move a station rather than renaming it, so a row already held is updated in place
+/// and a subscription naming it keeps pointing at the same station.
+pub async fn store_stations<C: ConnectionTrait>(
+    db: &C,
+    rows: &[StationRow],
+) -> Result<usize, DbErr> {
+    use super::models::station;
+    let mut written = 0usize;
+    for chunk in rows.chunks(STATION_CHUNK) {
+        let affected = station::Entity::insert_many(chunk.iter().map(|row| station::ActiveModel {
+            station_abbr: Set(row.abbr.clone()),
+            name: Set(row.name.clone()),
+            data_since: Set(row.data_since),
+            height_masl: Set(row.height_masl),
+            height_barometer_masl: Set(row.height_barometer_masl),
+            latitude: Set(row.latitude),
+            longitude: Set(row.longitude),
+            updated_at: Set(Utc::now()),
+        }))
+        .on_conflict(
+            OnConflict::column(station::Column::StationAbbr)
+                .update_columns([
+                    station::Column::Name,
+                    station::Column::DataSince,
+                    station::Column::HeightMasl,
+                    station::Column::HeightBarometerMasl,
+                    station::Column::Latitude,
+                    station::Column::Longitude,
+                    station::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await?;
+        written += usize::try_from(affected).unwrap_or(0);
+    }
+    Ok(written)
+}
+
+/// The attribution the MeteoSwiss terms ask for on anything published from the feed (Q77).
+pub const ATTRIBUTION: &str = "Source: MeteoSwiss";
+
+/// The feed attributing each of a site's parameters, keyed by catalog parameter. Read from the
+/// subscription rows, so a parameter whose code merely looks like a MeteoSwiss one is not
+/// attributed to the feed and a subscription switched off stops attributing.
+#[must_use]
+pub fn attributions(subscriptions: &[subscription::Model]) -> HashMap<Uuid, ExternalSource> {
+    subscriptions
+        .iter()
+        .filter(|sub| sub.enabled)
+        .map(|sub| {
+            (
+                sub.parameter_id,
+                ExternalSource {
+                    system: SOURCE_SYSTEM.to_string(),
+                    station: sub.station_abbr.trim().to_uppercase(),
+                    attribution: ATTRIBUTION.to_string(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// The attributions for one site, for a reader building its parameter list.
+pub async fn site_attributions<C: ConnectionTrait>(
+    db: &C,
+    site_id: Uuid,
+) -> Result<HashMap<Uuid, ExternalSource>, DbErr> {
+    let subscriptions = subscription::Entity::find()
+        .filter(subscription::Column::SiteId.eq(site_id))
+        .filter(subscription::Column::Enabled.eq(true))
+        .all(db)
+        .await?;
+    Ok(attributions(&subscriptions))
+}
+
+/// Mean Earth radius, the one the great-circle distance is quoted against.
+const EARTH_RADIUS_KM: f64 = 6371.0088;
+
+/// The stations whose abbreviation or name carries `q`, or every station where nothing was typed.
+pub async fn search_stations<C: ConnectionTrait>(
+    db: &C,
+    q: Option<&str>,
+) -> Result<Vec<super::models::station::Model>, DbErr> {
+    use sea_orm::sea_query::extension::postgres::PgExpr;
+    use sea_orm::sea_query::{Expr, ExprTrait};
+
+    use super::models::station;
+    let mut query = station::Entity::find();
+    if let Some(term) = q.map(str::trim).filter(|t| !t.is_empty()) {
+        // A picker is typed into in any case, and the wildcards are the operator's text rather
+        // than a pattern they wrote.
+        let pattern = format!("%{}%", term.replace('%', "\\%").replace('_', "\\_"));
+        query = query.filter(
+            Expr::col(station::Column::StationAbbr)
+                .ilike(&pattern)
+                .or(Expr::col(station::Column::Name).ilike(&pattern)),
+        );
+    }
+    query.all(db).await
+}
+
+/// The point a site ranks stations from, where it has one. Coordinates are hand-entered, so a site
+/// without them is ordinary rather than an error.
+pub async fn site_origin<C: ConnectionTrait>(
+    db: &C,
+    site_id: Uuid,
+) -> Result<Option<(f64, f64)>, DbErr> {
+    let Some(site) = crate::routes::private::sites::Entity::find_by_id(site_id)
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(site.latitude.zip(site.longitude))
+}
+
+/// Great-circle distance in kilometres between two WGS84 points.
+#[must_use]
+pub fn distance_km(from: (f64, f64), to: (f64, f64)) -> f64 {
+    let (lat1, lon1) = (from.0.to_radians(), from.1.to_radians());
+    let (lat2, lon2) = (to.0.to_radians(), to.1.to_radians());
+    let half_dlat = ((lat2 - lat1) / 2.0).sin();
+    let half_dlon = ((lon2 - lon1) / 2.0).sin();
+    let a = half_dlat.mul_add(half_dlat, lat1.cos() * lat2.cos() * half_dlon * half_dlon);
+    2.0 * EARTH_RADIUS_KM * a.sqrt().asin()
+}
+
+/// Order the candidates for a picker: nearest first from the site's coordinates, and by name where
+/// the site has none or a station's own coordinates are missing. The published list is 158 rows,
+/// so the ordering is done over the rows rather than asked of the database.
+#[must_use]
+pub fn rank_stations(
+    stations: Vec<super::models::station::Model>,
+    origin: Option<(f64, f64)>,
+) -> Vec<StationCandidate> {
+    let mut candidates: Vec<StationCandidate> = stations
+        .into_iter()
+        .map(|station| {
+            let distance_km = origin
+                .zip(station.latitude.zip(station.longitude))
+                .map(|(origin, at)| distance_km(origin, at));
+            StationCandidate {
+                station_abbr: station.station_abbr,
+                name: station.name,
+                data_since: station.data_since,
+                height_masl: station.height_masl,
+                height_barometer_masl: station.height_barometer_masl,
+                latitude: station.latitude,
+                longitude: station.longitude,
+                distance_km,
+            }
+        })
+        .collect();
+    candidates.sort_by(|a, b| match (a.distance_km, b.distance_km) {
+        (Some(x), Some(y)) => x.total_cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.name.cmp(&b.name),
+    });
+    candidates
 }
 
 /// Every enabled subscription, ordered so a station's sites are read together.
@@ -400,11 +681,19 @@ pub async fn fetch<C: ConnectionTrait>(
     if !status.is_success() {
         return Err(format!("{url}: HTTP {status}"));
     }
-    let body = response.text().await.map_err(|e| e.to_string())?;
+    // The OGD files are latin-1: the station metadata carries names like Oberägeri, and reading
+    // them as UTF-8 replaces the byte rather than the character. The data files are ASCII, which
+    // latin-1 reads identically.
+    let body = latin1(&response.bytes().await.map_err(|e| e.to_string())?);
     record_fetch(db, url, etag)
         .await
         .map_err(|e| e.to_string())?;
     Ok(Fetched::Body(body))
+}
+
+/// Latin-1 is a byte-per-character mapping onto the first 256 code points, so it always decodes.
+fn latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| char::from(*b)).collect()
 }
 
 /// The subscription's hooks: a site subscribes to a declared variable, and the catalog row that

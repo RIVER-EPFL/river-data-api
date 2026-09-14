@@ -9,6 +9,8 @@ use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
+use crate::routes::private::meteoswiss::models::ExternalSource;
+
 // --- The sites entity ---
 
 #[derive(
@@ -178,6 +180,10 @@ pub struct ParameterResponse {
     /// Data-driven cadence classification: 'low' (spot-only), 'high' (no spot), or 'mixed'.
     /// Low-frequency series render marker-only over their full range and skip the aggregate path.
     pub frequency: String,
+    /// The outside feed the values come from, where the site subscribes to one for this parameter.
+    /// None is the site's own instruments.
+    #[schema(required)]
+    pub external_source: Option<ExternalSource>,
 }
 
 /// Detailed site response with project info, parameters, and data range

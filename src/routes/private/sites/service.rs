@@ -19,6 +19,7 @@ use super::models::*;
 use crate::common::aggregates::Resolution;
 use crate::common::series::{Cells, Table};
 use crate::error::{AppError, AppResult};
+use crate::routes::private::meteoswiss::models::ExternalSource;
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::samples;
 use crate::routes::private::sensor_calibrations::models as sensor_calibrations;
@@ -301,6 +302,7 @@ pub(super) fn build_parameter_response(
     globals: &HashMap<Uuid, site_parameters::CatalogParameter>,
     extents: &HashMap<Uuid, ParameterExtent>,
     declared: &HashMap<Uuid, &'static str>,
+    attributions: &HashMap<Uuid, ExternalSource>,
 ) -> ParameterResponse {
     let d = site_parameters::SlotDescriptor::resolve(&p, globals.get(&p.parameter_id));
     let extent = extents.get(&p.parameter_id);
@@ -333,6 +335,7 @@ pub(super) fn build_parameter_response(
         has_continuous,
         has_spot,
         frequency,
+        external_source: attributions.get(&p.parameter_id).cloned(),
     }
 }
 

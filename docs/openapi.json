@@ -6812,6 +6812,29 @@
         ],
         "type": "object"
       },
+      "ExternalSource": {
+        "description": "How a parameter the site does not measure itself is attributed wherever it is read. The\nMeteoSwiss terms ask for the attribution on anything published from the feed, so the line is\nbuilt here rather than composed by each reader.",
+        "properties": {
+          "attribution": {
+            "description": "The attribution line to show.",
+            "type": "string"
+          },
+          "station": {
+            "description": "The station the values are read from.",
+            "type": "string"
+          },
+          "system": {
+            "description": "The feed, as its rows are keyed (`meteoswiss`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "system",
+          "station",
+          "attribution"
+        ],
+        "type": "object"
+      },
       "FamilyCandidate": {
         "properties": {
           "family_source_key": {
@@ -13035,6 +13058,17 @@
             "description": "How this site fills the slot: 'manual' or 'tool'",
             "type": "string"
           },
+          "external_source": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ExternalSource",
+                "description": "The outside feed the values come from, where the site subscribes to one for this parameter.\nNone is the site's own instruments."
+              }
+            ]
+          },
           "frequency": {
             "description": "Data-driven cadence classification: 'low' (spot-only), 'high' (no spot), or 'mixed'.\nLow-frequency series render marker-only over their full range and skip the aggregate path.",
             "type": "string"
@@ -13110,7 +13144,8 @@
           "reading_count",
           "has_continuous",
           "has_spot",
-          "frequency"
+          "frequency",
+          "external_source"
         ],
         "type": "object"
       },

@@ -541,6 +541,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/change_audit",
             get(crate::routes::private::change_audit::views::list_change_audit),
         )
+        .route(
+            "/meteoswiss/stations",
+            get(crate::routes::private::meteoswiss::views::list_stations),
+        )
         .layer(middleware::from_fn(require_read_metadata))
         .with_state(state.clone());
 

@@ -65,6 +65,7 @@ pub const MAINTENANCE: &[&str] = &[
     "refresh_aggregates",
     "alarm_backfill",
     "meteoswiss_sync",
+    "meteoswiss_recent",
 ];
 
 /// Triggered by a configuration change rather than by a person.
@@ -136,6 +137,7 @@ pub const CANCELLABLE: &[&str] = &[
     "event_audit",
     "event_recompute",
     "meteoswiss_sync",
+    "meteoswiss_recent",
 ];
 
 /// The recurring services [`register_scheduled_services`] adds. They carry a cadence
@@ -151,6 +153,7 @@ pub const SCHEDULED_SERVICE_NAMES: &[&str] = &[
     "notify_health",
     "dispatch_notifications",
     "meteoswiss_sync",
+    "meteoswiss_recent",
 ];
 
 // --- The Job contract and its registry ---
@@ -516,6 +519,9 @@ pub fn register_scheduled_services(registry: &mut JobRegistry, config: &crate::c
     ));
     registry.register(Arc::new(
         crate::routes::private::meteoswiss::flows::MeteoswissSync::from_config(config),
+    ));
+    registry.register(Arc::new(
+        crate::routes::private::meteoswiss::flows::MeteoswissRecent::from_config(config),
     ));
 
     // The policy tables in `registry` are keyed by trigger_type and cannot construct these, so the

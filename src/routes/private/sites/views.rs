@@ -36,6 +36,7 @@ use crate::common::{AppState, bulk, cache_key};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::annotations::{self, Annotation};
 use crate::routes::private::data_streams::models as data_streams;
+use crate::routes::private::meteoswiss::service as meteoswiss;
 use crate::routes::private::parameters;
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::samples::models as samples;
@@ -86,10 +87,11 @@ pub async fn list_site_parameters(
     let globals = site_parameters::catalog_map(&state.db, param_ids.iter().copied()).await?;
     let extents = parameter_extents(&state.db, site.id).await?;
     let declared = declared_frequencies(&state.db, site.id).await?;
+    let attributions = meteoswiss::site_attributions(&state.db, site.id).await?;
 
     let response: Vec<ParameterResponse> = params_list
         .into_iter()
-        .map(|p| build_parameter_response(p, &globals, &extents, &declared))
+        .map(|p| build_parameter_response(p, &globals, &extents, &declared, &attributions))
         .collect();
 
     Ok(Json(response))
@@ -134,10 +136,11 @@ pub async fn get_site_detail(
     let globals = site_parameters::catalog_map(&state.db, param_ids.iter().copied()).await?;
     let extents = parameter_extents(&state.db, site.id).await?;
     let declared = declared_frequencies(&state.db, site.id).await?;
+    let attributions = meteoswiss::site_attributions(&state.db, site.id).await?;
 
     let parameters: Vec<ParameterResponse> = params_list
         .into_iter()
-        .map(|p| build_parameter_response(p, &globals, &extents, &declared))
+        .map(|p| build_parameter_response(p, &globals, &extents, &declared, &attributions))
         .collect();
 
     // The extents cover the same rows this range spans (`WHERE site_id = $1`), so folding them is

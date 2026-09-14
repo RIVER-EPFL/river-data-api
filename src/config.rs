@@ -98,7 +98,10 @@ pub struct Config {
 
     /// MeteoSwiss Open Government Data SMN collection. The per-station recent file hangs under it.
     pub meteoswiss_base_url: String,
+    /// The all-stations latest-values file, republished every ten minutes.
+    pub meteoswiss_latest_url: String,
     pub meteoswiss_interval_seconds: u64,
+    pub meteoswiss_recent_interval_seconds: u64,
     pub meteoswiss_timeout_seconds: u64,
 
     // Derived-parameter janitor
@@ -202,7 +205,9 @@ impl Config {
             tools_runner_url: None,
             tools_runner_timeout_seconds: 60,
             meteoswiss_base_url: String::new(),
-            meteoswiss_interval_seconds: 3600,
+            meteoswiss_latest_url: String::new(),
+            meteoswiss_interval_seconds: 600,
+            meteoswiss_recent_interval_seconds: 86_400,
             meteoswiss_timeout_seconds: 30,
             janitor_interval_seconds: 3600,
             janitor_full_refresh_seconds: 86_400,
@@ -349,7 +354,15 @@ impl Config {
             )
             .trim_end_matches('/')
             .to_string(),
-            meteoswiss_interval_seconds: parse_or("METEOSWISS_INTERVAL_SECONDS", 3600),
+            meteoswiss_latest_url: string_or(
+                "METEOSWISS_LATEST_URL",
+                "https://data.geo.admin.ch/ch.meteoschweiz.messwerte-aktuell/VQHA80.csv",
+            ),
+            meteoswiss_interval_seconds: parse_or("METEOSWISS_INTERVAL_SECONDS", 600),
+            meteoswiss_recent_interval_seconds: parse_or(
+                "METEOSWISS_RECENT_INTERVAL_SECONDS",
+                86_400,
+            ),
             meteoswiss_timeout_seconds: parse_or("METEOSWISS_TIMEOUT_SECONDS", 60),
 
             // Derived-parameter janitor

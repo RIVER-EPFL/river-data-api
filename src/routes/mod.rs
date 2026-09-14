@@ -189,6 +189,7 @@ pub fn validate_optional_time_range(
         private::notifications::views::refresh_health,
         private::events::views::event_stream,
         private::change_audit::views::list_change_audit,
+        private::meteoswiss::views::list_stations,
         private::me::get_me,
         private::me::get_my_sites,
         private::api_tokens::views::list_user_grants,

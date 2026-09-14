@@ -1,6 +1,6 @@
 //! The shapes the MeteoSwiss feed is read into: one parsed interval, what a file yielded, what a
-//! conditional fetch returned, the subscription a site holds, and that subscription as the sync
-//! reads it.
+//! conditional fetch returned, the subscription a site holds, that subscription as the sync reads
+//! it, and the published station list a subscription names a station out of.
 
 use chrono::{DateTime, Utc};
 use sea_orm::FromQueryResult;
@@ -28,6 +28,19 @@ pub struct Series {
 pub enum Fetched {
     Body(String),
     Unchanged,
+}
+
+/// How a parameter the site does not measure itself is attributed wherever it is read. The
+/// MeteoSwiss terms ask for the attribution on anything published from the feed, so the line is
+/// built here rather than composed by each reader.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
+pub struct ExternalSource {
+    /// The feed, as its rows are keyed (`meteoswiss`).
+    pub system: String,
+    /// The station the values are read from.
+    pub station: String,
+    /// The attribution line to show.
+    pub attribution: String,
 }
 
 /// One enabled subscription, with the site it feeds.
@@ -84,6 +97,61 @@ pub mod subscription {
         pub enabled: bool,
         #[crudcrate(exclude(create, update), sortable)]
         pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// One row of the published station metadata, as the list is maintained from it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StationRow {
+    pub abbr: String,
+    pub name: String,
+    pub data_since: Option<chrono::NaiveDate>,
+    pub height_masl: Option<f64>,
+    /// Blank for a station that reports no pressure, which is 19 of the 158 published.
+    pub height_barometer_masl: Option<f64>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+}
+
+/// One station offered to a picker: what the list holds, plus how far it is from the site being
+/// configured where that site has coordinates.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct StationCandidate {
+    pub station_abbr: String,
+    pub name: String,
+    pub data_since: Option<chrono::NaiveDate>,
+    /// The station's own elevation, which every published station carries.
+    pub height_masl: Option<f64>,
+    /// The elevation the barometer sits at, which a station reporting no pressure leaves empty.
+    pub height_barometer_masl: Option<f64>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    /// Great-circle distance from the site, absent where either end has no coordinates.
+    pub distance_km: Option<f64>,
+}
+
+pub mod station {
+    use sea_orm::entity::prelude::*;
+
+    /// One SMN station, maintained from `ogd-smn_meta_stations.csv`. The abbreviation is the
+    /// source's own key and the one a subscription names.
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize)]
+    #[sea_orm(table_name = "meteoswiss_stations")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub station_abbr: String,
+        pub name: String,
+        pub data_since: Option<chrono::NaiveDate>,
+        pub height_masl: Option<f64>,
+        pub height_barometer_masl: Option<f64>,
+        pub latitude: Option<f64>,
+        pub longitude: Option<f64>,
+        pub updated_at: chrono::DateTime<chrono::Utc>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
