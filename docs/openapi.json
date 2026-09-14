@@ -10297,6 +10297,63 @@
         ],
         "type": "object"
       },
+      "ManualRun": {
+        "description": "What one kind needs before a person can run it off-cadence.\n\nThree answers, and every kind gives one (I94): a kind reached only from its own action route\nis `NotOffered` and is not listed; one whose `run` reads nothing from `params` is a button;\none that reads a target or a window declares each input, and both the refusal and the form are\nbuilt from that declaration. There is no free JSON field anywhere (Evan, Q165).",
+        "oneOf": [
+          {
+            "description": "Its inputs are not a person's to supply: staged rows it consumes, or a replay of persisted\ntimestamps. Reached from its own route.",
+            "properties": {
+              "offer": {
+                "enum": [
+                  "not_offered"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "offer"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Runs as it stands.",
+            "properties": {
+              "offer": {
+                "enum": [
+                  "no_parameters"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "offer"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Runs once these are given.",
+            "properties": {
+              "offer": {
+                "enum": [
+                  "declared"
+                ],
+                "type": "string"
+              },
+              "params": {
+                "items": {
+                  "$ref": "#/components/schemas/ParamSpec"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "params",
+              "offer"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "Me": {
         "properties": {
           "email": {
@@ -12250,6 +12307,43 @@
         },
         "required": [
           "param"
+        ],
+        "type": "object"
+      },
+      "ParamKind": {
+        "enum": [
+          "uuid",
+          "instant",
+          "text",
+          "bool",
+          "number",
+          "uuid_list",
+          "pair_list"
+        ],
+        "type": "string"
+      },
+      "ParamSpec": {
+        "description": "One input a manual run supplies, as the form renders it and the refusal names it.",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/ParamKind"
+          },
+          "label": {
+            "description": "What the control is labelled, and what the 400 calls the input.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "required",
+          "label"
         ],
         "type": "object"
       },
@@ -18562,6 +18656,37 @@
         "required": [
           "job_id",
           "enqueued"
+        ],
+        "type": "object"
+      },
+      "RunnableJob": {
+        "description": "One kind a person may run off-cadence, as the page lists it: what it needs, and the cadence it\nalso runs on where it has one.",
+        "properties": {
+          "enabled": {
+            "description": "Whether the cadence is switched on, where it has one.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "interval_seconds": {
+            "description": "Absent where the kind has no schedule at all, which the page reads as on demand.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "job_name": {
+            "type": "string"
+          },
+          "manual_run": {
+            "$ref": "#/components/schemas/ManualRun"
+          }
+        },
+        "required": [
+          "job_name",
+          "manual_run"
         ],
         "type": "object"
       },
@@ -39936,6 +40061,31 @@
         "summary": "Update many schedules"
       }
     },
+    "/api/schedules/runnable": {
+      "get": {
+        "description": "The `schedules` table holds a row only for a kind with a default cadence, so it is not the list\nof what can be run: the registry is.",
+        "operationId": "list_runnable",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RunnableJob"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The kinds a person may run, by name"
+          }
+        },
+        "summary": "`GET /api/schedules/runnable`, every job kind a person may run off-cadence, by name, with what\neach one needs and the cadence it also runs on where it has one. Requires `read_metadata`.",
+        "tags": [
+          "schedules"
+        ]
+      }
+    },
     "/api/schedules/{id}": {
       "get": {
         "description": "Retrieves one schedule by its ID.\n\nThis resource manages schedule items",
@@ -40076,6 +40226,13 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {
@@ -40087,11 +40244,14 @@
             },
             "description": "The enqueued run"
           },
+          "400": {
+            "description": "The job is not run by hand, or an input it declares is missing"
+          },
           "404": {
             "description": "No job of that name is registered"
           }
         },
-        "summary": "`POST /api/schedules/{job_name}/run_now`, fire one off-cadence run with the schedule's current\ntunables snapshot. 404 if `job_name` is not a known job. Requires `write_metadata` (+ non-scoped\ntoken).",
+        "summary": "`POST /api/schedules/{job_name}/run_now`, fire one off-cadence run with the schedule's current\ntunables snapshot and whatever inputs the kind declares. 404 if `job_name` is not a known job,\n400 if it is not run by hand or an input it declares is missing. Requires `write_metadata`\n(+ non-scoped token).",
         "tags": [
           "schedules"
         ]

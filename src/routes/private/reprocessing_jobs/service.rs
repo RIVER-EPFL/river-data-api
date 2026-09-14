@@ -118,6 +118,208 @@ pub const RERUNNABLE: &[&str] = &[
     "pairing_backfill",
 ];
 
+/// What one kind needs before a person can run it off-cadence.
+///
+/// Three answers, and every kind gives one (I94): a kind reached only from its own action route
+/// is `NotOffered` and is not listed; one whose `run` reads nothing from `params` is a button;
+/// one that reads a target or a window declares each input, and both the refusal and the form are
+/// built from that declaration. There is no free JSON field anywhere (Evan, Q165).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case", tag = "offer")]
+pub enum ManualRun {
+    /// Its inputs are not a person's to supply: staged rows it consumes, or a replay of persisted
+    /// timestamps. Reached from its own route.
+    NotOffered,
+    /// Runs as it stands.
+    NoParameters,
+    /// Runs once these are given.
+    Declared { params: Vec<ParamSpec> },
+}
+
+/// One input a manual run supplies, as the form renders it and the refusal names it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
+pub struct ParamSpec {
+    pub name: &'static str,
+    pub kind: ParamKind,
+    pub required: bool,
+    /// What the control is labelled, and what the 400 calls the input.
+    pub label: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ParamKind {
+    /// One row of the entity the label names.
+    Uuid,
+    /// An RFC 3339 instant.
+    Instant,
+    Text,
+    Bool,
+    Number,
+    /// An array of UUIDs; an empty one is "every one of them".
+    UuidList,
+    /// An array of `[site_id, parameter_id]` pairs, or of `{site_id, timestamps}` objects.
+    PairList,
+}
+
+const fn spec(
+    name: &'static str,
+    kind: ParamKind,
+    required: bool,
+    label: &'static str,
+) -> ParamSpec {
+    ParamSpec {
+        name,
+        kind,
+        required,
+        label,
+    }
+}
+
+/// One kind a person may run off-cadence, as the page lists it: what it needs, and the cadence it
+/// also runs on where it has one.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
+pub struct RunnableJob {
+    pub job_name: String,
+    pub manual_run: ManualRun,
+    /// Absent where the kind has no schedule at all, which the page reads as on demand.
+    pub interval_seconds: Option<i64>,
+    /// Whether the cadence is switched on, where it has one.
+    pub enabled: Option<bool>,
+}
+
+/// The kinds a person may run, by name. A `NotOffered` kind is left out rather than listed and
+/// refused: its inputs come from the route that enqueues it, so there is no form to offer.
+pub fn runnable_jobs<'a>(
+    names: impl Iterator<Item = &'a str>,
+    cadence: &HashMap<String, (Option<i64>, bool)>,
+) -> Vec<RunnableJob> {
+    let mut runnable: Vec<RunnableJob> = names
+        .filter_map(|name| {
+            let manual_run = manual_run_for(name);
+            if manual_run == ManualRun::NotOffered {
+                return None;
+            }
+            let scheduled = cadence.get(name);
+            Some(RunnableJob {
+                job_name: name.to_string(),
+                manual_run,
+                interval_seconds: scheduled.and_then(|(interval, _)| *interval),
+                enabled: scheduled.map(|(_, enabled)| *enabled),
+            })
+        })
+        .collect();
+    runnable.sort_by(|a, b| a.job_name.cmp(&b.job_name));
+    runnable
+}
+
+/// What a manual run of `trigger_type` needs. One table, so the route's refusal, the page's form
+/// and this answer cannot disagree; the kinds' own `required_uuid` guards stay the last defence.
+#[must_use]
+pub fn manual_run_for(trigger_type: &str) -> ManualRun {
+    use ParamKind::{Bool, Instant, Number, PairList, Text, Uuid, UuidList};
+    let declared = |params: Vec<ParamSpec>| ManualRun::Declared { params };
+    match trigger_type {
+        // Reads nothing but the scheduler's own snapshot.
+        "janitor_service"
+        | "alarm_sweep"
+        | "sync_event_sweep"
+        | "sync_ledger_retention"
+        | "identity_reconcile"
+        | "notify_health"
+        | "dispatch_notifications"
+        | "meteoswiss_sync"
+        | "reprocess_all"
+        | "derived_recompute"
+        | "backfill_calibrations"
+        | "backfill_attribution"
+        | "event_audit" => ManualRun::NoParameters,
+
+        "refresh_aggregates" => declared(vec![
+            spec("from", Instant, false, "Window start"),
+            spec("until", Instant, false, "Window end"),
+            spec("since", Instant, false, "Everything after"),
+        ]),
+        "manual_reprocess"
+        | "calibration_create"
+        | "calibration_update"
+        | "calibration_delete"
+        | "calibration_retire"
+        | "calibration_unretire"
+        | "calibration_recalculate" => declared(vec![spec("sensor_id", Uuid, true, "Instrument")]),
+        "sensor_swap" | "pairing_backfill" | "manual_adopt" | "attribution_pin" => declared(vec![
+            spec("site_id", Uuid, true, "Site"),
+            spec("parameter_id", Uuid, true, "Parameter"),
+            spec("sensor_id", Uuid, false, "Instrument"),
+        ]),
+        "deployment_create" | "deployment_update" | "deployment_delete" => declared(vec![
+            spec("sensor_id", Uuid, true, "Instrument"),
+            spec("site_id", Uuid, true, "Site"),
+            spec("parameter_id", Uuid, false, "Parameter"),
+        ]),
+        "derived_assignment" => declared(vec![
+            spec("derived_definition_id", Uuid, true, "Calculation"),
+            spec("site_id", Uuid, true, "Site"),
+        ]),
+        "merge_parameters" => declared(vec![
+            spec("source_parameter_id", Uuid, true, "Absorbed parameter"),
+            spec("target_parameter_id", Uuid, true, "Surviving parameter"),
+        ]),
+        "merge_site_parameters" => declared(vec![
+            spec("source_site_parameter_id", Uuid, true, "Absorbed slot"),
+            spec("target_site_parameter_id", Uuid, true, "Surviving slot"),
+        ]),
+        "plan_apply" | "plan_revert" => declared(vec![spec("plan_id", Uuid, true, "Pairing plan")]),
+        "alarm_backfill" => declared(vec![
+            spec("slots", PairList, false, "Slots"),
+            spec("start", Instant, false, "Window start"),
+            spec("end", Instant, false, "Window end"),
+        ]),
+        "replicate_reconciliation" | "replicate_reconciliation_delete" | "sync_full_reassert" => {
+            declared(vec![
+                spec("source_system", Text, true, "Source system"),
+                spec("tolerance", Number, false, "Relative tolerance"),
+                spec("dry_run", Bool, false, "Report only"),
+            ])
+        }
+        "measurement_retag" => declared(vec![
+            spec("target", Text, true, "Measurement type"),
+            spec("sensor_ids", UuidList, false, "Instruments"),
+            spec("stream_ids", UuidList, false, "Streams"),
+            spec("source_system", Text, false, "Source system"),
+        ]),
+        "sd_estimator_retag" => declared(vec![
+            spec("estimator", Text, true, "Estimator"),
+            spec("site_parameter_ids", UuidList, false, "Slots"),
+            spec("stream_ids", UuidList, false, "Streams"),
+            spec("start", Instant, false, "Window start"),
+            spec("end", Instant, false, "Window end"),
+            spec(
+                "override_instants",
+                Bool,
+                false,
+                "Override declared instants",
+            ),
+        ]),
+
+        // Its inputs are not a person's: staged rows the run deletes, or persisted timestamps.
+        _ => ManualRun::NotOffered,
+    }
+}
+
+/// The inputs a declared kind is missing from what a caller supplied, in declaration order.
+#[must_use]
+pub fn missing_params(offer: &ManualRun, supplied: &serde_json::Value) -> Vec<&'static str> {
+    let ManualRun::Declared { params } = offer else {
+        return Vec::new();
+    };
+    params
+        .iter()
+        .filter(|p| p.required && supplied.get(p.name).is_none_or(serde_json::Value::is_null))
+        .map(|p| p.label)
+        .collect()
+}
+
 /// Whether a running job of this `trigger_type` can be cooperatively cancelled, i.e. it iterates a
 /// loop and checks `JobContext::is_cancelled` at its batch checkpoints. Single-statement jobs
 /// (aggregate refresh, pairing backfill) have no checkpoint and report 409 on a cancel attempt.
@@ -199,6 +401,12 @@ pub trait Job: Send + Sync {
     /// scheduler seeds a `schedules` row from it on first start.
     fn default_schedule(&self) -> Option<Schedule> {
         None
+    }
+
+    /// What a manual off-cadence run of this kind needs. Delegates to the shared
+    /// [`manual_run_for`] table so the trait and the route's refusal cannot disagree.
+    fn manual_run(&self) -> ManualRun {
+        manual_run_for(self.name())
     }
 
     /// The operator-settable inputs this job reads. The default is none, which is what makes the
@@ -2002,6 +2210,10 @@ impl CRUDOperations for ScheduleOperations {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "tests/manual_run.rs"]
+mod manual_run_tests;
 
 #[cfg(test)]
 #[path = "tests/job.rs"]

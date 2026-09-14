@@ -546,6 +546,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             get(crate::routes::private::parameter_groups::views::group_definition),
         )
         .route(
+            "/schedules/runnable",
+            get(crate::routes::private::reprocessing_jobs::views::list_runnable),
+        )
+        .route(
             "/schedules/{job_name}/audit",
             get(crate::routes::private::reprocessing_jobs::views::get_schedule_audit),
         )

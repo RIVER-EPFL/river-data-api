@@ -318,6 +318,30 @@ fn full_registry(state: &AppState) -> JobRegistry {
     registry
 }
 
+/// `GET /api/schedules/runnable`, every job kind a person may run off-cadence, by name, with what
+/// each one needs and the cadence it also runs on where it has one. Requires `read_metadata`.
+///
+/// The `schedules` table holds a row only for a kind with a default cadence, so it is not the list
+/// of what can be run: the registry is.
+#[utoipa::path(
+    get,
+    path = "/api/schedules/runnable",
+    responses((status = 200, description = "The kinds a person may run, by name", body = Vec<service::RunnableJob>)),
+    tag = "schedules"
+)]
+pub async fn list_runnable(
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<service::RunnableJob>>> {
+    let registry = full_registry(&state);
+    let cadence = schedule::Entity::find()
+        .all(&state.db)
+        .await?
+        .into_iter()
+        .map(|row| (row.job_name, (row.interval_seconds, row.enabled)))
+        .collect();
+    Ok(Json(service::runnable_jobs(registry.names(), &cadence)))
+}
+
 /// `POST /api/schedules/{job_name}/run_now` response: the enqueued job id (None on a dedupe
 /// collision, an identical run_now in the same second) and whether one was created.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -328,14 +352,16 @@ pub struct RunNowResponse {
 }
 
 /// `POST /api/schedules/{job_name}/run_now`, fire one off-cadence run with the schedule's current
-/// tunables snapshot. 404 if `job_name` is not a known job. Requires `write_metadata` (+ non-scoped
-/// token).
+/// tunables snapshot and whatever inputs the kind declares. 404 if `job_name` is not a known job,
+/// 400 if it is not run by hand or an input it declares is missing. Requires `write_metadata`
+/// (+ non-scoped token).
 #[utoipa::path(
     post,
     path = "/api/schedules/{job_name}/run_now",
     params(("job_name" = String, Path, description = "Registered job name")),
     responses(
         (status = 200, description = "The enqueued run", body = RunNowResponse),
+        (status = 400, description = "The job is not run by hand, or an input it declares is missing"),
         (status = 404, description = "No job of that name is registered"),
     ),
     tag = "schedules"
@@ -343,10 +369,25 @@ pub struct RunNowResponse {
 pub async fn run_now(
     State(state): State<AppState>,
     Path(job_name): Path<String>,
+    body: Option<Json<serde_json::Value>>,
 ) -> AppResult<Json<RunNowResponse>> {
-    if full_registry(&state).get(&job_name).is_none() {
+    let Some(job) = full_registry(&state).get(&job_name) else {
         return Err(AppError::NotFound(format!(
             "no job named '{job_name}' is registered"
+        )));
+    };
+    let supplied = body.map_or_else(|| serde_json::json!({}), |Json(v)| v);
+    let offer = job.manual_run();
+    if offer == service::ManualRun::NotOffered {
+        return Err(AppError::BadRequest(format!(
+            "'{job_name}' is not run by hand: its inputs come from the route that enqueues it"
+        )));
+    }
+    let missing = service::missing_params(&offer, &supplied);
+    if !missing.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "'{job_name}' needs {}",
+            missing.join(", ")
         )));
     }
 
@@ -360,15 +401,16 @@ pub async fn run_now(
     // Per-second dedupe key so an accidental double-click collapses to one run; a deliberate second
     // run in a later second is allowed.
     let dedupe_key = format!("{job_name}:run_now:{}", chrono::Utc::now().timestamp());
-    let job_id = service::enqueue(
-        &state.db,
-        &job_name,
-        None,
-        None,
-        &serde_json::json!({ "trigger": "run_now", "tunables": tunables }),
-        Some(&dedupe_key),
-    )
-    .await?;
+    // The declared inputs travel beside the snapshot, under their own names, so the job reads them
+    // exactly as it reads the ones its action route sends.
+    let mut params = serde_json::json!({ "trigger": "run_now", "tunables": tunables });
+    if let (Some(object), Some(supplied)) = (params.as_object_mut(), supplied.as_object()) {
+        for (key, value) in supplied {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    let job_id =
+        service::enqueue(&state.db, &job_name, None, None, &params, Some(&dedupe_key)).await?;
 
     Ok(Json(RunNowResponse {
         enqueued: job_id.is_some(),
