@@ -11,7 +11,7 @@ use super::models::definition::CalculationFormula;
 use super::models::source;
 use crate::routes::private::constants;
 use crate::routes::private::parameters;
-use crate::routes::private::tools::service::free_identifiers;
+use crate::routes::private::tools::service::{CURVE_VARIABLES, free_identifiers};
 
 /// A formula's content hash: sha256 over the text itself, so one text is one version however it
 /// was saved.
@@ -99,8 +99,68 @@ pub(crate) struct ResolvedSources {
 pub(crate) async fn resolve_variables<C: ConnectionTrait>(
     db: &C,
     formula: &str,
+    context: &FormulaContext<'_>,
 ) -> Result<ResolvedSources, ApiError> {
-    resolve_identifiers(db, &free_identifiers(formula)).await
+    let steps = steps_of(db, context).await?;
+    let names: Vec<String> = variables_of(formula, context.curve_slot)?
+        .into_iter()
+        .filter(|name| !steps.iter().any(|step| step == name))
+        .collect();
+    resolve_identifiers(db, &names).await
+}
+
+/// What a formula is resolved in: the calculation whose earlier steps it may read, and the curve
+/// slot that binds its coefficients.
+pub(crate) struct FormulaContext<'a> {
+    pub tool_script_id: Option<Uuid>,
+    pub code: &'a str,
+    pub curve_slot: Option<&'a str>,
+}
+
+/// The codes of the calculation's other intermediates. A step stores nothing and mints no
+/// parameter, so its code names no reading: it reaches the formulas after it from the run, and
+/// recording it as a source would send the evaluation looking for a value the visit never holds.
+async fn steps_of<C: ConnectionTrait>(
+    db: &C,
+    context: &FormulaContext<'_>,
+) -> Result<Vec<String>, ApiError> {
+    let Some(tool_script_id) = context.tool_script_id else {
+        return Ok(Vec::new());
+    };
+    super::models::definition::Entity::find()
+        .filter(super::models::definition::Column::ToolScriptId.eq(tool_script_id))
+        .filter(super::models::definition::Column::Intermediate.eq(true))
+        .filter(super::models::definition::Column::Code.ne(context.code))
+        .all(db)
+        .await
+        .map(|rows| rows.into_iter().map(|row| row.code).collect())
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))
+}
+
+/// The identifiers a formula reads, minus the two its curve slot binds.
+///
+/// `curve_slope` and `curve_intercept` are supplied at evaluation from the slot's curve
+/// ([`crate::routes::private::tools::service::CURVE_VARIABLES`]), so they name no parameter,
+/// constant or site column. A formula reading one with no slot to bind it is refused by name: it
+/// could never be evaluated.
+pub(crate) fn variables_of(
+    formula: &str,
+    curve_slot: Option<&str>,
+) -> Result<Vec<String>, ApiError> {
+    let bound = curve_slot.is_some_and(|slot| !slot.trim().is_empty());
+    let mut names = Vec::new();
+    for name in free_identifiers(formula) {
+        if !CURVE_VARIABLES.contains(&name.as_str()) {
+            names.push(name);
+            continue;
+        }
+        if !bound {
+            return Err(ApiError::bad_request(format!(
+                "Formula variable '{name}' is a curve coefficient; the formula needs a curve slot                  to bind it"
+            )));
+        }
+    }
+    Ok(names)
 }
 
 /// [`resolve_variables`] over identifiers already taken from a formula, for a caller that has
@@ -328,13 +388,12 @@ fn code_matches(code: &str) -> sea_orm::sea_query::SimpleExpr {
 async fn stored_definition<C: ConnectionTrait>(
     db: &C,
     id: Uuid,
-) -> Result<(Option<Uuid>, String), ApiError> {
-    let stored = super::models::definition::Entity::find_by_id(id)
+) -> Result<super::models::definition::Model, ApiError> {
+    super::models::definition::Entity::find_by_id(id)
         .one(db)
         .await
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?
-        .ok_or_else(|| ApiError::not_found("Derived parameter definition", None))?;
-    Ok((stored.output_parameter_id, stored.formula))
+        .ok_or_else(|| ApiError::not_found("Derived parameter definition", None))
 }
 
 /// Delete existing sources and insert new ones for a derived definition.
@@ -516,7 +575,12 @@ impl CRUDOperations for CalculationFormulaOperations {
         data: &<CalculationFormula as CRUDResource>::CreateModel,
     ) -> Result<(), ApiError> {
         validate_formula(&data.formula)?;
-        let resolved = resolve_variables(db, &data.formula).await?;
+        let context = FormulaContext {
+            tool_script_id: data.tool_script_id,
+            code: &data.code,
+            curve_slot: data.curve_slot.as_deref(),
+        };
+        let resolved = resolve_variables(db, &data.formula, &context).await?;
         // A definition being created may already have its output parameter in the catalog, and
         // anything reading that parameter is a chain this formula would close.
         let output = existing_parameter_id(db, &data.code).await?;
@@ -529,7 +593,12 @@ impl CRUDOperations for CalculationFormulaOperations {
         db: &C,
         entity: &mut CalculationFormula,
     ) -> Result<(), ApiError> {
-        let resolved = resolve_variables(db, &entity.formula).await?;
+        let context = FormulaContext {
+            tool_script_id: entity.tool_script_id,
+            code: &entity.code,
+            curve_slot: entity.curve_slot.as_deref(),
+        };
+        let resolved = resolve_variables(db, &entity.formula, &context).await?;
         sync_sources(db, entity.id, &resolved).await?;
 
         // Auto-create a corresponding entry in the parameters table so this
@@ -572,11 +641,22 @@ impl CRUDOperations for CalculationFormulaOperations {
     ) -> Result<(), ApiError> {
         if let Some(Some(ref formula)) = data.formula {
             validate_formula(formula)?;
-            let resolved = resolve_variables(db, formula).await?;
             // The stored row says what this definition produces, so the cycle and depth guards run
             // before the write rather than after it: a refused update must leave nothing behind.
-            let (output, _) = stored_definition(db, id).await?;
-            validate_against_stored_graph(db, output, &resolved.parameters).await?;
+            // It also carries the curve slot when this update does not change it.
+            let stored = stored_definition(db, id).await?;
+            let curve_slot = match &data.curve_slot {
+                Some(slot) => slot.clone(),
+                None => stored.curve_slot.clone(),
+            };
+            let context = FormulaContext {
+                tool_script_id: stored.tool_script_id,
+                code: &stored.code,
+                curve_slot: curve_slot.as_deref(),
+            };
+            let resolved = resolve_variables(db, formula, &context).await?;
+            validate_against_stored_graph(db, stored.output_parameter_id, &resolved.parameters)
+                .await?;
         }
         Ok(())
     }
@@ -586,7 +666,12 @@ impl CRUDOperations for CalculationFormulaOperations {
         db: &C,
         entity: &mut CalculationFormula,
     ) -> Result<(), ApiError> {
-        let resolved = resolve_variables(db, &entity.formula).await?;
+        let context = FormulaContext {
+            tool_script_id: entity.tool_script_id,
+            code: &entity.code,
+            curve_slot: entity.curve_slot.as_deref(),
+        };
+        let resolved = resolve_variables(db, &entity.formula, &context).await?;
         sync_sources(db, entity.id, &resolved).await?;
 
         // Keep the output parameter in sync; an intermediate has none to keep.

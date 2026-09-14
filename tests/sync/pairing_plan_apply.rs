@@ -492,9 +492,15 @@ async fn apply_creates_the_group_the_source_registry_names() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    for (key, column, ordinal, role) in [
-        ("cat-a", "WTW_pH_1", 3, "measured"),
-        ("cat-b", "Field_BP", 8, "output"),
+    for (key, column, ordinal, role, calculation) in [
+        ("cat-a", "WTW_pH_1", 3, "measured", serde_json::Value::Null),
+        (
+            "cat-b",
+            "Field_BP",
+            8,
+            "output",
+            serde_json::json!({ "function": "calcPCO2", "inputs": ["WTW_pH_1"] }),
+        ),
     ] {
         let stream_id = Uuid::new_v4();
         let metadata = serde_json::json!({
@@ -506,6 +512,7 @@ async fn apply_creates_the_group_the_source_registry_names() {
                 "category_ordinal": ordinal,
                 "role": role,
                 "description": "from field sheet",
+                "source_calculation": calculation,
             },
         });
         crate::common::exec(
@@ -537,6 +544,23 @@ async fn apply_creates_the_group_the_source_registry_names() {
     assert_eq!(group["code"], serde_json::json!("field_data"), "{group}");
     assert_eq!(group["label"], serde_json::json!("Field data"), "{group}");
     assert_eq!(group["create"], serde_json::json!(true), "{group}");
+    let carried: Vec<&serde_json::Value> = plan["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|e| &e["parameter"]["calculation"])
+        .collect();
+    assert!(
+        carried.iter().any(|c| {
+            c["function"] == serde_json::json!("calcPCO2")
+                && c["inputs"] == serde_json::json!(["WTW_pH_1"])
+        }),
+        "the output column's own calculation rides on the plan: {carried:?}"
+    );
+    assert!(
+        carried.iter().any(|c| c.is_null()),
+        "and the measured column declares none: {carried:?}"
+    );
 
     let plan_id = plan["id"].as_str().expect("plan id").to_string();
     crate::common::plans::acknowledge_plan(&app, &token, &plan_id).await;
@@ -548,10 +572,11 @@ async fn apply_creates_the_group_the_source_registry_names() {
         "completed"
     );
 
-    let placed = db
+    let rows = db
         .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT p.code AS code, m.ordinal AS ordinal, m.role AS role, g.code AS group_code \
+            "SELECT p.code AS code, m.ordinal AS ordinal, m.role AS role, g.code AS group_code, \
+                    m.source_calculation AS source_calculation \
              FROM parameter_group_members m \
              JOIN parameter_groups g ON g.id = m.group_id \
              JOIN parameters p ON p.id = m.parameter_id \
@@ -560,7 +585,7 @@ async fn apply_creates_the_group_the_source_registry_names() {
         ))
         .await
         .unwrap();
-    let placed: Vec<(String, i32, String, String)> = placed
+    let placed: Vec<(String, i32, String, String)> = rows
         .iter()
         .map(|row| {
             (
@@ -578,6 +603,21 @@ async fn apply_creates_the_group_the_source_registry_names() {
             ("Field_BP".into(), 8, "output".into(), "field_data".into()),
         ],
         "both columns land in the one group, at the registry's positions and roles"
+    );
+    let recorded: Vec<Option<serde_json::Value>> = rows
+        .iter()
+        .map(|row| {
+            row.try_get::<Option<serde_json::Value>>("", "source_calculation")
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![
+            None,
+            Some(serde_json::json!({ "function": "calcPCO2", "inputs": ["WTW_pH_1"] })),
+        ],
+        "the output member records what the source computed it with, the measured one nothing"
     );
 
     let groups = db

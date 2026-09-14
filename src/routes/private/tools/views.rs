@@ -38,7 +38,9 @@ use super::service::{
 use crate::common::AppState;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::derived_parameters::service::{resolve_identifiers, validate_formula};
+use crate::routes::private::derived_parameters::service::{
+    resolve_identifiers, validate_formula, variables_of,
+};
 
 /// List the active analytical tools with their full input/output manifests.
 ///
@@ -551,6 +553,13 @@ async fn pin_draft_formulas(
     drafts: &[super::models::DraftFormula],
 ) -> AppResult<Vec<super::models::PinnedFormula>> {
     let codes: Vec<String> = drafts.iter().map(|d| d.code.trim().to_string()).collect();
+    // A step of the set stores nothing and reaches the formulas after it from the run, so it is
+    // no source: recording it as one sends the evaluation looking for a reading of it.
+    let steps: Vec<String> = drafts
+        .iter()
+        .filter(|d| d.intermediate)
+        .map(|d| d.code.trim().to_string())
+        .collect();
     let refused = |code: &str, e: crudcrate::ApiError| {
         AppError::BadRequest(format!("{code}: {}", api_message(e)))
     };
@@ -562,7 +571,8 @@ async fn pin_draft_formulas(
         }
         validate_formula(&draft.formula).map_err(|e| refused(code, e))?;
         let (produced, external): (Vec<String>, Vec<String>) =
-            super::service::free_identifiers(&draft.formula)
+            variables_of(&draft.formula, draft.curve_slot.as_deref())
+                .map_err(|e| refused(code, e))?
                 .into_iter()
                 .partition(|v| v != code && codes.contains(v));
         let resolved = resolve_identifiers(db, &external)
@@ -572,7 +582,12 @@ async fn pin_draft_formulas(
             .parameters
             .into_iter()
             .map(|(variable, _)| (variable.clone(), variable))
-            .chain(produced.into_iter().map(|v| (v.clone(), v)))
+            .chain(
+                produced
+                    .into_iter()
+                    .filter(|v| !steps.contains(v))
+                    .map(|v| (v.clone(), v)),
+            )
             .collect();
         sources.sort();
         formulas.push(super::models::PinnedFormula {

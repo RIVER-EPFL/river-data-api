@@ -8,6 +8,7 @@ mod common;
 
 mod calculation_closure;
 mod calculators;
+mod cnet_authoring;
 mod constants_parity;
 mod draft_run;
 mod formula_calculation;

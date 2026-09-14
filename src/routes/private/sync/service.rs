@@ -31,6 +31,7 @@ use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::api_tokens::service::hash_token;
 use crate::routes::private::parameter_groups::group_model as parameter_groups;
+use crate::routes::private::parameter_groups::member_model;
 use crate::routes::private::readings::samples::models as samples;
 use crate::routes::private::readings::status_events::models as status_events;
 use crate::routes::private::sensors;
@@ -2352,6 +2353,10 @@ pub struct PlanParamRef {
     #[serde(default)]
     #[schema(required)]
     pub group: Option<PlanGroupRef>,
+    /// The source calculation behind an `output` column, where the source declares one.
+    #[serde(default)]
+    #[schema(required)]
+    pub calculation: Option<PlanCalculationRef>,
     #[serde(default)]
     #[schema(required)]
     pub original_names: Vec<String>,
@@ -2376,6 +2381,19 @@ pub struct PlanGroupRef {
     #[schema(required)]
     pub description: Option<String>,
     pub create: bool,
+}
+
+/// What the source computed an `output` column with: its own calculation function and the columns
+/// that function reads.
+///
+/// The role says a column is computed; this says what computed it, which is the statement a
+/// formula set is authored against and the one an output still waiting for one is missing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PlanCalculationRef {
+    /// The source's own function name, verbatim (`calcPCO2`).
+    pub function: String,
+    /// The columns it reads, in the order the source lists them.
+    pub inputs: Vec<String>,
 }
 
 /// A group's code: lowercase, non-alphanumerics collapsed to underscores. The rule the portal seed
@@ -2428,6 +2446,34 @@ pub fn plan_group(metadata: &serde_json::Value) -> Option<PlanGroupRef> {
             .filter(|d| !d.is_empty())
             .map(ToString::to_string),
         create: true,
+    })
+}
+
+/// The calculation a stream's metadata declares for its column, where the source names one.
+///
+/// A function with no inputs is not a calculation anybody can read back, so both are required.
+#[must_use]
+pub fn plan_calculation(metadata: &serde_json::Value) -> Option<PlanCalculationRef> {
+    let declared = metadata.get("parameter")?.get("source_calculation")?;
+    let function = declared.get("function")?.as_str()?.trim();
+    if function.is_empty() {
+        return None;
+    }
+    let inputs: Vec<String> = declared
+        .get("inputs")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if inputs.is_empty() {
+        return None;
+    }
+    Some(PlanCalculationRef {
+        function: function.to_string(),
+        inputs,
     })
 }
 
@@ -2680,6 +2726,7 @@ pub async fn create_plan(
                 units: h.units,
                 group_key: None,
                 group: plan_group(&stream.metadata),
+                calculation: plan_calculation(&stream.metadata),
                 original_names: vec![],
             },
             confidence: "none".to_string(),
@@ -3279,6 +3326,7 @@ pub(super) async fn resolve_plan_entry<C: ConnectionTrait>(
             txn,
             parameter_id,
             group,
+            entry.parameter.calculation.as_ref(),
             &mut caches.groups,
             &mut counters.groups_created,
             &mut counters.group_members_created,
@@ -3307,6 +3355,7 @@ pub(super) async fn place_in_group<C: ConnectionTrait>(
     txn: &C,
     parameter_id: Uuid,
     group: &PlanGroupRef,
+    calculation: Option<&PlanCalculationRef>,
     cache: &mut HashMap<String, Uuid>,
     groups_created: &mut u32,
     members_created: &mut u32,
@@ -3352,23 +3401,29 @@ pub(super) async fn place_in_group<C: ConnectionTrait>(
             resolved
         }
     };
-    let written = txn
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO parameter_group_members \
-                 (id, group_id, parameter_id, ordinal, role, description) \
-             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (parameter_id) DO NOTHING",
-            [
-                Uuid::new_v4().into(),
-                group_id.into(),
-                parameter_id.into(),
-                group.ordinal.into(),
-                group.role.clone().into(),
-                group.description.clone().into(),
-            ],
-        ))
-        .await?;
-    if written.rows_affected() > 0 {
+    let source_calculation = calculation
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|e| AppError::Internal(format!("source calculation is not serialisable: {e}")))?;
+    let written = member_model::Entity::insert(member_model::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        group_id: Set(group_id),
+        parameter_id: Set(parameter_id),
+        ordinal: Set(group.ordinal),
+        role: Set(group.role.clone()),
+        description: Set(group.description.clone()),
+        source_calculation: Set(source_calculation),
+        ..Default::default()
+    })
+    .on_conflict(
+        sea_orm::sea_query::OnConflict::column(member_model::Column::ParameterId)
+            .do_nothing()
+            .to_owned(),
+    )
+    .try_insert()
+    .exec(txn)
+    .await?;
+    if matches!(written, sea_orm::TryInsertResult::Inserted(_)) {
         *members_created += 1;
     }
     Ok(())

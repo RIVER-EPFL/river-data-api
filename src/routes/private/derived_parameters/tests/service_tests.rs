@@ -74,3 +74,25 @@ fn a_definition_with_no_output_parameter_yet_closes_no_cycle() {
     let input = Uuid::new_v4();
     validate_dependency_chain(&graph(&[]), None, &[("x".to_string(), input)]).unwrap();
 }
+
+/// A curve slot binds `curve_slope` and `curve_intercept` at evaluation, so neither is a variable
+/// to resolve; with no slot to bind them the formula could never be evaluated.
+#[test]
+fn test_variables_of_holds_back_the_coefficients_a_curve_slot_binds() {
+    let formula = "(Vaisala_CO2_min * curve_slope + curve_intercept) * bp";
+    let names = super::variables_of(formula, Some("vaisala")).expect("a slot binds them");
+    assert_eq!(names, vec!["Vaisala_CO2_min".to_string(), "bp".to_string()]);
+}
+
+#[test]
+fn test_variables_of_refuses_a_coefficient_with_no_slot() {
+    let refused = super::variables_of("raw * curve_slope", None).expect_err("no slot");
+    let message = format!("{refused:?}");
+    assert!(message.contains("curve_slope"), "{message}");
+    assert!(message.contains("curve slot"), "{message}");
+}
+
+#[test]
+fn test_variables_of_reads_an_empty_slot_as_no_slot() {
+    assert!(super::variables_of("raw * curve_intercept", Some("  ")).is_err());
+}

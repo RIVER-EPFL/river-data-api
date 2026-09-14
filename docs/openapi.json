@@ -12395,6 +12395,7 @@
           "role": {
             "type": "string"
           },
+          "source_calculation": {},
           "units": {
             "type": [
               "string",
@@ -12451,6 +12452,9 @@
             "description": "`measured`, `entry_only` or `output`, held by a DB CHECK and by\n[`super::rules::Role`].",
             "type": "string"
           },
+          "source_calculation": {
+            "description": "What the source computed an `output` member with: `{ function, inputs }`, the portal's\nown calculation and the columns it reads. NULL where nothing computed the column, or\nwhere the source declares no calculation."
+          },
           "units": {
             "type": [
               "string",
@@ -12465,6 +12469,7 @@
           "ordinal",
           "role",
           "replicates",
+          "source_calculation",
           "label",
           "units",
           "description",
@@ -12514,6 +12519,9 @@
             "description": "`measured`, `entry_only` or `output`, held by a DB CHECK and by\n[`super::rules::Role`].",
             "type": "string"
           },
+          "source_calculation": {
+            "description": "What the source computed an `output` member with: `{ function, inputs }`, the portal's\nown calculation and the columns it reads. NULL where nothing computed the column, or\nwhere the source declares no calculation."
+          },
           "units": {
             "type": [
               "string",
@@ -12528,6 +12536,7 @@
           "ordinal",
           "role",
           "replicates",
+          "source_calculation",
           "label",
           "units",
           "description",
@@ -12577,6 +12586,7 @@
               "null"
             ]
           },
+          "source_calculation": {},
           "units": {
             "type": [
               "string",
@@ -13149,6 +13159,27 @@
           "$ref": "#/components/schemas/PlanAcceptedObject"
         },
         "type": "array"
+      },
+      "PlanCalculationRef": {
+        "description": "What the source computed an `output` column with: its own calculation function and the columns\nthat function reads.\n\nThe role says a column is computed; this says what computed it, which is the statement a\nformula set is authored against and the one an output still waiting for one is missing.",
+        "properties": {
+          "function": {
+            "description": "The source's own function name, verbatim (`calcPCO2`).",
+            "type": "string"
+          },
+          "inputs": {
+            "description": "The columns it reads, in the order the source lists them.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "function",
+          "inputs"
+        ],
+        "type": "object"
       },
       "PlanCurveAssignment": {
         "description": "One standard curve the source has replicated, and the instrument it is currently fitted on.\nRe-homing is a curve-level decision, so the curves are listed in their own right rather than\nonly inside the instrument that happens to own them.",
@@ -13990,6 +14021,17 @@
       },
       "PlanParamRef": {
         "properties": {
+          "calculation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanCalculationRef",
+                "description": "The source calculation behind an `output` column, where the source declares one."
+              }
+            ]
+          },
           "create": {
             "type": "boolean"
           },
@@ -14044,6 +14086,7 @@
           "create",
           "units",
           "group",
+          "calculation",
           "original_names"
         ],
         "type": "object"

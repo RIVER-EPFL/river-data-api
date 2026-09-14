@@ -494,3 +494,71 @@ async fn count(db: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
     .try_get::<i64>("", "count")
     .expect("count")
 }
+
+/// Scenario: a calculation computes a step and the formula after it reads that step, which is how
+/// the portal's pressure guard reaches the corrections that use it.
+///
+/// Expected behaviour: the step's value reaches the formula after it. An intermediate stores
+/// nothing and mints no parameter, so recording it as a source would send the run looking for a
+/// reading of it and skip the formula that reads it.
+#[tokio::test]
+#[serial]
+async fn a_formula_reads_the_step_before_it() {
+    let group_id = "00000000-0000-4000-c000-000000000107";
+    let (db, app, token) = setup().await;
+    seed_calculation(&db, group_id).await;
+    let script_id = calculation_id(&db).await;
+    declare_output(&db, group_id, "temp_ratio_out").await;
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": "half_temp",
+            "name": "half_temp",
+            "units": "ratio",
+            "formula": "DO_Temperature / 2",
+            "tool_script_id": script_id,
+            "ordinal": 1,
+            "intermediate": true,
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "the step ({status}): {text}");
+
+    let (status, text) = add_formula(
+        &app,
+        &token,
+        &script_id,
+        "temp_ratio_out",
+        "half_temp + Dissolved_O2",
+        2,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create ({status}): {text}");
+
+    let sources = crate::common::e2e::count(
+        &db,
+        "SELECT count(*) FROM derived_parameter_sources WHERE variable_name = 'half_temp'",
+    )
+    .await;
+    assert_eq!(
+        sources, 0,
+        "a step is no source: it names no stored reading"
+    );
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/tools/{CALCULATION}/calculate"),
+        &json!({ "DO_Temperature": 8.0, "Dissolved_O2": 2.0 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "calculate ({status}): {text}");
+    let result: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let value = result["results"]["temp_ratio_out"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no result: {text}"));
+    assert!((value - 6.0).abs() < 1e-12, "8 / 2 + 2: {text}");
+}
