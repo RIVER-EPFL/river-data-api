@@ -722,7 +722,7 @@ async fn a_derivation_writer_appends_no_decision() {
     // never a decision.
     river_db::routes::private::sensor_calibrations::service::recompose_from_own_curves(
         &f.db,
-        "TRUE",
+        sea_orm::sea_query::Expr::cust("TRUE"),
         "r.stream_id = $1",
         vec![f.stream.into()],
     )
@@ -739,7 +739,7 @@ async fn drift_keys(db: &DatabaseConnection) -> Vec<(Uuid, i16)> {
     let rows = db
         .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            decisions::inconsistent_rows_sql(),
+            decisions::inconsistent_rows().to_string(sea_orm::sea_query::PostgresQueryBuilder),
         ))
         .await
         .expect("the drift statement runs");
@@ -1255,7 +1255,7 @@ async fn every_kind_moves_exactly_the_columns_it_declares() {
 #[serial]
 async fn the_drift_report_folds_every_column_a_decision_asserts() {
     let derived: [&str; 1] = ["calibrated_value"];
-    let sql = decisions::inconsistent_rows_sql();
+    let sql = decisions::inconsistent_rows().to_string(sea_orm::sea_query::PostgresQueryBuilder);
     for kind in [
         Kind::Flag,
         Kind::Unflag,
@@ -1274,7 +1274,7 @@ async fn the_drift_report_folds_every_column_a_decision_asserts() {
                 continue;
             }
             assert!(
-                sql.contains(&format!("('{col}',")),
+                sql.contains(&format!("'{col}' AS \"col\"")),
                 "the drift report folds {col}, which a {} asserts",
                 kind.as_str()
             );

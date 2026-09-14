@@ -11,7 +11,10 @@ fn sql(job_id: Uuid, after_seq: i64, limit: u64) -> String {
 fn test_timeline_filters_one_job_from_after_seq() {
     let job_id = Uuid::nil();
     let out = sql(job_id, 41, 1000);
-    assert!(out.contains(r#""job_id" = '00000000-0000-0000-0000-000000000000'"#), "{out}");
+    assert!(
+        out.contains(r#""job_id" = '00000000-0000-0000-0000-000000000000'"#),
+        "{out}"
+    );
     assert!(out.contains(r#""seq" > 41"#), "{out}");
 }
 

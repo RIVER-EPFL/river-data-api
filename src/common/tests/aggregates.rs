@@ -233,6 +233,29 @@ fn test_since_covers_the_current_bucket() {
     assert_eq!(end, t("2026-08-12T15:00:00Z"));
 }
 
+/// The view name in the `CALL` is the enum's, never a caller's: the four statements the module can
+/// emit are exactly these, with both instants bound.
+#[test]
+fn test_the_statement_names_only_the_views_the_enum_declares() {
+    let window = Window::Range(t("2026-08-12T14:22:00Z"), t("2026-08-12T16:10:00Z"));
+    let emitted: Vec<String> = Resolution::ALL
+        .iter()
+        .map(|r| refresh_statement(*r, window, Utc::now()).unwrap().sql)
+        .collect();
+    let expected: Vec<String> = [
+        "readings_hourly",
+        "readings_daily",
+        "readings_weekly",
+        "readings_monthly",
+    ]
+    .iter()
+    .map(|view| {
+        format!("CALL refresh_continuous_aggregate('{view}', $1::timestamptz, $2::timestamptz)")
+    })
+    .collect();
+    assert_eq!(emitted, expected);
+}
+
 #[test]
 fn test_every_window_binds_both_instants() {
     let now = Utc::now();

@@ -144,18 +144,19 @@ async fn a_mutation_matching_nothing_reports_an_empty_range() {
 async fn recompose_from_own_curves_lifts_the_cap_for_itself() {
     let (db, capped, stream_id, base) = seed_compressed("guarded_recompose_cap").await;
 
-    let recomposed = river_db::routes::private::sensor_calibrations::service::recompose_from_own_curves_guarded(
-        &capped,
-        "TRUE",
-        "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
-        vec![
-            stream_id.into(),
-            sea_orm::prelude::DateTimeWithTimeZone::from(base).into(),
-            sea_orm::prelude::DateTimeWithTimeZone::from(base + Duration::minutes(ROWS)).into(),
-        ],
-    )
-    .await
-    .expect("the recompose lifts the cap for itself");
+    let recomposed =
+        river_db::routes::private::sensor_calibrations::service::recompose_from_own_curves_guarded(
+            &capped,
+            sea_orm::sea_query::Expr::cust("TRUE"),
+            "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
+            vec![
+                stream_id.into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(base).into(),
+                sea_orm::prelude::DateTimeWithTimeZone::from(base + Duration::minutes(ROWS)).into(),
+            ],
+        )
+        .await
+        .expect("the recompose lifts the cap for itself");
     assert_eq!(recomposed, u64::try_from(ROWS).unwrap());
 
     cleanup_test_db(&db).await;

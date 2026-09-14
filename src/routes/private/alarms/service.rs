@@ -7,8 +7,9 @@
 use chrono::{DateTime, FixedOffset, Utc};
 use crudcrate::{ApiError, CRUDOperations};
 use sea_orm::sea_query::{
-    Alias, CommonTableExpression, Condition, Expr, Func, JoinType, Order, PostgresQueryBuilder,
-    Query as SeaQuery, SelectStatement, UnionType, WithClause, WithQuery,
+    Alias, CommonTableExpression, Condition, Expr, Frame, FrameType, Func, JoinType, Order,
+    PostgresQueryBuilder, Query as SeaQuery, SelectStatement, UnionType, WindowStatement,
+    WithClause, WithQuery,
 };
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, ExprTrait, FromQueryResult, Statement,
@@ -313,11 +314,11 @@ pub(super) struct ParameterWithThreshold {
 /// the lowest unflagged replicate's own value when no sample row exists), so flagging a bad
 /// replicate moves the evaluated value instead of hiding the instant or handing it to a
 /// different replicate. A fully flagged group is not evaluated.
-pub(crate) fn violations_query(
+fn violations_parts(
     site_id: Uuid,
     param_ids: Option<Vec<Uuid>>,
     min_severity: i16,
-) -> WithQuery {
+) -> (SelectStatement, CommonTableExpression) {
     // The violation filter and severity ladder are built over each cadence arm's own value
     // expression, so the filter stays inside the index scan rather than above the union.
     let arm_predicates = |val_expr: &str| {
@@ -440,11 +441,36 @@ pub(crate) fn violations_query(
     let mut cte = CommonTableExpression::new();
     cte.table_name(resolved)
         .query(resolve_thresholds_query(Some(site_id), param_ids));
+    (violations, cte)
+}
+
+/// The site's breaching readings as one statement, the CTE its threshold scope needs attached.
+pub(crate) fn violations_query(
+    site_id: Uuid,
+    param_ids: Option<Vec<Uuid>>,
+    min_severity: i16,
+) -> WithQuery {
+    let (violations, cte) = violations_parts(site_id, param_ids, min_severity);
     violations.with(WithClause::new().cte(cte).to_owned())
 }
 
-/// How many breaching readings each parameter contributes over a range, from the same definition
-/// [`violations_sql`] serves, so a count and the export it gates cannot disagree.
+/// How many breaching readings each parameter contributes, over the same select
+/// [`violations_query`] serves, so a count and the export it gates cannot disagree.
+fn violation_counts_query(site_id: Uuid, min_severity: i16) -> WithQuery {
+    let (violations, cte) = violations_parts(site_id, None, min_severity);
+    let v = Alias::new("v");
+    SeaQuery::select()
+        .expr_as(
+            Expr::col((v.clone(), Alias::new("parameter_id"))),
+            Alias::new("pid"),
+        )
+        .expr_as(Func::count(Expr::cust("*")), Alias::new("n"))
+        .from_subquery(violations, v.clone())
+        .add_group_by([Expr::col((v, Alias::new("parameter_id")))])
+        .take()
+        .with(WithClause::new().cte(cte).to_owned())
+}
+
 /// One parameter's row count over a range.
 #[derive(FromQueryResult)]
 pub(super) struct ParameterCount {
@@ -457,10 +483,7 @@ pub async fn count_violations_by_parameter(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> AppResult<std::collections::HashMap<Uuid, i64>> {
-    let sql = format!(
-        "SELECT parameter_id AS pid, COUNT(*) AS n FROM ({}) v GROUP BY parameter_id",
-        violations_query(site_id, None, 1).to_string(PostgresQueryBuilder)
-    );
+    let sql = violation_counts_query(site_id, 1).to_string(PostgresQueryBuilder);
     let mut counts = std::collections::HashMap::new();
     for row in db
         .query_all_raw(Statement::from_sql_and_values(
@@ -488,14 +511,14 @@ pub(crate) fn cadence_label(spot: bool) -> &'static str {
 /// over its unflagged replicates (fallback: the lowest unflagged replicate's own value when no
 /// sample row exists), so flagging a bad replicate moves the evaluated value instead of hiding
 /// the instant or handing it to a different replicate; a fully flagged group is skipped.
-pub(crate) fn latest_served_query(spot: bool, site_col: &str, param_col: &str) -> SelectStatement {
+pub(crate) fn latest_served_query(spot: bool, site: Expr, parameter: Expr) -> SelectStatement {
     let r = served::r();
     let mut latest = SeaQuery::select();
     latest
         .column((r.clone(), readings::Column::Time))
         .from_as(readings::Entity, r.clone())
-        .and_where(Expr::cust(format!("r.site_id = {site_col}")))
-        .and_where(Expr::cust(format!("r.parameter_id = {param_col}")))
+        .and_where(Expr::col((r.clone(), readings::Column::SiteId)).eq(site))
+        .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).eq(parameter))
         .order_by((r.clone(), readings::Column::Time), Order::Desc)
         .limit(1);
     if spot {
@@ -605,7 +628,11 @@ pub(crate) async fn fetch_active_alarm_rows<C: ConnectionTrait>(
     // `idx_readings_site_param_time`, instead of a `DISTINCT ON` over the whole hypertable. Cost is
     // O(active slots), independent of history depth. The lateral body carries the per-cadence
     // serving rule (see `latest_served_query`).
-    let latest = latest_served_query(spot, "rt.site_id", "rt.parameter_id");
+    let latest = latest_served_query(
+        spot,
+        Expr::col((rt.clone(), Alias::new("site_id"))),
+        Expr::col((rt.clone(), Alias::new("parameter_id"))),
+    );
 
     let mut rows_query = SeaQuery::select();
     rows_query
@@ -986,6 +1013,133 @@ pub(crate) fn ordered_query(spot: bool) -> SelectStatement {
     }
 }
 
+/// One cadence's breach episodes over a window: per-instant severity, then gaps-and-islands.
+///
+/// Binds `$1` = site id, `$2` = parameter id, `$3` = start, `$4` = end, and whatever `sev_case`
+/// reads for the four bounds.
+pub(crate) fn episodes_query(sev_case: &str, spot: bool) -> WithQuery {
+    // Per-instant severity, then gaps-and-islands. `ordered` is the served series for the
+    // cadence: continuous and derived rows live at replicate_index 0 and stay when flagged (an
+    // out-of-range value keeps alerting); a spot instant is the replicate group at its slot,
+    // evaluated at the sample mean over its unflagged replicates (fallback: the lowest
+    // unflagged replicate's own value when no sample row exists), so a fully flagged group is
+    // skipped. `scored` applies the severity ladder; `marked` computes the LAG/LEAD neighbours;
+    // `runs` then cumulatively sums the run-start flag (a window function can't be nested inside
+    // another, so these must be separate CTEs). `run_id` increments at each breach that follows a
+    // non-breach, so all consecutive breaching readings share one id. `next_t`/`next_v` from the
+    // run's last row is the following in-range reading (NULL when the run reaches the window edge).
+    let t = Alias::new("t");
+    let v = Alias::new("v");
+    let sev = Alias::new("sev");
+    let ordered = Alias::new("ordered");
+    let scored = Alias::new("scored");
+    let marked = Alias::new("marked");
+    let runs = Alias::new("runs");
+    let w = Alias::new("w");
+
+    let mut ordered_cte = CommonTableExpression::new();
+    ordered_cte
+        .table_name(ordered.clone())
+        .query(ordered_query(spot));
+
+    let mut scored_cte = CommonTableExpression::new();
+    scored_cte.table_name(scored.clone()).query(
+        SeaQuery::select()
+            .columns([t.clone(), v.clone()])
+            .expr_as(Expr::cust(sev_case.to_owned()), sev.clone())
+            .from(ordered)
+            .take(),
+    );
+
+    let mut marked_cte = CommonTableExpression::new();
+    marked_cte.table_name(marked.clone()).query(
+        SeaQuery::select()
+            .columns([t.clone(), v.clone(), sev.clone()])
+            .expr_as(Expr::cust("sev > 0"), Alias::new("breach"))
+            .expr_as(
+                Expr::cust(
+                    "CASE WHEN sev > 0 AND COALESCE(LAG(sev) OVER w, 0) = 0 THEN 1 ELSE 0 END",
+                ),
+                Alias::new("run_start"),
+            )
+            .expr_as(Expr::cust("LEAD(t) OVER w"), Alias::new("next_t"))
+            .expr_as(Expr::cust("LEAD(v) OVER w"), Alias::new("next_v"))
+            .from(scored)
+            .window(
+                w,
+                WindowStatement::new()
+                    .order_by(t.clone(), Order::Asc)
+                    .take(),
+            )
+            .take(),
+    );
+
+    let mut runs_cte = CommonTableExpression::new();
+    runs_cte.table_name(runs.clone()).query(
+        SeaQuery::select()
+            .columns([
+                t.clone(),
+                v.clone(),
+                sev,
+                Alias::new("breach"),
+                Alias::new("next_t"),
+                Alias::new("next_v"),
+            ])
+            .expr_window_as(
+                Expr::cust("SUM(run_start)"),
+                WindowStatement::new()
+                    .order_by(t.clone(), Order::Asc)
+                    .frame_start(FrameType::Rows, Frame::UnboundedPreceding)
+                    .take(),
+                Alias::new("run_id"),
+            )
+            .from(marked)
+            .take(),
+    );
+
+    let episodes_query = SeaQuery::select()
+        .expr_as(Func::min(Expr::col(t.clone())), Alias::new("started_at"))
+        .expr_as(
+            Expr::cust("(ARRAY_AGG(v ORDER BY t ASC))[1]"),
+            Alias::new("value_at_start"),
+        )
+        .expr_as(Func::max(Expr::col(t)), Alias::new("last_seen_at"))
+        .expr_as(
+            Expr::cust("(ARRAY_AGG(v ORDER BY t DESC))[1]"),
+            Alias::new("last_value"),
+        )
+        .expr_as(Expr::cust("MAX(sev)::smallint"), Alias::new("max_severity"))
+        .expr_as(
+            Expr::cust("(ARRAY_AGG(sev ORDER BY t DESC))[1]::smallint"),
+            Alias::new("severity"),
+        )
+        .expr_as(
+            Expr::cust("(ARRAY_AGG(next_t ORDER BY t DESC))[1]"),
+            Alias::new("resolved_at"),
+        )
+        .expr_as(
+            Expr::cust("(ARRAY_AGG(next_v ORDER BY t DESC))[1]"),
+            Alias::new("resolved_value"),
+        )
+        .from(runs)
+        .and_where(Expr::col(Alias::new("breach")).eq(true))
+        .add_group_by([Expr::col(Alias::new("run_id"))])
+        .and_having(Expr::cust(
+            "(ARRAY_AGG(next_t ORDER BY t DESC))[1] IS NOT NULL",
+        ))
+        .order_by(Alias::new("started_at"), Order::Asc)
+        .take()
+        .with(
+            WithClause::new()
+                .cte(ordered_cte)
+                .cte(scored_cte)
+                .cte(marked_cte)
+                .cte(runs_cte)
+                .to_owned(),
+        );
+    episodes_query
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn fetch_episodes(
     db: &DatabaseConnection,
@@ -997,53 +1151,7 @@ pub(super) async fn fetch_episodes(
     sev_case: &str,
     spot: bool,
 ) -> Result<Vec<EpisodeRow>, sea_orm::DbErr> {
-    // Per-instant severity, then gaps-and-islands. `ordered` is the served series for the
-    // cadence: continuous and derived rows live at replicate_index 0 and stay when flagged (an
-    // out-of-range value keeps alerting); a spot instant is the replicate group at its slot,
-    // evaluated at the sample mean over its unflagged replicates (fallback: the lowest
-    // unflagged replicate's own value when no sample row exists), so a fully flagged group is
-    // skipped. `scored` applies the severity ladder; `marked` computes the LAG/LEAD neighbours;
-    // `runs` then cumulatively sums the run-start flag (a window function can't be nested inside
-    // another, so these must be separate CTEs). `run_id` increments at each breach that follows a
-    // non-breach, so all consecutive breaching readings share one id. `next_t`/`next_v` from the
-    // run's last row is the following in-range reading (NULL when the run reaches the window edge).
-    let ordered = ordered_query(spot).to_string(PostgresQueryBuilder);
-    let sql = format!(
-        r"
-        WITH ordered AS ({ordered}),
-        scored AS (
-            SELECT t, v, {sev_case} AS sev FROM ordered
-        ),
-        marked AS (
-            SELECT t, v, sev,
-                   (sev > 0) AS breach,
-                   CASE WHEN sev > 0 AND COALESCE(LAG(sev) OVER w, 0) = 0 THEN 1 ELSE 0 END AS run_start,
-                   LEAD(t) OVER w AS next_t,
-                   LEAD(v) OVER w AS next_v
-            FROM scored
-            WINDOW w AS (ORDER BY t)
-        ),
-        runs AS (
-            SELECT t, v, sev, breach, next_t, next_v,
-                   SUM(run_start) OVER (ORDER BY t ROWS UNBOUNDED PRECEDING) AS run_id
-            FROM marked
-        )
-        SELECT
-            MIN(t) AS started_at,
-            (ARRAY_AGG(v ORDER BY t ASC))[1] AS value_at_start,
-            MAX(t) AS last_seen_at,
-            (ARRAY_AGG(v ORDER BY t DESC))[1] AS last_value,
-            MAX(sev)::smallint AS max_severity,
-            (ARRAY_AGG(sev ORDER BY t DESC))[1]::smallint AS severity,
-            (ARRAY_AGG(next_t ORDER BY t DESC))[1] AS resolved_at,
-            (ARRAY_AGG(next_v ORDER BY t DESC))[1] AS resolved_value
-        FROM runs
-        WHERE breach
-        GROUP BY run_id
-        HAVING (ARRAY_AGG(next_t ORDER BY t DESC))[1] IS NOT NULL
-        ORDER BY started_at
-        "
-    );
+    let sql = episodes_query(sev_case, spot).to_string(PostgresQueryBuilder);
 
     let values: Vec<sea_orm::Value> = vec![
         site_id.into(),

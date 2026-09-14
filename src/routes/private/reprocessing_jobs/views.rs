@@ -19,9 +19,9 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use super::models::job;
-use super::models::job_log;
 use super::models::job::Column;
 use super::models::job::Entity;
+use super::models::job_log;
 use super::models::schedule;
 use super::service;
 use super::service::JobRegistry;

@@ -50,7 +50,7 @@ use crate::common::middleware::ProjectScope;
 use crate::common::middleware::sensor_in_scope;
 use crate::common::scope::Unowned;
 use crate::common::scope::confine_target;
-use crate::common::scope::project_filter_sql;
+use crate::common::scope::project_filter;
 use crate::common::scope::project_of_sensor;
 use crate::common::scope::require_named_target;
 use crate::error::AppError;
@@ -62,8 +62,8 @@ use crate::routes::private::readings::models::Selection;
 use crate::routes::private::readings::models::decision_set;
 use crate::routes::private::readings::service;
 use crate::routes::private::readings::service::NewValue;
-use crate::routes::private::readings::service::not_pinned_sql;
 use crate::routes::private::sensor_calibrations;
+use crate::routes::private::sensor_deployments;
 use crate::routes::private::sites;
 use crate::routes::private::standard_curves;
 
@@ -99,22 +99,33 @@ pub struct RetireResponse {
     pub dry_run: bool,
 }
 
-/// The one curve that would cover reading `r` once this one is gone, as a scalar expression.
-/// `$1` is the curve being retired and `$2` its instrument.
-fn covering_curve_sql() -> String {
-    format!(
-        "(SELECT p.id FROM ({pick}) p)",
-        pick = super::resolver::pick_calibration_lateral_excluding("$2", Some("$1")),
+/// The one curve that would cover reading `r` once `retiring` is gone, as a scalar expression.
+fn covering_curve(retiring: Uuid, sensor_id: Uuid) -> Expr {
+    let c = Alias::new("c");
+    let p = Alias::new("p");
+    Expr::from(
+        SeaQuery::select()
+            .column((p.clone(), super::models::Column::Id))
+            .from_subquery(
+                super::resolver::pick_calibration_query_owned(
+                    Expr::col((c.clone(), super::models::Column::SensorId)).eq(sensor_id),
+                    Some(Expr::col((c, super::models::Column::Id)).ne(retiring)),
+                ),
+                p,
+            )
+            .take(),
     )
 }
 
 /// The readings this curve corrected that a retirement moves: its own, minus the ones a person
 /// pinned to it, which keep the curve they were pinned to.
-fn moved_rows_sql() -> String {
-    format!(
-        "r.calibration_id = $1 AND {not_pinned}",
-        not_pinned = not_pinned_sql("r", Kind::CalibrationPin),
-    )
+fn moved_rows(retiring: Uuid) -> Expr {
+    Expr::col((Alias::new("r"), readings::Column::CalibrationId))
+        .eq(retiring)
+        .and(crate::routes::private::readings::service::not_pinned(
+            "r",
+            Kind::CalibrationPin,
+        ))
 }
 
 /// What retiring a curve would move: the readings it corrected, and how they land.
@@ -134,14 +145,9 @@ async fn counts<C: ConnectionTrait>(
     // Each reading this curve corrects, with whether the retirement moves it and which curve
     // would then cover it. The two fragments carry their own binds, so the outer counts are a
     // built statement rather than a `format!` over them.
-    let moved = moved_rows_sql();
-    let covering = covering_curve_sql();
     let per_reading = SeaQuery::select()
-        .expr_as(Expr::cust_with_values(moved, [id]), Alias::new("moved"))
-        .expr_as(
-            Expr::cust_with_values(covering, [id, sensor_id]),
-            Alias::new("covered"),
-        )
+        .expr_as(moved_rows(id), Alias::new("moved"))
+        .expr_as(covering_curve(id, sensor_id), Alias::new("covered"))
         .from_as(readings::Entity, Alias::new("r"))
         .and_where(ExprTrait::eq(
             Expr::col((Alias::new("r"), readings::Column::CalibrationId)),
@@ -241,14 +247,8 @@ pub async fn retire_calibration(
         let recorded = service::record_many(
             txn,
             Kind::CurveRetire,
-            crate::routes::private::collection_events::flows::rows_matching(
-                &moved_rows_sql(),
-                vec![id.into(), sensor_id.into()],
-            ),
-            NewValue::Sql(sea_orm::sea_query::Expr::cust_with_values(
-                covering_curve_sql_object(),
-                [sea_orm::Value::from(id), sea_orm::Value::from(sensor_id)],
-            )),
+            Condition::all().add(moved_rows(id)),
+            NewValue::Sql(covering_curve_object(id, sensor_id)),
             &actor,
             req.reason.as_deref(),
             origin,
@@ -260,10 +260,7 @@ pub async fn retire_calibration(
         // curves it now names produce, including none at all.
         super::service::recompose_decided_rows(txn, set_id).await?;
         super::models::Entity::update_many()
-            .col_expr(
-                super::models::Column::RetiredAt,
-                Expr::current_timestamp(),
-            )
+            .col_expr(super::models::Column::RetiredAt, Expr::current_timestamp())
             .col_expr(
                 super::models::Column::RetiredBy,
                 Expr::value(Some(actor.clone())),
@@ -308,11 +305,11 @@ pub async fn retire_calibration(
 
 /// The per-row assertion a retirement records: the curve that reading moves onto, `null` when
 /// none covers it.
-fn covering_curve_sql_object() -> String {
-    format!(
-        "jsonb_build_object('calibration_id', {covering})",
-        covering = covering_curve_sql(),
-    )
+fn covering_curve_object(retiring: Uuid, sensor_id: Uuid) -> Expr {
+    Expr::from(Func::cust(Alias::new("jsonb_build_object")).args([
+        Expr::val("calibration_id"),
+        covering_curve(retiring, sensor_id),
+    ]))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -589,12 +586,7 @@ pub async fn get_calibration_window(
         Alias::new("calibrated_value"),
         Alias::new("is_flagged"),
     ];
-    let flag = || {
-        Func::coalesce([
-            Expr::col(readings::Column::IsFlagged),
-            Expr::value(false),
-        ])
-    };
+    let flag = || Func::coalesce([Expr::col(readings::Column::IsFlagged), Expr::value(false)]);
     let continuous_arm = SeaQuery::select()
         .column(readings::Column::Time)
         .column(readings::Column::RawValue)
@@ -767,25 +759,40 @@ async fn default_scan_floor(
 /// The caller's projects, reached through the sensor's deployments: an instrument deployed
 /// nowhere resolves to no project and does not appear in a restricted caller's enumeration.
 fn deployed_in_scope(scope: &AccessScope) -> Option<Expr> {
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    let predicate = project_filter_sql(scope, "s.project_id", &mut values)?;
-    Some(Expr::cust_with_values(
-        format!(
-            "EXISTS (SELECT 1 FROM sensor_deployments d \
-             JOIN sites s ON s.id = d.site_id \
-             WHERE d.sensor_id = r.sensor_id AND {predicate})"
-        ),
-        values,
+    let confine = project_filter(scope, (Alias::new("s"), sites::Column::ProjectId))?;
+    Some(Expr::exists(
+        SeaQuery::select()
+            .expr(Expr::val(1))
+            .from_as(sensor_deployments::Entity, Alias::new("d"))
+            .join_as(
+                JoinType::InnerJoin,
+                sites::Entity,
+                Alias::new("s"),
+                Expr::col((Alias::new("s"), sites::Column::Id))
+                    .equals((Alias::new("d"), sensor_deployments::Column::SiteId)),
+            )
+            .and_where(
+                Expr::col((Alias::new("d"), sensor_deployments::Column::SensorId))
+                    .equals((Alias::new("r"), readings::Column::SensorId)),
+            )
+            .and_where(confine)
+            .to_owned(),
     ))
 }
 
 /// The caller's projects, reached through the reading's own site.
 fn site_in_scope(scope: &AccessScope) -> Option<Expr> {
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    let predicate = project_filter_sql(scope, "s.project_id", &mut values)?;
-    Some(Expr::cust_with_values(
-        format!("EXISTS (SELECT 1 FROM sites s WHERE s.id = r.site_id AND {predicate})"),
-        values,
+    let confine = project_filter(scope, (Alias::new("s"), sites::Column::ProjectId))?;
+    Some(Expr::exists(
+        SeaQuery::select()
+            .expr(Expr::val(1))
+            .from_as(sites::Entity, Alias::new("s"))
+            .and_where(
+                Expr::col((Alias::new("s"), sites::Column::Id))
+                    .equals((Alias::new("r"), readings::Column::SiteId)),
+            )
+            .and_where(confine)
+            .to_owned(),
     ))
 }
 
@@ -902,9 +909,7 @@ async fn fetch_calibration_candidates(
         .add(Expr::col((r.clone(), readings::Column::SensorId)).is_not_null())
         .add(Expr::col((r.clone(), readings::Column::CalibrationId)).is_null())
         .add(Expr::col((cw.clone(), Alias::new("id"))).is_not_null())
-        .add(Expr::cust(
-            crate::routes::private::sensor_calibrations::service::window_resolved_rows("r"),
-        ));
+        .add(crate::routes::private::sensor_calibrations::service::window_resolved_rows("r"));
     if let Some(predicate) = deployed_in_scope(scope) {
         scanned = scanned.add(predicate);
     }
@@ -1085,9 +1090,7 @@ async fn fetch_orphaned_corrections(
 
     let r = Alias::new("r");
     let mut scanned = scan_floor(since)
-        .add(Expr::cust(
-            crate::routes::private::sensor_calibrations::service::orphaned_correction_rows("r"),
-        ))
+        .add(crate::routes::private::sensor_calibrations::service::orphaned_correction_rows("r"))
         .add(Expr::cust("r.measurement_type IS DISTINCT FROM 'derived'"));
     if let Some(predicate) = site_in_scope(scope) {
         scanned = scanned.add(predicate);
@@ -1355,3 +1358,7 @@ pub async fn recalculate_calibration(
 
     Ok(Json(RecalculateResponse { job_id }))
 }
+
+#[cfg(test)]
+#[path = "tests/views.rs"]
+mod tests;

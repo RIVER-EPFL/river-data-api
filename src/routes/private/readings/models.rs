@@ -22,32 +22,59 @@ pub use river_data_core::models::IngestReading;
 pub use river_data_core::models::IngestStatusEvent;
 pub use river_data_core::models::SourceWindow;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+/// A stored reading.
+///
+/// The key is the triple, so no route addresses one row by an id. Only the read routes are
+/// generated: a value arrives through ingest, batch, grab entry or CSV import, each of which
+/// resolves its attribution from the pairing and builds its provenance server-side, and it changes
+/// only through the curation routes, which append to `reading_decisions` first. Nothing deletes.
+#[derive(
+    Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize, crudcrate::EntityToModels,
+)]
 #[sea_orm(table_name = "readings")]
+#[crudcrate(
+    api_struct = "Reading",
+    name_singular = "reading",
+    name_plural = "readings",
+    generate_router,
+    routes(read)
+)]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
+    #[crudcrate(primary_key, exclude(update), filterable)]
     pub stream_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
+    #[crudcrate(primary_key, exclude(update), filterable, sortable)]
     pub time: DateTimeWithTimeZone,
     #[sea_orm(primary_key, auto_increment = false)]
+    #[crudcrate(primary_key, exclude(update), filterable)]
     pub replicate_index: i16,
+    #[crudcrate(filterable)]
     pub site_id: Option<Uuid>,
+    #[crudcrate(filterable)]
     pub parameter_id: Option<Uuid>,
+    #[crudcrate(sortable)]
     pub raw_value: f64,
     pub calibrated_value: Option<f64>,
+    #[crudcrate(filterable)]
     pub sensor_id: Option<Uuid>,
     /// The time-windowed base calibration the value was corrected with.
     pub calibration_id: Option<Uuid>,
     /// The hand-picked lab curve applied on top of the base calibration, for grab measurements.
+    #[crudcrate(filterable)]
     pub standard_curve_id: Option<Uuid>,
     pub deployment_id: Option<Uuid>,
     pub logged: Option<bool>,
+    #[crudcrate(filterable)]
     pub measurement_type: Option<String>,
+    #[crudcrate(filterable)]
     pub is_flagged: Option<bool>,
     pub flag_reason: Option<String>,
+    #[crudcrate(filterable)]
     pub sample_id: Option<Uuid>,
     /// The collection event (site visit) an attributed spot reading belongs to. Stamped by
     /// `collection_events::attach` after the write; NULL on continuous and derived rows.
+    #[crudcrate(filterable)]
     pub collection_event_id: Option<Uuid>,
     /// Retraction stamp: the source's claimed window no longer contains this reading. A withdrawn
     /// reading is excluded from serving, statistics and alarms, and a later honest window that
@@ -58,8 +85,9 @@ pub struct Model {
     /// the value). NULL on rows that predate tracking.
     pub ingested_at: Option<DateTimeWithTimeZone>,
     /// Where this value came from: `tool_run` | `chain` | `csv_import` | `manual` | `batch` |
-    /// `sync` | `derived` | `migration`. Total, held by a DB trigger for a writer that names none,
+    /// `sync` | `derived`. Total, held by a DB trigger for a writer that names none,
     /// so an unrecorded origin is a named kind rather than a NULL blob (Q49).
+    #[crudcrate(filterable)]
     pub provenance_kind: Option<String>,
     /// The server-built record of what produced this value: the tool run and pinned script version,
     /// its resolved inputs, constants and curves, and the outputs it returned. Written by the grab
@@ -75,6 +103,7 @@ pub struct Model {
     pub created_by: Option<String>,
     /// An intern's entry that no manager has verified. Curated surfaces leave it out
     /// (`common/served.rs`); only `reading_decisions` moves it, through its projection trigger.
+    #[crudcrate(filterable)]
     pub unverified: bool,
     /// The formula version a derived value was computed under, on a derived row.
     pub derived_version_id: Option<Uuid>,
@@ -687,7 +716,6 @@ pub enum Origin {
     Audit,
     Chain,
     Rollback,
-    Migration,
     System,
     Janitor,
 }
@@ -702,7 +730,6 @@ impl Origin {
             Self::Audit => "audit",
             Self::Chain => "chain",
             Self::Rollback => "rollback",
-            Self::Migration => "migration",
             Self::System => "system",
             Self::Janitor => "janitor",
         }
@@ -731,12 +758,6 @@ pub(super) struct OwnershipRow {
 pub(super) struct ReplicateKeyRow {
     pub(super) stream_id: Uuid,
     pub(super) replicate_index: i16,
-}
-
-#[derive(FromQueryResult)]
-pub(super) struct RestoreRow {
-    pub(super) replicate_index: i16,
-    pub(super) old: serde_json::Value,
 }
 
 /// A stored decision.
@@ -1337,38 +1358,6 @@ pub struct ReloadResponse {
     pub curves: Vec<serde_json::Value>,
 }
 
-/// One proposed correction, as the review surface reads it.
-#[derive(Debug, Serialize, ToSchema, FromQueryResult)]
-pub struct Proposal {
-    pub id: Uuid,
-    pub stream_id: Uuid,
-    pub source_system: String,
-    pub source_key: String,
-    #[schema(required)]
-    pub site_id: Option<Uuid>,
-    #[schema(required)]
-    pub site_name: Option<String>,
-    #[schema(required)]
-    pub parameter_id: Option<Uuid>,
-    #[schema(required)]
-    pub parameter_code: Option<String>,
-    pub time: DateTime<Utc>,
-    pub replicate_index: i16,
-    pub stored_raw_value: f64,
-    pub proposed_raw_value: f64,
-    #[schema(required)]
-    pub stored_standard_curve_id: Option<Uuid>,
-    #[schema(required)]
-    pub proposed_standard_curve_id: Option<Uuid>,
-    pub status: String,
-    pub first_seen_at: DateTime<Utc>,
-    pub last_seen_at: DateTime<Utc>,
-    #[schema(required)]
-    pub decided_by: Option<String>,
-    #[schema(required)]
-    pub decided_at: Option<DateTime<Utc>>,
-}
-
 /// What a decision did, per proposal.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DecideResponse {
@@ -1622,19 +1611,6 @@ pub(super) struct ArrivalRow {
     pub(super) stream_id: Uuid,
     pub(super) replicate_index: i16,
     pub(super) at: DateTime<chrono::FixedOffset>,
-}
-
-#[derive(FromQueryResult)]
-pub(super) struct PinRow {
-    pub(super) stream_id: Uuid,
-    pub(super) id: Uuid,
-    pub(super) kind: String,
-    pub(super) replicate_index: Option<i16>,
-    pub(super) new: serde_json::Value,
-    pub(super) actor: String,
-    pub(super) at: DateTime<chrono::FixedOffset>,
-    pub(super) reason: Option<String>,
-    pub(super) set_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2756,7 +2732,10 @@ pub mod change_proposal {
     #[crudcrate(
         api_struct = "ReadingChangeProposal",
         name_singular = "reading_change_proposal",
-        name_plural = "reading_change_proposals"
+        name_plural = "reading_change_proposals",
+        generate_router,
+        routes(read),
+        operations = crate::routes::private::readings::service::ChangeProposalOperations
     )]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
@@ -2780,10 +2759,43 @@ pub mod change_proposal {
         pub last_seen_at: chrono::DateTime<chrono::Utc>,
         pub decided_by: Option<String>,
         pub decided_at: Option<chrono::DateTime<chrono::Utc>>,
+        /// The stream's own naming, and the slot its pairing places it in. Filled from the
+        /// pairing on read; a proposal against an unpaired stream carries only the source half.
+        #[sea_orm(ignore)]
+        #[crudcrate(non_db_attr = true, exclude(create, update))]
+        pub source_system: Option<String>,
+        #[sea_orm(ignore)]
+        #[crudcrate(non_db_attr = true, exclude(create, update))]
+        pub source_key: Option<String>,
+        #[sea_orm(ignore)]
+        #[crudcrate(non_db_attr = true, exclude(create, update))]
+        pub site_id: Option<Uuid>,
+        #[sea_orm(ignore)]
+        #[crudcrate(non_db_attr = true, exclude(create, update))]
+        pub site_name: Option<String>,
+        #[sea_orm(ignore)]
+        #[crudcrate(non_db_attr = true, exclude(create, update))]
+        pub parameter_id: Option<Uuid>,
+        #[sea_orm(ignore)]
+        #[crudcrate(non_db_attr = true, exclude(create, update))]
+        pub parameter_code: Option<String>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "crate::routes::private::data_streams::Entity",
+            from = "Column::StreamId",
+            to = "crate::routes::private::data_streams::Column::Id"
+        )]
+        DataStream,
+    }
+
+    impl Related<crate::routes::private::data_streams::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::DataStream.def()
+        }
+    }
 
     impl ActiveModelBehavior for ActiveModel {}
 }

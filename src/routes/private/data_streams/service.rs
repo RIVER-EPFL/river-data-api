@@ -695,19 +695,17 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
     // Every reading re-pointed is a slot-move decision (ADR 0008), recorded before the move so
     // the record holds the slot it came from.
     {
-        let mut values: Vec<sea_orm::Value> = vec![target_param.into(), source_param.into()];
-        if let Some(site_id) = site {
-            values.push(site_id.into());
-        }
-        // $1 is the target parameter, $2 the source, $3 the site when the scope names one.
-        let row_predicate = match scope {
-            MoveScope::EverySite => "r.parameter_id = $2",
-            MoveScope::Site(_) => "r.parameter_id = $2 AND r.site_id = $3",
+        let moved = {
+            use crate::routes::private::collection_events::flows::row;
+            use crate::routes::private::readings::models::Column;
+            sea_orm::Condition::all()
+                .add(row(Column::ParameterId).eq(source_param))
+                .add_option(site.map(|site_id| row(Column::SiteId).eq(site_id)))
         };
         crate::routes::private::readings::service::record_many(
             conn,
             crate::routes::private::readings::models::Kind::SlotMove,
-            crate::routes::private::collection_events::flows::rows_matching(row_predicate, values),
+            moved,
             crate::routes::private::readings::service::NewValue::Literal(
                 serde_json::json!({ "parameter_id": target_param }),
             ),
@@ -964,10 +962,7 @@ pub fn advance_cursor(stream_id: Uuid, newest: DateTimeWithTimeZone) -> UpdateMa
             models::Column::LastDataTime,
             Expr::cust_with_exprs(
                 "GREATEST(COALESCE($1, $2), $2)",
-                [
-                    Expr::col(models::Column::LastDataTime),
-                    Expr::value(newest),
-                ],
+                [Expr::col(models::Column::LastDataTime), Expr::value(newest)],
             ),
         )
         .col_expr(models::Column::UpdatedAt, Expr::current_timestamp())

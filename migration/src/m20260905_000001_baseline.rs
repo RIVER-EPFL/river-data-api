@@ -147,8 +147,7 @@ CREATE FUNCTION public.readings_default_provenance_kind() RETURNS trigger
                 NEW.provenance_kind := CASE
                     WHEN origin = 'grab_sample' THEN 'manual'
                     WHEN origin = 'api' THEN 'batch'
-                    WHEN origin IS NOT NULL THEN 'sync'
-                    ELSE 'migration'
+                    ELSE 'sync'
                 END;
                 RETURN NEW;
             END;
@@ -323,7 +322,7 @@ CREATE TABLE public.readings (
     provenance_kind text,
     derived_version_id uuid,
     CONSTRAINT readings_instrument_required CHECK (((sensor_id IS NOT NULL) OR (site_id IS NULL) OR (NOT ((measurement_type)::text IS DISTINCT FROM 'derived'::text)))),
-    CONSTRAINT readings_provenance_kind_check CHECK ((provenance_kind = ANY (ARRAY['tool_run'::text, 'chain'::text, 'csv_import'::text, 'manual'::text, 'batch'::text, 'sync'::text, 'derived'::text, 'migration'::text]))),
+    CONSTRAINT readings_provenance_kind_check CHECK ((provenance_kind = ANY (ARRAY['tool_run'::text, 'chain'::text, 'csv_import'::text, 'manual'::text, 'batch'::text, 'sync'::text, 'derived'::text]))),
     CONSTRAINT readings_withdrawn_spot_only CHECK (((withdrawn_at IS NULL) OR ((measurement_type)::text = 'spot'::text)))
 );
 
@@ -717,7 +716,7 @@ CREATE TABLE public.reading_decisions (
     set_id uuid,
     job_id uuid,
     CONSTRAINT reading_decisions_kind_check CHECK ((kind = ANY (ARRAY['flag'::text, 'unflag'::text, 'withdraw'::text, 'reassert'::text, 'curve'::text, 'calibration_pin'::text, 'instrument_pin'::text, 'slot_move'::text, 'value_correction'::text, 'unverified_entry'::text, 'verify'::text, 'reject'::text, 'chain'::text, 'detach'::text, 'return'::text, 'curve_retire'::text, 'formula_transition'::text, 'curve_recompose'::text, 'derived_computed'::text, 'reprocess'::text, 'rollback'::text]))),
-    CONSTRAINT reading_decisions_origin_check CHECK ((origin = ANY (ARRAY['manual'::text, 'sync'::text, 'csv'::text, 'audit'::text, 'chain'::text, 'rollback'::text, 'migration'::text, 'system'::text, 'janitor'::text])))
+    CONSTRAINT reading_decisions_origin_check CHECK ((origin = ANY (ARRAY['manual'::text, 'sync'::text, 'csv'::text, 'audit'::text, 'chain'::text, 'rollback'::text, 'system'::text, 'janitor'::text])))
 );
 
 CREATE TABLE public.replicate_audit_holds (

@@ -1707,14 +1707,20 @@ pub async fn resolve_hold(
                 let flagged = crate::routes::private::readings::service::record_many(
                     txn,
                     crate::routes::private::readings::models::Kind::Flag,
-                    crate::routes::private::collection_events::flows::rows_matching(
-                        &format!(
-                            "r.stream_id = $1 AND r.time = $2 \
-                             AND r.replicate_index IN ({index_list}) \
-                             AND r.is_flagged IS NOT TRUE"
-                        ),
-                        vec![stream_id.into(), group_time.into()],
-                    ),
+                    {
+                        use crate::routes::private::collection_events::flows::row;
+                        use crate::routes::private::readings::models::Column;
+                        sea_orm::Condition::all()
+                            .add(row(Column::StreamId).eq(stream_id))
+                            .add(row(Column::Time).eq(group_time))
+                            .add(row(Column::ReplicateIndex).is_in(indexes.clone()))
+                            .add(
+                                crate::routes::private::collection_events::flows::row_is_true(
+                                    Column::IsFlagged,
+                                    false,
+                                ),
+                            )
+                    },
                     crate::routes::private::readings::service::NewValue::Literal(
                         serde_json::json!({ "reason": reason, "hold_id": id }),
                     ),
@@ -2022,9 +2028,8 @@ pub async fn reopen_hold(
                         .map(|a| {
                             a.iter()
                                 .filter_map(serde_json::Value::as_i64)
-                                .map(|i| i.to_string())
+                                .filter_map(|i| i16::try_from(i).ok())
                                 .collect::<Vec<_>>()
-                                .join(", ")
                         })
                         .unwrap_or_default(),
                     r.get("reason")
@@ -2058,22 +2063,24 @@ pub async fn reopen_hold(
         let reopened = super::service::status_for(paired);
         let resolution = merged_resolution(prev, serde_json::json!({"action": "reopened"}), &by);
         if status == HoldStatus::Remediated.as_str()
-            && let Some((index_list, reason)) = &flagged
-            && !index_list.is_empty()
+            && let Some((indexes, reason)) = &flagged
+            && !indexes.is_empty()
         {
             // Only the rows this resolution flagged: a flag someone set since, or with another
             // reason, stays.
             crate::routes::private::readings::service::record_many(
                 txn,
                 crate::routes::private::readings::models::Kind::Unflag,
-                crate::routes::private::collection_events::flows::rows_matching(
-                    &format!(
-                        "r.stream_id = $1 AND r.time = $2 \
-                         AND r.replicate_index IN ({index_list}) \
-                         AND r.is_flagged = TRUE AND r.flag_reason = $3"
-                    ),
-                    vec![stream_id.into(), group_time.into(), reason.clone().into()],
-                ),
+                {
+                    use crate::routes::private::collection_events::flows::row;
+                    use crate::routes::private::readings::models::Column;
+                    sea_orm::Condition::all()
+                        .add(row(Column::StreamId).eq(stream_id))
+                        .add(row(Column::Time).eq(group_time))
+                        .add(row(Column::ReplicateIndex).is_in(indexes.clone()))
+                        .add(row(Column::IsFlagged).eq(true))
+                        .add(row(Column::FlagReason).eq(reason.clone()))
+                },
                 crate::routes::private::readings::service::NewValue::Literal(
                     serde_json::json!({ "hold_id": id, "reopened": true }),
                 ),
@@ -2209,71 +2216,97 @@ pub async fn acknowledge_holds_bulk(
     Json(payload): Json<BulkAcknowledgeRequest>,
 ) -> AppResult<Json<AcknowledgeResponse>> {
     let by = crate::common::actor::label(&auth);
-    let mut binds: Vec<sea_orm::Value> = vec![by.clone().into()];
-    let mut bounds = String::new();
+    let h = Alias::new("h");
+    let hold_col = |c: hold_model::Column| Expr::col((h.clone(), c));
+    let below = |signature: &str, ceiling: f64| {
+        Expr::cust_with_values(
+            format!("{signature} <= $1"),
+            [sea_orm::Value::from(ceiling)],
+        )
+    };
+    let mut bounds = Condition::all();
     // A restricted caller acknowledges only holds whose stream is paired to a site in their
     // projects; unpaired (deferred) holds belong to no project and stay out of their reach.
     if let Some(projects) = scope.sql_project_array() {
-        binds.push(projects);
-        bounds.push_str(&format!(
-            " AND EXISTS (SELECT 1 FROM site_parameters sp JOIN sites st ON st.id = sp.site_id \
-             WHERE sp.id = ds.site_parameter_id AND st.project_id = ANY(${}))",
-            binds.len()
+        bounds = bounds.add(Expr::cust_with_values(
+            "EXISTS (SELECT 1 FROM site_parameters sp JOIN sites st ON st.id = sp.site_id \
+             WHERE sp.id = ds.site_parameter_id AND st.project_id = ANY($1))",
+            [projects],
         ));
     }
     let stream_scoped = payload.stream_id.is_some() || payload.source_system.is_some();
     if let Some(stream_id) = payload.stream_id {
-        binds.push(stream_id.into());
-        bounds.push_str(&format!(" AND h.stream_id = ${}", binds.len()));
+        bounds = bounds.add(hold_col(hold_model::Column::StreamId).eq(stream_id));
     }
     if let Some(source_system) = payload.source_system {
-        binds.push(source_system.into());
-        bounds.push_str(&format!(" AND ds.source_system = ${}", binds.len()));
-    }
-    if let Some(start) = payload.start {
-        binds.push(sea_orm::prelude::DateTimeWithTimeZone::from(start).into());
-        bounds.push_str(&format!(" AND h.group_time >= ${}", binds.len()));
-    }
-    if let Some(end) = payload.end {
-        binds.push(sea_orm::prelude::DateTimeWithTimeZone::from(end).into());
-        bounds.push_str(&format!(" AND h.group_time <= ${}", binds.len()));
-    }
-    if let Some(ceiling) = payload.max_relative_delta {
-        binds.push(ceiling.into());
-        bounds.push_str(&format!(" AND {RELATIVE_DELTA_SQL} <= ${}", binds.len()));
-    }
-    if let Some(ceiling) = payload.max_mean_relative_delta {
-        binds.push(ceiling.into());
-        bounds.push_str(&format!(
-            " AND {MEAN_RELATIVE_DELTA_SQL} <= ${}",
-            binds.len()
+        bounds = bounds.add(Expr::cust_with_values(
+            "ds.source_system = $1",
+            [sea_orm::Value::from(source_system)],
         ));
     }
+    if let Some(start) = payload.start {
+        bounds = bounds.add(
+            hold_col(hold_model::Column::GroupTime)
+                .gte(sea_orm::prelude::DateTimeWithTimeZone::from(start)),
+        );
+    }
+    if let Some(end) = payload.end {
+        bounds = bounds.add(
+            hold_col(hold_model::Column::GroupTime)
+                .lte(sea_orm::prelude::DateTimeWithTimeZone::from(end)),
+        );
+    }
+    if let Some(ceiling) = payload.max_relative_delta {
+        bounds = bounds.add(below(RELATIVE_DELTA_SQL, ceiling));
+    }
+    if let Some(ceiling) = payload.max_mean_relative_delta {
+        bounds = bounds.add(below(MEAN_RELATIVE_DELTA_SQL, ceiling));
+    }
     if let Some(ceiling) = payload.max_sd_relative_delta {
-        binds.push(ceiling.into());
-        bounds.push_str(&format!(" AND {SD_RELATIVE_DELTA_SQL} <= ${}", binds.len()));
+        bounds = bounds.add(below(SD_RELATIVE_DELTA_SQL, ceiling));
     }
     // The same gate the single acknowledge applies, so a threshold sweep cannot drive around it:
     // at n = 10 the divisor offset is only ~5%, well inside a plausible ceiling.
     let population_sd = &*POPULATION_SD_SQL;
-    let undeclared_gate = format!(
-        "(({population_sd}) AND h.kind = '{kind}' \
-          AND EXISTS (SELECT 1 FROM site_parameters sp \
-                      WHERE sp.id = ds.site_parameter_id AND sp.sd_estimator IS NULL))",
-        kind = HoldKind::ReplicateStats.as_str()
-    );
+    let undeclared_gate = || {
+        Expr::cust(format!(
+            "(({population_sd}) AND h.kind = '{kind}' \
+              AND EXISTS (SELECT 1 FROM site_parameters sp \
+                          WHERE sp.id = ds.site_parameter_id AND sp.sd_estimator IS NULL))",
+            kind = HoldKind::ReplicateStats.as_str()
+        ))
+    };
+    let ds = Alias::new("ds");
+    let joined = |on_pending: Condition| {
+        let mut q = SeaQuery::select();
+        q.expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("n"))
+            .from_as(hold_model::Entity, h.clone())
+            .join_as(
+                JoinType::InnerJoin,
+                crate::routes::private::data_streams::models::Entity,
+                ds.clone(),
+                Expr::col((
+                    ds.clone(),
+                    crate::routes::private::data_streams::models::Column::Id,
+                ))
+                .equals((h.clone(), hold_model::Column::StreamId)),
+            )
+            .cond_where(on_pending);
+        q.take()
+    };
+    let (sql, values) = joined(
+        Condition::all()
+            .add(hold_col(hold_model::Column::Status).eq(HoldStatus::Pending.as_str()))
+            .add(undeclared_gate())
+            .add(bounds.clone()),
+    )
+    .build(PostgresQueryBuilder);
     let skipped = state
         .db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT COUNT(*)::bigint AS n
-                 FROM replicate_audit_holds h
-                 JOIN data_streams ds ON ds.id = h.stream_id
-                 WHERE h.status = '{pending}' AND {undeclared_gate}{bounds}",
-                pending = HoldStatus::Pending.as_str()
-            ),
-            binds.clone(),
+            sql,
+            values,
         ))
         .await?
         .map_or(Ok(0_i64), |row| row.try_get::<i64>("", "n"))?;
@@ -2299,22 +2332,47 @@ pub async fn acknowledge_holds_bulk(
         stream_less.count(&state.db).await?
     };
 
-    let resolution_sql = accept_ours_resolution_sql("$1");
+    let (sql, values) = SeaQuery::update()
+        .table(
+            sea_orm::sea_query::IntoTableRef::into_table_ref(hold_model::Entity).alias(h.clone()),
+        )
+        .value(
+            hold_model::Column::Status,
+            Expr::val(HoldStatus::Acknowledged.as_str()),
+        )
+        .value(
+            hold_model::Column::Resolution,
+            crate::routes::private::sync::service::accept_ours_resolution(&by),
+        )
+        .value(hold_model::Column::AcknowledgedBy, Expr::val(by.clone()))
+        .value(hold_model::Column::AcknowledgedAt, Expr::cust("NOW()"))
+        .from(
+            sea_orm::sea_query::IntoTableRef::into_table_ref(
+                crate::routes::private::data_streams::models::Entity,
+            )
+            .alias(ds.clone()),
+        )
+        .cond_where(
+            Condition::all()
+                .add(
+                    Expr::col((
+                        ds.clone(),
+                        crate::routes::private::data_streams::models::Column::Id,
+                    ))
+                    .equals((h.clone(), hold_model::Column::StreamId)),
+                )
+                .add(hold_col(hold_model::Column::Status).eq(HoldStatus::Pending.as_str()))
+                .add(undeclared_gate().not())
+                .add(bounds),
+        )
+        .to_owned()
+        .build(PostgresQueryBuilder);
     let acknowledged = state
         .db
         .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "UPDATE replicate_audit_holds AS h
-                 SET status = '{acknowledged}', resolution = {resolution_sql},
-                     acknowledged_by = $1, acknowledged_at = NOW()
-                 FROM data_streams ds
-                 WHERE ds.id = h.stream_id AND h.status = '{pending}'
-                   AND NOT {undeclared_gate}{bounds}",
-                acknowledged = HoldStatus::Acknowledged.as_str(),
-                pending = HoldStatus::Pending.as_str()
-            ),
-            binds,
+            sql,
+            values,
         ))
         .await?
         .rows_affected();
@@ -2426,10 +2484,6 @@ pub fn manage_routes() -> Router<AppState> {
         .route(
             "/replicate_audit_holds/acknowledge_bulk",
             post(acknowledge_holds_bulk),
-        )
-        .route(
-            "/change_proposals",
-            get(crate::routes::private::readings::views::list_proposals),
         )
         .route(
             "/change_proposals/decide",

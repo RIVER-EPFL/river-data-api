@@ -4,8 +4,8 @@
 //!
 //! Run: cargo test --test reprocessing_jobs worker_timeline -- --test-threads=1
 
-use river_db::routes::private::reprocessing_jobs::service::Job;
 use river_db::routes::private::reprocessing_jobs::service as jobs;
+use river_db::routes::private::reprocessing_jobs::service::Job;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 

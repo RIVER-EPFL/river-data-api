@@ -247,11 +247,19 @@ fn the_kinds_that_move_a_served_value_fire_the_recompute() {
 
 #[test]
 fn a_pin_exclusion_names_the_kind_and_covers_group_pins() {
-    let sql = super::not_pinned_sql("r", Kind::InstrumentPin);
-    assert!(sql.contains("d.kind = 'instrument_pin'"));
-    assert!(sql.contains("d.rolled_back_by IS NULL"));
-    assert!(sql.contains("d.replicate_index IS NULL OR d.replicate_index = r.replicate_index"));
-    assert!(super::not_pinned_sql("tgt", Kind::CalibrationPin).contains("tgt.stream_id"));
+    let rendered = |alias, kind| {
+        sea_orm::sea_query::Query::select()
+            .expr(sea_orm::sea_query::Expr::val(1))
+            .and_where(super::not_pinned(alias, kind))
+            .to_string(sea_orm::sea_query::PostgresQueryBuilder)
+    };
+    let sql = rendered("r", Kind::InstrumentPin);
+    assert!(sql.contains(r#""d"."kind" = 'instrument_pin'"#));
+    assert!(sql.contains(r#""d"."rolled_back_by" IS NULL"#));
+    assert!(sql.contains(
+        r#""d"."replicate_index" IS NULL OR "d"."replicate_index" = "r"."replicate_index""#
+    ));
+    assert!(rendered("tgt", Kind::CalibrationPin).contains(r#""tgt"."stream_id""#));
 }
 
 #[test]
@@ -622,14 +630,17 @@ fn a_rollback_asserts_the_columns_it_restores_and_the_decision_it_undid_is_not_f
 
 #[test]
 fn the_drift_statement_folds_every_owned_column_and_repairs_none() {
-    let sql = super::inconsistent_rows_sql();
+    let sql = super::inconsistent_rows().to_string(sea_orm::sea_query::PostgresQueryBuilder);
     for col in super::FOLDED_COLUMNS {
         assert!(sql.contains(&format!("'{col}'")), "{col} is not folded");
     }
-    assert!(sql.contains("d.rolled_back_by IS NULL"));
-    assert!(sql.contains("d.replicate_index IS NULL OR d.replicate_index = c.replicate_index"));
+    assert!(sql.contains(r#""d"."rolled_back_by" IS NULL"#));
+    assert!(sql.contains(
+        r#""d"."replicate_index" IS NULL OR "d"."replicate_index" = "c"."replicate_index""#
+    ));
     // A row with no decision at all is still a candidate when a column left the born state.
-    assert!(sql.contains("r.is_flagged IS TRUE OR r.flag_reason IS NOT NULL"));
+    assert!(sql.contains(r#""r"."is_flagged" IS TRUE"#));
+    assert!(sql.contains(r#""r"."flag_reason" IS NOT NULL"#));
     for write in ["UPDATE ", "DELETE ", "INSERT "] {
         assert!(
             !sql.contains(write),

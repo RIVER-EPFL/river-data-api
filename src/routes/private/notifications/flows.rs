@@ -14,8 +14,8 @@ use sea_orm::{
 use super::models::*;
 use super::service::*;
 use crate::common::AppState;
-use crate::routes::private::alarms::models::alarm_event;
 use crate::config::Config;
+use crate::routes::private::alarms::models::alarm_event;
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::models as readings;

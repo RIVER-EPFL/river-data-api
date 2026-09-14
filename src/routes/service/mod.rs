@@ -30,12 +30,16 @@ use crate::routes::private::{
     derived_parameters::models::definition::CalculationFormula,
     derived_parameters::models::source::DerivedParameterSource,
     notes::Note,
-    notifications::{NotificationLog, NotificationMute, NotificationState},
+    notifications::{
+        NotificationLog, NotificationMute, NotificationState, NotificationSubscriber,
+    },
     parameter_groups::group_model::ParameterGroup,
     parameter_groups::member_model::ParameterGroupMember,
     parameters::Parameter,
     projects::subprojects::Subproject,
     readings::decision_model::ReadingDecision,
+    readings::models::Reading,
+    readings::models::change_proposal::ReadingChangeProposal,
     readings::samples::Sample,
     reprocessing_jobs::ReprocessingJob,
     reprocessing_jobs::models::job_log::ReprocessingJobLog,
@@ -198,6 +202,12 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/replicate_audit_holds",
             sensor_crud(ReplicateAuditHold::router(db)),
         )
+        // The proposed corrections, read-only for the same reason: a proposal is raised by the
+        // windowed ingest and decided through `/sync/change_proposals/decide`.
+        .nest(
+            "/reading_change_proposals",
+            sensor_crud(ReadingChangeProposal::router(db)),
+        )
         // Field metadata, not sensor movement: a standard curve affects only the grabs an operator
         // enters against it, so the person entering the plate's readings adds its curve in the same
         // sitting. `sensor_crud` (MANAGER) is the alternative, and would make them wait on a manager.
@@ -274,9 +284,19 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/notification_states",
             admin_only_crud(NotificationState::router(db)),
         )
+        // The roster, `routes(read)`: a person's own `/notifications/me` is the only writer, and
+        // the device count beside the switch is attached by the entity's own hook.
+        .nest(
+            "/notification_subscribers",
+            admin_only_crud(NotificationSubscriber::router(db)),
+        )
         .nest("/annotations", field_data_crud(Annotation::router(db)))
         .nest("/constants", catalog_crud(Constant::router(db)))
         .nest("/samples", field_data_crud(Sample::router(db)))
+        // The readings themselves, read-only: every write path resolves attribution from the
+        // pairing and builds provenance server-side, and a change goes through the curation
+        // routes, which append to `reading_decisions` first.
+        .nest("/readings", field_data_crud(Reading::router(db)))
         .nest(
             "/collection_events",
             field_data_crud(CollectionEvent::router(db)),
@@ -306,8 +326,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         data_streams::views as stream_views, derived_parameters::views as derived_views,
         parameters::views as parameter_views, projects::views as project_views,
         readings::status_events::views as status_events_batch, readings::views as readings_views,
-        search,
-        sensor_calibrations::views as calibration_views,
+        search, sensor_calibrations::views as calibration_views,
         sensor_deployments::views as deployment_views, sensors::views as sensor_views,
         site_parameters::views as site_parameter_views, sync::views as sync_views, tools,
     };

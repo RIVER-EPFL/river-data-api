@@ -234,10 +234,10 @@ fn a_stream_hold_conflicts_on_the_open_stream_index() {
         },
         HoldStatus::Pending,
     ))
-    .to_string();
+    .to_string(sea_orm::sea_query::PostgresQueryBuilder);
     assert!(
         sql.contains(
-            "ON CONFLICT (stream_id, group_time, kind) WHERE status IN ('pending', 'deferred')"
+            r#"ON CONFLICT ("stream_id", "group_time", "kind") WHERE status IN ('pending', 'deferred')"#
         ),
         "{sql}"
     );
@@ -253,15 +253,15 @@ fn a_slot_hold_conflicts_on_the_streamless_event_index() {
         },
         HoldStatus::Pending,
     ))
-    .to_string();
+    .to_string(sea_orm::sea_query::PostgresQueryBuilder);
     assert!(
         sql.contains(
-            "ON CONFLICT (kind, site_id, parameter_id, group_time) WHERE stream_id IS NULL AND status = 'pending'"
+            r#"ON CONFLICT ("kind", "site_id", "parameter_id", "group_time") WHERE stream_id IS NULL AND status = 'pending'"#
         ),
         "{sql}"
     );
     assert!(
-        sql.contains("site_id, parameter_id, group_time, kind"),
+        sql.contains(r#""site_id", "parameter_id", "group_time", "kind""#),
         "{sql}"
     );
 }
@@ -274,13 +274,13 @@ fn a_standing_stream_hold_stamps_its_own_instant_and_conflicts_on_the_stream() {
         },
         HoldStatus::Pending,
     ))
-    .to_string();
+    .to_string(sea_orm::sea_query::PostgresQueryBuilder);
     assert!(
         sql.contains("VALUES ('00000000-0000-0000-0000-000000000000', NOW(),"),
         "{sql}"
     );
     assert!(
-        sql.contains("ON CONFLICT (stream_id) WHERE kind = 'source_identity_changed'"),
+        sql.contains(r#"ON CONFLICT ("stream_id") WHERE kind = 'source_identity_changed'"#),
         "{sql}"
     );
 }
@@ -294,12 +294,15 @@ fn a_re_detection_refreshes_the_payload_and_promotes_a_deferred_hold_only() {
         },
         HoldStatus::Pending,
     ))
-    .to_string();
-    assert!(sql.contains("expected = EXCLUDED.expected"), "{sql}");
-    assert!(sql.contains("created_at = NOW()"), "{sql}");
+    .to_string(sea_orm::sea_query::PostgresQueryBuilder);
+    assert!(
+        sql.contains(r#""expected" = "excluded"."expected""#),
+        "{sql}"
+    );
+    assert!(sql.contains(r#""created_at" = NOW()"#), "{sql}");
     assert!(
         sql.contains(
-            "status = CASE WHEN replicate_audit_holds.status = 'deferred'\n                                              AND EXCLUDED.status = 'pending'\n                                         THEN 'pending' ELSE replicate_audit_holds.status END"
+            r#""status" = CASE WHEN replicate_audit_holds.status = 'deferred' AND EXCLUDED.status = 'pending' THEN 'pending' ELSE replicate_audit_holds.status END"#
         ),
         "{sql}"
     );

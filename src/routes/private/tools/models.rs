@@ -957,12 +957,6 @@ pub struct Manifest {
     pub site_inputs: Vec<ManifestSiteInput>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub event_inputs: Vec<ManifestEventInput>,
-    /// Opaque QC block, stored as declared and served on `GET /tools` for clients that read it.
-    /// Nothing server-side reads it: the seasonal check and the event audit take no input from
-    /// the manifest. The only validation is that it is an object.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub qc: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sections: Vec<ManifestSection>,
     pub match_keywords: Vec<String>,
@@ -991,8 +985,6 @@ pub(super) struct ManifestRaw {
     site_inputs: Vec<ManifestSiteInput>,
     #[serde(default)]
     event_inputs: Vec<ManifestEventInput>,
-    #[serde(default)]
-    qc: Option<serde_json::Value>,
     #[serde(default)]
     match_keywords: Vec<String>,
 }
@@ -1085,11 +1077,6 @@ impl<'de> Deserialize<'de> for Manifest {
                 )));
             }
         }
-        if let Some(qc) = &raw.qc
-            && !qc.is_object()
-        {
-            return Err(D::Error::custom("qc must be an object"));
-        }
         Ok(Self {
             label: raw.label,
             description: raw.description,
@@ -1099,7 +1086,6 @@ impl<'de> Deserialize<'de> for Manifest {
             curves: raw.curves,
             site_inputs: raw.site_inputs,
             event_inputs: raw.event_inputs,
-            qc: raw.qc,
             sections: raw.sections,
             match_keywords: raw.match_keywords,
         })
@@ -1263,9 +1249,6 @@ pub struct ToolDescriptor {
     pub site_inputs: Vec<ManifestSiteInput>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub event_inputs: Vec<ManifestEventInput>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub qc: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sections: Vec<ManifestSection>,
     pub match_keywords: Vec<String>,
@@ -1423,7 +1406,6 @@ impl ActiveTool {
             curves: self.manifest.curves.clone(),
             site_inputs: self.manifest.site_inputs.clone(),
             event_inputs: self.manifest.event_inputs.clone(),
-            qc: self.manifest.qc.clone(),
             sections: self.manifest.sections.clone(),
             match_keywords: self.manifest.match_keywords.clone(),
             script_version_id: self.version_id,

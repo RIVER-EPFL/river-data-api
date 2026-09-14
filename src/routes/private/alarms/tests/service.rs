@@ -34,12 +34,14 @@ fn arms() -> Vec<(&'static str, String, bool)> {
         ),
         (
             "latest_served_query continuous",
-            latest_served_query(false, "$1", "$2").to_string(PostgresQueryBuilder),
+            latest_served_query(false, Expr::cust("$1"), Expr::cust("$2"))
+                .to_string(PostgresQueryBuilder),
             false,
         ),
         (
             "latest_served_query spot",
-            latest_served_query(true, "$1", "$2").to_string(PostgresQueryBuilder),
+            latest_served_query(true, Expr::cust("$1"), Expr::cust("$2"))
+                .to_string(PostgresQueryBuilder),
             true,
         ),
         (
@@ -131,5 +133,54 @@ fn test_the_latest_slot_value_is_one_recent_unflagged_row_per_slot() {
     assert!(
         spot_rank < time_desc,
         "continuous wins before newest: {sql}"
+    );
+}
+
+/// Expected behaviour: the episode statement keeps the four-step chain, each window function in
+/// its own step, and closes a run only where the following in-range reading exists.
+#[test]
+fn test_the_episode_statement_walks_ordered_scored_marked_runs() {
+    let sql = super::episodes_query("CASE WHEN v > 1 THEN 2 ELSE 0 END", false)
+        .to_string(PostgresQueryBuilder);
+    let steps: Vec<usize> = [
+        "\"ordered\" AS",
+        "\"scored\" AS",
+        "\"marked\" AS",
+        "\"runs\" AS",
+    ]
+    .iter()
+    .map(|step| {
+        sql.find(step)
+            .unwrap_or_else(|| panic!("{step} missing: {sql}"))
+    })
+    .collect();
+    assert!(steps.windows(2).all(|w| w[0] < w[1]), "in order: {sql}");
+    assert!(
+        sql.contains("ROWS UNBOUNDED PRECEDING"),
+        "the run id is a running sum over every earlier instant: {sql}"
+    );
+    assert!(
+        sql.contains("HAVING (ARRAY_AGG(next_t ORDER BY t DESC))[1] IS NOT NULL"),
+        "a run still breaching at the window edge is not an episode: {sql}"
+    );
+}
+
+/// Expected behaviour: the per-parameter count reads the violations select itself, so a count and
+/// the export it gates cannot disagree.
+#[test]
+fn test_the_violation_count_groups_the_violations_select() {
+    let site = Uuid::nil();
+    let counts = super::violation_counts_query(site, 1).to_string(PostgresQueryBuilder);
+    let violations = violations_query(site, None, 1).to_string(PostgresQueryBuilder);
+    let select = violations
+        .find(r#"SELECT "sv"."parameter_id""#)
+        .expect("the violations select");
+    assert!(
+        counts.contains(&violations[select..]),
+        "the count carries the violations select verbatim: {counts}"
+    );
+    assert!(
+        counts.contains(r#"COUNT(*) AS "n""#) && counts.contains(r#"GROUP BY "v"."parameter_id""#),
+        "one row per parameter: {counts}"
     );
 }

@@ -2241,31 +2241,14 @@ pub async fn get_site_sensor_identity(
 
     let param_filter = query.parameter_ids.as_deref().map(parse_uuid_csv);
 
-    // $1 = site_id, $2 = end, $3 = start, then optional parameter_ids.
-    let mut band_sql = String::from(
-        r"SELECT d.id AS deployment_id, d.sensor_id, s.serial_number AS sensor_serial,
-                 s.name AS sensor_name, d.site_id, d.parameter_id, d.deployed_from, d.deployed_until
-          FROM sensor_deployments d
-          JOIN sensors s ON s.id = d.sensor_id
-          WHERE d.site_id = $1
-            AND d.deployed_from < $2
-            AND COALESCE(d.deployed_until, 'infinity'::timestamptz) > $3",
-    );
-    let mut values: Vec<sea_orm::Value> =
-        vec![site.id.into(), query.end.into(), query.start.into()];
-    if let Some(ref pids) = param_filter
-        && !pids.is_empty()
-    {
-        band_sql.push_str(" AND d.parameter_id = ANY($4)");
-        values.push(pids.clone().into());
-    }
-    band_sql.push_str(" ORDER BY d.parameter_id, d.deployed_from");
-
+    let (band_sql, band_values) =
+        sensor_identity_bands_query(site.id, query.start, query.end, param_filter.as_deref())
+            .build(PostgresQueryBuilder);
     let band_rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &band_sql,
-            values.clone(),
+            band_sql,
+            band_values,
         ))
         .await?;
 
@@ -2294,34 +2277,14 @@ pub async fn get_site_sensor_identity(
     // calibration whose parameter is not resolved yet has no series to sit on and is not a
     // plottable marker. Lab curves cannot appear here at all: they live in `standard_curves`,
     // which has no window to plot.
-    let mut cal_sql = String::from(
-        r"SELECT c.id AS calibration_id, c.sensor_id, c.parameter_id,
-                 c.slope, c.intercept, c.valid_from, c.valid_until
-          FROM sensor_calibrations c
-          WHERE c.sensor_id IN (
-              SELECT DISTINCT d.sensor_id FROM sensor_deployments d
-              WHERE d.site_id = $1
-                AND d.deployed_from < $2
-                AND COALESCE(d.deployed_until, 'infinity'::timestamptz) > $3",
-    );
-    if let Some(ref pids) = param_filter
-        && !pids.is_empty()
-    {
-        cal_sql.push_str(" AND d.parameter_id = ANY($4)");
-    }
-    cal_sql.push_str(
-        r" )
-            AND c.parameter_id IS NOT NULL
-            AND c.valid_from < $2
-            AND COALESCE(c.valid_until, 'infinity'::timestamptz) > $3
-          ORDER BY c.parameter_id, c.valid_from",
-    );
-
+    let (cal_sql, cal_values) =
+        sensor_calibration_markers_query(site.id, query.start, query.end, param_filter.as_deref())
+            .build(PostgresQueryBuilder);
     let cal_rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &cal_sql,
-            values,
+            cal_sql,
+            cal_values,
         ))
         .await?;
 

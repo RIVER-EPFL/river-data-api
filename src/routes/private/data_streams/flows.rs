@@ -12,14 +12,14 @@
 
 use async_trait::async_trait;
 use sea_orm::sea_query::{Alias, Expr, Func, PostgresQueryBuilder, Query, UpdateStatement};
-use sea_orm::{ConnectionTrait, DbErr, EntityTrait, Statement, TransactionTrait};
+use sea_orm::{Condition, ConnectionTrait, DbErr, EntityTrait, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use super::models::{Backfilled, SlotScope};
 use super::service::{release_slot_rows, resolve_retire_target};
 use crate::common::bulk_write::{self, TouchedRange};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::collection_events::flows::{rows_matching, touched_events};
+use crate::routes::private::collection_events::flows::touched_events;
 use crate::routes::private::collection_events::service::{EventSource, attach_collection_events};
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::readings::models as readings;
@@ -32,15 +32,19 @@ use crate::routes::private::sync::service::{HoldScope, repoint_holds};
 
 /// The scope as a predicate over `data_streams ds`, which is the one table all four statements
 /// and the three shared helpers join.
-fn predicate(scope: HoldScope) -> (&'static str, Vec<sea_orm::Value>) {
-    match scope {
-        HoldScope::Stream(id) => ("ds.id = $1", vec![id.into()]),
-        HoldScope::Plan(id) => ("ds.pairing_plan_id = $1", vec![id.into()]),
-    }
+fn predicate(scope: HoldScope) -> Condition {
+    use sea_orm::sea_query::ExprTrait;
+
+    // The shared helpers join the streams table as `ds`.
+    let ds = Alias::new("ds");
+    Condition::all().add(match scope {
+        HoldScope::Stream(id) => Expr::col((ds, data_streams::Column::Id)).eq(id),
+        HoldScope::Plan(id) => Expr::col((ds, data_streams::Column::PairingPlanId)).eq(id),
+    })
 }
 
-/// The same scope, built. The text form above stays until the three shared helpers this file calls
-/// take a condition instead of a string.
+/// The same scope over the streams table itself, for the statements that name it rather than
+/// joining it.
 fn scope_condition(scope: HoldScope) -> Expr {
     use sea_orm::sea_query::ExprTrait;
 
@@ -155,7 +159,7 @@ pub async fn backfill<C: ConnectionTrait>(
     scope: HoldScope,
     deployment_id: Option<Uuid>,
 ) -> AppResult<Backfilled> {
-    let (scope_sql, binds) = predicate(scope);
+    let scoped = predicate(scope);
 
     // The backfill reaches chunks the compression policy has already closed.
     bulk_write::lift_decompression_cap(conn).await?;
@@ -166,12 +170,12 @@ pub async fn backfill<C: ConnectionTrait>(
 
     // Replicate groups on the newly paired streams (2+ spot readings sharing a slot and timestamp,
     // e.g. migrated NOMIS A/B/C rows) form samples. The row-level triggers populate the statistics.
-    materialise_samples(conn, rows_matching(scope_sql, binds.clone())).await?;
+    materialise_samples(conn, scoped.clone()).await?;
 
     // Attribution arriving is what makes these spot readings addressable as visits: attach their
     // collection events now, deriving the source from where each stream came from.
-    attach_collection_events(conn, scope_sql, binds.clone(), EventSource::ByStreamOrigin).await?;
-    let touched = touched_events(conn, rows_matching(scope_sql, binds.clone())).await?;
+    attach_collection_events(conn, scoped.clone(), EventSource::ByStreamOrigin).await?;
+    let touched = touched_events(conn, scoped).await?;
 
     let (sql, values) = attribute_status_events(scope).build(PostgresQueryBuilder);
     conn.execute_raw(Statement::from_sql_and_values(

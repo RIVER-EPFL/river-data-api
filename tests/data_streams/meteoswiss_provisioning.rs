@@ -234,7 +234,9 @@ async fn a_station_registers_once_and_leaves_the_provenance_less_instruments_alo
     .await;
     assert_eq!(bench_before, 2, "both serial instruments are stored");
 
-    let first = instrument(&db, STATION).await.expect("register the station");
+    let first = instrument(&db, STATION)
+        .await
+        .expect("register the station");
     let again = instrument(&db, STATION)
         .await
         .expect("register the same station again");

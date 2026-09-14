@@ -262,17 +262,6 @@ pub struct TestSendResponse {
     pub all_sent: bool,
 }
 
-#[derive(Debug, Serialize, ToSchema, FromQueryResult)]
-#[serde(rename_all = "camelCase")]
-pub struct SubscriberRow {
-    pub keycloak_sub: String,
-    pub web_push_enabled: bool,
-    #[sea_orm(alias = "push_count")]
-    pub push_subscription_count: i64,
-    #[sea_orm(alias = "overrides")]
-    pub subscription_overrides: i64,
-}
-
 #[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelHealth {
@@ -560,6 +549,59 @@ pub mod subscription {
         pub updated_at: chrono::DateTime<chrono::Utc>,
         #[crudcrate(filterable)]
         pub channel: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// A person notifications are addressed to. The row is created on their first visit to their own
+/// settings and on their first push device, and `web_push_enabled` is the switch every channel
+/// delivery is gated on.
+///
+/// Read-only as an entity (`routes(read)`): the generated list is the admin roster, and the only
+/// writer is the person themselves through `/notifications/me`.
+pub mod subscriber {
+    use crudcrate::EntityToModels;
+    use sea_orm::entity::prelude::*;
+
+    #[derive(
+        Clone,
+        Debug,
+        PartialEq,
+        DeriveEntityModel,
+        serde::Serialize,
+        serde::Deserialize,
+        EntityToModels,
+    )]
+    #[sea_orm(table_name = "notification_subscribers")]
+    #[crudcrate(
+        api_struct = "NotificationSubscriber",
+        name_singular = "notification_subscriber",
+        name_plural = "notification_subscribers",
+        generate_router,
+        routes(read),
+        operations = crate::routes::private::notifications::service::SubscriberOperations
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
+        pub id: Uuid,
+        #[crudcrate(filterable, fulltext, sortable)]
+        pub keycloak_sub: String,
+        #[crudcrate(filterable, sortable)]
+        pub web_push_enabled: bool,
+        #[crudcrate(exclude(create, update), sortable)]
+        pub created_at: chrono::DateTime<chrono::Utc>,
+        #[crudcrate(exclude(create, update), sortable)]
+        pub updated_at: chrono::DateTime<chrono::Utc>,
+        /// Push devices registered to this person, which is what the roster reports beside the
+        /// switch.
+        #[sea_orm(ignore)]
+        #[crudcrate(non_db_attr = true, exclude(create, update))]
+        pub push_subscription_count: Option<i64>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

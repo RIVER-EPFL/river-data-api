@@ -5,26 +5,29 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use moka::future::Cache;
 use sea_orm::sea_query::{Expr, ExprTrait, OnConflict};
 use sea_orm::{
     ActiveValue, ActiveValue::NotSet, ActiveValue::Set, ColumnTrait, ConnectionTrait,
     DatabaseConnection, DbErr, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter,
-    QueryOrder, Statement, TryInsertResult,
+    QueryOrder, QuerySelect, Statement, TransactionTrait, TryInsertResult,
 };
 use std::fmt::Write as _;
 use uuid::Uuid;
 
+use super::models::subscriber::NotificationSubscriber;
 use super::models::*;
 use crate::common::AppState;
-use crate::routes::private::alarms::models::alarm_event;
 use crate::common::authz::Role;
 use crate::common::grants::load_grants;
 use crate::common::middleware::AuthContext;
 use crate::common::paging::{Page, Window};
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::alarms::models::alarm_event;
 use crate::routes::private::api_tokens::service as users;
+use crate::routes::private::readings::decision_model;
 
 pub(super) const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 
@@ -1011,36 +1014,106 @@ pub(super) fn require_sub(auth: &AuthContext) -> AppResult<String> {
     })
 }
 
+// --- The roster ---
+
+/// What the roster reports over the stored row: how many push devices the person has registered.
+/// The generated list is the roster, so the count is attached to it here rather than spelled in a
+/// route of its own.
+pub struct SubscriberOperations;
+
+impl CRUDOperations for SubscriberOperations {
+    type Resource = NotificationSubscriber;
+
+    async fn after_get_one<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        entity: &mut NotificationSubscriber,
+    ) -> Result<(), ApiError> {
+        let counts = push_device_counts(db, std::slice::from_ref(&entity.keycloak_sub)).await?;
+        entity.push_subscription_count =
+            Some(counts.get(&entity.keycloak_sub).copied().unwrap_or(0));
+        Ok(())
+    }
+
+    async fn after_get_all<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        entities: &mut Vec<<NotificationSubscriber as CRUDResource>::ListModel>,
+    ) -> Result<(), ApiError> {
+        if entities.is_empty() {
+            return Ok(());
+        }
+        let subs: Vec<String> = entities.iter().map(|e| e.keycloak_sub.clone()).collect();
+        let counts = push_device_counts(db, &subs).await?;
+        for entity in entities.iter_mut() {
+            entity.push_subscription_count =
+                Some(counts.get(&entity.keycloak_sub).copied().unwrap_or(0));
+        }
+        Ok(())
+    }
+}
+
+/// Registered push devices per login, for the logins asked about. A login with no device is absent
+/// from the result rather than carrying a zero.
+pub async fn push_device_counts<C: ConnectionTrait>(
+    db: &C,
+    subs: &[String],
+) -> Result<std::collections::HashMap<String, i64>, ApiError> {
+    #[derive(FromQueryResult)]
+    struct DeviceCount {
+        keycloak_sub: String,
+        devices: i64,
+    }
+
+    let rows = push_subscription::Entity::find()
+        .select_only()
+        .column(push_subscription::Column::KeycloakSub)
+        .column_as(push_subscription::Column::Id.count(), "devices")
+        .filter(push_subscription::Column::KeycloakSub.is_in(subs.to_vec()))
+        .group_by(push_subscription::Column::KeycloakSub)
+        .into_model::<DeviceCount>()
+        .all(db)
+        .await
+        .map_err(ApiError::database)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.keycloak_sub, r.devices))
+        .collect())
+}
+
 pub(super) async fn ensure_subscriber(state: &AppState, sub: &str) -> AppResult<()> {
-    state
-        .db
-        .execute_raw(Statement::from_sql_and_values(
-            PG,
-            "INSERT INTO notification_subscribers (keycloak_sub) VALUES ($1) \
-             ON CONFLICT (keycloak_sub) DO NOTHING",
-            [sub.into()],
-        ))
-        .await?;
+    subscriber::Entity::insert(subscriber::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        keycloak_sub: Set(sub.to_string()),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::column(subscriber::Column::KeycloakSub)
+            .do_nothing()
+            .to_owned(),
+    )
+    .try_insert()
+    .exec(&state.db)
+    .await?;
     Ok(())
 }
 
+/// The subscriber row for this login, or `None` before their first visit.
+pub(super) async fn find_subscriber(
+    db: &DatabaseConnection,
+    sub: &str,
+) -> AppResult<Option<subscriber::Model>> {
+    Ok(subscriber::Entity::find()
+        .filter(subscriber::Column::KeycloakSub.eq(sub))
+        .one(db)
+        .await?)
+}
+
 pub(super) async fn load(state: &AppState, sub: &str) -> AppResult<MyNotifications> {
-    let row = state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            PG,
-            "SELECT COALESCE(ns.web_push_enabled, true) AS web_push_enabled \
-             FROM notification_subscribers ns WHERE ns.keycloak_sub = $1",
-            [sub.into()],
-        ))
-        .await?;
-    // No subscriber row means the default, which the query already spells; a row that will not
-    // decode is an error.
-    let web_push_enabled = row
-        .as_ref()
-        .map(|r| r.try_get::<bool>("", "web_push_enabled"))
-        .transpose()?
-        .unwrap_or(true);
+    // No subscriber row means the default: every channel is on until somebody turns one off.
+    let web_push_enabled = find_subscriber(&state.db, sub)
+        .await?
+        .is_none_or(|row| row.web_push_enabled);
 
     let push_count = i64::try_from(
         push_subscription::Entity::find()
@@ -1383,20 +1456,12 @@ pub(super) async fn decisions_since(
     kind: &str,
     since: DateTime<Utc>,
 ) -> Result<i64, DbErr> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            PG,
-            "SELECT count(*)::bigint AS n FROM reading_decisions WHERE kind = $1 AND at > $2",
-            [
-                kind.into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(since).into(),
-            ],
-        ))
+    let n = decision_model::Entity::find()
+        .filter(decision_model::Column::Kind.eq(kind))
+        .filter(decision_model::Column::At.gt(sea_orm::prelude::DateTimeWithTimeZone::from(since)))
+        .count(db)
         .await?;
-    match row {
-        Some(row) => row.try_get("", "n"),
-        None => Ok(0),
-    }
+    Ok(i64::try_from(n).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]

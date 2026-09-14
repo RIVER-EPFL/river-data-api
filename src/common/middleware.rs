@@ -678,7 +678,7 @@ fn scoped_site_parameter_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::Sel
 /// The streams serving a slot in the granted projects. A stream with no slot yet belongs to no
 /// project, so a decision on one is not listed for a confined caller, which is the same answer
 /// `data_streams` itself gives.
-fn scoped_stream_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
+pub(crate) fn scoped_stream_ids_query(projects: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
     use crate::routes::private::data_streams;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
     data_streams::Entity::find()
@@ -743,9 +743,10 @@ fn crud_scope_condition(
     use crate::routes::private::{
         alarms::models as alarm_thresholds, alarms::models::alarm_event as alarm_events,
         annotations, data_streams, notes, projects as projects_entity, projects::subprojects,
-        readings::decision_model as reading_decisions, readings::samples, reprocessing_jobs,
-        sensor_deployments, sensors, sensor_calibrations, standard_curves, sites,
-        site_parameters, sync::hold_model as holds,
+        readings::decision_model as reading_decisions, readings::models as readings,
+        readings::models::change_proposal as change_proposals, readings::samples,
+        reprocessing_jobs, sensor_calibrations, sensor_deployments, sensors, site_parameters,
+        sites, standard_curves, sync::hold_model as holds,
     };
     use sea_orm::{ColumnTrait, Condition};
     let ids = || projects.iter().copied();
@@ -770,12 +771,20 @@ fn crud_scope_condition(
         }
         "alarm_events" => alarm_events::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
         "samples" => samples::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
+        // A reading is confined the way its statistics row is: by the site the pairing attributed
+        // it to. An unattributed reading names no site and is nobody's project's.
+        "readings" => readings::Column::SiteId.in_subquery(scoped_site_ids_query(projects)),
         "data_streams" => data_streams::Column::SiteParameterId
             .in_subquery(scoped_site_parameter_ids_query(projects)),
         // The ledger is keyed by stream, so it is confined the way the streams are. A decision is
         // never written through CRUD, so the one direction that matters is the read.
         "reading_decisions" => {
             reading_decisions::Column::StreamId.in_subquery(scoped_stream_ids_query(projects))
+        }
+        // A proposal is keyed by stream too: an unpaired stream belongs to no project and is not a
+        // confined caller's to rule on.
+        "reading_change_proposals" => {
+            change_proposals::Column::StreamId.in_subquery(scoped_stream_ids_query(projects))
         }
         // A hold is keyed by stream or, for a finding no stream produced, by site. Either half
         // confines it; a hold carrying neither belongs to no project and is not listed.

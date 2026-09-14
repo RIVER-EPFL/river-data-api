@@ -5,8 +5,8 @@
 //! Run: cargo test --test reprocessing_jobs -- --test-threads=1
 
 use river_db::common::AppEvent;
-use river_db::routes::private::reprocessing_jobs::service::{Job, JobRegistry};
 use river_db::routes::private::reprocessing_jobs::service as jobs;
+use river_db::routes::private::reprocessing_jobs::service::{Job, JobRegistry};
 use river_db::routes::private::sync::flows::{SyncFullReassert, SyncLedgerRetention};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;

@@ -5,6 +5,16 @@ fn rendered(query: impl sea_orm::sea_query::QueryStatementBuilder) -> String {
     build(query).sql
 }
 
+/// One expression, rendered on its own, so a test can read what a statement carries.
+fn expr_sql(e: Expr) -> String {
+    use sea_orm::sea_query::{PostgresQueryBuilder, Query};
+    Query::select()
+        .expr(e)
+        .to_string(PostgresQueryBuilder)
+        .trim_start_matches("SELECT ")
+        .to_owned()
+}
+
 /// The report and the split ask the same question at different moments: a reading whose curve
 /// belongs to another instrument. Keeping the predicate in one place is what stops the report
 /// listing rows the split would not have asked about.
@@ -48,18 +58,17 @@ fn a_recording_statement_inserts_only_where_a_written_column_differs() {
 
 #[test]
 fn the_drift_sweep_repairs_exactly_what_the_recompose_writes() {
-    let drifted = own_curve_rows(Expr::cust(format!(
-        "{corrected} AND tgt.calibrated_value IS DISTINCT FROM ({value})",
-        corrected = corrected_rows("r"),
-        value = recomposed_own_curve_value(),
+    let drifted = own_curve_rows(corrected_rows("r").and(Expr::cust_with_exprs(
+        "tgt.calibrated_value IS DISTINCT FROM ($1)",
+        [recomposed_own_curve_value()],
     )));
     let sweep = rendered(recompose_statement(drifted));
     assert!(
-        sweep.contains(&recomposed_own_curve_value()),
+        sweep.contains(&expr_sql(recomposed_own_curve_value())),
         "the sweep writes the value the recompose computes: {sweep}"
     );
     assert!(
-        sweep.contains(&orphaned_correction_rows("r")),
+        sweep.contains(&expr_sql(orphaned_correction_rows("r"))),
         "and leaves an orphaned correction alone, as the recompose does: {sweep}"
     );
     let spot = rendered(recompose_statement(own_curve_rows(Expr::cust(
@@ -80,9 +89,15 @@ fn the_drift_sweep_repairs_exactly_what_the_recompose_writes() {
 /// the one producer of the ranking is where that is said.
 #[test]
 fn a_retired_curve_is_never_a_candidate() {
+    let rendered_pick = |q: sea_orm::sea_query::SelectStatement| {
+        q.to_string(sea_orm::sea_query::PostgresQueryBuilder)
+    };
     for pick in [
-        super::super::resolver::pick_calibration_lateral("$1"),
-        super::super::resolver::pick_calibration_lateral_excluding("$2", Some("$1")),
+        rendered_pick(super::super::resolver::pick_calibration_query("$1")),
+        rendered_pick(super::super::resolver::pick_calibration_query_excluding(
+            "$2",
+            Some("$1"),
+        )),
     ] {
         assert!(
             pick.replace('"', "").contains("c.retired_at IS NULL"),

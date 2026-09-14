@@ -18,3 +18,16 @@ async fn test_every_hook_of_one_request_owes_one_reconcile() {
         .await;
     assert!(owed.load(Ordering::Relaxed));
 }
+
+#[test]
+fn a_job_with_no_tunables_refuses_every_key() {
+    let sweep = AlarmSweep {
+        interval_seconds: 60,
+    };
+    assert!(sweep.validate(&serde_json::json!({})).is_ok());
+    let err = sweep
+        .validate(&serde_json::json!({ "retention_days": 7 }))
+        .unwrap_err();
+    assert!(err.contains("no tunables"), "{err}");
+    assert!(err.contains("retention_days"), "{err}");
+}

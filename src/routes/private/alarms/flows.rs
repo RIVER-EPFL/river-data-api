@@ -4,10 +4,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use crudcrate::{UpsertStatus, upsert};
+use sea_orm::sea_query::{Alias, Expr, Query as SeaQuery, QueryStatementBuilder, SimpleExpr};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait,
-    FromQueryResult, QueryFilter, QuerySelect, Set, Statement, TransactionSession,
-    TransactionTrait,
+    QueryFilter, QuerySelect, Set, TransactionSession, TransactionTrait,
 };
 use uuid::Uuid;
 
@@ -26,6 +26,7 @@ use crate::routes::private::reprocessing_jobs::flows::{
 };
 use crate::routes::private::reprocessing_jobs::service::Job;
 use crate::routes::private::reprocessing_jobs::service::{JobContext, JobReport, Schedule};
+use crate::routes::private::site_parameters::models as site_parameters;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -218,59 +219,41 @@ async fn reconcile_cadence<C: ConnectionTrait + TransactionTrait>(
         .iter()
         .map(|b| (b.site_id, b.parameter_id))
         .collect();
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    let mut next = 1usize;
+    use sea_orm::sea_query::ExprTrait;
+    let slot_tuple = Expr::tuple([
+        Expr::col(alarm_event::Column::SiteId),
+        Expr::col(alarm_event::Column::ParameterId),
+    ]);
 
-    let scope_clause = if let Some(s) = slots {
-        let mut pairs = Vec::with_capacity(s.len());
-        for (site, param) in s {
-            pairs.push(format!("(${},${})", next, next + 1));
-            values.push((*site).into());
-            values.push((*param).into());
-            next += 2;
-        }
-        format!(
-            " AND (ae.site_id, ae.parameter_id) IN ({})",
-            pairs.join(",")
-        )
-    } else {
-        String::new()
-    };
-
-    let not_in_clause = if keep.is_empty() {
-        String::new()
-    } else {
-        let mut pairs = Vec::with_capacity(keep.len());
-        for (site, param) in &keep {
-            pairs.push(format!("(${},${})", next, next + 1));
-            values.push((*site).into());
-            values.push((*param).into());
-            next += 2;
-        }
-        format!(
-            " AND (ae.site_id, ae.parameter_id) NOT IN ({})",
-            pairs.join(",")
-        )
-    };
     // The latest served value under the same per-cadence rule the breach set uses, wrapped to a
     // single column for the scalar assignment.
-    let latest = super::service::latest_served_query(spot, "ae.site_id", "ae.parameter_id")
-        .to_string(sea_orm::sea_query::PostgresQueryBuilder);
-    let resolve_sql = format!(
-        "UPDATE alarm_events ae \
-         SET resolved_at = NOW(), \
-             updated_at = NOW(), \
-             resolved_value = (SELECT lv.value FROM ({latest}) lv) \
-         WHERE ae.resolved_at IS NULL AND ae.measurement_type = '{cadence}'{scope_clause}{not_in_clause}"
+    let latest = super::service::latest_served_query(
+        spot,
+        Expr::col((alarm_event::Entity, alarm_event::Column::SiteId)),
+        Expr::col((alarm_event::Entity, alarm_event::Column::ParameterId)),
     );
-    let resolved = db
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &resolve_sql,
-            values,
-        ))
-        .await?
-        .rows_affected() as usize;
+    let lv = Alias::new("lv");
+    let resolving_value = SeaQuery::select()
+        .column((lv.clone(), Alias::new("value")))
+        .from_subquery(latest, lv)
+        .take();
+
+    let mut update = alarm_event::Entity::update_many()
+        .col_expr(alarm_event::Column::ResolvedAt, Expr::current_timestamp())
+        .col_expr(alarm_event::Column::UpdatedAt, Expr::current_timestamp())
+        .col_expr(
+            alarm_event::Column::ResolvedValue,
+            SimpleExpr::SubQuery(None, Box::new(resolving_value.into_sub_query_statement())),
+        )
+        .filter(alarm_event::Column::ResolvedAt.is_null())
+        .filter(alarm_event::Column::MeasurementType.eq(cadence));
+    if let Some(s) = slots {
+        update = update.filter(slot_tuple.clone().in_tuples(s.iter().copied()));
+    }
+    if !keep.is_empty() {
+        update = update.filter(slot_tuple.in_tuples(keep).not());
+    }
+    let resolved = update.exec(db).await?.rows_affected as usize;
     stats.resolved = resolved;
 
     Ok(stats)
@@ -369,30 +352,22 @@ pub async fn rebuild_alarm_events(
     start: Option<DateTime<Utc>>,
     end: Option<DateTime<Utc>>,
 ) -> Result<i64, sea_orm::DbErr> {
-    let mut conditions = vec!["sp.is_active = true".to_string()];
-    let mut values: Vec<sea_orm::Value> = Vec::new();
+    let mut query = site_parameters::Entity::find()
+        .select_only()
+        .column(site_parameters::Column::SiteId)
+        .column(site_parameters::Column::ParameterId)
+        .distinct()
+        .filter(site_parameters::Column::IsActive.eq(true));
     if let Some(s) = site_id {
-        values.push(s.into());
-        conditions.push(format!("sp.site_id = ${}", values.len()));
+        query = query.filter(site_parameters::Column::SiteId.eq(s));
     }
     if let Some(p) = parameter_id {
-        values.push(p.into());
-        conditions.push(format!("sp.parameter_id = ${}", values.len()));
+        query = query.filter(site_parameters::Column::ParameterId.eq(p));
     }
-    let slot_sql = format!(
-        "SELECT DISTINCT sp.site_id, sp.parameter_id FROM site_parameters sp WHERE {}",
-        conditions.join(" AND ")
-    );
-    let slots: Vec<(Uuid, Uuid)> = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &slot_sql,
-            values,
-        ))
+    let slots: Vec<(Uuid, Uuid)> = query
+        .into_model::<SlotRow>()
+        .all(db)
         .await?
-        .iter()
-        .map(|r| SlotRow::from_query_result(r, ""))
-        .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         // A reading with no slot has no thresholds to evaluate against.
         .filter_map(|r| Some((r.site_id?, r.parameter_id?)))
@@ -512,7 +487,7 @@ impl Job for AlarmBackfill {
 /// emit an `AlarmStateChanged` SSE on change, the alarm-sweeper backstop. Wraps
 /// [`sweeper::evaluate_alarm_events`] + the same SSE the old `sweeper::periodic` emitted.
 pub struct AlarmSweep {
-    pub(crate) interval_seconds: u64,
+    interval_seconds: u64,
 }
 
 impl AlarmSweep {

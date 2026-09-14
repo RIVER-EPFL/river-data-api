@@ -112,13 +112,12 @@ fn ce() -> Alias {
 /// window can be historical.
 pub async fn attach_collection_events<C: ConnectionTrait>(
     conn: &C,
-    row_predicate: &str,
-    binds: Vec<sea_orm::Value>,
+    selected: Condition,
     source: EventSource,
 ) -> AppResult<()> {
-    let attributed_spot = |predicate: String, binds: Vec<sea_orm::Value>| {
+    let attributed_spot = |selected: Condition| {
         Condition::all()
-            .add(Expr::cust_with_values(predicate, binds))
+            .add(selected)
             .add(Expr::col((r(), readings::Column::CollectionEventId)).is_null())
             .add(Expr::col((r(), readings::Column::SiteId)).is_not_null())
             .add(ExprTrait::eq(
@@ -138,7 +137,7 @@ pub async fn attach_collection_events<C: ConnectionTrait>(
             ds(),
             Expr::col((r(), readings::Column::StreamId)).equals((ds(), data_streams::Column::Id)),
         )
-        .cond_where(attributed_spot(row_predicate.to_string(), binds.clone()))
+        .cond_where(attributed_spot(selected.clone()))
         .add_group_by([
             Expr::col((r(), readings::Column::SiteId)),
             Expr::col((r(), readings::Column::Time)),
@@ -179,7 +178,7 @@ pub async fn attach_collection_events<C: ConnectionTrait>(
         .from(IntoTableRef::into_table_ref(data_streams::Entity).alias(ds()))
         .from(IntoTableRef::into_table_ref(super::Entity).alias(ce()))
         .cond_where(
-            attributed_spot(row_predicate.to_string(), binds)
+            attributed_spot(selected)
                 .add(
                     Expr::col((r(), readings::Column::StreamId))
                         .equals((ds(), data_streams::Column::Id)),

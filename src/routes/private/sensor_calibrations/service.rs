@@ -82,8 +82,8 @@ pub fn apply_curves(raw: f64, base: Option<Curve>, standard: Option<Curve>) -> f
 /// rows in one statement. `raw_expr`, `slope_expr` and `intercept_expr` name the operands in the
 /// caller's query.
 #[must_use]
-pub fn calibrated_value_sql(raw_expr: &str, slope_expr: &str, intercept_expr: &str) -> String {
-    format!("{slope_expr} * {raw_expr} + {intercept_expr}")
+pub fn calibrated_value(raw: Expr, slope: Expr, intercept: Expr) -> Expr {
+    slope.mul(raw).add(intercept)
 }
 
 /// What names a curve in a caller's query: the id column that says whether the curve is there at
@@ -101,28 +101,29 @@ pub struct CurveColumns<'a> {
 /// value. Writing the raw value there would make an uncorrected reading indistinguishable from one
 /// an identity curve corrected, which is the distinction the two curve references exist to keep.
 #[must_use]
-pub fn recomposed_value_sql(
-    raw_expr: &str,
-    base: &CurveColumns,
-    standard: &CurveColumns,
-) -> String {
-    let after_base = format!(
-        "CASE WHEN {base_id} IS NULL THEN {raw_expr} ELSE {applied} END",
-        base_id = base.id,
-        applied = calibrated_value_sql(raw_expr, base.slope, base.intercept),
-    );
-    let after_standard = calibrated_value_sql(
-        &format!("({after_base})"),
-        standard.slope,
-        standard.intercept,
-    );
-    format!(
-        "CASE WHEN {base_id} IS NULL AND {std_id} IS NULL THEN NULL \
-              WHEN {std_id} IS NULL THEN {after_base} \
-              ELSE {after_standard} END",
-        base_id = base.id,
-        std_id = standard.id,
+pub fn recomposed_value(raw_expr: &str, base: &CurveColumns, standard: &CurveColumns) -> Expr {
+    let raw = || Expr::cust(raw_expr.to_string());
+    let named = |name: &str| Expr::cust(name.to_string());
+    let after_base = || -> Expr {
+        Expr::case(named(base.id).is_null(), raw())
+            .finally(calibrated_value(
+                raw(),
+                named(base.slope),
+                named(base.intercept),
+            ))
+            .into()
+    };
+    Expr::case(
+        named(base.id).is_null().and(named(standard.id).is_null()),
+        Expr::null(),
     )
+    .case(named(standard.id).is_null(), after_base())
+    .finally(calibrated_value(
+        after_base(),
+        named(standard.slope),
+        named(standard.intercept),
+    ))
+    .into()
 }
 
 /// The rows a window resolution owns, ie. everything but a grab.
@@ -132,34 +133,28 @@ pub fn recomposed_value_sql(
 /// correction with whatever the timeline currently says. `alias` names the readings row in the
 /// caller's query.
 #[must_use]
-pub fn window_resolved_rows(alias: &str) -> String {
-    format!("{alias}.measurement_type IS DISTINCT FROM 'spot'")
+pub fn window_resolved_rows(alias: &str) -> Expr {
+    Expr::cust(format!("{alias}.measurement_type IS DISTINCT FROM 'spot'"))
 }
 
 /// A row whose calibration a window may author: window-resolved and not pinned to a calibration
 /// (ADR 0008, M59).
-pub fn calibration_derivable(alias: &str) -> String {
-    format!(
-        "{} AND {}",
-        window_resolved_rows(alias),
-        crate::routes::private::readings::service::not_pinned_sql(
-            alias,
-            crate::routes::private::readings::models::Kind::CalibrationPin
-        )
-    )
+#[must_use]
+pub fn calibration_derivable(alias: &str) -> Expr {
+    window_resolved_rows(alias).and(crate::routes::private::readings::service::not_pinned(
+        alias,
+        crate::routes::private::readings::models::Kind::CalibrationPin,
+    ))
 }
 
 /// A row whose instrument and deployment a window may author: window-resolved and not pinned to
 /// an instrument.
-pub fn attribution_derivable(alias: &str) -> String {
-    format!(
-        "{} AND {}",
-        window_resolved_rows(alias),
-        crate::routes::private::readings::service::not_pinned_sql(
-            alias,
-            crate::routes::private::readings::models::Kind::InstrumentPin
-        )
-    )
+#[must_use]
+pub fn attribution_derivable(alias: &str) -> Expr {
+    window_resolved_rows(alias).and(crate::routes::private::readings::service::not_pinned(
+        alias,
+        crate::routes::private::readings::models::Kind::InstrumentPin,
+    ))
 }
 
 /// A reading corrected by a standard curve that belongs to some other instrument.
@@ -191,12 +186,15 @@ pub fn foreign_curve_rows(readings: &str, curve: &str) -> String {
 /// NOT one of these: that copy is what the old writers materialised for an uncorrected reading, it
 /// carries no information, and clearing it changes nothing the API serves.
 #[must_use]
-pub fn orphaned_correction_rows(alias: &str) -> String {
-    format!(
-        "{alias}.calibration_id IS NULL AND {alias}.standard_curve_id IS NULL \
-         AND {alias}.calibrated_value IS NOT NULL \
-         AND {alias}.calibrated_value IS DISTINCT FROM {alias}.raw_value"
-    )
+pub fn orphaned_correction_rows(alias: &str) -> Expr {
+    let r = Alias::new(alias);
+    Expr::col((r.clone(), readings::Column::CalibrationId))
+        .is_null()
+        .and(Expr::col((r.clone(), readings::Column::StandardCurveId)).is_null())
+        .and(Expr::col((r, readings::Column::CalibratedValue)).is_not_null())
+        .and(Expr::cust(format!(
+            "{alias}.calibrated_value IS DISTINCT FROM {alias}.raw_value"
+        )))
 }
 
 /// Rewrite each spot reading's `calibrated_value` from the curves the row itself names.
@@ -216,13 +214,19 @@ pub async fn recompose_spot_readings<C: ConnectionTrait>(
     scope_sql: &str,
     params: Vec<sea_orm::Value>,
 ) -> Result<u64, sea_orm::DbErr> {
-    recompose_from_own_curves(db, "r.measurement_type = 'spot'", scope_sql, params).await
+    recompose_from_own_curves(
+        db,
+        Expr::cust("r.measurement_type = 'spot'"),
+        scope_sql,
+        params,
+    )
+    .await
 }
 
 /// What the curves a row itself names produce from its raw value. Both the recompose and the drift
 /// sweep judge against this one expression, so what the sweep repairs is what the recompose writes.
-fn recomposed_own_curve_value() -> String {
-    recomposed_value_sql(
+fn recomposed_own_curve_value() -> Expr {
+    recomposed_value(
         "tgt.raw_value",
         &CurveColumns {
             id: "r.cal_id",
@@ -275,7 +279,7 @@ fn recompose_statement(qualify: Expr) -> UpdateStatement {
         .table(readings::Entity.into_table_ref().alias(Alias::new("tgt")))
         .value(
             readings::Column::CalibratedValue,
-            Expr::cust(recomposed_own_curve_value()),
+            recomposed_own_curve_value(),
         )
         .from(recompose_source())
         .and_where(Expr::cust("tgt.stream_id = r.stream_id"))
@@ -288,7 +292,7 @@ fn recompose_statement(qualify: Expr) -> UpdateStatement {
 /// `qualify`, less the corrections no curve on the row accounts for. A recomposition driven by the
 /// row's own curves cannot reproduce one of those numbers, so it leaves them standing.
 fn own_curve_rows(qualify: Expr) -> Expr {
-    qualify.and(Expr::cust(orphaned_correction_rows("r")).not())
+    qualify.and(orphaned_correction_rows("r").not())
 }
 
 /// The one statement that repoints readings onto the calibration window covering them and rebuilds
@@ -304,7 +308,7 @@ pub(super) fn repoint_statement(
     selection: Expr,
     returning: Option<ReturningClause>,
 ) -> UpdateStatement {
-    let value = recomposed_value_sql(
+    let value = recomposed_value(
         "tgt.raw_value",
         &CurveColumns {
             id: "picked.cal_id",
@@ -321,7 +325,7 @@ pub(super) fn repoint_statement(
     update
         .table(readings::Entity.into_table_ref().alias(Alias::new("tgt")))
         .value(readings::Column::CalibrationId, Expr::cust("picked.cal_id"))
-        .value(readings::Column::CalibratedValue, Expr::cust(value))
+        .value(readings::Column::CalibratedValue, value)
         .from(repoint_source(pick, selection))
         .and_where(Expr::cust("tgt.stream_id = picked.p_stream_id"))
         .and_where(Expr::cust("tgt.time = picked.p_time"))
@@ -381,14 +385,11 @@ fn repoint_source(pick: SelectStatement, selection: Expr) -> TableRef {
 /// Idempotent, so a scope wider than the rows that changed is safe.
 pub async fn recompose_from_own_curves<C: ConnectionTrait>(
     db: &C,
-    rows_sql: &str,
+    rows: Expr,
     scope_sql: &str,
     params: Vec<sea_orm::Value>,
 ) -> Result<u64, sea_orm::DbErr> {
-    let qualify = own_curve_rows(Expr::cust_with_values(
-        format!("({rows_sql}) AND ({scope_sql})"),
-        params,
-    ));
+    let qualify = own_curve_rows(rows.and(Expr::cust_with_values(scope_sql.to_string(), params)));
     let result = db.execute_raw(build(recompose_statement(qualify))).await?;
     Ok(result.rows_affected())
 }
@@ -423,12 +424,12 @@ pub async fn recompose_decided_rows<C: ConnectionTrait>(
 /// function and stay in one transaction.
 pub async fn recompose_from_own_curves_guarded<C: sea_orm::TransactionTrait>(
     db: &C,
-    rows_sql: &str,
+    rows: Expr,
     scope_sql: &str,
     params: Vec<sea_orm::Value>,
 ) -> crate::error::AppResult<u64> {
     crate::common::bulk_write::guarded(db, async |txn| {
-        recompose_from_own_curves(txn, rows_sql, scope_sql, params)
+        recompose_from_own_curves(txn, rows, scope_sql, params)
             .await
             .map_err(crate::error::AppError::Database)
     })
@@ -438,8 +439,11 @@ pub async fn recompose_from_own_curves_guarded<C: sea_orm::TransactionTrait>(
 /// Rows a curve-drift sweep can judge: the value is a claim about curves the row names, so a row
 /// naming neither carries nothing to check against.
 #[must_use]
-pub fn corrected_rows(alias: &str) -> String {
-    format!("({alias}.calibration_id IS NOT NULL OR {alias}.standard_curve_id IS NOT NULL)")
+pub fn corrected_rows(alias: &str) -> Expr {
+    let r = Alias::new(alias);
+    Expr::col((r.clone(), readings::Column::CalibrationId))
+        .is_not_null()
+        .or(Expr::col((r, readings::Column::StandardCurveId)).is_not_null())
 }
 
 /// The sweep's own summary row. `moved` is a `count(*)`, so it is a non-null bigint; the span and
@@ -550,10 +554,9 @@ pub async fn sweep_curve_drift(
     db: &DatabaseConnection,
     job_id: Option<Uuid>,
 ) -> crate::error::AppResult<CurveDrift> {
-    let drifted = own_curve_rows(Expr::cust(format!(
-        "{corrected} AND tgt.calibrated_value IS DISTINCT FROM ({value})",
-        corrected = corrected_rows("r"),
-        value = recomposed_own_curve_value(),
+    let drifted = own_curve_rows(corrected_rows("r").and(Expr::cust_with_exprs(
+        "tgt.calibrated_value IS DISTINCT FROM ($1)",
+        [recomposed_own_curve_value()],
     )));
     let update = recompose_statement(drifted)
         .returning(ReturningClause::Exprs(vec![Expr::cust(
@@ -1223,7 +1226,7 @@ fn derived_upsert(
             Expr::val(parameter_id),
             Expr::val(time),
             Expr::val(result),
-            Expr::val(Option::<f64>::None),
+            Expr::null(),
             Expr::val(0_i16),
             Expr::val(DERIVED),
             Expr::val(DERIVED),
@@ -1322,10 +1325,13 @@ async fn record_derived_arrival(
     crate::routes::private::readings::service::record_many(
         db,
         crate::routes::private::readings::models::Kind::DerivedComputed,
-        crate::routes::private::collection_events::flows::rows_matching(
-            "r.stream_id = $1 AND r.time = $2 AND r.replicate_index = 0",
-            vec![stream_id.into(), time.into()],
-        ),
+        {
+            use crate::routes::private::collection_events::flows::row;
+            Condition::all()
+                .add(row(readings::Column::StreamId).eq(stream_id))
+                .add(row(readings::Column::Time).eq(time))
+                .add(row(readings::Column::ReplicateIndex).eq(0_i16))
+        },
         crate::routes::private::readings::service::NewValue::Born,
         "system",
         None,
@@ -1578,10 +1584,8 @@ impl Scope {
         let windowed = attribution_derivable("r");
         match self {
             Self::Sensor(sensor_id) => Expr::cust_with_values(
-                format!(
-                    r"r.sensor_id = $1
+                r"r.sensor_id = $1
                     AND r.site_id IS NOT NULL
-                    AND {windowed}
                     AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments d2
                                    WHERE d2.sensor_id = $1
                                      AND (r.parameter_id IS NULL OR d2.parameter_id = r.parameter_id))
@@ -1591,17 +1595,15 @@ impl Scope {
                           AND (r.parameter_id IS NULL OR d.parameter_id = r.parameter_id)
                           AND r.time >= d.deployed_from
                           AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
-                    )"
-                ),
+                    )",
                 [sensor_id],
-            ),
+            )
+            .and(windowed),
             Self::Slot {
                 site_id,
                 parameter_id,
             } => Expr::cust_with_values(
-                format!(
-                    r"r.site_id = $1 AND r.parameter_id = $2
-                    AND {windowed}
+                r"r.site_id = $1 AND r.parameter_id = $2
                     AND r.time >= (SELECT MIN(deployed_from) FROM sensor_deployments
                                    WHERE site_id = $1 AND parameter_id = $2)
                     AND NOT EXISTS (
@@ -1609,10 +1611,10 @@ impl Scope {
                         WHERE d.site_id = $1 AND d.parameter_id = $2
                           AND r.time >= d.deployed_from
                           AND r.time < COALESCE(d.deployed_until, 'infinity'::timestamptz)
-                    )"
-                ),
+                    )",
                 [site_id, parameter_id],
-            ),
+            )
+            .and(windowed),
         }
     }
 
@@ -1755,7 +1757,7 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
             .and_where(Expr::cust("prev.time = r.time"))
             .and_where(Expr::cust("prev.replicate_index = r.replicate_index"))
             .and_where(scope.attribution_scope())
-            .and_where(Expr::cust(attribution_derivable("r")))
+            .and_where(attribution_derivable("r"))
             .and_where(Expr::cust("r.time >= dw.deployed_from"))
             .and_where(Expr::cust("r.time < dw.deployed_until"))
             .returning(ReturningClause::Exprs(vec![Expr::cust(format!(
@@ -1776,11 +1778,12 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
             super::resolver::pick_calibration_query_owned(scope.pick_owner(), None),
             scope
                 .readings_predicate()
-                .and(Expr::cust(calibration_derivable("r")))
-                .and(Expr::cust(format!(
-                    "NOT (cw.id IS NULL AND ({orphaned}))",
-                    orphaned = orphaned_correction_rows("r"),
-                ))),
+                .and(calibration_derivable("r"))
+                .and(
+                    Expr::cust("cw.id IS NULL")
+                        .and(orphaned_correction_rows("r"))
+                        .not(),
+                ),
             Some(ReturningClause::Exprs(vec![Expr::cust(
                 "tgt.stream_id, tgt.time, tgt.replicate_index, tgt.site_id, \
                  picked.p_was_calibration_id AS was_calibration_id, \
@@ -2039,13 +2042,14 @@ async fn reprocess_after_calibration_write<C: ConnectionTrait>(
 /// none. The repoint that clears the way for the delete excludes pinned rows, so each one still
 /// names the curve when the DELETE runs and the foreign key refuses the statement.
 async fn pinned_readings<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<Option<i64>, ApiError> {
-    let not_pinned = crate::routes::private::readings::service::not_pinned_sql(
+    let pinned = crate::routes::private::readings::service::not_pinned(
         "readings",
         crate::routes::private::readings::models::Kind::CalibrationPin,
-    );
+    )
+    .not();
     let n = readings::Entity::find()
         .filter(readings::Column::CalibrationId.eq(id))
-        .filter(Expr::cust(format!("NOT ({not_pinned})")))
+        .filter(pinned)
         .count(db)
         .await
         .map_err(ApiError::database)?;

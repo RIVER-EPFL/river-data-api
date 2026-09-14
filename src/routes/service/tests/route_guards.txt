@@ -30,7 +30,6 @@
 /api_token_audit_logs/distinct/status_codes => require_admin
 /calculations/closure => require_read_data
 /change_audit => require_read_metadata
-/change_proposals => deny_scoped_token+require_manage_sensors
 /change_proposals/decide => deny_scoped_token+require_manage_sensors
 /collection_events/stage => require_write_data
 /collection_events/stage_many => require_write_data
@@ -66,7 +65,6 @@
 /notifications/me/push/ping => require_read_data
 /notifications/me/push/test => require_read_data
 /notifications/me/subscriptions => require_read_data
-/notifications/subscribers => require_admin
 /notifications/test-send => require_admin
 /pairing-plans => deny_scoped_token+require_admin_or_token_write_metadata
 /pairing-plans => require_read_metadata

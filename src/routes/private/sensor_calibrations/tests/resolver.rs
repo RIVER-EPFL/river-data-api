@@ -1,5 +1,17 @@
 use super::*;
 
+/// The ranking, rendered, so a test can read what a caller's statement carries.
+fn pick_sql(sensor_expr: &str) -> String {
+    pick_calibration_query(sensor_expr).to_string(sea_orm::sea_query::PostgresQueryBuilder)
+}
+
+/// One expression, rendered on its own, so a test can read what a caller's statement carries.
+fn expr_sql(e: Expr) -> String {
+    use sea_orm::sea_query::{PostgresQueryBuilder, Query};
+    let sql = Query::select().expr(e).to_string(PostgresQueryBuilder);
+    sql.trim_start_matches("SELECT ").to_owned()
+}
+
 #[test]
 fn the_import_reads_the_streams_own_rows_and_writes_only_what_moves() {
     let stream = uuid::Uuid::from_u128(1);
@@ -25,8 +37,8 @@ fn the_import_reads_the_streams_own_rows_and_writes_only_what_moves() {
 
 #[test]
 fn the_ranking_is_one_expression_parameterised_only_by_the_sensor() {
-    let by_bind = pick_calibration_lateral("$1");
-    let by_column = pick_calibration_lateral("r.sensor_id");
+    let by_bind = pick_sql("$1");
+    let by_column = pick_sql("r.sensor_id");
     assert_eq!(
         by_bind.replace("c.sensor_id = $1", "c.sensor_id = r.sensor_id"),
         by_column,
@@ -36,7 +48,7 @@ fn the_ranking_is_one_expression_parameterised_only_by_the_sensor() {
 
 #[test]
 fn the_ranking_is_deterministic_for_curves_sharing_a_valid_from() {
-    let sql = pick_calibration_lateral("$1");
+    let sql = pick_sql("$1");
     assert!(
         sql.replace('"', "").contains("c.valid_from DESC"),
         "recency ranks first: {sql}"
@@ -49,7 +61,7 @@ fn the_ranking_is_deterministic_for_curves_sharing_a_valid_from() {
 
 #[test]
 fn the_window_is_half_open() {
-    let sql = pick_calibration_lateral("$1");
+    let sql = pick_sql("$1");
     assert!(sql.contains("r.time >= c.valid_from"), "{sql}");
     assert!(
         sql.contains("r.time < COALESCE(c.valid_until, 'infinity'::timestamptz)"),
@@ -76,8 +88,12 @@ fn applying_a_resolved_curve_is_slope_times_raw_plus_intercept() {
 #[test]
 fn the_sql_and_rust_forms_name_the_same_operands_in_the_same_order() {
     assert_eq!(
-        calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept"),
-        "picked.slope * tgt.raw_value + picked.intercept",
+        expr_sql(calibrated_value(
+            Expr::cust("tgt.raw_value"),
+            Expr::cust("picked.slope"),
+            Expr::cust("picked.intercept"),
+        )),
+        "((picked.slope) * (tgt.raw_value)) + (picked.intercept)",
         "the set-based writers correct a row the way `apply_calibration` does"
     );
 }
@@ -87,8 +103,8 @@ fn the_sql_and_rust_forms_name_the_same_operands_in_the_same_order() {
 /// copy of its raw value.
 #[test]
 fn the_sql_recomposition_writes_null_when_no_curve_applies() {
-    use super::super::service::{CurveColumns, recomposed_value_sql};
-    let sql = recomposed_value_sql(
+    use super::super::service::{CurveColumns, recomposed_value};
+    let sql = expr_sql(recomposed_value(
         "tgt.raw_value",
         &CurveColumns {
             id: "picked.cal_id",
@@ -100,13 +116,13 @@ fn the_sql_recomposition_writes_null_when_no_curve_applies() {
             slope: "sc.slope",
             intercept: "sc.intercept",
         },
-    );
+    ));
     assert!(
-        sql.contains("WHEN picked.cal_id IS NULL AND sc.id IS NULL THEN NULL"),
+        sql.contains("WHEN ((picked.cal_id) IS NULL AND (sc.id) IS NULL) THEN NULL"),
         "{sql}"
     );
     assert!(
-        sql.contains("sc.slope * (CASE WHEN picked.cal_id IS NULL THEN tgt.raw_value"),
+        sql.contains("(sc.slope) * (CASE WHEN ((picked.cal_id) IS NULL) THEN tgt.raw_value"),
         "the standard curve corrects what the base produced: {sql}"
     );
 }

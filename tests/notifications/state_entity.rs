@@ -53,7 +53,10 @@ async fn the_composite_key_selects_one_row() {
         .exec(&db)
         .await
         .expect("clear one state row");
-    assert_eq!(cleared.rows_affected, 1, "the other subject key is untouched");
+    assert_eq!(
+        cleared.rows_affected, 1,
+        "the other subject key is untouched"
+    );
 
     crate::common::cleanup_test_db(&db).await;
 }

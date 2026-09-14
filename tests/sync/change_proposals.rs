@@ -97,9 +97,15 @@ async fn a_granted_manager_decides_their_own_projects_proposals_and_no_others() 
     state.grants_cache.invalidate_all();
     let jwt = crate::common::keycloak::get_keycloak_jwt("manager1", "manager1").await;
 
-    let (status, body) =
-        crate::common::get_json_with_token(&app, "/api/sync/change_proposals?status=pending", &jwt)
-            .await;
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!(
+            "/api/reading_change_proposals?filter={}",
+            crate::common::e2e::percent_encode(r#"{"status":"pending"}"#)
+        ),
+        &jwt,
+    )
+    .await;
     assert_eq!(status, 200, "list ({status}): {body}");
     let listed: Vec<String> = body
         .as_array()

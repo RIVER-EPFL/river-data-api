@@ -32,7 +32,7 @@ use crate::common::middleware::DenyScoped;
 use crate::common::middleware::ProjectScope;
 use crate::common::scope::Unowned;
 use crate::common::scope::confine_target;
-use crate::common::scope::project_filter_sql;
+use crate::common::scope::project_filter;
 use crate::common::scope::project_of_site;
 use crate::common::scope::require_named_target;
 use crate::common::scope::require_sites_in_scope;
@@ -341,9 +341,8 @@ async fn fetch_backfill_candidates(
     let mut open = Condition::all()
         .add(Expr::col((d.clone(), deployments::Column::DeployedUntil)).is_null())
         .add(Expr::cust("c.claimable_count > 0"));
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    if let Some(predicate) = project_filter_sql(scope, "s.project_id", &mut values) {
-        open = open.add(Expr::cust_with_values(predicate, values));
+    if let Some(confine) = project_filter(scope, (s_.clone(), sites::Column::ProjectId)) {
+        open = open.add(confine);
     }
 
     let on_true = || Condition::all().add(Expr::cust("true"));

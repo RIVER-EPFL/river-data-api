@@ -10,6 +10,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use river_data_core::models::MeasurementType;
 use sea_orm::ActiveModelTrait;
+use sea_orm::ActiveValue;
 use sea_orm::ColumnTrait;
 use sea_orm::Condition;
 use sea_orm::ConnectionTrait;
@@ -23,19 +24,18 @@ use sea_orm::QueryOrder;
 use sea_orm::QuerySelect;
 use sea_orm::Set;
 use sea_orm::Statement;
-use sea_orm::entity::prelude::*;
-use sea_orm::ActiveValue;
 use sea_orm::Value;
+use sea_orm::entity::prelude::*;
 use sea_orm::sea_query::Alias;
-use sea_orm::sea_query::OnConflict;
-use sea_orm::sea_query::SimpleExpr;
 use sea_orm::sea_query::CommonTableExpression;
 use sea_orm::sea_query::Expr;
 use sea_orm::sea_query::Func;
 use sea_orm::sea_query::JoinType;
+use sea_orm::sea_query::OnConflict;
 use sea_orm::sea_query::Order;
 use sea_orm::sea_query::PostgresQueryBuilder;
 use sea_orm::sea_query::Query;
+use sea_orm::sea_query::SimpleExpr;
 use sea_orm::sea_query::WithClause;
 use sea_orm::sea_query::extension::postgres::PgBinOper;
 use uuid::Uuid;
@@ -1213,7 +1213,6 @@ pub(super) fn row_from(stored: decision_model::Model) -> AppResult<DecisionRow> 
             "audit" => Origin::Audit,
             "chain" => Origin::Chain,
             "rollback" => Origin::Rollback,
-            "migration" => Origin::Migration,
             "system" => Origin::System,
             "janitor" => Origin::Janitor,
             other => {
@@ -1438,14 +1437,16 @@ pub async fn rollback<C: ConnectionTrait>(
             d.time.with_timezone(&chrono::Utc),
         )),
         touched_events: if d.kind.fires_recompute() {
-            crate::routes::private::collection_events::flows::touched_events(
-                conn,
-                crate::routes::private::collection_events::flows::rows_matching(
-                    "r.stream_id = $1 AND r.time = $2 \
-                     AND ($3::smallint IS NULL OR r.replicate_index = $3)",
-                    key_binds(&key),
-                ),
-            )
+            crate::routes::private::collection_events::flows::touched_events(conn, {
+                use crate::routes::private::collection_events::flows::row;
+                Condition::all()
+                    .add(row(readings::Column::StreamId).eq(key.stream_id))
+                    .add(row(readings::Column::Time).eq(key.time))
+                    .add_option(
+                        key.replicate_index
+                            .map(|i| row(readings::Column::ReplicateIndex).eq(i)),
+                    )
+            })
             .await?
         } else {
             Vec::new()
@@ -1993,16 +1994,22 @@ pub async fn record_keyed<C: ConnectionTrait>(
         touched_events: Vec::new(),
     };
     if recorded.rows > 0 && kind.fires_recompute() {
-        recorded.touched_events =
-            crate::routes::private::collection_events::flows::touched_events(
-                conn,
-                crate::routes::private::collection_events::flows::rows_matching(
-                    "r.stream_id = $1 AND (r.time, r.replicate_index) IN \
-                     (SELECT t, ri FROM unnest($2::text[]::timestamptz[], $3::int[]::smallint[]) AS k(t, ri))",
-                    vec![stream_id.into(), times.into(), indices.into()],
-                ),
-            )
-            .await?;
+        recorded.touched_events = crate::routes::private::collection_events::flows::touched_events(
+            conn,
+            Condition::all()
+                .add(
+                    crate::routes::private::collection_events::flows::row(
+                        readings::Column::StreamId,
+                    )
+                    .eq(stream_id),
+                )
+                .add(Expr::cust_with_values(
+                    "(r.time, r.replicate_index) IN (SELECT t, ri FROM \
+                         unnest($1::text[]::timestamptz[], $2::int[]::smallint[]) AS k(t, ri))",
+                    [sea_orm::Value::from(times), sea_orm::Value::from(indices)],
+                )),
+        )
+        .await?;
     }
     Ok(recorded)
 }
@@ -2129,17 +2136,50 @@ pub async fn record_chain_supersessions<C: ConnectionTrait>(
     Ok(all)
 }
 
-/// SQL over `alias` (a `readings` row) that is true when no live pin of `kind` covers the row.
-/// Every derivation that would rewrite the pinned column carries this, so a pin outlives reprocess.
+/// The live decisions covering the `readings` row `alias` names, as a correlated subquery.
+/// `kind` confines it to one kind; `None` takes every kind.
+fn live_decisions(alias: &str, kind: Option<Kind>) -> sea_orm::sea_query::SelectStatement {
+    let r = Alias::new(alias);
+    let d = Alias::new("d");
+    Query::select()
+        .expr(Expr::val(1))
+        .from_as(decision_model::Entity, d.clone())
+        .cond_where(
+            Condition::all()
+                .add(
+                    Expr::col((d.clone(), decision_model::Column::StreamId))
+                        .equals((r.clone(), readings::Column::StreamId)),
+                )
+                .add(
+                    Expr::col((d.clone(), decision_model::Column::Time))
+                        .equals((r.clone(), readings::Column::Time)),
+                )
+                .add(
+                    Condition::any()
+                        .add(
+                            Expr::col((d.clone(), decision_model::Column::ReplicateIndex))
+                                .is_null(),
+                        )
+                        .add(
+                            Expr::col((d.clone(), decision_model::Column::ReplicateIndex))
+                                .equals((r, readings::Column::ReplicateIndex)),
+                        ),
+                )
+                .add_option(
+                    kind.map(|k| {
+                        Expr::col((d.clone(), decision_model::Column::Kind)).eq(k.as_str())
+                    }),
+                )
+                .add(Expr::col((d, decision_model::Column::RolledBackBy)).is_null()),
+        )
+        .to_owned()
+}
+
+/// True over `alias` (a `readings` row) when no live pin of `kind` covers the row. Every
+/// derivation that would rewrite the pinned column carries this, so a pin outlives reprocess.
 #[must_use]
-pub fn not_pinned_sql(alias: &str, kind: Kind) -> String {
-    format!(
-        "NOT EXISTS (SELECT 1 FROM reading_decisions d \
-             WHERE d.stream_id = {alias}.stream_id AND d.time = {alias}.time \
-               AND (d.replicate_index IS NULL OR d.replicate_index = {alias}.replicate_index) \
-               AND d.kind = '{}' AND d.rolled_back_by IS NULL)",
-        kind.as_str()
-    )
+pub fn not_pinned(alias: &str, kind: Kind) -> SimpleExpr {
+    Expr::exists(live_decisions(alias, Some(kind))).not()
 }
 
 /// A judgement is a person's ruling on a reading: whether it counts, which curve made it, what
@@ -2391,10 +2431,98 @@ pub fn projected_state(newest_first: &[FoldEntry]) -> ProjectedColumns {
     }
 }
 
-/// The same fold in SQL, anti-joined against the readings: every key whose folded columns are not
-/// what its live decisions say they should be, with the columns the reading holds and the map its
-/// decisions fold to (`folded`), so a caller can show a person which side says what. Report-only, because which side is wrong is a
-/// decision (a rollback, or a fresh decision), never something a sweep may pick.
+/// Each column a decision asserts, with the expression that reads its asserted value off a
+/// decision row. A jsonb projection has no builder; the statement folding it does.
+const FOLD_ARMS: [(&str, &str); 9] = [
+    (
+        "is_flagged",
+        "CASE d.kind WHEN 'flag' THEN 'true'::jsonb WHEN 'unflag' THEN 'false'::jsonb \
+         WHEN 'rollback' THEN d.new -> 'columns' -> 'is_flagged' END",
+    ),
+    (
+        "flag_reason",
+        "CASE d.kind WHEN 'flag' THEN COALESCE(d.new -> 'reason', 'null'::jsonb) \
+         WHEN 'unflag' THEN 'null'::jsonb \
+         WHEN 'rollback' THEN d.new -> 'columns' -> 'flag_reason' END",
+    ),
+    (
+        "withdrawn_at",
+        "CASE WHEN d.kind IN ('withdraw', 'reject') \
+                  THEN to_jsonb(COALESCE((d.new ->> 'withdrawn_at')::timestamptz, d.at)) \
+              WHEN d.kind = 'reassert' THEN 'null'::jsonb \
+              WHEN d.kind = 'rollback' THEN d.new -> 'columns' -> 'withdrawn_at' END",
+    ),
+    (
+        "withdrawn_reason",
+        "CASE WHEN d.kind IN ('withdraw', 'reject') \
+                  THEN COALESCE(d.new -> 'reason', 'null'::jsonb) \
+              WHEN d.kind = 'reassert' THEN 'null'::jsonb \
+              WHEN d.kind = 'rollback' THEN d.new -> 'columns' -> 'withdrawn_reason' END",
+    ),
+    (
+        "unverified",
+        "CASE WHEN d.kind = 'unverified_entry' THEN 'true'::jsonb \
+              WHEN d.kind IN ('verify', 'reject') THEN 'false'::jsonb \
+              WHEN d.kind = 'rollback' THEN d.new -> 'columns' -> 'unverified' END",
+    ),
+    (
+        "standard_curve_id",
+        "CASE d.kind WHEN 'curve' THEN d.new -> 'standard_curve_id' \
+         WHEN 'rollback' THEN d.new -> 'columns' -> 'standard_curve_id' END",
+    ),
+    (
+        "calibration_id",
+        "CASE d.kind WHEN 'calibration_pin' THEN d.new -> 'calibration_id' \
+         WHEN 'rollback' THEN d.new -> 'columns' -> 'calibration_id' END",
+    ),
+    (
+        "sensor_id",
+        "CASE d.kind WHEN 'instrument_pin' THEN d.new -> 'sensor_id' \
+         WHEN 'rollback' THEN d.new -> 'columns' -> 'sensor_id' END",
+    ),
+    (
+        "raw_value",
+        "CASE d.kind WHEN 'value_correction' THEN d.new -> 'raw_value' \
+         WHEN 'rollback' THEN d.new -> 'columns' -> 'raw_value' END",
+    ),
+];
+
+/// Where the row and the fold of its decisions disagree. `IS DISTINCT FROM` over a jsonb
+/// extraction has no builder; the statement carrying it does.
+const FOLD_DISAGREES: &str = "c.is_flagged IS DISTINCT FROM COALESCE((e.m ->> 'is_flagged')::boolean, false) \
+     OR c.flag_reason IS DISTINCT FROM (e.m ->> 'flag_reason') \
+     OR c.withdrawn_at IS DISTINCT FROM (e.m ->> 'withdrawn_at')::timestamptz \
+     OR c.withdrawn_reason IS DISTINCT FROM (e.m ->> 'withdrawn_reason') \
+     OR c.unverified IS DISTINCT FROM COALESCE((e.m ->> 'unverified')::boolean, false) \
+     OR (jsonb_exists(e.m, 'standard_curve_id') \
+         AND c.standard_curve_id IS DISTINCT FROM (e.m ->> 'standard_curve_id')::uuid) \
+     OR (jsonb_exists(e.m, 'calibration_id') \
+         AND c.calibration_id IS DISTINCT FROM (e.m ->> 'calibration_id')::uuid) \
+     OR (jsonb_exists(e.m, 'sensor_id') AND c.sensor_id IS DISTINCT FROM (e.m ->> 'sensor_id')::uuid) \
+     OR (jsonb_exists(e.m, 'raw_value') \
+         AND c.raw_value IS DISTINCT FROM (e.m ->> 'raw_value')::double precision)";
+
+/// The columns a decision can assert, read off one decision row as `(col, val)` pairs. One row of
+/// `reading_decisions` yields nine, of which the kinds that assert nothing leave NULL.
+fn fold_arms() -> sea_orm::sea_query::SelectStatement {
+    let mut arms = FOLD_ARMS.iter().map(|(col, case)| {
+        Query::select()
+            .expr_as(Expr::val(*col), Alias::new("col"))
+            .expr_as(Expr::cust(*case), Alias::new("val"))
+            .to_owned()
+    });
+    let mut first = arms.next().expect("FOLD_ARMS is not empty");
+    for arm in arms {
+        first.union(sea_orm::sea_query::UnionType::All, arm);
+    }
+    first
+}
+
+/// The same fold as a statement, anti-joined against the readings: every key whose folded columns
+/// are not what its live decisions say they should be, with the columns the reading holds and the
+/// map its decisions fold to (`folded`), so a caller can show a person which side says what.
+/// Report-only, because which side is wrong is a decision (a rollback, or a fresh decision), never
+/// something a sweep may pick.
 ///
 /// It folds every column a decision's own assertion determines. The one it cannot is
 /// `calibrated_value`, which is recomposed from the row's own curves rather than asserted, so it
@@ -2402,97 +2530,126 @@ pub fn projected_state(newest_first: &[FoldEntry]) -> ProjectedColumns {
 /// columns only some kinds assert are compared only where a decision asserted one, so a row
 /// carrying an instrument nothing pinned is not drift.
 #[must_use]
-pub fn inconsistent_rows_sql() -> String {
-    "WITH candidate AS (
-         SELECT r.stream_id, r.time, r.replicate_index,
-                COALESCE(r.is_flagged, false) AS is_flagged, r.flag_reason,
-                r.withdrawn_at, r.withdrawn_reason, COALESCE(r.unverified, false) AS unverified,
-                r.standard_curve_id, r.calibration_id, r.sensor_id, r.raw_value
-         FROM readings r
-         WHERE r.is_flagged IS TRUE OR r.flag_reason IS NOT NULL
-            OR r.withdrawn_at IS NOT NULL OR r.withdrawn_reason IS NOT NULL
-            OR r.unverified IS TRUE
-            OR EXISTS (SELECT 1 FROM reading_decisions d
-                        WHERE d.stream_id = r.stream_id AND d.time = r.time
-                          AND (d.replicate_index IS NULL
-                               OR d.replicate_index = r.replicate_index)
-                          AND d.rolled_back_by IS NULL)
-     )
-     SELECT c.*, e.m AS folded
-     FROM candidate c
-     LEFT JOIN LATERAL (
-         SELECT jsonb_object_agg(a.col, a.val) AS m
-         FROM (
-             SELECT DISTINCT ON (v.col) v.col, v.val
-             FROM reading_decisions d
-             CROSS JOIN LATERAL (VALUES
-                 ('is_flagged', CASE d.kind
-                      WHEN 'flag' THEN 'true'::jsonb
-                      WHEN 'unflag' THEN 'false'::jsonb
-                      WHEN 'rollback' THEN d.new -> 'columns' -> 'is_flagged' END),
-                 ('flag_reason', CASE d.kind
-                      WHEN 'flag' THEN COALESCE(d.new -> 'reason', 'null'::jsonb)
-                      WHEN 'unflag' THEN 'null'::jsonb
-                      WHEN 'rollback' THEN d.new -> 'columns' -> 'flag_reason' END),
-                 ('withdrawn_at', CASE
-                      WHEN d.kind IN ('withdraw', 'reject')
-                          THEN to_jsonb(COALESCE((d.new ->> 'withdrawn_at')::timestamptz, d.at))
-                      WHEN d.kind = 'reassert' THEN 'null'::jsonb
-                      WHEN d.kind = 'rollback' THEN d.new -> 'columns' -> 'withdrawn_at' END),
-                 ('withdrawn_reason', CASE
-                      WHEN d.kind IN ('withdraw', 'reject')
-                          THEN COALESCE(d.new -> 'reason', 'null'::jsonb)
-                      WHEN d.kind = 'reassert' THEN 'null'::jsonb
-                      WHEN d.kind = 'rollback' THEN d.new -> 'columns' -> 'withdrawn_reason' END),
-                 ('unverified', CASE
-                      WHEN d.kind = 'unverified_entry' THEN 'true'::jsonb
-                      WHEN d.kind IN ('verify', 'reject') THEN 'false'::jsonb
-                      WHEN d.kind = 'rollback' THEN d.new -> 'columns' -> 'unverified' END),
-                 ('standard_curve_id', CASE d.kind
-                      WHEN 'curve' THEN d.new -> 'standard_curve_id'
-                      WHEN 'rollback' THEN d.new -> 'columns' -> 'standard_curve_id' END),
-                 ('calibration_id', CASE d.kind
-                      WHEN 'calibration_pin' THEN d.new -> 'calibration_id'
-                      WHEN 'rollback' THEN d.new -> 'columns' -> 'calibration_id' END),
-                 ('sensor_id', CASE d.kind
-                      WHEN 'instrument_pin' THEN d.new -> 'sensor_id'
-                      WHEN 'rollback' THEN d.new -> 'columns' -> 'sensor_id' END),
-                 ('raw_value', CASE d.kind
-                      WHEN 'value_correction' THEN d.new -> 'raw_value'
-                      WHEN 'rollback' THEN d.new -> 'columns' -> 'raw_value' END)
-             ) AS v(col, val)
-             WHERE d.stream_id = c.stream_id AND d.time = c.time
-               AND (d.replicate_index IS NULL OR d.replicate_index = c.replicate_index)
-               AND d.rolled_back_by IS NULL AND v.val IS NOT NULL
-             ORDER BY v.col, d.at DESC, d.id DESC
-         ) a
-     ) e ON TRUE
-     WHERE c.is_flagged IS DISTINCT FROM COALESCE((e.m ->> 'is_flagged')::boolean, false)
-        OR c.flag_reason IS DISTINCT FROM (e.m ->> 'flag_reason')
-        OR c.withdrawn_at IS DISTINCT FROM (e.m ->> 'withdrawn_at')::timestamptz
-        OR c.withdrawn_reason IS DISTINCT FROM (e.m ->> 'withdrawn_reason')
-        OR c.unverified IS DISTINCT FROM COALESCE((e.m ->> 'unverified')::boolean, false)
-        OR (e.m ? 'standard_curve_id'
-            AND c.standard_curve_id IS DISTINCT FROM (e.m ->> 'standard_curve_id')::uuid)
-        OR (e.m ? 'calibration_id'
-            AND c.calibration_id IS DISTINCT FROM (e.m ->> 'calibration_id')::uuid)
-        OR (e.m ? 'sensor_id' AND c.sensor_id IS DISTINCT FROM (e.m ->> 'sensor_id')::uuid)
-        OR (e.m ? 'raw_value'
-            AND c.raw_value IS DISTINCT FROM (e.m ->> 'raw_value')::double precision)"
-        .to_string()
+pub fn inconsistent_rows() -> sea_orm::sea_query::SelectStatement {
+    let r = Alias::new("r");
+    let c = Alias::new("c");
+    let d = Alias::new("d");
+    let v = Alias::new("v");
+    let a = Alias::new("a");
+    let e = Alias::new("e");
+    let col = Alias::new("col");
+    let val = Alias::new("val");
+
+    let candidate = Query::select()
+        .column((r.clone(), readings::Column::StreamId))
+        .column((r.clone(), readings::Column::Time))
+        .column((r.clone(), readings::Column::ReplicateIndex))
+        .expr_as(
+            Func::coalesce([
+                Expr::col((r.clone(), readings::Column::IsFlagged)),
+                Expr::val(false),
+            ]),
+            Alias::new("is_flagged"),
+        )
+        .column((r.clone(), readings::Column::FlagReason))
+        .column((r.clone(), readings::Column::WithdrawnAt))
+        .column((r.clone(), readings::Column::WithdrawnReason))
+        .expr_as(
+            Func::coalesce([
+                Expr::col((r.clone(), readings::Column::Unverified)),
+                Expr::val(false),
+            ]),
+            Alias::new("unverified"),
+        )
+        .column((r.clone(), readings::Column::StandardCurveId))
+        .column((r.clone(), readings::Column::CalibrationId))
+        .column((r.clone(), readings::Column::SensorId))
+        .column((r.clone(), readings::Column::RawValue))
+        .from_as(readings::Entity, r.clone())
+        .cond_where(
+            Condition::any()
+                .add(Expr::cust(r#""r"."is_flagged" IS TRUE"#))
+                .add(Expr::col((r.clone(), readings::Column::FlagReason)).is_not_null())
+                .add(Expr::col((r.clone(), readings::Column::WithdrawnAt)).is_not_null())
+                .add(Expr::col((r.clone(), readings::Column::WithdrawnReason)).is_not_null())
+                .add(Expr::cust(r#""r"."unverified" IS TRUE"#))
+                .add(Expr::exists(live_decisions("r", None))),
+        )
+        .to_owned();
+
+    let live = Query::select()
+        .distinct_on([(v.clone(), col.clone())])
+        .column((v.clone(), col.clone()))
+        .column((v.clone(), val.clone()))
+        .from_as(decision_model::Entity, d.clone())
+        .join_lateral(
+            JoinType::InnerJoin,
+            fold_arms(),
+            v.clone(),
+            Expr::cust("TRUE"),
+        )
+        .cond_where(
+            Condition::all()
+                .add(
+                    Expr::col((d.clone(), decision_model::Column::StreamId))
+                        .equals((c.clone(), Alias::new("stream_id"))),
+                )
+                .add(
+                    Expr::col((d.clone(), decision_model::Column::Time))
+                        .equals((c.clone(), Alias::new("time"))),
+                )
+                .add(
+                    Condition::any()
+                        .add(
+                            Expr::col((d.clone(), decision_model::Column::ReplicateIndex))
+                                .is_null(),
+                        )
+                        .add(
+                            Expr::col((d.clone(), decision_model::Column::ReplicateIndex))
+                                .equals((c.clone(), Alias::new("replicate_index"))),
+                        ),
+                )
+                .add(Expr::col((d.clone(), decision_model::Column::RolledBackBy)).is_null())
+                .add(Expr::col((v.clone(), val.clone())).is_not_null()),
+        )
+        .order_by((v.clone(), col.clone()), Order::Asc)
+        .order_by((d.clone(), decision_model::Column::At), Order::Desc)
+        .order_by((d, decision_model::Column::Id), Order::Desc)
+        .to_owned();
+
+    let folded = Query::select()
+        .expr_as(
+            Expr::cust("jsonb_object_agg(a.col, a.val)"),
+            Alias::new("m"),
+        )
+        .from_subquery(live, a)
+        .to_owned();
+
+    Query::select()
+        .expr(Expr::col((c.clone(), sea_orm::sea_query::Asterisk)))
+        .expr_as(
+            Expr::col((e.clone(), Alias::new("m"))),
+            Alias::new("folded"),
+        )
+        .from_subquery(candidate, c.clone())
+        .join_lateral(JoinType::LeftJoin, folded, e, Expr::cust("TRUE"))
+        .cond_where(Expr::cust(FOLD_DISAGREES))
+        .to_owned()
 }
 
 /// How many readings the record and the columns disagree about. The janitor reports it; nothing
 /// repairs it.
 pub async fn curation_drift_count<C: ConnectionTrait>(conn: &C) -> AppResult<i64> {
-    let sql = format!(
-        "SELECT count(*)::bigint AS n FROM ({}) drift",
-        inconsistent_rows_sql()
-    );
+    let (sql, values) = Query::select()
+        .expr_as(Expr::cust("count(*)::bigint"), Alias::new("n"))
+        .from_subquery(inconsistent_rows(), Alias::new("drift"))
+        .to_owned()
+        .build(PostgresQueryBuilder);
     let row = conn
-        .query_one_raw(Statement::from_string(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             sql,
+            values,
         ))
         .await?
         .ok_or_else(|| AppError::Internal("counting curation drift returned no row".to_string()))?;
@@ -2513,7 +2670,7 @@ pub(super) async fn recompose_corrected<C: ConnectionTrait>(
 ) -> AppResult<()> {
     crate::routes::private::sensor_calibrations::service::recompose_from_own_curves(
         conn,
-        &crate::routes::private::sensor_calibrations::service::corrected_rows("r"),
+        crate::routes::private::sensor_calibrations::service::corrected_rows("r"),
         scope_sql,
         params,
     )
@@ -3828,8 +3985,9 @@ fn distinct_from(column: change_proposal::Column) -> SimpleExpr {
 }
 
 fn reopens_expr() -> SimpleExpr {
-    distinct_from(change_proposal::Column::ProposedRawValue)
-        .or(distinct_from(change_proposal::Column::ProposedStandardCurveId))
+    distinct_from(change_proposal::Column::ProposedRawValue).or(distinct_from(
+        change_proposal::Column::ProposedStandardCurveId,
+    ))
 }
 
 /// Keep the conflicting row's value where the proposal is unchanged, reset it where it is not.
@@ -3888,57 +4046,116 @@ pub(super) fn proposal_conflict() -> OnConflict {
         .to_owned()
 }
 
-pub(super) const SELECT: &str = r"SELECT p.id, p.stream_id, ds.source_system, ds.source_key,
-       sp.site_id, s.name AS site_name, sp.parameter_id, par.code AS parameter_code,
-       p.time, p.replicate_index, p.stored_raw_value, p.proposed_raw_value,
-       p.stored_standard_curve_id, p.proposed_standard_curve_id,
-       p.status, p.first_seen_at, p.last_seen_at, p.decided_by, p.decided_at
-  FROM reading_change_proposals p
-  JOIN data_streams ds ON ds.id = p.stream_id
-  LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id
-  LEFT JOIN sites s ON s.id = sp.site_id
-  LEFT JOIN parameters par ON par.id = sp.parameter_id";
+/// The stream's naming and the slot its pairing places it in, for one set of streams.
+///
+/// A proposal is keyed by stream; the review list shows the slot, so the labels are read once per
+/// page rather than joined into every row of the queue.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct StreamSlot {
+    id: Uuid,
+    source_system: String,
+    source_key: String,
+    site_id: Option<Uuid>,
+    site_name: Option<String>,
+    parameter_id: Option<Uuid>,
+    parameter_code: Option<String>,
+}
 
-/// Every proposal matching the filter, newest source assertion first.
-pub async fn list(
-    db: &DatabaseConnection,
-    status: Option<&str>,
-    stream_id: Option<Uuid>,
-    projects: Option<sea_orm::Value>,
-) -> AppResult<Vec<Proposal>> {
-    let mut sql = SELECT.to_string();
-    let mut binds: Vec<sea_orm::Value> = Vec::new();
-    let mut clauses: Vec<String> = Vec::new();
-    if let Some(status) = status {
-        binds.push(status.into());
-        clauses.push(format!("p.status = ${}", binds.len()));
+async fn stream_slots<C: ConnectionTrait>(
+    conn: &C,
+    stream_ids: Vec<Uuid>,
+) -> Result<HashMap<Uuid, StreamSlot>, sea_orm::DbErr> {
+    use crate::routes::private::{data_streams, parameters, site_parameters, sites};
+    if stream_ids.is_empty() {
+        return Ok(HashMap::new());
     }
-    if let Some(stream_id) = stream_id {
-        binds.push(stream_id.into());
-        clauses.push(format!("p.stream_id = ${}", binds.len()));
-    }
-    if let Some(projects) = projects {
-        // A scoped caller sees a proposal only where the pairing places it in one of its projects;
-        // an unpaired stream belongs to no project and is not theirs to rule on.
-        binds.push(projects);
-        clauses.push(format!("s.project_id = ANY(${})", binds.len()));
-    }
-    if !clauses.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&clauses.join(" AND "));
-    }
-    sql.push_str(" ORDER BY p.last_seen_at DESC, p.time DESC LIMIT 1000");
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            binds,
-        ))
+    let rows = data_streams::Entity::find()
+        .select_only()
+        .column(data_streams::Column::Id)
+        .column(data_streams::Column::SourceSystem)
+        .column(data_streams::Column::SourceKey)
+        .column(site_parameters::Column::SiteId)
+        .column_as(sites::Column::Name, "site_name")
+        .column(site_parameters::Column::ParameterId)
+        .column_as(parameters::Column::Code, "parameter_code")
+        .join(
+            JoinType::LeftJoin,
+            data_streams::Relation::SiteParameter.def(),
+        )
+        .join(JoinType::LeftJoin, site_parameters::Relation::Site.def())
+        .join(
+            JoinType::LeftJoin,
+            site_parameters::Relation::Parameter.def(),
+        )
+        .filter(data_streams::Column::Id.is_in(stream_ids))
+        .into_model::<StreamSlot>()
+        .all(conn)
         .await?;
-    rows.iter()
-        .map(|r| Proposal::from_query_result(r, ""))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
+    Ok(rows.into_iter().map(|r| (r.id, r)).collect())
+}
+
+/// A proposal row the labels are written onto. The detail and the list model are separate structs
+/// carrying the same six fields, so the lookup is written once against this.
+trait Labelled {
+    fn stream_id(&self) -> Uuid;
+    fn label(&mut self, slot: &StreamSlot);
+}
+
+macro_rules! labelled {
+    ($t:ty) => {
+        impl Labelled for $t {
+            fn stream_id(&self) -> Uuid {
+                self.stream_id
+            }
+            fn label(&mut self, slot: &StreamSlot) {
+                self.source_system = Some(slot.source_system.clone());
+                self.source_key = Some(slot.source_key.clone());
+                self.site_id = slot.site_id;
+                self.site_name = slot.site_name.clone();
+                self.parameter_id = slot.parameter_id;
+                self.parameter_code = slot.parameter_code.clone();
+            }
+        }
+    };
+}
+
+labelled!(change_proposal::ReadingChangeProposal);
+labelled!(change_proposal::ReadingChangeProposalList);
+
+/// What the generated proposal list cannot state on its own: the stream's naming and its slot.
+pub struct ChangeProposalOperations;
+
+async fn label_proposals<C: ConnectionTrait, T: Labelled>(
+    db: &C,
+    rows: &mut [T],
+) -> Result<(), crudcrate::ApiError> {
+    let slots = stream_slots(db, rows.iter().map(Labelled::stream_id).collect()).await?;
+    for row in rows {
+        if let Some(slot) = slots.get(&row.stream_id()) {
+            row.label(slot);
+        }
+    }
+    Ok(())
+}
+
+impl crudcrate::CRUDOperations for ChangeProposalOperations {
+    type Resource = change_proposal::ReadingChangeProposal;
+
+    async fn after_get_one<C: ConnectionTrait + sea_orm::TransactionTrait>(
+        &self,
+        db: &C,
+        entity: &mut change_proposal::ReadingChangeProposal,
+    ) -> Result<(), crudcrate::ApiError> {
+        label_proposals(db, std::slice::from_mut(entity)).await
+    }
+
+    async fn after_get_all<C: ConnectionTrait + sea_orm::TransactionTrait>(
+        &self,
+        db: &C,
+        entities: &mut Vec<change_proposal::ReadingChangeProposalList>,
+    ) -> Result<(), crudcrate::ApiError> {
+        label_proposals(db, entities.as_mut_slice()).await
+    }
 }
 
 /// The proposals a caller may decide, out of the ids they named. A restricted caller reaches only
@@ -3947,37 +4164,28 @@ pub async fn list(
 pub(super) async fn load_undecided<C: ConnectionTrait>(
     conn: &C,
     ids: &[Uuid],
-    projects: Option<sea_orm::Value>,
+    projects: Option<&[Uuid]>,
 ) -> AppResult<Vec<Pending>> {
-    let mut binds: Vec<sea_orm::Value> = vec![ids.to_vec().into()];
-    let scope = if let Some(projects) = projects {
-        binds.push(projects);
-        format!(
-            " AND EXISTS (SELECT 1 FROM data_streams ds \
-                 JOIN site_parameters sp ON sp.id = ds.site_parameter_id \
-                 JOIN sites s ON s.id = sp.site_id \
-                WHERE ds.id = p.stream_id AND s.project_id = ANY(${}))",
-            binds.len()
-        )
-    } else {
-        String::new()
-    };
-    let rows = conn
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT p.id, p.stream_id, p.time, p.replicate_index, p.proposed_raw_value,
-                        p.proposed_standard_curve_id, p.stored_standard_curve_id
-                   FROM reading_change_proposals p
-                  WHERE p.id = ANY($1) AND p.status <> 'accepted'{scope}
-                  FOR UPDATE OF p"
-            ),
-            binds,
-        ))
-        .await?;
-    rows.iter()
-        .map(|r| Pending::from_query_result(r, ""))
-        .collect::<Result<Vec<_>, _>>()
+    let scoped_streams = projects.map(crate::common::middleware::scoped_stream_ids_query);
+    let mut query = change_proposal::Entity::find()
+        .select_only()
+        .column(change_proposal::Column::Id)
+        .column(change_proposal::Column::StreamId)
+        .column(change_proposal::Column::Time)
+        .column(change_proposal::Column::ReplicateIndex)
+        .column(change_proposal::Column::ProposedRawValue)
+        .column(change_proposal::Column::ProposedStandardCurveId)
+        .column(change_proposal::Column::StoredStandardCurveId)
+        .filter(change_proposal::Column::Id.is_in(ids.to_vec()))
+        .filter(change_proposal::Column::Status.ne("accepted"))
+        .lock(sea_orm::sea_query::LockType::Update);
+    if let Some(scoped) = scoped_streams {
+        query = query.filter(change_proposal::Column::StreamId.in_subquery(scoped));
+    }
+    query
+        .into_model::<Pending>()
+        .all(conn)
+        .await
         .map_err(Into::into)
 }
 
@@ -3990,7 +4198,7 @@ pub async fn decide<C: ConnectionTrait>(
     accept: bool,
     actor: &str,
     reason: Option<&str>,
-    projects: Option<sea_orm::Value>,
+    projects: Option<&[Uuid]>,
 ) -> AppResult<(DecideResponse, Recorded)> {
     let mut response = DecideResponse {
         accepted: 0,
@@ -4072,38 +4280,40 @@ pub async fn decide<C: ConnectionTrait>(
         response.rejected = pending.len();
     }
     if !found.is_empty() {
-        conn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE reading_change_proposals
-                SET status = $2, decided_by = $3, decided_at = now()
-              WHERE id = ANY($1)",
-            [
-                found.clone().into(),
-                if accept { "accepted" } else { "rejected" }.into(),
-                actor.into(),
-            ],
-        ))
-        .await?;
+        change_proposal::Entity::update_many()
+            .col_expr(
+                change_proposal::Column::Status,
+                Expr::value(if accept { "accepted" } else { "rejected" }),
+            )
+            .col_expr(change_proposal::Column::DecidedBy, Expr::value(actor))
+            .col_expr(
+                change_proposal::Column::DecidedAt,
+                Expr::current_timestamp(),
+            )
+            .filter(change_proposal::Column::Id.is_in(found.clone()))
+            .exec(conn)
+            .await?;
     }
     Ok((response, written))
 }
 
 /// How many proposals are awaiting a decision, per source system. The notification's subject.
 pub async fn pending_by_source(db: &DatabaseConnection) -> AppResult<Vec<(String, i64)>> {
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT ds.source_system AS source_system, count(*) AS n
-               FROM reading_change_proposals p
-               JOIN data_streams ds ON ds.id = p.stream_id
-              WHERE p.status = 'pending'
-              GROUP BY ds.source_system"
-                .to_string(),
-        ))
-        .await?;
-    rows.iter()
-        .map(|r| SourceCount::from_query_result(r, "").map(|c| (c.source_system, c.n)))
-        .collect::<Result<Vec<_>, _>>()
+    use crate::routes::private::data_streams;
+    change_proposal::Entity::find()
+        .select_only()
+        .column_as(data_streams::Column::SourceSystem, "source_system")
+        .column_as(change_proposal::Column::Id.count(), "n")
+        .join(
+            JoinType::InnerJoin,
+            change_proposal::Relation::DataStream.def(),
+        )
+        .filter(change_proposal::Column::Status.eq("pending"))
+        .group_by(data_streams::Column::SourceSystem)
+        .into_model::<SourceCount>()
+        .all(db)
+        .await
+        .map(|rows| rows.into_iter().map(|c| (c.source_system, c.n)).collect())
         .map_err(Into::into)
 }
 
@@ -4139,24 +4349,23 @@ pub(super) async fn load_value_arrivals(
     stream_ids: &[Uuid],
     at: DateTime<Utc>,
 ) -> AppResult<HashMap<(Uuid, i16), DateTime<Utc>>> {
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT stream_id, replicate_index, MAX(at) AS at
-             FROM reading_decisions
-             WHERE stream_id = ANY($1) AND time = $2
-               AND kind = 'value_correction' AND rolled_back_by IS NULL
-               AND replicate_index IS NOT NULL
-             GROUP BY stream_id, replicate_index",
-            [
-                stream_ids.to_vec().into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(at).into(),
-            ],
-        ))
+    let rows = decision_model::Entity::find()
+        .select_only()
+        .column(decision_model::Column::StreamId)
+        .column(decision_model::Column::ReplicateIndex)
+        .column_as(decision_model::Column::At.max(), "at")
+        .filter(decision_model::Column::StreamId.is_in(stream_ids.to_vec()))
+        .filter(decision_model::Column::Time.eq(sea_orm::prelude::DateTimeWithTimeZone::from(at)))
+        .filter(decision_model::Column::Kind.eq(Kind::ValueCorrection.as_str()))
+        .filter(decision_model::Column::RolledBackBy.is_null())
+        .filter(decision_model::Column::ReplicateIndex.is_not_null())
+        .group_by(decision_model::Column::StreamId)
+        .group_by(decision_model::Column::ReplicateIndex)
+        .into_model::<ArrivalRow>()
+        .all(db)
         .await?;
     let mut out = HashMap::new();
-    for r in rows.iter().map(|r| ArrivalRow::from_query_result(r, "")) {
-        let r = r?;
+    for r in rows {
         out.insert((r.stream_id, r.replicate_index), r.at.with_timezone(&Utc));
     }
     Ok(out)
@@ -4168,23 +4377,19 @@ pub(super) async fn load_pins(
     stream_ids: &[Uuid],
     at: DateTime<Utc>,
 ) -> AppResult<HashMap<Uuid, Vec<PinRef>>> {
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT stream_id, id, kind, replicate_index, new, actor, at, reason, set_id
-             FROM reading_decisions
-             WHERE stream_id = ANY($1) AND time = $2
-               AND kind IN ('instrument_pin', 'calibration_pin') AND rolled_back_by IS NULL
-             ORDER BY at DESC",
-            [
-                stream_ids.to_vec().into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(at).into(),
-            ],
-        ))
+    let rows = decision_model::Entity::find()
+        .filter(decision_model::Column::StreamId.is_in(stream_ids.to_vec()))
+        .filter(decision_model::Column::Time.eq(sea_orm::prelude::DateTimeWithTimeZone::from(at)))
+        .filter(
+            decision_model::Column::Kind
+                .is_in([Kind::InstrumentPin.as_str(), Kind::CalibrationPin.as_str()]),
+        )
+        .filter(decision_model::Column::RolledBackBy.is_null())
+        .order_by_desc(decision_model::Column::At)
+        .all(db)
         .await?;
     let mut out: HashMap<Uuid, Vec<PinRef>> = HashMap::new();
-    for r in rows.iter().map(|r| PinRow::from_query_result(r, "")) {
-        let r = r?;
+    for r in rows {
         out.entry(r.stream_id).or_default().push(PinRef {
             decision_id: r.id,
             kind: r.kind,
@@ -4220,7 +4425,7 @@ pub fn classify_source(source_system: &str) -> &'static str {
 /// import, a hand entry, a batch); a sync or derived reading's story is resolved from the stream,
 /// the covering receipt and the definition. The discriminator is stored on every row either way,
 /// so an origin nothing recorded is a named kind rather than a NULL blob.
-pub const PROVENANCE_KINDS: [&str; 8] = [
+pub const PROVENANCE_KINDS: [&str; 7] = [
     "tool_run",
     "chain",
     "csv_import",
@@ -4228,7 +4433,6 @@ pub const PROVENANCE_KINDS: [&str; 8] = [
     "batch",
     "sync",
     "derived",
-    "migration",
 ];
 
 /// The kind a writer with no better evidence stamps, from the row's own classification and the
@@ -4237,16 +4441,15 @@ pub const PROVENANCE_KINDS: [&str; 8] = [
 #[must_use]
 pub fn provenance_kind_for_stream(
     measurement_type: Option<&str>,
-    source_system: Option<&str>,
+    source_system: &str,
 ) -> &'static str {
     if measurement_type == Some("derived") {
         return "derived";
     }
     match source_system {
-        Some("grab_sample") => "manual",
-        Some("api") => "batch",
-        Some(_) => "sync",
-        None => "migration",
+        "grab_sample" => "manual",
+        "api" => "batch",
+        _ => "sync",
     }
 }
 
@@ -6191,128 +6394,8 @@ pub mod admission {
     }
 
     #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn declared_missing_markers_carry_no_value_and_no_error() {
-            for cell in ["", "   ", "NaN", "nan", "NA", "na"] {
-                assert_eq!(classify_cell(cell), Cell::Missing, "cell {cell:?}");
-            }
-        }
-
-        #[test]
-        fn every_spelling_of_the_sentinel_is_the_same_marker() {
-            for cell in ["-9999", "-9999.0", "-9999.00", " -9999.000 ", "-9.999e3"] {
-                assert_eq!(classify_cell(cell), Cell::Missing, "cell {cell:?}");
-            }
-            assert!(is_missing_sentinel(-9999.0));
-            assert!(!is_missing_sentinel(-9998.9));
-            assert!(!is_missing_sentinel(9999.0));
-        }
-
-        #[test]
-        fn a_value_next_to_the_sentinel_is_a_measurement() {
-            assert_eq!(classify_cell("-9999.5"), Cell::Value(-9999.5));
-            assert_eq!(classify_cell("-999.9"), Cell::Value(-999.9));
-        }
-
-        #[test]
-        fn non_finite_cells_are_errors_rather_than_missing_values() {
-            for cell in ["Inf", "inf", "-inf", "Infinity", "-Infinity"] {
-                assert!(
-                    matches!(classify_cell(cell), Cell::Invalid(_)),
-                    "cell {cell:?} must be a row error"
-                );
-            }
-        }
-
-        #[test]
-        fn unparseable_cells_are_errors() {
-            assert!(matches!(classify_cell("n/a"), Cell::Invalid(_)));
-            assert!(matches!(classify_cell("12,5"), Cell::Invalid(_)));
-        }
-
-        #[test]
-        fn ordinary_cells_parse() {
-            assert_eq!(classify_cell(" 12.5 "), Cell::Value(12.5));
-            assert_eq!(classify_cell("0"), Cell::Value(0.0));
-            assert_eq!(classify_cell("1e3"), Cell::Value(1000.0));
-        }
-
-        #[test]
-        fn non_finite_values_are_refused_on_every_path() {
-            assert!(admit_value(f64::NAN).is_err());
-            assert!(admit_value(f64::INFINITY).is_err());
-            assert!(admit_value(f64::NEG_INFINITY).is_err());
-            assert!(admit_value(0.0).is_ok());
-            assert!(admit_value(MISSING_SENTINEL).is_ok());
-        }
-
-        #[test]
-        fn the_timestamp_window_holds_at_its_edges_and_refuses_beyond_them() {
-            let now = Utc::now();
-            let (min_time, max_time) = window(now);
-            assert!(time_rejection_at(now, now).is_none());
-            assert!(time_rejection_at(now, min_time + Duration::minutes(1)).is_none());
-            assert!(time_rejection_at(now, max_time - Duration::minutes(1)).is_none());
-            assert!(time_rejection_at(now, min_time - Duration::days(1)).is_some());
-            assert!(time_rejection_at(now, max_time + Duration::days(1)).is_some());
-        }
-
-        /// Expected behaviour: the lead bound moves with the clock, so a file's rows are judged
-        /// against one reading of it. Judged a millisecond later, this timestamp changes answer.
-        #[test]
-        fn a_timestamp_just_past_the_lead_bound_turns_on_which_clock_read_judges_it() {
-            let now = Utc::now();
-            let just_past = now + Duration::days(MAX_LEAD_DAYS) + Duration::microseconds(500);
-            assert!(time_rejection_at(now, just_past).is_some());
-            assert!(time_rejection_at(now + Duration::milliseconds(1), just_past).is_none());
-        }
-
-        /// Expected behaviour: the floor is a fixed date, so a decade-old archive series stays
-        /// ingestible indefinitely. A relative floor would make the same reading admissible today
-        /// and refused later, which is what stalls a portal backfill.
-        #[test]
-        fn the_backward_bound_does_not_move_with_the_clock() {
-            let (early, _) = window("2020-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap());
-            let (late, _) = window("2099-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap());
-            assert_eq!(early, late);
-
-            let archive = "2016-08-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
-            assert!(time_rejection_at(Utc::now(), archive).is_none());
-        }
-
-        /// Expected behaviour: `rejection` and `admit` are one implementation, so the reason a
-        /// reading is skipped on `/ingest` is the reason it would be refused elsewhere.
-        #[test]
-        fn rejection_reports_what_admit_raises() {
-            let now = Utc::now();
-            let (_, max_time) = window(now);
-
-            assert_eq!(rejection(now, 1.0, None), None);
-            assert_eq!(rejection(now, MISSING_SENTINEL, Some("spot")), None);
-
-            for (time, value, declared) in [
-                (max_time + Duration::days(2), 1.0, None),
-                (now, f64::NAN, None),
-                (now, 1.0, Some("grab")),
-            ] {
-                let reason = rejection(time, value, declared);
-                assert!(reason.is_some(), "expected a reason for {declared:?}");
-                assert!(admit(time, value, declared).is_err());
-            }
-        }
-
-        #[test]
-        fn the_classification_vocabulary_is_closed() {
-            let now = Utc::now();
-            for declared in [None, Some("continuous"), Some("spot"), Some("derived")] {
-                assert!(admit(now, 1.0, declared).is_ok(), "declared {declared:?}");
-            }
-            assert!(admit(now, 1.0, Some("grab")).is_err());
-        }
-    }
+    #[path = "tests/admission.rs"]
+    mod tests;
 }
 
 /// What one reading claims about the standard curve that corrected it, as its writer resolved it.
@@ -6595,22 +6678,23 @@ pub(super) async fn upsert_curve_claim_hold<C: ConnectionTrait>(
         },
     )
     .await?;
-    conn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        format!(
-            "UPDATE replicate_audit_holds SET status = '{superseded}'
-             WHERE stream_id = $1 AND group_time = $2 AND kind = '{kind}'
-               AND status IN {open}",
-            superseded = HoldStatus::Superseded.as_str(),
-            open = *crate::routes::private::sync::service::OPEN,
-            kind = HoldKind::ReplicateStats.as_str()
-        ),
-        [
-            stream_id.into(),
-            sea_orm::prelude::DateTimeWithTimeZone::from(group_time).into(),
-        ],
-    ))
-    .await?;
+    crate::routes::private::sync::hold_model::Entity::update_many()
+        .col_expr(
+            crate::routes::private::sync::hold_model::Column::Status,
+            Expr::val(HoldStatus::Superseded.as_str()),
+        )
+        .filter(crate::routes::private::sync::hold_model::Column::StreamId.eq(stream_id))
+        .filter(crate::routes::private::sync::hold_model::Column::GroupTime.eq(group_time))
+        .filter(
+            crate::routes::private::sync::hold_model::Column::Kind
+                .eq(HoldKind::ReplicateStats.as_str()),
+        )
+        .filter(
+            crate::routes::private::sync::hold_model::Column::Status
+                .is_in(crate::routes::private::sync::service::open_statuses()),
+        )
+        .exec(conn)
+        .await?;
     Ok(())
 }
 
@@ -7520,26 +7604,29 @@ pub async fn open_unverified_holds<C: sea_orm::ConnectionTrait>(
     actor: &str,
 ) -> AppResult<()> {
     for (parameter_id, at) in groups {
-        let binds = [
-            site_id.into(),
-            (*parameter_id).into(),
-            sea_orm::prelude::DateTimeWithTimeZone::from(*at).into(),
-            serde_json::json!({ "state": "unverified", "entered_by": actor }).into(),
-        ];
-        let updated = conn
-            .execute_raw(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    "UPDATE replicate_audit_holds SET computed = $4, created_at = NOW() \
-                     WHERE site_id = $1 AND parameter_id = $2 AND group_time = $3 \
-                       AND kind = '{kind}' AND status IN {open}",
-                    kind = HoldKind::UnverifiedEntry.as_str(),
-                    open = *crate::routes::private::sync::service::OPEN
-                ),
-                binds,
-            ))
+        let updated = crate::routes::private::sync::hold_model::Entity::update_many()
+            .col_expr(
+                crate::routes::private::sync::hold_model::Column::Computed,
+                Expr::val(serde_json::json!({ "state": "unverified", "entered_by": actor })),
+            )
+            .col_expr(
+                crate::routes::private::sync::hold_model::Column::CreatedAt,
+                Expr::cust("NOW()"),
+            )
+            .filter(crate::routes::private::sync::hold_model::Column::SiteId.eq(site_id))
+            .filter(crate::routes::private::sync::hold_model::Column::ParameterId.eq(*parameter_id))
+            .filter(crate::routes::private::sync::hold_model::Column::GroupTime.eq(*at))
+            .filter(
+                crate::routes::private::sync::hold_model::Column::Kind
+                    .eq(HoldKind::UnverifiedEntry.as_str()),
+            )
+            .filter(
+                crate::routes::private::sync::hold_model::Column::Status
+                    .is_in(crate::routes::private::sync::service::open_statuses()),
+            )
+            .exec(conn)
             .await?
-            .rows_affected();
+            .rows_affected;
         if updated > 0 {
             continue;
         }
@@ -7728,18 +7815,21 @@ pub(super) async fn stage_import_rows(
     rows: &[StagedRow],
 ) -> AppResult<()> {
     for (chunk_index, chunk) in rows.chunks(BATCH_SIZE).enumerate() {
-        let staged = chunk.iter().enumerate().map(|(i, r)| import_staging::ActiveModel {
-            import_token: ActiveValue::Set(import_token),
-            seq: ActiveValue::Set((chunk_index * BATCH_SIZE + i) as i64),
-            stream_id: ActiveValue::Set(r.stream_id),
-            site_id: ActiveValue::Set(Some(r.site_id)),
-            parameter_id: ActiveValue::Set(Some(r.parameter_id)),
-            time: ActiveValue::Set(r.time.into()),
-            raw_value: ActiveValue::Set(r.raw_value),
-            sensor_id: ActiveValue::Set(r.sensor_id),
-            calibration_id: ActiveValue::Set(r.calibration_id),
-            deployment_id: ActiveValue::Set(r.deployment_id),
-        });
+        let staged = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, r)| import_staging::ActiveModel {
+                import_token: ActiveValue::Set(import_token),
+                seq: ActiveValue::Set((chunk_index * BATCH_SIZE + i) as i64),
+                stream_id: ActiveValue::Set(r.stream_id),
+                site_id: ActiveValue::Set(Some(r.site_id)),
+                parameter_id: ActiveValue::Set(Some(r.parameter_id)),
+                time: ActiveValue::Set(r.time.into()),
+                raw_value: ActiveValue::Set(r.raw_value),
+                sensor_id: ActiveValue::Set(r.sensor_id),
+                calibration_id: ActiveValue::Set(r.calibration_id),
+                deployment_id: ActiveValue::Set(r.deployment_id),
+            });
         import_staging::Entity::insert_many(staged).exec(db).await?;
     }
     Ok(())
@@ -8771,33 +8861,33 @@ pub async fn run_windowed_diff<C: ConnectionTrait>(
         // ruling is consumed (hold -> remediated). The source re-asserts the same window every
         // cycle, so "acknowledge, then let the next cycle through" is the whole workflow; a
         // later reshape brakes afresh with a new hold.
-        let release = conn
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    "SELECT id FROM replicate_audit_holds
-                     WHERE stream_id = $1 AND kind = '{kind}' AND status = '{acknowledged}'
-                     ORDER BY created_at DESC LIMIT 1",
-                    acknowledged = HoldStatus::Acknowledged.as_str(),
-                    kind = HoldKind::BrakeFired.as_str()
-                ),
-                [stream_id.into()],
-            ))
+        let release = crate::routes::private::sync::hold_model::Entity::find()
+            .filter(crate::routes::private::sync::hold_model::Column::StreamId.eq(stream_id))
+            .filter(
+                crate::routes::private::sync::hold_model::Column::Kind
+                    .eq(HoldKind::BrakeFired.as_str()),
+            )
+            .filter(
+                crate::routes::private::sync::hold_model::Column::Status
+                    .eq(HoldStatus::Acknowledged.as_str()),
+            )
+            .order_by_desc(crate::routes::private::sync::hold_model::Column::CreatedAt)
+            .one(conn)
             .await?;
         match release {
-            Some(row) => {
-                let hold_id: Uuid = row.try_get("", "id")?;
-                conn.execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    format!(
-                        "UPDATE replicate_audit_holds SET status = '{remediated}'
-                         WHERE id = $1 AND status = '{acknowledged}'",
-                        remediated = HoldStatus::Remediated.as_str(),
-                        acknowledged = HoldStatus::Acknowledged.as_str()
-                    ),
-                    [hold_id.into()],
-                ))
-                .await?;
+            Some(hold) => {
+                crate::routes::private::sync::hold_model::Entity::update_many()
+                    .col_expr(
+                        crate::routes::private::sync::hold_model::Column::Status,
+                        Expr::val(HoldStatus::Remediated.as_str()),
+                    )
+                    .filter(crate::routes::private::sync::hold_model::Column::Id.eq(hold.id))
+                    .filter(
+                        crate::routes::private::sync::hold_model::Column::Status
+                            .eq(HoldStatus::Acknowledged.as_str()),
+                    )
+                    .exec(conn)
+                    .await?;
                 tracing::info!(%stream_id, changed = outcome.changed,
                     withdrawn = to_withdraw.len() + withdraw_touched.len(),
                     "acknowledged brake released; reshape applies once");

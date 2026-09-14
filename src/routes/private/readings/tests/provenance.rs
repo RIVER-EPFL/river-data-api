@@ -12,23 +12,24 @@ fn test_a_computed_value_is_not_classified_as_a_sync() {
 #[test]
 fn test_provenance_kind_for_stream_matches_the_trigger_rule() {
     assert_eq!(
-        provenance_kind_for_stream(Some("derived"), Some("cnet")),
+        provenance_kind_for_stream(Some("derived"), "cnet"),
         "derived"
     );
     assert_eq!(
-        provenance_kind_for_stream(Some("spot"), Some("grab_sample")),
+        provenance_kind_for_stream(Some("spot"), "grab_sample"),
         "manual"
     );
-    assert_eq!(provenance_kind_for_stream(None, Some("api")), "batch");
+    assert_eq!(provenance_kind_for_stream(None, "api"), "batch");
     assert_eq!(
-        provenance_kind_for_stream(Some("continuous"), Some("vaisala")),
+        provenance_kind_for_stream(Some("continuous"), "vaisala"),
         "sync"
     );
 }
 
 #[test]
-fn test_a_stream_that_proves_nothing_is_stamped_migration() {
-    assert_eq!(provenance_kind_for_stream(None, None), "migration");
+fn test_a_source_the_rule_does_not_name_is_a_sync() {
+    assert_eq!(provenance_kind_for_stream(None, "portal"), "sync");
+    assert_eq!(provenance_kind_for_stream(Some("spot"), "nomis"), "sync");
 }
 
 #[test]
@@ -42,11 +43,10 @@ fn test_provenance_kind_for_run_follows_the_minting_path() {
 #[test]
 fn test_every_kind_a_writer_can_stamp_is_a_declared_kind() {
     for kind in [
-        provenance_kind_for_stream(Some("derived"), None),
-        provenance_kind_for_stream(None, Some("grab_sample")),
-        provenance_kind_for_stream(None, Some("api")),
-        provenance_kind_for_stream(None, Some("vaisala")),
-        provenance_kind_for_stream(None, None),
+        provenance_kind_for_stream(Some("derived"), "cnet"),
+        provenance_kind_for_stream(None, "grab_sample"),
+        provenance_kind_for_stream(None, "api"),
+        provenance_kind_for_stream(None, "vaisala"),
         provenance_kind_for_run(None),
         provenance_kind_for_run(Some("interactive")),
         provenance_kind_for_run(Some("chain")),

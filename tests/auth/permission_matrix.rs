@@ -383,6 +383,11 @@ fn entities() -> Vec<Entity> {
             families: &["read"],
             ..admin_only("notification_states")
         },
+        // The roster, `routes(read)`: a person's own `/notifications/me` is the only writer.
+        Entity {
+            families: &["read"],
+            ..admin_only("notification_subscribers")
+        },
         field_data("annotations", CrudScope::ProjectBound),
         catalog("constants", CrudScope::Global),
         field_data("samples", CrudScope::ProjectBound),
@@ -422,6 +427,18 @@ fn entities() -> Vec<Entity> {
         Entity {
             families: &["read"],
             ..sensor("replicate_audit_holds", CrudScope::Global)
+        },
+        // The proposed corrections as rows: raised by the windowed ingest, decided through
+        // `/sync/change_proposals/decide`, so the entity is read-only under the same gate.
+        Entity {
+            families: &["read"],
+            ..sensor("reading_change_proposals", CrudScope::Global)
+        },
+        // The readings themselves: written by ingest, batch, grab entry and CSV import, changed
+        // through the curation routes, never deleted, so the entity is read-only.
+        Entity {
+            families: &["read"],
+            ..field_data("readings", CrudScope::ProjectBound)
         },
         // The curation ledger: append-only, every writer a curation path with its own rules
         // (ADR 0008). `GET /readings/decisions` is one reading's history; this is the table.
@@ -800,7 +817,6 @@ fn table() -> Table {
             ("GET", "/api/sync/replicate_reconciliation/duplicate_slots"),
             ("GET", "/api/sync/replicate_reconciliation/candidates"),
             ("POST", "/api/sync/replicate_reconciliation"),
-            ("GET", "/api/sync/change_proposals"),
             ("POST", "/api/sync/change_proposals/decide"),
         ],
     );
@@ -879,7 +895,6 @@ fn table() -> Table {
             ("GET", "/api/notifications/health"),
             ("GET", "/api/notifications/deliveries"),
             ("POST", "/api/notifications/health/refresh"),
-            ("GET", "/api/notifications/subscribers"),
         ],
     );
 

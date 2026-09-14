@@ -38,12 +38,21 @@ pub enum Writer {
     Chain,
 }
 
-/// A row selection still spelled as SQL over `r` (`readings`) and `ds` (`data_streams`), with the
-/// values its `$n` placeholders bind. The write paths build these predicates as text today, so
-/// this is how one is handed to [`touched_events`] until they build them.
+/// A `readings` column as the visit lookup, the event attachment and the sample materialiser all
+/// name it: the reading row is `r` in each of their statements, so a caller selecting rows for one
+/// of them writes its predicate over this.
 #[must_use]
-pub fn rows_matching(row_predicate: &str, binds: Vec<sea_orm::Value>) -> Condition {
-    Condition::all().add(Expr::cust_with_values(row_predicate.to_string(), binds))
+pub fn row(column: readings::Column) -> Expr {
+    Expr::col((Alias::new("r"), column))
+}
+
+/// The same column tested three-valued: `IS TRUE`, or `IS NOT TRUE` (which a NULL satisfies).
+/// sea-query has no operator for either, and `= TRUE` is not the same test.
+#[must_use]
+pub fn row_is_true(column: readings::Column, expected: bool) -> Expr {
+    let not = if expected { "" } else { "NOT " };
+    let name = sea_orm::Iden::to_string(&column);
+    Expr::cust(format!(r#""r"."{name}" IS {not}TRUE"#))
 }
 
 /// The visits whose readings `rows` selects, with the parameters touched at each.

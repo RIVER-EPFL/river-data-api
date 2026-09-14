@@ -180,7 +180,10 @@ async fn a_portal_source_reaches_a_served_value_and_changes_only_when_decided() 
     );
     let (code, pending) = crate::common::get_json_with_token(
         &app,
-        "/api/sync/change_proposals?status=pending",
+        &format!(
+            "/api/reading_change_proposals?filter={}",
+            crate::common::e2e::percent_encode(r#"{"status":"pending"}"#)
+        ),
         &token,
     )
     .await;

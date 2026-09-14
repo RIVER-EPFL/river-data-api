@@ -328,7 +328,7 @@ pub struct EventCell {
     /// A server-built tool-run blob is stored on the measurement.
     pub has_provenance: bool,
     /// Where the value came from, as the row records it: `tool_run` | `chain` | `csv_import` |
-    /// `manual` | `batch` | `sync` | `derived` | `migration`. Narrower than `origin`, which reads
+    /// `manual` | `batch` | `sync` | `derived`. Narrower than `origin`, which reads
     /// the stream alone and cannot tell a hand entry from a tool save on the same channel.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]

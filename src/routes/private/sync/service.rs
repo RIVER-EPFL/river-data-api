@@ -7,7 +7,8 @@ use axum::http::request::Parts;
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
 use sea_orm::sea_query::{
-    Alias, Expr, ExprTrait as _, Func, JoinType, PostgresQueryBuilder, Query as SeaQuery,
+    Alias, Expr, ExprTrait as _, Func, JoinType, OnConflict, PostgresQueryBuilder,
+    Query as SeaQuery,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
@@ -23,6 +24,7 @@ use uuid::Uuid;
 
 use river_data_core::commands as core_commands;
 
+use super::hold_model;
 use crate::common::AppState;
 use crate::common::authz::AccessScope;
 use crate::common::bulk_write;
@@ -637,6 +639,12 @@ pub struct GroupMismatch {
 pub(crate) static OPEN: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| HoldStatus::sql_list(&HoldStatus::OPEN));
 
+/// The same set for a built predicate: `status IN (...)` without spelling the list.
+#[must_use]
+pub fn open_statuses() -> [&'static str; 2] {
+    HoldStatus::OPEN.map(HoldStatus::as_str)
+}
+
 /// Everything past review. `use_portal`, `use_manual` and `consumed` are legacy statuses kept
 /// for history; nothing produces them.
 pub(super) static RESOLVED: std::sync::LazyLock<String> =
@@ -778,45 +786,53 @@ impl Hold<'_> {
     /// the same row rather than a duplicate. Each target is an open-only partial index, so a
     /// decision already taken is never rewritten: a detection beside a terminal hold inserts a
     /// fresh open row.
-    pub(super) fn target(&self) -> (&'static str, String, Vec<sea_orm::Value>) {
+    pub(super) fn target(&self) -> (Vec<hold_model::Column>, Vec<Expr>, OnConflict) {
+        use hold_model::Column;
+        let instant = |t: DateTime<Utc>| Expr::val(sea_orm::prelude::DateTimeWithTimeZone::from(t));
         match self.key {
             HoldKey::Stream {
                 stream_id,
                 group_time,
             } => (
-                "stream_id, group_time",
-                format!("(stream_id, group_time, kind) WHERE status IN {}", *OPEN),
-                vec![
-                    stream_id.into(),
-                    sea_orm::prelude::DateTimeWithTimeZone::from(group_time).into(),
-                ],
+                vec![Column::StreamId, Column::GroupTime],
+                vec![Expr::val(stream_id), instant(group_time)],
+                OnConflict::columns([Column::StreamId, Column::GroupTime, Column::Kind])
+                    .target_and_where(Expr::cust(format!("status IN {}", *OPEN)))
+                    .to_owned(),
             ),
             HoldKey::Slot {
                 site_id,
                 parameter_id,
                 group_time,
             } => (
-                "site_id, parameter_id, group_time",
-                format!(
-                    "(kind, site_id, parameter_id, group_time) WHERE stream_id IS NULL \
-                     AND status = '{}'",
-                    HoldStatus::Pending.as_str()
-                )
-                .to_string(),
+                vec![Column::SiteId, Column::ParameterId, Column::GroupTime],
                 vec![
-                    site_id.into(),
-                    parameter_id.into(),
-                    sea_orm::prelude::DateTimeWithTimeZone::from(group_time).into(),
+                    Expr::val(site_id),
+                    Expr::val(parameter_id),
+                    instant(group_time),
                 ],
+                OnConflict::columns([
+                    Column::Kind,
+                    Column::SiteId,
+                    Column::ParameterId,
+                    Column::GroupTime,
+                ])
+                .target_and_where(Expr::cust(format!(
+                    "stream_id IS NULL AND status = '{}'",
+                    HoldStatus::Pending.as_str()
+                )))
+                .to_owned(),
             ),
             HoldKey::StreamStanding { stream_id } => (
-                "stream_id, group_time",
-                format!(
-                    "(stream_id) WHERE kind = '{}' AND status IN {}",
-                    HoldKind::SourceIdentityChanged.as_str(),
-                    *OPEN
-                ),
-                vec![stream_id.into(), "NOW()".into()],
+                vec![Column::StreamId, Column::GroupTime],
+                vec![Expr::val(stream_id), Expr::cust("NOW()")],
+                OnConflict::column(Column::StreamId)
+                    .target_and_where(Expr::cust(format!(
+                        "kind = '{}' AND status IN {}",
+                        HoldKind::SourceIdentityChanged.as_str(),
+                        *OPEN
+                    )))
+                    .to_owned(),
             ),
         }
     }
@@ -824,48 +840,53 @@ impl Hold<'_> {
 
 /// The one statement every hold is written by. Read it back in a test rather than a database.
 #[must_use]
-pub fn hold_statement(hold: &Hold) -> Statement {
-    let (key_columns, conflict, mut values) = hold.target();
-    let key_placeholders: String = match hold.key {
-        HoldKey::StreamStanding { .. } => {
-            values.pop();
-            "$1, NOW()".to_string()
-        }
-        _ => (1..=values.len())
-            .map(|i| format!("${i}"))
-            .collect::<Vec<_>>()
-            .join(", "),
-    };
-    let n = values.len();
-    values.push(hold.kind.as_str().into());
-    values.push(hold.expected.clone().into());
-    values.push(hold.computed.clone().into());
-    values.push(hold.delta.clone().into());
-    values.push(hold.status.as_str().into());
-    values.push(hold.tool.into());
-    Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        format!(
-            "INSERT INTO replicate_audit_holds
-                 ({key_columns}, kind, expected, computed, delta, status, tool)
-             VALUES ({key_placeholders}, ${kind}, ${expected}, ${computed}, ${delta}, ${status}, ${tool})
-             ON CONFLICT {conflict}
-             DO UPDATE SET expected = EXCLUDED.expected, computed = EXCLUDED.computed,
-                           delta = EXCLUDED.delta, tool = EXCLUDED.tool, created_at = NOW(),
-                           status = CASE WHEN replicate_audit_holds.status = '{deferred}'
-                                              AND EXCLUDED.status = '{pending}'
-                                         THEN '{pending}' ELSE replicate_audit_holds.status END",
-            deferred = HoldStatus::Deferred.as_str(),
-            pending = HoldStatus::Pending.as_str(),
-            kind = n + 1,
-            expected = n + 2,
-            computed = n + 3,
-            delta = n + 4,
-            status = n + 5,
-            tool = n + 6,
-        ),
-        values,
-    )
+pub fn hold_statement(hold: &Hold) -> sea_orm::sea_query::InsertStatement {
+    use hold_model::Column;
+    let (mut columns, mut values, mut conflict) = hold.target();
+    columns.extend([
+        Column::Kind,
+        Column::Expected,
+        Column::Computed,
+        Column::Delta,
+        Column::Status,
+        Column::Tool,
+    ]);
+    values.extend([
+        Expr::val(hold.kind.as_str()),
+        Expr::val(hold.expected.clone()),
+        Expr::val(hold.computed.clone()),
+        Expr::val(hold.delta.clone()),
+        Expr::val(hold.status.as_str()),
+        Expr::val(hold.tool),
+    ]);
+    // A re-detection refreshes the payload and promotes a deferred hold, and never rewrites a
+    // decision already taken.
+    conflict
+        .update_columns([
+            Column::Expected,
+            Column::Computed,
+            Column::Delta,
+            Column::Tool,
+        ])
+        .values([
+            (Column::CreatedAt, Expr::cust("NOW()")),
+            (
+                Column::Status,
+                Expr::cust(format!(
+                    "CASE WHEN replicate_audit_holds.status = '{deferred}' \
+                          AND EXCLUDED.status = '{pending}' \
+                     THEN '{pending}' ELSE replicate_audit_holds.status END",
+                    deferred = HoldStatus::Deferred.as_str(),
+                    pending = HoldStatus::Pending.as_str(),
+                )),
+            ),
+        ]);
+    SeaQuery::insert()
+        .into_table(hold_model::Entity)
+        .columns(columns)
+        .values_panic(values)
+        .on_conflict(conflict)
+        .to_owned()
 }
 
 /// Which streams' holds a pairing change moves.
@@ -889,8 +910,8 @@ pub async fn repoint_holds<C: ConnectionTrait>(
     } else {
         ("deferred", "pending")
     };
-    // `replicate_audit_holds` has no entity, so the hold update stays a statement; the streams a
-    // plan owns are read through the `data_streams` entity rather than joined by name.
+    // The streams a plan owns are read through the `data_streams` entity rather than joined by
+    // name.
     let stream_ids: Vec<Uuid> = match scope {
         HoldScope::Stream(stream_id) => vec![stream_id],
         HoldScope::Plan(plan_id) => {
@@ -906,15 +927,12 @@ pub async fn repoint_holds<C: ConnectionTrait>(
     if stream_ids.is_empty() {
         return Ok(());
     }
-    conn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        format!(
-            "UPDATE replicate_audit_holds SET status = '{to}'
-             WHERE stream_id = ANY($1) AND status = '{from}'"
-        ),
-        [stream_ids.into()],
-    ))
-    .await?;
+    hold_model::Entity::update_many()
+        .col_expr(hold_model::Column::Status, Expr::val(to))
+        .filter(hold_model::Column::StreamId.is_in(stream_ids))
+        .filter(hold_model::Column::Status.eq(from))
+        .exec(conn)
+        .await?;
     Ok(())
 }
 
@@ -922,7 +940,13 @@ pub async fn repoint_holds<C: ConnectionTrait>(
 /// update of the same row, never a duplicate; a deferred row found by a paired-stream detection is
 /// promoted to pending.
 pub async fn upsert_hold<C: ConnectionTrait>(conn: &C, hold: &Hold<'_>) -> AppResult<()> {
-    conn.execute_raw(hold_statement(hold)).await?;
+    let (sql, values) = hold_statement(hold).build(PostgresQueryBuilder);
+    conn.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+        values,
+    ))
+    .await?;
     Ok(())
 }
 
@@ -981,12 +1005,14 @@ pub async fn close_hold<C: ConnectionTrait>(
     hold_id: Uuid,
     terminal_status: HoldStatus,
 ) -> AppResult<()> {
-    conn.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "UPDATE replicate_audit_holds SET status = $2 WHERE id = $1",
-        [hold_id.into(), terminal_status.as_str().into()],
-    ))
-    .await?;
+    hold_model::Entity::update_many()
+        .col_expr(
+            hold_model::Column::Status,
+            Expr::val(terminal_status.as_str()),
+        )
+        .filter(hold_model::Column::Id.eq(hold_id))
+        .exec(conn)
+        .await?;
     Ok(())
 }
 
@@ -1160,25 +1186,10 @@ pub(super) struct KindCountRow {
     pub(super) n: i64,
 }
 
-/// The payload the last audit recorded at one slot. Both columns are `NOT NULL`, so a row that
-/// does not decode is a corrupt hold rather than an absent one.
-#[derive(FromQueryResult)]
-pub(super) struct PayloadRow {
-    pub(super) expected: serde_json::Value,
-    pub(super) computed: serde_json::Value,
-}
-
 #[derive(FromQueryResult)]
 pub(super) struct ReplicateStateRow {
     pub(super) replicate_index: i16,
     pub(super) flagged: bool,
-}
-
-#[derive(FromQueryResult)]
-pub(super) struct HoldSlotRow {
-    pub(super) site_id: Option<Uuid>,
-    pub(super) parameter_id: Option<Uuid>,
-    pub(super) group_time: sea_orm::prelude::DateTimeWithTimeZone,
 }
 
 #[derive(FromQueryResult)]
@@ -1230,16 +1241,17 @@ pub(super) struct ReopenHoldRow {
 /// entry) while preserving any prior actions under `history` (a reopened hold can be
 /// re-resolved). Shared by single and bulk acknowledge; `by_bind` is the placeholder carrying
 /// the actor label.
-pub(super) fn accept_ours_resolution_sql(by_bind: &str) -> String {
-    format!(
-        "CASE
-    WHEN h.resolution IS NULL
-        THEN jsonb_build_object('action', 'accept_ours', 'by', {by_bind}::text, 'at', NOW())
-    ELSE jsonb_build_object('action', 'accept_ours', 'by', {by_bind}::text, 'at', NOW(),
-         'history',
-         COALESCE(h.resolution->'history', '[]'::jsonb)
-             || jsonb_build_array(h.resolution - 'history'))
-    END"
+pub(super) fn accept_ours_resolution(by: &str) -> Expr {
+    Expr::cust_with_values(
+        "CASE \
+         WHEN h.resolution IS NULL \
+             THEN jsonb_build_object('action', 'accept_ours', 'by', $1::text, 'at', NOW()) \
+         ELSE jsonb_build_object('action', 'accept_ours', 'by', $1::text, 'at', NOW(), \
+              'history', \
+              COALESCE(h.resolution->'history', '[]'::jsonb) \
+                  || jsonb_build_array(h.resolution - 'history')) \
+         END",
+        [sea_orm::Value::from(by)],
     )
 }
 
@@ -1344,19 +1356,14 @@ pub(super) async fn hold_numbers<C: ConnectionTrait>(
     conn: &C,
     hold_id: Uuid,
 ) -> (serde_json::Value, serde_json::Value) {
-    let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT expected, computed FROM replicate_audit_holds WHERE id = $1",
-            [hold_id.into()],
-        ))
+    hold_model::Entity::find_by_id(hold_id)
+        .one(conn)
         .await
         .ok()
-        .flatten();
-    row.and_then(|row| PayloadRow::from_query_result(&row, "").ok())
+        .flatten()
         .map_or_else(
             || (serde_json::Value::Null, serde_json::Value::Null),
-            |row| (row.expected, row.computed),
+            |hold| (hold.expected, hold.computed),
         )
 }
 
@@ -1421,20 +1428,29 @@ pub(super) async fn refuse_undeclared_estimator(
 /// they build differs.
 pub(super) async fn accept_ours(state: &AppState, id: Uuid, by: &str) -> AppResult<()> {
     refuse_undeclared_estimator(&state.db, id).await?;
-    let resolution_sql = accept_ours_resolution_sql("$2");
+    // The resolution expression names the row as `h`, so the statement aliases the table.
+    let (sql, values) = SeaQuery::update()
+        .table(
+            sea_orm::sea_query::IntoTableRef::into_table_ref(hold_model::Entity)
+                .alias(Alias::new("h")),
+        )
+        .value(
+            hold_model::Column::Status,
+            Expr::val(HoldStatus::Acknowledged.as_str()),
+        )
+        .value(hold_model::Column::Resolution, accept_ours_resolution(by))
+        .value(hold_model::Column::AcknowledgedBy, Expr::val(by))
+        .value(hold_model::Column::AcknowledgedAt, Expr::cust("NOW()"))
+        .and_where(Expr::col(hold_model::Column::Id).eq(id))
+        .and_where(Expr::col(hold_model::Column::Status).eq(HoldStatus::Pending.as_str()))
+        .to_owned()
+        .build(PostgresQueryBuilder);
     let updated = state
         .db
         .execute_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "UPDATE replicate_audit_holds AS h
-                 SET status = '{acknowledged}', resolution = {resolution_sql},
-                     acknowledged_by = $2, acknowledged_at = NOW()
-                 WHERE id = $1 AND status = '{pending}'",
-                acknowledged = HoldStatus::Acknowledged.as_str(),
-                pending = HoldStatus::Pending.as_str()
-            ),
-            [id.into(), by.into()],
+            sql,
+            values,
         ))
         .await?
         .rows_affected();
@@ -1469,21 +1485,12 @@ pub(super) async fn rule_on_entry(
 ) -> AppResult<Json<ResolveHoldResponse>> {
     use crate::routes::private::readings::models::{Kind, Origin};
     use crate::routes::private::readings::service::{NewValue, record_many};
-    let hold = state
-        .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT site_id, parameter_id, group_time FROM replicate_audit_holds
-                 WHERE id = $1 AND kind = '{kind}' AND status IN {open}",
-                kind = HoldKind::UnverifiedEntry.as_str(),
-                open = *OPEN
-            ),
-            [id.into()],
-        ))
+    let hold = hold_model::Entity::find_by_id(id)
+        .filter(hold_model::Column::Kind.eq(HoldKind::UnverifiedEntry.as_str()))
+        .filter(hold_model::Column::Status.is_in(HoldStatus::OPEN.map(HoldStatus::as_str)))
+        .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("no pending unverified entry hold {id}")))?;
-    let hold = HoldSlotRow::from_query_result(&hold, "")?;
     let group_time = hold.group_time;
     let (Some(site_id), Some(parameter_id)) = (hold.site_id, hold.parameter_id) else {
         return Err(AppError::BadRequest(format!(
@@ -1511,10 +1518,20 @@ pub(super) async fn rule_on_entry(
         let recorded = record_many(
             txn,
             kind,
-            crate::routes::private::collection_events::flows::rows_matching(
-                "r.site_id = $1 AND r.parameter_id = $2 AND r.time = $3 AND r.unverified IS TRUE",
-                vec![site_id.into(), parameter_id.into(), group_time.into()],
-            ),
+            {
+                use crate::routes::private::collection_events::flows::row;
+                use crate::routes::private::readings::models::Column;
+                sea_orm::Condition::all()
+                    .add(row(Column::SiteId).eq(site_id))
+                    .add(row(Column::ParameterId).eq(parameter_id))
+                    .add(row(Column::Time).eq(group_time))
+                    .add(
+                        crate::routes::private::collection_events::flows::row_is_true(
+                            Column::Unverified,
+                            true,
+                        ),
+                    )
+            },
             NewValue::Literal(new),
             by,
             Some(&reason),
@@ -1522,23 +1539,25 @@ pub(super) async fn rule_on_entry(
             None,
         )
         .await?;
-        txn.execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "UPDATE replicate_audit_holds
-                 SET status = '{status}', acknowledged_by = $2, acknowledged_at = NOW(),
-                     resolution = jsonb_build_object('mode', $3::text, 'by', $2::text,
-                                                     'at', to_jsonb(NOW()), 'rows', $4::bigint)
-                 WHERE id = $1"
-            ),
-            [
-                id.into(),
-                by.into(),
-                mode.into(),
-                i64::try_from(recorded.rows).unwrap_or(i64::MAX).into(),
-            ],
-        ))
-        .await?;
+        hold_model::Entity::update_many()
+            .col_expr(hold_model::Column::Status, Expr::val(status))
+            .col_expr(hold_model::Column::AcknowledgedBy, Expr::val(by))
+            .col_expr(hold_model::Column::AcknowledgedAt, Expr::cust("NOW()"))
+            .col_expr(
+                hold_model::Column::Resolution,
+                Expr::cust_with_values(
+                    "jsonb_build_object('mode', $1::text, 'by', $2::text, \
+                     'at', to_jsonb(NOW()), 'rows', $3::bigint)",
+                    [
+                        sea_orm::Value::from(mode),
+                        sea_orm::Value::from(by),
+                        sea_orm::Value::from(i64::try_from(recorded.rows).unwrap_or(i64::MAX)),
+                    ],
+                ),
+            )
+            .filter(hold_model::Column::Id.eq(id))
+            .exec(txn)
+            .await?;
         Ok(recorded.rows)
     })
     .await?;

@@ -148,7 +148,10 @@ async fn a_portal_import_reaches_paired_attributed_readings_under_one_instrument
         );
         for station in STATIONS {
             assert!(
-                !instrument["name"].as_str().unwrap_or_default().contains(station),
+                !instrument["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(station),
                 "a lab instrument is carried to every station, so its name names none: {entry}"
             );
         }

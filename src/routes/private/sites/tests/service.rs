@@ -74,3 +74,75 @@ fn a_withdrawn_instant_is_counted_once_and_the_window_stays_on_the_inner_query()
         "an upper bound joins it there rather than outside: {bounded}"
     );
 }
+
+/// Expected behaviour: a deployment still open covers the window, and the parameter filter is in
+/// the statement only when one was asked for. Reading `deployed_until` as a closed bound would
+/// drop the band an instrument is on right now.
+#[test]
+fn an_open_deployment_is_in_the_window_and_the_parameter_filter_is_optional() {
+    use sea_orm::sea_query::PostgresQueryBuilder;
+
+    let site = uuid::Uuid::from_u128(1);
+    let parameter = uuid::Uuid::from_u128(2);
+    let start = chrono::DateTime::from_timestamp(0, 0).expect("epoch is a timestamp");
+    let end = chrono::DateTime::from_timestamp(86_400, 0).expect("a day later is a timestamp");
+
+    let unfiltered =
+        super::sensor_identity_bands_query(site, start, end, None).to_string(PostgresQueryBuilder);
+    assert!(
+        unfiltered.contains(r#""d"."deployed_until" IS NULL OR "d"."deployed_until" >"#),
+        "an open deployment covers everything after its start: {unfiltered}"
+    );
+    assert!(
+        unfiltered.contains(r#"INNER JOIN "sensors""#),
+        "the band names the instrument that held the slot: {unfiltered}"
+    );
+    assert!(
+        !unfiltered.contains(r#""d"."parameter_id" IN"#),
+        "no parameter filter was asked for: {unfiltered}"
+    );
+    assert!(
+        unfiltered.ends_with(r#"ORDER BY "d"."parameter_id" ASC, "d"."deployed_from" ASC"#),
+        "bands arrive grouped by parameter, oldest first: {unfiltered}"
+    );
+
+    let filtered = super::sensor_identity_bands_query(site, start, end, Some(&[parameter]))
+        .to_string(PostgresQueryBuilder);
+    assert!(
+        filtered.contains(r#""d"."parameter_id" IN"#),
+        "the asked-for parameters confine the bands: {filtered}"
+    );
+    let empty = super::sensor_identity_bands_query(site, start, end, Some(&[]))
+        .to_string(PostgresQueryBuilder);
+    assert_eq!(
+        empty, unfiltered,
+        "an empty filter list confines nothing: {empty}"
+    );
+}
+
+/// Expected behaviour: markers are the curves of the instruments deployed here over the window,
+/// and a curve with no parameter has no series to sit on. Dropping the subquery would plot every
+/// curve in the database on the site's charts.
+#[test]
+fn a_marker_belongs_to_an_instrument_deployed_here_and_names_its_parameter() {
+    use sea_orm::sea_query::PostgresQueryBuilder;
+
+    let site = uuid::Uuid::from_u128(1);
+    let start = chrono::DateTime::from_timestamp(0, 0).expect("epoch is a timestamp");
+    let end = chrono::DateTime::from_timestamp(86_400, 0).expect("a day later is a timestamp");
+
+    let markers = super::sensor_calibration_markers_query(site, start, end, None)
+        .to_string(PostgresQueryBuilder);
+    assert!(
+        markers.contains(r#"IN (SELECT DISTINCT "d"."sensor_id""#),
+        "only instruments deployed at this site carry markers: {markers}"
+    );
+    assert!(
+        markers.contains(r#""c"."parameter_id" IS NOT NULL"#),
+        "a curve with no parameter has no series to sit on: {markers}"
+    );
+    assert!(
+        markers.contains(r#""c"."valid_until" IS NULL OR "c"."valid_until" >"#),
+        "a curve still in force overlaps the window: {markers}"
+    );
+}

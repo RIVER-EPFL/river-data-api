@@ -2,7 +2,7 @@
 //!
 //! Every path that needs the answer, the write paths (`/ingest`, `/grab_samples`, stream import)
 //! and the set-based reprocess UPDATEs, ranks the candidate curves with the SQL
-//! [`pick_calibration_lateral`] emits. There is one ranking, so a value stored at write time and the
+//! [`pick_calibration_query`] emits. There is one ranking, so a value stored at write time and the
 //! value a later reprocess would recompute are the same number by construction rather than by
 //! agreement between two hand-kept implementations.
 //!
@@ -20,8 +20,8 @@
 use chrono::{DateTime, Utc};
 use sea_orm::Order;
 use sea_orm::sea_query::{
-    Alias, Condition, Expr, ExprTrait as _, IntoIden, IntoTableRef, JoinType, PostgresQueryBuilder,
-    Query as SeaQuery, SelectStatement, TableRef, UpdateStatement,
+    Alias, Condition, Expr, ExprTrait as _, Func, IntoIden, IntoTableRef, JoinType,
+    PostgresQueryBuilder, Query as SeaQuery, SelectStatement, TableRef, UpdateStatement,
 };
 
 use super::models as model;
@@ -30,7 +30,7 @@ use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use super::service::{Curve, calibrated_value_sql};
+use super::service::{Curve, calibrated_value};
 use crate::common::bulk_write;
 use crate::error::AppResult;
 
@@ -57,14 +57,14 @@ pub fn pick_calibration_query_excluding(
 ) -> SelectStatement {
     pick_calibration_query_owned(
         Expr::cust(format!("c.sensor_id = {sensor_expr}")),
-        exclude_expr,
+        exclude_expr.map(|e| Expr::cust(format!("c.id <> {e}"))),
     )
 }
 
 /// [`pick_calibration_query`] with the owning instrument as an expression rather than a spelled
 /// one, so a built statement can bind it instead of naming a placeholder the builder renumbers.
 #[must_use]
-pub fn pick_calibration_query_owned(owner: Expr, exclude_expr: Option<&str>) -> SelectStatement {
+pub fn pick_calibration_query_owned(owner: Expr, exclude: Option<Expr>) -> SelectStatement {
     let c = Alias::new("c");
     let mut pick = SeaQuery::select();
     pick.columns([
@@ -90,22 +90,10 @@ pub fn pick_calibration_query_owned(owner: Expr, exclude_expr: Option<&str>) -> 
     .order_by((c.clone(), model::Column::ValidFrom), Order::Desc)
     .order_by((c.clone(), model::Column::Id), Order::Desc)
     .limit(1);
-    if let Some(e) = exclude_expr {
-        pick.and_where(Expr::cust(format!("c.id <> {e}")));
+    if let Some(e) = exclude {
+        pick.and_where(e);
     }
     pick.take()
-}
-
-/// [`pick_calibration_query`] rendered, for a caller whose own statement is still SQL text.
-#[must_use]
-pub fn pick_calibration_lateral(sensor_expr: &str) -> String {
-    pick_calibration_query(sensor_expr).to_string(PostgresQueryBuilder)
-}
-
-/// [`pick_calibration_query_excluding`] rendered, for the same reason.
-#[must_use]
-pub fn pick_calibration_lateral_excluding(sensor_expr: &str, exclude_expr: Option<&str>) -> String {
-    pick_calibration_query_excluding(sensor_expr, exclude_expr).to_string(PostgresQueryBuilder)
 }
 
 /// One instant's resolved curve, as the timeline query returns it.
@@ -140,21 +128,57 @@ pub async fn resolve_for_times<C: ConnectionTrait>(
     wanted.sort_unstable();
     wanted.dedup();
 
-    let sql = format!(
-        r"SELECT r.time AS t, cw.id AS cal_id, cw.slope AS slope, cw.intercept AS intercept
-          FROM (
-              SELECT $1::uuid AS sensor_id, $2::uuid AS parameter_id, q.time AS time
-              FROM unnest($3::text[]::timestamptz[]) AS q(time)
-          ) r
-          JOIN LATERAL ({pick}) cw ON true",
-        pick = pick_calibration_lateral("r.sensor_id")
-    );
+    let r = Alias::new("r");
+    let q = Alias::new("q");
+    let cw = Alias::new("cw");
+    let uuid = Alias::new("uuid");
+    let asked = SeaQuery::select()
+        .expr_as(
+            Expr::val(sensor_id).cast_as(uuid.clone()),
+            Alias::new("sensor_id"),
+        )
+        .expr_as(
+            Expr::val(parameter_id).cast_as(uuid),
+            Alias::new("parameter_id"),
+        )
+        .expr_as(Expr::col((q.clone(), q.clone())), Alias::new("time"))
+        .from(TableRef::FunctionCall(
+            Func::cust(Alias::new("unnest")).arg(Expr::cust_with_values(
+                "$1::text[]::timestamptz[]",
+                [sea_orm::Value::from(wanted)],
+            )),
+            q.into_iden(),
+        ))
+        .take();
+    let (sql, values) = SeaQuery::select()
+        .expr_as(Expr::col((r.clone(), Alias::new("time"))), Alias::new("t"))
+        .expr_as(
+            Expr::col((cw.clone(), model::Column::Id)),
+            Alias::new("cal_id"),
+        )
+        .expr_as(
+            Expr::col((cw.clone(), model::Column::Slope)),
+            Alias::new("slope"),
+        )
+        .expr_as(
+            Expr::col((cw.clone(), model::Column::Intercept)),
+            Alias::new("intercept"),
+        )
+        .from_subquery(asked, r)
+        .join_lateral(
+            JoinType::InnerJoin,
+            pick_calibration_query("r.sensor_id"),
+            cw,
+            Expr::cust("TRUE"),
+        )
+        .take()
+        .build(PostgresQueryBuilder);
 
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            [sensor_id.into(), parameter_id.into(), wanted.into()],
+            sql,
+            values,
         ))
         .await?;
 
@@ -233,7 +257,11 @@ fn attribute_by_window_query(stream_id: Uuid, sensor_id: Uuid) -> UpdateStatemen
     let r = Alias::new("r");
     let cw = Alias::new("cw");
     let windowed = super::service::calibration_derivable("tgt");
-    let value = calibrated_value_sql("tgt.raw_value", "picked.slope", "picked.intercept");
+    let value = calibrated_value(
+        Expr::cust("tgt.raw_value"),
+        Expr::cust("picked.slope"),
+        Expr::cust("picked.intercept"),
+    );
 
     // One row per reading of the stream, with the curve whose window covers its own time.
     let picked = SeaQuery::select()
@@ -268,17 +296,19 @@ fn attribute_by_window_query(stream_id: Uuid, sensor_id: Uuid) -> UpdateStatemen
         .value(Alias::new("sensor_id"), sensor_id)
         .value(
             Alias::new("calibration_id"),
-            Expr::cust(format!(
-                "CASE WHEN {windowed} THEN COALESCE(picked.cal_id, tgt.calibration_id) \
-                 ELSE tgt.calibration_id END"
-            )),
+            Expr::case(
+                windowed.clone(),
+                Expr::cust("COALESCE(picked.cal_id, tgt.calibration_id)"),
+            )
+            .finally(Expr::cust("tgt.calibration_id")),
         )
         .value(
             Alias::new("calibrated_value"),
-            Expr::cust(format!(
-                "CASE WHEN picked.cal_id IS NOT NULL AND {windowed} THEN {value} \
-                 ELSE tgt.calibrated_value END"
-            )),
+            Expr::case(
+                Expr::cust("picked.cal_id IS NOT NULL").and(windowed.clone()),
+                value,
+            )
+            .finally(Expr::cust("tgt.calibrated_value")),
         )
         .from(TableRef::SubQuery(
             Box::new(picked),
@@ -287,14 +317,15 @@ fn attribute_by_window_query(stream_id: Uuid, sensor_id: Uuid) -> UpdateStatemen
         .and_where(Expr::cust("tgt.stream_id = picked.p_stream_id"))
         .and_where(Expr::cust("tgt.time = picked.p_time"))
         .and_where(Expr::cust("tgt.replicate_index = picked.p_replicate_index"))
-        .and_where(Expr::cust_with_values(
-            format!(
-                "(tgt.sensor_id IS DISTINCT FROM $1 \
-                  OR (picked.cal_id IS NOT NULL AND {windowed} \
-                      AND tgt.calibration_id IS DISTINCT FROM picked.cal_id))"
+        .and_where(
+            Expr::cust_with_values("tgt.sensor_id IS DISTINCT FROM $1", [sensor_id]).or(
+                Expr::cust("picked.cal_id IS NOT NULL")
+                    .and(windowed)
+                    .and(Expr::cust(
+                        "tgt.calibration_id IS DISTINCT FROM picked.cal_id",
+                    )),
             ),
-            [sensor_id],
-        ))
+        )
         .take()
 }
 

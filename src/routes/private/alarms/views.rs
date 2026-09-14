@@ -25,10 +25,23 @@ use sea_orm::ColumnTrait;
 use sea_orm::ConnectionTrait;
 use sea_orm::EntityTrait;
 use sea_orm::FromQueryResult;
+use sea_orm::Order;
 use sea_orm::QueryFilter;
 use sea_orm::QueryOrder;
 use sea_orm::Set;
 use sea_orm::Statement;
+use sea_orm::sea_query::Alias;
+use sea_orm::sea_query::Asterisk;
+use sea_orm::sea_query::CommonTableExpression;
+use sea_orm::sea_query::Condition;
+use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::ExprTrait;
+use sea_orm::sea_query::Func;
+use sea_orm::sea_query::JoinType;
+use sea_orm::sea_query::PostgresQueryBuilder;
+use sea_orm::sea_query::Query as SeaQuery;
+use sea_orm::sea_query::SelectStatement;
+use sea_orm::sea_query::WithClause;
 use serde::Deserialize;
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -61,11 +74,12 @@ use super::service::fetch_latest_reading_times;
 use super::service::fetch_open_events;
 use super::service::violations_query;
 use crate::common::AppState;
+use crate::common::authz::AccessScope;
 use crate::common::bulk;
 use crate::common::middleware::AuthContext;
 use crate::common::middleware::ProjectScope;
 use crate::common::paging::Window;
-use crate::common::scope::project_filter_sql;
+use crate::common::scope::project_filter;
 use crate::common::scope::require_named_target;
 use crate::common::scope::require_sites_in_scope;
 use crate::common::series;
@@ -74,8 +88,10 @@ use crate::common::series::Table;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::routes::cache;
+use crate::routes::private::parameters;
 use crate::routes::private::reprocessing_jobs::models::QueuedJobResponse;
 use crate::routes::private::site_parameters;
+use crate::routes::private::sites;
 use crate::routes::private::sites::models::ProjectRef;
 use crate::routes::private::sites::models::SiteRef;
 use crate::routes::resolve_site_with_project;
@@ -608,94 +624,21 @@ pub async fn get_alarm_events(
     Query(query): Query<AlarmEventsQuery>,
 ) -> AppResult<Json<AlarmEventsResponse>> {
     let limit = Window::from_limit_offset(query.limit, None, 200, 1000).limit;
-
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    let mut conditions: Vec<String> = Vec::new();
-
-    if let Some(predicate) = project_filter_sql(&scope, "s.project_id", &mut values) {
-        conditions.push(predicate);
-    }
-    if let Some(site_id) = query.site_id {
-        values.push(site_id.into());
-        conditions.push(format!("ae.site_id = ${}", values.len()));
-    }
-    if let Some(severity) = query.severity {
-        values.push(severity.into());
-        conditions.push(format!("ae.max_severity = ${}", values.len()));
-    }
-    if let Some(parameter_id) = query.parameter_id {
-        values.push(parameter_id.into());
-        conditions.push(format!("ae.parameter_id = ${}", values.len()));
-    }
-    if let Some(start) = query.start {
-        values.push(start.into());
-        conditions.push(format!("ae.last_seen_at >= ${}", values.len()));
-    }
-    if let Some(end) = query.end {
-        values.push(end.into());
-        conditions.push(format!("ae.started_at <= ${}", values.len()));
-    }
-    match query.status.as_deref() {
-        Some("open") => conditions.push("ae.resolved_at IS NULL".to_string()),
-        Some("resolved") => conditions.push("ae.resolved_at IS NOT NULL".to_string()),
-        _ => {}
-    }
-
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
-
     let offset = query.offset.unwrap_or(0);
+    let matching = alarm_events_matching(&scope, &query);
 
-    let sql = format!(
-        r"
-        SELECT ae.id, ae.site_id, s.name AS site_name, ae.parameter_id,
-               COALESCE(sp.name, p.name) AS parameter_name, ae.measurement_type,
-               ae.severity, ae.max_severity, ae.started_at, ae.last_seen_at,
-               ae.value_at_start, ae.last_value, ae.resolved_at, ae.resolved_value,
-               ae.acknowledged_at, ae.acknowledged_by
-        FROM alarm_events ae
-        JOIN sites s ON s.id = ae.site_id
-        JOIN parameters p ON p.id = ae.parameter_id
-        LEFT JOIN site_parameters sp ON sp.site_id = ae.site_id AND sp.parameter_id = ae.parameter_id
-        {where_clause}
-        ORDER BY (ae.resolved_at IS NULL) DESC, ae.last_seen_at DESC
-        LIMIT {limit} OFFSET {offset}
-        "
-    );
-
-    // Count all matching events (before LIMIT) so `total` reflects the full match set, not the
-    // truncated page. Only the alarm_events + sites join is needed, no filter touches sp/p.
-    let count_sql = format!(
-        r"
-        SELECT COUNT(*) AS cnt
-        FROM alarm_events ae
-        JOIN sites s ON s.id = ae.site_id
-        {where_clause}
-        "
-    );
-    let total: usize = state
+    let total = state
         .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &count_sql,
-            values.clone(),
-        ))
+        .query_one_raw(alarm_events_count(matching.clone()))
         .await?
         .map(|row| row.try_get::<i64>("", "cnt"))
         .transpose()?
         .unwrap_or(0)
-        .max(0) as usize;
+        .clamp(0, i64::MAX) as usize;
 
     let events: Vec<AlarmEventResponse> = state
         .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            values,
-        ))
+        .query_all_raw(alarm_events_page(matching, limit, offset))
         .await?
         .into_iter()
         .filter_map(|row| AlarmEventRow::from_query_result(&row, "").ok())
@@ -721,6 +664,133 @@ pub async fn get_alarm_events(
 
     Ok(Json(AlarmEventsResponse { events, total }))
 }
+/// The events a request matches: the caller's projects, then each filter the query names.
+///
+/// Shared by the page and the count, so `total` is of the whole match set rather than of the page.
+fn alarm_events_matching(scope: &AccessScope, query: &AlarmEventsQuery) -> Condition {
+    let ae = Alias::new("ae");
+    let mut matching = Condition::all();
+    if let Some(confine) = project_filter(scope, (Alias::new("s"), sites::Column::ProjectId)) {
+        matching = matching.add(confine);
+    }
+    if let Some(site_id) = query.site_id {
+        matching = matching.add(Expr::col((ae.clone(), alarm_event::Column::SiteId)).eq(site_id));
+    }
+    if let Some(severity) = query.severity {
+        matching =
+            matching.add(Expr::col((ae.clone(), alarm_event::Column::MaxSeverity)).eq(severity));
+    }
+    if let Some(parameter_id) = query.parameter_id {
+        matching = matching
+            .add(Expr::col((ae.clone(), alarm_event::Column::ParameterId)).eq(parameter_id));
+    }
+    if let Some(start) = query.start {
+        matching =
+            matching.add(Expr::col((ae.clone(), alarm_event::Column::LastSeenAt)).gte(start));
+    }
+    if let Some(end) = query.end {
+        matching = matching.add(Expr::col((ae.clone(), alarm_event::Column::StartedAt)).lte(end));
+    }
+    match query.status.as_deref() {
+        Some("open") => matching.add(Expr::col((ae, alarm_event::Column::ResolvedAt)).is_null()),
+        Some("resolved") => {
+            matching.add(Expr::col((ae, alarm_event::Column::ResolvedAt)).is_not_null())
+        }
+        _ => matching,
+    }
+}
+
+/// One page of events, newest unresolved first, each carrying its site and parameter labels.
+fn alarm_events_page(matching: Condition, limit: u64, offset: u64) -> Statement {
+    let ae = Alias::new("ae");
+    let sp = Alias::new("sp");
+    let p = Alias::new("p");
+    let (sql, values) = alarm_events_from(matching)
+        .columns([
+            (ae.clone(), alarm_event::Column::Id),
+            (ae.clone(), alarm_event::Column::SiteId),
+        ])
+        .expr_as(
+            Expr::col((Alias::new("s"), sites::Column::Name)),
+            Alias::new("site_name"),
+        )
+        .column((ae.clone(), alarm_event::Column::ParameterId))
+        .expr_as(
+            Func::coalesce([
+                Expr::col((sp.clone(), site_parameters::Column::Name)),
+                Expr::col((p.clone(), parameters::Column::Name)),
+            ]),
+            Alias::new("parameter_name"),
+        )
+        .columns([
+            (ae.clone(), alarm_event::Column::MeasurementType),
+            (ae.clone(), alarm_event::Column::Severity),
+            (ae.clone(), alarm_event::Column::MaxSeverity),
+            (ae.clone(), alarm_event::Column::StartedAt),
+            (ae.clone(), alarm_event::Column::LastSeenAt),
+            (ae.clone(), alarm_event::Column::ValueAtStart),
+            (ae.clone(), alarm_event::Column::LastValue),
+            (ae.clone(), alarm_event::Column::ResolvedAt),
+            (ae.clone(), alarm_event::Column::ResolvedValue),
+            (ae.clone(), alarm_event::Column::AcknowledgedAt),
+            (ae.clone(), alarm_event::Column::AcknowledgedBy),
+        ])
+        .join_as(
+            JoinType::InnerJoin,
+            parameters::Entity,
+            p.clone(),
+            Expr::col((p, parameters::Column::Id))
+                .equals((ae.clone(), alarm_event::Column::ParameterId)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            site_parameters::Entity,
+            sp.clone(),
+            Expr::col((sp.clone(), site_parameters::Column::SiteId))
+                .equals((ae.clone(), alarm_event::Column::SiteId))
+                .and(
+                    Expr::col((sp, site_parameters::Column::ParameterId))
+                        .equals((ae.clone(), alarm_event::Column::ParameterId)),
+                ),
+        )
+        .order_by_expr(
+            Expr::col((ae.clone(), alarm_event::Column::ResolvedAt))
+                .is_null()
+                .into(),
+            Order::Desc,
+        )
+        .order_by((ae, alarm_event::Column::LastSeenAt), Order::Desc)
+        .limit(limit)
+        .offset(offset)
+        .build(PostgresQueryBuilder);
+    Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values)
+}
+
+/// How many events match, before the page is taken. Only the site join is needed: no filter
+/// touches the parameter labels.
+fn alarm_events_count(matching: Condition) -> Statement {
+    let (sql, values) = alarm_events_from(matching)
+        .expr_as(Expr::col(Asterisk).count(), Alias::new("cnt"))
+        .build(PostgresQueryBuilder);
+    Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values)
+}
+
+/// `alarm_events` joined to the sites the confinement is expressed over, under one match set.
+fn alarm_events_from(matching: Condition) -> SelectStatement {
+    let ae = Alias::new("ae");
+    let s = Alias::new("s");
+    SeaQuery::select()
+        .from_as(alarm_event::Entity, ae.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            sites::Entity,
+            s.clone(),
+            Expr::col((s, sites::Column::Id)).equals((ae, alarm_event::Column::SiteId)),
+        )
+        .cond_where(matching)
+        .to_owned()
+}
+
 /// Resolved thresholds, one row per active `(site, parameter)` slot, each carrying its latest value.
 ///
 /// The single source of truth for the 3-tier resolution (site row → global row → parameter
@@ -742,43 +812,23 @@ pub async fn get_thresholds(
     ProjectScope(scope): ProjectScope,
     Query(query): Query<ThresholdsQuery>,
 ) -> AppResult<Json<Vec<ThresholdWithValue>>> {
-    let resolved_cte = super::service::resolve_thresholds_query(
-        query.site_id,
-        query.parameter_id.map(|p| vec![p]),
-    )
-    .to_string(sea_orm::sea_query::PostgresQueryBuilder);
-
-    // Confined to the caller's projects, the same rule the three alarm siblings apply: the payload
-    // is one row per active slot, so an unconfined answer is an inventory of every project's slots
-    // and their current values.
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    let project_filter = project_filter_sql(&scope, "s.project_id", &mut values)
-        .map(|predicate| format!("WHERE {predicate}"))
-        .unwrap_or_default();
-
-    // Attach the latest reading per slot so the table can show a current value beside each threshold.
-    // Bounded to the last 30 days so TimescaleDB chunk-excludes to recent chunks (fast even for the
-    // unscoped/global view); a slot with no recent reading gets a NULL current value. Continuous
-    // readings win over spot so an occasional grab does not stand in for a sensor's current value;
-    // a spot-only slot still reports its latest grab.
-    let latest_cte = super::service::latest_slot_values_sql();
-    let sql = format!(
-        "WITH resolved AS ({resolved_cte}), latest AS ({latest_cte}) \
-         SELECT r.site_id, r.parameter_id, r.warning_min, r.warning_max, r.alarm_min, r.alarm_max, \
-                r.source, l.current_value \
-         FROM resolved r \
-         JOIN sites s ON s.id = r.site_id \
-         LEFT JOIN latest l ON l.site_id = r.site_id AND l.parameter_id = r.parameter_id \
-         {project_filter}"
+    // Attach the latest reading per slot so the table can show a current value beside each
+    // threshold. Bounded to the last 30 days so TimescaleDB chunk-excludes to recent chunks (fast
+    // even for the unscoped/global view); a slot with no recent reading gets a NULL current value.
+    // Continuous readings win over spot so an occasional grab does not stand in for a sensor's
+    // current value; a spot-only slot still reports its latest grab.
+    let statement = thresholds_with_values(
+        &scope,
+        super::service::resolve_thresholds_query(
+            query.site_id,
+            query.parameter_id.map(|p| vec![p]),
+        ),
+        super::service::latest_slot_values_query(),
     );
 
     let rows = state
         .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            values,
-        ))
+        .query_all_raw(statement)
         .await?
         .into_iter()
         .filter_map(|r| ThresholdWithValue::from_query_result(&r, "").ok())
@@ -786,6 +836,69 @@ pub async fn get_thresholds(
 
     Ok(Json(rows))
 }
+/// One row per resolved slot with its latest value, confined to the caller's projects.
+///
+/// The confinement is the same rule the three alarm siblings apply: the payload is one row per
+/// active slot, so an unconfined answer is an inventory of every project's slots and their current
+/// values.
+fn thresholds_with_values(
+    scope: &AccessScope,
+    resolved: SelectStatement,
+    latest: SelectStatement,
+) -> Statement {
+    let r = Alias::new("r");
+    let l = Alias::new("l");
+    let s = Alias::new("s");
+    let with = WithClause::new()
+        .cte(cte(Alias::new("resolved"), resolved))
+        .cte(cte(Alias::new("latest"), latest))
+        .to_owned();
+
+    let mut query = SeaQuery::select()
+        .columns([
+            (r.clone(), Alias::new("site_id")),
+            (r.clone(), Alias::new("parameter_id")),
+            (r.clone(), Alias::new("warning_min")),
+            (r.clone(), Alias::new("warning_max")),
+            (r.clone(), Alias::new("alarm_min")),
+            (r.clone(), Alias::new("alarm_max")),
+            (r.clone(), Alias::new("source")),
+        ])
+        .column((l.clone(), Alias::new("current_value")))
+        .from_as(Alias::new("resolved"), r.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            sites::Entity,
+            s.clone(),
+            Expr::col((s.clone(), sites::Column::Id)).equals((r.clone(), Alias::new("site_id"))),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            Alias::new("latest"),
+            l.clone(),
+            Expr::col((l.clone(), Alias::new("site_id")))
+                .equals((r.clone(), Alias::new("site_id")))
+                .and(
+                    Expr::col((l.clone(), Alias::new("parameter_id")))
+                        .equals((r.clone(), Alias::new("parameter_id"))),
+                ),
+        )
+        .to_owned();
+    if let Some(confine) = project_filter(scope, (s, sites::Column::ProjectId)) {
+        query.and_where(confine);
+    }
+
+    let (sql, values) = query.with(with).build(PostgresQueryBuilder);
+    Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values)
+}
+
+/// A named CTE over a built select.
+fn cte(name: Alias, query: SelectStatement) -> CommonTableExpression {
+    let mut cte = CommonTableExpression::new();
+    cte.table_name(name).query(query);
+    cte
+}
+
 /// Run the reconcile every hook of this request asked for, once, after the handler returns.
 pub async fn coalesce_reconcile(
     State(state): State<AppState>,

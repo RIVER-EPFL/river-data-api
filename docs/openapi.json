@@ -6492,7 +6492,7 @@
             "type": "string"
           },
           "provenance_kind": {
-            "description": "Where the value came from, as the row records it: `tool_run` | `chain` | `csv_import` |\n`manual` | `batch` | `sync` | `derived` | `migration`. Narrower than `origin`, which reads\nthe stream alone and cannot tell a hand entry from a tool save on the same channel.",
+            "description": "Where the value came from, as the row records it: `tool_run` | `chain` | `csv_import` |\n`manual` | `batch` | `sync` | `derived`. Narrower than `origin`, which reads\nthe stream alone and cannot tell a hand entry from a tool save on the same channel.",
             "type": "string"
           },
           "read_by": {
@@ -11068,6 +11068,84 @@
         ],
         "type": "object"
       },
+      "NotificationSubscriberList": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "keycloak_sub": {
+            "type": "string"
+          },
+          "push_subscription_count": {
+            "description": "Push devices registered to this person, which is what the roster reports beside the\nswitch.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "web_push_enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "keycloak_sub",
+          "web_push_enabled",
+          "created_at",
+          "updated_at",
+          "push_subscription_count"
+        ],
+        "type": "object"
+      },
+      "NotificationSubscriberResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "keycloak_sub": {
+            "type": "string"
+          },
+          "push_subscription_count": {
+            "description": "Push devices registered to this person, which is what the roster reports beside the\nswitch.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "web_push_enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "keycloak_sub",
+          "web_push_enabled",
+          "created_at",
+          "updated_at",
+          "push_subscription_count"
+        ],
+        "type": "object"
+      },
       "Origin": {
         "enum": [
           "manual",
@@ -11076,7 +11154,6 @@
           "audit",
           "chain",
           "rollback",
-          "migration",
           "system",
           "janitor"
         ],
@@ -15077,127 +15154,6 @@
         },
         "type": "object"
       },
-      "Proposal": {
-        "description": "One proposed correction, as the review surface reads it.",
-        "properties": {
-          "decided_at": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "decided_by": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "first_seen_at": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "last_seen_at": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "parameter_code": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "parameter_id": {
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "proposed_raw_value": {
-            "format": "double",
-            "type": "number"
-          },
-          "proposed_standard_curve_id": {
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "replicate_index": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "site_id": {
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "site_name": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "source_key": {
-            "type": "string"
-          },
-          "source_system": {
-            "type": "string"
-          },
-          "status": {
-            "type": "string"
-          },
-          "stored_raw_value": {
-            "format": "double",
-            "type": "number"
-          },
-          "stored_standard_curve_id": {
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "stream_id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "time": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "id",
-          "stream_id",
-          "source_system",
-          "source_key",
-          "site_id",
-          "site_name",
-          "parameter_id",
-          "parameter_code",
-          "time",
-          "replicate_index",
-          "stored_raw_value",
-          "proposed_raw_value",
-          "stored_standard_curve_id",
-          "proposed_standard_curve_id",
-          "status",
-          "first_seen_at",
-          "last_seen_at",
-          "decided_by",
-          "decided_at"
-        ],
-        "type": "object"
-      },
       "ProposeInstrumentsRequest": {
         "additionalProperties": false,
         "description": "A source's whole instrument register, offered for a plan to admit.",
@@ -15366,6 +15322,262 @@
         "required": [
           "job_id",
           "status"
+        ],
+        "type": "object"
+      },
+      "ReadingChangeProposalList": {
+        "properties": {
+          "decided_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decided_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "first_seen_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "last_seen_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "parameter_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parameter_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "proposed_raw_value": {
+            "format": "double",
+            "type": "number"
+          },
+          "proposed_standard_curve_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replicate_index": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "site_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "site_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_system": {
+            "description": "The stream's own naming, and the slot its pairing places it in. Filled from the\npairing on read; a proposal against an unpaired stream carries only the source half.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`pending` | `accepted` | `rejected`, a table CHECK.",
+            "type": "string"
+          },
+          "stored_raw_value": {
+            "format": "double",
+            "type": "number"
+          },
+          "stored_standard_curve_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stream_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "stream_id",
+          "time",
+          "replicate_index",
+          "proposed_raw_value",
+          "proposed_standard_curve_id",
+          "stored_raw_value",
+          "stored_standard_curve_id",
+          "status",
+          "first_seen_at",
+          "last_seen_at",
+          "decided_by",
+          "decided_at",
+          "source_system",
+          "source_key",
+          "site_id",
+          "site_name",
+          "parameter_id",
+          "parameter_code"
+        ],
+        "type": "object"
+      },
+      "ReadingChangeProposalResponse": {
+        "properties": {
+          "decided_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decided_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "first_seen_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "last_seen_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "parameter_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parameter_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "proposed_raw_value": {
+            "format": "double",
+            "type": "number"
+          },
+          "proposed_standard_curve_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replicate_index": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "site_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "site_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_system": {
+            "description": "The stream's own naming, and the slot its pairing places it in. Filled from the\npairing on read; a proposal against an unpaired stream carries only the source half.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`pending` | `accepted` | `rejected`, a table CHECK.",
+            "type": "string"
+          },
+          "stored_raw_value": {
+            "format": "double",
+            "type": "number"
+          },
+          "stored_standard_curve_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stream_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "stream_id",
+          "time",
+          "replicate_index",
+          "proposed_raw_value",
+          "proposed_standard_curve_id",
+          "stored_raw_value",
+          "stored_standard_curve_id",
+          "status",
+          "first_seen_at",
+          "last_seen_at",
+          "decided_by",
+          "decided_at",
+          "source_system",
+          "source_key",
+          "site_id",
+          "site_name",
+          "parameter_id",
+          "parameter_code"
         ],
         "type": "object"
       },
@@ -15749,6 +15961,211 @@
           "site_id",
           "parameter_id",
           "time"
+        ],
+        "type": "object"
+      },
+      "ReadingList": {
+        "properties": {
+          "calibrated_value": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "calibration_id": {
+            "description": "The time-windowed base calibration the value was corrected with.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "collection_event_id": {
+            "description": "The collection event (site visit) an attributed spot reading belongs to. Stamped by\n`collection_events::attach` after the write; NULL on continuous and derived rows.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_by": {
+            "description": "Who entered it, on a hand-entered measurement.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deployment_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "derived_version_id": {
+            "description": "The formula version a derived value was computed under, on a derived row.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "flag_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ingested_at": {
+            "description": "When the stored value arrived (DB default on insert, re-stamped when an overwrite changes\nthe value). NULL on rows that predate tracking.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_flagged": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "label": {
+            "description": "The operator's name for the measurement.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "logged": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "measurement_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "notes": {
+            "description": "The operator's free text about the measurement.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parameter_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provenance": {
+            "description": "The server-built record of what produced this value: the tool run and pinned script version,\nits resolved inputs, constants and curves, and the outputs it returned. Written by the grab\nwrite path from the stored `tool_runs` row, never by a client."
+          },
+          "provenance_kind": {
+            "description": "Where this value came from: `tool_run` | `chain` | `csv_import` | `manual` | `batch` |\n`sync` | `derived`. Total, held by a DB trigger for a writer that names none,\nso an unrecorded origin is a named kind rather than a NULL blob (Q49).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "raw_value": {
+            "format": "double",
+            "type": "number"
+          },
+          "replicate_index": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "sample_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sensor_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "site_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "standard_curve_id": {
+            "description": "The hand-picked lab curve applied on top of the base calibration, for grab measurements.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stream_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "unverified": {
+            "description": "An intern's entry that no manager has verified. Curated surfaces leave it out\n(`common/served.rs`); only `reading_decisions` moves it, through its projection trigger.",
+            "type": "boolean"
+          },
+          "withdrawn_at": {
+            "description": "Retraction stamp: the source's claimed window no longer contains this reading. A withdrawn\nreading is excluded from serving, statistics and alarms, and a later honest window that\nre-asserts the row clears the stamp. Spot rows only (DB CHECK); never a delete.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "withdrawn_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "stream_id",
+          "time",
+          "replicate_index",
+          "site_id",
+          "parameter_id",
+          "raw_value",
+          "calibrated_value",
+          "sensor_id",
+          "calibration_id",
+          "standard_curve_id",
+          "deployment_id",
+          "logged",
+          "measurement_type",
+          "is_flagged",
+          "flag_reason",
+          "sample_id",
+          "collection_event_id",
+          "withdrawn_at",
+          "withdrawn_reason",
+          "ingested_at",
+          "provenance_kind",
+          "provenance",
+          "label",
+          "notes",
+          "created_by",
+          "unverified",
+          "derived_version_id"
         ],
         "type": "object"
       },
@@ -22563,31 +22980,6 @@
             ]
           }
         },
-        "type": "object"
-      },
-      "SubscriberRow": {
-        "properties": {
-          "keycloakSub": {
-            "type": "string"
-          },
-          "pushSubscriptionCount": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "subscriptionOverrides": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "webPushEnabled": {
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "keycloakSub",
-          "webPushEnabled",
-          "pushSubscriptionCount",
-          "subscriptionOverrides"
-        ],
         "type": "object"
       },
       "SubscriptionScope": {
@@ -32526,6 +32918,150 @@
         "summary": "Get all notification_states"
       }
     },
+    "/api/notification_subscribers": {
+      "get": {
+        "description": "Retrieves all notification_subscribers.\n\nThis resource manages notification_subscriber items\n\nAdditional sortable columns: \n- keycloak_sub\n- web_push_enabled\n- created_at\n- updated_at.\n\nAdditional filterable columns: \n- keycloak_sub\n- web_push_enabled.",
+        "operationId": "get_all_notification_subscribers",
+        "parameters": [
+          {
+            "description": "JSON-encoded filter for querying resources.\n\nThis parameter supports various filtering options:\n- Free text search: `{\"q\": \"search text\"}`\n- Filtering by a single ID: `{\"id\": \"550e8400-e29b-41d4-a716-446655440000\"}`\n- Filtering by multiple IDs: `{\"id\": [\"550e8400-e29b-41d4-a716-446655440000\", \"550e8400-e29b-41d4-a716-446655440001\"]}`\n- Filtering on other columns: `{\"name\": \"example\"}`",
+            "example": {
+              "id": "550e8400-e29b-41d4-a716-446655440000",
+              "name": "example",
+              "q": "search text"
+            },
+            "in": "query",
+            "name": "filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Range for pagination in the format \"[start, end]\".\n\nExample: `[0,9]`",
+            "example": "[0,9]",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number for standard REST pagination (1-based).\n\nExample: `1`",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page for standard REST pagination.\n\nExample: `10`",
+            "example": 10,
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort order for the results in the format `[\"column\", \"order\"]`.\n\nExample: `[\"id\", \"ASC\"]`",
+            "example": "[\"id\", \"ASC\"]",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort column for standard REST format.\n\nExample: `title`",
+            "example": "title",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort order for standard REST format (ASC or DESC).\n\nExample: `ASC`",
+            "example": "ASC",
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/NotificationSubscriberList"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "List of resources"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get all notification_subscribers"
+      }
+    },
+    "/api/notification_subscribers/{id}": {
+      "get": {
+        "description": "Retrieves one notification_subscriber by its ID.\n\nThis resource manages notification_subscriber items",
+        "operationId": "get_one_notification_subscriber",
+        "parameters": [
+          {
+            "description": "Resource identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationSubscriberResponse"
+                }
+              }
+            },
+            "description": "The requested resource"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get one notification_subscriber"
+      }
+    },
     "/api/notifications/channels": {
       "get": {
         "operationId": "list_channels",
@@ -32754,29 +33290,6 @@
               }
             },
             "description": "Updated settings"
-          }
-        },
-        "tags": [
-          "notifications"
-        ]
-      }
-    },
-    "/api/notifications/subscribers": {
-      "get": {
-        "operationId": "list_subscribers",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/SubscriberRow"
-                  },
-                  "type": "array"
-                }
-              }
-            },
-            "description": "Subscriber roster"
           }
         },
         "tags": [
@@ -35387,6 +35900,150 @@
         ]
       }
     },
+    "/api/reading_change_proposals": {
+      "get": {
+        "description": "Retrieves all reading_change_proposals.\n\nThis resource manages reading_change_proposal items\n\nAdditional sortable columns: \n- time\n- first_seen_at\n- last_seen_at.\n\nAdditional filterable columns: \n- stream_id\n- status.",
+        "operationId": "get_all_reading_change_proposals",
+        "parameters": [
+          {
+            "description": "JSON-encoded filter for querying resources.\n\nThis parameter supports various filtering options:\n- Free text search: `{\"q\": \"search text\"}`\n- Filtering by a single ID: `{\"id\": \"550e8400-e29b-41d4-a716-446655440000\"}`\n- Filtering by multiple IDs: `{\"id\": [\"550e8400-e29b-41d4-a716-446655440000\", \"550e8400-e29b-41d4-a716-446655440001\"]}`\n- Filtering on other columns: `{\"name\": \"example\"}`",
+            "example": {
+              "id": "550e8400-e29b-41d4-a716-446655440000",
+              "name": "example",
+              "q": "search text"
+            },
+            "in": "query",
+            "name": "filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Range for pagination in the format \"[start, end]\".\n\nExample: `[0,9]`",
+            "example": "[0,9]",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number for standard REST pagination (1-based).\n\nExample: `1`",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page for standard REST pagination.\n\nExample: `10`",
+            "example": 10,
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort order for the results in the format `[\"column\", \"order\"]`.\n\nExample: `[\"id\", \"ASC\"]`",
+            "example": "[\"id\", \"ASC\"]",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort column for standard REST format.\n\nExample: `title`",
+            "example": "title",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort order for standard REST format (ASC or DESC).\n\nExample: `ASC`",
+            "example": "ASC",
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ReadingChangeProposalList"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "List of resources"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get all reading_change_proposals"
+      }
+    },
+    "/api/reading_change_proposals/{id}": {
+      "get": {
+        "description": "Retrieves one reading_change_proposal by its ID.\n\nThis resource manages reading_change_proposal items",
+        "operationId": "get_one_reading_change_proposal",
+        "parameters": [
+          {
+            "description": "Resource identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadingChangeProposalResponse"
+                }
+              }
+            },
+            "description": "The requested resource"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get one reading_change_proposal"
+      }
+    },
     "/api/reading_decisions": {
       "get": {
         "description": "Retrieves all reading_decisions.\n\nThis resource manages reading_decision items\n\nAdditional sortable columns: \n- stream_id\n- time\n- replicate_index\n- kind\n- actor\n- at\n- origin.\n\nAdditional filterable columns: \n- stream_id\n- time\n- replicate_index\n- kind\n- actor\n- origin\n- supersedes\n- rolled_back_by\n- set_id\n- job_id.",
@@ -35529,6 +36186,111 @@
           }
         },
         "summary": "Get one reading_decision"
+      }
+    },
+    "/api/readings": {
+      "get": {
+        "description": "Retrieves all readings.\n\nThis resource manages reading items\n\nAdditional sortable columns: \n- time\n- raw_value.\n\nAdditional filterable columns: \n- stream_id\n- time\n- replicate_index\n- site_id\n- parameter_id\n- sensor_id\n- standard_curve_id\n- measurement_type\n- is_flagged\n- sample_id\n- collection_event_id\n- provenance_kind\n- unverified.",
+        "operationId": "get_all_readings",
+        "parameters": [
+          {
+            "description": "JSON-encoded filter for querying resources.\n\nThis parameter supports various filtering options:\n- Free text search: `{\"q\": \"search text\"}`\n- Filtering by a single ID: `{\"id\": \"550e8400-e29b-41d4-a716-446655440000\"}`\n- Filtering by multiple IDs: `{\"id\": [\"550e8400-e29b-41d4-a716-446655440000\", \"550e8400-e29b-41d4-a716-446655440001\"]}`\n- Filtering on other columns: `{\"name\": \"example\"}`",
+            "example": {
+              "id": "550e8400-e29b-41d4-a716-446655440000",
+              "name": "example",
+              "q": "search text"
+            },
+            "in": "query",
+            "name": "filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Range for pagination in the format \"[start, end]\".\n\nExample: `[0,9]`",
+            "example": "[0,9]",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number for standard REST pagination (1-based).\n\nExample: `1`",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page for standard REST pagination.\n\nExample: `10`",
+            "example": 10,
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort order for the results in the format `[\"column\", \"order\"]`.\n\nExample: `[\"id\", \"ASC\"]`",
+            "example": "[\"id\", \"ASC\"]",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort column for standard REST format.\n\nExample: `title`",
+            "example": "title",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort order for standard REST format (ASC or DESC).\n\nExample: `ASC`",
+            "example": "ASC",
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ReadingList"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "List of resources"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get all readings"
       }
     },
     "/api/readings/batch": {
@@ -43708,56 +44470,6 @@
           }
         },
         "summary": "Update one subproject"
-      }
-    },
-    "/api/sync/change_proposals": {
-      "get": {
-        "operationId": "list_proposals",
-        "parameters": [
-          {
-            "description": "`pending` (the default view of the queue), `accepted` or `rejected`.",
-            "in": "query",
-            "name": "status",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          {
-            "in": "query",
-            "name": "stream_id",
-            "required": false,
-            "schema": {
-              "format": "uuid",
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/Proposal"
-                  },
-                  "type": "array"
-                }
-              }
-            },
-            "description": "Proposed corrections"
-          }
-        },
-        "summary": "The proposed corrections a person has still to decide. Requires `manage_sensors`, the same\nreview layer the audit holds use.",
-        "tags": [
-          "sync"
-        ]
       }
     },
     "/api/sync/change_proposals/decide": {

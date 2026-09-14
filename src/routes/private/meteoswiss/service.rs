@@ -15,7 +15,8 @@ use uuid::Uuid;
 use super::models::{Point, Series, Subscriber};
 use crate::routes::private::{data_streams, parameters, readings, sensors, site_parameters};
 
-/// The catalog parameter the feed lands on, seeded by `m20260907_000007_meteoswiss_pressure`.
+/// The catalog parameter the feed lands on. Nothing creates it: a tick that finds no such code
+/// in the catalog lands nothing and says so.
 pub(super) const PARAMETER_CODE: &str = "barometric_pressure";
 /// The SMN variable: station-level pressure, in hectopascals.
 pub(super) const VARIABLE: &str = "prestas0";
@@ -116,7 +117,10 @@ pub async fn parameter_id<C: ConnectionTrait>(db: &C) -> Result<Option<Uuid>, Db
 /// Registered on `(source_system, source_key)`, which is unique only where both are set: an
 /// instrument named by serial carries neither, and the registration's predicate is what keeps
 /// every one of those from reading as the same row.
-pub async fn instrument<C: ConnectionTrait + sea_orm::TransactionTrait>(db: &C, station: &str) -> Result<Uuid, DbErr> {
+pub async fn instrument<C: ConnectionTrait + sea_orm::TransactionTrait>(
+    db: &C,
+    station: &str,
+) -> Result<Uuid, DbErr> {
     let mut mint = sensors::ActiveModel {
         name: Set(Some(format!("MeteoSwiss {station}"))),
         manufacturer: Set(Some("MeteoSwiss".to_string())),
@@ -133,7 +137,11 @@ pub async fn instrument<C: ConnectionTrait + sea_orm::TransactionTrait>(db: &C, 
     mint.source_key = Set(Some(station.to_string()));
     let (sensor, _) = crudcrate::upsert::<sensors::Sensor, _>(db, mint)
         .await
-        .map_err(|e| DbErr::Custom(format!("Failed to mint the MeteoSwiss station instrument: {e}")))?;
+        .map_err(|e| {
+            DbErr::Custom(format!(
+                "Failed to mint the MeteoSwiss station instrument: {e}"
+            ))
+        })?;
     Ok(sensor.id)
 }
 

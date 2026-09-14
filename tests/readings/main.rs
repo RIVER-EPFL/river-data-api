@@ -21,6 +21,7 @@ mod csv_import_tool_curves;
 mod csv_import_worker;
 mod decisions;
 mod edits;
+mod entity_list;
 mod flag_range_dry_run;
 mod grab_replace_scope;
 mod grab_samples_insertion;

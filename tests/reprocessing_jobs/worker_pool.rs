@@ -7,9 +7,9 @@
 
 use async_trait::async_trait;
 use river_db::common::AppEvent;
-use river_db::routes::private::reprocessing_jobs::service::{Job, JobRegistry};
-use river_db::routes::private::reprocessing_jobs::service::JobContext;
 use river_db::routes::private::reprocessing_jobs::service as jobs;
+use river_db::routes::private::reprocessing_jobs::service::JobContext;
+use river_db::routes::private::reprocessing_jobs::service::{Job, JobRegistry};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
 use std::sync::Arc;

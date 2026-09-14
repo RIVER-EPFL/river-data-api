@@ -61,8 +61,6 @@ pub(crate) fn uuid_array(params: &serde_json::Value, key: &str) -> Vec<Uuid> {
         .unwrap_or_default()
 }
 
-/// Parse an array of `[site_id, parameter_id]` UUID pairs under `key`. Each element is a two-string
-/// array; malformed elements are skipped.
 /// What a loop over slots did: how many succeeded, which failed and why, and the total the
 /// successful ones moved. A run whose every slot failed is a failed run, not a completed one that
 /// happened to move nothing.
@@ -124,6 +122,8 @@ impl SlotOutcome {
     }
 }
 
+/// Parse an array of `[site_id, parameter_id]` UUID pairs under `key`. Each element is a two-string
+/// array; malformed elements are skipped.
 pub(crate) fn uuid_pair_array(params: &serde_json::Value, key: &str) -> Vec<(Uuid, Uuid)> {
     params
         .get(key)

@@ -158,6 +158,10 @@ pub async fn refresh(db: &DatabaseConnection, window: Window) -> AppResult<()> {
 }
 
 /// The `CALL` for one view, with the window aligned to that view's buckets.
+///
+/// The one statement in this crate that is not built through crudcrate or `sea_query`, because
+/// neither expresses `CALL` (Q146). What keeps it safe is where its parts come from: the instants
+/// are bound, and the view name is [`Resolution::view`], never a string a caller supplied.
 fn refresh_statement(
     resolution: Resolution,
     window: Window,

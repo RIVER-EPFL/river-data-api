@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use river_db::common::AppEvent;
-use river_db::routes::private::reprocessing_jobs::service::RetryPolicy;
 use river_db::routes::private::reprocessing_jobs::service as jobs;
+use river_db::routes::private::reprocessing_jobs::service::RetryPolicy;
 use sea_orm::DbErr;
 use serial_test::serial;
 use tokio::sync::broadcast::error::TryRecvError;

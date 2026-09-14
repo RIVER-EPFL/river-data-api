@@ -57,7 +57,8 @@ pub async fn sweep_stale_sync_events(
     db: &sea_orm::DatabaseConnection,
     stale_after_seconds: u64,
 ) -> Result<u64, DbErr> {
-    let cutoff = Utc::now() - Duration::seconds(i64::try_from(stale_after_seconds).unwrap_or(i64::MAX));
+    let cutoff =
+        Utc::now() - Duration::seconds(i64::try_from(stale_after_seconds).unwrap_or(i64::MAX));
     let appended = Expr::col(events::Column::Errors)
         .if_null(Expr::val(serde_json::json!([])))
         .binary(
@@ -687,9 +688,11 @@ async fn cutover_family(
 
         crate::routes::private::readings::service::materialise_samples(
             txn,
-            crate::routes::private::collection_events::flows::rows_matching(
-                "r.stream_id = $1",
-                vec![pair.new_id.into()],
+            sea_orm::Condition::all().add(
+                crate::routes::private::collection_events::flows::row(
+                    crate::routes::private::readings::models::Column::StreamId,
+                )
+                .eq(pair.new_id),
             ),
         )
         .await?;

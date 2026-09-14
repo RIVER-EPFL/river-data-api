@@ -1,4 +1,5 @@
 use super::*;
+use sea_orm::sea_query::Alias;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -103,28 +104,8 @@ fn test_row_guard_is_404_and_target_guard_is_403() {
 }
 
 #[test]
-fn test_project_filter_sql_numbers_the_placeholder_after_existing_values() {
-    let mut values: Vec<sea_orm::Value> = vec![42i32.into()];
-    let predicate = project_filter_sql(&granted(), "s.project_id", &mut values);
-    assert_eq!(predicate.as_deref(), Some("s.project_id = ANY($2)"));
-    assert_eq!(values.len(), 2);
-}
-
-#[test]
-fn test_project_filter_sql_is_absent_for_an_unrestricted_caller() {
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    assert!(project_filter_sql(&AccessScope::Unrestricted, "s.project_id", &mut values).is_none());
-    assert!(values.is_empty());
-}
-
-#[test]
-fn test_project_filter_sql_binds_an_empty_set_for_a_member_with_no_grants() {
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    assert_eq!(
-        project_filter_sql(&no_grants(), "s.project_id", &mut values).as_deref(),
-        Some("s.project_id = ANY($1)")
-    );
-    assert_eq!(values.len(), 1);
+fn test_the_project_filter_is_absent_for_an_unrestricted_caller() {
+    assert!(project_filter(&AccessScope::Unrestricted, Alias::new("project_id")).is_none());
 }
 
 /// Scenario: a restricted caller's project filter goes into a sea-query statement rather than

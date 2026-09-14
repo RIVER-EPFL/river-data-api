@@ -15,6 +15,7 @@ use sea_orm::FromQueryResult;
 use sea_orm::QueryFilter;
 use sea_orm::QueryOrder;
 use sea_orm::QuerySelect;
+use sea_orm::QueryTrait;
 use sea_orm::Set;
 use sea_orm::Statement;
 use sea_orm::sea_query::Expr;
@@ -35,7 +36,6 @@ use crate::common::middleware::enforce_project_scope_for_sites;
 use crate::common::middleware::require_admin;
 use crate::common::middleware::require_read_data;
 use crate::common::middleware::require_write_data;
-use crate::common::scope::project_filter_sql;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::routes::private::collection_events::flows;
@@ -43,6 +43,7 @@ use crate::routes::private::data_streams;
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
 use crate::routes::private::parameters;
 use crate::routes::private::readings;
+use crate::routes::private::readings::decision_model;
 use crate::routes::private::readings::models::ConflictMode;
 use crate::routes::private::readings::models::Kind;
 use crate::routes::private::readings::models::Origin;
@@ -401,31 +402,41 @@ pub async fn return_output(
         let mut decided = 0u64;
         for stream_id in &streams {
             // The value the first correction after the detach replaced is the tool's last value.
-            let restore = txn
-                .query_all_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT DISTINCT ON (c.replicate_index) c.replicate_index, c.old
-                     FROM reading_decisions c
-                     WHERE c.stream_id = $1 AND c.time = $2 AND c.kind = 'value_correction'
-                       AND c.rolled_back_by IS NULL
-                       AND c.at > (SELECT max(d.at) FROM reading_decisions d
-                                    WHERE d.stream_id = $1 AND d.time = $2 AND d.kind = 'detach'
-                                      AND d.rolled_back_by IS NULL)
-                     ORDER BY c.replicate_index, c.at ASC, c.id ASC",
-                    [
-                        (*stream_id).into(),
-                        sea_orm::prelude::DateTimeWithTimeZone::from(req.time).into(),
-                    ],
+            let at = sea_orm::prelude::DateTimeWithTimeZone::from(req.time);
+            let detached_at = decision_model::Entity::find()
+                .select_only()
+                .expr(decision_model::Column::At.max())
+                .filter(decision_model::Column::StreamId.eq(*stream_id))
+                .filter(decision_model::Column::Time.eq(at))
+                .filter(decision_model::Column::Kind.eq(Kind::Detach.as_str()))
+                .filter(decision_model::Column::RolledBackBy.is_null())
+                .into_query();
+            let restore = decision_model::Entity::find()
+                .select_only()
+                .column(decision_model::Column::ReplicateIndex)
+                .column(decision_model::Column::Old)
+                .filter(decision_model::Column::StreamId.eq(*stream_id))
+                .filter(decision_model::Column::Time.eq(at))
+                .filter(decision_model::Column::Kind.eq(Kind::ValueCorrection.as_str()))
+                .filter(decision_model::Column::RolledBackBy.is_null())
+                .filter(sea_orm::ExprTrait::gt(
+                    Expr::col(decision_model::Column::At),
+                    detached_at,
                 ))
+                .distinct_on([decision_model::Column::ReplicateIndex])
+                .order_by_asc(decision_model::Column::ReplicateIndex)
+                .order_by_asc(decision_model::Column::At)
+                .order_by_asc(decision_model::Column::Id)
+                .into_tuple::<(Option<i16>, serde_json::Value)>()
+                .all(txn)
                 .await?;
             let rows: Vec<(chrono::DateTime<chrono::Utc>, i16, serde_json::Value)> = restore
-                .iter()
-                .filter_map(|r| {
-                    let row = RestoreRow::from_query_result(r, "").ok()?;
-                    let raw = row.old.get("raw_value")?.as_f64()?;
+                .into_iter()
+                .filter_map(|(replicate_index, old)| {
+                    let raw = old.get("raw_value")?.as_f64()?;
                     Some((
                         req.time,
-                        row.replicate_index,
+                        replicate_index?,
                         serde_json::json!({ "raw_value": raw }),
                     ))
                 })
@@ -827,30 +838,6 @@ pub async fn reload_run(
     }))
 }
 
-/// The proposed corrections a person has still to decide. Requires `manage_sensors`, the same
-/// review layer the audit holds use.
-#[utoipa::path(
-    get,
-    path = "/api/sync/change_proposals",
-    params(ListQuery),
-    responses((status = 200, description = "Proposed corrections", body = Vec<Proposal>)),
-    tag = "sync"
-)]
-pub async fn list_proposals(
-    axum::extract::State(state): axum::extract::State<crate::common::AppState>,
-    crate::common::middleware::ProjectScope(scope): crate::common::middleware::ProjectScope,
-    axum::extract::Query(query): axum::extract::Query<ListQuery>,
-) -> AppResult<axum::Json<Vec<Proposal>>> {
-    let rows = list(
-        &state.db,
-        query.status.as_deref(),
-        query.stream_id,
-        scope.sql_project_array(),
-    )
-    .await?;
-    Ok(axum::Json(rows))
-}
-
 /// Accept or reject proposed corrections. Requires `manage_sensors`.
 #[utoipa::path(
     post,
@@ -870,6 +857,7 @@ pub async fn decide_proposals(
 ) -> AppResult<axum::Json<DecideResponse>> {
     let accept = parse_decision(&req.decision)?;
     let actor = crate::common::actor::label(&auth);
+    let projects = scope.project_ids();
     let (response, written) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         decide(
             txn,
@@ -877,7 +865,7 @@ pub async fn decide_proposals(
             accept,
             &actor,
             req.reason.as_deref(),
-            scope.sql_project_array(),
+            projects.as_deref(),
         )
         .await
     })
@@ -1518,13 +1506,18 @@ pub async fn insert_batch_readings(
                 models.iter().map(|m| *m.stream_id.as_ref()).collect();
             stream_ids.sort_unstable();
             stream_ids.dedup();
-            let row_predicate = "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3";
-            let binds: Vec<sea_orm::Value> =
-                vec![stream_ids.clone().into(), first.into(), last.into()];
+            let window = || {
+                use crate::routes::private::collection_events::flows::row;
+                use crate::routes::private::readings::models::Column;
+                use sea_orm::ExprTrait as _;
+                sea_orm::Condition::all()
+                    .add(row(Column::StreamId).is_in(stream_ids.clone()))
+                    .add(row(Column::Time).gte(first))
+                    .add(row(Column::Time).lte(last))
+            };
             crate::routes::private::collection_events::service::attach_collection_events(
                 txn,
-                row_predicate,
-                binds.clone(),
+                window(),
                 crate::routes::private::collection_events::service::EventSource::Manual,
             )
             .await?;
@@ -1532,7 +1525,7 @@ pub async fn insert_batch_readings(
             // path wrote either row, so the batch goes through the one materialiser too.
             crate::routes::private::readings::service::materialise_samples(
                 txn,
-                flows::rows_matching(row_predicate, binds.clone()),
+                window(),
             )
             .await?;
             let mut instants = spot_times.clone();
@@ -1541,10 +1534,14 @@ pub async fn insert_batch_readings(
             touched_events =
                 crate::routes::private::collection_events::flows::touched_events(
                     txn,
-                    crate::routes::private::collection_events::flows::rows_matching(
-                        "r.stream_id = ANY($1) AND r.time = ANY($2)",
-                        vec![stream_ids.into(), instants.into()],
-                    ),
+                    {
+                        use crate::routes::private::collection_events::flows::row;
+                        use crate::routes::private::readings::models::Column;
+                        use sea_orm::ExprTrait as _;
+                        sea_orm::Condition::all()
+                            .add(row(Column::StreamId).is_in(stream_ids))
+                            .add(row(Column::Time).is_in(instants))
+                    },
                 )
                 .await?;
         }
@@ -1579,7 +1576,7 @@ pub async fn insert_batch_readings(
         if let (Some(first), Some(last)) = (times.iter().min(), times.iter().max()) {
             sensor_calibrations::service::recompose_from_own_curves_guarded(
                 &state.db,
-                "TRUE",
+                sea_orm::sea_query::Expr::cust("TRUE"),
                 "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3",
                 vec![stream_ids.into(), (*first).into(), (*last).into()],
             )
@@ -2315,40 +2312,40 @@ pub async fn ingest_readings(
                         .is_none_or(|d| d.new_rows + d.changed + d.withdrawn + d.reinstated > 0);
                 let mut touched_events = Vec::new();
                 if diff_touched && let Some((lo, hi)) = sample_window {
-                    let binds: Vec<sea_orm::Value> = vec![
-                        payload.stream_id.into(),
-                        sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
-                        sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
-                    ];
+                    let window = || {
+                        use crate::routes::private::readings::models::Column;
+                        use sea_orm::ExprTrait as _;
+                        sea_orm::Condition::all()
+                            .add(flows::row(Column::StreamId).eq(payload.stream_id))
+                            .add(flows::row(Column::Time).gte(
+                                sea_orm::prelude::DateTimeWithTimeZone::from(lo),
+                            ))
+                            .add(flows::row(Column::Time).lte(
+                                sea_orm::prelude::DateTimeWithTimeZone::from(hi),
+                            ))
+                    };
                     crate::routes::private::readings::service::materialise_samples_with_estimator(
                         txn,
-                        flows::rows_matching(
-                            "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
-                            binds.clone(),
-                        ),
+                        window(),
                         stream_sd_estimator.as_deref(),
                     )
                     .await?;
                     // Each source row maps onto one collection event (D7). A sync service replaying
                     // a portal row writes a portal_sync event; any other writer is a person.
                     crate::routes::private::collection_events::service::attach_collection_events(
-                    txn,
-                    "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
-                    binds.clone(),
-                    if is_sync_service {
-                        crate::routes::private::collection_events::service::EventSource::PortalSync
-                    } else {
-                        crate::routes::private::collection_events::service::EventSource::Manual
-                    },
-                )
-                .await?;
+                        txn,
+                        window(),
+                        if is_sync_service {
+                            crate::routes::private::collection_events::service::EventSource::PortalSync
+                        } else {
+                            crate::routes::private::collection_events::service::EventSource::Manual
+                        },
+                    )
+                    .await?;
                     touched_events =
                         crate::routes::private::collection_events::flows::touched_events(
                             txn,
-                            crate::routes::private::collection_events::flows::rows_matching(
-                                "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
-                                binds,
-                            ),
+                            window(),
                         )
                         .await?;
                 }
@@ -2436,7 +2433,7 @@ pub async fn ingest_readings(
         && let Some((lo, hi)) = span
         && let Err(e) = sensor_calibrations::service::recompose_from_own_curves_guarded(
             &state.db,
-            "TRUE",
+            sea_orm::sea_query::Expr::cust("TRUE"),
             "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
             vec![
                 payload.stream_id.into(),
@@ -3406,12 +3403,21 @@ pub async fn insert_grab_samples(
             ) {
                 crate::routes::private::collection_events::service::attach_collection_events(
                     txn,
-                    "r.site_id = $1 AND r.time >= $2 AND r.time <= $3",
-                    vec![
-                        payload.site_id.into(),
-                        sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
-                        sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
-                    ],
+                    {
+                        use crate::routes::private::collection_events::flows::row;
+                        use crate::routes::private::readings::models::Column;
+                        use sea_orm::ExprTrait as _;
+                        sea_orm::Condition::all()
+                            .add(row(Column::SiteId).eq(payload.site_id))
+                            .add(
+                                row(Column::Time)
+                                    .gte(sea_orm::prelude::DateTimeWithTimeZone::from(lo)),
+                            )
+                            .add(
+                                row(Column::Time)
+                                    .lte(sea_orm::prelude::DateTimeWithTimeZone::from(hi)),
+                            )
+                    },
                     crate::routes::private::collection_events::service::EventSource::Manual,
                 )
                 .await?;
@@ -3421,13 +3427,13 @@ pub async fn insert_grab_samples(
                     .collect();
                 instants.sort_unstable();
                 instants.dedup();
-                touched_events = flows::touched_events(
-                    txn,
-                    flows::rows_matching(
-                        "r.site_id = $1 AND r.time = ANY($2)",
-                        vec![payload.site_id.into(), instants.into()],
-                    ),
-                )
+                touched_events = flows::touched_events(txn, {
+                    use crate::routes::private::readings::models::Column;
+                    use sea_orm::ExprTrait as _;
+                    sea_orm::Condition::all()
+                        .add(flows::row(Column::SiteId).eq(payload.site_id))
+                        .add(flows::row(Column::Time).is_in(instants))
+                })
                 .await?;
             }
 
@@ -4345,39 +4351,76 @@ pub async fn curation_drift(
     ProjectScope(scope): ProjectScope,
     Query(params): Query<CurationDriftQuery>,
 ) -> AppResult<Json<CurationDriftResponse>> {
-    use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
+    use crate::routes::private::readings::models as readings;
+    use crate::routes::private::sites::models as sites;
+    use sea_orm::sea_query::{Alias, Expr, JoinType, PostgresQueryBuilder, Query};
+    use sea_orm::{Condition, ConnectionTrait, ExprTrait, FromQueryResult, Statement};
 
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    // A reading outside the token's projects is not this caller's to see, and an unpaired one
-    // belongs to no project at all, so a scoped caller is shown neither.
-    let project_filter = project_filter_sql(&scope, "st.project_id", &mut values)
-        .map(|predicate| format!("WHERE {predicate}"))
-        .unwrap_or_default();
-    values.push(i64::from(limit).into());
-    let limit_param = values.len();
-
-    // Still spelled: the drift definition it reads from is `inconsistent_rows_sql`, a CTE with
-    // nested laterals over a VALUES list, and a subquery in `FROM` takes a built statement or
-    // nothing. It converts when that fragment does (C223).
-    let sql = format!(
-        r"SELECT d.stream_id, d.time, d.replicate_index, r.site_id, r.parameter_id,
-                 jsonb_strip_nulls(jsonb_build_object(
-                     'is_flagged', d.is_flagged, 'flag_reason', d.flag_reason,
-                     'withdrawn_at', d.withdrawn_at, 'withdrawn_reason', d.withdrawn_reason,
-                     'unverified', d.unverified, 'standard_curve_id', d.standard_curve_id,
-                     'calibration_id', d.calibration_id, 'sensor_id', d.sensor_id,
-                     'raw_value', d.raw_value)) AS stored,
-                 COALESCE(d.folded, '{{}}'::jsonb) AS folded
-          FROM ({drift}) d
-          JOIN readings r ON r.stream_id = d.stream_id AND r.time = d.time
-                         AND r.replicate_index = d.replicate_index
-          LEFT JOIN sites st ON st.id = r.site_id
-          {project_filter}
-          ORDER BY d.time DESC
-          LIMIT ${limit_param}",
-        drift = crate::routes::private::readings::service::inconsistent_rows_sql(),
-    );
+    let d = Alias::new("d");
+    let r = Alias::new("r");
+    let st = Alias::new("st");
+    let (sql, values) = Query::select()
+        .column((d.clone(), Alias::new("stream_id")))
+        .column((d.clone(), Alias::new("time")))
+        .column((d.clone(), Alias::new("replicate_index")))
+        .column((r.clone(), readings::Column::SiteId))
+        .column((r.clone(), readings::Column::ParameterId))
+        .expr_as(
+            Expr::cust(
+                "jsonb_strip_nulls(jsonb_build_object(\
+                     'is_flagged', d.is_flagged, 'flag_reason', d.flag_reason, \
+                     'withdrawn_at', d.withdrawn_at, 'withdrawn_reason', d.withdrawn_reason, \
+                     'unverified', d.unverified, 'standard_curve_id', d.standard_curve_id, \
+                     'calibration_id', d.calibration_id, 'sensor_id', d.sensor_id, \
+                     'raw_value', d.raw_value))",
+            ),
+            Alias::new("stored"),
+        )
+        .expr_as(
+            Expr::cust("COALESCE(d.folded, '{}'::jsonb)"),
+            Alias::new("folded"),
+        )
+        .from_subquery(
+            crate::routes::private::readings::service::inconsistent_rows(),
+            d.clone(),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            readings::Entity,
+            r.clone(),
+            Condition::all()
+                .add(
+                    Expr::col((r.clone(), readings::Column::StreamId))
+                        .equals((d.clone(), Alias::new("stream_id"))),
+                )
+                .add(
+                    Expr::col((r.clone(), readings::Column::Time))
+                        .equals((d.clone(), Alias::new("time"))),
+                )
+                .add(
+                    Expr::col((r.clone(), readings::Column::ReplicateIndex))
+                        .equals((d.clone(), Alias::new("replicate_index"))),
+                ),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            sites::Entity,
+            st.clone(),
+            Expr::col((st.clone(), sites::Column::Id)).equals((r, readings::Column::SiteId)),
+        )
+        // A reading outside the token's projects is not this caller's to see, and an unpaired one
+        // belongs to no project at all, so a scoped caller is shown neither.
+        .cond_where(
+            Condition::all().add_option(crate::common::scope::project_filter(
+                &scope,
+                (st, sites::Column::ProjectId),
+            )),
+        )
+        .order_by((d, Alias::new("time")), sea_orm::Order::Desc)
+        .limit(u64::from(limit))
+        .to_owned()
+        .build(PostgresQueryBuilder);
 
     let rows = app_state
         .db

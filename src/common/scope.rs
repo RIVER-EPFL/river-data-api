@@ -4,7 +4,7 @@
 //! other handler confines itself, and the default when it does not is to serve everything. These are
 //! the three shapes a handler needs, so confining is one call:
 //!
-//! - enumerating rows: [`scope_site_ids`] for a `site_id = ANY($n)` filter, or [`project_filter_sql`]
+//! - enumerating rows: [`scope_site_ids`] for a `site_id = ANY($n)` filter, or [`project_filter`]
 //!   when the query already joins `sites`;
 //! - a body-supplied target: [`require_sites_in_scope`], 403 outside the caller's projects;
 //! - an id-addressed row: [`require_row_in_scope`], 404 outside the caller's projects, over a
@@ -98,22 +98,8 @@ pub async fn require_sites_in_scope(
     crate::common::middleware::enforce_project_scope_for_sites(db, scope, site_ids).await
 }
 
-/// Push the caller's project set onto `values` and return the SQL predicate confining `column` to
-/// it, or `None` when the caller is unrestricted (the caller then omits the predicate). `column` is
-/// the query's own `project_id` expression, ie. `s.project_id`.
-#[must_use]
-pub fn project_filter_sql(
-    scope: &AccessScope,
-    column: &str,
-    values: &mut Vec<sea_orm::Value>,
-) -> Option<String> {
-    let projects = scope.sql_project_array()?;
-    values.push(projects);
-    Some(format!("{column} = ANY(${})", values.len()))
-}
-
-/// The same confinement as an expression, for a caller that builds its query rather than spelling
-/// it. `None` when the caller is unrestricted, which is a predicate the query then omits.
+/// The caller's projects as a predicate on `column`, `None` when the caller is unrestricted, which
+/// is a predicate the query then omits.
 #[must_use]
 pub fn project_filter(
     scope: &AccessScope,

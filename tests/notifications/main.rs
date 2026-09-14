@@ -16,4 +16,5 @@ mod mute_gate;
 mod probe_sql;
 mod reconcile_test;
 mod state_entity;
+mod subscriber_entity;
 mod triggers_test;

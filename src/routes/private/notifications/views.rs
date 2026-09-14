@@ -10,8 +10,8 @@ use axum::{
 };
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter,
-    QueryOrder, Statement, TransactionTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult,
+    IntoActiveModel, QueryFilter, QueryOrder, Statement, TransactionTrait,
 };
 use uuid::Uuid;
 
@@ -97,44 +97,6 @@ pub async fn test_send(
     }))
 }
 
-#[utoipa::path(
-    get,
-    path = "/api/notifications/subscribers",
-    responses((status = 200, description = "Subscriber roster", body = [SubscriberRow])),
-    tag = "notifications"
-)]
-pub async fn list_subscribers(
-    State(state): State<AppState>,
-) -> AppResult<Json<Vec<SubscriberRow>>> {
-    let rows = state
-        .db
-        .query_all_raw(Statement::from_string(
-            PG,
-            "WITH subs AS ( \
-                SELECT keycloak_sub FROM notification_subscribers \
-                UNION \
-                SELECT DISTINCT keycloak_sub FROM web_push_subscriptions \
-             ) \
-             SELECT s.keycloak_sub, \
-                COALESCE(ns.web_push_enabled, true) AS web_push_enabled, \
-                (SELECT COUNT(*) FROM notification_subscriptions nsub \
-                   WHERE nsub.keycloak_sub = s.keycloak_sub) AS overrides, \
-                (SELECT COUNT(*) FROM web_push_subscriptions wps \
-                   WHERE wps.keycloak_sub = s.keycloak_sub) AS push_count \
-             FROM subs s \
-             LEFT JOIN notification_subscribers ns ON ns.keycloak_sub = s.keycloak_sub \
-             ORDER BY s.keycloak_sub"
-                .to_string(),
-        ))
-        .await?;
-
-    let out = rows
-        .iter()
-        .map(|r| SubscriberRow::from_query_result(r, ""))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(out))
-}
-
 /// `GET /api/notifications/health`, latest persisted health per channel (admin-only).
 #[utoipa::path(
     get,
@@ -201,17 +163,16 @@ pub async fn update_my_notifications(
 ) -> AppResult<Json<MyNotifications>> {
     let sub = require_sub(&auth)?;
     ensure_subscriber(&state, &sub).await?;
-    state
-        .db
-        .execute_raw(Statement::from_sql_and_values(
-            PG,
-            "UPDATE notification_subscribers \
-             SET web_push_enabled = COALESCE($2, web_push_enabled), \
-                 updated_at = NOW() \
-             WHERE keycloak_sub = $1",
-            [sub.clone().into(), req.web_push_enabled.into()],
-        ))
-        .await?;
+    let row = find_subscriber(&state.db, &sub)
+        .await?
+        .ok_or_else(|| AppError::Internal("subscriber row missing after ensure".to_string()))?;
+    let mut prefs = row.into_active_model();
+    // An absent preference is left as it stands, which is what the update model says with NotSet.
+    if let Some(enabled) = req.web_push_enabled {
+        prefs.web_push_enabled = Set(enabled);
+        prefs.updated_at = Set(chrono::Utc::now());
+        prefs.update(&state.db).await?;
+    }
     Ok(Json(load(&state, &sub).await?))
 }
 
@@ -476,7 +437,6 @@ pub fn oversight_routes() -> Router<AppState> {
         .route("/notifications/deliveries", get(list_delivery_log))
         .route("/notifications/health/refresh", post(refresh_health))
         .route("/notifications/test-send", post(test_send))
-        .route("/notifications/subscribers", get(list_subscribers))
         .layer(middleware::from_fn(
             crate::common::middleware::require_admin,
         ))

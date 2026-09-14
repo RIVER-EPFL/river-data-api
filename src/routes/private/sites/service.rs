@@ -10,8 +10,8 @@ use sea_orm::sea_query::{
     SelectStatement,
 };
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
-    QuerySelect, Statement,
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult, Order, QueryFilter,
+    QueryOrder, QuerySelect, Statement,
 };
 use uuid::Uuid;
 
@@ -21,6 +21,9 @@ use crate::common::series::{Cells, Table};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::samples;
+use crate::routes::private::sensor_calibrations::models as sensor_calibrations;
+use crate::routes::private::sensor_deployments::models as sensor_deployments;
+use crate::routes::private::sensors::models as sensors;
 use crate::routes::private::site_parameters;
 
 // --- Site detail and the parameter list ---
@@ -855,6 +858,152 @@ pub(super) fn value_source(
 }
 
 // --- Sensor identity bands ---
+
+/// Deployments at a site whose slot overlaps the window, optionally confined to some parameters.
+///
+/// An open deployment has no `deployed_until` and covers everything after its start, which is what
+/// the NULL arm says.
+fn deployments_over_window(
+    d: &Alias,
+    site_id: Uuid,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    parameter_ids: Option<&[Uuid]>,
+) -> Condition {
+    let mut overlapping = Condition::all()
+        .add(Expr::col((d.clone(), sensor_deployments::Column::SiteId)).eq(site_id))
+        .add(Expr::col((d.clone(), sensor_deployments::Column::DeployedFrom)).lt(end))
+        .add(
+            Condition::any()
+                .add(Expr::col((d.clone(), sensor_deployments::Column::DeployedUntil)).is_null())
+                .add(Expr::col((d.clone(), sensor_deployments::Column::DeployedUntil)).gt(start)),
+        );
+    if let Some(ids) = parameter_ids.filter(|ids| !ids.is_empty()) {
+        overlapping = overlapping.add(
+            Expr::col((d.clone(), sensor_deployments::Column::ParameterId)).is_in(ids.to_vec()),
+        );
+    }
+    overlapping
+}
+
+/// The deployment bands a site's chart draws, each naming the instrument that held the slot.
+pub(super) fn sensor_identity_bands_query(
+    site_id: Uuid,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    parameter_ids: Option<&[Uuid]>,
+) -> SelectStatement {
+    let d = Alias::new("d");
+    let s = Alias::new("s");
+    let mut bands = SeaQuery::select();
+    bands
+        .expr_as(
+            Expr::col((d.clone(), sensor_deployments::Column::Id)),
+            Alias::new("deployment_id"),
+        )
+        .column((d.clone(), sensor_deployments::Column::SensorId))
+        .expr_as(
+            Expr::col((s.clone(), sensors::Column::SerialNumber)),
+            Alias::new("sensor_serial"),
+        )
+        .expr_as(
+            Expr::col((s.clone(), sensors::Column::Name)),
+            Alias::new("sensor_name"),
+        )
+        .column((d.clone(), sensor_deployments::Column::SiteId))
+        .column((d.clone(), sensor_deployments::Column::ParameterId))
+        .column((d.clone(), sensor_deployments::Column::DeployedFrom))
+        .column((d.clone(), sensor_deployments::Column::DeployedUntil))
+        .from_as(sensor_deployments::Entity, d.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            sensors::Entity,
+            s.clone(),
+            Expr::col((s, sensors::Column::Id))
+                .equals((d.clone(), sensor_deployments::Column::SensorId)),
+        )
+        .cond_where(deployments_over_window(
+            &d,
+            site_id,
+            start,
+            end,
+            parameter_ids,
+        ))
+        .order_by(
+            (d.clone(), sensor_deployments::Column::ParameterId),
+            Order::Asc,
+        )
+        .order_by((d, sensor_deployments::Column::DeployedFrom), Order::Asc);
+    bands
+}
+
+/// The calibration markers those bands carry: curves of the instruments deployed at the site over
+/// the window, overlapping it themselves.
+///
+/// A marker sits on the series of the calibration's own parameter, so a curve whose parameter is
+/// not resolved yet has no series to sit on and is left out.
+pub(super) fn sensor_calibration_markers_query(
+    site_id: Uuid,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    parameter_ids: Option<&[Uuid]>,
+) -> SelectStatement {
+    let c = Alias::new("c");
+    let d = Alias::new("d");
+
+    let mut deployed_here = SeaQuery::select();
+    deployed_here
+        .distinct()
+        .column((d.clone(), sensor_deployments::Column::SensorId))
+        .from_as(sensor_deployments::Entity, d.clone())
+        .cond_where(deployments_over_window(
+            &d,
+            site_id,
+            start,
+            end,
+            parameter_ids,
+        ));
+
+    let mut markers = SeaQuery::select();
+    markers
+        .expr_as(
+            Expr::col((c.clone(), sensor_calibrations::Column::Id)),
+            Alias::new("calibration_id"),
+        )
+        .column((c.clone(), sensor_calibrations::Column::SensorId))
+        .column((c.clone(), sensor_calibrations::Column::ParameterId))
+        .column((c.clone(), sensor_calibrations::Column::Slope))
+        .column((c.clone(), sensor_calibrations::Column::Intercept))
+        .column((c.clone(), sensor_calibrations::Column::ValidFrom))
+        .column((c.clone(), sensor_calibrations::Column::ValidUntil))
+        .from_as(sensor_calibrations::Entity, c.clone())
+        .cond_where(
+            Condition::all()
+                .add(
+                    Expr::col((c.clone(), sensor_calibrations::Column::SensorId))
+                        .in_subquery(deployed_here.take()),
+                )
+                .add(Expr::col((c.clone(), sensor_calibrations::Column::ParameterId)).is_not_null())
+                .add(Expr::col((c.clone(), sensor_calibrations::Column::ValidFrom)).lt(end))
+                .add(
+                    Condition::any()
+                        .add(
+                            Expr::col((c.clone(), sensor_calibrations::Column::ValidUntil))
+                                .is_null(),
+                        )
+                        .add(
+                            Expr::col((c.clone(), sensor_calibrations::Column::ValidUntil))
+                                .gt(start),
+                        ),
+                ),
+        )
+        .order_by(
+            (c.clone(), sensor_calibrations::Column::ParameterId),
+            Order::Asc,
+        )
+        .order_by((c, sensor_calibrations::Column::ValidFrom), Order::Asc);
+    markers
+}
 
 pub(super) fn parse_uuid_csv(s: &str) -> Vec<Uuid> {
     s.split(',')

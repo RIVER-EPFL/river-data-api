@@ -162,7 +162,10 @@ async fn withdrawn_index(db: &DatabaseConnection, stream_id: &str, index: i16) -
 async fn proposals(fx: &Fixture, status: &str) -> serde_json::Value {
     let (code, body) = crate::common::get_json_with_token(
         &fx.app,
-        &format!("/api/sync/change_proposals?status={status}"),
+        &format!(
+            "/api/reading_change_proposals?filter={}",
+            crate::common::e2e::percent_encode(&format!(r#"{{"status":"{status}"}}"#))
+        ),
         &fx.token,
     )
     .await;

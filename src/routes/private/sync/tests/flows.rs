@@ -6,7 +6,9 @@ use crate::routes::private::sync::models::events;
 
 fn swept_update_sql() -> String {
     events::Entity::update_many()
-        .filter(stale_running(Utc.with_ymd_and_hms(2026, 9, 11, 12, 0, 0).unwrap()))
+        .filter(stale_running(
+            Utc.with_ymd_and_hms(2026, 9, 11, 12, 0, 0).unwrap(),
+        ))
         .build(sea_orm::DatabaseBackend::Postgres)
         .to_string()
 }

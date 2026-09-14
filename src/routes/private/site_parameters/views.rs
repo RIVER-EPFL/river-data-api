@@ -59,7 +59,7 @@ use super::service::slot_scope;
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
 use crate::common::scope::Unowned;
-use crate::common::scope::project_filter_sql;
+use crate::common::scope::project_filter;
 use crate::common::scope::project_of_site_parameter;
 use crate::common::scope::require_target_in_scope;
 use crate::error::AppError;
@@ -567,9 +567,8 @@ pub async fn undeclared_sd_estimators(
 
     let mut undeclared_slots = Condition::all()
         .add(Expr::col((sp.clone(), site_parameters::Column::SdEstimator)).is_null());
-    let mut values: Vec<sea_orm::Value> = Vec::new();
-    if let Some(predicate) = project_filter_sql(&scope, "st.project_id", &mut values) {
-        undeclared_slots = undeclared_slots.add(Expr::cust_with_values(predicate, values));
+    if let Some(confine) = project_filter(&scope, (st.clone(), sites::Column::ProjectId)) {
+        undeclared_slots = undeclared_slots.add(confine);
     }
 
     let on_true = || Condition::all().add(Expr::cust("true"));

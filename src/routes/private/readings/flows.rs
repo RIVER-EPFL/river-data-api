@@ -18,8 +18,8 @@ use uuid::Uuid;
 
 use crate::routes::private::data_streams;
 use crate::routes::private::readings;
-use crate::routes::private::readings::models::import_staging;
 use crate::routes::private::readings::models::ConflictMode;
+use crate::routes::private::readings::models::import_staging;
 use crate::routes::private::readings::service::BATCH_SIZE as CSV_BATCH_SIZE;
 use crate::routes::private::readings::service::readings_on_conflict;
 use crate::routes::private::reprocessing_jobs::flows::{
@@ -523,7 +523,7 @@ impl CsvImport {
             let recomposed =
                 crate::routes::private::sensor_calibrations::service::recompose_from_own_curves_guarded(
                     ctx.db(),
-                    "TRUE",
+                    sea_orm::sea_query::Expr::cust("TRUE"),
                     "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3",
                     vec![
                         stream_ids.into(),
@@ -553,27 +553,22 @@ impl CsvImport {
             let mut stream_ids: Vec<Uuid> = models.iter().map(|m| *m.stream_id.as_ref()).collect();
             stream_ids.sort_unstable();
             stream_ids.dedup();
-            let row_predicate = format!(
-                "r.stream_id = ANY($1) AND r.time >= '{}'::timestamptz AND r.time <= '{}'::timestamptz",
-                first.to_rfc3339(),
-                last.to_rfc3339()
-            );
-            let stream_ids_for_events = stream_ids.clone();
-            crate::routes::private::readings::service::materialise_samples(
-                ctx.db(),
-                crate::routes::private::collection_events::flows::rows_matching(
-                    &row_predicate,
-                    vec![stream_ids.clone().into()],
-                ),
-            )
-            .await
-            .map_err(as_db_err)?;
+            let window = || {
+                use crate::routes::private::collection_events::flows::row;
+                use crate::routes::private::readings::models::Column;
+                sea_orm::Condition::all()
+                    .add(row(Column::StreamId).is_in(stream_ids.clone()))
+                    .add(row(Column::Time).gte(*first))
+                    .add(row(Column::Time).lte(*last))
+            };
+            crate::routes::private::readings::service::materialise_samples(ctx.db(), window())
+                .await
+                .map_err(as_db_err)?;
 
             // A CSV import is a person entering visits after the fact: manual collection events.
             crate::routes::private::collection_events::service::attach_collection_events(
                 ctx.db(),
-                &row_predicate,
-                vec![stream_ids.into()],
+                window(),
                 crate::routes::private::collection_events::service::EventSource::Manual,
             )
             .await
@@ -584,10 +579,7 @@ impl CsvImport {
             // events this looks them up by.
             touched_visits = crate::routes::private::collection_events::flows::touched_events(
                 ctx.db(),
-                crate::routes::private::collection_events::flows::rows_matching(
-                    &row_predicate,
-                    vec![stream_ids_for_events.into()],
-                ),
+                window(),
             )
             .await
             .map_err(as_db_err)?;

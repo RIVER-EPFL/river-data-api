@@ -1,5 +1,6 @@
-//! Admin notification oversight: the health probe endpoint, the one-off test-send, and the subscriber
-//! roster. All are admin-only (`require_admin`). Requires the dev Keycloak for real JWTs; auto-skips.
+//! Admin notification oversight: the health probe endpoint, the one-off test-send, and the
+//! subscriber roster, which is the `notification_subscribers` entity list. All are admin-only;
+//! requires the dev Keycloak for real JWTs, and auto-skips.
 
 use crate::common::keycloak::{build_test_app_with_keycloak, get_keycloak_jwt, keycloak_reachable};
 use serial_test::serial;
@@ -77,7 +78,7 @@ async fn subscriber_roster_lists_opted_in_users() {
     assert_eq!(s, 200);
 
     let (s, body) =
-        crate::common::get_json_with_token(&app, "/api/notifications/subscribers", &admin).await;
+        crate::common::get_json_with_token(&app, "/api/notification_subscribers", &admin).await;
     assert_eq!(s, 200, "admin reads the roster");
     let roster = body.as_array().expect("roster array");
     assert!(
@@ -85,10 +86,16 @@ async fn subscriber_roster_lists_opted_in_users() {
         "the opted-in user appears in the roster"
     );
     assert!(
-        roster.iter().all(|r| r["keycloakSub"].is_string()),
-        "each row carries keycloakSub"
+        roster.iter().all(|r| r["keycloak_sub"].is_string()),
+        "each row carries keycloak_sub"
+    );
+    assert!(
+        roster
+            .iter()
+            .all(|r| r["push_subscription_count"].as_i64() == Some(0)),
+        "the device count is filled in, and nobody registered one: {roster:?}"
     );
 
-    let (s, _) = crate::common::get_with_token(&app, "/api/notifications/subscribers", &user).await;
+    let (s, _) = crate::common::get_with_token(&app, "/api/notification_subscribers", &user).await;
     assert_eq!(s, 403, "a non-admin cannot read the roster");
 }

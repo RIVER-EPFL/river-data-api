@@ -1,5 +1,4 @@
 use super::JanitorRun;
-use crate::routes::private::alarms::flows::AlarmSweep;
 use crate::routes::private::reprocessing_jobs::service::{Job, TunableKind};
 
 fn janitor() -> JanitorRun {
@@ -35,19 +34,6 @@ fn the_janitor_still_takes_its_one_key() {
             .validate(&serde_json::json!({ "retention_days": 0 }))
             .is_err()
     );
-}
-
-#[test]
-fn a_job_with_no_tunables_refuses_every_key() {
-    let sweep = AlarmSweep {
-        interval_seconds: 60,
-    };
-    assert!(sweep.validate(&serde_json::json!({})).is_ok());
-    let err = sweep
-        .validate(&serde_json::json!({ "retention_days": 7 }))
-        .unwrap_err();
-    assert!(err.contains("no tunables"), "{err}");
-    assert!(err.contains("retention_days"), "{err}");
 }
 
 /// Every job accepts a tunables object built from its own declared defaults, and refuses a
