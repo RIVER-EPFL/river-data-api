@@ -18,8 +18,7 @@
 //! Nothing here fills the head of a rollup or repairs its history on a schedule. The views are
 //! real-time, so the open bucket is read from the raw rows, and each policy starts at NULL, so a
 //! change to an old reading is materialised again by the next tick. A refresh here is a caller
-//! making its own change visible before that tick, or an operator repairing a database that was
-//! edited out of band.
+//! making its own change visible before that tick, over the span it moved and no more.
 
 use chrono::{DateTime, Datelike, Duration, DurationRound, Months, Utc, Weekday};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
@@ -99,12 +98,9 @@ impl Resolution {
 
 /// What a refresh should cover. The head of every rollup is served from the raw rows and each
 /// view's policy starts at NULL, so a window here is only about making a change visible before
-/// the next tick would carry it.
+/// the next tick would carry it; there is no whole-history shape, because that is the policies'.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Window {
-    /// The whole history of every view (`NULL, NULL`). Nothing schedules this: it is the operator
-    /// repair for a database edited out of band, where waiting for the policy is not an answer.
-    Full,
     /// From an instant that changed up to now.
     Since(DateTime<Utc>),
     /// An explicit range of changed instants. Bounds may arrive in either order.
@@ -118,13 +114,11 @@ impl Window {
         touched.span().map(|(lo, hi)| Window::Range(lo, hi))
     }
 
-    /// The raw instants this window covers, before per-view bucket alignment. `None` is the whole
-    /// history, which needs no alignment.
-    fn bounds(self, now: DateTime<Utc>) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    /// The raw instants this window covers, before per-view bucket alignment.
+    fn bounds(self, now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
         match self {
-            Window::Full => None,
-            Window::Since(since) => Some((since, now.max(since))),
-            Window::Range(a, b) => Some((a.min(b), a.max(b))),
+            Window::Since(since) => (since, now.max(since)),
+            Window::Range(a, b) => (a.min(b), a.max(b)),
         }
     }
 }
@@ -170,12 +164,7 @@ fn refresh_statement(
     now: DateTime<Utc>,
 ) -> AppResult<Statement> {
     let view = resolution.view();
-    let Some((lo, hi)) = window.bounds(now) else {
-        return Ok(Statement::from_string(
-            DatabaseBackend::Postgres,
-            format!("CALL refresh_continuous_aggregate('{view}', NULL, NULL)"),
-        ));
-    };
+    let (lo, hi) = window.bounds(now);
     let start = resolution.floor(lo)?;
     let end = resolution.bucket_end(hi.max(lo))?;
     Ok(Statement::from_sql_and_values(

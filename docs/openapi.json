@@ -16018,19 +16018,6 @@
         ],
         "type": "object"
       },
-      "RefreshAggregatesRequest": {
-        "properties": {
-          "since": {
-            "description": "Rematerialise only from this instant to now. Omitted, the whole history is rematerialised,\nwhich is the repair for a database edited out of band; the open bucket is served from the\nraw rows and each policy already covers the rest.",
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "RegisterAnnotationsRequest": {
         "additionalProperties": false,
         "properties": {
@@ -25848,37 +25835,6 @@
           }
         },
         "summary": "Force a full open-alarm reconcile right now, instead of waiting for the periodic backstop\nsweep. Runs the same single tick the sweeper runs (open new breaches, refresh still-breaching,\nauto-resolve returned-to-range) across every active slot, synchronously, the post-LATERAL\nbreach query is O(active slots), so this returns in well under a second. Operator escape hatch\nfor \"I changed something and want the alarm state correct immediately\". Requires `write_data`.",
-        "tags": [
-          "actions"
-        ]
-      }
-    },
-    "/api/actions/refresh_aggregates": {
-      "post": {
-        "operationId": "refresh_aggregates",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RefreshAggregatesRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/QueuedJobResponse"
-                }
-              }
-            },
-            "description": "Refresh triggered"
-          }
-        },
-        "summary": "Refresh of TimescaleDB continuous aggregates, tracked as a `reprocessing_jobs` row.\nReturns immediately with the job id; the refresh runs in a background task with a\n10-minute timeout (a timeout marks the job `failed`). Requires `write_data`.",
         "tags": [
           "actions"
         ]

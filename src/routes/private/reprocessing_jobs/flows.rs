@@ -161,9 +161,8 @@ pub(crate) fn optional_datetime(
 
 /// Refresh the rollups over the window a caller states, so a change it already committed is
 /// visible before the hourly policy would carry it: `from` and `until` for a range, `since` for
-/// everything after an instant. A run naming no window rematerialises the whole history, which is
-/// the repair for a database edited out of band and the only thing left that the policies and the
-/// real-time head do not do by themselves.
+/// everything after an instant. A window is required; whole-history repair belongs to the
+/// policies, which start at NULL and rematerialise every bucket each hour.
 pub struct RefreshAggregates;
 
 #[async_trait]
@@ -183,7 +182,11 @@ impl Job for RefreshAggregates {
         let window = match (instant("from"), instant("until"), instant("since")) {
             (Some(from), Some(until), _) => crate::common::aggregates::Window::Range(from, until),
             (_, _, Some(since)) => crate::common::aggregates::Window::Since(since),
-            _ => crate::common::aggregates::Window::Full,
+            _ => {
+                return Err(DbErr::Custom(
+                    "refresh_aggregates needs a window: from and until, or since".into(),
+                ));
+            }
         };
         // A refresh that could not run must fail the job: reporting `completed` while the rollups
         // still serve the old numbers is the failure this job exists to make visible.
@@ -222,13 +225,15 @@ pub(crate) fn build(query: &sea_query::SelectStatement) -> Statement {
 // process-global `AppState` (`crate::common::global_app_state`), the same set-once handle pattern
 // the CrudCrate hooks use for the event sender.
 
-/// Fill missing derived readings, refresh continuous aggregates, and prune old tracked-job rows,
-/// the derived-consistency janitor. Wraps [`janitor::run_once`] plus the per-tick full/incremental
-/// refresh and periodic retention the old `janitor::periodic` loop did.
+/// Fill missing derived readings, recompose values whose curve coefficients moved, and prune old
+/// tracked-job rows. The rollups are not its business: they serve their head from the raw rows and
+/// each policy rematerialises the history hourly, so what this job refreshes is only the span its
+/// own writes moved.
 pub struct JanitorRun {
     /// Fallback cadence for the full-refresh decision, used only when the run carries no
     /// scheduler-stamped `interval_seconds` (`run_now`). The `schedules` row is the authority.
     interval_seconds: u64,
+    /// How often one tick runs the derived gap scan unbounded instead of over twice the cadence.
     full_refresh_seconds: u64,
     maintenance_retention_days: u32,
     operator_retention_days: u32,

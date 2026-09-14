@@ -260,11 +260,10 @@ mod tests;
 //    target: `require_named_target` refuses it. Administrators, unscoped tokens and sync tokens are
 //    unrestricted and unaffected.
 //
-// `refresh_aggregates` and `reconcile_alarms` are the two exceptions to rule 3, and the reason is
-// what they write: neither takes a target because neither touches stored measurements or history.
-// They recompute derived state (the rollups, the open-alarm set) that the scheduler already
-// recomputes on its own cadence, so a member triggering one changes nothing they could not obtain
-// by waiting.
+// `reconcile_alarms` is the one exception to rule 3, and the reason is what it writes: it takes no
+// target because it touches no stored measurement or history. It recomputes derived state (the
+// open-alarm set) that the sweeper already recomputes on its own cadence, so a member triggering
+// one changes nothing they could not obtain by waiting.
 //
 // `deny_scoped_token` on the route group stops a project-scoped API TOKEN before any of this; it
 // was never a check on granted members, who reach these handlers as `AccessScope::Projects`.

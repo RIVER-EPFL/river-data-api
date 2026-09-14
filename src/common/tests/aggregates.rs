@@ -234,10 +234,18 @@ fn test_since_covers_the_current_bucket() {
 }
 
 #[test]
-fn test_full_binds_no_values() {
-    let statement = refresh_statement(Resolution::Hourly, Window::Full, Utc::now()).unwrap();
-    assert!(statement.sql.contains("NULL, NULL"));
-    assert!(statement.values.is_none());
+fn test_every_window_binds_both_instants() {
+    let now = Utc::now();
+    for window in [
+        Window::Since(t("2026-08-12T14:22:00Z")),
+        Window::Range(t("2026-08-12T14:22:00Z"), t("2026-08-12T16:10:00Z")),
+    ] {
+        for resolution in Resolution::ALL {
+            let statement = refresh_statement(resolution, window, now).unwrap();
+            assert!(statement.sql.contains("$1::timestamptz, $2::timestamptz"));
+            assert_eq!(statement.values.as_ref().map(|v| v.0.len()), Some(2));
+        }
+    }
 }
 
 #[test]

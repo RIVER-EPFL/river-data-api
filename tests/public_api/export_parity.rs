@@ -720,25 +720,6 @@ async fn public_aggregates_list_only_the_requested_sites_parameters() {
     )
     .await;
 
-    let (status, refresh) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/actions/refresh_aggregates",
-        &json!({ "full": true }),
-        &jwt,
-    )
-    .await;
-    assert!(
-        (200..300).contains(&status),
-        "refresh aggregates ({status}): {refresh}"
-    );
-    let job_id = refresh["job_id"].as_str();
-    assert!(job_id.is_some(), "the refresh is a tracked job: {refresh}");
-    assert_eq!(
-        e2e::poll_job(&app, &jwt, job_id.unwrap(), 30).await,
-        "completed",
-        "the aggregate refresh completes"
-    );
-
     let window = "start=2025-06-06T00:00:00Z&end=2025-06-06T23:59:59Z";
     let (status, narrow_agg) = crate::common::get_json(
         &app,

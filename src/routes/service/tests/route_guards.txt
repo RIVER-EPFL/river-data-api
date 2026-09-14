@@ -14,7 +14,6 @@
 /actions/preview_derived => require_read_data
 /actions/rebuild_alarm_events => deny_scoped_token+require_write_data
 /actions/reconcile_alarms => deny_scoped_token+require_write_data
-/actions/refresh_aggregates => deny_scoped_token+require_write_data
 /actions/reprocess => deny_scoped_token+require_manage_sensors
 /actions/reprocess_all => deny_scoped_token+require_write_data
 /actions/retag_sd_estimator => deny_scoped_token+require_manage_sensors

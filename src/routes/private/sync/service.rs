@@ -3214,16 +3214,6 @@ pub async fn apply_plan(
         )
         .await?;
     }
-    crate::routes::private::reprocessing_jobs::service::enqueue(
-        db,
-        "refresh_aggregates",
-        None,
-        None,
-        &serde_json::json!({}),
-        None,
-    )
-    .await?;
-
     let result = ApplyResult {
         projects_created: counters.projects_created,
         sites_created: counters.sites_created,

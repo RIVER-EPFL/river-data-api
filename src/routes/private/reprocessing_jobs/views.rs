@@ -16,7 +16,6 @@ use sea_orm::Statement;
 use sea_orm::sea_query::Expr;
 use serde::Deserialize;
 use serde::Serialize;
-use utoipa::ToSchema;
 use uuid::Uuid;
 
 use super::models::job;
@@ -34,7 +33,6 @@ use crate::common::scope::RowProject;
 use crate::common::scope::Unowned;
 use crate::error::AppError;
 use crate::error::AppResult;
-use crate::routes::private::reprocessing_jobs::models::QueuedJobResponse;
 
 /// The statuses a job can still be cancelled or found in flight from: not yet finished, whoever
 /// holds it. `pending` and `retrying` are historical and still on rows.
@@ -49,7 +47,7 @@ fn sql_list(states: &[&str]) -> String {
 /// Refuse a job whose target lies outside the caller's grants. An out-of-scope job and an absent
 /// one answer 404 alike, so the response does not confirm the job exists.
 ///
-/// A job with no project-bearing target (`refresh_aggregates`, `reprocess_all`) is admitted: any
+/// A job with no project-bearing target (`reprocess_all`) is admitted: any
 /// member may trigger one, so withholding its timeline would hide the record of their own run.
 /// A job naming a target that resolves to no project is refused.
 async fn confine_job(state: &AppState, scope: &AccessScope, job_id: Uuid) -> AppResult<()> {
@@ -401,45 +399,6 @@ pub async fn get_schedule_audit(
         )
         .await?,
     ))
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct RefreshAggregatesRequest {
-    /// Rematerialise only from this instant to now. Omitted, the whole history is rematerialised,
-    /// which is the repair for a database edited out of band; the open bucket is served from the
-    /// raw rows and each policy already covers the rest.
-    #[serde(default)]
-    pub since: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-/// Refresh of TimescaleDB continuous aggregates, tracked as a `reprocessing_jobs` row.
-/// Returns immediately with the job id; the refresh runs in a background task with a
-/// 10-minute timeout (a timeout marks the job `failed`). Requires `write_data`.
-#[utoipa::path(
-    post,
-    path = "/api/actions/refresh_aggregates",
-    request_body = RefreshAggregatesRequest,
-    responses(
-        (status = 200, description = "Refresh triggered", body = QueuedJobResponse),
-    ),
-    tag = "actions"
-)]
-pub async fn refresh_aggregates(
-    State(app_state): State<AppState>,
-    Json(payload): Json<RefreshAggregatesRequest>,
-) -> AppResult<Json<QueuedJobResponse>> {
-    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
-        &app_state.db,
-        "refresh_aggregates",
-        None,
-        None,
-        &serde_json::json!({ "since": payload.since.map(|t| t.to_rfc3339()) }),
-        None,
-    )
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    Ok(Json(QueuedJobResponse::queued(job_id)))
 }
 
 #[cfg(test)]

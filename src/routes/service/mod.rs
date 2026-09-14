@@ -306,7 +306,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         data_streams::views as stream_views, derived_parameters::views as derived_views,
         parameters::views as parameter_views, projects::views as project_views,
         readings::status_events::views as status_events_batch, readings::views as readings_views,
-        reprocessing_jobs::views as job_views, search,
+        search,
         sensor_calibrations::views as calibration_views,
         sensor_deployments::views as deployment_views, sensors::views as sensor_views,
         site_parameters::views as site_parameter_views, sync::views as sync_views, tools,
@@ -418,10 +418,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     // Operator / global data actions that span projects or have no per-project target. Denied to
     // project-scoped tokens (a logger key has no reason to trigger a global reprocess/refresh).
     let data_action_routes = Router::new()
-        .route(
-            "/actions/refresh_aggregates",
-            post(job_views::refresh_aggregates),
-        )
         .route(
             "/actions/compute_derived",
             post(derived_views::compute_derived),
