@@ -5,9 +5,9 @@ use chrono::{DateTime, Utc};
 use sea_orm::DbErr;
 use std::collections::BTreeMap;
 
-use super::models::{Point, Subscriber};
+use super::models::{Fetched, Point, Subscriber};
 use super::service::{
-    advance_cursor, cursor, insert, instrument, provision, recent_url, series, subscribers,
+    advance_cursor, cursor, fetch, insert, instrument, provision, recent_url, series, subscribers,
 };
 use crate::config::Config;
 use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport, Schedule};
@@ -69,8 +69,8 @@ impl Job for MeteoswissSync {
         let mut inserted = 0usize;
         let mut stations_read = 0usize;
         let mut stations_failed = 0usize;
+        let mut unchanged = 0usize;
         let mut variables_failed = 0usize;
-        let mut unattached = 0usize;
         let mut blank = 0usize;
         let mut unreadable = 0usize;
         let mut earliest: Option<DateTime<Utc>> = None;
@@ -80,8 +80,14 @@ impl Job for MeteoswissSync {
                 break;
             }
             let url = recent_url(&self.base_url, &station);
-            let body = match fetch(&client, &url).await {
-                Ok(body) => body,
+            let body = match fetch(ctx.db(), &client, &url).await {
+                Ok(Fetched::Body(body)) => body,
+                // The source holds what the last tick landed, so there is nothing to read out of
+                // it and nothing to report against the station.
+                Ok(Fetched::Unchanged) => {
+                    unchanged += 1;
+                    continue;
+                }
                 Err(e) => {
                     stations_failed += 1;
                     ctx.log(
@@ -113,20 +119,7 @@ impl Job for MeteoswissSync {
                 unreadable += series.unreadable;
 
                 for site in sites {
-                    let Some(parameter_id) = site.parameter_id else {
-                        unattached += 1;
-                        ctx.log(
-                            "warn",
-                            "A MeteoSwiss subscription lands on no catalog parameter",
-                            serde_json::json!({
-                                "subscription_id": site.subscription_id,
-                                "station": station,
-                                "variable": variable,
-                            }),
-                        )
-                        .await;
-                        continue;
-                    };
+                    let parameter_id = site.parameter_id;
                     let stream_id = provision(ctx.db(), &site, parameter_id).await?;
                     let cursor = cursor(ctx.db(), stream_id).await?;
                     let fresh: Vec<&Point> = series
@@ -175,8 +168,8 @@ impl Job for MeteoswissSync {
                 .scope_opt("since", earliest.map(|t| t.to_rfc3339()))
                 .count("stations", stations_read)
                 .count("stations_failed", stations_failed)
+                .count("stations_unchanged", unchanged)
                 .count("variables_failed", variables_failed)
-                .count("subscriptions_unattached", unattached)
                 .count("readings_inserted", inserted)
                 .count("blank_cells", blank)
                 .count("unreadable_rows", unreadable),
@@ -184,13 +177,4 @@ impl Job for MeteoswissSync {
         .await;
         Ok(i64::try_from(inserted).unwrap_or(i64::MAX))
     }
-}
-
-async fn fetch(client: &reqwest::Client, url: &str) -> Result<String, String> {
-    let response = client.get(url).send().await.map_err(|e| e.to_string())?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("{url}: HTTP {status}"));
-    }
-    response.text().await.map_err(|e| e.to_string())
 }

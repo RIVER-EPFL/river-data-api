@@ -10305,13 +10305,6 @@
               "null"
             ]
           },
-          "parameter_id": {
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "site_id": {
             "format": "uuid",
             "type": "string"
@@ -10348,12 +10341,9 @@
             "type": "string"
           },
           "parameter_id": {
-            "description": "The catalog parameter the variable lands on. Null lands nothing: a tick says so and\nmoves to the next subscription.",
+            "description": "The catalog parameter the variable lands on, minted with the subscription.",
             "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "site_id": {
             "format": "uuid",
@@ -10397,12 +10387,9 @@
             "type": "string"
           },
           "parameter_id": {
-            "description": "The catalog parameter the variable lands on. Null lands nothing: a tick says so and\nmoves to the next subscription.",
+            "description": "The catalog parameter the variable lands on, minted with the subscription.",
             "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "site_id": {
             "format": "uuid",
@@ -10433,13 +10420,6 @@
           "enabled": {
             "type": [
               "boolean",
-              "null"
-            ]
-          },
-          "parameter_id": {
-            "format": "uuid",
-            "type": [
-              "string",
               "null"
             ]
           },

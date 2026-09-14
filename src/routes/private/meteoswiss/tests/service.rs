@@ -1,4 +1,4 @@
-use super::{insert_chunk, recent_url, series};
+use super::{VARIABLES, insert_chunk, recent_url, require_declared, series, variable};
 use crate::routes::private::meteoswiss::models::Point;
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
@@ -112,4 +112,24 @@ fn test_the_insert_tags_the_rows_continuous_and_does_nothing_on_conflict() {
     );
     assert!(str::contains(&sql, "'continuous'"), "{sql}");
     assert!(str::ends_with(&sql, "DO NOTHING"), "{sql}");
+}
+
+/// Scenario: a site is subscribed to a variable name somebody typed.
+/// Expected behaviour: only a declared variable is accepted, whatever its case and spacing, and a
+/// refusal names what is on offer.
+#[test]
+fn test_only_a_declared_variable_can_be_subscribed_to() {
+    assert_eq!(
+        variable("  PRESTAS0 ").map(|v| v.code),
+        Some("barometric_pressure")
+    );
+    assert!(require_declared("prestas0").is_ok());
+
+    let refusal =
+        require_declared("tre200s0").expect_err("the feed publishes no such subscription");
+    let message = format!("{refusal:?}");
+    assert!(str::contains(&message, "tre200s0"), "{message}");
+    for declared in VARIABLES {
+        assert!(str::contains(&message, declared.name), "{message}");
+    }
 }

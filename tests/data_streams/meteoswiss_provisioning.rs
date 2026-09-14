@@ -5,9 +5,10 @@
 //! Run with: cargo test --test data_streams meteoswiss
 
 use chrono::{DateTime, TimeZone, Utc};
+use river_db::routes::private::meteoswiss::models::subscription::MeteoswissSubscriptionCreate;
 use river_db::routes::private::meteoswiss::models::{Point, Subscriber};
 use river_db::routes::private::meteoswiss::service::{
-    advance_cursor, cursor, instrument, parameter_id, provision, subscribers,
+    MeteoswissSubscriptionOperations, advance_cursor, cursor, instrument, provision, subscribers,
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serial_test::serial;
@@ -79,9 +80,7 @@ async fn meteoswiss_declaration_provisions_a_paired_pressure_stream() {
     assert_eq!(declared[0].station, STATION);
     assert_eq!(declared[0].variable, VARIABLE);
 
-    let parameter = declared[0]
-        .parameter_id
-        .expect("the subscription names the parameter it lands on");
+    let parameter = declared[0].parameter_id;
     let stream_id = provision(&db, &declared[0], parameter).await.unwrap();
 
     let paired = scalar_i64(
@@ -127,14 +126,14 @@ async fn meteoswiss_readings_land_attributed_and_a_replay_inserts_nothing() {
     ensure_pressure_parameter(&db).await;
     subscribe(&db, crate::common::fixtures::SITE1_ID, STATION).await;
 
-    let parameter = parameter_id(&db).await.unwrap().unwrap();
+    let parameter = subscribers(&db).await.unwrap()[0].parameter_id;
     let site = Subscriber {
         subscription_id: Uuid::new_v4(),
         site_id: Uuid::parse_str(crate::common::fixtures::SITE1_ID).unwrap(),
         site_name: "Site 1".to_string(),
         station: STATION.to_string(),
         variable: VARIABLE.to_string(),
-        parameter_id: Some(parameter),
+        parameter_id: parameter,
     };
     let stream_id = provision(&db, &site, parameter).await.unwrap();
     let sensor_id = instrument(&db, STATION).await.unwrap();
@@ -277,4 +276,129 @@ async fn a_station_registers_once_and_leaves_the_provenance_less_instruments_alo
     );
 
     crate::common::cleanup_test_db(&db).await;
+}
+
+/// Scenario: a blank catalog, and a site subscribed to station pressure.
+/// Expected behaviour: the subscription mints the catalog row its variable lands on and points at
+/// it, and a second site subscribing to the same variable reuses that row.
+#[tokio::test]
+#[serial]
+async fn subscribing_mints_the_catalog_parameter_the_variable_lands_on() {
+    use crudcrate::CRUDOperations;
+
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT count(*) AS n FROM parameters WHERE lower(code) = 'barometric_pressure'",
+        )
+        .await,
+        0,
+        "the catalog does not hold it before anyone subscribes"
+    );
+
+    let subscribe = |site_id: &'static str| MeteoswissSubscriptionCreate {
+        site_id: Uuid::parse_str(site_id).unwrap(),
+        station_abbr: STATION.to_string(),
+        variable: VARIABLE.to_string(),
+        enabled: Some(true),
+    };
+    let first = MeteoswissSubscriptionOperations
+        .perform_create(&db, subscribe(crate::common::fixtures::SITE1_ID))
+        .await
+        .expect("subscribe the first site");
+    let second = MeteoswissSubscriptionOperations
+        .perform_create(&db, subscribe(crate::common::fixtures::SITE2_ID))
+        .await
+        .expect("subscribe the second site");
+
+    assert_eq!(
+        first.parameter_id, second.parameter_id,
+        "one catalog row serves every site reading the variable"
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT count(*) AS n FROM parameters \
+                  WHERE id = '{}' AND lower(code) = 'barometric_pressure' \
+                    AND default_units = 'hPa' AND category = 'measurement'",
+                first.parameter_id
+            ),
+        )
+        .await,
+        1,
+        "the minted row is the variable's declaration"
+    );
+
+    let subscriptions = subscribers(&db).await.unwrap();
+    assert_eq!(subscriptions.len(), 2);
+    assert!(
+        subscriptions
+            .iter()
+            .all(|s| s.parameter_id == first.parameter_id)
+    );
+}
+
+/// Scenario: the SMN file has not been republished since the last tick.
+/// Expected behaviour: the stored ETag goes out as `If-None-Match`, the source answers 304, and
+/// the fetch reports the body unchanged rather than downloading it again.
+#[tokio::test]
+#[serial]
+async fn a_second_fetch_is_conditional_and_a_304_reads_as_unchanged() {
+    use axum::http::{HeaderMap, StatusCode};
+    use river_db::routes::private::meteoswiss::models::Fetched;
+    use river_db::routes::private::meteoswiss::service::fetch;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+
+    const ETAG: &str = "\"smn-1\"";
+    let bodies_served = Arc::new(AtomicUsize::new(0));
+    let served = bodies_served.clone();
+    let app = axum::Router::new().route(
+        "/file.csv",
+        axum::routing::get(move |headers: HeaderMap| {
+            let served = served.clone();
+            async move {
+                if headers
+                    .get(axum::http::header::IF_NONE_MATCH)
+                    .and_then(|v| v.to_str().ok())
+                    == Some(ETAG)
+                {
+                    return (StatusCode::NOT_MODIFIED, [("etag", ETAG)], String::new());
+                }
+                served.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    [("etag", ETAG)],
+                    "station;value".to_string(),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/file.csv", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let client = reqwest::Client::new();
+    let first = fetch(&db, &client, &url).await.expect("the first fetch");
+    assert!(matches!(first, Fetched::Body(ref body) if body == "station;value"));
+    let second = fetch(&db, &client, &url).await.expect("the second fetch");
+    assert!(
+        matches!(second, Fetched::Unchanged),
+        "the source holds what we hold"
+    );
+    assert_eq!(
+        bodies_served.load(Ordering::SeqCst),
+        1,
+        "the body is downloaded once"
+    );
+
+    server.abort();
 }

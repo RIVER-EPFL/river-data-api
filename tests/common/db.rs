@@ -223,6 +223,7 @@ pub const CLEANUP_TRUNCATED_TABLES: &[&str] = &[
     "instrument_proposals",
     "pairing_plans",
     "data_streams",
+    "meteoswiss_fetch_state",
     "reprocessing_jobs",
     "schedules",
     "change_audit",

@@ -1,5 +1,6 @@
-//! The shapes the MeteoSwiss feed is read into: one parsed interval, what a file yielded, the
-//! subscription a site holds, and that subscription as the sync reads it.
+//! The shapes the MeteoSwiss feed is read into: one parsed interval, what a file yielded, what a
+//! conditional fetch returned, the subscription a site holds, and that subscription as the sync
+//! reads it.
 
 use chrono::{DateTime, Utc};
 use sea_orm::FromQueryResult;
@@ -23,6 +24,12 @@ pub struct Series {
     pub unreadable: usize,
 }
 
+/// What a conditional fetch returned: the body, or the source saying it holds what we hold.
+pub enum Fetched {
+    Body(String),
+    Unchanged,
+}
+
 /// One enabled subscription, with the site it feeds.
 #[derive(Debug, FromQueryResult)]
 pub struct Subscriber {
@@ -31,12 +38,14 @@ pub struct Subscriber {
     pub site_name: String,
     pub station: String,
     pub variable: String,
-    pub parameter_id: Option<Uuid>,
+    pub parameter_id: Uuid,
 }
 
 pub mod subscription {
     use crudcrate::EntityToModels;
     use sea_orm::entity::prelude::*;
+
+    use super::super::service::MeteoswissSubscriptionOperations;
 
     #[derive(
         Clone,
@@ -52,7 +61,8 @@ pub mod subscription {
         api_struct = "MeteoswissSubscription",
         name_singular = "meteoswiss_subscription",
         name_plural = "meteoswiss_subscriptions",
-        generate_router
+        generate_router,
+        operations = MeteoswissSubscriptionOperations
     )]
     pub struct Model {
         #[sea_orm(primary_key, auto_increment = false)]
@@ -66,15 +76,34 @@ pub mod subscription {
         /// The SMN variable the station is read for, `prestas0` for station-level pressure.
         #[crudcrate(filterable, sortable)]
         pub variable: String,
-        /// The catalog parameter the variable lands on. Null lands nothing: a tick says so and
-        /// moves to the next subscription.
-        #[crudcrate(filterable)]
-        pub parameter_id: Option<Uuid>,
+        /// The catalog parameter the variable lands on, minted with the subscription.
+        #[crudcrate(filterable, exclude(create, update))]
+        pub parameter_id: Uuid,
         /// A subscription switched off keeps the station and the variable and stops the fetch.
         #[crudcrate(filterable, sortable, on_create = true)]
         pub enabled: bool,
         #[crudcrate(exclude(create, update), sortable)]
         pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod fetch_state {
+    use sea_orm::entity::prelude::*;
+
+    /// What the last fetch of one URL returned. The ETag is the source's, echoed back on the next
+    /// request as `If-None-Match`.
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize)]
+    #[sea_orm(table_name = "meteoswiss_fetch_state")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub url: String,
+        pub etag: Option<String>,
+        pub fetched_at: chrono::DateTime<chrono::Utc>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
