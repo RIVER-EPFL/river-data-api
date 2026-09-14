@@ -9,6 +9,7 @@ mod common;
 mod apply_group;
 mod create_flags;
 mod declare_sd_estimator;
+mod delete_guard;
 mod minimal_create;
 mod needs_review;
 mod retag_sd_estimator;

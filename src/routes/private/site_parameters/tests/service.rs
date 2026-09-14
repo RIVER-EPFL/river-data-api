@@ -174,3 +174,18 @@ fn an_empty_id_list_narrows_the_scope_rather_than_widening_it() {
         "the stream id is still matched: {no_slots}"
     );
 }
+
+/// Expected behaviour: a slot that measured nothing deletes, and one that holds readings is
+/// refused with the count in the message. Deleting the second nulls `site_id` and `parameter_id`
+/// on every reading it carried, which is what the Active toggle exists to avoid (Q160).
+#[test]
+fn test_only_a_slot_that_measured_nothing_can_be_deleted() {
+    assert_eq!(super::refuse_delete_of_measured_slot(0), None);
+
+    let refusal = super::refuse_delete_of_measured_slot(14_203).expect("a measured slot refuses");
+    assert!(refusal.contains("14203"), "the count is named: {refusal}");
+    assert!(
+        refusal.contains("Active"),
+        "the refusal points at the toggle that retires: {refusal}"
+    );
+}

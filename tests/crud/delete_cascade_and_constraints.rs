@@ -9,8 +9,9 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
     (f.db, f.app, f.token)
 }
 
-// Scenario: site_parameter has paired data_streams + readings.
-// Expected behaviour: DELETE succeeds, streams are unpaired (site_parameter_id set to NULL).
+// Scenario: a site stops measuring a parameter someone wants the slot gone for.
+// Expected behaviour: the delete is refused while the slot holds readings, and the streams paired
+// to it stay paired; retirement is the Active flag, which keeps the history attributed (Q160).
 #[tokio::test]
 #[serial]
 async fn delete_site_parameter_with_paired_streams() {
@@ -28,12 +29,93 @@ async fn delete_site_parameter_with_paired_streams() {
         "site_parameter should have paired streams"
     );
 
-    let (status, _) =
+    let (status, body) =
+        crate::common::delete_with_token(&app, &format!("/api/site_parameters/{sp_id}"), &token)
+            .await;
+    assert_eq!(status, 400, "a measured slot is refused: {body}");
+
+    let still_paired = count(
+        &db,
+        &format!("SELECT count(*) AS c FROM data_streams WHERE site_parameter_id = '{sp_id}'"),
+    )
+    .await;
+    assert_eq!(still_paired, stream_count, "the refusal changed nothing");
+
+    let attributed = count(
+        &db,
+        &format!(
+            "SELECT count(*) AS c FROM readings r JOIN site_parameters sp ON sp.id = '{sp_id}' \
+             WHERE r.site_id = sp.site_id AND r.parameter_id = sp.parameter_id"
+        ),
+    )
+    .await;
+    assert!(attributed > 0, "the readings are still the slot's");
+
+    let sp_exists = count(
+        &db,
+        &format!("SELECT count(*) AS c FROM site_parameters WHERE id = '{sp_id}'"),
+    )
+    .await;
+    assert_eq!(sp_exists, 1, "the slot is still there");
+}
+
+// Scenario: a slot paired by mistake, before anything was measured through it.
+// Expected behaviour: DELETE succeeds and the streams paired to it are released.
+#[tokio::test]
+#[serial]
+async fn delete_unmeasured_site_parameter_unpairs_its_streams() {
+    let (db, app, token) = setup().await;
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        "/api/site_parameters",
+        &serde_json::json!({
+            "site_id": crate::common::SITE2_ID,
+            "parameter_id": crate::common::GLOBAL_PARAM_DEPTH_ID,
+        }),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "create the slot: {status} {text}"
+    );
+    let created: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+    let sp_id = created["id"].as_str().expect("id").to_string();
+
+    let (rstatus, rtext) = crate::common::post_json_with_token(
+        &app,
+        "/api/streams/register",
+        &serde_json::json!({
+            "source_system": "test",
+            "source_key": "unmeasured-slot-stream",
+            "name": "Unmeasured slot stream",
+        }),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&rstatus),
+        "register a stream: {rstatus} {rtext}"
+    );
+    let stream: serde_json::Value = serde_json::from_str(&rtext).expect("valid json");
+    let stream_id = stream["id"].as_str().expect("stream id").to_string();
+
+    let (pstatus, ptext) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/streams/{stream_id}/pair"),
+        &serde_json::json!({ "site_parameter_id": sp_id }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&pstatus), "pair it: {pstatus} {ptext}");
+
+    let (dstatus, dtext) =
         crate::common::delete_with_token(&app, &format!("/api/site_parameters/{sp_id}"), &token)
             .await;
     assert!(
-        status == 200 || status == 204,
-        "DELETE should succeed, got {status}"
+        (200..300).contains(&dstatus),
+        "an unmeasured slot deletes: {dstatus} {dtext}"
     );
 
     let unpaired = count(

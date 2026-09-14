@@ -8,6 +8,7 @@ use sea_orm::ColumnTrait;
 use sea_orm::ConnectionTrait;
 use sea_orm::DatabaseConnection;
 use sea_orm::EntityTrait;
+use sea_orm::PaginatorTrait;
 use sea_orm::QueryFilter;
 use sea_orm::QuerySelect;
 use sea_orm::Statement;
@@ -49,6 +50,32 @@ use crate::routes::private::reprocessing_jobs::models::job as reprocessing_jobs;
 use crate::routes::private::sensors::service::require_measuring_instrument;
 use crate::routes::private::site_parameters;
 
+/// How many readings the slot carries. Zero is a slot paired by mistake and never measured, which
+/// deletes; anything else is a history the delete would unattribute.
+async fn readings_held<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<u64, sea_orm::DbErr> {
+    let Some(slot) = Entity::find_by_id(id).one(db).await? else {
+        return Ok(0);
+    };
+    readings::Entity::find()
+        .filter(readings::Column::SiteId.eq(slot.site_id))
+        .filter(readings::Column::ParameterId.eq(slot.parameter_id))
+        .count(db)
+        .await
+}
+
+/// Why a delete is refused, or None where the slot has nothing to lose. Deleting a measured slot
+/// nulls `site_id` and `parameter_id` on every reading it carried, which is what the Active toggle
+/// exists to avoid (Q160).
+fn refuse_delete_of_measured_slot(held: u64) -> Option<String> {
+    (held > 0).then(|| {
+        format!(
+            "This parameter holds {held} readings at this site. Deleting it would leave them \
+             attributed to no site and no parameter. Untick Active to retire the slot and keep \
+             its history."
+        )
+    })
+}
+
 pub struct SiteParameterOperations;
 
 impl CRUDOperations for SiteParameterOperations {
@@ -69,11 +96,18 @@ impl CRUDOperations for SiteParameterOperations {
     /// events, delete the samples nothing references any more, release the streams that fed it,
     /// and rebuild the rollups. `retire_slot` also does the `data_streams` NULLing the foreign key
     /// requires, so the delete CrudCrate performs next succeeds.
+    ///
+    /// A slot that measured something is retired with its Active flag instead, so nothing here
+    /// unattributes a history (Q160).
     async fn before_delete<C: ConnectionTrait + TransactionTrait>(
         &self,
         db: &C,
         id: Uuid,
     ) -> Result<(), ApiError> {
+        let held = readings_held(db, id).await.map_err(ApiError::database)?;
+        if let Some(refusal) = refuse_delete_of_measured_slot(held) {
+            return Err(ApiError::bad_request(refusal));
+        }
         crate::routes::private::data_streams::flows::retire_slot(
             db,
             crate::routes::private::data_streams::models::SlotScope::SiteParameter(id),
