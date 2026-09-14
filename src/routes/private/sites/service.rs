@@ -703,6 +703,8 @@ pub(super) fn withdrawn_instants_query(
 pub fn resolution_of(keyword: &str) -> Option<Resolution> {
     match keyword {
         "hourly" => Some(Resolution::Hourly),
+        "6hourly" => Some(Resolution::SixHourly),
+        "12hourly" => Some(Resolution::TwelveHourly),
         "daily" => Some(Resolution::Daily),
         "weekly" => Some(Resolution::Weekly),
         "monthly" => Some(Resolution::Monthly),
@@ -715,6 +717,8 @@ pub fn resolution_of(keyword: &str) -> Option<Resolution> {
 pub fn bucket_interval(resolution: Resolution) -> &'static str {
     match resolution {
         Resolution::Hourly => "1 hour",
+        Resolution::SixHourly => "6 hours",
+        Resolution::TwelveHourly => "12 hours",
         Resolution::Daily => "1 day",
         Resolution::Weekly => "7 days",
         Resolution::Monthly => "1 month",

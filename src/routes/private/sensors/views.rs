@@ -1137,7 +1137,7 @@ pub async fn get_sensor_readings(
         } else {
             Some(bucket_interval(resolution_of(resolution).ok_or_else(|| {
             AppError::BadRequest(format!(
-                "Invalid resolution '{resolution}' (expected raw|hourly|daily|weekly|monthly)"
+                "Invalid resolution '{resolution}' (expected raw|hourly|6hourly|12hourly|daily|weekly|monthly)"
             ))
         })?))
         };

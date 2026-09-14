@@ -1,6 +1,6 @@
 //! The continuous-aggregate refresh.
 //!
-//! One fallible entry point, [`refresh`], owns the four rollup views, the per-view bucket arithmetic
+//! One fallible entry point, [`refresh`], owns the rollup views, the per-view bucket arithmetic
 //! and the error handling. A caller states the window it changed; this module turns that into a
 //! window TimescaleDB accepts.
 //!
@@ -30,6 +30,8 @@ use crate::error::{AppError, AppResult};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
     Hourly,
+    SixHourly,
+    TwelveHourly,
     Daily,
     Weekly,
     Monthly,
@@ -37,8 +39,10 @@ pub enum Resolution {
 
 impl Resolution {
     /// Every rollup, coarsest last.
-    pub const ALL: [Resolution; 4] = [
+    pub const ALL: [Resolution; 6] = [
         Resolution::Hourly,
+        Resolution::SixHourly,
+        Resolution::TwelveHourly,
         Resolution::Daily,
         Resolution::Weekly,
         Resolution::Monthly,
@@ -48,6 +52,8 @@ impl Resolution {
     pub fn view(self) -> &'static str {
         match self {
             Resolution::Hourly => "readings_hourly",
+            Resolution::SixHourly => "readings_six_hourly",
+            Resolution::TwelveHourly => "readings_twelve_hourly",
             Resolution::Daily => "readings_daily",
             Resolution::Weekly => "readings_weekly",
             Resolution::Monthly => "readings_monthly",
@@ -55,13 +61,16 @@ impl Resolution {
     }
 
     /// Start of the bucket holding `t`, matching `time_bucket` on a UTC-anchored timestamptz:
-    /// the hour, the UTC day, the Monday of the week, the first of the month.
+    /// the hour, the quarter and half day from the epoch, the UTC day, the Monday of the week, the
+    /// first of the month.
     ///
     /// `duration_trunc` anchors to the Unix epoch, a Thursday, so the weekly bucket is taken from
     /// the Monday of `t`'s week rather than truncated to seven days.
     pub fn floor(self, t: DateTime<Utc>) -> AppResult<DateTime<Utc>> {
         let floor = match self {
             Resolution::Hourly => t.duration_trunc(Duration::hours(1)),
+            Resolution::SixHourly => t.duration_trunc(Duration::hours(6)),
+            Resolution::TwelveHourly => t.duration_trunc(Duration::hours(12)),
             Resolution::Daily => t.duration_trunc(Duration::days(1)),
             Resolution::Weekly => {
                 let monday = t.date_naive().week(Weekday::Mon).first_day();
@@ -87,6 +96,8 @@ impl Resolution {
         let start = self.floor(t)?;
         match self {
             Resolution::Hourly => Ok(start + Duration::hours(1)),
+            Resolution::SixHourly => Ok(start + Duration::hours(6)),
+            Resolution::TwelveHourly => Ok(start + Duration::hours(12)),
             Resolution::Daily => Ok(start + Duration::days(1)),
             Resolution::Weekly => Ok(start + Duration::days(7)),
             Resolution::Monthly => start
@@ -126,7 +137,7 @@ impl Window {
 /// Refresh every rollup over `window`.
 ///
 /// Each view is attempted even if an earlier one fails, so one broken view cannot leave the others
-/// stale; the first error is returned once all four have been tried. A caller inside a tracked job
+/// stale; the first error is returned once every view has been tried. A caller inside a tracked job
 /// must propagate the error, a swallowed refresh reports a job as completed while the rollups still
 /// serve the old numbers.
 pub async fn refresh(db: &DatabaseConnection, window: Window) -> AppResult<()> {

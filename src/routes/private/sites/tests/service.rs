@@ -146,3 +146,23 @@ fn a_marker_belongs_to_an_instrument_deployed_here_and_names_its_parameter() {
         "a curve still in force overlaps the window: {markers}"
     );
 }
+
+#[test]
+fn test_every_rollup_is_reachable_by_a_resolution_keyword() {
+    use crate::common::aggregates::Resolution;
+    use crate::routes::private::sites::service::{bucket_interval, resolution_of};
+
+    let keywords = ["hourly", "6hourly", "12hourly", "daily", "weekly", "monthly"];
+    let reached: Vec<Resolution> = keywords.iter().filter_map(|k| resolution_of(k)).collect();
+    assert_eq!(reached, Resolution::ALL.to_vec());
+    assert_eq!(resolution_of("6h"), None);
+}
+
+#[test]
+fn test_the_bucket_width_matches_the_view_the_resolution_names() {
+    use crate::common::aggregates::Resolution;
+    use crate::routes::private::sites::service::bucket_interval;
+
+    assert_eq!(bucket_interval(Resolution::SixHourly), "6 hours");
+    assert_eq!(bucket_interval(Resolution::TwelveHourly), "12 hours");
+}

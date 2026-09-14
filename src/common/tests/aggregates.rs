@@ -244,6 +244,8 @@ fn test_the_statement_names_only_the_views_the_enum_declares() {
         .collect();
     let expected: Vec<String> = [
         "readings_hourly",
+        "readings_six_hourly",
+        "readings_twelve_hourly",
         "readings_daily",
         "readings_weekly",
         "readings_monthly",
@@ -283,4 +285,36 @@ fn test_touched_window_is_none_when_nothing_changed() {
     let (start, end) = window_of(Resolution::Hourly, window, t("2026-08-12T16:30:00Z"));
     assert_eq!(start, t("2026-08-12T14:00:00Z"));
     assert_eq!(end, t("2026-08-12T17:00:00Z"));
+}
+
+#[test]
+fn test_floor_six_hourly_is_the_epoch_anchored_quarter_day() {
+    assert_eq!(
+        Resolution::SixHourly
+            .floor(t("2026-08-12T14:22:00Z"))
+            .unwrap(),
+        t("2026-08-12T12:00:00Z")
+    );
+    assert_eq!(
+        Resolution::SixHourly
+            .bucket_end(t("2026-08-12T14:22:00Z"))
+            .unwrap(),
+        t("2026-08-12T18:00:00Z")
+    );
+}
+
+#[test]
+fn test_floor_twelve_hourly_is_midnight_or_noon() {
+    assert_eq!(
+        Resolution::TwelveHourly
+            .floor(t("2026-08-12T14:22:00Z"))
+            .unwrap(),
+        t("2026-08-12T12:00:00Z")
+    );
+    assert_eq!(
+        Resolution::TwelveHourly
+            .floor(t("2026-08-12T05:00:00Z"))
+            .unwrap(),
+        t("2026-08-12T00:00:00Z")
+    );
 }

@@ -301,11 +301,14 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
         "SELECT remove_continuous_aggregate_policy('readings_monthly', if_not_exists => true)",
         "SELECT remove_continuous_aggregate_policy('readings_weekly', if_not_exists => true)",
         "SELECT remove_continuous_aggregate_policy('readings_daily', if_not_exists => true)",
+        "SELECT remove_continuous_aggregate_policy('readings_twelve_hourly', if_not_exists => true)",
+        "SELECT remove_continuous_aggregate_policy('readings_six_hourly', if_not_exists => true)",
         "SELECT remove_continuous_aggregate_policy('readings_hourly', if_not_exists => true)",
-        // The four rollups are materialized hypertables of their own, so truncating `readings`
-        // leaves their buckets in place and the next test reading extents from a summary sees the
+        // The rollups are materialized hypertables of their own, so truncating `readings` leaves
+        // their buckets in place and the next test reading extents from a summary sees the
         // previous test's data.
-        "TRUNCATE readings_hourly, readings_daily, readings_weekly, readings_monthly",
+        "TRUNCATE readings_hourly, readings_six_hourly, readings_twelve_hourly, readings_daily, \
+                  readings_weekly, readings_monthly",
         // Tool scripts a test installed. The migration-seeded ones (`created_by = 'seed'`) are
         // reference data and stay; a fixture left enabled makes the next theme's visits recompute
         // against a calculation that theme never installed.

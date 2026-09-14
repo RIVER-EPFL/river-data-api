@@ -850,7 +850,7 @@ pub async fn get_site_readings(
     path = "/api/sites/{site_id}/aggregates/{resolution}",
     params(
         ("site_id" = String, Path, description = "Site UUID or name"),
-        ("resolution" = String, Path, description = "Aggregation resolution: hourly, daily, weekly, monthly"),
+        ("resolution" = String, Path, description = "Aggregation resolution: hourly, 6hourly, 12hourly, daily, weekly, monthly"),
         SiteAggregatesQuery
     ),
     responses(
@@ -888,7 +888,7 @@ pub async fn get_site_aggregates(
 
     let Some(rollup) = resolution_of(resolution.as_str()) else {
         return Err(AppError::BadRequest(format!(
-            "Invalid resolution: {resolution}. Must be one of: hourly, daily, weekly, monthly"
+            "Invalid resolution: {resolution}. Must be one of: hourly, 6hourly, 12hourly, daily, weekly, monthly"
         )));
     };
 

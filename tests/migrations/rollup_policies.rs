@@ -19,8 +19,10 @@ use crate::common::sensor_lifecycle::seed_base_entities;
 use crate::common::{GLOBAL_PARAM_TEMP_ID, SITE1_ID};
 
 /// The rollups and the bucket each policy stops one of before now.
-const VIEWS: [(&str, &str); 4] = [
+const VIEWS: [(&str, &str); 6] = [
     ("readings_hourly", "01:00:00"),
+    ("readings_six_hourly", "06:00:00"),
+    ("readings_twelve_hourly", "12:00:00"),
     ("readings_daily", "1 day"),
     ("readings_weekly", "7 days"),
     ("readings_monthly", "1 mon"),
@@ -113,7 +115,11 @@ async fn assertions(db: &DatabaseConnection) {
             )
         })
         .collect();
-    assert_eq!(views.len(), 4, "the four rollups are present: {views:?}");
+    assert_eq!(
+        views.len(),
+        VIEWS.len(),
+        "every rollup is present: {views:?}"
+    );
     assert!(
         views.iter().all(|(_, only)| !*only),
         "a materialized-only rollup serves its open bucket as absence, which is the head of \

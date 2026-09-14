@@ -8109,7 +8109,7 @@
             "description": "Behaviour on (stream_id, time, replicate_index) collisions. Defaults to `skip`."
           },
           "csv": {
-            "description": "Wide CSV text: a `DateTime` column plus one column per parameter.\nOptional when `session_id` references a previously uploaded CSV.",
+            "description": "Wide CSV text: a `DateTime`, `Date` or `Time` column plus one column per parameter.\nOptional when `session_id` references a previously uploaded CSV.",
             "type": [
               "string",
               "null"
@@ -41736,7 +41736,7 @@
             }
           },
           {
-            "description": "Aggregation resolution: hourly, daily, weekly, monthly",
+            "description": "Aggregation resolution: hourly, 6hourly, 12hourly, daily, weekly, monthly",
             "in": "path",
             "name": "resolution",
             "required": true,

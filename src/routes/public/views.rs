@@ -736,7 +736,8 @@ struct AggregateRow {
     count: i64,
 }
 
-/// Aggregated time-series (hourly, daily, weekly, monthly) for a public project site.
+/// Aggregated time-series (hourly, 6hourly, 12hourly, daily, weekly, monthly) for a public
+/// project site.
 /// Covers continuous and derived readings only; grab samples (measurement_type 'spot')
 /// are excluded, fetch them from the readings endpoint with `measurement_type=spot`.
 #[utoipa::path(
@@ -745,7 +746,7 @@ struct AggregateRow {
     params(
         ("project_code" = String, Path, description = "Public project code"),
         ("site_code" = String, Path, description = "Site code"),
-        ("resolution" = String, Path, description = "hourly, daily, weekly, or monthly"),
+        ("resolution" = String, Path, description = "hourly, 6hourly, 12hourly, daily, weekly, or monthly"),
         AggregatesQuery,
     ),
     responses(
@@ -764,7 +765,7 @@ pub async fn get_aggregates(
 
     let Some(rollup) = resolution_of(resolution.as_str()) else {
         return Err(AppError::BadRequest(format!(
-            "Invalid resolution: {resolution}. Must be: hourly, daily, weekly, monthly"
+            "Invalid resolution: {resolution}. Must be: hourly, 6hourly, 12hourly, daily, weekly, monthly"
         )));
     };
 
