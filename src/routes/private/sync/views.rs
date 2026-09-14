@@ -1,7 +1,6 @@
 //! The sync HTTP surface: the control plane a sync service calls, the operator routes a human
 //! drives, and the pairing-plan and review-queue handlers.
 
-use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
 use axum::routing::{get, patch, post};
 use axum::{
@@ -16,7 +15,7 @@ use sea_orm::sea_query::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
-    QueryFilter, QueryOrder, Set, Statement,
+    QueryFilter, Set, Statement,
 };
 use tower_http::limit::RequestBodyLimitLayer;
 use uuid::Uuid;
@@ -38,7 +37,7 @@ use river_data_core::models::{
 
 use crate::common::AppState;
 use crate::common::middleware::{AuthContext, ProjectScope};
-use crate::common::paging::{Window, content_range};
+use crate::common::paging::Window;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors;
 use crate::routes::private::sync::flows as reconcile;
@@ -495,67 +494,6 @@ pub async fn enroll(
 // Handlers
 // ============================================================================
 
-/// List all registered sync services with their health (computed from `last_heartbeat`
-/// age vs the `sync_health_healthy_secs`/`sync_health_warning_secs` thresholds in `Config`).
-/// Sorted by `updated_at` DESC. Requires `read_metadata`.
-#[utoipa::path(
-    get,
-    path = "/api/sync/services",
-    responses(
-        (status = 200, description = "Registered sync services with health", body = [SyncServiceResponse]),
-    ),
-    tag = "sync"
-)]
-pub async fn list_services(
-    State(state): State<AppState>,
-) -> AppResult<Json<Vec<SyncServiceResponse>>> {
-    let services = services::Entity::find()
-        .order_by_desc(services::Column::UpdatedAt)
-        .all(&state.db)
-        .await?;
-
-    let config = state.config.as_ref();
-    let ids: Vec<Uuid> = services.iter().map(|s| s.id).collect();
-    let mut errors = recent_errors(&state.db, &ids).await?;
-    Ok(Json(
-        services
-            .into_iter()
-            .map(|s| {
-                let error = errors.remove(&s.id);
-                service_to_response(s, config, error)
-            })
-            .collect(),
-    ))
-}
-
-/// Get a single sync service by ID with its computed health. Requires `read_metadata`.
-#[utoipa::path(
-    get,
-    path = "/api/sync/services/{id}",
-    params(("id" = Uuid, Path, description = "Sync service UUID")),
-    responses(
-        (status = 200, description = "Sync service detail", body = SyncServiceResponse),
-        (status = 404, description = "Service not found"),
-    ),
-    tag = "sync"
-)]
-pub async fn get_service(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> AppResult<Json<SyncServiceResponse>> {
-    let service = services::Entity::find_by_id(id)
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
-
-    let error = recent_errors(&state.db, &[service.id]).await?.remove(&id);
-    Ok(Json(service_to_response(
-        service,
-        state.config.as_ref(),
-        error,
-    )))
-}
-
 /// Queue a command for a sync service. The command is picked up on the next heartbeat
 /// (within `command_expiry_secs`). Valid commands: `trigger_sync`, `trigger_full_sync`,
 /// `pause`, `resume`, `resync_streams` with `{"source_keys": [...]}` (re-fetch the named
@@ -618,127 +556,6 @@ pub async fn issue_command(
     Ok(Json(command_to_response(inserted)))
 }
 
-/// Update a sync service's operator settings. The service adopts a new cadence on its next
-/// heartbeat, with no redeploy and no restart. Requires `write_metadata`.
-#[utoipa::path(
-    patch,
-    path = "/api/sync/services/{id}",
-    params(("id" = Uuid, Path, description = "Sync service UUID")),
-    request_body = UpdateServiceRequest,
-    responses(
-        (status = 200, description = "Updated service", body = SyncServiceResponse),
-        (status = 400, description = "Cadence below the minimum"),
-        (status = 404, description = "Service not found"),
-    ),
-    tag = "sync"
-)]
-pub async fn update_service(
-    State(state): State<AppState>,
-    Path(service_id): Path<Uuid>,
-    Json(req): Json<UpdateServiceRequest>,
-) -> AppResult<Json<SyncServiceResponse>> {
-    let service = services::Entity::find_by_id(service_id)
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Service not found".to_string()))?;
-
-    let last_error = recent_errors(&state.db, &[service.id])
-        .await?
-        .remove(&service_id);
-    if req.sync_interval_secs.is_none() && req.full_reassert_enabled.is_none() {
-        return Ok(Json(service_to_response(
-            service,
-            state.config.as_ref(),
-            last_error,
-        )));
-    }
-    if let Some(Some(secs)) = req.sync_interval_secs
-        && secs < MIN_SYNC_INTERVAL_SECS
-    {
-        return Err(AppError::BadRequest(format!(
-            "sync_interval_secs must be at least {MIN_SYNC_INTERVAL_SECS} seconds"
-        )));
-    }
-
-    let mut active: services::ActiveModel = service.into();
-    if let Some(interval) = req.sync_interval_secs {
-        active.sync_interval_secs = Set(interval);
-    }
-    if let Some(enabled) = req.full_reassert_enabled {
-        active.full_reassert_enabled = Set(enabled);
-    }
-    active.updated_at = Set(Utc::now().into());
-    let updated = active.update(&state.db).await?;
-    Ok(Json(service_to_response(
-        updated,
-        state.config.as_ref(),
-        last_error,
-    )))
-}
-
-/// Paginated list of sync commands (newest first). Returns a `Content-Range: items {start}-{end}/{total}`
-/// header for React-admin style pagination. Requires `read_metadata`.
-#[utoipa::path(
-    get,
-    path = "/api/sync/commands",
-    params(PaginationQuery),
-    responses(
-        (
-            status = 200,
-            description = "Page of commands. Response includes a `Content-Range` header with `items start-end/total` for pagination.",
-            body = [SyncCommandResponse]
-        ),
-        (status = 400, description = "per_page is zero"),
-    ),
-    tag = "sync"
-)]
-pub async fn list_commands(
-    State(state): State<AppState>,
-    Query(params): Query<PaginationQuery>,
-) -> AppResult<(StatusCode, HeaderMap, Json<Vec<SyncCommandResponse>>)> {
-    use sea_orm::PaginatorTrait;
-
-    let window = params.resolve()?;
-
-    let paginator = commands::Entity::find()
-        .order_by_desc(commands::Column::CreatedAt)
-        .paginate(&state.db, window.limit);
-
-    let total = paginator.num_items().await?;
-    let commands: Vec<SyncCommandResponse> = paginator
-        .fetch_page(window.page() - 1)
-        .await?
-        .into_iter()
-        .map(command_to_response)
-        .collect();
-
-    let headers = content_range(window.offset, commands.len(), total, "items");
-
-    Ok((StatusCode::OK, headers, Json(commands)))
-}
-
-/// One command's current state, for polling a command just issued. Requires `read_metadata`.
-#[utoipa::path(
-    get,
-    path = "/api/sync/commands/{id}",
-    params(("id" = Uuid, Path, description = "Command UUID")),
-    responses(
-        (status = 200, body = SyncCommandResponse),
-        (status = 404, description = "Command not found"),
-    ),
-    tag = "sync"
-)]
-pub async fn get_command(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> AppResult<Json<SyncCommandResponse>> {
-    let command = commands::Entity::find_by_id(id)
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Command not found".to_string()))?;
-    Ok(Json(command_to_response(command)))
-}
-
 /// Mint a new enrollment credential (client_id + client_secret). The `client_secret` is
 /// returned in plaintext exactly ONCE, only the SHA-256 hash is stored. Used to bootstrap
 /// a new sync service instance. Gated by `require_admin` upstream (Keycloak Administrator
@@ -784,42 +601,6 @@ pub async fn create_credential(
     }))
 }
 
-/// List enrollment credentials with their service binding and revocation status. The
-/// client_secret is never returned here, only the hash is stored. Gated by `require_admin`
-/// upstream, matching credential mint and revoke: a credential bootstraps a full-permission
-/// sync session token, so no API token may enumerate them.
-#[utoipa::path(
-    get,
-    path = "/api/sync/credentials",
-    responses(
-        (status = 200, description = "Credentials list (no secrets)", body = [CredentialResponse]),
-    ),
-    tag = "sync"
-)]
-pub async fn list_credentials(
-    State(state): State<AppState>,
-) -> AppResult<Json<Vec<CredentialResponse>>> {
-    let creds = credentials::Entity::find()
-        .order_by_desc(credentials::Column::CreatedAt)
-        .all(&state.db)
-        .await?;
-
-    Ok(Json(
-        creds
-            .into_iter()
-            .map(|c| CredentialResponse {
-                id: c.id,
-                client_id: c.client_id,
-                service_type: c.service_type,
-                source_system: c.source_system,
-                service_id: c.service_id,
-                revoked: c.revoked,
-                created_at: c.created_at.to_rfc3339(),
-            })
-            .collect(),
-    ))
-}
-
 /// Revoke an enrollment credential and immediately invalidate every active session
 /// token bound to its service. Subsequent heartbeat or command updates will be rejected
 /// as 401. Requires Keycloak Administrator (`require_admin` upstream).
@@ -854,45 +635,6 @@ pub async fn revoke_credential(
     }
 
     Ok(Json(RevokedResponse { revoked: true }))
-}
-
-/// Paginated list of sync events (newest first). Returns a `Content-Range` header for
-/// React-admin style pagination. Each event records readings/status_events_synced counts,
-/// optional errors/log JSON payloads, and duration. Requires `read_metadata`.
-#[utoipa::path(
-    get,
-    path = "/api/sync/events",
-    params(PaginationQuery),
-    responses(
-        (
-            status = 200,
-            description = "Page of sync events. Response includes a `Content-Range` header.",
-            body = [SyncEventResponse]
-        ),
-        (status = 400, description = "per_page is zero"),
-    ),
-    tag = "sync"
-)]
-pub async fn list_sync_events(
-    State(state): State<AppState>,
-    Query(params): Query<PaginationQuery>,
-) -> AppResult<(StatusCode, HeaderMap, Json<Vec<SyncEventResponse>>)> {
-    use sea_orm::PaginatorTrait;
-
-    let window = params.resolve()?;
-
-    let paginator = events::Entity::find()
-        .order_by_desc(events::Column::StartedAt)
-        .paginate(&state.db, window.limit);
-
-    let total = paginator.num_items().await?;
-    let events = paginator.fetch_page(window.page() - 1).await?;
-
-    let response: Vec<SyncEventResponse> = events.into_iter().map(sync_event_to_response).collect();
-
-    let headers = content_range(window.offset, response.len(), total, "items");
-
-    Ok((StatusCode::OK, headers, Json(response)))
 }
 
 /// Revoke a sync service: marks every credential bound to it as revoked AND deletes
@@ -2440,11 +2182,6 @@ pub async fn acknowledge_holds_bulk(
 ///   cannot enumerate which credentials exist.
 pub fn read_routes() -> Router<AppState> {
     Router::new()
-        .route("/services", get(list_services))
-        .route("/services/{id}", get(get_service))
-        .route("/commands", get(list_commands))
-        .route("/commands/{id}", get(get_command))
-        .route("/events", get(list_sync_events))
         .route("/pairing-plans", get(list_pairing_plans))
         .route("/pairing-plans/{id}", get(get_pairing_plan))
         .route("/pairing-plans/{id}/site-metadata", get(plan_site_metadata))
@@ -2455,7 +2192,6 @@ pub fn read_routes() -> Router<AppState> {
 
 pub fn write_routes() -> Router<AppState> {
     Router::new()
-        .route("/services/{id}", patch(update_service))
         .route("/services/{id}/commands", post(issue_command))
         .route("/services/{id}/revoke", post(revoke_service))
         .route("/pairing-plans", post(create_pairing_plan))
@@ -2519,10 +2255,7 @@ pub fn destructive_routes() -> Router<AppState> {
 
 pub fn admin_routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/credentials",
-            get(list_credentials).post(create_credential),
-        )
+        .route("/credentials", post(create_credential))
         .route("/credentials/{id}/revoke", post(revoke_credential))
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(require_admin))

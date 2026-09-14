@@ -69,13 +69,9 @@ async fn every_sync_route_the_dashboard_and_services_call_still_exists() {
         ("PATCH", format!("/api/sync/events/{event_id}")),
     ];
 
-    // Operator surface, called by the dashboard (river-data-ui/src/lib/api/service.ts).
+    // Operator surface, called by the dashboard (river-data-ui/src/lib/api/service.ts). Reading a
+    // service, a command or an event is the CRUD route below and nothing here: one URL per table.
     let operator = [
-        ("GET", "/api/sync/services".to_string()),
-        ("GET", format!("/api/sync/services/{service_id}")),
-        ("GET", "/api/sync/commands".to_string()),
-        ("GET", "/api/sync/events".to_string()),
-        ("GET", "/api/sync/credentials".to_string()),
         ("POST", format!("/api/sync/services/{service_id}/commands")),
         ("POST", format!("/api/sync/services/{service_id}/revoke")),
         ("POST", "/api/sync/credentials".to_string()),
@@ -85,10 +81,12 @@ async fn every_sync_route_the_dashboard_and_services_call_still_exists() {
         ),
     ];
 
-    // Entity listings, read by the dashboard's system page.
+    // Entity listings and detail, the only URL each of these tables has.
     let crud = [
         ("GET", "/api/sync_services".to_string()),
+        ("GET", format!("/api/sync_services/{service_id}")),
         ("GET", "/api/sync_commands".to_string()),
+        ("GET", format!("/api/sync_commands/{command_id}")),
         ("GET", "/api/sync_events".to_string()),
         ("GET", "/api/sync_service_credentials".to_string()),
     ];

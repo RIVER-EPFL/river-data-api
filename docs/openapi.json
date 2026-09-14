@@ -4266,49 +4266,6 @@
         ],
         "type": "object"
       },
-      "CredentialResponse": {
-        "properties": {
-          "client_id": {
-            "type": "string"
-          },
-          "created_at": {
-            "type": "string"
-          },
-          "id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "revoked": {
-            "type": "boolean"
-          },
-          "service_id": {
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "service_type": {
-            "type": "string"
-          },
-          "source_system": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "id",
-          "client_id",
-          "service_type",
-          "source_system",
-          "service_id",
-          "revoked",
-          "created_at"
-        ],
-        "type": "object"
-      },
       "CsvValueState": {
         "description": "What the file's numbers are, deciding whether the import may claim a correction.",
         "enum": [
@@ -23460,6 +23417,7 @@
             ]
           },
           "completed_at": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
@@ -23472,16 +23430,7 @@
               "null"
             ]
           },
-          "errors": {
-            "description": "The messages the pass reported, in order.",
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
+          "errors": {},
           "event_type": {
             "type": "string"
           },
@@ -23489,17 +23438,9 @@
             "format": "uuid",
             "type": "string"
           },
-          "log": {
-            "description": "The lines the pass logged, in order.",
-            "items": {
-              "type": "string"
-            },
-            "type": [
-              "array",
-              "null"
-            ]
-          },
+          "log": {},
           "readings_skipped": {
+            "description": "Readings the cycle sent that ingest admission dropped.",
             "format": "int64",
             "type": "integer"
           },
@@ -23512,6 +23453,7 @@
             "type": "string"
           },
           "started_at": {
+            "format": "date-time",
             "type": "string"
           },
           "status": {
@@ -23625,12 +23567,6 @@
           "instance_id": {
             "type": "string"
           },
-          "last_error": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "last_sync_completed_at": {
             "format": "date-time",
             "type": [
@@ -23689,9 +23625,6 @@
           "client_id": {
             "type": "string"
           },
-          "client_secret_hash": {
-            "type": "string"
-          },
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -23724,7 +23657,6 @@
         "required": [
           "id",
           "client_id",
-          "client_secret_hash",
           "service_type",
           "source_system",
           "service_id",
@@ -23738,9 +23670,6 @@
           "client_id": {
             "type": "string"
           },
-          "client_secret_hash": {
-            "type": "string"
-          },
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -23773,7 +23702,6 @@
         "required": [
           "id",
           "client_id",
-          "client_secret_hash",
           "service_type",
           "source_system",
           "service_id",
@@ -23831,7 +23759,7 @@
             ]
           },
           "full_reassert_enabled": {
-            "description": "Whether the weekly `sync_full_reassert` queues a `trigger_full_sync` for this service.\nSet through `PATCH /sync/services/{id}`.",
+            "description": "Whether the weekly `sync_full_reassert` queues a `trigger_full_sync` for this service.",
             "type": "boolean"
           },
           "id": {
@@ -23842,6 +23770,7 @@
             "type": "string"
           },
           "last_error": {
+            "description": "The first error of the service's most recent cycle that reported one, filled by\n`SyncServiceOperations` from `sync_events`. The column itself has never been written: a\nservice has no field to report an error through, so the row cannot carry one.",
             "type": [
               "string",
               "null"
@@ -23878,7 +23807,7 @@
             "type": "string"
           },
           "sync_interval_secs": {
-            "description": "Operator-set scheduled sync cadence in seconds. NULL leaves the service on its own\n`SYNC_INTERVAL_SECONDS`. Set through `PATCH /sync/services/{id}`, which enforces the\nminimum the runner floors at; generic CRUD must not write it around that check.",
+            "description": "Operator-set scheduled sync cadence in seconds. NULL leaves the service on its own\n`SYNC_INTERVAL_SECONDS`. `SyncServiceOperations::before_update` enforces the minimum\nthe runner floors at.",
             "format": "int32",
             "type": [
               "integer",
@@ -23911,6 +23840,7 @@
       "SyncServiceResponse": {
         "properties": {
           "created_at": {
+            "format": "date-time",
             "type": "string"
           },
           "current_operation": {
@@ -23920,11 +23850,8 @@
             ]
           },
           "full_reassert_enabled": {
-            "description": "Whether the weekly full re-assert queues a `trigger_full_sync` for this service.",
+            "description": "Whether the weekly `sync_full_reassert` queues a `trigger_full_sync` for this service.",
             "type": "boolean"
-          },
-          "health": {
-            "type": "string"
           },
           "id": {
             "format": "uuid",
@@ -23934,19 +23861,21 @@
             "type": "string"
           },
           "last_error": {
-            "description": "The first error of the service's most recent cycle that reported one. Read from\n`sync_events`, not from `sync_services.last_error`: nothing has ever written that column and\na service has no field to report an error through, so the row itself cannot carry one.",
+            "description": "The first error of the service's most recent cycle that reported one, filled by\n`SyncServiceOperations` from `sync_events`. The column itself has never been written: a\nservice has no field to report an error through, so the row cannot carry one.",
             "type": [
               "string",
               "null"
             ]
           },
           "last_heartbeat": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
             ]
           },
           "last_sync_completed_at": {
+            "format": "date-time",
             "type": [
               "string",
               "null"
@@ -23959,7 +23888,7 @@
             "type": "string"
           },
           "source_system": {
-            "description": "The source system this service's registrations are written under; null where the credential\nit enrolled on declares none.",
+            "description": "Copied from the credential at enrolment: the source system this service's registrations are\nwritten under. Not a CRUD field, it belongs to the credential.",
             "type": [
               "string",
               "null"
@@ -23969,7 +23898,7 @@
             "type": "string"
           },
           "sync_interval_secs": {
-            "description": "Operator-set scheduled cadence in seconds; null means the service's own configuration.",
+            "description": "Operator-set scheduled sync cadence in seconds. NULL leaves the service on its own\n`SYNC_INTERVAL_SECONDS`. `SyncServiceOperations::before_update` enforces the minimum\nthe runner floors at.",
             "format": "int32",
             "type": [
               "integer",
@@ -23977,6 +23906,7 @@
             ]
           },
           "updated_at": {
+            "format": "date-time",
             "type": "string"
           }
         },
@@ -23987,13 +23917,12 @@
           "instance_id",
           "status",
           "paused",
+          "current_operation",
           "sync_interval_secs",
           "full_reassert_enabled",
-          "current_operation",
           "last_heartbeat",
           "last_sync_completed_at",
           "last_error",
-          "health",
           "created_at",
           "updated_at"
         ],
@@ -24007,13 +23936,13 @@
               "null"
             ]
           },
-          "instance_id": {
+          "full_reassert_enabled": {
             "type": [
-              "string",
+              "boolean",
               "null"
             ]
           },
-          "last_error": {
+          "instance_id": {
             "type": [
               "string",
               "null"
@@ -24041,6 +23970,13 @@
           "status": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "sync_interval_secs": {
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           }
@@ -25354,28 +25290,6 @@
             "format": "uuid",
             "type": [
               "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
-      "UpdateServiceRequest": {
-        "additionalProperties": false,
-        "description": "Settings an operator may change on a registered service. Absent fields are left alone;\nan explicit null clears the setting.",
-        "properties": {
-          "full_reassert_enabled": {
-            "description": "Whether the weekly full re-assert queues a `trigger_full_sync` for this service.",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          },
-          "sync_interval_secs": {
-            "description": "Scheduled sync cadence in seconds. Null returns the service to its own\n`SYNC_INTERVAL_SECONDS`. Below `MIN_SYNC_INTERVAL_SECS` is refused.",
-            "format": "int32",
-            "type": [
-              "integer",
               "null"
             ]
           }
@@ -44506,90 +44420,7 @@
         ]
       }
     },
-    "/api/sync/commands": {
-      "get": {
-        "operationId": "list_commands",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "page",
-            "required": false,
-            "schema": {
-              "format": "int64",
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          {
-            "in": "query",
-            "name": "per_page",
-            "required": false,
-            "schema": {
-              "format": "int64",
-              "minimum": 0,
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/SyncCommandResponse"
-                  },
-                  "type": "array"
-                }
-              }
-            },
-            "description": "Page of commands. Response includes a `Content-Range` header with `items start-end/total` for pagination."
-          },
-          "400": {
-            "description": "per_page is zero"
-          }
-        },
-        "summary": "Paginated list of sync commands (newest first). Returns a `Content-Range: items {start}-{end}/{total}`\nheader for React-admin style pagination. Requires `read_metadata`.",
-        "tags": [
-          "sync"
-        ]
-      }
-    },
     "/api/sync/commands/{id}": {
-      "get": {
-        "operationId": "get_command",
-        "parameters": [
-          {
-            "description": "Command UUID",
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SyncCommandResponse"
-                }
-              }
-            },
-            "description": ""
-          },
-          "404": {
-            "description": "Command not found"
-          }
-        },
-        "summary": "One command's current state, for polling a command just issued. Requires `read_metadata`.",
-        "tags": [
-          "sync"
-        ]
-      },
       "patch": {
         "operationId": "update_command",
         "parameters": [
@@ -44645,28 +44476,6 @@
       }
     },
     "/api/sync/credentials": {
-      "get": {
-        "operationId": "list_credentials",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/CredentialResponse"
-                  },
-                  "type": "array"
-                }
-              }
-            },
-            "description": "Credentials list (no secrets)"
-          }
-        },
-        "summary": "List enrollment credentials with their service binding and revocation status. The\nclient_secret is never returned here, only the hash is stored. Gated by `require_admin`\nupstream, matching credential mint and revoke: a credential bootstraps a full-permission\nsync session token, so no API token may enumerate them.",
-        "tags": [
-          "sync"
-        ]
-      },
       "post": {
         "operationId": "create_credential",
         "requestBody": {
@@ -44768,53 +44577,6 @@
       }
     },
     "/api/sync/events": {
-      "get": {
-        "operationId": "list_sync_events",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "page",
-            "required": false,
-            "schema": {
-              "format": "int64",
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          {
-            "in": "query",
-            "name": "per_page",
-            "required": false,
-            "schema": {
-              "format": "int64",
-              "minimum": 0,
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/SyncEventResponse"
-                  },
-                  "type": "array"
-                }
-              }
-            },
-            "description": "Page of sync events. Response includes a `Content-Range` header."
-          },
-          "400": {
-            "description": "per_page is zero"
-          }
-        },
-        "summary": "Paginated list of sync events (newest first). Returns a `Content-Range` header for\nReact-admin style pagination. Each event records readings/status_events_synced counts,\noptional errors/log JSON payloads, and duration. Requires `read_metadata`.",
-        "tags": [
-          "sync"
-        ]
-      },
       "post": {
         "operationId": "create_sync_event",
         "requestBody": {
@@ -45705,113 +45467,6 @@
           }
         },
         "summary": "The (site, parameter) slots where two streams carry the same instant. Serving returns one row\nper instant, so a duplicated slot is invisible on the chart; this is the list the operator\nreconciles from. Two streams sharing a slot without ever sharing an instant (a sensor feed\nbeside a grab feed) is the normal case and is not listed.",
-        "tags": [
-          "sync"
-        ]
-      }
-    },
-    "/api/sync/services": {
-      "get": {
-        "operationId": "list_services",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/SyncServiceResponse"
-                  },
-                  "type": "array"
-                }
-              }
-            },
-            "description": "Registered sync services with health"
-          }
-        },
-        "summary": "List all registered sync services with their health (computed from `last_heartbeat`\nage vs the `sync_health_healthy_secs`/`sync_health_warning_secs` thresholds in `Config`).\nSorted by `updated_at` DESC. Requires `read_metadata`.",
-        "tags": [
-          "sync"
-        ]
-      }
-    },
-    "/api/sync/services/{id}": {
-      "get": {
-        "operationId": "get_service",
-        "parameters": [
-          {
-            "description": "Sync service UUID",
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SyncServiceResponse"
-                }
-              }
-            },
-            "description": "Sync service detail"
-          },
-          "404": {
-            "description": "Service not found"
-          }
-        },
-        "summary": "Get a single sync service by ID with its computed health. Requires `read_metadata`.",
-        "tags": [
-          "sync"
-        ]
-      },
-      "patch": {
-        "operationId": "update_service",
-        "parameters": [
-          {
-            "description": "Sync service UUID",
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpdateServiceRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SyncServiceResponse"
-                }
-              }
-            },
-            "description": "Updated service"
-          },
-          "400": {
-            "description": "Cadence below the minimum"
-          },
-          "404": {
-            "description": "Service not found"
-          }
-        },
-        "summary": "Update a sync service's operator settings. The service adopts a new cadence on its next\nheartbeat, with no redeploy and no restart. Requires `write_metadata`.",
         "tags": [
           "sync"
         ]

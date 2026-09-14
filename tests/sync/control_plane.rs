@@ -1,5 +1,5 @@
 //! Sync control plane over the in-process HTTP surface: enrollment, heartbeat, the command
-//! issue→deliver→update lifecycle, sync-event reporting, service revocation, and health derivation.
+//! issue→deliver→update lifecycle, sync-event reporting, and service revocation.
 //! The handlers take `AppState` directly, so every one runs against the test DB with no live
 //! infra. Auth: enroll is unauthenticated; heartbeat/command-update/event endpoints take a sync
 //! session token; the admin issue-command/revoke/list endpoints take an API token.
@@ -11,6 +11,11 @@
 //!
 //! Run: cargo test --test sync -- --test-threads=1
 
+use crudcrate::CRUDResource;
+use river_db::routes::private::sync::models::events::SyncEvent;
+use river_db::routes::private::sync::models::services::SyncServiceUpdate;
+use river_db::routes::private::sync::models::services::{self, SyncService};
+use river_db::routes::private::sync::service::SyncServiceOperations;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 
@@ -177,8 +182,29 @@ async fn the_sync_cadence_is_set_by_an_operator_and_carried_on_the_heartbeat() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     let (token, service_id) = crate::common::seed_sync_session_token(&db).await;
-    let admin = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
+
+    // The cadence is set through the one URL the table has, `PATCH /api/sync_services/{id}`,
+    // which is Keycloak-administrator only; the update is driven here so the floor and the
+    // heartbeat that carries it are asserted without Keycloak.
+    let set_cadence = async |secs: Option<i32>| {
+        crudcrate::CRUDOperations::update(
+            &SyncServiceOperations,
+            &db,
+            service_id,
+            SyncServiceUpdate {
+                sync_interval_secs: Some(secs),
+                service_type: None,
+                instance_id: None,
+                status: None,
+                paused: None,
+                current_operation: None,
+                full_reassert_enabled: None,
+                last_sync_completed_at: None,
+            },
+        )
+        .await
+    };
 
     let (status, hb) = crate::common::post_json_parse_with_token(
         &app,
@@ -193,28 +219,16 @@ async fn the_sync_cadence_is_set_by_an_operator_and_carried_on_the_heartbeat() {
         "an unset cadence leaves the service on its own configuration: {hb}"
     );
 
-    let (status, body) = crate::common::patch_json_with_token(
-        &app,
-        &format!("/api/sync/services/{service_id}"),
-        &serde_json::json!({"sync_interval_secs": 10}),
-        &admin,
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "a cadence under the runner's floor is refused: {body}"
+    let refused = set_cadence(Some(10))
+        .await
+        .expect_err("a cadence under the runner's floor is refused");
+    assert!(
+        refused.to_string().contains("at least 30"),
+        "the refusal names the floor: {refused}"
     );
 
-    let (status, body) = crate::common::patch_json_with_token(
-        &app,
-        &format!("/api/sync/services/{service_id}"),
-        &serde_json::json!({"sync_interval_secs": 3600}),
-        &admin,
-    )
-    .await;
-    assert_eq!(status, 200, "set cadence ({status}): {body}");
-    let updated: serde_json::Value = serde_json::from_str(&body).expect("service json");
-    assert_eq!(updated["sync_interval_secs"], 3600);
+    let updated = set_cadence(Some(3600)).await.expect("set cadence");
+    assert_eq!(updated.sync_interval_secs, Some(3600));
 
     let (_, hb) = crate::common::post_json_parse_with_token(
         &app,
@@ -228,14 +242,8 @@ async fn the_sync_cadence_is_set_by_an_operator_and_carried_on_the_heartbeat() {
         "the running service learns the cadence from its heartbeat: {hb}"
     );
 
-    let (status, body) = crate::common::patch_json_with_token(
-        &app,
-        &format!("/api/sync/services/{service_id}"),
-        &serde_json::json!({"sync_interval_secs": null}),
-        &admin,
-    )
-    .await;
-    assert_eq!(status, 200, "clear cadence ({status}): {body}");
+    let cleared = set_cadence(None).await.expect("clear cadence");
+    assert_eq!(cleared.sync_interval_secs, None);
     let (_, hb) = crate::common::post_json_parse_with_token(
         &app,
         "/api/sync/heartbeat",
@@ -399,7 +407,6 @@ async fn sync_event_create_update_and_read_back() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     let (token, service_id) = crate::common::seed_sync_session_token(&db).await;
-    let admin = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
 
     let (status, ev) = crate::common::post_json_parse_with_token(
@@ -471,17 +478,11 @@ async fn sync_event_create_update_and_read_back() {
         "successful event stamped last_sync_completed_at on the service"
     );
 
-    let (status, events) =
-        crate::common::get_json_with_token(&app, "/api/sync/events", &admin).await;
-    assert_eq!(status, 200, "list events ({status}): {events}");
-    let found = events
-        .as_array()
-        .expect("array")
-        .iter()
-        .find(|e| e["id"] == serde_json::json!(event_id))
-        .expect("event in list");
-    assert_eq!(found["readings_synced"], 42);
-    assert_eq!(found["status"], "completed");
+    let found = SyncEvent::get_one(&db, event_id.parse().expect("event uuid"))
+        .await
+        .expect("the event reads back");
+    assert_eq!(found.readings_synced, 42);
+    assert_eq!(found.status, "completed");
 }
 
 #[tokio::test]
@@ -531,91 +532,6 @@ async fn revoke_service_kills_active_session() {
     )
     .await;
     assert_eq!(status, 401, "the revoked session no longer authenticates");
-}
-
-#[tokio::test]
-#[serial]
-async fn health_state_derived_from_heartbeat_recency() {
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    let read_token = crate::common::seed_token_read_metadata_only(&db).await;
-
-    let unknown = uuid::Uuid::new_v4();
-    let healthy = uuid::Uuid::new_v4();
-    let warning = uuid::Uuid::new_v4();
-    let stale = uuid::Uuid::new_v4();
-    let rows = [
-        (unknown, "NULL"),
-        (healthy, "now() - interval '30 seconds'"),
-        (warning, "now() - interval '200 seconds'"),
-        (stale, "now() - interval '600 seconds'"),
-    ];
-    for (id, hb) in rows {
-        crate::common::exec(
-            &db,
-            &format!(
-                "INSERT INTO sync_services (id, service_type, instance_id, status, last_heartbeat, created_at, updated_at) \
-                 VALUES ('{id}', 'test', '{id}', 'idle', {hb}, now(), now())"
-            ),
-        )
-        .await;
-    }
-
-    let app = crate::common::build_test_app(db.clone());
-    let (status, services) =
-        crate::common::get_json_with_token(&app, "/api/sync/services", &read_token).await;
-    assert_eq!(status, 200, "list services ({status}): {services}");
-    let arr = services.as_array().expect("array");
-    let health_of = |id: uuid::Uuid| -> String {
-        arr.iter()
-            .find(|s| s["id"] == serde_json::json!(id.to_string()))
-            .unwrap_or_else(|| panic!("service {id} missing: {services}"))["health"]
-            .as_str()
-            .expect("health string")
-            .to_string()
-    };
-    assert_eq!(health_of(unknown), "unknown");
-    assert_eq!(health_of(healthy), "healthy");
-    assert_eq!(health_of(warning), "warning");
-    assert_eq!(health_of(stale), "stale");
-
-    let (status, one) = crate::common::get_json_with_token(
-        &app,
-        &format!("/api/sync/services/{healthy}"),
-        &read_token,
-    )
-    .await;
-    assert_eq!(status, 200, "get service ({status}): {one}");
-    assert_eq!(one["health"], "healthy");
-
-    // The dashboard consumes these by name, so an added or renamed field is a breaking change.
-    let mut keys: Vec<&str> = one
-        .as_object()
-        .expect("object")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
-    assert_eq!(
-        keys,
-        [
-            "created_at",
-            "current_operation",
-            "full_reassert_enabled",
-            "health",
-            "id",
-            "instance_id",
-            "last_error",
-            "last_heartbeat",
-            "last_sync_completed_at",
-            "paused",
-            "service_type",
-            "source_system",
-            "status",
-            "sync_interval_secs",
-            "updated_at",
-        ]
-    );
 }
 
 #[tokio::test]
@@ -1092,15 +1008,22 @@ async fn a_service_reports_the_error_of_its_most_recent_failing_cycle() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     let (_token, service_id) = crate::common::seed_sync_session_token(&db).await;
-    let admin = crate::common::seed_token_full(&db).await;
-    let app = crate::common::build_test_app(db.clone());
 
-    let (status, body) =
-        crate::common::get_json_with_token(&app, "/api/sync/services", &admin).await;
-    assert_eq!(status, 200, "{body}");
+    let listed = || async {
+        SyncService::get_all(
+            &db,
+            &sea_orm::Condition::all(),
+            services::Column::CreatedAt,
+            sea_orm::Order::Desc,
+            0,
+            50,
+        )
+        .await
+        .expect("the service list")
+    };
     assert!(
-        body[0]["last_error"].is_null(),
-        "a service with no failing cycle reports none: {body}"
+        listed().await[0].last_error.is_none(),
+        "a service with no failing cycle reports none"
     );
 
     for (started, errors) in [
@@ -1126,24 +1049,19 @@ async fn a_service_reports_the_error_of_its_most_recent_failing_cycle() {
         .await;
     }
 
-    let (status, body) =
-        crate::common::get_json_with_token(&app, "/api/sync/services", &admin).await;
-    assert_eq!(status, 200, "{body}");
-    let reported = body[0]["last_error"].as_str().expect("an error line");
+    let rows = listed().await;
+    let reported = rows[0].last_error.as_deref().expect("an error line");
     assert!(
         reported.contains("only accepted on a stream declared spot"),
         "the newest cycle's first error, with the server's reason: {reported}"
     );
 
-    let (status, one) = crate::common::get_json_with_token(
-        &app,
-        &format!("/api/sync/services/{service_id}"),
-        &admin,
-    )
-    .await;
-    assert_eq!(status, 200, "{one}");
+    let one = SyncService::get_one(&db, service_id)
+        .await
+        .expect("the service detail");
     assert_eq!(
-        one["last_error"], body[0]["last_error"],
-        "the detail agrees"
+        one.last_error.as_deref(),
+        Some(reported),
+        "the detail agrees with the listing"
     );
 }

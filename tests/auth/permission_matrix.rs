@@ -775,11 +775,6 @@ fn table() -> Table {
         TokenAccess::Same,
         Scope::Open,
         &[
-            ("GET", "/api/sync/services"),
-            ("GET", "/api/sync/services/{id}"),
-            ("GET", "/api/sync/commands"),
-            ("GET", "/api/sync/commands/{id}"),
-            ("GET", "/api/sync/events"),
             ("GET", "/api/sync/pairing-plans"),
             ("GET", "/api/sync/pairing-plans/{id}"),
             ("GET", "/api/sync/pairing-plans/{id}/site-metadata"),
@@ -793,7 +788,6 @@ fn table() -> Table {
         TokenAccess::Bit(TokenBit::WriteMetadata),
         Scope::DenyScopedToken,
         &[
-            ("PATCH", "/api/sync/services/{id}"),
             ("POST", "/api/sync/services/{id}/commands"),
             ("POST", "/api/sync/services/{id}/revoke"),
             ("POST", "/api/sync/pairing-plans"),
@@ -833,7 +827,6 @@ fn table() -> Table {
         TokenAccess::Deny,
         Scope::Open,
         &[
-            ("GET", "/api/sync/credentials"),
             ("POST", "/api/sync/credentials"),
             ("POST", "/api/sync/credentials/{id}/revoke"),
             ("POST", "/api/readings/detach"),
@@ -1291,6 +1284,8 @@ fn every_registered_route_has_a_row() {
         // credential and the session token, not the capability gates this table covers.
         "/api/sync/enroll",
         "/api/sync/heartbeat",
+        "/api/sync/commands/{id}",
+        "/api/sync/events",
         "/api/sync/events/{id}",
         // The tool authoring surface's runner-backed drafts, exercised by the tools theme against
         // a live runner; the gate is the same require_admin as its siblings in the table.

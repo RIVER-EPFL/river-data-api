@@ -29,7 +29,6 @@ use crate::common::AppState;
 use crate::common::authz::AccessScope;
 use crate::common::bulk_write;
 use crate::common::middleware::enforce_project_scope_for_sites;
-use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::api_tokens::service::hash_token;
 use crate::routes::private::parameter_groups::group_model as parameter_groups;
@@ -47,6 +46,7 @@ use crate::routes::private::{
 };
 use crate::routes::private::{collection_events, readings};
 
+use super::models::services::{SyncService, SyncServiceList};
 use super::models::*;
 
 /// An authenticated sync service: who it is, and what it writes provenance under.
@@ -241,25 +241,6 @@ pub(crate) async fn create_session_token(state: &AppState, service_id: Uuid) -> 
     Ok(raw_token)
 }
 
-pub(super) fn compute_health(
-    last_heartbeat: Option<chrono::DateTime<chrono::FixedOffset>>,
-    config: &Config,
-) -> String {
-    match last_heartbeat {
-        None => "unknown".to_string(),
-        Some(hb) => {
-            let age = Utc::now() - hb.with_timezone(&Utc);
-            if age.num_seconds() < config.sync_health_healthy_secs {
-                "healthy".to_string()
-            } else if age.num_seconds() < config.sync_health_warning_secs {
-                "warning".to_string()
-            } else {
-                "stale".to_string()
-            }
-        }
-    }
-}
-
 /// The first error of a service's most recent cycle that reported one, or None when its recent
 /// cycles were clean. One query for every service on the page.
 /// The last error a sync service recorded, if it recorded one.
@@ -297,31 +278,6 @@ pub(super) async fn recent_errors<C: sea_orm::ConnectionTrait>(
     Ok(out)
 }
 
-pub(super) fn service_to_response(
-    s: services::Model,
-    config: &Config,
-    last_error: Option<String>,
-) -> SyncServiceResponse {
-    let health = compute_health(s.last_heartbeat, config);
-    SyncServiceResponse {
-        id: s.id,
-        service_type: s.service_type,
-        source_system: s.source_system,
-        instance_id: s.instance_id,
-        status: s.status,
-        paused: s.paused,
-        sync_interval_secs: s.sync_interval_secs,
-        full_reassert_enabled: s.full_reassert_enabled,
-        current_operation: s.current_operation,
-        last_heartbeat: s.last_heartbeat.map(|t| t.to_rfc3339()),
-        last_sync_completed_at: s.last_sync_completed_at.map(|t| t.to_rfc3339()),
-        last_error,
-        health,
-        created_at: s.created_at.to_rfc3339(),
-        updated_at: s.updated_at.to_rfc3339(),
-    }
-}
-
 pub(super) fn command_to_response(c: commands::Model) -> SyncCommandResponse {
     SyncCommandResponse {
         id: c.id,
@@ -334,24 +290,6 @@ pub(super) fn command_to_response(c: commands::Model) -> SyncCommandResponse {
         expires_at: c.expires_at.to_rfc3339(),
         acknowledged_at: c.acknowledged_at.map(|t| t.to_rfc3339()),
         completed_at: c.completed_at.map(|t| t.to_rfc3339()),
-    }
-}
-
-pub(super) fn sync_event_to_response(e: events::Model) -> SyncEventResponse {
-    SyncEventResponse {
-        id: e.id,
-        service_id: e.service_id,
-        command_id: e.command_id,
-        event_type: e.event_type,
-        status: e.status,
-        readings_synced: e.readings_synced,
-        readings_skipped: e.readings_skipped,
-        status_events_synced: e.status_events_synced,
-        errors: e.errors,
-        log: e.log,
-        started_at: e.started_at.to_rfc3339(),
-        completed_at: e.completed_at.map(|t| t.to_rfc3339()),
-        duration_ms: e.duration_ms,
     }
 }
 
@@ -395,6 +333,60 @@ pub fn validate_command(command: &str, payload: Option<&serde_json::Value>) -> R
 /// Shortest cadence an operator may set. Matches the floor the sync runner applies, so the
 /// portal refuses a number the service would silently override.
 pub(super) const MIN_SYNC_INTERVAL_SECS: i32 = 30;
+
+/// The one URL per sync service is the generated CRUD route, so the cadence floor and the error a
+/// service's last cycle reported are hooks on it rather than a second handler beside it.
+pub struct SyncServiceOperations;
+
+impl crudcrate::CRUDOperations for SyncServiceOperations {
+    type Resource = SyncService;
+
+    /// The runner floors the cadence at `MIN_SYNC_INTERVAL_SECS`, so a number below it is refused
+    /// here rather than accepted and silently overridden. An explicit null clears the override.
+    async fn before_update<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        _db: &C,
+        _id: Uuid,
+        data: &<SyncService as crudcrate::CRUDResource>::UpdateModel,
+    ) -> Result<(), crudcrate::ApiError> {
+        if let Some(Some(secs)) = data.sync_interval_secs
+            && secs < MIN_SYNC_INTERVAL_SECS
+        {
+            return Err(crudcrate::ApiError::bad_request(format!(
+                "sync_interval_secs must be at least {MIN_SYNC_INTERVAL_SECS} seconds"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn after_get_one<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        entity: &mut SyncService,
+    ) -> Result<(), crudcrate::ApiError> {
+        let id = entity.id;
+        entity.last_error = recent_errors(db, &[id])
+            .await
+            .map_err(|e| crudcrate::ApiError::internal(e.to_string(), None))?
+            .remove(&id);
+        Ok(())
+    }
+
+    async fn after_get_all<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        entities: &mut Vec<SyncServiceList>,
+    ) -> Result<(), crudcrate::ApiError> {
+        let ids: Vec<Uuid> = entities.iter().map(|s| s.id).collect();
+        let mut errors = recent_errors(db, &ids)
+            .await
+            .map_err(|e| crudcrate::ApiError::internal(e.to_string(), None))?;
+        for entity in entities {
+            entity.last_error = errors.remove(&entity.id);
+        }
+        Ok(())
+    }
+}
 
 /// The rows this file's raw queries return. Derived rather than hand-decoded so a column added to
 /// a query and not to its reader is a compile error rather than a field silently left behind.

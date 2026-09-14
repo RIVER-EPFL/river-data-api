@@ -35,15 +35,12 @@
 /collection_events/stage_many => require_write_data
 /collection_events/{id}/detail => require_read_data
 /collection_events/{id}/recompute => require_write_data
-/commands => require_read_metadata
 /commands/{id} => -
-/commands/{id} => require_read_metadata
 /credentials => require_admin
 /credentials/{id}/revoke => require_admin
 /enroll => -
 /events => -
 /events => require_read_data
-/events => require_read_metadata
 /events/{id} => -
 /grab_samples => require_enter_field_data
 /healthz => -
@@ -124,9 +121,6 @@
 /sensors/{id}/readings => require_read_data
 /sensors/{sensor_id}/adopt => deny_scoped_token+require_manage_sensors
 /sensors/{sensor_id}/adopt_suggestions => require_read_metadata
-/services => require_read_metadata
-/services/{id} => deny_scoped_token+require_admin_or_token_write_metadata
-/services/{id} => require_read_metadata
 /services/{id}/commands => deny_scoped_token+require_admin_or_token_write_metadata
 /services/{id}/revoke => deny_scoped_token+require_admin_or_token_write_metadata
 /site_parameters/{id}/declare_sd_estimator => deny_scoped_token+require_manage_sensors

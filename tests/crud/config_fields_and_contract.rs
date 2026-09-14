@@ -598,43 +598,6 @@ async fn get_without_unwinding(
         .map_err(|e| e.to_string())
 }
 
-// per_page=0 is clamped on the upper bound only, so it reaches SeaORM's paginate() and
-// panics instead of answering the caller.
-#[tokio::test]
-#[serial]
-async fn sync_list_endpoints_answer_a_zero_per_page() {
-    let db = setup_test_db().await;
-    cleanup_test_db(&db).await;
-    let token = seed_api_token(&db, full_permissions(), None).await;
-    let app = build_test_app(db.clone());
-
-    for path in ["/api/sync/commands", "/api/sync/events"] {
-        let (status, body) = get_without_unwinding(&app, &format!("{path}?per_page=25"), &token)
-            .await
-            .unwrap_or_else(|e| panic!("{path} with a normal page size must answer: {e}"));
-        assert_eq!(status, 200, "{path} with per_page=25 ({status}): {body}");
-
-        let (status, body) = get_without_unwinding(&app, &format!("{path}?per_page=1000"), &token)
-            .await
-            .unwrap_or_else(|e| panic!("{path} above the upper clamp must answer: {e}"));
-        assert_eq!(
-            status, 200,
-            "{path} clamps an oversized page size rather than refusing it ({status}): {body}"
-        );
-
-        let outcome = get_without_unwinding(&app, &format!("{path}?per_page=0"), &token).await;
-        assert!(
-            outcome.is_ok(),
-            "{path} with per_page=0 must answer the caller, not panic the handler: {outcome:?}"
-        );
-        let (status, body) = outcome.unwrap();
-        assert!(
-            status == 400 || status == 200,
-            "{path} with per_page=0 rejects the value or clamps it to a page ({status}): {body}"
-        );
-    }
-}
-
 struct RecordingChannel {
     sent: Arc<Mutex<Vec<OutgoingMessage>>>,
 }

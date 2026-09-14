@@ -29,7 +29,7 @@ async fn no_api_token_can_list_enrollment_credentials() {
         ("sync session token", sync_session),
     ] {
         let (status, body) =
-            crate::common::get_with_token(&app, "/api/sync/credentials", &token).await;
+            crate::common::get_with_token(&app, "/api/sync_service_credentials", &token).await;
         assert_eq!(
             status, 403,
             "{label} must not list enrollment credentials ({status}): {body}"
@@ -38,17 +38,15 @@ async fn no_api_token_can_list_enrollment_credentials() {
             !body.contains("svc_gate"),
             "{label} sees no client_id in the refusal: {body}"
         );
-
-        // The CRUD twin over the same table already refuses; the two now agree.
-        let (status, _) =
-            crate::common::get_with_token(&app, "/api/sync_service_credentials", &token).await;
-        assert_eq!(status, 403, "{label} on the CRUD twin ({status})");
     }
 }
 
+/// Q75: services, commands and events have one URL each, the CRUD route, and it is
+/// administrator-only. A read_metadata token reached them through `/api/sync/*` until the
+/// hand-written listings went; neither URL admits it now.
 #[tokio::test]
 #[serial]
-async fn the_other_sync_read_routes_stay_open_to_a_metadata_token() {
+async fn a_metadata_token_reads_no_sync_service_command_or_event() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -56,15 +54,25 @@ async fn the_other_sync_read_routes_stay_open_to_a_metadata_token() {
 
     let token = crate::common::seed_token_read_metadata_only(&db).await;
 
+    // `/sync/events` keeps its POST, the control plane's cycle report, so reading it is a 405
+    // where the other two are gone outright.
+    for (path, expected) in [
+        ("/api/sync/services", 404),
+        ("/api/sync/commands", 404),
+        ("/api/sync/events", 405),
+    ] {
+        let (status, body) = crate::common::get_with_token(&app, path, &token).await;
+        assert_eq!(status, expected, "GET {path} ({status}): {body}");
+    }
     for path in [
-        "/api/sync/services",
-        "/api/sync/commands",
-        "/api/sync/events",
+        "/api/sync_services",
+        "/api/sync_commands",
+        "/api/sync_events",
     ] {
         let (status, body) = crate::common::get_with_token(&app, path, &token).await;
         assert_eq!(
-            status, 200,
-            "{path} stays a read_metadata route ({status}): {body}"
+            status, 403,
+            "{path} is administrator-only ({status}): {body}"
         );
     }
 }

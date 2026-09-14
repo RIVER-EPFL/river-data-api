@@ -1340,9 +1340,8 @@ async fn granted_members_receive_job_frames_on_the_event_stream() {
     );
 }
 
-/// `GET /api/sync/credentials` lists enrollment credentials at `read_metadata`, while its
-/// create and revoke twins and the whole `sync_service_credentials` CRUD surface are
-/// Administrator-only.
+/// Enrollment credentials have one URL, the `sync_service_credentials` CRUD surface, and it is
+/// Administrator-only; the mint and revoke actions beside it take the same gate.
 #[tokio::test]
 #[serial]
 async fn listing_sync_credentials_is_administrator_only() {
@@ -1378,16 +1377,8 @@ async fn listing_sync_credentials_is_administrator_only() {
         ("read-only API token", read_token.as_str()),
         ("intern member", intern.as_str()),
     ] {
-        // Control: the CRUD surface over the same table is already Administrator-only.
         let (status, body) =
             crate::common::get_with_token(&app, "/api/sync_service_credentials", caller).await;
-        assert_eq!(
-            status, 403,
-            "the credentials CRUD surface already refuses a {label}: {body}"
-        );
-
-        let (status, body) =
-            crate::common::get_with_token(&app, "/api/sync/credentials", caller).await;
         assert_eq!(
             status, 403,
             "listing enrollment credentials must be Administrator-only, a {label} is refused: \
@@ -1399,7 +1390,8 @@ async fn listing_sync_credentials_is_administrator_only() {
         );
     }
 
-    let (status, body) = crate::common::get_with_token(&app, "/api/sync/credentials", &admin).await;
+    let (status, body) =
+        crate::common::get_with_token(&app, "/api/sync_service_credentials", &admin).await;
     assert_eq!(
         status, 200,
         "an administrator still lists enrollment credentials: {body}"
@@ -1407,6 +1399,10 @@ async fn listing_sync_credentials_is_administrator_only() {
     assert!(
         body.contains(&client_id),
         "the administrator's listing carries the credential: {body}"
+    );
+    assert!(
+        !body.contains("client_secret_hash"),
+        "and the stored hash is never served: {body}"
     );
 }
 

@@ -17,8 +17,6 @@ mod duplicate_slots;
 mod fake_portal_cycle;
 mod hold_kinds;
 mod notes_register;
-mod pagination;
-mod pagination_bounds;
 mod pairing_backfill_parity;
 mod pairing_plan_apply;
 mod pairing_plan_hardening;

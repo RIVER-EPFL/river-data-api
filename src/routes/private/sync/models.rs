@@ -96,38 +96,6 @@ pub enum SecretFormat {
 // ============================================================================
 
 #[derive(Serialize, utoipa::ToSchema)]
-pub struct SyncServiceResponse {
-    pub id: Uuid,
-    pub service_type: String,
-    /// The source system this service's registrations are written under; null where the credential
-    /// it enrolled on declares none.
-    #[schema(required)]
-    pub source_system: Option<String>,
-    pub instance_id: String,
-    pub status: String,
-    pub paused: bool,
-    /// Operator-set scheduled cadence in seconds; null means the service's own configuration.
-    #[schema(required)]
-    pub sync_interval_secs: Option<i32>,
-    /// Whether the weekly full re-assert queues a `trigger_full_sync` for this service.
-    pub full_reassert_enabled: bool,
-    #[schema(required)]
-    pub current_operation: Option<String>,
-    #[schema(required)]
-    pub last_heartbeat: Option<String>,
-    #[schema(required)]
-    pub last_sync_completed_at: Option<String>,
-    /// The first error of the service's most recent cycle that reported one. Read from
-    /// `sync_events`, not from `sync_services.last_error`: nothing has ever written that column and
-    /// a service has no field to report an error through, so the row itself cannot carry one.
-    #[schema(required)]
-    pub last_error: Option<String>,
-    pub health: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Serialize, utoipa::ToSchema)]
 pub struct SyncCommandResponse {
     pub id: Uuid,
     pub service_id: Uuid,
@@ -168,45 +136,6 @@ pub struct CreateCredentialRequest {
 pub struct CreateCredentialResponse {
     pub client_id: String,
     pub client_secret: String,
-}
-
-#[derive(Serialize, utoipa::ToSchema)]
-pub struct CredentialResponse {
-    pub id: Uuid,
-    pub client_id: String,
-    pub service_type: String,
-    #[schema(required)]
-    pub source_system: Option<String>,
-    #[schema(required)]
-    pub service_id: Option<Uuid>,
-    pub revoked: bool,
-    pub created_at: String,
-}
-
-#[derive(Serialize, utoipa::ToSchema)]
-pub struct SyncEventResponse {
-    pub id: Uuid,
-    pub service_id: Uuid,
-    #[schema(required)]
-    pub command_id: Option<Uuid>,
-    pub event_type: String,
-    pub status: String,
-    pub readings_synced: i64,
-    pub readings_skipped: i64,
-    pub status_events_synced: i64,
-    /// The messages the pass reported, in order.
-    #[schema(value_type = Option<Vec<String>>)]
-    #[schema(required)]
-    pub errors: Option<serde_json::Value>,
-    /// The lines the pass logged, in order.
-    #[schema(value_type = Option<Vec<String>>)]
-    #[schema(required)]
-    pub log: Option<serde_json::Value>,
-    pub started_at: String,
-    #[schema(required)]
-    pub completed_at: Option<String>,
-    #[schema(required)]
-    pub duration_ms: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -250,29 +179,6 @@ impl PaginationQuery {
             MAX_PER_PAGE,
         ))
     }
-}
-
-/// Settings an operator may change on a registered service. Absent fields are left alone;
-/// an explicit null clears the setting.
-#[derive(serde::Deserialize, utoipa::ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct UpdateServiceRequest {
-    /// Scheduled sync cadence in seconds. Null returns the service to its own
-    /// `SYNC_INTERVAL_SECONDS`. Below `MIN_SYNC_INTERVAL_SECS` is refused.
-    #[serde(default, deserialize_with = "double_option")]
-    pub sync_interval_secs: Option<Option<i32>>,
-    /// Whether the weekly full re-assert queues a `trigger_full_sync` for this service.
-    #[serde(default)]
-    pub full_reassert_enabled: Option<bool>,
-}
-
-/// Distinguish "field absent" from "field is null": the first leaves the setting, the second
-/// clears it.
-pub fn double_option<'de, D>(de: D) -> Result<Option<Option<i32>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    serde::Deserialize::deserialize(de).map(Some)
 }
 
 /// What a revocation answers with.
@@ -1145,7 +1051,9 @@ pub mod credentials {
         #[sea_orm(unique)]
         #[crudcrate(filterable)]
         pub client_id: String,
-        #[crudcrate(exclude(create, update))]
+        /// Never served: the CRUD list and detail are the only readers of this table now, and a
+        /// hash is what a leaked one would be replayed from.
+        #[crudcrate(exclude(create, update, one, list))]
         pub client_secret_hash: String,
         #[crudcrate(filterable)]
         pub service_type: String,
@@ -1262,6 +1170,8 @@ pub mod services {
     use sea_orm::entity::prelude::*;
     use serde::{Deserialize, Serialize};
 
+    use super::super::service::SyncServiceOperations;
+
     #[derive(
         Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize, EntityToModels,
     )]
@@ -1270,6 +1180,7 @@ pub mod services {
         api_struct = "SyncService",
         name_singular = "sync_service",
         name_plural = "sync_services",
+        operations = SyncServiceOperations,
         generate_router
     )]
     pub struct Model {
@@ -1290,17 +1201,20 @@ pub mod services {
         pub paused: bool,
         pub current_operation: Option<String>,
         /// Operator-set scheduled sync cadence in seconds. NULL leaves the service on its own
-        /// `SYNC_INTERVAL_SECONDS`. Set through `PATCH /sync/services/{id}`, which enforces the
-        /// minimum the runner floors at; generic CRUD must not write it around that check.
-        #[crudcrate(exclude(create, update))]
+        /// `SYNC_INTERVAL_SECONDS`. `SyncServiceOperations::before_update` enforces the minimum
+        /// the runner floors at.
+        #[crudcrate(exclude(create))]
         pub sync_interval_secs: Option<i32>,
         /// Whether the weekly `sync_full_reassert` queues a `trigger_full_sync` for this service.
-        /// Set through `PATCH /sync/services/{id}`.
-        #[crudcrate(filterable, exclude(create, update))]
+        #[crudcrate(filterable, exclude(create))]
         pub full_reassert_enabled: bool,
         #[crudcrate(sortable, exclude(create, update))]
         pub last_heartbeat: Option<DateTimeWithTimeZone>,
         pub last_sync_completed_at: Option<DateTimeWithTimeZone>,
+        /// The first error of the service's most recent cycle that reported one, filled by
+        /// `SyncServiceOperations` from `sync_events`. The column itself has never been written: a
+        /// service has no field to report an error through, so the row cannot carry one.
+        #[crudcrate(exclude(create, update))]
         pub last_error: Option<String>,
         #[crudcrate(sortable, exclude(create, update))]
         pub created_at: DateTimeWithTimeZone,
