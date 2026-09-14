@@ -180,6 +180,13 @@ impl Job for BackfillCalibrations {
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let sensors = uuid_array(ctx.params(), "sensors");
+        // Nothing to backfill is a run that should not have been minted: the route refuses an
+        // empty selection, and reporting zero here reads as "there was nothing to do" (B262).
+        if sensors.is_empty() {
+            return Err(DbErr::Custom(
+                "backfill_calibrations: no instruments given".to_string(),
+            ));
+        }
         let mut results = Vec::with_capacity(sensors.len());
         for sensor_id in sensors {
             let moved = reprocess_sensor_readings(ctx.db(), sensor_id, Some(ctx.job_id()))

@@ -2935,3 +2935,36 @@ pub mod decision_set {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+/// One reading whose curation columns are not the fold of its live decisions.
+#[derive(Debug, Serialize, ToSchema, sea_orm::FromQueryResult)]
+pub struct CurationDriftRow {
+    pub stream_id: Uuid,
+    pub time: chrono::DateTime<chrono::FixedOffset>,
+    pub replicate_index: i16,
+    #[schema(required)]
+    pub site_id: Option<Uuid>,
+    #[schema(required)]
+    pub parameter_id: Option<Uuid>,
+    /// The curation columns the reading holds.
+    #[schema(value_type = Object)]
+    pub stored: serde_json::Value,
+    /// What the reading's live decisions fold to. A column absent from it is one no decision
+    /// asserts, which is not a disagreement.
+    #[schema(value_type = Object)]
+    pub folded: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CurationDriftResponse {
+    /// Every disagreeing reading, not only the ones listed below.
+    pub total: i64,
+    /// The first `limit` of them, newest first, so a person can open one.
+    pub rows: Vec<CurationDriftRow>,
+}
+
+/// How many drift rows to list beside the count.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct CurationDriftQuery {
+    pub limit: Option<u32>,
+}

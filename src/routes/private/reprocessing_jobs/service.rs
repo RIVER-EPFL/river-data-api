@@ -230,10 +230,20 @@ pub fn manual_run_for(trigger_type: &str) -> ManualRun {
         | "dispatch_notifications"
         | "meteoswiss_sync"
         | "reprocess_all"
-        | "derived_recompute"
-        | "backfill_calibrations"
-        | "backfill_attribution"
         | "event_audit" => ManualRun::NoParameters,
+
+        // Each of these reads its scope from `params`, so a run minted with none either fails at
+        // the first missing key or moves nothing and reports zero (B262). What they read is what
+        // they declare.
+        "derived_recompute" => declared(vec![
+            spec("derived_definition_id", Uuid, false, "Calculation"),
+            spec("site_ids", UuidList, false, "Sites"),
+            spec("parameter_ids", UuidList, false, "Parameters"),
+            spec("start", Instant, false, "Window start"),
+            spec("end", Instant, false, "Window end"),
+        ]),
+        "backfill_calibrations" => declared(vec![spec("sensors", UuidList, true, "Instruments")]),
+        "backfill_attribution" => declared(vec![spec("slots", PairList, true, "Slots")]),
 
         "refresh_aggregates" => declared(vec![
             spec("from", Instant, false, "Window start"),

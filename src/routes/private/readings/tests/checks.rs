@@ -44,3 +44,19 @@ fn the_method_describes_every_class_and_the_window_it_queries() {
     assert!(m.pooled.contains("Flagged") && m.pooled.contains("withdrawn"));
     assert!(m.value.contains("raw"));
 }
+
+#[test]
+fn the_pooled_window_names_the_time_column_and_counts_the_short_way_round_the_year() {
+    let sql = super::pooled_rows(
+        uuid::Uuid::nil(),
+        uuid::Uuid::nil(),
+        "2025-12-10T00:00:00Z".parse().unwrap(),
+    )
+    .to_string(sea_orm::sea_query::PostgresQueryBuilder);
+
+    assert!(sql.contains(r#"date_part('month', "time")"#), "{sql}");
+    assert!(sql.contains("LEAST("), "{sql}");
+    assert!(sql.contains(&format!("<= {WINDOW_MONTHS}")), "{sql}");
+    assert!(sql.contains(r#""is_flagged" IS NOT TRUE"#), "{sql}");
+    assert!(sql.contains(r#""unverified" IS NOT TRUE"#), "{sql}");
+}

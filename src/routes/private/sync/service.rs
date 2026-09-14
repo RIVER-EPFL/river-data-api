@@ -7,8 +7,8 @@ use axum::http::request::Parts;
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
 use sea_orm::sea_query::{
-    Alias, Expr, ExprTrait as _, Func, JoinType, OnConflict, PostgresQueryBuilder,
-    Query as SeaQuery,
+    Alias, Expr, ExprTrait as _, Func, JoinType, OnConflict, Order, PostgresQueryBuilder,
+    Query as SeaQuery, SelectStatement,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
@@ -423,14 +423,40 @@ pub(super) async fn enforce_hold_scope(
     scope: &AccessScope,
     hold_id: Uuid,
 ) -> AppResult<()> {
+    let hold = Alias::new("h");
+    let stream = Alias::new("ds");
+    let slot = Alias::new("sp");
+    let statement = SeaQuery::select()
+        .expr_as(
+            Func::coalesce::<[Expr; 2], _>([
+                Expr::col((slot.clone(), site_parameters::models::Column::SiteId)),
+                Expr::col((hold.clone(), hold_model::Column::SiteId)),
+            ]),
+            Alias::new("site_id"),
+        )
+        .from_as(hold_model::Entity, hold.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            data_streams::models::Entity,
+            stream.clone(),
+            Expr::col((stream.clone(), data_streams::models::Column::Id))
+                .equals((hold.clone(), hold_model::Column::StreamId)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            site_parameters::models::Entity,
+            slot.clone(),
+            Expr::col((slot, site_parameters::models::Column::Id))
+                .equals((stream, data_streams::models::Column::SiteParameterId)),
+        )
+        .and_where(Expr::col((hold, hold_model::Column::Id)).eq(hold_id))
+        .take();
+    let (sql, values) = statement.build(PostgresQueryBuilder);
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT COALESCE(sp.site_id, h.site_id) AS site_id FROM replicate_audit_holds h
-             LEFT JOIN data_streams ds ON ds.id = h.stream_id
-             LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id
-             WHERE h.id = $1",
-            [hold_id.into()],
+            sql,
+            values,
         ))
         .await?
         .ok_or_else(|| AppError::NotFound(format!("no replicate audit hold {hold_id}")))?;
@@ -637,11 +663,6 @@ pub fn open_statuses() -> [&'static str; 2] {
     HoldStatus::OPEN.map(HoldStatus::as_str)
 }
 
-/// Everything past review. `use_portal`, `use_manual` and `consumed` are legacy statuses kept
-/// for history; nothing produces them.
-pub(super) static RESOLVED: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| HoldStatus::sql_list(&HoldStatus::RESOLVED));
-
 /// The most recent hold for a group, as the ingest gate reads it. Terminal decisions matter to
 /// the gate as much as open holds: a re-detected disagreement must not reopen a group an
 /// operator already ruled on.
@@ -695,22 +716,35 @@ pub async fn latest_holds<C: ConnectionTrait>(
     // Range bind + exact-match filter here: a timestamptz array bind panics in the driver, and
     // one batch's audit instants are contiguous anyway.
     let wanted: std::collections::HashSet<DateTime<Utc>> = times.iter().copied().collect();
+    let latest = SeaQuery::select()
+        .distinct_on([hold_model::Column::GroupTime])
+        .columns([
+            hold_model::Column::Id,
+            hold_model::Column::GroupTime,
+            hold_model::Column::Status,
+            hold_model::Column::Expected,
+        ])
+        .from(hold_model::Entity)
+        .and_where(Expr::col(hold_model::Column::StreamId).eq(stream_id))
+        .and_where(
+            Expr::col(hold_model::Column::GroupTime)
+                .gte(sea_orm::prelude::DateTimeWithTimeZone::from(*lo)),
+        )
+        .and_where(
+            Expr::col(hold_model::Column::GroupTime)
+                .lte(sea_orm::prelude::DateTimeWithTimeZone::from(*hi)),
+        )
+        .and_where(Expr::col(hold_model::Column::Kind).eq(HoldKind::ReplicateStats.as_str()))
+        .order_by(hold_model::Column::GroupTime, Order::Asc)
+        .order_by(hold_model::Column::CreatedAt, Order::Desc)
+        .order_by(hold_model::Column::Id, Order::Desc)
+        .take();
+    let (sql, values) = latest.build(PostgresQueryBuilder);
     let rows = conn
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT DISTINCT ON (group_time) id, group_time, status, expected
-                 FROM replicate_audit_holds
-                 WHERE stream_id = $1 AND group_time >= $2 AND group_time <= $3
-                   AND kind = '{REPLICATE_STATS}'
-                 ORDER BY group_time, created_at DESC, id DESC",
-                REPLICATE_STATS = HoldKind::ReplicateStats.as_str()
-            ),
-            [
-                stream_id.into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(*lo).into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(*hi).into(),
-            ],
+            sql,
+            values,
         ))
         .await?;
     rows.iter()
@@ -1085,41 +1119,136 @@ pub(super) fn merged_resolution(
     next
 }
 
+/// A statistic of one of the hold's jsonb documents, as a float: `(h.<doc>-><statistic>)::float8`.
+///
+/// The three documents a hold carries are opaque `serde_json::Value` on the entity, so the reader
+/// names the statistic rather than a column; what stays built is the column the document lives in,
+/// so a renamed column is a compile error here.
+fn statistic(column: hold_model::Column, name: &str) -> Expr {
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    Expr::col((Alias::new("h"), column))
+        .cast_json_field(name)
+        .cast_as(Alias::new("float8"))
+}
+
 /// The one denominator every relative delta is normalised by: the MEAN magnitude, not each
 /// statistic's own, because that is the scale an operator judges significance on (an sd off by 2
 /// on a value of 150 is noise; a mean off by 2 is not).
-macro_rules! scale_sql {
-    () => {
-        "GREATEST(
-        abs(COALESCE((h.expected->>'mean')::float8, 0)),
-        abs(COALESCE((h.computed->>'mean')::float8, 0)),
-        1e-9
-    )"
-    };
+pub fn scale_expr() -> Expr {
+    greatest([
+        abs(coalesce_zero(statistic(
+            hold_model::Column::Expected,
+            "mean",
+        ))),
+        abs(coalesce_zero(statistic(
+            hold_model::Column::Computed,
+            "mean",
+        ))),
+        Expr::val(1e-9),
+    ])
 }
 
-pub(super) const MEAN_RELATIVE_DELTA_SQL: &str = concat!(
-    "COALESCE(abs((h.delta->>'mean')::float8), 0) / ",
-    scale_sql!()
-);
+/// How far the source and the recomputation disagree on one statistic, against the mean's scale.
+pub fn relative_delta_of(name: &str) -> Expr {
+    coalesce_zero(abs(statistic(hold_model::Column::Delta, name))).div(scale_expr())
+}
 
-pub(super) const SD_RELATIVE_DELTA_SQL: &str = concat!(
-    "COALESCE(abs((h.delta->>'sd')::float8), 0) / ",
-    scale_sql!()
-);
+/// One scalar per hold saying how large the disagreement is, whichever statistic carries it.
+/// The list's per-row value, the sort and the threshold bulk acknowledge all read this one
+/// producer, so what the UI shows and what the slider acknowledges can never disagree.
+pub fn relative_delta_expr() -> Expr {
+    greatest([
+        coalesce_zero(abs(statistic(hold_model::Column::Delta, "mean"))),
+        coalesce_zero(abs(statistic(hold_model::Column::Delta, "sd"))),
+    ])
+    .div(scale_expr())
+}
 
-/// One scalar per hold saying how large the disagreement is against the measurement's own scale:
-/// `max(|Δmean|, |Δsd|) / max(|portal mean|, |computed mean|)`, i.e. the greater of
-/// [`MEAN_RELATIVE_DELTA_SQL`] and [`SD_RELATIVE_DELTA_SQL`]. The same expression drives the
-/// list's per-row value, the sort, and the threshold bulk acknowledge, so what the UI shows and
-/// what the slider acknowledges can never disagree.
-pub(super) const RELATIVE_DELTA_SQL: &str = concat!(
-    "GREATEST(
-        COALESCE(abs((h.delta->>'mean')::float8), 0),
-        COALESCE(abs((h.delta->>'sd')::float8), 0)
-    ) / ",
-    scale_sql!()
-);
+/// The same bound as [`tolerance_bound`], between two value expressions.
+fn bound_expr(a: Expr, b: Expr, rel_tol: f64, abs_tol: f64) -> Expr {
+    greatest([
+        Expr::val(rel_tol).mul(greatest([abs(a), abs(b)])),
+        Expr::val(abs_tol),
+        Expr::val(QUANTUM_FLOOR),
+    ])
+}
+
+/// The population-divisor signature, over the alias `h` (`replicate_audit_holds`).
+///
+/// It reproduces exactly the arm [`classify`] returns `population_sd` from: the replicate counts
+/// agree (so `n_mismatch` cannot preempt it), the means agree, and the source's sd is our sd under
+/// the other divisor, `s * sqrt((n-1)/n)`. The prefix search behind `stale_subset` has no built
+/// spelling, but it is tested after this arm, so a row matching here is `population_sd` in both.
+pub fn population_sd_expr() -> Condition {
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    let expected_n =
+        Expr::col((Alias::new("h"), hold_model::Column::Expected)).cast_json_field("n");
+    let computed_n =
+        Expr::col((Alias::new("h"), hold_model::Column::Computed)).cast_json_field("n");
+    let expected_mean = statistic(hold_model::Column::Expected, "mean");
+    let computed_mean = statistic(hold_model::Column::Computed, "mean");
+    let expected_sd = statistic(hold_model::Column::Expected, "sd");
+    let population_sd = statistic(hold_model::Column::Computed, "sd").mul(sqrt(
+        statistic(hold_model::Column::Computed, "n")
+            .sub(Expr::val(1))
+            .div(statistic(hold_model::Column::Computed, "n")),
+    ));
+    Condition::all()
+        .add(
+            Condition::any().add(expected_n.clone().is_null()).add(
+                expected_n
+                    .cast_as(Alias::new("int"))
+                    .eq(computed_n.clone().cast_as(Alias::new("int"))),
+            ),
+        )
+        .add(computed_n.cast_as(Alias::new("int")).gte(2))
+        .add(json_present(hold_model::Column::Expected, "mean"))
+        .add(json_present(hold_model::Column::Computed, "mean"))
+        .add(
+            abs(expected_mean.clone().sub(computed_mean.clone())).lte(bound_expr(
+                expected_mean,
+                computed_mean,
+                DEFAULT_REL_TOL,
+                DEFAULT_ABS_TOL,
+            )),
+        )
+        .add(json_present(hold_model::Column::Expected, "sd"))
+        .add(json_present(hold_model::Column::Computed, "sd"))
+        .add(
+            abs(expected_sd.clone().sub(population_sd.clone())).lte(bound_expr(
+                expected_sd,
+                population_sd,
+                SD_REL_TOL,
+                SD_ABS_TOL,
+            )),
+        )
+}
+
+/// `h.<doc>-><statistic> IS NOT NULL`, the guard each comparison takes before reading a statistic.
+fn json_present(column: hold_model::Column, name: &str) -> Expr {
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    Expr::col((Alias::new("h"), column))
+        .cast_json_field(name)
+        .is_not_null()
+}
+
+fn abs(e: Expr) -> Expr {
+    Func::cust(Alias::new("abs")).arg(e).into()
+}
+
+fn sqrt(e: Expr) -> Expr {
+    Func::cust(Alias::new("sqrt")).arg(e).into()
+}
+
+fn greatest<I: IntoIterator<Item = Expr>>(args: I) -> Expr {
+    args.into_iter()
+        .fold(Func::cust(Alias::new("GREATEST")), |f, a| f.arg(a))
+        .into()
+}
+
+fn coalesce_zero(e: Expr) -> Expr {
+    Func::coalesce([e, Expr::val(0)]).into()
+}
 
 /// The population-divisor signature, in SQL, over the alias `h` (`replicate_audit_holds`).
 ///
@@ -1161,6 +1290,406 @@ pub static POPULATION_SD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock:
          AND abs({expected_sd} - {population_sd}) <= {sd_bound}"
     )
 });
+
+// --- The review queue's statements ---
+
+/// A built statement, rendered once for the connection to run. Rendering lives here rather than at
+/// the call site so a handler never holds SQL text.
+pub fn built(statement: SelectStatement) -> Statement {
+    let (sql, values) = statement.build(PostgresQueryBuilder);
+    Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values)
+}
+
+/// A column of the hold, under the alias `h` every expression in this file is written over.
+fn hold_col(column: hold_model::Column) -> Expr {
+    Expr::col((Alias::new("h"), column))
+}
+
+/// A column of the hold's stream, under the alias `ds`.
+fn stream_col(column: data_streams::models::Column) -> Expr {
+    Expr::col((Alias::new("ds"), column))
+}
+
+/// `h.<doc>-><name>` as text, for a value the hold records that is not a statistic.
+fn json_text(column: hold_model::Column, name: &str) -> Expr {
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    Expr::col((Alias::new("h"), column)).cast_json_field(name)
+}
+
+/// `COUNT(*) FILTER (WHERE condition)`, as a count over a CASE that is NULL where the condition
+/// does not hold. An empty set counts zero, which is what the page reads the number as.
+fn count_where(condition: Condition) -> Expr {
+    let case: Expr = sea_orm::sea_query::CaseStatement::new()
+        .case(condition, 1)
+        .into();
+    Expr::from(Func::count(case)).cast_as(Alias::new("bigint"))
+}
+
+/// The caller's projects, reached either through the hold's stream pairing or through the site a
+/// stream-less finding names; `None` when the caller is unrestricted.
+///
+/// A restricted caller sees only holds whose stream is paired into their projects; unpaired
+/// (deferred) holds belong to no project and are visible only without project restriction.
+fn holds_in_scope(scope: &AccessScope) -> Option<Condition> {
+    let confine = || {
+        crate::common::scope::project_filter(scope, (Alias::new("st"), sites::Column::ProjectId))
+    };
+    let paired = Expr::exists(
+        SeaQuery::select()
+            .expr(Expr::val(1))
+            .from_as(site_parameters::Entity, Alias::new("sp_scope"))
+            .join_as(
+                JoinType::InnerJoin,
+                sites::Entity,
+                Alias::new("st"),
+                Expr::col((Alias::new("st"), sites::Column::Id))
+                    .equals((Alias::new("sp_scope"), site_parameters::Column::SiteId)),
+            )
+            .and_where(
+                Expr::col((Alias::new("sp_scope"), site_parameters::Column::Id)).equals((
+                    Alias::new("ds"),
+                    data_streams::models::Column::SiteParameterId,
+                )),
+            )
+            .and_where(confine()?)
+            .to_owned(),
+    );
+    let own_site = Expr::exists(
+        SeaQuery::select()
+            .expr(Expr::val(1))
+            .from_as(sites::Entity, Alias::new("st"))
+            .and_where(
+                Expr::col((Alias::new("st"), sites::Column::Id))
+                    .equals((Alias::new("h"), hold_model::Column::SiteId)),
+            )
+            .and_where(confine()?)
+            .to_owned(),
+    );
+    Some(Condition::any().add(paired).add(own_site))
+}
+
+/// Whether the slot behind the hold's stream declares an sd estimator.
+fn estimator_declared_expr() -> Expr {
+    Expr::exists(
+        SeaQuery::select()
+            .expr(Expr::val(1))
+            .from_as(site_parameters::Entity, Alias::new("sp_declared"))
+            .and_where(
+                Expr::col((Alias::new("sp_declared"), site_parameters::Column::Id)).equals((
+                    Alias::new("ds"),
+                    data_streams::models::Column::SiteParameterId,
+                )),
+            )
+            .and_where(
+                Expr::col((
+                    Alias::new("sp_declared"),
+                    site_parameters::Column::SdEstimator,
+                ))
+                .is_not_null(),
+            )
+            .to_owned(),
+    )
+}
+
+/// The filters the queue's three statements share: the caller's project confinement, the identity
+/// and source filters, the three relative-delta ceilings and the two classification arms.
+///
+/// The status view is not among them. It is applied per statement, so `pending` and `deferred`
+/// report the whole backlog under these filters whichever view the page shows.
+pub fn hold_filters(scope: &AccessScope, query: &ListHoldsQuery) -> AppResult<Condition> {
+    let mut filters = Condition::all();
+    if let Some(in_scope) = holds_in_scope(scope) {
+        filters = filters.add(in_scope);
+    }
+    if let Some(id) = query.id {
+        filters = filters.add(hold_col(hold_model::Column::Id).eq(id));
+    }
+    if let Some(stream_id) = query.stream_id {
+        filters = filters.add(hold_col(hold_model::Column::StreamId).eq(stream_id));
+    }
+    if let Some(stream_ids) = query.stream_ids.as_deref().filter(|s| !s.is_empty()) {
+        let ids: Vec<Uuid> = stream_ids
+            .split(',')
+            .map(|s| {
+                s.trim()
+                    .parse()
+                    .map_err(|_| AppError::BadRequest(format!("invalid stream id '{s}'")))
+            })
+            .collect::<Result<_, _>>()?;
+        filters = filters.add(hold_col(hold_model::Column::StreamId).is_in(ids));
+    }
+    if let Some(source_system) = query.source_system.clone() {
+        filters =
+            filters.add(stream_col(data_streams::models::Column::SourceSystem).eq(source_system));
+    }
+    if let Some(ceiling) = query.max_relative_delta {
+        filters = filters.add(relative_delta_expr().lte(ceiling));
+    }
+    if let Some(ceiling) = query.max_mean_relative_delta {
+        filters = filters.add(relative_delta_of("mean").lte(ceiling));
+    }
+    if let Some(ceiling) = query.max_sd_relative_delta {
+        filters = filters.add(relative_delta_of("sd").lte(ceiling));
+    }
+    let replicate_stats =
+        || hold_col(hold_model::Column::Kind).eq(HoldKind::ReplicateStats.as_str());
+    match query.classification.as_deref() {
+        Some("population_sd") => {
+            filters = filters.add(replicate_stats()).add(population_sd_expr());
+        }
+        Some("not_population_sd") => {
+            // COALESCE, not a bare NOT: a hold missing a statistic leaves the signature NULL, and
+            // a NULL is not the population signature, so it belongs to the complement. This is
+            // what makes the two filters partition the replicate-stats holds exactly.
+            filters = filters.add(replicate_stats()).add(
+                Expr::from(Func::coalesce([
+                    Expr::from(population_sd_expr()),
+                    Expr::val(false),
+                ]))
+                .not(),
+            );
+        }
+        Some(other) => {
+            return Err(AppError::BadRequest(format!(
+                "classification '{other}' has no filter; only 'population_sd' and \
+                 'not_population_sd' are filterable"
+            )));
+        }
+        None => {}
+    }
+    match query.estimator_declared {
+        Some(true) => filters = filters.add(estimator_declared_expr()),
+        Some(false) => filters = filters.add(estimator_declared_expr().not()),
+        None => {}
+    }
+    Ok(filters)
+}
+
+/// The status view the page asks for: one status, the `resolved` set, or the pending queue.
+pub fn hold_status_condition(status: Option<&str>) -> AppResult<Condition> {
+    let column = hold_col(hold_model::Column::Status);
+    match status {
+        Some("resolved") => {
+            Ok(Condition::all().add(column.is_in(HoldStatus::RESOLVED.iter().map(|s| s.as_str()))))
+        }
+        Some(other) => match HoldStatus::parse(other) {
+            Some(status) => Ok(Condition::all().add(column.eq(status.as_str()))),
+            None => Err(AppError::BadRequest(format!(
+                "unknown hold status '{other}'"
+            ))),
+        },
+        None => Ok(Condition::all().add(column.eq(HoldStatus::Pending.as_str()))),
+    }
+}
+
+/// How the queue is ordered: newest first, or largest disagreement first, which is what lets an
+/// operator triage the whole backlog across pages.
+pub fn hold_order_by(sort: Option<&str>) -> AppResult<Vec<(Expr, Order)>> {
+    let created = || (hold_col(hold_model::Column::CreatedAt), Order::Desc);
+    match sort {
+        None | Some("created_at_desc") => Ok(vec![created()]),
+        Some("relative_delta_desc") => Ok(vec![(relative_delta_expr(), Order::Desc), created()]),
+        Some("relative_delta_asc") => Ok(vec![(relative_delta_expr(), Order::Asc), created()]),
+        Some(other) => Err(AppError::BadRequest(format!("unknown sort '{other}'"))),
+    }
+}
+
+/// `replicate_audit_holds h LEFT JOIN data_streams ds`, the reach every shared filter needs.
+fn holds_with_stream() -> SelectStatement {
+    let mut q = SeaQuery::select();
+    q.from_as(hold_model::Entity, Alias::new("h")).join_as(
+        JoinType::LeftJoin,
+        data_streams::models::Entity,
+        Alias::new("ds"),
+        stream_col(data_streams::models::Column::Id)
+            .equals((Alias::new("h"), hold_model::Column::StreamId)),
+    );
+    q.take()
+}
+
+/// What the page shows above the queue: the total under the asked-for view, and the pending and
+/// deferred backlogs under the same filters.
+pub fn hold_counts_statement(filters: &Condition, status: &Condition) -> SelectStatement {
+    let at =
+        |s: HoldStatus| Condition::all().add(hold_col(hold_model::Column::Status).eq(s.as_str()));
+    let mut q = holds_with_stream();
+    q.expr_as(count_where(status.clone()), Alias::new("total"))
+        .expr_as(count_where(at(HoldStatus::Pending)), Alias::new("pending"))
+        .expr_as(
+            count_where(at(HoldStatus::Deferred)),
+            Alias::new("deferred"),
+        )
+        .cond_where(filters.clone());
+    q.take()
+}
+
+/// The pending backlog split by kind: the entry points announce what is waiting, and a fired brake
+/// is not a replicate-statistics disagreement.
+pub fn hold_kind_counts_statement(filters: &Condition) -> SelectStatement {
+    let mut q = holds_with_stream();
+    q.column((Alias::new("h"), hold_model::Column::Kind))
+        .expr_as(
+            Expr::from(Func::count(Expr::val(1))).cast_as(Alias::new("bigint")),
+            Alias::new("n"),
+        )
+        .cond_where(
+            filters
+                .clone()
+                .add(hold_col(hold_model::Column::Status).eq(HoldStatus::Pending.as_str())),
+        )
+        .group_by_col((Alias::new("h"), hold_model::Column::Kind));
+    q.take()
+}
+
+/// The divisor the hold's sd was computed under: recorded on the hold, else the slot's
+/// declaration, else the sample divisor. A hold of another kind carries no estimator at all.
+fn estimator_of_hold(sp: &Alias) -> Expr {
+    sea_orm::sea_query::CaseStatement::new()
+        .case(
+            hold_col(hold_model::Column::Kind).eq(HoldKind::ReplicateStats.as_str()),
+            Func::coalesce([
+                json_text(hold_model::Column::Computed, "sd_estimator"),
+                Expr::col((sp.clone(), site_parameters::Column::SdEstimator)),
+                Expr::val("sample"),
+            ]),
+        )
+        .into()
+}
+
+/// One page of the queue, with the slot labels a reviewer reads a hold by. A stream-less finding
+/// carries its own site and parameter, so each label falls back to the pair the hold names.
+pub fn hold_list_statement(
+    filters: &Condition,
+    status: &Condition,
+    order_by: &[(Expr, Order)],
+    limit: u64,
+    offset: u64,
+) -> SelectStatement {
+    let sp = Alias::new("sp");
+    let site = Alias::new("s");
+    let parameter = Alias::new("p");
+    let event_site = Alias::new("es");
+    let event_parameter = Alias::new("ep");
+    let mut q = holds_with_stream();
+    q.join_as(
+        JoinType::LeftJoin,
+        site_parameters::Entity,
+        sp.clone(),
+        Expr::col((sp.clone(), site_parameters::Column::Id)).equals((
+            Alias::new("ds"),
+            data_streams::models::Column::SiteParameterId,
+        )),
+    )
+    .join_as(
+        JoinType::LeftJoin,
+        sites::Entity,
+        site.clone(),
+        Expr::col((site.clone(), sites::Column::Id))
+            .equals((sp.clone(), site_parameters::Column::SiteId)),
+    )
+    .join_as(
+        JoinType::LeftJoin,
+        parameters::Entity,
+        parameter.clone(),
+        Expr::col((parameter.clone(), parameters::Column::Id))
+            .equals((sp.clone(), site_parameters::Column::ParameterId)),
+    )
+    .join_as(
+        JoinType::LeftJoin,
+        sites::Entity,
+        event_site.clone(),
+        Expr::col((event_site.clone(), sites::Column::Id))
+            .equals((Alias::new("h"), hold_model::Column::SiteId)),
+    )
+    .join_as(
+        JoinType::LeftJoin,
+        parameters::Entity,
+        event_parameter.clone(),
+        Expr::col((event_parameter.clone(), parameters::Column::Id))
+            .equals((Alias::new("h"), hold_model::Column::ParameterId)),
+    );
+    for column in [
+        hold_model::Column::Id,
+        hold_model::Column::StreamId,
+        hold_model::Column::Kind,
+    ] {
+        q.column((Alias::new("h"), column));
+    }
+    for column in [
+        data_streams::models::Column::SourceSystem,
+        data_streams::models::Column::SourceKey,
+        data_streams::models::Column::SourceName,
+    ] {
+        q.column((Alias::new("ds"), column));
+    }
+    q.expr_as(
+        Func::coalesce([
+            Expr::col((site.clone(), sites::Column::Id)),
+            Expr::col((event_site.clone(), sites::Column::Id)),
+        ]),
+        Alias::new("site_id"),
+    )
+    .expr_as(
+        Func::coalesce([
+            Expr::col((site, sites::Column::Name)),
+            Expr::col((event_site, sites::Column::Name)),
+        ]),
+        Alias::new("site_name"),
+    )
+    .expr_as(
+        Func::coalesce([
+            Expr::col((parameter.clone(), parameters::Column::Name)),
+            Expr::col((event_parameter.clone(), parameters::Column::Name)),
+        ]),
+        Alias::new("parameter_name"),
+    )
+    .expr_as(
+        Func::coalesce([
+            Expr::col((parameter, parameters::Column::Code)),
+            Expr::col((event_parameter, parameters::Column::Code)),
+        ]),
+        Alias::new("parameter_code"),
+    )
+    .column((Alias::new("h"), hold_model::Column::Tool))
+    .expr_as(
+        stream_col(data_streams::models::Column::SiteParameterId).is_not_null(),
+        Alias::new("paired"),
+    );
+    for column in [
+        hold_model::Column::GroupTime,
+        hold_model::Column::Expected,
+        hold_model::Column::Computed,
+        hold_model::Column::Delta,
+        hold_model::Column::Status,
+    ] {
+        q.column((Alias::new("h"), column));
+    }
+    // The signature is computed per row from the two documents once the page is decoded; the
+    // column is here so the decoder has one to fill.
+    q.expr_as(
+        Expr::val("").cast_as(Alias::new("text")),
+        Alias::new("classification"),
+    )
+    .expr_as(estimator_of_hold(&sp), Alias::new("sd_estimator"));
+    for column in [
+        hold_model::Column::Resolution,
+        hold_model::Column::CreatedAt,
+        hold_model::Column::AcknowledgedBy,
+        hold_model::Column::AcknowledgedAt,
+    ] {
+        q.column((Alias::new("h"), column));
+    }
+    q.expr_as(relative_delta_expr(), Alias::new("relative_delta"))
+        .expr_as(relative_delta_of("mean"), Alias::new("mean_relative_delta"))
+        .expr_as(relative_delta_of("sd"), Alias::new("sd_relative_delta"))
+        .cond_where(filters.clone().add(status.clone()))
+        .limit(limit)
+        .offset(offset);
+    for (expr, order) in order_by {
+        q.order_by_expr(expr.clone(), order.clone());
+    }
+    q.take()
+}
 
 /// The row shapes the raw hold queries return. A derived decoder is checked against the SELECT it
 /// fills, so a column renamed in one query and not in its mapper fails where the query is written.

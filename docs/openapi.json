@@ -9885,9 +9885,6 @@
             },
             "type": "array"
           },
-          "qc": {
-            "description": "Opaque QC block, stored as declared and served on `GET /tools` for clients that read it.\nNothing server-side reads it: the seasonal check and the event audit take no input from\nthe manifest. The only validation is that it is an object."
-          },
           "sections": {
             "items": {
               "$ref": "#/components/schemas/ManifestSection"
@@ -24914,7 +24911,6 @@
             },
             "type": "array"
           },
-          "qc": {},
           "script_version_id": {
             "format": "uuid",
             "type": "string"

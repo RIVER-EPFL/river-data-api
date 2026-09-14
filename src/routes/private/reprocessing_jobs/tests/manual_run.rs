@@ -20,10 +20,43 @@ fn a_kind_reading_nothing_from_its_params_is_a_button() {
         "alarm_sweep",
         "janitor_service",
         "reprocess_all",
-        "backfill_attribution",
         "event_audit",
     ] {
         assert_eq!(manual_run_for(kind), ManualRun::NoParameters, "{kind}");
+    }
+}
+
+/// A kind whose `run` reads its scope from `params` is a form, never a button: minted with `{}`,
+/// `derived_recompute` fails at its first missing key and the two backfills move nothing and
+/// report zero (B262). What each declares is what its `run` reads.
+#[test]
+fn a_kind_that_reads_its_scope_from_params_is_a_form() {
+    let names =
+        |kind: &str| -> Vec<&'static str> { declared(kind).iter().map(|p| p.name).collect() };
+    assert_eq!(
+        names("derived_recompute"),
+        [
+            "derived_definition_id",
+            "site_ids",
+            "parameter_ids",
+            "start",
+            "end"
+        ]
+    );
+    assert_eq!(names("backfill_calibrations"), ["sensors"]);
+    assert_eq!(names("backfill_attribution"), ["slots"]);
+
+    // The selection is the whole point of the run, so a manual run without it is refused before
+    // a job row is minted.
+    for (kind, label) in [
+        ("backfill_calibrations", "Instruments"),
+        ("backfill_attribution", "Slots"),
+    ] {
+        assert_eq!(
+            missing_params(&manual_run_for(kind), &serde_json::json!({})),
+            vec![label],
+            "{kind}"
+        );
     }
 }
 

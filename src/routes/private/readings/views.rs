@@ -9,20 +9,14 @@ use chrono::Utc;
 use sea_orm::ActiveModelTrait;
 use sea_orm::ColumnTrait;
 use sea_orm::Condition;
-use sea_orm::ConnectionTrait;
 use sea_orm::EntityTrait;
-use sea_orm::FromQueryResult;
 use sea_orm::QueryFilter;
 use sea_orm::QueryOrder;
 use sea_orm::QuerySelect;
 use sea_orm::QueryTrait;
 use sea_orm::Set;
-use sea_orm::Statement;
 use sea_orm::sea_query::Expr;
-use serde::Deserialize;
-use serde::Serialize;
 use tower_http::limit::RequestBodyLimitLayer;
-use utoipa::ToSchema;
 use uuid::Uuid;
 
 use super::models::*;
@@ -69,7 +63,6 @@ use crate::routes::private::site_parameters;
 use crate::routes::private::sites;
 use crate::routes::private::standard_curves;
 use crate::routes::private::sync::models::GroupAudit;
-use crate::routes::private::sync::models::HoldKind;
 use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::private::sync::service as audit;
 use crate::routes::private::tools::models::run as tool_run;
@@ -191,22 +184,13 @@ pub async fn sample_preview(
     let hold = match q.hold_id {
         None => None,
         Some(hold_id) => {
-            let row = state
-                .db
-                .query_one_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    format!(
-                        "SELECT expected FROM replicate_audit_holds
-                         WHERE id = $1 AND kind = '{kind}' AND group_time = $2",
-                        kind = HoldKind::ReplicateStats.as_str()
-                    ),
-                    [hold_id.into(), time.into()],
-                ))
-                .await?
-                .ok_or_else(|| {
-                    AppError::NotFound(format!("no replicate audit hold {hold_id} on this instant"))
-                })?;
-            let expected: serde_json::Value = row.try_get("", "expected")?;
+            let expected = crate::routes::private::readings::service::hold_expectation(
+                &state.db, hold_id, time,
+            )
+            .await?
+            .ok_or_else(|| {
+                AppError::NotFound(format!("no replicate audit hold {hold_id} on this instant"))
+            })?;
             let expected = GroupAudit {
                 time: q.time,
                 expected_mean: expected.get("mean").and_then(serde_json::Value::as_f64),
@@ -3921,26 +3905,16 @@ async fn import_one_site(
 
     // Site parameters for this site: lower(sp.name) -> (parameter_id, sp_name).
     // Also build alias map from the site's parameters only.
-    let sp_rows = state
-        .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT sp.name AS sp_name, sp.parameter_id, p.code AS param_name, p.aliases \
-             FROM site_parameters sp JOIN parameters p ON p.id = sp.parameter_id \
-             WHERE sp.site_id = $1",
-            [site_id.into()],
-        ))
-        .await?;
+    let sp_rows =
+        crate::routes::private::readings::service::site_parameter_columns(&state.db, site_id)
+            .await?;
 
     let mut site_param_map: HashMap<String, (Uuid, String)> = HashMap::new();
     let mut site_alias_map: HashMap<String, (Uuid, String)> = HashMap::new();
     let mut param_names: HashMap<Uuid, String> = HashMap::new();
     let mut site_param_ids: HashSet<Uuid> = HashSet::new();
 
-    for row in &sp_rows {
-        let Ok(row) = SlotColumnRow::from_query_result(row, "") else {
-            continue;
-        };
+    for row in sp_rows {
         let (pid, sp_name, param_name, aliases) = (
             row.parameter_id,
             row.sp_name.unwrap_or_default(),
@@ -3959,21 +3933,8 @@ async fn import_one_site(
     }
 
     // Derived-output parameters are computed, never ingested.
-    let derived_rows = state
-        .db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT output_parameter_id FROM calculation_formulas \
-             WHERE output_parameter_id IS NOT NULL"
-                .to_owned(),
-        ))
-        .await?;
-    // A dropped row would let a derived output through as if nothing produced it, so a decode
-    // failure is an error rather than a shorter set.
-    let derived_outputs: HashSet<Uuid> = derived_rows
-        .iter()
-        .map(|r| Ok(r.try_get::<Uuid>("", "output_parameter_id")?))
-        .collect::<AppResult<HashSet<Uuid>>>()?;
+    let derived_outputs =
+        crate::routes::private::readings::service::derived_output_parameter_ids(&state.db).await?;
 
     // Global catalog fallback: lower(name) -> id, lower(alias) -> id.
     let catalog_rows = parameters::Entity::find().all(&state.db).await?;
@@ -4189,22 +4150,11 @@ async fn import_one_site(
         let mut owning_ids: Vec<Uuid> = overlap.owning_stream.values().copied().collect();
         owning_ids.sort_unstable();
         owning_ids.dedup();
-        let mut family_keys: HashMap<Uuid, String> = HashMap::new();
-        if !owning_ids.is_empty() {
-            for row in state
-                .db
-                .query_all_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT id, source_key FROM data_streams \
-                     WHERE id = ANY($1) AND metadata -> 'replicates' IS NOT NULL",
-                    [owning_ids.into()],
-                ))
-                .await?
-            {
-                let row = FamilyKeyRow::from_query_result(&row, "")?;
-                family_keys.insert(row.id, row.source_key);
-            }
-        }
+        let family_keys = crate::routes::private::readings::service::replicate_family_keys(
+            &state.db,
+            &owning_ids,
+        )
+        .await?;
         if !family_keys.is_empty() {
             let header_of: HashMap<Uuid, String> = mappings
                 .iter()
@@ -4264,18 +4214,13 @@ async fn import_one_site(
     {
         let mut api_stream_of: HashMap<Uuid, Uuid> = HashMap::new();
         let mapped_params: Vec<Uuid> = mappings.iter().map(|m| m.parameter_id).collect();
-        for row in state
-            .db
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT sp.parameter_id, ds.id FROM data_streams ds \
-                 JOIN site_parameters sp ON sp.id = ds.site_parameter_id \
-                 WHERE ds.source_system = 'api' AND sp.site_id = $1 AND sp.parameter_id = ANY($2)",
-                [site_id.into(), mapped_params.into()],
-            ))
-            .await?
+        for row in crate::routes::private::readings::service::api_streams_of_slots(
+            &state.db,
+            site_id,
+            &mapped_params,
+        )
+        .await?
         {
-            let row = SlotStreamRow::from_query_result(&row, "")?;
             api_stream_of.insert(row.parameter_id, row.id);
         }
 
@@ -4651,33 +4596,6 @@ pub fn readings_admin_routes(state: &AppState) -> axum::Router {
         .with_state(state.clone())
 }
 
-/// One reading whose curation columns are not the fold of its live decisions.
-#[derive(Debug, Serialize, ToSchema, sea_orm::FromQueryResult)]
-pub struct CurationDriftRow {
-    pub stream_id: Uuid,
-    pub time: chrono::DateTime<chrono::FixedOffset>,
-    pub replicate_index: i16,
-    #[schema(required)]
-    pub site_id: Option<Uuid>,
-    #[schema(required)]
-    pub parameter_id: Option<Uuid>,
-    /// The curation columns the reading holds.
-    #[schema(value_type = Object)]
-    pub stored: serde_json::Value,
-    /// What the reading's live decisions fold to. A column absent from it is one no decision
-    /// asserts, which is not a disagreement.
-    #[schema(value_type = Object)]
-    pub folded: serde_json::Value,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct CurationDriftResponse {
-    /// Every disagreeing reading, not only the ones listed below.
-    pub total: i64,
-    /// The first `limit` of them, newest first, so a person can open one.
-    pub rows: Vec<CurationDriftRow>,
-}
-
 /// Readings whose curation columns disagree with the decisions recorded against them.
 ///
 /// The columns are the projection of the record, written by the same trigger in the writer's
@@ -4696,98 +4614,17 @@ pub async fn curation_drift(
     ProjectScope(scope): ProjectScope,
     Query(params): Query<CurationDriftQuery>,
 ) -> AppResult<Json<CurationDriftResponse>> {
-    use crate::routes::private::readings::models as readings;
-    use crate::routes::private::sites::models as sites;
-    use sea_orm::sea_query::{Alias, Expr, JoinType, PostgresQueryBuilder, Query};
-    use sea_orm::{Condition, ConnectionTrait, ExprTrait, FromQueryResult, Statement};
-
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
-    let d = Alias::new("d");
-    let r = Alias::new("r");
-    let st = Alias::new("st");
-    let (sql, values) = Query::select()
-        .column((d.clone(), Alias::new("stream_id")))
-        .column((d.clone(), Alias::new("time")))
-        .column((d.clone(), Alias::new("replicate_index")))
-        .column((r.clone(), readings::Column::SiteId))
-        .column((r.clone(), readings::Column::ParameterId))
-        .expr_as(
-            Expr::cust(
-                "jsonb_strip_nulls(jsonb_build_object(\
-                     'is_flagged', d.is_flagged, 'flag_reason', d.flag_reason, \
-                     'withdrawn_at', d.withdrawn_at, 'withdrawn_reason', d.withdrawn_reason, \
-                     'unverified', d.unverified, 'standard_curve_id', d.standard_curve_id, \
-                     'calibration_id', d.calibration_id, 'sensor_id', d.sensor_id, \
-                     'raw_value', d.raw_value))",
-            ),
-            Alias::new("stored"),
-        )
-        .expr_as(
-            Expr::cust("COALESCE(d.folded, '{}'::jsonb)"),
-            Alias::new("folded"),
-        )
-        .from_subquery(
-            crate::routes::private::readings::service::inconsistent_rows(),
-            d.clone(),
-        )
-        .join_as(
-            JoinType::InnerJoin,
-            readings::Entity,
-            r.clone(),
-            Condition::all()
-                .add(
-                    Expr::col((r.clone(), readings::Column::StreamId))
-                        .equals((d.clone(), Alias::new("stream_id"))),
-                )
-                .add(
-                    Expr::col((r.clone(), readings::Column::Time))
-                        .equals((d.clone(), Alias::new("time"))),
-                )
-                .add(
-                    Expr::col((r.clone(), readings::Column::ReplicateIndex))
-                        .equals((d.clone(), Alias::new("replicate_index"))),
-                ),
-        )
-        .join_as(
-            JoinType::LeftJoin,
-            sites::Entity,
-            st.clone(),
-            Expr::col((st.clone(), sites::Column::Id)).equals((r, readings::Column::SiteId)),
-        )
-        // A reading outside the token's projects is not this caller's to see, and an unpaired one
-        // belongs to no project at all, so a scoped caller is shown neither.
-        .cond_where(
-            Condition::all().add_option(crate::common::scope::project_filter(
-                &scope,
-                (st, sites::Column::ProjectId),
-            )),
-        )
-        .order_by((d, Alias::new("time")), sea_orm::Order::Desc)
-        .limit(u64::from(limit))
-        .to_owned()
-        .build(PostgresQueryBuilder);
-
-    let rows = app_state
-        .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            values,
-        ))
-        .await?
-        .iter()
-        .map(|row| CurationDriftRow::from_query_result(row, ""))
-        .collect::<Result<Vec<_>, _>>()?;
+    let rows = crate::routes::private::readings::service::curation_drift_rows(
+        &app_state.db,
+        &scope,
+        limit,
+    )
+    .await?;
 
     Ok(Json(CurationDriftResponse {
         total: crate::routes::private::readings::service::curation_drift_count(&app_state.db)
             .await?,
         rows,
     }))
-}
-
-/// How many drift rows to list beside the count.
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-pub struct CurationDriftQuery {
-    pub limit: Option<u32>,
 }

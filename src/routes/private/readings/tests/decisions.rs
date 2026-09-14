@@ -649,6 +649,103 @@ fn the_drift_statement_folds_every_owned_column_and_repairs_none() {
     }
 }
 
+/// Expected behaviour: `supersedes` names exactly the family it supersedes, and a kind that has no
+/// family supersedes nothing rather than every decision on the key. The text it replaced bound an
+/// array and matched with `= ANY($1)`, which on an empty array is false; the built form renders
+/// sea-query's own empty-`IN` falsehood.
+#[test]
+fn a_kind_supersedes_its_own_family_and_a_family_less_kind_supersedes_nothing() {
+    use super::{Kind, family_kinds, supersedes};
+    use sea_orm::sea_query::{Alias, PostgresQueryBuilder, Query};
+
+    assert_eq!(family_kinds(Kind::Flag), ["flag", "unflag"]);
+    assert_eq!(family_kinds(Kind::Unflag), family_kinds(Kind::Flag));
+    assert_eq!(
+        family_kinds(Kind::Withdraw),
+        ["withdraw", "reassert", "reject"]
+    );
+    assert_eq!(Kind::Rollback.family(), None);
+    // A kind that stands alone supersedes nothing, which is what its own comment in `family` says
+    // it must not do. Each carries a family name of its own and none is among the candidates, so
+    // the list comes back empty: a second reprocess does not hide the reprocess before it.
+    for kind in [
+        Kind::Rollback,
+        Kind::CurveRetire,
+        Kind::FormulaTransition,
+        Kind::CurveRecompose,
+        Kind::DerivedComputed,
+        Kind::Reprocess,
+    ] {
+        assert!(family_kinds(kind).is_empty(), "{kind:?}");
+    }
+
+    let render = |kind: Kind| {
+        let c = Alias::new("c");
+        Query::select()
+            .expr(supersedes(kind, &c))
+            .from_as(crate::routes::private::readings::models::Entity, c.clone())
+            .to_owned()
+            .to_string(PostgresQueryBuilder)
+    };
+    let flag = render(Kind::Flag);
+    assert!(
+        flag.contains(r#""d"."kind" IN ('flag', 'unflag')"#),
+        "{flag}"
+    );
+    assert!(
+        flag.contains(r#""replicate_index" IS NOT DISTINCT FROM "c"."replicate_index""#),
+        "the composite key matches a NULL index on both sides: {flag}"
+    );
+    let alone = render(Kind::Reprocess);
+    assert!(
+        alone.contains("1 = 2"),
+        "an empty family matches no decision, the way the array it replaced did: {alone}"
+    );
+}
+
+/// Expected behaviour: the three boolean predicates that are not pinned elsewhere render as
+/// `IS TRUE` / `IS NOT TRUE`, never `= TRUE`. A nullable boolean compared with `=` is NULL rather
+/// than false, which would project `flagged` as NULL on a never-flagged row and drop the CASE arm.
+#[test]
+fn the_boolean_predicates_read_a_null_flag_as_false() {
+    use sea_orm::QueryTrait;
+    use sea_orm::sea_query::PostgresQueryBuilder;
+
+    let preview = super::preview_rows()
+        .build(sea_orm::DatabaseBackend::Postgres)
+        .to_string();
+    assert!(
+        preview.contains(r#""is_flagged" IS TRUE"#),
+        "the projected flag reads a NULL as false: {preview}"
+    );
+
+    let kept = sea_orm::sea_query::Query::select()
+        .expr(super::kept_reason())
+        .from(crate::routes::private::readings::models::Entity)
+        .to_owned()
+        .to_string(PostgresQueryBuilder);
+    assert!(
+        kept.contains(r#""is_flagged" IS TRUE"#),
+        "the CASE arm reads a NULL as false: {kept}"
+    );
+
+    let curved = sea_orm::sea_query::Query::select()
+        .expr(sea_orm::sea_query::Expr::cust("1"))
+        .from(crate::routes::private::readings::models::Entity)
+        .cond_where(super::curated_or_curved(false))
+        .to_owned()
+        .to_string(PostgresQueryBuilder);
+    assert!(
+        curved.contains(r#""is_flagged" IS TRUE"#),
+        "a replace keeps a flagged replicate whose flag is stored NULL nowhere: {curved}"
+    );
+
+    for sql in [&preview, &kept, &curved] {
+        assert!(!sql.contains("= TRUE"), "{sql}");
+        assert!(!sql.contains("IS $"), "a bound keyword is not SQL: {sql}");
+    }
+}
+
 #[test]
 fn only_an_intern_enters_a_pending_measurement() {
     use super::entry_state;
@@ -750,4 +847,34 @@ fn the_key_set_names_the_column_each_key_is_read_by() {
         assert!(sql.contains(column), "{column} missing from {sql}");
     }
     assert_eq!(sql.matches("unnest").count(), 3, "{sql}");
+}
+
+#[test]
+fn the_supersedes_lookup_names_its_columns_and_reads_the_live_row_of_the_family() {
+    let sql = sea_orm::sea_query::Query::select()
+        .expr(super::supersedes(
+            Kind::Flag,
+            &sea_orm::sea_query::Alias::new("t"),
+        ))
+        .to_owned()
+        .to_string(sea_orm::sea_query::PostgresQueryBuilder);
+
+    assert!(
+        sql.contains(r#""d"."stream_id" = "t"."stream_id""#),
+        "{sql}"
+    );
+    assert!(sql.contains(r#""d"."time" = "t"."time""#), "{sql}");
+    assert!(
+        sql.contains(r#""d"."replicate_index" IS NOT DISTINCT FROM "t"."replicate_index""#),
+        "{sql}"
+    );
+    assert!(sql.contains(r#""d"."rolled_back_by" IS NULL"#), "{sql}");
+    // The whole family, so an unflag supersedes the flag it answers.
+    for kind in super::family_kinds(Kind::Flag) {
+        assert!(sql.contains(&format!("'{kind}'")), "{kind} missing: {sql}");
+    }
+    assert!(
+        sql.contains(r#"ORDER BY "d"."at" DESC, "d"."id" DESC LIMIT 1"#),
+        "{sql}"
+    );
 }

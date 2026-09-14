@@ -10,8 +10,8 @@ use axum::{
 use chrono::Utc;
 use sea_orm::ExprTrait;
 use sea_orm::sea_query::{
-    Alias, Expr, Func, JoinType, PostgresQueryBuilder, Query as SeaQuery, SelectStatement,
-    SimpleExpr, SubQueryStatement,
+    Alias, Expr, Func, JoinType, LockType, PostgresQueryBuilder, Query as SeaQuery,
+    SelectStatement, SimpleExpr, SubQueryStatement,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
@@ -27,6 +27,8 @@ use crate::common::middleware::{
 use crate::routes::service::ACTION_BODY_LIMIT;
 use river_data_core::commands as core_commands;
 
+use crate::routes::private::annotations::models as annotations;
+use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::samples::models as samples;
 use crate::routes::private::site_parameters::models as site_parameters;
@@ -716,8 +718,57 @@ fn refresh_group(rows: Condition) -> Statement {
     )
 }
 
-/// One built statement, ready to execute.
-fn built(query: SelectStatement) -> Statement {
+/// The three table aliases every hold statement here reads through, so a column reference names
+/// the same table in each of them.
+const HOLD: &str = "h";
+const STREAM: &str = "ds";
+const SLOT: &str = "sp";
+
+/// A hold joined to the stream that raised it, and that stream's slot. The join to the slot is the
+/// caller's: an inner join asks for a hold on a paired stream, a left join admits an unpaired one.
+fn hold_on_its_stream(to_slot: JoinType) -> SelectStatement {
+    SeaQuery::select()
+        .from_as(hold_model::Entity, Alias::new(HOLD))
+        .join_as(
+            JoinType::InnerJoin,
+            data_streams::Entity,
+            Alias::new(STREAM),
+            Expr::col((Alias::new(STREAM), data_streams::Column::Id))
+                .equals((Alias::new(HOLD), hold_model::Column::StreamId)),
+        )
+        .join_as(
+            to_slot,
+            site_parameters::Entity,
+            Alias::new(SLOT),
+            Expr::col((Alias::new(SLOT), site_parameters::Column::Id))
+                .equals((Alias::new(STREAM), data_streams::Column::SiteParameterId)),
+        )
+        .take()
+}
+
+/// A hold whose stream is paired, read through that pairing.
+fn hold_on_its_slot() -> SelectStatement {
+    hold_on_its_stream(JoinType::InnerJoin)
+}
+
+/// The holds this bulk acknowledge has not already put a note on. An acknowledge that ran twice
+/// inside the minute the statement looks back over would otherwise annotate the same instant
+/// again.
+fn not_yet_annotated() -> SelectStatement {
+    let existing = Alias::new("a");
+    SeaQuery::select()
+        .expr(Expr::val(1))
+        .from_as(annotations::Entity, existing.clone())
+        .and_where(
+            Expr::col((existing, annotations::Column::AuditHoldId))
+                .equals((Alias::new(HOLD), hold_model::Column::Id)),
+        )
+        .take()
+}
+
+/// One built statement, ready to execute. Select, update or insert: every statement here reaches
+/// the connection this way, so nothing in the file hands the driver SQL it assembled itself.
+fn built<Q: sea_orm::sea_query::QueryStatementWriter>(query: Q) -> Statement {
     let (sql, values) = query.build(PostgresQueryBuilder);
     Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values)
 }
@@ -999,134 +1050,14 @@ pub async fn list_holds(
     ProjectScope(scope): ProjectScope,
     Query(query): Query<ListHoldsQuery>,
 ) -> AppResult<Json<ListHoldsResponse>> {
-    let mut conditions = vec!["TRUE".to_string()];
-    let mut binds: Vec<sea_orm::Value> = Vec::new();
-    // A restricted caller sees only holds whose stream is paired into their projects; unpaired
-    // (deferred) holds belong to no project and are visible only without project restriction.
-    if let Some(projects) = scope.sql_project_array() {
-        binds.push(projects);
-        conditions.push(format!(
-            "(EXISTS (SELECT 1 FROM site_parameters sp JOIN sites st ON st.id = sp.site_id \
-              WHERE sp.id = ds.site_parameter_id AND st.project_id = ANY(${n})) \
-              OR EXISTS (SELECT 1 FROM sites st WHERE st.id = h.site_id \
-              AND st.project_id = ANY(${n})))",
-            n = binds.len()
-        ));
-    }
-    if let Some(id) = query.id {
-        binds.push(id.into());
-        conditions.push(format!("h.id = ${}", binds.len()));
-    }
-    if let Some(stream_id) = query.stream_id {
-        binds.push(stream_id.into());
-        conditions.push(format!("h.stream_id = ${}", binds.len()));
-    }
-    if let Some(stream_ids) = query.stream_ids.as_deref().filter(|s| !s.is_empty()) {
-        let ids: Vec<Uuid> = stream_ids
-            .split(',')
-            .map(|s| {
-                s.trim()
-                    .parse()
-                    .map_err(|_| AppError::BadRequest(format!("invalid stream id '{s}'")))
-            })
-            .collect::<Result<_, _>>()?;
-        binds.push(ids.into());
-        conditions.push(format!("h.stream_id = ANY(${})", binds.len()));
-    }
-    if let Some(source_system) = query.source_system.clone() {
-        binds.push(source_system.into());
-        conditions.push(format!("ds.source_system = ${}", binds.len()));
-    }
-    if let Some(ceiling) = query.max_relative_delta {
-        binds.push(ceiling.into());
-        conditions.push(format!("{RELATIVE_DELTA_SQL} <= ${}", binds.len()));
-    }
-    if let Some(ceiling) = query.max_mean_relative_delta {
-        binds.push(ceiling.into());
-        conditions.push(format!("{MEAN_RELATIVE_DELTA_SQL} <= ${}", binds.len()));
-    }
-    if let Some(ceiling) = query.max_sd_relative_delta {
-        binds.push(ceiling.into());
-        conditions.push(format!("{SD_RELATIVE_DELTA_SQL} <= ${}", binds.len()));
-    }
-    match query.classification.as_deref() {
-        Some("population_sd") => {
-            conditions.push(format!(
-                "h.kind = '{}' AND ({})",
-                HoldKind::ReplicateStats.as_str(),
-                *POPULATION_SD_SQL
-            ));
-        }
-        Some("not_population_sd") => {
-            // COALESCE, not a bare NOT: a hold missing a statistic leaves the signature NULL, and
-            // a NULL is not the population signature, so it belongs to the complement. This is
-            // what makes the two filters partition the replicate-stats holds exactly, matching
-            // the `count(*) FILTER (...)` evidence quoted elsewhere.
-            conditions.push(format!(
-                "h.kind = '{}' AND NOT COALESCE(({}), false)",
-                HoldKind::ReplicateStats.as_str(),
-                *POPULATION_SD_SQL
-            ));
-        }
-        Some(other) => {
-            return Err(AppError::BadRequest(format!(
-                "classification '{other}' has no filter; only 'population_sd' and \
-                 'not_population_sd' are filterable"
-            )));
-        }
-        None => {}
-    }
-    if let Some(declared) = query.estimator_declared {
-        let negate = if declared { "" } else { "NOT " };
-        conditions.push(format!(
-            "{negate}EXISTS (SELECT 1 FROM site_parameters sp              WHERE sp.id = ds.site_parameter_id AND sp.sd_estimator IS NOT NULL)"
-        ));
-    }
-    // The status view is kept out of the count statement's WHERE so `pending`/`deferred` report
-    // the whole backlog under the other filters, whichever view the page shows. Status values
-    // come from the allowlist below, so inlining them is safe.
-    let base_clause = conditions.join(" AND ");
-    let status_sql = match query.status.as_deref() {
-        Some("resolved") => format!("h.status IN {}", *RESOLVED),
-        Some(other) => match HoldStatus::parse(other) {
-            Some(status) => format!("h.status = '{}'", status.as_str()),
-            None => {
-                return Err(AppError::BadRequest(format!(
-                    "unknown hold status '{other}'"
-                )));
-            }
-        },
-        None => format!("h.status = '{}'", HoldStatus::Pending.as_str()),
-    };
-    let where_clause = format!("{base_clause} AND {status_sql}");
-    let order_by = match query.sort.as_deref() {
-        None | Some("created_at_desc") => "h.created_at DESC".to_string(),
-        Some("relative_delta_desc") => format!("{RELATIVE_DELTA_SQL} DESC, h.created_at DESC"),
-        Some("relative_delta_asc") => format!("{RELATIVE_DELTA_SQL} ASC, h.created_at DESC"),
-        Some(other) => {
-            return Err(AppError::BadRequest(format!("unknown sort '{other}'")));
-        }
-    };
-
+    let filters = hold_filters(&scope, &query)?;
+    let status = hold_status_condition(query.status.as_deref())?;
+    let order_by = hold_order_by(query.sort.as_deref())?;
     let window = Window::from_page(query.page, query.page_size, 50, 500);
-    let (limit, offset) = (window.limit, window.offset);
 
     let count_row = state
         .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT COUNT(*) FILTER (WHERE {status_sql})::bigint AS total,
-                        COUNT(*) FILTER (WHERE h.status = '{pending}')::bigint AS pending,
-                        COUNT(*) FILTER (WHERE h.status = '{deferred}')::bigint AS deferred
-                 FROM replicate_audit_holds h
-                 LEFT JOIN data_streams ds ON ds.id = h.stream_id
-                 WHERE {base_clause}",
-                pending = HoldStatus::Pending.as_str(),
-                deferred = HoldStatus::Deferred.as_str()
-            ),
-            binds.clone(),
-        ))
+        .query_one_raw(built(hold_counts_statement(&filters, &status)))
         .await?
         .ok_or_else(|| AppError::Internal("hold count returned no row".to_string()))?;
     let HoldCountsRow {
@@ -1135,41 +1066,13 @@ pub async fn list_holds(
         deferred,
     } = HoldCountsRow::from_query_result(&count_row, "")?;
 
-    let mut rows = HoldRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        format!(
-            "SELECT h.id, h.stream_id, h.kind, ds.source_system, ds.source_key, ds.source_name,
-                    COALESCE(s.id, es.id) AS site_id,
-                    COALESCE(s.name, es.name) AS site_name,
-                    COALESCE(p.name, ep.name) AS parameter_name,
-                    COALESCE(p.code, ep.code) AS parameter_code,
-                    h.tool,
-                    COALESCE(ds.site_parameter_id IS NOT NULL, FALSE) AS paired,
-                    h.group_time,
-                    h.expected, h.computed, h.delta, h.status,
-                    ''::text AS classification,
-                    CASE WHEN h.kind = '{REPLICATE_STATS}'
-                         THEN COALESCE(h.computed->>'sd_estimator', sp.sd_estimator, 'sample')
-                    END AS sd_estimator,
-                    h.resolution,
-                    h.created_at, h.acknowledged_by, h.acknowledged_at,
-                    {RELATIVE_DELTA_SQL} AS relative_delta,
-                    {MEAN_RELATIVE_DELTA_SQL} AS mean_relative_delta,
-                    {SD_RELATIVE_DELTA_SQL} AS sd_relative_delta
-             FROM replicate_audit_holds h
-             LEFT JOIN data_streams ds ON ds.id = h.stream_id
-             LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id
-             LEFT JOIN sites s ON s.id = sp.site_id
-             LEFT JOIN parameters p ON p.id = sp.parameter_id
-             LEFT JOIN sites es ON es.id = h.site_id
-             LEFT JOIN parameters ep ON ep.id = h.parameter_id
-             WHERE {where_clause}
-             ORDER BY {order_by}
-             LIMIT {limit} OFFSET {offset}",
-            REPLICATE_STATS = HoldKind::ReplicateStats.as_str()
-        ),
-        binds.clone(),
-    ))
+    let mut rows = HoldRow::find_by_statement(built(hold_list_statement(
+        &filters,
+        &status,
+        &order_by,
+        window.limit,
+        window.offset,
+    )))
     .all(&state.db)
     .await?;
     for row in &mut rows {
@@ -1180,22 +1083,9 @@ pub async fn list_holds(
         }
     }
 
-    // Same filters as the counts above, split by kind: the entry points announce what is waiting,
-    // and a fired brake is not a replicate-statistics disagreement.
     let kind_rows = state
         .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT h.kind, COUNT(*)::bigint AS n
-                 FROM replicate_audit_holds h
-                 LEFT JOIN data_streams ds ON ds.id = h.stream_id
-                 WHERE {base_clause} AND h.status = '{pending}'
-                 GROUP BY h.kind",
-                pending = HoldStatus::Pending.as_str()
-            ),
-            binds.clone(),
-        ))
+        .query_all_raw(built(hold_kind_counts_statement(&filters)))
         .await?;
     let mut pending_by_kind = std::collections::BTreeMap::new();
     for row in &kind_rows {
@@ -1336,15 +1226,22 @@ pub async fn resolve_hold(
                 // The hold is locked before anything is flagged: the flags and the decision record
                 // that explains them must land together or not at all.
                 let hold = txn
-                    .query_one_raw(Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        format!(
-                            "SELECT stream_id, group_time, resolution, computed
-                             FROM replicate_audit_holds
-                             WHERE id = $1 AND status = '{pending}' FOR UPDATE",
-                            pending = HoldStatus::Pending.as_str()
-                        ),
-                        [id.into()],
+                    .query_one_raw(built(
+                        SeaQuery::select()
+                            .columns([
+                                hold_model::Column::StreamId,
+                                hold_model::Column::GroupTime,
+                                hold_model::Column::Resolution,
+                                hold_model::Column::Computed,
+                            ])
+                            .from(hold_model::Entity)
+                            .and_where(Expr::col(hold_model::Column::Id).eq(id))
+                            .and_where(
+                                Expr::col(hold_model::Column::Status)
+                                    .eq(HoldStatus::Pending.as_str()),
+                            )
+                            .lock(LockType::Update)
+                            .take(),
                     ))
                     .await?
                     .ok_or_else(|| {
@@ -1566,19 +1463,27 @@ async fn declare_estimator(
     let (site_parameter_id, affected) =
         crate::common::bulk_write::guarded(&state.db, async |txn| {
             let hold = txn
-                .query_one_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    format!(
-                        "SELECT h.group_time, h.resolution, sp.id AS site_parameter_id,
-                                sp.site_id, sp.parameter_id, sp.sd_estimator AS previous
-                         FROM replicate_audit_holds h
-                         JOIN data_streams ds ON ds.id = h.stream_id
-                         JOIN site_parameters sp ON sp.id = ds.site_parameter_id
-                         WHERE h.id = $1 AND h.status = '{pending}'
-                         FOR UPDATE OF h",
-                        pending = HoldStatus::Pending.as_str()
-                    ),
-                    [id.into()],
+                .query_one_raw(built(
+                    hold_on_its_slot()
+                        .column((HOLD, hold_model::Column::GroupTime))
+                        .column((HOLD, hold_model::Column::Resolution))
+                        .expr_as(
+                            Expr::col((SLOT, site_parameters::Column::Id)),
+                            Alias::new("site_parameter_id"),
+                        )
+                        .column((SLOT, site_parameters::Column::SiteId))
+                        .column((SLOT, site_parameters::Column::ParameterId))
+                        .expr_as(
+                            Expr::col((SLOT, site_parameters::Column::SdEstimator)),
+                            Alias::new("previous"),
+                        )
+                        .and_where(Expr::col((HOLD, hold_model::Column::Id)).eq(id))
+                        .and_where(
+                            Expr::col((HOLD, hold_model::Column::Status))
+                                .eq(HoldStatus::Pending.as_str()),
+                        )
+                        .lock_with_tables(LockType::Update, [Alias::new(HOLD)])
+                        .take(),
                 ))
                 .await?
                 .ok_or_else(|| {
@@ -1734,20 +1639,26 @@ pub async fn reopen_hold(
     let by = crate::common::actor::label(&auth);
     let reopened = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let hold = txn
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    "SELECT h.stream_id, h.group_time, h.status, h.resolution,
-                            (ds.site_parameter_id IS NOT NULL) AS paired,
-                            ds.site_parameter_id, sp.site_id, sp.parameter_id
-                     FROM replicate_audit_holds h
-                     JOIN data_streams ds ON ds.id = h.stream_id
-                     LEFT JOIN site_parameters sp ON sp.id = ds.site_parameter_id
-                     WHERE h.id = $1 AND h.status IN {reopenable}
-                     FOR UPDATE OF h",
-                    reopenable = HoldStatus::sql_list(&HoldStatus::REOPENABLE)
-                ),
-                [id.into()],
+            .query_one_raw(built(
+                hold_on_its_stream(JoinType::LeftJoin)
+                    .column((HOLD, hold_model::Column::StreamId))
+                    .column((HOLD, hold_model::Column::GroupTime))
+                    .column((HOLD, hold_model::Column::Status))
+                    .column((HOLD, hold_model::Column::Resolution))
+                    .expr_as(
+                        Expr::col((STREAM, data_streams::Column::SiteParameterId)).is_not_null(),
+                        Alias::new("paired"),
+                    )
+                    .column((STREAM, data_streams::Column::SiteParameterId))
+                    .column((SLOT, site_parameters::Column::SiteId))
+                    .column((SLOT, site_parameters::Column::ParameterId))
+                    .and_where(Expr::col((HOLD, hold_model::Column::Id)).eq(id))
+                    .and_where(
+                        Expr::col((HOLD, hold_model::Column::Status))
+                            .is_in(HoldStatus::REOPENABLE.map(HoldStatus::as_str)),
+                    )
+                    .lock_with_tables(LockType::Update, [Alias::new(HOLD)])
+                    .take(),
             ))
             .await?
             .ok_or_else(|| AppError::NotFound(format!("no decided replicate audit hold {id}")))?;
@@ -1851,14 +1762,10 @@ pub async fn reopen_hold(
                                 .eq(sp_id),
                         )
                         .add(not_chosen_per_instant());
-                    let (sql, values) = restore_estimator(previous.clone())
-                        .cond_where(slot_rows.clone())
-                        .take()
-                        .build(PostgresQueryBuilder);
-                    txn.execute_raw(Statement::from_sql_and_values(
-                        sea_orm::DatabaseBackend::Postgres,
-                        sql,
-                        values,
+                    txn.execute_raw(built(
+                        restore_estimator(previous.clone())
+                            .cond_where(slot_rows.clone())
+                            .take(),
                     ))
                     .await?;
                     txn.execute_raw(built(
@@ -1891,31 +1798,27 @@ pub async fn reopen_hold(
                 // have been created in.
                 let instant = slot_samples(site_id, parameter_id)
                     .add(Expr::col(samples::Column::CollectedAt).eq(group_time));
-                let (sql, values) = SeaQuery::update()
-                    .table(samples::Entity)
-                    .value(
-                        samples::Column::SdEstimator,
-                        Expr::cust("COALESCE(site_parameters.sd_estimator, 'sample')"),
-                    )
-                    .value(
-                        samples::Column::SdEstimatorSource,
-                        Expr::cust(
-                            "CASE WHEN site_parameters.sd_estimator IS NULL THEN 'default' \
-                             ELSE 'slot' END",
-                        ),
-                    )
-                    .from(site_parameters::Entity)
-                    .and_where(Expr::cust("site_parameters.site_id = samples.site_id"))
-                    .and_where(Expr::cust(
-                        "site_parameters.parameter_id = samples.parameter_id",
-                    ))
-                    .cond_where(instant.clone())
-                    .take()
-                    .build(PostgresQueryBuilder);
-                txn.execute_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    sql,
-                    values,
+                txn.execute_raw(built(
+                    SeaQuery::update()
+                        .table(samples::Entity)
+                        .value(
+                            samples::Column::SdEstimator,
+                            Expr::cust("COALESCE(site_parameters.sd_estimator, 'sample')"),
+                        )
+                        .value(
+                            samples::Column::SdEstimatorSource,
+                            Expr::cust(
+                                "CASE WHEN site_parameters.sd_estimator IS NULL THEN 'default' \
+                                 ELSE 'slot' END",
+                            ),
+                        )
+                        .from(site_parameters::Entity)
+                        .and_where(Expr::cust("site_parameters.site_id = samples.site_id"))
+                        .and_where(Expr::cust(
+                            "site_parameters.parameter_id = samples.parameter_id",
+                        ))
+                        .cond_where(instant.clone())
+                        .take(),
                 ))
                 .await?;
                 txn.execute_raw(refresh_group(instant)).await?;
@@ -1960,12 +1863,6 @@ pub async fn acknowledge_holds_bulk(
     let by = crate::common::actor::label(&auth);
     let h = Alias::new("h");
     let hold_col = |c: hold_model::Column| Expr::col((h.clone(), c));
-    let below = |signature: &str, ceiling: f64| {
-        Expr::cust_with_values(
-            format!("{signature} <= $1"),
-            [sea_orm::Value::from(ceiling)],
-        )
-    };
     let mut bounds = Condition::all();
     // A restricted caller acknowledges only holds whose stream is paired to a site in their
     // projects; unpaired (deferred) holds belong to no project and stay out of their reach.
@@ -1999,24 +1896,27 @@ pub async fn acknowledge_holds_bulk(
         );
     }
     if let Some(ceiling) = payload.max_relative_delta {
-        bounds = bounds.add(below(RELATIVE_DELTA_SQL, ceiling));
+        bounds = bounds.add(super::service::relative_delta_expr().lte(ceiling));
     }
     if let Some(ceiling) = payload.max_mean_relative_delta {
-        bounds = bounds.add(below(MEAN_RELATIVE_DELTA_SQL, ceiling));
+        bounds = bounds.add(super::service::relative_delta_of("mean").lte(ceiling));
     }
     if let Some(ceiling) = payload.max_sd_relative_delta {
-        bounds = bounds.add(below(SD_RELATIVE_DELTA_SQL, ceiling));
+        bounds = bounds.add(super::service::relative_delta_of("sd").lte(ceiling));
     }
     // The same gate the single acknowledge applies, so a threshold sweep cannot drive around it:
     // at n = 10 the divisor offset is only ~5%, well inside a plausible ceiling.
-    let population_sd = &*POPULATION_SD_SQL;
     let undeclared_gate = || {
-        Expr::cust(format!(
-            "(({population_sd}) AND h.kind = '{kind}' \
-              AND EXISTS (SELECT 1 FROM site_parameters sp \
-                          WHERE sp.id = ds.site_parameter_id AND sp.sd_estimator IS NULL))",
-            kind = HoldKind::ReplicateStats.as_str()
-        ))
+        Condition::all()
+            .add(super::service::population_sd_expr())
+            .add(
+                Expr::col((h.clone(), hold_model::Column::Kind))
+                    .eq(HoldKind::ReplicateStats.as_str()),
+            )
+            .add(Expr::cust(
+                "EXISTS (SELECT 1 FROM site_parameters sp \
+                 WHERE sp.id = ds.site_parameter_id AND sp.sd_estimator IS NULL)",
+            ))
     };
     let ds = Alias::new("ds");
     let joined = |on_pending: Condition| {
@@ -2036,20 +1936,14 @@ pub async fn acknowledge_holds_bulk(
             .cond_where(on_pending);
         q.take()
     };
-    let (sql, values) = joined(
-        Condition::all()
-            .add(hold_col(hold_model::Column::Status).eq(HoldStatus::Pending.as_str()))
-            .add(undeclared_gate())
-            .add(bounds.clone()),
-    )
-    .build(PostgresQueryBuilder);
     let skipped = state
         .db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            values,
-        ))
+        .query_one_raw(built(joined(
+            Condition::all()
+                .add(hold_col(hold_model::Column::Status).eq(HoldStatus::Pending.as_str()))
+                .add(undeclared_gate())
+                .add(bounds.clone()),
+        )))
         .await?
         .map_or(Ok(0_i64), |row| row.try_get::<i64>("", "n"))?;
 
@@ -2074,7 +1968,7 @@ pub async fn acknowledge_holds_bulk(
         stream_less.count(&state.db).await?
     };
 
-    let (sql, values) = SeaQuery::update()
+    let acknowledge = SeaQuery::update()
         .table(
             sea_orm::sea_query::IntoTableRef::into_table_ref(hold_model::Entity).alias(h.clone()),
         )
@@ -2107,50 +2001,62 @@ pub async fn acknowledge_holds_bulk(
                 .add(undeclared_gate().not())
                 .add(bounds),
         )
-        .to_owned()
-        .build(PostgresQueryBuilder);
+        .to_owned();
     let acknowledged = state
         .db
-        .execute_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            values,
-        ))
+        .execute_raw(built(acknowledge))
         .await?
         .rows_affected();
     // One note per instant, as the single acknowledge writes: a sweep is many decisions, and each
     // one is about a value somebody may later look at on a chart. The insert reads the holds this
     // call just decided, identified by the actor and timestamp it stamped on them.
     if acknowledged > 0 {
-        let annotated = state
-            .db
-            .execute_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    "INSERT INTO annotations
-                     (site_id, parameter_id, start_time, end_time, text, category,
-                      created_by, audit_hold_id)
-                 SELECT sp.site_id, sp.parameter_id, h.group_time, h.group_time,
-                        'Audit accepted in bulk: the statistics computed here stand (source mean '
-                          || COALESCE(round((h.expected->>'mean')::numeric, 4)::text, 'none')
-                          || ' sd ' || COALESCE(round((h.expected->>'sd')::numeric, 4)::text, 'none')
-                          || ', recomputed mean '
-                          || COALESCE(round((h.computed->>'mean')::numeric, 4)::text, 'none')
-                          || ' sd ' || COALESCE(round((h.computed->>'sd')::numeric, 4)::text, 'none')
-                          || ' over ' || COALESCE(h.computed->>'n', '0')
-                          || ' replicates). Accepted by ' || $1 || '.',
-                        $2, $1, h.id
-                 FROM replicate_audit_holds h
-                 JOIN data_streams ds ON ds.id = h.stream_id
-                 JOIN site_parameters sp ON sp.id = ds.site_parameter_id
-                 WHERE h.status = '{acknowledged}' AND h.acknowledged_by = $1
-                   AND h.acknowledged_at > NOW() - INTERVAL '1 minute'
-                   AND NOT EXISTS (SELECT 1 FROM annotations a WHERE a.audit_hold_id = h.id)",
-                    acknowledged = HoldStatus::Acknowledged.as_str()
-                ),
-                [by.into(), AUDIT_ANNOTATION_CATEGORY.into()],
-            ))
-            .await;
+        let note = Expr::cust_with_values(
+            "'Audit accepted in bulk: the statistics computed here stand (source mean '
+               || COALESCE(round((h.expected->>'mean')::numeric, 4)::text, 'none')
+               || ' sd ' || COALESCE(round((h.expected->>'sd')::numeric, 4)::text, 'none')
+               || ', recomputed mean '
+               || COALESCE(round((h.computed->>'mean')::numeric, 4)::text, 'none')
+               || ' sd ' || COALESCE(round((h.computed->>'sd')::numeric, 4)::text, 'none')
+               || ' over ' || COALESCE(h.computed->>'n', '0')
+               || ' replicates). Accepted by ' || $1 || '.'",
+            [by.clone()],
+        );
+        let decided_here = hold_on_its_slot()
+            .column((SLOT, site_parameters::Column::SiteId))
+            .column((SLOT, site_parameters::Column::ParameterId))
+            .column((HOLD, hold_model::Column::GroupTime))
+            .column((HOLD, hold_model::Column::GroupTime))
+            .expr(note)
+            .expr(Expr::val(AUDIT_ANNOTATION_CATEGORY))
+            .expr(Expr::val(by.clone()))
+            .column((HOLD, hold_model::Column::Id))
+            .and_where(
+                Expr::col((HOLD, hold_model::Column::Status)).eq(HoldStatus::Acknowledged.as_str()),
+            )
+            .and_where(Expr::col((HOLD, hold_model::Column::AcknowledgedBy)).eq(by.clone()))
+            .and_where(
+                Expr::col((HOLD, hold_model::Column::AcknowledgedAt))
+                    .gt(Expr::cust("NOW() - INTERVAL '1 minute'")),
+            )
+            .and_where(Expr::exists(not_yet_annotated()).not())
+            .take();
+        let mut annotate = SeaQuery::insert();
+        annotate
+            .into_table(annotations::Entity)
+            .columns([
+                annotations::Column::SiteId,
+                annotations::Column::ParameterId,
+                annotations::Column::StartTime,
+                annotations::Column::EndTime,
+                annotations::Column::Text,
+                annotations::Column::Category,
+                annotations::Column::CreatedBy,
+                annotations::Column::AuditHoldId,
+            ])
+            .select_from(decided_here)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let annotated = state.db.execute_raw(built(annotate.to_owned())).await;
         if let Err(e) = annotated {
             tracing::warn!("could not annotate bulk-acknowledged holds: {e}");
         }

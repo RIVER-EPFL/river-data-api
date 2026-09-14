@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use sea_orm::ColumnTrait;
 use sea_orm::Condition;
-use sea_orm::ConnectionTrait;
 use sea_orm::DbErr;
 use sea_orm::EntityTrait;
 use sea_orm::ExprTrait;
@@ -10,7 +9,6 @@ use sea_orm::QueryFilter;
 use sea_orm::QueryOrder;
 use sea_orm::QuerySelect;
 use sea_orm::Set;
-use sea_orm::Statement;
 use sea_orm::entity::prelude::*;
 use sea_orm::sea_query;
 use sea_orm::sea_query::Expr;
@@ -79,11 +77,6 @@ impl From<import_staging::Model> for StagedRow {
 pub(super) struct CuratedRow {
     pub(super) replicate_index: i16,
     pub(super) reason: String,
-}
-
-#[derive(FromQueryResult)]
-pub(super) struct IdRow {
-    pub(super) id: Uuid,
 }
 
 /// Take a spot group's replicates from `count` onwards out of what the group serves, ahead of an
@@ -261,18 +254,12 @@ impl CsvImport {
             let mut staged_streams: Vec<Uuid> = staged.iter().map(|row| row.stream_id).collect();
             staged_streams.sort_unstable();
             staged_streams.dedup();
-            let family_ids: std::collections::HashSet<Uuid> = ctx
-                .db()
-                .query_all_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT id FROM data_streams \
-                     WHERE id = ANY($1) AND metadata -> 'replicates' IS NOT NULL",
-                    [staged_streams.into()],
-                ))
-                .await?
-                .iter()
-                .filter_map(|row| IdRow::from_query_result(row, "").ok().map(|r| r.id))
-                .collect();
+            let family_ids: std::collections::HashSet<Uuid> =
+                super::service::replicate_family_keys(ctx.db(), &staged_streams)
+                    .await
+                    .map_err(|e| DbErr::Custom(e.to_string()))?
+                    .into_keys()
+                    .collect();
             if !family_ids.is_empty() {
                 let before = staged.len();
                 staged.retain(|row| !family_ids.contains(&row.stream_id));
@@ -670,12 +657,6 @@ impl CsvImport {
     }
 }
 
-/// A stream named by its source pair.
-#[derive(FromQueryResult)]
-struct StreamRef {
-    source_system: String,
-    source_key: String,
-}
 /// Retag readings.measurement_type for a sensor/stream scope, then refresh continuous aggregates
 /// over the affected window. Backs the bulk reclassification actions (mark sensors low/high
 /// frequency, classify sensorless streams): the classification columns (`sensors.data_frequency`,
@@ -811,27 +792,16 @@ impl Job for MeasurementRetag {
         // A stream declaring a different classification will keep writing its own value on
         // ingest, so the retag would drift back; surface the conflict in the job timeline.
         if !declared {
-            let conflicting = ctx
-                .db()
-                .query_all_raw(Statement::from_sql_and_values(
-                    sea_orm::DatabaseBackend::Postgres,
-                    "SELECT source_system, source_key FROM data_streams \
-                     WHERE measurement_type IS NOT NULL AND measurement_type <> $1 \
-                       AND (sensor_id = ANY($2) OR id = ANY($3) \
-                            OR ($4::text IS NOT NULL AND source_system = $4))",
-                    [
-                        target.clone().into(),
-                        sensor_ids.clone().into(),
-                        stream_ids.clone().into(),
-                        source_system.clone().into(),
-                    ],
-                ))
-                .await?;
-            for row in &conflicting {
-                let StreamRef {
-                    source_system: system,
-                    source_key: key,
-                } = StreamRef::from_query_result(row, "")?;
+            let conflicting = super::service::streams_declaring_other_type(
+                ctx.db(),
+                &target,
+                &sensor_ids,
+                &stream_ids,
+                source_system.as_deref(),
+            )
+            .await
+            .map_err(|e| DbErr::Custom(e.to_string()))?;
+            for (system, key) in &conflicting {
                 ctx.log(
                     "warn",
                     &format!(

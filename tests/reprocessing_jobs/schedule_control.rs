@@ -658,13 +658,14 @@ async fn disabling_a_schedule_halts_the_tick_and_re_enabling_resets_the_grid() {
     );
 }
 
-/// `backfill_attribution` is on-demand only, so it has no `schedules` row: that is what makes the
-/// empty tunables snapshot and the empty audit trail meaningful here. It is also in the worker's
-/// registry, so the manual run genuinely reaches a handler instead of terminal-failing.
+/// `reprocess_all` is on-demand only, so it has no `schedules` row: that is what makes the empty
+/// tunables snapshot and the empty audit trail meaningful here. It is also in the worker's
+/// registry and reads nothing from its params, so the manual run genuinely reaches a handler
+/// instead of terminal-failing or being refused for a missing input.
 #[tokio::test]
 #[serial]
 async fn run_now_dedupes_within_the_second_snapshots_empty_tunables_and_writes_no_audit_row() {
-    const JOB: &str = "backfill_attribution";
+    const JOB: &str = "reprocess_all";
 
     let Some((db, app)) = setup("run_now_dedupes_within_the_second").await else {
         return;

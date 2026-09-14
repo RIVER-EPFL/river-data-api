@@ -368,15 +368,23 @@ pub async fn family_keys_in_streams<C: ConnectionTrait>(
 }
 
 /// The declared replicate families among the streams `reached` selects, by source key.
+/// A stream whose metadata declares a replicate family, as the predicate every reader of that
+/// fact shares. `alias` is the table alias the caller's statement uses.
+pub(crate) fn declares_replicates(alias: &Alias) -> Expr {
+    Expr::col((alias.clone(), models::Column::Metadata))
+        .binary(
+            sea_orm::sea_query::extension::postgres::PgBinOper::GetJsonField,
+            Expr::val(METADATA_KEY),
+        )
+        .is_not_null()
+}
+
 fn family_keys_query(reached: Condition) -> SelectStatement {
     let s = Alias::new("s");
     SeaQuery::select()
         .column((s.clone(), models::Column::SourceKey))
         .from_as(models::Entity, s.clone())
-        .and_where(Expr::cust_with_values(
-            "s.metadata -> $1 IS NOT NULL",
-            [METADATA_KEY],
-        ))
+        .and_where(declares_replicates(&s))
         .cond_where(reached)
         .order_by((s, models::Column::SourceKey), Order::Asc)
         .take()

@@ -131,11 +131,10 @@ pub struct Config {
     pub ingest_receipt_retention_days: u32,
 
     // Sync control plane: session token lifetime, how long an unacknowledged command stays
-    // deliverable, the heartbeat-age thresholds behind a service's health, and the prefix on a
+    // deliverable, the heartbeat age past which a service is reported stale, and the prefix on a
     // minted enrollment client_id. Services in the field hold tokens issued under these values.
     pub sync_session_token_ttl_secs: u64,
     pub sync_command_expiry_secs: u64,
-    pub sync_health_healthy_secs: i64,
     pub sync_health_warning_secs: i64,
     pub sync_client_id_prefix: String,
 
@@ -221,7 +220,6 @@ impl Config {
             ingest_receipt_retention_days: 365,
             sync_session_token_ttl_secs: 900,
             sync_command_expiry_secs: 300,
-            sync_health_healthy_secs: 90,
             sync_health_warning_secs: 300,
             sync_client_id_prefix: "svc_".to_string(),
             job_max_retries: 3,
@@ -381,7 +379,6 @@ impl Config {
 
             sync_session_token_ttl_secs: parse_or("SYNC_SESSION_TOKEN_TTL_SECS", 900),
             sync_command_expiry_secs: parse_or("SYNC_COMMAND_EXPIRY_SECS", 300),
-            sync_health_healthy_secs: parse_or("SYNC_HEALTH_HEALTHY_SECS", 90),
             sync_health_warning_secs: parse_or("SYNC_HEALTH_WARNING_SECS", 300),
             sync_client_id_prefix: string_or("SYNC_CLIENT_ID_PREFIX", "svc_"),
 

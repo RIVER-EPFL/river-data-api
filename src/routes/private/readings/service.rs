@@ -54,6 +54,8 @@ use crate::common::state::EventSender;
 use crate::common::state::ResponseCache;
 use crate::error::AppError;
 use crate::error::AppResult;
+use crate::routes::private::alarms::models::alarm_event;
+use crate::routes::private::change_audit::models as change_audit;
 use crate::routes::private::collection_events;
 use crate::routes::private::collection_events::flows;
 use crate::routes::private::collection_events::flows::TouchedEvent;
@@ -61,6 +63,7 @@ use crate::routes::private::data_streams;
 use crate::routes::private::data_streams::models::receipts;
 use crate::routes::private::derived_parameters::models::definition as calculation_formulas;
 use crate::routes::private::derived_parameters::models::version as derived_versions;
+use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings;
 use crate::routes::private::readings::models::ConflictMode;
 use crate::routes::private::readings::models::Kind;
@@ -69,12 +72,14 @@ use crate::routes::private::readings::models::Owner;
 use crate::routes::private::readings::models::ProvenanceQuery;
 use crate::routes::private::readings::models::Selection;
 use crate::routes::private::readings::samples;
+use crate::routes::private::reprocessing_jobs::models::job as jobs_model;
 use crate::routes::private::sensor_calibrations;
 use crate::routes::private::sensor_deployments as deployments;
 use crate::routes::private::sensors;
 use crate::routes::private::site_parameters;
 use crate::routes::private::sites;
 use crate::routes::private::standard_curves;
+use crate::routes::private::sync::hold_model;
 use crate::routes::private::sync::models::GroupAudit;
 use crate::routes::private::sync::models::HoldKind;
 use crate::routes::private::sync::models::HoldStatus;
@@ -297,6 +302,13 @@ pub(super) fn effective_value(alias: Option<&str>) -> Expr {
     .into()
 }
 
+/// The `TRUE` keyword. `IS TRUE` and `IS NOT TRUE` read a nullable boolean as false where it is
+/// NULL; the right-hand side has to be the keyword, because a bound `true` emits `IS $1`, which is
+/// not SQL.
+fn sql_true() -> sea_orm::sea_query::Keyword {
+    sea_orm::sea_query::Keyword::Custom(sea_orm::sea_query::IntoIden::into_iden(Alias::new("TRUE")))
+}
+
 /// A readings select narrowed to the columns a [`PreviewRow`] decodes: the slot, the replicate's
 /// served value, and whether it is currently excluded from the statistics.
 pub(super) fn preview_rows() -> sea_orm::Select<readings::Entity> {
@@ -306,7 +318,10 @@ pub(super) fn preview_rows() -> sea_orm::Select<readings::Entity> {
         .column(readings::Column::ParameterId)
         .column(readings::Column::ReplicateIndex)
         .column_as(effective_value(None), "value")
-        .column_as(Expr::cust("is_flagged IS TRUE"), "flagged")
+        .column_as(
+            Expr::col(readings::Column::IsFlagged).is(sql_true()),
+            "flagged",
+        )
         .column_as(
             Expr::col(readings::Column::WithdrawnAt).is_not_null(),
             "withdrawn",
@@ -316,7 +331,10 @@ pub(super) fn preview_rows() -> sea_orm::Select<readings::Entity> {
 /// Why a replicate survived a grab replace, in the order the reasons are checked.
 pub(super) fn kept_reason() -> Expr {
     sea_orm::sea_query::CaseStatement::new()
-        .case(Expr::cust("is_flagged IS TRUE"), "flagged")
+        .case(
+            Expr::col(readings::Column::IsFlagged).is(sql_true()),
+            "flagged",
+        )
         .case(
             Expr::col(readings::Column::WithdrawnAt).is_not_null(),
             "withdrawn",
@@ -329,7 +347,7 @@ pub(super) fn kept_reason() -> Expr {
 /// the request supplies a curve of its own.
 pub(super) fn curated_or_curved(supplies_curve: bool) -> Condition {
     let mut kept = Condition::any()
-        .add(Expr::cust("is_flagged IS TRUE"))
+        .add(Expr::col(readings::Column::IsFlagged).is(sql_true()))
         .add(readings::Column::WithdrawnAt.is_not_null());
     if !supplies_curve {
         kept = kept.add(readings::Column::StandardCurveId.is_not_null());
@@ -838,8 +856,37 @@ pub fn hold_match(
 /// Half-width of the seasonal window: the entry month plus and minus this many months.
 pub const WINDOW_MONTHS: i32 = 2;
 
+/// Modulus of the cyclic month distance in [`month_distance`].
+const MONTHS_IN_YEAR: i32 = 12;
+
 /// Cap on the per-parameter distribution sample returned for plotting.
 pub(super) const DISTRIBUTION_CAP: i64 = 500;
+
+/// Months between a stored instant and the one being screened, counted the short way round the
+/// year, so December is two months from February.
+fn month_distance(column: readings::Column, at: sea_orm::prelude::DateTimeWithTimeZone) -> Expr {
+    let month_of = |e: Expr| {
+        Func::cust(Alias::new("date_part"))
+            .arg("month")
+            .arg(e)
+            .cast_as(Alias::new("int"))
+    };
+    let stored = month_of(Expr::col(column));
+    let screened = || month_of(Expr::val(at).cast_as(Alias::new("timestamptz")));
+    let forward = stored
+        .clone()
+        .sub(screened())
+        .add(MONTHS_IN_YEAR)
+        .modulo(MONTHS_IN_YEAR);
+    let backward = screened()
+        .sub(stored)
+        .add(MONTHS_IN_YEAR)
+        .modulo(MONTHS_IN_YEAR);
+    Func::cust(Alias::new("LEAST"))
+        .arg(forward)
+        .arg(backward)
+        .into()
+}
 
 /// The rows the window pools: one slot's unflagged, non-withdrawn spot replicates whose month is
 /// within [`WINDOW_MONTHS`] of the entry month, cyclically, across every year.
@@ -857,21 +904,11 @@ pub(super) fn pooled_rows(
                 .add(readings::Column::SiteId.eq(site_id))
                 .add(readings::Column::ParameterId.eq(parameter_id))
                 .add(readings::Column::MeasurementType.eq("spot"))
-                .add(Expr::cust("is_flagged IS NOT TRUE"))
+                .add(Expr::col(readings::Column::IsFlagged).is_not(sql_true()))
                 .add(readings::Column::WithdrawnAt.is_null())
-                .add(Expr::cust("unverified IS NOT TRUE"))
+                .add(Expr::col(readings::Column::Unverified).is_not(sql_true()))
                 // Cyclic month distance, so December is two months from February.
-                .add(Expr::cust_with_values(
-                    "LEAST(\
-                       (EXTRACT(MONTH FROM time)::int \
-                        - EXTRACT(MONTH FROM $1::timestamptz)::int + 12) % 12, \
-                       (EXTRACT(MONTH FROM $1::timestamptz)::int \
-                        - EXTRACT(MONTH FROM time)::int + 12) % 12) <= $2",
-                    [
-                        sea_orm::Value::from(at),
-                        sea_orm::Value::from(WINDOW_MONTHS),
-                    ],
-                )),
+                .add(month_distance(readings::Column::Time, at).lte(WINDOW_MONTHS)),
         )
         .to_owned()
 }
@@ -1642,6 +1679,44 @@ pub(super) fn family_kinds(kind: Kind) -> Vec<String> {
     .collect()
 }
 
+/// The live decision of this kind's family standing on the same reading key, which the row being
+/// written supersedes. NULL where the key carries none. `target` is the alias the enclosing select
+/// reads its keys from.
+pub(super) fn supersedes(kind: Kind, target: &Alias) -> Expr {
+    let d = Alias::new("d");
+    Expr::from(
+        Query::select()
+            .column((d.clone(), decision_model::Column::Id))
+            .from_as(decision_model::Entity, d.clone())
+            .cond_where(
+                Condition::all()
+                    .add(
+                        Expr::col((d.clone(), decision_model::Column::StreamId))
+                            .equals((target.clone(), decision_model::Column::StreamId)),
+                    )
+                    .add(
+                        Expr::col((d.clone(), decision_model::Column::Time))
+                            .equals((target.clone(), decision_model::Column::Time)),
+                    )
+                    .add(
+                        Expr::col((d.clone(), decision_model::Column::ReplicateIndex)).binary(
+                            sea_orm::sea_query::BinOper::Custom("IS NOT DISTINCT FROM"),
+                            Expr::col((target.clone(), decision_model::Column::ReplicateIndex)),
+                        ),
+                    )
+                    .add(
+                        Expr::col((d.clone(), decision_model::Column::Kind))
+                            .is_in(family_kinds(kind)),
+                    )
+                    .add(Expr::col((d.clone(), decision_model::Column::RolledBackBy)).is_null()),
+            )
+            .order_by((d.clone(), decision_model::Column::At), Order::Desc)
+            .order_by((d, decision_model::Column::Id), Order::Desc)
+            .limit(1)
+            .take(),
+    )
+}
+
 /// Record one decision per reading a predicate selects, in one statement, capturing each row's
 /// prior state as `old` and naming the decision each supersedes. `row_predicate` is SQL over
 /// `r` (`readings`) and `ds` (`data_streams`) with `binds` numbered from `$1`.
@@ -1741,14 +1816,7 @@ pub async fn record_many<C: ConnectionTrait>(
         .expr(new_expr)
         .expr(Expr::val(actor))
         .expr(Expr::val(origin.as_str()))
-        .expr(Expr::cust_with_values(
-            "(SELECT d.id FROM reading_decisions d \
-               WHERE d.stream_id = t.stream_id AND d.time = t.time \
-                 AND d.replicate_index IS NOT DISTINCT FROM t.replicate_index \
-                 AND d.kind = ANY($1) AND d.rolled_back_by IS NULL \
-               ORDER BY d.at DESC, d.id DESC LIMIT 1)",
-            [sea_orm::Value::from(family_kinds(kind))],
-        ))
+        .expr(supersedes(kind, &t))
         .expr(Expr::val(reason))
         .expr(Expr::val(set_id))
         .from_as(Alias::new("target"), t)
@@ -1889,17 +1957,35 @@ pub async fn record_keyed<C: ConnectionTrait>(
     let r = Alias::new("r");
     let k = Alias::new("k");
     let t = Alias::new("t");
+    let d = Alias::new("d");
     let state = state_object(Some("r"));
     let keys = key_set(times.clone(), indices.clone(), news);
     let already_decided = Query::select()
         .expr(Expr::val(1))
-        .from_as(decision_model::Entity, Alias::new("d"))
-        .cond_where(Expr::cust_with_values(
-            "d.stream_id = r.stream_id AND d.time = r.time \
-             AND d.replicate_index IS NOT DISTINCT FROM r.replicate_index \
-             AND d.kind = $1 AND d.rolled_back_by IS NULL AND d.new @> k.n",
-            [sea_orm::Value::from(kind.as_str())],
-        ))
+        .from_as(decision_model::Entity, d.clone())
+        .cond_where(
+            Condition::all()
+                .add(
+                    Expr::col((d.clone(), decision_model::Column::StreamId))
+                        .equals((r.clone(), readings::Column::StreamId)),
+                )
+                .add(
+                    Expr::col((d.clone(), decision_model::Column::Time))
+                        .equals((r.clone(), readings::Column::Time)),
+                )
+                .add(
+                    Expr::col((d.clone(), decision_model::Column::ReplicateIndex)).binary(
+                        sea_orm::sea_query::BinOper::Custom("IS NOT DISTINCT FROM"),
+                        Expr::col((r.clone(), readings::Column::ReplicateIndex)),
+                    ),
+                )
+                .add(Expr::col((d.clone(), decision_model::Column::Kind)).eq(kind.as_str()))
+                .add(Expr::col((d.clone(), decision_model::Column::RolledBackBy)).is_null())
+                .add(
+                    Expr::col((d.clone(), decision_model::Column::New))
+                        .binary(PgBinOper::Contains, Expr::col((k.clone(), Alias::new("n")))),
+                ),
+        )
         .to_owned();
     let mut scope = Condition::all();
     match mode {
@@ -1959,14 +2045,7 @@ pub async fn record_keyed<C: ConnectionTrait>(
         .column((t.clone(), Alias::new("n")))
         .expr(Expr::val(actor))
         .expr(Expr::val(origin.as_str()))
-        .expr(Expr::cust_with_values(
-            "(SELECT d.id FROM reading_decisions d \
-               WHERE d.stream_id = t.stream_id AND d.time = t.time \
-                 AND d.replicate_index IS NOT DISTINCT FROM t.replicate_index \
-                 AND d.kind = ANY($1) AND d.rolled_back_by IS NULL \
-               ORDER BY d.at DESC, d.id DESC LIMIT 1)",
-            [sea_orm::Value::from(family_kinds(kind))],
-        ))
+        .expr(supersedes(kind, &t))
         .expr(Expr::val(reason))
         .expr(Expr::val(set_id))
         .from_as(Alias::new("target"), t)
@@ -2568,11 +2647,11 @@ pub fn inconsistent_rows() -> sea_orm::sea_query::SelectStatement {
         .from_as(readings::Entity, r.clone())
         .cond_where(
             Condition::any()
-                .add(Expr::cust(r#""r"."is_flagged" IS TRUE"#))
+                .add(Expr::col((r.clone(), readings::Column::IsFlagged)).is(sql_true()))
                 .add(Expr::col((r.clone(), readings::Column::FlagReason)).is_not_null())
                 .add(Expr::col((r.clone(), readings::Column::WithdrawnAt)).is_not_null())
                 .add(Expr::col((r.clone(), readings::Column::WithdrawnReason)).is_not_null())
-                .add(Expr::cust(r#""r"."unverified" IS TRUE"#))
+                .add(Expr::col((r.clone(), readings::Column::Unverified)).is(sql_true()))
                 .add(Expr::exists(live_decisions("r", None))),
         )
         .to_owned();
@@ -3232,14 +3311,29 @@ pub(super) async fn ingest_passes<C: ConnectionTrait>(
     if streams.is_empty() {
         return Ok(Vec::new());
     }
+    let query = Query::select()
+        .columns([
+            receipts::Column::Id,
+            receipts::Column::At,
+            receipts::Column::Submitted,
+            receipts::Column::NewRows,
+            receipts::Column::Changed,
+            receipts::Column::Unchanged,
+            receipts::Column::Withdrawn,
+            receipts::Column::RejectedTotal,
+            receipts::Column::Braked,
+        ])
+        .from(receipts::Entity)
+        .and_where(Expr::col(receipts::Column::StreamId).is_in(streams.iter().copied()))
+        .and_where(Expr::col(receipts::Column::WindowFrom).lte(time))
+        .and_where(Expr::col(receipts::Column::WindowTo).gte(time))
+        .order_by(receipts::Column::At, Order::Desc)
+        .take();
+    let (sql, values) = query.build(PostgresQueryBuilder);
     let rows = ReceiptRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "SELECT id, at, submitted, new_rows, changed, unchanged, withdrawn, rejected_total, \
-                braked \
-           FROM ingest_receipts \
-          WHERE stream_id = ANY($1) AND window_from <= $2 AND window_to >= $2 \
-          ORDER BY at DESC",
-        [streams.to_vec().into(), time.into()],
+        sql,
+        values,
     ))
     .all(conn)
     .await?;
@@ -3272,6 +3366,11 @@ pub(super) async fn ingest_passes<C: ConnectionTrait>(
         .collect())
 }
 
+/// Holds raised on one of these streams.
+fn on_streams(streams: &[Uuid]) -> SimpleExpr {
+    Expr::col(hold_model::Column::StreamId).is_in(streams.iter().copied())
+}
+
 /// The review queue, by both of its key shapes: a statistics hold is keyed by stream, an event
 /// finding by the slot it was found at.
 pub(super) async fn holds<C: ConnectionTrait>(
@@ -3284,28 +3383,40 @@ pub(super) async fn holds<C: ConnectionTrait>(
         if streams.is_empty() {
             return Ok(Vec::new());
         }
-        return hold_rows(conn, "stream_id = ANY($1)", vec![streams.to_vec().into()]).await;
+        return hold_rows(conn, Condition::all().add(on_streams(streams))).await;
     };
     hold_rows(
         conn,
-        "stream_id = ANY($1) OR (site_id = $2 AND parameter_id = $3)",
-        vec![streams.to_vec().into(), site_id.into(), parameter_id.into()],
+        Condition::any().add(on_streams(streams)).add(
+            Condition::all()
+                .add(Expr::col(hold_model::Column::SiteId).eq(site_id))
+                .add(Expr::col(hold_model::Column::ParameterId).eq(parameter_id)),
+        ),
     )
     .await
 }
 
 pub(super) async fn hold_rows<C: ConnectionTrait>(
     conn: &C,
-    predicate: &str,
-    binds: Vec<sea_orm::Value>,
+    reached: Condition,
 ) -> AppResult<Vec<LedgerEntry>> {
+    let (sql, values) = Query::select()
+        .columns([
+            hold_model::Column::Id,
+            hold_model::Column::Kind,
+            hold_model::Column::Status,
+            hold_model::Column::CreatedAt,
+            hold_model::Column::Tool,
+        ])
+        .from(hold_model::Entity)
+        .cond_where(reached)
+        .order_by(hold_model::Column::CreatedAt, Order::Desc)
+        .take()
+        .build(PostgresQueryBuilder);
     let rows = LedgerHoldRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        format!(
-            "SELECT id, kind, status, created_at, tool FROM replicate_audit_holds \
-              WHERE {predicate} ORDER BY created_at DESC"
-        ),
-        binds,
+        sql,
+        values,
     ))
     .all(conn)
     .await?;
@@ -3338,13 +3449,16 @@ pub(super) async fn tool_runs<C: ConnectionTrait>(
     // The event arm matches on a field inside `context`, which no typed column expresses, so the
     // statement stays; decoding into the entity's own model is what keeps the columns honest.
     let rows = tool_run::Entity::find()
-        .from_raw_sql(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT * FROM tool_runs \
-              WHERE id = ANY($1) OR context->>'collection_event_id' = ANY($2) \
-              ORDER BY created_at DESC",
-            [runs.to_vec().into(), event_keys.into()],
-        ))
+        .filter(
+            Condition::any()
+                .add(tool_run::Column::Id.is_in(runs.iter().copied()))
+                .add(
+                    Expr::col(tool_run::Column::Context)
+                        .binary(PgBinOper::CastJsonField, Expr::val("collection_event_id"))
+                        .is_in(event_keys),
+                ),
+        )
+        .order_by_desc(tool_run::Column::CreatedAt)
         .all(conn)
         .await?;
     Ok(rows
@@ -3374,19 +3488,37 @@ pub(super) async fn job_entries<C: ConnectionTrait>(
         return Ok(Vec::new());
     };
     let event_keys: Vec<String> = events.iter().map(ToString::to_string).collect();
+    let param = |key: &str| {
+        Expr::col(jobs_model::Column::Params)
+            .binary(PgBinOper::CastJsonField, Expr::val(key.to_string()))
+    };
+    let (sql, values) = Query::select()
+        .columns([
+            jobs_model::Column::Id,
+            jobs_model::Column::TriggerType,
+            jobs_model::Column::Status,
+            jobs_model::Column::ErrorMessage,
+            jobs_model::Column::CreatedAt,
+            jobs_model::Column::CompletedAt,
+            jobs_model::Column::ReadingsUpdated,
+        ])
+        .from(jobs_model::Entity)
+        .cond_where(
+            Condition::any()
+                .add(
+                    Condition::all()
+                        .add(param("site_id").eq(site_id.to_string()))
+                        .add(param("parameter_id").eq(parameter_id.to_string())),
+                )
+                .add(param("collection_event_id").is_in(event_keys)),
+        )
+        .order_by(jobs_model::Column::CreatedAt, Order::Desc)
+        .take()
+        .build(PostgresQueryBuilder);
     let rows = JobRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "SELECT id, trigger_type, status, error_message, created_at, completed_at, \
-                readings_updated \
-           FROM reprocessing_jobs \
-          WHERE (params->>'site_id' = $1 AND params->>'parameter_id' = $2) \
-             OR params->>'collection_event_id' = ANY($3) \
-          ORDER BY created_at DESC",
-        [
-            site_id.to_string().into(),
-            parameter_id.to_string().into(),
-            event_keys.into(),
-        ],
+        sql,
+        values,
     ))
     .all(conn)
     .await?;
@@ -3457,15 +3589,40 @@ pub(super) async fn slot_changes<C: ConnectionTrait>(
     let (Some(site_id), Some(parameter_id)) = (site_id, parameter_id) else {
         return Ok(Vec::new());
     };
+    let slot_subjects = Query::select()
+        .expr(Expr::cust_with_expr(
+            "'site_parameter:' || $1",
+            Expr::col(site_parameters::Column::Id).cast_as(Alias::new("text")),
+        ))
+        .from(site_parameters::Entity)
+        .and_where(Expr::col(site_parameters::Column::SiteId).eq(site_id))
+        .and_where(Expr::col(site_parameters::Column::ParameterId).eq(parameter_id))
+        .take();
+    let (sql, values) = Query::select()
+        .columns([
+            change_audit::Column::Id,
+            change_audit::Column::Change,
+            change_audit::Column::OldValue,
+            change_audit::Column::NewValue,
+            change_audit::Column::ChangedBy,
+            change_audit::Column::ChangedAt,
+        ])
+        .from(change_audit::Entity)
+        .cond_where(
+            Condition::any()
+                .add(
+                    Expr::col(change_audit::Column::Subject)
+                        .eq(format!("parameter:{parameter_id}")),
+                )
+                .add(Expr::col(change_audit::Column::Subject).in_subquery(slot_subjects)),
+        )
+        .order_by(change_audit::Column::ChangedAt, Order::Desc)
+        .take()
+        .build(PostgresQueryBuilder);
     let rows = ChangeRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "SELECT c.id, c.change, c.old_value, c.new_value, c.changed_by, c.changed_at \
-           FROM change_audit c \
-          WHERE c.subject = 'parameter:' || $2::text \
-             OR c.subject IN (SELECT 'site_parameter:' || sp.id::text FROM site_parameters sp \
-                               WHERE sp.site_id = $1 AND sp.parameter_id = $2) \
-          ORDER BY c.changed_at DESC",
-        [site_id.into(), parameter_id.into()],
+        sql,
+        values,
     ))
     .all(conn)
     .await?;
@@ -3495,14 +3652,34 @@ pub(super) async fn alarms<C: ConnectionTrait>(
     let (Some(site_id), Some(parameter_id)) = (site_id, parameter_id) else {
         return Ok(Vec::new());
     };
+    let (sql, values) = Query::select()
+        .columns([
+            alarm_event::Column::Id,
+            alarm_event::Column::Severity,
+            alarm_event::Column::MaxSeverity,
+            alarm_event::Column::StartedAt,
+            alarm_event::Column::ResolvedAt,
+            alarm_event::Column::AcknowledgedBy,
+            alarm_event::Column::MeasurementType,
+        ])
+        .from(alarm_event::Entity)
+        .and_where(Expr::col(alarm_event::Column::SiteId).eq(site_id))
+        .and_where(Expr::col(alarm_event::Column::ParameterId).eq(parameter_id))
+        .and_where(Expr::col(alarm_event::Column::StartedAt).lte(time))
+        // An open episode has no resolution, so its last sighting stands in for one.
+        .and_where(
+            Expr::expr(Func::coalesce([
+                Expr::col(alarm_event::Column::ResolvedAt),
+                Expr::col(alarm_event::Column::LastSeenAt),
+            ]))
+            .gte(time),
+        )
+        .take()
+        .build(PostgresQueryBuilder);
     let rows = AlarmRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
-        "SELECT id, severity, max_severity, started_at, resolved_at, acknowledged_by, \
-                measurement_type \
-           FROM alarm_events \
-          WHERE site_id = $1 AND parameter_id = $2 \
-            AND started_at <= $3 AND COALESCE(resolved_at, last_seen_at) >= $3",
-        [site_id.into(), parameter_id.into(), time.into()],
+        sql,
+        values,
     ))
     .all(conn)
     .await?;
@@ -4891,15 +5068,7 @@ pub(super) async fn fetch_covering_receipts(
     time: DateTime<Utc>,
 ) -> AppResult<HashMap<Uuid, ReceiptSummary>> {
     let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT DISTINCT ON (stream_id) stream_id, id, at, window_from, window_to, \
-                    submitted, new_rows, changed, unchanged, withdrawn, rejected_total, braked \
-             FROM ingest_receipts \
-             WHERE stream_id = ANY($1) AND window_from <= $2 AND window_to >= $2 \
-             ORDER BY stream_id, at DESC",
-            [stream_ids.to_vec().into(), time.into()],
-        ))
+        .query_all_raw(build(covering_receipts_query(stream_ids, time)))
         .await?;
     let mut out = HashMap::new();
     for row in rows
@@ -4929,12 +5098,270 @@ pub(super) async fn fetch_covering_receipts(
 
 /// The statuses a hold is still live under, as the ledger's "what is open here" readers name it:
 /// awaiting review, or reviewed but not yet acted on.
-fn live_hold_statuses() -> String {
-    HoldStatus::sql_list(&[
-        HoldStatus::Pending,
-        HoldStatus::Deferred,
-        HoldStatus::Acknowledged,
-    ])
+fn live_hold_statuses() -> Vec<&'static str> {
+    vec![
+        HoldStatus::Pending.as_str(),
+        HoldStatus::Deferred.as_str(),
+        HoldStatus::Acknowledged.as_str(),
+    ]
+}
+
+/// A built statement as SeaORM takes it. Every reader below builds its query and hands it over
+/// here, so no reader spells SQL and none of them repeats the handoff.
+fn build(query: sea_orm::sea_query::SelectStatement) -> Statement {
+    let (sql, values) = query.build(PostgresQueryBuilder);
+    Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values)
+}
+
+/// The latest receipt per stream whose window covers the instant.
+fn covering_receipts_query(
+    stream_ids: &[Uuid],
+    time: DateTime<Utc>,
+) -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::data_streams::models::receipts as ingest_receipt;
+    Query::select()
+        .distinct_on([ingest_receipt::Column::StreamId])
+        .columns([
+            ingest_receipt::Column::StreamId,
+            ingest_receipt::Column::Id,
+            ingest_receipt::Column::At,
+            ingest_receipt::Column::WindowFrom,
+            ingest_receipt::Column::WindowTo,
+            ingest_receipt::Column::Submitted,
+            ingest_receipt::Column::NewRows,
+            ingest_receipt::Column::Changed,
+            ingest_receipt::Column::Unchanged,
+            ingest_receipt::Column::Withdrawn,
+            ingest_receipt::Column::RejectedTotal,
+            ingest_receipt::Column::Braked,
+        ])
+        .from(ingest_receipt::Entity)
+        .cond_where(
+            Condition::all()
+                .add(Expr::col(ingest_receipt::Column::StreamId).is_in(stream_ids.to_vec()))
+                .add(Expr::col(ingest_receipt::Column::WindowFrom).lte(time))
+                .add(Expr::col(ingest_receipt::Column::WindowTo).gte(time)),
+        )
+        .order_by(ingest_receipt::Column::StreamId, Order::Asc)
+        .order_by(ingest_receipt::Column::At, Order::Desc)
+        .take()
+}
+
+/// Live replicate-statistics holds on these streams at the instant. The `parameter_id` column is
+/// null so the row reads as [`HoldRow`], which both hold readers share.
+fn stream_holds_query(
+    stream_ids: &[Uuid],
+    time: DateTime<Utc>,
+) -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::sync::hold_model as holds;
+    Query::select()
+        .column(holds::Column::StreamId)
+        .expr_as(
+            Expr::cust("NULL::uuid"),
+            Alias::new(holds::Column::ParameterId.as_str()),
+        )
+        .columns([
+            holds::Column::Id,
+            holds::Column::Kind,
+            holds::Column::Status,
+            holds::Column::CreatedAt,
+        ])
+        .from(holds::Entity)
+        .cond_where(
+            Condition::all()
+                .add(Expr::col(holds::Column::StreamId).is_in(stream_ids.to_vec()))
+                .add(Expr::col(holds::Column::GroupTime).eq(time))
+                .add(Expr::col(holds::Column::Status).is_in(live_hold_statuses())),
+        )
+        .order_by(holds::Column::CreatedAt, Order::Desc)
+        .take()
+}
+
+/// Live holds no stream produced: the event-audit findings and reconciliation holds keyed on the
+/// slot instead.
+fn slot_holds_query(
+    site_id: Uuid,
+    parameter_ids: &[Uuid],
+    time: DateTime<Utc>,
+) -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::sync::hold_model as holds;
+    Query::select()
+        .expr_as(
+            Expr::cust("NULL::uuid"),
+            Alias::new(holds::Column::StreamId.as_str()),
+        )
+        .columns([
+            holds::Column::ParameterId,
+            holds::Column::Id,
+            holds::Column::Kind,
+            holds::Column::Status,
+            holds::Column::CreatedAt,
+        ])
+        .from(holds::Entity)
+        .cond_where(
+            Condition::all()
+                .add(Expr::col(holds::Column::StreamId).is_null())
+                .add(Expr::col(holds::Column::SiteId).eq(site_id))
+                .add(Expr::col(holds::Column::ParameterId).is_in(parameter_ids.to_vec()))
+                .add(Expr::col(holds::Column::GroupTime).eq(time))
+                .add(Expr::col(holds::Column::Status).is_in(live_hold_statuses())),
+        )
+        .order_by(holds::Column::CreatedAt, Order::Desc)
+        .take()
+}
+
+/// The formulas one hop from these parameters: the ones that output them, and the ones that read
+/// them as a source.
+fn formulas_one_hop_query(parameter_ids: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::derived_parameters::models::definition::{
+        Column as FormulaColumn, Entity as FormulaEntity,
+    };
+    use crate::routes::private::derived_parameters::models::source;
+    use crate::routes::private::parameters as parameters_entity;
+    use crate::routes::private::tools::models::script as tool_script;
+
+    let d = Alias::new("d");
+    let p = Alias::new("p");
+    let sc = Alias::new("sc");
+    let reads_one = Query::select()
+        .column(source::Column::DerivedDefinitionId)
+        .from(source::Entity)
+        .and_where(Expr::col(source::Column::ParameterId).is_in(parameter_ids.to_vec()))
+        .take();
+
+    Query::select()
+        .columns([
+            (d.clone(), FormulaColumn::Id),
+            (d.clone(), FormulaColumn::Code),
+            (d.clone(), FormulaColumn::Name),
+            (d.clone(), FormulaColumn::PerReplicate),
+            (d.clone(), FormulaColumn::OutputParameterId),
+        ])
+        .expr_as(
+            Expr::col((p.clone(), parameters_entity::Column::Code)),
+            Alias::new("output_parameter_code"),
+        )
+        .expr_as(
+            Expr::col((sc.clone(), tool_script::Column::Name)),
+            Alias::new("calculation"),
+        )
+        .expr_as(
+            Func::coalesce([
+                Expr::col((sc.clone(), tool_script::Column::Enabled)),
+                Expr::value(true),
+            ]),
+            Alias::new("enabled"),
+        )
+        .from_as(FormulaEntity, d.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            tool_script::Entity,
+            sc.clone(),
+            Expr::col((sc, tool_script::Column::Id))
+                .equals((d.clone(), FormulaColumn::ToolScriptId)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            parameters_entity::Entity,
+            p.clone(),
+            Expr::col((p, parameters_entity::Column::Id))
+                .equals((d.clone(), FormulaColumn::OutputParameterId)),
+        )
+        .cond_where(
+            Condition::any()
+                .add(
+                    Expr::col((d.clone(), FormulaColumn::OutputParameterId))
+                        .is_in(parameter_ids.to_vec()),
+                )
+                .add(Expr::col((d.clone(), FormulaColumn::Id)).in_subquery(reads_one)),
+        )
+        .order_by((d.clone(), FormulaColumn::Ordinal), Order::Asc)
+        .order_by((d, FormulaColumn::Code), Order::Asc)
+        .take()
+}
+
+/// The sources of these formulas, with the code of the parameter each reads.
+fn formula_sources_query(definition_ids: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::derived_parameters::models::source;
+    use crate::routes::private::parameters as parameters_entity;
+
+    let ds = Alias::new("ds");
+    let p = Alias::new("p");
+    Query::select()
+        .columns([
+            (ds.clone(), source::Column::DerivedDefinitionId),
+            (ds.clone(), source::Column::VariableName),
+            (ds.clone(), source::Column::ParameterId),
+            (ds.clone(), source::Column::SiteProperty),
+        ])
+        .expr_as(
+            Expr::col((p.clone(), parameters_entity::Column::Code)),
+            Alias::new("parameter_code"),
+        )
+        .from_as(source::Entity, ds.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            parameters_entity::Entity,
+            p.clone(),
+            Expr::col((p, parameters_entity::Column::Id))
+                .equals((ds.clone(), source::Column::ParameterId)),
+        )
+        .and_where(
+            Expr::col((ds.clone(), source::Column::DerivedDefinitionId))
+                .is_in(definition_ids.to_vec()),
+        )
+        .order_by((ds, source::Column::VariableName), Order::Asc)
+        .take()
+}
+
+/// Each site as one jsonb row, which is what lets a formula read whichever site property it names
+/// without the reader knowing the column list.
+fn site_rows_query(site_ids: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::sites::models as sites_model;
+    Query::select()
+        .column(sites_model::Column::Id)
+        .expr_as(Expr::cust("to_jsonb(sites)"), Alias::new("row"))
+        .from(sites_model::Entity)
+        .and_where(Expr::col(sites_model::Column::Id).is_in(site_ids.to_vec()))
+        .take()
+}
+
+/// The slot's code, name, unit and declared precision, the site's own configuration winning over
+/// the catalog default.
+fn slot_identity_query(site_id: Uuid, parameter_id: Uuid) -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::parameters as parameters_entity;
+    use crate::routes::private::site_parameters::models as site_parameters_model;
+
+    let p = Alias::new("p");
+    let sp = Alias::new("sp");
+    Query::select()
+        .columns([
+            (p.clone(), parameters_entity::Column::Code),
+            (p.clone(), parameters_entity::Column::Name),
+        ])
+        .expr_as(
+            Func::coalesce([
+                Expr::col((sp.clone(), site_parameters_model::Column::DisplayUnits)),
+                Expr::col((p.clone(), parameters_entity::Column::DefaultUnits)),
+            ]),
+            Alias::new("units"),
+        )
+        .column((sp.clone(), site_parameters_model::Column::DecimalPlaces))
+        .from_as(parameters_entity::Entity, p.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            site_parameters_model::Entity,
+            sp.clone(),
+            Condition::all()
+                .add(
+                    Expr::col((sp.clone(), site_parameters_model::Column::ParameterId))
+                        .equals((p.clone(), parameters_entity::Column::Id)),
+                )
+                .add(Expr::col((sp, site_parameters_model::Column::SiteId)).eq(site_id)),
+        )
+        .and_where(Expr::col((p, parameters_entity::Column::Id)).eq(parameter_id))
+        .limit(1)
+        .take()
 }
 
 /// Replicate-statistics holds keyed by stream at the instant. Terminal holds are left out.
@@ -4944,18 +5371,7 @@ pub(super) async fn fetch_stream_holds(
     time: DateTime<Utc>,
 ) -> AppResult<HashMap<Uuid, Vec<HoldRef>>> {
     let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT stream_id, NULL::uuid AS parameter_id, id, kind, status, created_at \
-                 FROM replicate_audit_holds \
-                 WHERE stream_id = ANY($1) AND group_time = $2 \
-                   AND status IN {live} \
-                 ORDER BY created_at DESC",
-                live = live_hold_statuses()
-            ),
-            [stream_ids.to_vec().into(), time.into()],
-        ))
+        .query_all_raw(build(stream_holds_query(stream_ids, time)))
         .await?;
     let mut out: HashMap<Uuid, Vec<HoldRef>> = HashMap::new();
     for row in rows.iter().map(|r| HoldRow::from_query_result(r, "")) {
@@ -4982,22 +5398,11 @@ pub(super) async fn fetch_slot_holds(
     let mut out: HashMap<(Uuid, Uuid), Vec<HoldRef>> = HashMap::new();
     for (site_id, parameter_ids) in by_site {
         let found = db
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                format!(
-                    "SELECT NULL::uuid AS stream_id, parameter_id, id, kind, status, created_at \
-                     FROM replicate_audit_holds \
-                     WHERE stream_id IS NULL AND site_id = $1 AND parameter_id = ANY($2) \
-                       AND group_time = $3 AND status IN {live} \
-                     ORDER BY created_at DESC",
-                    live = live_hold_statuses()
-                ),
-                [
-                    site_id.into(),
-                    parameter_ids.into_iter().collect::<Vec<_>>().into(),
-                    time.into(),
-                ],
-            ))
+            .query_all_raw(build(slot_holds_query(
+                site_id,
+                &parameter_ids.into_iter().collect::<Vec<_>>(),
+                time,
+            )))
             .await?;
         for row in found.iter().map(|r| HoldRow::from_query_result(r, "")) {
             let row = row?;
@@ -5352,20 +5757,7 @@ pub(super) async fn fetch_formula_links(
         return Ok(FormulaLinks::default());
     }
     let found = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT d.id, d.code, d.name, d.per_replicate, d.output_parameter_id, \
-                    p.code AS output_parameter_code, s.name AS calculation, \
-                    COALESCE(s.enabled, true) AS enabled \
-               FROM calculation_formulas d \
-               LEFT JOIN tool_scripts s ON s.id = d.tool_script_id \
-               LEFT JOIN parameters p ON p.id = d.output_parameter_id \
-              WHERE d.output_parameter_id = ANY($1) \
-                 OR d.id IN (SELECT derived_definition_id FROM derived_parameter_sources \
-                              WHERE parameter_id = ANY($1)) \
-              ORDER BY d.ordinal, d.code",
-            [parameter_ids.into()],
-        ))
+        .query_all_raw(build(formulas_one_hop_query(&parameter_ids)))
         .await?;
     let mut formulas: Vec<FormulaLink> = Vec::with_capacity(found.len());
     for row in found.iter().map(|r| LinkRow::from_query_result(r, "")) {
@@ -5387,16 +5779,7 @@ pub(super) async fn fetch_formula_links(
     }
     let definition_ids: Vec<Uuid> = formulas.iter().map(|f| f.definition_id).collect();
     let sources = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT ds.derived_definition_id, ds.variable_name, ds.parameter_id, \
-                    ds.site_property, p.code AS parameter_code \
-               FROM derived_parameter_sources ds \
-               LEFT JOIN parameters p ON p.id = ds.parameter_id \
-              WHERE ds.derived_definition_id = ANY($1) \
-              ORDER BY ds.variable_name",
-            [definition_ids.into()],
-        ))
+        .query_all_raw(build(formula_sources_query(&definition_ids)))
         .await?;
     let mut by_definition: HashMap<Uuid, Vec<SourceLink>> = HashMap::new();
     for row in sources.iter().map(|r| SourceRow::from_query_result(r, "")) {
@@ -5493,13 +5876,7 @@ pub(super) async fn fetch_served_values(
     if columns.is_empty() {
         return Ok(served);
     }
-    let sites = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id, to_jsonb(sites) AS row FROM sites WHERE id = ANY($1)",
-            [site_ids.into()],
-        ))
-        .await?;
+    let sites = db.query_all_raw(build(site_rows_query(&site_ids))).await?;
     for row in sites.iter().map(|r| SiteRow::from_query_result(r, "")) {
         let row = row?;
         let values: HashMap<String, f64> = columns
@@ -5524,15 +5901,7 @@ pub(super) async fn slot_identity(
     parameter_id: Uuid,
 ) -> AppResult<Option<(String, String, Option<String>, Option<i16>)>> {
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT p.code, p.name, COALESCE(sp.display_units, p.default_units) AS units, \
-                    sp.decimal_places \
-             FROM parameters p \
-             LEFT JOIN site_parameters sp ON sp.parameter_id = p.id AND sp.site_id = $2 \
-             WHERE p.id = $1 LIMIT 1",
-            [parameter_id.into(), site_id.into()],
-        ))
+        .query_one_raw(build(slot_identity_query(site_id, parameter_id)))
         .await?;
     let Some(row) = row else { return Ok(None) };
     let row = SlotRow::from_query_result(&row, "")?;
@@ -9250,6 +9619,292 @@ mod tail;
 #[cfg(test)]
 #[path = "tests/batch.rs"]
 mod batch;
+
+// --- Statements the handlers and job bodies used to spell ---
+
+/// The readings whose stored curation columns disagree with what their decision record asserts,
+/// newest first. A reading outside the caller's projects is not theirs to see, and an unpaired one
+/// belongs to no project at all, so a scoped caller is shown neither.
+#[must_use]
+pub(super) fn curation_drift_query(
+    scope: &crate::common::authz::AccessScope,
+    limit: u32,
+) -> sea_orm::sea_query::SelectStatement {
+    use crate::routes::private::sites::models as sites;
+    let d = Alias::new("d");
+    let r = Alias::new("r");
+    let st = Alias::new("st");
+    Query::select()
+        .column((d.clone(), Alias::new("stream_id")))
+        .column((d.clone(), Alias::new("time")))
+        .column((d.clone(), Alias::new("replicate_index")))
+        .column((r.clone(), readings::Column::SiteId))
+        .column((r.clone(), readings::Column::ParameterId))
+        .expr_as(
+            Expr::cust(
+                "jsonb_strip_nulls(jsonb_build_object(\
+                     'is_flagged', d.is_flagged, 'flag_reason', d.flag_reason, \
+                     'withdrawn_at', d.withdrawn_at, 'withdrawn_reason', d.withdrawn_reason, \
+                     'unverified', d.unverified, 'standard_curve_id', d.standard_curve_id, \
+                     'calibration_id', d.calibration_id, 'sensor_id', d.sensor_id, \
+                     'raw_value', d.raw_value))",
+            ),
+            Alias::new("stored"),
+        )
+        .expr_as(
+            Expr::cust("COALESCE(d.folded, '{}'::jsonb)"),
+            Alias::new("folded"),
+        )
+        .from_subquery(
+            crate::routes::private::readings::service::inconsistent_rows(),
+            d.clone(),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            readings::Entity,
+            r.clone(),
+            Condition::all()
+                .add(
+                    Expr::col((r.clone(), readings::Column::StreamId))
+                        .equals((d.clone(), Alias::new("stream_id"))),
+                )
+                .add(
+                    Expr::col((r.clone(), readings::Column::Time))
+                        .equals((d.clone(), Alias::new("time"))),
+                )
+                .add(
+                    Expr::col((r.clone(), readings::Column::ReplicateIndex))
+                        .equals((d.clone(), Alias::new("replicate_index"))),
+                ),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            sites::Entity,
+            st.clone(),
+            Expr::col((st.clone(), sites::Column::Id)).equals((r, readings::Column::SiteId)),
+        )
+        .cond_where(
+            Condition::all().add_option(crate::common::scope::project_filter(
+                scope,
+                (st, sites::Column::ProjectId),
+            )),
+        )
+        .order_by((d, Alias::new("time")), sea_orm::Order::Desc)
+        .limit(u64::from(limit))
+        .take()
+}
+
+/// The drift rows themselves, as the handler serves them.
+pub(super) async fn curation_drift_rows<C: ConnectionTrait>(
+    conn: &C,
+    scope: &crate::common::authz::AccessScope,
+    limit: u32,
+) -> AppResult<Vec<CurationDriftRow>> {
+    let (sql, values) = curation_drift_query(scope, limit).build(PostgresQueryBuilder);
+    conn.query_all_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+        values,
+    ))
+    .await?
+    .iter()
+    .map(|row| Ok(CurationDriftRow::from_query_result(row, "")?))
+    .collect()
+}
+
+/// What the source said at a replicate-statistics hold, for the preview to compare against.
+/// `None` when no such hold sits on that instant.
+pub(super) async fn hold_expectation<C: ConnectionTrait>(
+    conn: &C,
+    hold_id: Uuid,
+    at: chrono::DateTime<chrono::FixedOffset>,
+) -> AppResult<Option<serde_json::Value>> {
+    Ok(hold_model::Entity::find()
+        .filter(hold_model::Column::Id.eq(hold_id))
+        .filter(hold_model::Column::Kind.eq(HoldKind::ReplicateStats.as_str()))
+        .filter(hold_model::Column::GroupTime.eq(at))
+        .one(conn)
+        .await?
+        .map(|hold| hold.expected))
+}
+
+/// Which of these streams declare a replicate family. A family's replicates sync from the source,
+/// so no other writer may mint an index onto one.
+pub(super) async fn replicate_family_keys<C: ConnectionTrait>(
+    conn: &C,
+    stream_ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, String>> {
+    if stream_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let s = Alias::new("s");
+    let (sql, values) = Query::select()
+        .column((s.clone(), data_streams::models::Column::Id))
+        .column((s.clone(), data_streams::models::Column::SourceKey))
+        .from_as(data_streams::models::Entity, s.clone())
+        .and_where(
+            Expr::col((s.clone(), data_streams::models::Column::Id))
+                .is_in(stream_ids.iter().copied()),
+        )
+        .and_where(data_streams::service::declares_replicates(&s))
+        .to_owned()
+        .build(PostgresQueryBuilder);
+    let mut out = HashMap::new();
+    for row in conn
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await?
+    {
+        let row = FamilyKeyRow::from_query_result(&row, "")?;
+        out.insert(row.id, row.source_key);
+    }
+    Ok(out)
+}
+
+/// The streams a retag would reach that declare a different classification of their own. Ingest
+/// keeps writing a declared value, so the retag would drift back and the conflict is reported
+/// rather than silently overwritten.
+pub(super) async fn streams_declaring_other_type<C: ConnectionTrait>(
+    conn: &C,
+    target: &str,
+    sensor_ids: &[Uuid],
+    stream_ids: &[Uuid],
+    source_system: Option<&str>,
+) -> AppResult<Vec<(String, String)>> {
+    let mut reached = Condition::any()
+        .add(Expr::col(data_streams::models::Column::SensorId).is_in(sensor_ids.iter().copied()))
+        .add(Expr::col(data_streams::models::Column::Id).is_in(stream_ids.iter().copied()));
+    if let Some(system) = source_system {
+        reached = reached.add(Expr::col(data_streams::models::Column::SourceSystem).eq(system));
+    }
+    let (sql, values) = Query::select()
+        .column(data_streams::models::Column::SourceSystem)
+        .column(data_streams::models::Column::SourceKey)
+        .from(data_streams::models::Entity)
+        .and_where(Expr::col(data_streams::models::Column::MeasurementType).is_not_null())
+        .and_where(Expr::col(data_streams::models::Column::MeasurementType).ne(target))
+        .cond_where(reached)
+        .to_owned()
+        .build(PostgresQueryBuilder);
+    let mut out = Vec::new();
+    for row in conn
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await?
+    {
+        out.push((
+            row.try_get::<String>("", "source_system")?,
+            row.try_get::<String>("", "source_key")?,
+        ));
+    }
+    Ok(out)
+}
+
+/// A site's parameter columns, as the importer resolves a header against them: the slot's own
+/// name, the catalog code and the catalog aliases.
+pub(super) async fn site_parameter_columns<C: ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+) -> AppResult<Vec<SlotColumnRow>> {
+    let sp = Alias::new("sp");
+    let p = Alias::new("p");
+    let (sql, values) = Query::select()
+        .expr_as(
+            Expr::col((sp.clone(), site_parameters::Column::Name)),
+            Alias::new("sp_name"),
+        )
+        .column((sp.clone(), site_parameters::Column::ParameterId))
+        .expr_as(
+            Expr::col((p.clone(), parameters::Column::Code)),
+            Alias::new("param_name"),
+        )
+        .column((p.clone(), parameters::Column::Aliases))
+        .from_as(site_parameters::Entity, sp.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            parameters::Entity,
+            p.clone(),
+            Expr::col((p, parameters::Column::Id))
+                .equals((sp.clone(), site_parameters::Column::ParameterId)),
+        )
+        .and_where(Expr::col((sp, site_parameters::Column::SiteId)).eq(site_id))
+        .to_owned()
+        .build(PostgresQueryBuilder);
+    let rows = conn
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| SlotColumnRow::from_query_result(row, "").ok())
+        .collect())
+}
+
+/// Every parameter a calculation writes. A derived output is computed, never ingested, so the
+/// importer refuses a column naming one.
+pub(super) async fn derived_output_parameter_ids<C: ConnectionTrait>(
+    conn: &C,
+) -> AppResult<HashSet<Uuid>> {
+    Ok(calculation_formulas::Entity::find()
+        .filter(calculation_formulas::Column::OutputParameterId.is_not_null())
+        .select_only()
+        .column(calculation_formulas::Column::OutputParameterId)
+        .into_tuple::<Option<Uuid>>()
+        .all(conn)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
+/// The `api` stream already carrying each of these slots at this site, which is where an imported
+/// row lands.
+pub(super) async fn api_streams_of_slots<C: ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+    parameter_ids: &[Uuid],
+) -> AppResult<Vec<SlotStreamRow>> {
+    let ds = Alias::new("ds");
+    let sp = Alias::new("sp");
+    let (sql, values) = Query::select()
+        .column((sp.clone(), site_parameters::Column::ParameterId))
+        .column((ds.clone(), data_streams::models::Column::Id))
+        .from_as(data_streams::models::Entity, ds.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            site_parameters::Entity,
+            sp.clone(),
+            Expr::col((sp.clone(), site_parameters::Column::Id))
+                .equals((ds.clone(), data_streams::models::Column::SiteParameterId)),
+        )
+        .and_where(Expr::col((ds, data_streams::models::Column::SourceSystem)).eq("api"))
+        .and_where(Expr::col((sp.clone(), site_parameters::Column::SiteId)).eq(site_id))
+        .and_where(
+            Expr::col((sp, site_parameters::Column::ParameterId))
+                .is_in(parameter_ids.iter().copied()),
+        )
+        .to_owned()
+        .build(PostgresQueryBuilder);
+    let rows = conn
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await?;
+    rows.iter()
+        .map(|row| Ok(SlotStreamRow::from_query_result(row, "")?))
+        .collect()
+}
 
 #[cfg(test)]
 #[path = "tests/grab_samples.rs"]

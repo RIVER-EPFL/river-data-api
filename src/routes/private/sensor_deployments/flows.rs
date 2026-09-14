@@ -301,6 +301,12 @@ impl Job for BackfillAttribution {
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let slots = uuid_pair_array(ctx.params(), "slots");
+        // The twin of `backfill_calibrations`: an empty selection is a refusal, not a zero (B262).
+        if slots.is_empty() {
+            return Err(DbErr::Custom(
+                "backfill_attribution: no slots given".to_string(),
+            ));
+        }
         let mut results = Vec::with_capacity(slots.len());
         for (site_id, parameter_id) in slots {
             let moved = reprocess_site_parameter_readings(

@@ -51,3 +51,39 @@ fn an_entry_with_no_instrument_keys_on_its_parameter() {
     assert_eq!(instrument_key(&a), instrument_key(&b));
     assert_ne!(instrument_key(&a), instrument_key(&entry("NUT_P", None)));
 }
+
+/// Expected behaviour: the hold statements reach the stream and its slot through one join builder,
+/// and the reads that take a row to decide lock only the hold. A join written per statement is how
+/// a rename compiles clean and fails in whichever of them names the old column.
+#[test]
+fn test_a_hold_reaches_its_slot_through_one_join_and_locks_only_the_hold() {
+    use sea_orm::sea_query::{JoinType, LockType, PostgresQueryBuilder};
+
+    let paired = super::hold_on_its_slot()
+        .lock_with_tables(
+            LockType::Update,
+            [sea_orm::sea_query::Alias::new(super::HOLD)],
+        )
+        .to_owned()
+        .to_string(PostgresQueryBuilder);
+    assert!(
+        paired.contains(r#"INNER JOIN "data_streams" AS "ds" ON "ds"."id" = "h"."stream_id""#),
+        "the stream is joined on the hold's stream_id: {paired}"
+    );
+    assert!(
+        paired.contains(
+            r#"INNER JOIN "site_parameters" AS "sp" ON "sp"."id" = "ds"."site_parameter_id""#
+        ),
+        "the slot is the stream's pairing: {paired}"
+    );
+    assert!(
+        paired.contains(r#"FOR UPDATE OF "h""#),
+        "only the hold row is locked: {paired}"
+    );
+
+    let unpaired = super::hold_on_its_stream(JoinType::LeftJoin).to_string(PostgresQueryBuilder);
+    assert!(
+        unpaired.contains(r#"LEFT JOIN "site_parameters""#),
+        "a left join admits a hold whose stream is unpaired: {unpaired}"
+    );
+}
