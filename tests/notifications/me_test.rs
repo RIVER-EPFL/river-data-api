@@ -7,6 +7,7 @@ use crate::common::keycloak::{
     build_test_app_with_keycloak, get_keycloak_jwt, grant_project, keycloak_reachable,
     keycloak_user_id,
 };
+use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use serial_test::serial;
 
 macro_rules! require_keycloak {
@@ -137,6 +138,50 @@ async fn push_device_registers_lists_and_deletes_by_endpoint() {
     assert_eq!(
         me["pushSubscriptionCount"], 1,
         "the device count follows the delete"
+    );
+}
+
+/// Expected behaviour: a device implies a subscriber row, so the roster is the subscriber table and
+/// not a union with the devices.
+#[tokio::test]
+#[serial]
+async fn registering_a_device_creates_the_subscriber_row() {
+    require_keycloak!();
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let sub = keycloak_user_id("user").await;
+    grant_project(&db, &sub, PROJECT_ID).await;
+    let app = build_test_app_with_keycloak(db.clone()).await;
+    let user = get_keycloak_jwt("user", "user").await;
+
+    let (s, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/notifications/me/push",
+        &serde_json::json!({
+            "endpoint": "https://updates.push.services.mozilla.com/wpush/v2/first-endpoint",
+            "p256dh": "test-p256dh-key",
+            "auth": "test-auth-key",
+            "user_agent": "Firefox/Linux",
+        }),
+        &user,
+    )
+    .await;
+    assert_eq!(s, 200, "register the first device: {body}");
+
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM notification_subscribers WHERE keycloak_sub = $1",
+            [sub.clone().into()],
+        ))
+        .await
+        .expect("the subscribers read")
+        .expect("one count row");
+    assert_eq!(
+        row.try_get::<i64>("", "n").expect("a count"),
+        1,
+        "the device's owner is a subscriber without having read /notifications/me first"
     );
 }
 

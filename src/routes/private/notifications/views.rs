@@ -358,6 +358,9 @@ pub async fn register_push_subscription(
     Json(body): Json<RegisterPushRequest>,
 ) -> AppResult<Json<PushSubscriptionRow>> {
     let sub = require_sub(&auth)?;
+    // A device implies a subscriber: the roster is the subscriber table, so a person who registers
+    // one without ever opening their settings still has a row there.
+    ensure_subscriber(&state, &sub).await?;
     let row = push_subscription::Entity::insert(push_subscription::ActiveModel {
         id: Set(Uuid::new_v4()),
         keycloak_sub: Set(sub),
