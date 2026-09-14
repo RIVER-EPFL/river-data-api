@@ -8,9 +8,9 @@ use sea_orm_migration::prelude::*;
 /// database starts blank, and every parameter, constant, tool script and instrument arrives
 /// through the plan or the form an operator validates (Q134).
 ///
-/// This is the second flattening. The 55 migrations it folds in are deleted, not kept: they live
-/// in commit 09556d14, the last one registering all of them, and the 99 the first baseline
-/// replaced live in 3b6876a.
+/// The migrations this folds in are deleted, not kept, and each flattening names the commit that
+/// still registers them: the three written after 2026-09-11 live in 29b96f17, the 55 before them
+/// in 09556d14, and the 99 the first baseline replaced in 3b6876a.
 ///
 /// There is no route from a database holding rows to this schema, and none is wanted. Production
 /// is wiped and rebuilt blank when dev moves to prod (Q138): dump it first, build the new
@@ -1119,6 +1119,9 @@ ALTER TABLE ONLY public.constants
 ALTER TABLE ONLY public.constants
     ADD CONSTRAINT constants_pkey PRIMARY KEY (id);
 
+ALTER TABLE ONLY public.csv_import_staging
+    ADD CONSTRAINT csv_import_staging_pkey PRIMARY KEY (import_token, seq);
+
 ALTER TABLE ONLY public.data_streams
     ADD CONSTRAINT data_streams_pkey PRIMARY KEY (id);
 
@@ -1394,6 +1397,8 @@ CREATE INDEX idx_readings_sample_id ON public.readings USING btree (sample_id) W
 CREATE INDEX idx_readings_sensor_time ON public.readings USING btree (sensor_id, "time" DESC) WHERE (sensor_id IS NOT NULL);
 
 CREATE INDEX idx_readings_site_param_time ON public.readings USING btree (site_id, parameter_id, "time" DESC) WHERE (site_id IS NOT NULL);
+
+CREATE INDEX idx_readings_spot_param_sensor_time ON public.readings USING btree (parameter_id, sensor_id, "time" DESC) WHERE ((measurement_type)::text = 'spot'::text);
 
 CREATE INDEX idx_readings_spot_sensor_time ON public.readings USING btree (sensor_id, "time") WHERE ((measurement_type)::text = 'spot'::text);
 
@@ -1811,7 +1816,7 @@ SELECT add_compression_policy('readings', INTERVAL '30 days', if_not_exists => T
 SELECT add_compression_policy('status_events', INTERVAL '90 days', if_not_exists => TRUE);
 
 CREATE MATERIALIZED VIEW readings_hourly
-WITH (timescaledb.continuous) AS
+WITH (timescaledb.continuous, timescaledb.materialized_only = false) AS
 SELECT
     time_bucket('1 hour', time) AS bucket,
     site_id,
@@ -1829,7 +1834,7 @@ GROUP BY time_bucket('1 hour', time), site_id, parameter_id, sensor_id
 WITH NO DATA;
 
 CREATE MATERIALIZED VIEW readings_daily
-WITH (timescaledb.continuous) AS
+WITH (timescaledb.continuous, timescaledb.materialized_only = false) AS
 SELECT
     time_bucket('1 day', time) AS bucket,
     site_id,
@@ -1847,7 +1852,7 @@ GROUP BY time_bucket('1 day', time), site_id, parameter_id, sensor_id
 WITH NO DATA;
 
 CREATE MATERIALIZED VIEW readings_weekly
-WITH (timescaledb.continuous) AS
+WITH (timescaledb.continuous, timescaledb.materialized_only = false) AS
 SELECT
     time_bucket('1 week', time) AS bucket,
     site_id,
@@ -1865,7 +1870,7 @@ GROUP BY time_bucket('1 week', time), site_id, parameter_id, sensor_id
 WITH NO DATA;
 
 CREATE MATERIALIZED VIEW readings_monthly
-WITH (timescaledb.continuous) AS
+WITH (timescaledb.continuous, timescaledb.materialized_only = false) AS
 SELECT
     time_bucket('1 month', time) AS bucket,
     site_id,
@@ -1882,14 +1887,17 @@ WHERE site_id IS NOT NULL AND replicate_index = 0 AND (is_flagged IS NOT TRUE) A
 GROUP BY time_bucket('1 month', time), site_id, parameter_id, sensor_id
 WITH NO DATA;
 
+-- start_offset NULL covers the whole history, so a correction to an old reading is
+-- rematerialised by the next tick; buckets_per_batch => 0 refreshes that window in one batch,
+-- which the 2.23 default does not and never converges on the monthly rollup.
 SELECT add_continuous_aggregate_policy('readings_hourly',
-    start_offset => INTERVAL '3 hours',  end_offset => INTERVAL '1 hour',  schedule_interval => INTERVAL '1 hour',  if_not_exists => TRUE);
+    start_offset => NULL, end_offset => INTERVAL '1 hour',  schedule_interval => INTERVAL '1 hour', buckets_per_batch => 0, if_not_exists => TRUE);
 SELECT add_continuous_aggregate_policy('readings_daily',
-    start_offset => INTERVAL '3 days',   end_offset => INTERVAL '1 day',   schedule_interval => INTERVAL '1 day',   if_not_exists => TRUE);
+    start_offset => NULL, end_offset => INTERVAL '1 day',   schedule_interval => INTERVAL '1 hour', buckets_per_batch => 0, if_not_exists => TRUE);
 SELECT add_continuous_aggregate_policy('readings_weekly',
-    start_offset => INTERVAL '3 weeks',  end_offset => INTERVAL '1 week',  schedule_interval => INTERVAL '1 week',  if_not_exists => TRUE);
+    start_offset => NULL, end_offset => INTERVAL '1 week',  schedule_interval => INTERVAL '1 hour', buckets_per_batch => 0, if_not_exists => TRUE);
 SELECT add_continuous_aggregate_policy('readings_monthly',
-    start_offset => INTERVAL '3 months', end_offset => INTERVAL '1 month', schedule_interval => INTERVAL '1 month', if_not_exists => TRUE);
+    start_offset => NULL, end_offset => INTERVAL '1 month', schedule_interval => INTERVAL '1 hour', buckets_per_batch => 0, if_not_exists => TRUE);
 
 "#;
 
