@@ -26,6 +26,7 @@ use crate::common::served::{self};
 use crate::error::AppResult;
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::samples::models as samples;
+use crate::routes::private::sensors::models as sensors;
 use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::sites::models as sites;
 /// site if needed.
@@ -59,6 +60,31 @@ pub fn severity_of_range(min: Option<f64>, max: Option<f64>, t: &ResolvedThresho
     let lo = min.map(|v| severity_of(v, t)).unwrap_or(0);
     let hi = max.map(|v| severity_of(v, t)).unwrap_or(0);
     std::cmp::max(lo, hi)
+}
+
+/// A range breach is an alarm, never a warning: the instrument cannot read the value at all, so
+/// there is no degree to it.
+pub const INSTRUMENT_RANGE_SEVERITY: i16 = 2;
+
+/// The bounds an instrument's manufacturer specifies. An undeclared bound is no bound, and an
+/// instrument declaring neither raises nothing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InstrumentRange {
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+/// Whether a value falls outside what the instrument that measured it can read.
+#[must_use]
+pub fn out_of_instrument_range(value: f64, range: &InstrumentRange) -> bool {
+    range.min.is_some_and(|m| value < m) || range.max.is_some_and(|m| value > m)
+}
+
+/// SQL mirror of [`out_of_instrument_range`], kept in lock-step with it by the alarm-consistency
+/// test. Same bound-expression convention as [`severity_case`].
+#[must_use]
+pub fn instrument_range_condition(val: &str, rmin: &str, rmax: &str) -> String {
+    format!("(({rmin} IS NOT NULL AND {val} < {rmin}) OR ({rmax} IS NOT NULL AND {val} > {rmax}))")
 }
 
 /// Boolean SQL predicate true when a value breaches at or above `min_severity` (1 includes warnings,
@@ -516,6 +542,9 @@ pub(crate) fn latest_served_query(spot: bool, site: Expr, parameter: Expr) -> Se
     let mut latest = SeaQuery::select();
     latest
         .column((r.clone(), readings::Column::Time))
+        // The instrument the value was measured on, which is what an instrument-range episode is
+        // about. Unread by the threshold arm, and one more column on a single-row lateral.
+        .column((r.clone(), readings::Column::SensorId))
         .from_as(readings::Entity, r.clone())
         .and_where(Expr::col((r.clone(), readings::Column::SiteId)).eq(site))
         .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).eq(parameter))
@@ -718,13 +747,153 @@ pub(crate) async fn fetch_active_alarm_rows<C: ConnectionTrait>(
 
     Ok(rows)
 }
-/// Open persisted alarm event, keyed by (site, parameter, measurement_type) for annotating the
-/// live feed.
+/// One slot whose latest served value is outside what the instrument that measured it can read.
+#[derive(Debug, FromQueryResult)]
+pub(crate) struct InstrumentRangeRow {
+    pub(crate) site_id: Uuid,
+    pub(crate) site_name: String,
+    pub(crate) parameter_id: Uuid,
+    pub(crate) parameter_name: String,
+    pub(crate) sensor_id: Uuid,
+    pub(crate) sensor_name: Option<String>,
+    pub(crate) current_value: f64,
+    pub(crate) time: chrono::DateTime<chrono::FixedOffset>,
+    pub(crate) range_min: Option<f64>,
+    pub(crate) range_max: Option<f64>,
+}
+
+/// The instrument-range breach set: the same shape as [`fetch_active_alarm_rows`], read against
+/// the instrument's own bounds instead of the slot's thresholds. An instrument declaring no range
+/// contributes nothing, so a database that has entered none behaves exactly as before.
+pub(crate) async fn fetch_instrument_range_rows<C: ConnectionTrait>(
+    db: &C,
+    scope: &crate::common::authz::AccessScope,
+    slots: Option<&[(Uuid, Uuid)]>,
+    spot: bool,
+) -> AppResult<Vec<InstrumentRangeRow>> {
+    if matches!(slots, Some(s) if s.is_empty()) {
+        return Ok(Vec::new());
+    }
+
+    let sp = Alias::new("sp");
+    let s_ = Alias::new("s");
+    let lr = Alias::new("lr");
+    let sen = Alias::new("sen");
+
+    let mut active = Condition::all().add(Expr::cust(instrument_range_condition(
+        "lr.value",
+        "sen.range_min",
+        "sen.range_max",
+    )));
+    if let Some(predicate) = project_filter(scope, (s_.clone(), sites::Column::ProjectId)) {
+        active = active.add(predicate);
+    }
+    if let Some(slots) = slots {
+        let pairs: Vec<Expr> = slots
+            .iter()
+            .map(|(site_id, parameter_id)| {
+                Expr::tuple([Expr::value(*site_id), Expr::value(*parameter_id)])
+            })
+            .collect();
+        active = active.add(
+            Expr::tuple([
+                Expr::col((sp.clone(), site_parameters::Column::SiteId)),
+                Expr::col((sp.clone(), site_parameters::Column::ParameterId)),
+            ])
+            .is_in(pairs),
+        );
+    }
+
+    let latest = latest_served_query(
+        spot,
+        Expr::col((sp.clone(), site_parameters::Column::SiteId)),
+        Expr::col((sp.clone(), site_parameters::Column::ParameterId)),
+    );
+
+    let mut rows_query = SeaQuery::select();
+    rows_query
+        .expr_as(
+            Expr::col((sp.clone(), site_parameters::Column::SiteId)),
+            Alias::new("site_id"),
+        )
+        .expr_as(
+            Expr::col((s_.clone(), sites::Column::Name)),
+            Alias::new("site_name"),
+        )
+        .expr_as(
+            Expr::col((sp.clone(), site_parameters::Column::ParameterId)),
+            Alias::new("parameter_id"),
+        )
+        .expr_as(
+            Expr::col((sp.clone(), site_parameters::Column::Name)),
+            Alias::new("parameter_name"),
+        )
+        .expr_as(
+            Expr::col((sen.clone(), sensors::Column::Id)),
+            Alias::new("sensor_id"),
+        )
+        .expr_as(
+            Expr::col((sen.clone(), sensors::Column::Name)),
+            Alias::new("sensor_name"),
+        )
+        .expr_as(
+            Expr::col((lr.clone(), Alias::new("value"))),
+            Alias::new("current_value"),
+        )
+        .column((lr.clone(), Alias::new("time")))
+        .columns([
+            (sen.clone(), sensors::Column::RangeMin),
+            (sen.clone(), sensors::Column::RangeMax),
+        ])
+        .from_as(site_parameters::Entity, sp.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            sites::Entity,
+            s_.clone(),
+            Expr::col((s_.clone(), sites::Column::Id))
+                .equals((sp.clone(), site_parameters::Column::SiteId)),
+        )
+        .join_lateral(
+            JoinType::InnerJoin,
+            latest,
+            lr.clone(),
+            Condition::all().add(Expr::cust("true")),
+        )
+        .join_as(
+            JoinType::InnerJoin,
+            sensors::Entity,
+            sen.clone(),
+            Expr::col((sen.clone(), sensors::Column::Id))
+                .equals((lr.clone(), readings::Column::SensorId)),
+        )
+        .and_where(Expr::col((sp.clone(), site_parameters::Column::IsActive)).eq(true))
+        .cond_where(active)
+        .order_by((s_.clone(), sites::Column::Name), Order::Asc)
+        .order_by(Alias::new("parameter_name"), Order::Asc);
+
+    let (sql, values) = rows_query.build(PostgresQueryBuilder);
+    let rows: Vec<InstrumentRangeRow> = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await?
+        .into_iter()
+        .filter_map(|row| InstrumentRangeRow::from_query_result(&row, "").ok())
+        .collect();
+
+    Ok(rows)
+}
+
+/// Open persisted alarm event, keyed by (site, parameter, measurement_type, kind) for annotating
+/// the live feed. The kind is in the key because one slot holds one open episode of each.
 #[derive(Debug, FromQueryResult)]
 pub(super) struct OpenEventRow {
     pub(super) site_id: Uuid,
     pub(super) parameter_id: Uuid,
     pub(super) measurement_type: String,
+    pub(super) kind: String,
     pub(super) id: Uuid,
     pub(super) started_at: chrono::DateTime<chrono::FixedOffset>,
     pub(super) acknowledged_at: Option<chrono::DateTime<chrono::FixedOffset>>,
@@ -732,12 +901,12 @@ pub(super) struct OpenEventRow {
     pub(super) max_severity: i16,
 }
 /// Fetch the currently-open alarm events as a map keyed by (site_id, parameter_id,
-/// measurement_type). Used to attach `event_id` + acknowledgement state to the (stateless)
+/// measurement_type, kind). Used to attach `event_id` + acknowledgement state to the (stateless)
 /// current-breach feed.
 pub(super) async fn fetch_open_events(
     db: &sea_orm::DatabaseConnection,
     scope: &crate::common::authz::AccessScope,
-) -> AppResult<HashMap<(Uuid, Uuid, String), OpenEventRow>> {
+) -> AppResult<HashMap<(Uuid, Uuid, String, String), OpenEventRow>> {
     let ae = Alias::new("ae");
     let s_ = Alias::new("s");
     let mut open =
@@ -750,6 +919,7 @@ pub(super) async fn fetch_open_events(
             (ae.clone(), alarm_event::Column::SiteId),
             (ae.clone(), alarm_event::Column::ParameterId),
             (ae.clone(), alarm_event::Column::MeasurementType),
+            (ae.clone(), alarm_event::Column::Kind),
             (ae.clone(), alarm_event::Column::Id),
             (ae.clone(), alarm_event::Column::StartedAt),
             (ae.clone(), alarm_event::Column::AcknowledgedAt),
@@ -777,7 +947,15 @@ pub(super) async fn fetch_open_events(
         .await?
     {
         if let Ok(r) = OpenEventRow::from_query_result(&row, "") {
-            map.insert((r.site_id, r.parameter_id, r.measurement_type.clone()), r);
+            map.insert(
+                (
+                    r.site_id,
+                    r.parameter_id,
+                    r.measurement_type.clone(),
+                    r.kind.clone(),
+                ),
+                r,
+            );
         }
     }
     Ok(map)
@@ -939,6 +1117,8 @@ pub(super) struct AlarmEventRow {
     pub(super) parameter_id: Uuid,
     pub(super) parameter_name: String,
     pub(super) measurement_type: String,
+    pub(super) kind: String,
+    pub(super) sensor_id: Option<Uuid>,
     pub(super) severity: i16,
     pub(super) max_severity: i16,
     pub(super) started_at: chrono::DateTime<chrono::FixedOffset>,

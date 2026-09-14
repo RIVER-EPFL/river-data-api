@@ -39,6 +39,13 @@ pub struct Model {
     pub manufacturer: Option<String>,
     #[crudcrate(filterable)]
     pub model: Option<String>,
+    /// The lowest value the manufacturer specifies this unit can measure. Entered by hand; no
+    /// source feed supplies one, and NULL means unstated rather than unbounded.
+    #[crudcrate(filterable, sortable)]
+    pub range_min: Option<f64>,
+    /// The highest value the manufacturer specifies this unit can measure.
+    #[crudcrate(filterable, sortable)]
+    pub range_max: Option<f64>,
     #[crudcrate(filterable)]
     pub is_active: Option<bool>,
     #[crudcrate(filterable)]

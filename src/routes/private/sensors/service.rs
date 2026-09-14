@@ -707,32 +707,55 @@ struct FirstReadingRow {
     first_reading: Option<DateTime<Utc>>,
 }
 
-/// Refuse an instrument nothing measures on, for the writes that name one: a slot's declaration
-/// and a deployment. `subject` names the write in the message, since the operator picked the row
-/// from a list and needs to be told why this one is not an answer.
+/// Why a write may not name this instrument, or `None` when it may. A bookkeeping row records
+/// that nothing was declared, and a retired one is no longer in the lab; an unset `is_active`
+/// is the column's default, which is active.
+#[must_use]
+pub fn instrument_refusal(
+    kind: InstrumentKind,
+    is_active: Option<bool>,
+    name: &str,
+    subject: &str,
+) -> Option<String> {
+    if kind.is_bookkeeping() {
+        return Some(format!(
+            "{name} is a {} row, which records that nothing was declared; it cannot be {subject}",
+            kind.as_str()
+        ));
+    }
+    if !is_active.unwrap_or(true) {
+        return Some(format!(
+            "{name} is retired, so it cannot be {subject}; reactivate the instrument first"
+        ));
+    }
+    None
+}
+
+/// Refuse an instrument nothing measures on, and one that has been retired, for the writes that
+/// name one: a slot's declaration and a deployment. `subject` names the write in the message,
+/// since the operator picked the row from a list and needs to be told why this one is not an
+/// answer.
 pub async fn require_measuring_instrument<C: ConnectionTrait>(
     db: &C,
     sensor_id: Uuid,
     subject: &str,
 ) -> AppResult<()> {
-    let (stored_kind, name, is_lab_instrument) = Entity::find_by_id(sensor_id)
+    let (stored_kind, name, is_lab_instrument, is_active) = Entity::find_by_id(sensor_id)
         .select_only()
         .column(Column::Kind)
         .column(Column::Name)
         .column(Column::IsLabInstrument)
-        .into_tuple::<(Option<String>, Option<String>, Option<bool>)>()
+        .column(Column::IsActive)
+        .into_tuple::<(Option<String>, Option<String>, Option<bool>, Option<bool>)>()
         .one(db)
         .await?
         .ok_or_else(|| AppError::BadRequest(format!("Instrument {sensor_id} not found")))?;
     let kind = InstrumentKind::of(stored_kind.as_deref(), is_lab_instrument);
-    if !kind.is_bookkeeping() {
-        return Ok(());
-    }
     let name = name.unwrap_or_else(|| sensor_id.to_string());
-    Err(AppError::BadRequest(format!(
-        "{name} is a {} row, which records that nothing was declared; it cannot be {subject}",
-        kind.as_str()
-    )))
+    match instrument_refusal(kind, is_active, &name, subject) {
+        Some(message) => Err(AppError::BadRequest(message)),
+        None => Ok(()),
+    }
 }
 
 /// Insert a source-registered instrument for `(source_system, source_key)`, or return the existing

@@ -222,3 +222,52 @@ async fn a_device_is_still_accepted_as_what_measures_a_slot() {
     .await;
     assert_eq!(status, 200, "a device is admitted: {body}");
 }
+
+const RETIRED_INSTRUMENT: &str = "00000000-0000-4000-c000-0000000000b5";
+
+/// An instrument marked inactive has left the lab. Naming it at a write would have window
+/// resolution attribute every later reading to something that is gone, so both writes that name
+/// one refuse it. Readings stay unguarded: a visit entered from paper after the retirement lands.
+#[tokio::test]
+#[serial]
+async fn a_retired_instrument_cannot_be_declared_or_deployed() {
+    let f = crate::common::seeded_app().await;
+    let (app, token, db) = (f.app, f.token, f.db);
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, name, is_active, kind, created_at) \
+             VALUES ('{RETIRED_INSTRUMENT}', 'miniDOT 7392', false, 'device', now())"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/site_parameters/{}", crate::common::PARAM_S1_TEMP_ID),
+        &serde_json::json!({ "instrument_sensor_id": RETIRED_INSTRUMENT }),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "the declaration refuses a retired instrument: {body}"
+    );
+    assert!(
+        body.contains("retired"),
+        "the refusal says the instrument is retired: {body}"
+    );
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sensors/{RETIRED_INSTRUMENT}/adopt"),
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "adopt refuses a retired instrument: {body}");
+}

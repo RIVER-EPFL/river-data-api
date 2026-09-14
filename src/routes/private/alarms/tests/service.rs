@@ -184,3 +184,59 @@ fn test_the_violation_count_groups_the_violations_select() {
         "one row per parameter: {counts}"
     );
 }
+
+// Scenario: an instrument reads a value its manufacturer says it cannot measure.
+//
+// Expected behaviour: the instrument's own bounds decide it, an undeclared bound is no bound,
+// and the SQL the sweeper runs says exactly what the Rust says.
+mod instrument_range {
+    use super::super::{InstrumentRange, instrument_range_condition, out_of_instrument_range};
+
+    fn range(min: Option<f64>, max: Option<f64>) -> InstrumentRange {
+        InstrumentRange { min, max }
+    }
+
+    #[test]
+    fn test_out_of_instrument_range_is_false_inside_the_bounds() {
+        assert!(!out_of_instrument_range(8.0, &range(Some(0.0), Some(20.0))));
+    }
+
+    #[test]
+    fn test_out_of_instrument_range_takes_each_bound() {
+        assert!(out_of_instrument_range(-0.5, &range(Some(0.0), Some(20.0))));
+        assert!(out_of_instrument_range(32.0, &range(Some(0.0), Some(20.0))));
+    }
+
+    #[test]
+    fn test_a_bound_is_inclusive() {
+        assert!(!out_of_instrument_range(0.0, &range(Some(0.0), Some(20.0))));
+        assert!(!out_of_instrument_range(
+            20.0,
+            &range(Some(0.0), Some(20.0))
+        ));
+    }
+
+    #[test]
+    fn test_an_undeclared_bound_is_no_bound() {
+        assert!(!out_of_instrument_range(-99.0, &range(None, Some(20.0))));
+        assert!(out_of_instrument_range(99.0, &range(None, Some(20.0))));
+        assert!(out_of_instrument_range(-99.0, &range(Some(0.0), None)));
+    }
+
+    #[test]
+    fn test_an_instrument_declaring_no_range_raises_nothing() {
+        assert!(!out_of_instrument_range(1e9, &range(None, None)));
+        assert!(!out_of_instrument_range(-1e9, &range(None, None)));
+    }
+
+    /// The SQL mirror names both bounds, guards each against NULL and compares in the same
+    /// direction, which is what keeps it in lock-step with the Rust above.
+    #[test]
+    fn test_the_sql_mirror_matches_the_rust_bound_for_bound() {
+        let sql = instrument_range_condition("v", "lo", "hi");
+        assert_eq!(
+            sql, "((lo IS NOT NULL AND v < lo) OR (hi IS NOT NULL AND v > hi))",
+            "{sql}"
+        );
+    }
+}

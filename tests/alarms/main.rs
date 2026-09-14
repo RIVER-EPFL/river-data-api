@@ -12,4 +12,5 @@ mod event_driven_reconcile;
 mod events_feed_and_summary;
 mod export_summary_counts;
 mod global_threshold_breach_consistency;
+mod instrument_range_episodes;
 mod threshold_lifecycle_and_state;

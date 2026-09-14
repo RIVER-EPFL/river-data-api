@@ -76,7 +76,21 @@ pub struct ActiveAlarm {
     pub current_value: f64,
     /// Cadence of the series that raised this breach: 'continuous' (sensor) or 'spot' (grab).
     pub measurement_type: String,
+    /// What raised it: 'threshold', the site or parameter bounds, or 'instrument_range', a value
+    /// outside what the instrument that measured it can read.
+    pub kind: String,
+    /// The bounds that were breached. On an 'instrument_range' breach these are the instrument's
+    /// own `range_min`/`range_max`, carried as the alarm bounds because a range breach has no
+    /// warning degree to it.
     pub threshold: ResolvedThreshold,
+    /// The instrument an 'instrument_range' breach is about; absent on a threshold breach, which
+    /// is about the water rather than the device.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub sensor_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub sensor_name: Option<String>,
     /// 1=warning, 2=alarm
     pub severity: i16,
     /// Timestamp of the latest violating reading
@@ -215,6 +229,12 @@ pub struct AlarmEventResponse {
     pub parameter_name: String,
     /// Cadence of the series that raised this event: 'continuous' (sensor) or 'spot' (grab).
     pub measurement_type: String,
+    /// What raised it: 'threshold' or 'instrument_range'.
+    pub kind: String,
+    /// The instrument an 'instrument_range' event is about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub sensor_id: Option<Uuid>,
     /// Current severity (1=warning, 2=alarm)
     pub severity: i16,
     /// Highest severity seen while the event has been open (1=warning, 2=alarm)
@@ -383,7 +403,7 @@ pub mod alarm_event {
         name_plural = "alarm_events",
         generate_router,
         routes(read),
-        upsert_key(site_id, parameter_id, measurement_type),
+        upsert_key(site_id, parameter_id, measurement_type, kind),
         upsert_where = Column::ResolvedAt.is_null()
     )]
     pub struct Model {
@@ -428,6 +448,15 @@ pub mod alarm_event {
         /// The cadence the episode belongs to: a grab series and a sensor series alarm apart.
         #[crudcrate(filterable, sortable)]
         pub measurement_type: String,
+        /// What raised it: `threshold`, the site or parameter bounds, or `instrument_range`, a
+        /// value outside what the instrument that measured it can read. The two stand open on the
+        /// same slot at once, so a failing instrument is not read as an unusual river.
+        #[crudcrate(filterable, sortable, on_create = "threshold".to_string())]
+        pub kind: String,
+        /// The instrument a range episode is about; NULL on a threshold episode, which is about
+        /// the water rather than the device.
+        #[crudcrate(filterable)]
+        pub sensor_id: Option<Uuid>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

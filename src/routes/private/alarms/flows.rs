@@ -44,6 +44,11 @@ pub(super) fn record_owed() -> bool {
         .try_with(|owed| owed.store(true, Ordering::Relaxed))
         .is_ok()
 }
+/// The two things that raise an episode. `kind` on the row says which, and the open-unique index
+/// carries it, so one slot can hold one of each at a time.
+pub const KIND_THRESHOLD: &str = "threshold";
+pub const KIND_INSTRUMENT_RANGE: &str = "instrument_range";
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SweepStats {
     pub opened: usize,
@@ -153,10 +158,14 @@ async fn reconcile<C: ConnectionTrait + TransactionTrait>(
     // has its own latest reading, its own open event per slot, and its own resolution.
     let mut stats = SweepStats::default();
     for spot in [false, true] {
-        let s = reconcile_cadence(db, slots, spot).await?;
-        stats.opened += s.opened;
-        stats.updated += s.updated;
-        stats.resolved += s.resolved;
+        for s in [
+            reconcile_cadence(db, slots, spot).await?,
+            reconcile_instrument_range(db, slots, spot).await?,
+        ] {
+            stats.opened += s.opened;
+            stats.updated += s.updated;
+            stats.resolved += s.resolved;
+        }
     }
     Ok(stats)
 }
@@ -187,6 +196,7 @@ async fn reconcile_cadence<C: ConnectionTrait + TransactionTrait>(
             site_id: Set(b.site_id),
             parameter_id: Set(b.parameter_id),
             measurement_type: Set(cadence.to_string()),
+            kind: Set(KIND_THRESHOLD.to_string()),
             severity: Set(b.severity),
             max_severity: Set(b.severity),
             started_at: Set(b.time.with_timezone(&Utc)),
@@ -219,6 +229,22 @@ async fn reconcile_cadence<C: ConnectionTrait + TransactionTrait>(
         .iter()
         .map(|b| (b.site_id, b.parameter_id))
         .collect();
+    stats.resolved = resolve_absent(db, slots, &keep, cadence, KIND_THRESHOLD, spot).await?;
+
+    Ok(stats)
+}
+
+/// Stamp every open episode of this cadence and kind that is no longer in `keep` as resolved,
+/// carrying the latest served value as the resolving one. Scoped runs resolve only within their
+/// own slots, so a trigger about one slot never closes an episode elsewhere.
+async fn resolve_absent<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    slots: Option<&[(Uuid, Uuid)]>,
+    keep: &[(Uuid, Uuid)],
+    cadence: &str,
+    kind: &str,
+    spot: bool,
+) -> AppResult<usize> {
     use sea_orm::sea_query::ExprTrait;
     let slot_tuple = Expr::tuple([
         Expr::col(alarm_event::Column::SiteId),
@@ -246,15 +272,65 @@ async fn reconcile_cadence<C: ConnectionTrait + TransactionTrait>(
             SimpleExpr::SubQuery(None, Box::new(resolving_value.into_sub_query_statement())),
         )
         .filter(alarm_event::Column::ResolvedAt.is_null())
-        .filter(alarm_event::Column::MeasurementType.eq(cadence));
+        .filter(alarm_event::Column::MeasurementType.eq(cadence))
+        .filter(alarm_event::Column::Kind.eq(kind));
     if let Some(s) = slots {
         update = update.filter(slot_tuple.clone().in_tuples(s.iter().copied()));
     }
     if !keep.is_empty() {
-        update = update.filter(slot_tuple.in_tuples(keep).not());
+        update = update.filter(slot_tuple.in_tuples(keep.iter().copied()).not());
     }
-    let resolved = update.exec(db).await?.rows_affected as usize;
-    stats.resolved = resolved;
+    Ok(update.exec(db).await?.rows_affected as usize)
+}
+
+/// The instrument-range arm of the same tick: a value outside what the instrument that measured it
+/// can read opens an episode of its own, attributed to that instrument, beside whatever the site
+/// and parameter thresholds say. An instrument with no declared range raises nothing.
+async fn reconcile_instrument_range<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    slots: Option<&[(Uuid, Uuid)]>,
+    spot: bool,
+) -> AppResult<SweepStats> {
+    let cadence = super::service::cadence_label(spot);
+    let breaches = super::service::fetch_instrument_range_rows(
+        db,
+        &crate::common::authz::AccessScope::Unrestricted,
+        slots,
+        spot,
+    )
+    .await?;
+
+    let mut stats = SweepStats::default();
+    let txn = db.begin().await?;
+    for b in &breaches {
+        let sent = alarm_event::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            site_id: Set(b.site_id),
+            parameter_id: Set(b.parameter_id),
+            measurement_type: Set(cadence.to_string()),
+            kind: Set(KIND_INSTRUMENT_RANGE.to_string()),
+            sensor_id: Set(Some(b.sensor_id)),
+            severity: Set(super::service::INSTRUMENT_RANGE_SEVERITY),
+            max_severity: Set(super::service::INSTRUMENT_RANGE_SEVERITY),
+            started_at: Set(b.time.with_timezone(&Utc)),
+            value_at_start: Set(b.current_value),
+            last_seen_at: Set(b.time.with_timezone(&Utc)),
+            last_value: Set(b.current_value),
+            ..Default::default()
+        };
+        let (_episode, status) = upsert::<AlarmEvent, _>(&txn, sent).await?;
+        match status {
+            UpsertStatus::Created => stats.opened += 1,
+            UpsertStatus::Updated | UpsertStatus::Unchanged => stats.updated += 1,
+        }
+    }
+    txn.commit().await?;
+
+    let keep: Vec<(Uuid, Uuid)> = breaches
+        .iter()
+        .map(|b| (b.site_id, b.parameter_id))
+        .collect();
+    stats.resolved = resolve_absent(db, slots, &keep, cadence, KIND_INSTRUMENT_RANGE, spot).await?;
 
     Ok(stats)
 }

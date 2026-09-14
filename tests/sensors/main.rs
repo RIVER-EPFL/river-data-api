@@ -12,6 +12,7 @@ mod instruments_overview;
 mod lab_instrument_row;
 mod last_used_by_parameter;
 mod list_latest_reading;
+mod manufacturer_range;
 mod multi_parameter_channel;
 mod read_endpoints;
 mod sensor_register;

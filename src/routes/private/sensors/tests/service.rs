@@ -137,3 +137,98 @@ fn test_curve_use_per_instrument_counts_curves_and_their_newest_use() {
     assert!(sql.contains(r#"MAX("r"."time")"#), "{sql}");
     assert!(sql.contains(r#"GROUP BY "sc"."sensor_id""#), "{sql}");
 }
+
+// Scenario: a write names an instrument by id. Expected behaviour: a bookkeeping row and a
+// retired row are both refused, and the message says which of the two it is.
+mod instrument_refusal {
+    use super::super::{InstrumentKind, instrument_refusal};
+
+    #[test]
+    fn test_instrument_refusal_accepts_an_active_device() {
+        assert!(
+            instrument_refusal(
+                InstrumentKind::Device,
+                Some(true),
+                "miniDOT 7392",
+                "deployed"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_instrument_refusal_accepts_an_active_lab_instrument() {
+        assert!(
+            instrument_refusal(InstrumentKind::Lab, Some(true), "Shimadzu TOC", "deployed")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_instrument_refusal_reads_an_unset_flag_as_active() {
+        assert!(
+            instrument_refusal(InstrumentKind::Device, None, "miniDOT 7392", "deployed").is_none()
+        );
+    }
+
+    #[test]
+    fn test_instrument_refusal_rejects_a_retired_device() {
+        let message = instrument_refusal(
+            InstrumentKind::Device,
+            Some(false),
+            "miniDOT 7392",
+            "deployed to a site",
+        )
+        .expect("a retired instrument is refused");
+        assert!(message.contains("miniDOT 7392"), "{message}");
+        assert!(message.contains("retired"), "{message}");
+        assert!(message.contains("deployed to a site"), "{message}");
+    }
+
+    #[test]
+    fn test_instrument_refusal_rejects_a_retired_lab_instrument() {
+        assert!(
+            instrument_refusal(InstrumentKind::Lab, Some(false), "Shimadzu TOC", "deployed")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_instrument_refusal_rejects_an_active_source_parameter_row() {
+        let message = instrument_refusal(
+            InstrumentKind::SourceParameter,
+            Some(true),
+            "DOC (cnet)",
+            "deployed",
+        )
+        .expect("a bookkeeping row is refused");
+        assert!(message.contains("nothing was declared"), "{message}");
+    }
+
+    #[test]
+    fn test_instrument_refusal_rejects_an_active_entry_channel_row() {
+        assert!(
+            instrument_refusal(
+                InstrumentKind::EntryChannel,
+                Some(true),
+                "Martigny Depth (grab_sample)",
+                "deployed",
+            )
+            .is_some()
+        );
+    }
+
+    // A row that is both is refused as bookkeeping: that is the fact about the row itself, and
+    // retiring one changes nothing about what it stands for.
+    #[test]
+    fn test_instrument_refusal_names_bookkeeping_before_retirement() {
+        let message = instrument_refusal(
+            InstrumentKind::EntryChannel,
+            Some(false),
+            "Martigny Depth (grab_sample)",
+            "deployed",
+        )
+        .expect("refused");
+        assert!(message.contains("nothing was declared"), "{message}");
+    }
+}

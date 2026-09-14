@@ -47,6 +47,7 @@ use serde::Serialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use super::flows::{KIND_INSTRUMENT_RANGE, KIND_THRESHOLD};
 use super::models::AcknowledgedAlarmResponse;
 use super::models::ActiveAlarm;
 use super::models::ActiveAlarmsResponse;
@@ -58,17 +59,21 @@ use super::models::AlarmSiteSummary;
 use super::models::AlarmSummaryResponse;
 use super::models::AlarmViolationsResponse;
 use super::models::ParameterViolationData;
+use super::models::ResolvedThreshold;
 use super::models::SiteAlarmsQuery;
 use super::models::ThresholdWithValue;
 use super::models::ThresholdsQuery;
 use super::models::alarm_event;
 use super::service::ActiveAlarmRow;
 use super::service::AlarmEventRow;
+use super::service::INSTRUMENT_RANGE_SEVERITY;
+use super::service::InstrumentRangeRow;
 use super::service::ParameterWithThreshold;
 use super::service::ViolationRow;
 use super::service::cadence_label;
 use super::service::confine_alarm_event;
 use super::service::fetch_active_alarm_rows;
+use super::service::fetch_instrument_range_rows;
 use super::service::fetch_last_alarm_warning_times;
 use super::service::fetch_latest_reading_times;
 use super::service::fetch_open_events;
@@ -375,17 +380,26 @@ pub async fn get_active_alarms(
     ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<ActiveAlarmsResponse>> {
     let mut tagged: Vec<(ActiveAlarmRow, &'static str)> = Vec::new();
+    let mut ranges: Vec<(InstrumentRangeRow, &'static str)> = Vec::new();
     for spot in [false, true] {
         for row in fetch_active_alarm_rows(&state.db, &scope, None, spot).await? {
             tagged.push((row, cadence_label(spot)));
         }
+        for row in fetch_instrument_range_rows(&state.db, &scope, None, spot).await? {
+            ranges.push((row, cadence_label(spot)));
+        }
     }
     let open = fetch_open_events(&state.db, &scope).await?;
 
-    let alarms: Vec<ActiveAlarm> = tagged
+    let mut alarms: Vec<ActiveAlarm> = tagged
         .into_iter()
         .map(|(row, cadence)| {
-            let ev = open.get(&(row.site_id, row.parameter_id, cadence.to_string()));
+            let ev = open.get(&(
+                row.site_id,
+                row.parameter_id,
+                cadence.to_string(),
+                KIND_THRESHOLD.to_string(),
+            ));
             ActiveAlarm {
                 threshold: row.bounds(),
                 site_id: row.site_id,
@@ -394,6 +408,9 @@ pub async fn get_active_alarms(
                 parameter_name: row.parameter_name,
                 current_value: row.current_value,
                 measurement_type: cadence.to_string(),
+                kind: KIND_THRESHOLD.to_string(),
+                sensor_id: None,
+                sensor_name: None,
                 severity: row.severity,
                 since: row.time.with_timezone(&Utc),
                 started_at: ev.map(|e| e.started_at.with_timezone(&Utc)),
@@ -405,6 +422,42 @@ pub async fn get_active_alarms(
             }
         })
         .collect();
+
+    // A range breach stands beside whatever the thresholds say, so the two are appended rather
+    // than merged: the page can tell a failing instrument from an unusual river.
+    alarms.extend(ranges.into_iter().map(|(row, cadence)| {
+        let ev = open.get(&(
+            row.site_id,
+            row.parameter_id,
+            cadence.to_string(),
+            KIND_INSTRUMENT_RANGE.to_string(),
+        ));
+        ActiveAlarm {
+            threshold: ResolvedThreshold {
+                warning_min: None,
+                warning_max: None,
+                alarm_min: row.range_min,
+                alarm_max: row.range_max,
+            },
+            site_id: row.site_id,
+            site_name: row.site_name,
+            parameter_id: row.parameter_id,
+            parameter_name: row.parameter_name,
+            current_value: row.current_value,
+            measurement_type: cadence.to_string(),
+            kind: KIND_INSTRUMENT_RANGE.to_string(),
+            sensor_id: Some(row.sensor_id),
+            sensor_name: row.sensor_name,
+            severity: INSTRUMENT_RANGE_SEVERITY,
+            since: row.time.with_timezone(&Utc),
+            started_at: ev.map(|e| e.started_at.with_timezone(&Utc)),
+            event_id: ev.map(|e| e.id),
+            acknowledged: ev.is_some_and(|e| e.acknowledged_at.is_some()),
+            acknowledged_at: ev.and_then(|e| e.acknowledged_at.map(|t| t.with_timezone(&Utc))),
+            acknowledged_by: ev.and_then(|e| e.acknowledged_by.clone()),
+            max_severity: ev.map(|e| e.max_severity),
+        }
+    }));
 
     let total = alarms.len();
     Ok(Json(ActiveAlarmsResponse { alarms, total }))
@@ -649,6 +702,8 @@ pub async fn get_alarm_events(
             parameter_id: r.parameter_id,
             parameter_name: r.parameter_name,
             measurement_type: r.measurement_type,
+            kind: r.kind,
+            sensor_id: r.sensor_id,
             severity: r.severity,
             max_severity: r.max_severity,
             started_at: r.started_at.with_timezone(&Utc),
@@ -724,6 +779,8 @@ fn alarm_events_page(matching: Condition, limit: u64, offset: u64) -> Statement 
         )
         .columns([
             (ae.clone(), alarm_event::Column::MeasurementType),
+            (ae.clone(), alarm_event::Column::Kind),
+            (ae.clone(), alarm_event::Column::SensorId),
             (ae.clone(), alarm_event::Column::Severity),
             (ae.clone(), alarm_event::Column::MaxSeverity),
             (ae.clone(), alarm_event::Column::StartedAt),
