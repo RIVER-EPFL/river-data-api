@@ -76,7 +76,10 @@ fn test_replicate_curve_is_the_slot_the_param_declares() {
 #[test]
 fn test_timestamp_column_accepts_the_three_header_names_in_any_case() {
     assert_eq!(timestamp_column(&["DateTime", "Depth"]), Ok(0));
-    assert_eq!(timestamp_column(&["Site_ID", "Date", "WaterTempdegC"]), Ok(1));
+    assert_eq!(
+        timestamp_column(&["Site_ID", "Date", "WaterTempdegC"]),
+        Ok(1)
+    );
     assert_eq!(timestamp_column(&["Site_ID", "TIME"]), Ok(1));
 }
 

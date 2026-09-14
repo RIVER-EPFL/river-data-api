@@ -60,6 +60,11 @@ pub async fn stop_test_workers() {
 /// Spawn a background job worker for the test, mirroring prod so flipped (`queued`) jobs run to
 /// completion under POST-and-poll tests. Stopped by [`stop_test_workers`], which the cleanup runs.
 ///
+/// The registry is the one `main.rs` builds, recurring services included, so a test can enqueue a
+/// scheduled service's job (`alarm_sweep`, `janitor_service`, …) and have it run. Nothing here
+/// ticks a cadence: no `schedules` row is seeded and no scheduler loop is spawned, so a service
+/// runs only when a test asks for it.
+///
 /// `worker::run` finishes the job it has claimed before it stops, which is what makes it usable as
 /// a barrier: when the handle resolves, nothing this worker started is still writing. It finishes
 /// that one job and no more, so the wait is bounded by what is in flight rather than by how many
@@ -67,9 +72,12 @@ pub async fn stop_test_workers() {
 fn spawn_test_worker(state: &AppState) {
     let db = state.db.clone();
     let events = state.events.clone();
-    let registry = std::sync::Arc::new(
-        river_db::routes::private::reprocessing_jobs::service::build_registry(),
+    let mut built = river_db::routes::private::reprocessing_jobs::service::build_registry();
+    river_db::routes::private::reprocessing_jobs::service::register_scheduled_services(
+        &mut built,
+        &state.config,
     );
+    let registry = std::sync::Arc::new(built);
     let (shutdown, mut stopped) = tokio::sync::watch::channel(false);
     let handle = tokio::spawn(async move {
         river_db::routes::private::reprocessing_jobs::service::run_workers(

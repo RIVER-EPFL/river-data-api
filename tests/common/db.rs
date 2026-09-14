@@ -220,6 +220,7 @@ pub const CLEANUP_TRUNCATED_TABLES: &[&str] = &[
     "sync_commands",
     "sync_services",
     "sync_service_credentials",
+    "instrument_proposals",
     "pairing_plans",
     "data_streams",
     "reprocessing_jobs",

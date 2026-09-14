@@ -1131,16 +1131,15 @@ pub async fn get_sensor_readings(
     };
 
     let resolution = query.resolution.as_deref().unwrap_or("raw");
-    let bucket =
-        if resolution == "raw" {
-            None
-        } else {
-            Some(bucket_interval(resolution_of(resolution).ok_or_else(|| {
+    let bucket = if resolution == "raw" {
+        None
+    } else {
+        Some(bucket_interval(resolution_of(resolution).ok_or_else(|| {
             AppError::BadRequest(format!(
                 "Invalid resolution '{resolution}' (expected raw|hourly|6hourly|12hourly|daily|weekly|monthly)"
             ))
         })?))
-        };
+    };
 
     // Full reading extent for this sensor on the served channel (drives the UI slider bounds,
     // independent of the window).

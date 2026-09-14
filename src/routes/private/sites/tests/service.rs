@@ -152,7 +152,9 @@ fn test_every_rollup_is_reachable_by_a_resolution_keyword() {
     use crate::common::aggregates::Resolution;
     use crate::routes::private::sites::service::{bucket_interval, resolution_of};
 
-    let keywords = ["hourly", "6hourly", "12hourly", "daily", "weekly", "monthly"];
+    let keywords = [
+        "hourly", "6hourly", "12hourly", "daily", "weekly", "monthly",
+    ];
     let reached: Vec<Resolution> = keywords.iter().filter_map(|k| resolution_of(k)).collect();
     assert_eq!(reached, Resolution::ALL.to_vec());
     assert_eq!(resolution_of("6h"), None);

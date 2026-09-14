@@ -468,7 +468,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/actions/preview_derived",
             post(derived_views::preview_derived),
         )
-        .route("/events", get(crate::routes::private::events::views::event_stream))
+        .route(
+            "/events",
+            get(crate::routes::private::events::views::event_stream),
+        )
         .route(
             "/reprocessing_jobs/{id}/logs",
             get(crate::routes::private::reprocessing_jobs::views::get_job_logs),

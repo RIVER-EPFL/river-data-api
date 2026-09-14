@@ -795,8 +795,9 @@ async fn run_now_dedupes_within_the_second_snapshots_empty_tunables_and_writes_n
 /// genuine worker transition emits, for a run an operator asked for over HTTP, on data onboarded
 /// through the sensor-flow track.
 ///
-/// `reprocess_all` is the job under test: it reads no parameters, re-derives whatever slots the
-/// deployment timeline holds and returns, so the run reaches a terminal state on its own.
+/// `alarm_sweep` is the job under test: it is one of the recurring services the Schedules page
+/// lists, so Run now is a button an operator has, and it reconciles the alarm set and returns
+/// without reading a parameter.
 #[tokio::test]
 #[serial]
 async fn sse_streams_the_completion_of_an_operator_requested_run() {
@@ -861,7 +862,7 @@ async fn sse_streams_the_completion_of_an_operator_requested_run() {
 
     let (status, run) = crate::common::post_json_parse_with_token(
         &app,
-        "/api/schedules/reprocess_all/run_now",
+        "/api/schedules/alarm_sweep/run_now",
         &json!({}),
         &manager,
     )
@@ -918,7 +919,7 @@ async fn sse_streams_the_completion_of_an_operator_requested_run() {
         "the stored row and the streamed frame agree: {job}"
     );
     assert_eq!(
-        job["trigger_type"], "reprocess_all",
+        job["trigger_type"], "alarm_sweep",
         "the row is the run the operator asked for: {job}"
     );
 }
