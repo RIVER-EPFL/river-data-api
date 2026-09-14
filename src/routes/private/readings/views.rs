@@ -3672,10 +3672,8 @@ pub async fn import_csv(
         .map_err(|e| AppError::BadRequest(format!("Failed to read CSV header: {e}")))?
         .clone();
 
-    let datetime_idx = headers
-        .iter()
-        .position(|h| h.eq_ignore_ascii_case("datetime") || h.eq_ignore_ascii_case("time"))
-        .unwrap_or(0);
+    let columns: Vec<&str> = headers.iter().collect();
+    let datetime_idx = timestamp_column(&columns).map_err(AppError::BadRequest)?;
 
     let mut mappings: Vec<ColumnMapping> = Vec::new();
     let mut mapped_columns: HashMap<String, String> = HashMap::new();

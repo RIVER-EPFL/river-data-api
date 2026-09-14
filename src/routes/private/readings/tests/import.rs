@@ -72,3 +72,17 @@ fn test_replicate_curve_is_the_slot_the_param_declares() {
     // A declared slot the row left empty carries nothing.
     assert_eq!(replicate_curve(&doc_params(), "DOC", &HashMap::new()), None);
 }
+
+#[test]
+fn test_timestamp_column_accepts_the_three_header_names_in_any_case() {
+    assert_eq!(timestamp_column(&["DateTime", "Depth"]), Ok(0));
+    assert_eq!(timestamp_column(&["Site_ID", "Date", "WaterTempdegC"]), Ok(1));
+    assert_eq!(timestamp_column(&["Site_ID", "TIME"]), Ok(1));
+}
+
+#[test]
+fn test_timestamp_column_names_the_headers_it_saw_when_none_is_a_time() {
+    let refused = timestamp_column(&["Site_ID", "WaterTempdegC"]).unwrap_err();
+    assert!(refused.contains("Site_ID"), "{refused}");
+    assert!(refused.contains("WaterTempdegC"), "{refused}");
+}

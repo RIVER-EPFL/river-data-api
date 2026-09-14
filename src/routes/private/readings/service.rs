@@ -7977,6 +7977,26 @@ pub(super) fn replicate_column(
         })
 }
 
+/// The index of the CSV's timestamp column, matched case-insensitively against the names an
+/// import declares its time under. No match is the caller's error: taking a column by position
+/// would parse whatever happens to be first as a time.
+pub(super) fn timestamp_column(headers: &[&str]) -> Result<usize, String> {
+    headers
+        .iter()
+        .position(|h| TIMESTAMP_HEADERS.iter().any(|n| h.eq_ignore_ascii_case(n)))
+        .ok_or_else(|| {
+            format!(
+                "No timestamp column: expected a header named {}, found {}",
+                TIMESTAMP_HEADERS.join(", "),
+                headers.join(", ")
+            )
+        })
+}
+
+/// The header names a timestamp column may carry. `Date` is what the portals' high-frequency
+/// exports head theirs.
+const TIMESTAMP_HEADERS: [&str; 3] = ["DateTime", "Date", "Time"];
+
 /// A header naming one of the tool's curve slots (case-insensitive): its cells are standard curve
 /// ids, one per row.
 pub(super) fn curve_column(
@@ -8084,10 +8104,8 @@ pub(super) async fn import_tool_csv(
         .headers()
         .map_err(|e| AppError::BadRequest(format!("Failed to read CSV header: {e}")))?
         .clone();
-    let datetime_idx = headers
-        .iter()
-        .position(|h| h.eq_ignore_ascii_case("datetime") || h.eq_ignore_ascii_case("time"))
-        .unwrap_or(0);
+    let columns: Vec<&str> = headers.iter().collect();
+    let datetime_idx = timestamp_column(&columns).map_err(AppError::BadRequest)?;
 
     let mut mapped_columns: HashMap<String, String> = HashMap::new();
     let mut unmapped_columns: Vec<String> = Vec::new();

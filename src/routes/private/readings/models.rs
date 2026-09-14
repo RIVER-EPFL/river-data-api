@@ -2388,7 +2388,7 @@ pub enum CsvValueState {
 pub struct ImportCsvRequest {
     /// Target site, by UUID or case-insensitive name.
     pub site: String,
-    /// Wide CSV text: a `DateTime` column plus one column per parameter.
+    /// Wide CSV text: a `DateTime`, `Date` or `Time` column plus one column per parameter.
     /// Optional when `session_id` references a previously uploaded CSV.
     #[serde(default)]
     pub csv: Option<String>,
