@@ -819,11 +819,14 @@ pub struct CalibrationBackfillCandidate {
 }
 
 /// Readings carrying a correction no curve accounts for: neither a calibration nor a standard
-/// curve is named, yet `calibrated_value` differs from `raw_value`. Reported, never rewritten,
-/// the stored number is somebody's measurement and this code cannot know how it was produced.
+/// curve is named, yet `calibrated_value` differs from `raw_value`. The stored number is somebody's
+/// measurement and this code cannot know how it was produced.
 ///
-/// The reprocess engines hold the same rows back (`service::orphaned_correction_rows`, the shared
-/// definition this query uses), so nothing an operator can trigger overwrites one either.
+/// A recomposition driven by the row's own curves leaves them standing
+/// (`service::orphaned_correction_rows`, the shared definition this query uses). A calibration
+/// window that covers one is another matter: the reprocess recomputes it from that curve and
+/// records the move in `reading_decisions`, so the row leaves this report as soon as a curve can
+/// account for it (Q114).
 #[derive(Debug, Serialize, ToSchema, Clone)]
 pub struct OrphanedCorrection {
     #[schema(required)]

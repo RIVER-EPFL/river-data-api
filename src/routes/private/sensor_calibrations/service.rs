@@ -182,9 +182,11 @@ pub fn foreign_curve_rows(readings: &str, curve: &str) -> String {
 /// engines, the identity retirement migration), so one of these arrived by a writer that supplied a
 /// corrected number with no provenance: `POST /readings/batch` accepts a bare `calibrated_value`,
 /// and historical imports did the same. The number is somebody's measurement, produced by a method
-/// this code cannot recover, so no rewrite here can be more than a guess.
+/// this code cannot recover.
 ///
-/// They are therefore held out of every recomposition and reported instead, by
+/// One a calibration window covers is recomputed from that curve, and the move is appended to
+/// `reading_decisions` under the job that made it, so the number it held is still readable and the
+/// repair reversible (Q114). One no window covers is left where it is and reported by
 /// `GET /actions/calibration_candidates`. A row whose stored value merely COPIES its raw value is
 /// NOT one of these: that copy is what the old writers materialised for an uncorrected reading, it
 /// carries no information, and clearing it changes nothing the API serves.
@@ -1851,10 +1853,12 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
 /// correction as well as replace one, or a curve deleted or moved off a reading would leave that
 /// reading serving a number nothing on the row accounts for.
 ///
-/// `orphaned_correction_rows` is the one thing that clear does not reach: a row resolving no window,
-/// naming no curve, and holding a number that is not a copy of its raw value was written that way by
-/// a caller, and recomputing it here would replace somebody's measurement with a NULL. Those are
-/// reported by `GET /actions/calibration_candidates` and left alone.
+/// `orphaned_correction_rows` is what clear does not reach, and only while no window covers it: a
+/// row resolving no window, naming no curve, and holding a number that is not a copy of its raw
+/// value was written that way by a caller, and clearing it here would replace somebody's
+/// measurement with a NULL. Those are reported by `GET /actions/calibration_candidates` and left
+/// alone. One a window does cover is recomputed from that curve like any other row, its old value
+/// on the `reading_decisions` row this step appends (Q114).
 ///
 /// Steps 1 to 4 run in one guarded transaction (`common::bulk_write`), which lifts TimescaleDB's
 /// per-statement decompression cap: a deep-historical reprocess rewrites rows in compressed
