@@ -5,6 +5,7 @@ mod m20260914_000001_member_source_calculation;
 mod m20260914_000002_sensor_range;
 mod m20260914_000003_alarm_event_kind;
 mod m20260914_000004_six_and_twelve_hour_rollups;
+mod m20260914_000005_meteoswiss_subscriptions;
 
 pub struct Migrator;
 
@@ -17,6 +18,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260914_000002_sensor_range::Migration),
             Box::new(m20260914_000003_alarm_event_kind::Migration),
             Box::new(m20260914_000004_six_and_twelve_hour_rollups::Migration),
+            Box::new(m20260914_000005_meteoswiss_subscriptions::Migration),
         ]
     }
 }

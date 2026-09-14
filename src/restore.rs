@@ -51,18 +51,33 @@ struct Carried {
     /// The columns a page walks by, unique together and in index order.
     key: &'static [&'static str],
     references: &'static [(&'static str, Reference)],
+    /// Id columns that live inside a jsonb document rather than in a column of their own: the
+    /// column, the key holding the id, and where it points. One that does not resolve is nulled
+    /// and reported, never a reason to refuse the row: the document describes the row, it is not
+    /// what the row is.
+    nested: &'static [(&'static str, &'static str, Reference)],
 }
 
 const CARRIED: &[Carried] = &[
+    // Before `readings`: a reading's provenance blob names the run that computed it by id, and the
+    // blob is carried verbatim, so the run has to be there under that same id.
+    Carried {
+        table: "tool_runs",
+        key: &["id"],
+        references: &[],
+        nested: &[("context", "site_id", Reference::Natural("sites"))],
+    },
     Carried {
         table: "collection_events",
         key: &["id"],
         references: &[("site_id", Reference::Natural("sites"))],
+        nested: &[],
     },
     Carried {
         table: "reading_decision_sets",
         key: &["id"],
         references: &[],
+        nested: &[],
     },
     Carried {
         table: "samples",
@@ -71,6 +86,7 @@ const CARRIED: &[Carried] = &[
             ("site_id", Reference::Natural("sites")),
             ("parameter_id", Reference::Natural("parameters")),
         ],
+        nested: &[],
     },
     Carried {
         table: "readings",
@@ -93,6 +109,7 @@ const CARRIED: &[Carried] = &[
             ),
             ("sample_id", Reference::Natural("samples")),
         ],
+        nested: &[],
     },
     Carried {
         table: "reading_decisions",
@@ -106,6 +123,64 @@ const CARRIED: &[Carried] = &[
             // nullable and why a cutover drops it rather than inventing a run.
             ("job_id", Reference::Dropped),
         ],
+        nested: &[],
+    },
+    Carried {
+        table: "replicate_audit_holds",
+        key: &["id"],
+        references: &[
+            ("stream_id", Reference::Natural("data_streams")),
+            ("site_id", Reference::Natural("sites")),
+            ("parameter_id", Reference::Natural("parameters")),
+        ],
+        nested: &[],
+    },
+    Carried {
+        table: "annotations",
+        key: &["id"],
+        references: &[
+            ("site_id", Reference::Natural("sites")),
+            ("parameter_id", Reference::Natural("parameters")),
+            ("standard_curve_id", Reference::Natural("standard_curves")),
+            ("audit_hold_id", Reference::Carried),
+        ],
+        nested: &[],
+    },
+    Carried {
+        table: "meteoswiss_subscriptions",
+        key: &["id"],
+        references: &[
+            ("site_id", Reference::Natural("sites")),
+            ("parameter_id", Reference::Natural("parameters")),
+        ],
+        nested: &[],
+    },
+    Carried {
+        table: "notes",
+        key: &["id"],
+        references: &[("site_id", Reference::Natural("sites"))],
+        nested: &[],
+    },
+    Carried {
+        table: "alarm_events",
+        key: &["id"],
+        references: &[
+            ("site_id", Reference::Natural("sites")),
+            ("parameter_id", Reference::Natural("parameters")),
+            ("sensor_id", Reference::Natural("sensors")),
+        ],
+        nested: &[],
+    },
+    Carried {
+        table: "status_events",
+        key: &["stream_id", "time"],
+        references: &[
+            ("stream_id", Reference::Natural("data_streams")),
+            ("site_id", Reference::Natural("sites")),
+            ("parameter_id", Reference::Natural("parameters")),
+            ("sensor_id", Reference::Natural("sensors")),
+        ],
+        nested: &[],
     },
 ];
 
@@ -412,6 +487,32 @@ async fn carry<S: ConnectionTrait>(
                     }
                 }
             }
+            for (column, key, reference) in carried.nested {
+                let Some(id) = row
+                    .get(*column)
+                    .and_then(|document| document.get(*key))
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|text| Uuid::parse_str(text).ok())
+                else {
+                    continue;
+                };
+                let moved = match reference {
+                    Reference::Carried => Some(id),
+                    Reference::Dropped => None,
+                    Reference::Natural(table) => maps[table].get(&id).copied(),
+                };
+                match moved {
+                    Some(moved) => {
+                        row[*column][*key] = serde_json::Value::String(moved.to_string())
+                    }
+                    None => {
+                        row[*column][*key] = serde_json::Value::Null;
+                        report
+                            .unmatched
+                            .push(format!("{}.{column}.{key} dropped", carried.table));
+                    }
+                }
+            }
             batch.push(row);
         }
 
@@ -546,7 +647,12 @@ pub async fn restore(
     let mut maps: HashMap<&str, HashMap<Uuid, Uuid>> = HashMap::new();
     let keys = natural_keys();
     for table in CARRIED {
-        for (_, reference) in table.references {
+        let referenced = table
+            .references
+            .iter()
+            .map(|(_, reference)| reference)
+            .chain(table.nested.iter().map(|(_, _, reference)| reference));
+        for reference in referenced {
             if let Reference::Natural(name) = reference
                 && !maps.contains_key(name)
             {

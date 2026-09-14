@@ -24,6 +24,7 @@ use crate::routes::private::{
     change_audit::models::ChangeAudit,
     collection_events::CollectionEvent,
     constants::Constant,
+    meteoswiss::models::subscription::MeteoswissSubscription,
     data_streams::DataStream,
     data_streams::models::receipts::IngestReceipt,
     data_streams::pairing_plans::PairingPlan,
@@ -290,6 +291,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         .nest("/annotations", field_data_crud(Annotation::router(db)))
         .nest("/constants", catalog_crud(Constant::router(db)))
+        .nest(
+            "/meteoswiss_subscriptions",
+            catalog_crud(MeteoswissSubscription::router(db)),
+        )
         .nest("/samples", field_data_crud(Sample::router(db)))
         // The readings themselves, read-only: every write path resolves attribution from the
         // pairing and builds provenance server-side, and a change goes through the curation

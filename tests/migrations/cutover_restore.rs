@@ -2,7 +2,8 @@
 //! point where its streams, sites, parameters and instruments exist, and the dump's curated state
 //! is carried across (Q138, M189, M190).
 //!
-//! Expected behaviour: the readings, their curation ledger, the sample statistics and the public
+//! Expected behaviour: the readings, their curation ledger, the sample statistics, the review
+//! queue, the annotations, the site notes, the alarm episodes, the device status and the public
 //! API setups arrive intact under the rebuilt database's own ids. The assertion is a content hash
 //! per table over every column, with the id references replaced by the natural keys the two
 //! databases share, so a column the restore forgets fails it.
@@ -50,6 +51,16 @@ UPDATE projects SET is_public = true, public_code = 'breathe',
  WHERE name = 'Breathe';
 UPDATE site_parameters SET is_public = true WHERE name = 'Martigny DOC';
 
+INSERT INTO tool_runs (id, tool_name, tool_version, inputs, constants, curves, outputs,
+                       created_by, context, source)
+     SELECT '22222222-2222-2222-2222-222222222222', 'doc',
+            jsonb_build_object('version_no', 1), jsonb_build_object('replicates', '[1, 2]'::jsonb),
+            '{}'::jsonb, '{}'::jsonb, jsonb_build_object('doc_avg_ppb', 101),
+            'someone@example.org',
+            jsonb_build_object('site_id', s.id, 'collected_at', '2024-06-01T09:00:00Z'),
+            'interactive'
+       FROM sites s WHERE s.name = 'Martigny';
+
 INSERT INTO samples (id, site_id, parameter_id, collected_at, sd_estimator, sd_estimator_source)
      SELECT '11111111-1111-1111-1111-111111111111', s.id, p.id, '2024-06-01T09:00:00Z',
             'population', 'slot'
@@ -61,7 +72,9 @@ INSERT INTO readings (stream_id, time, replicate_index, site_id, parameter_id, r
                       provenance, label, notes, created_by, unverified)
      SELECT d.id, '2024-06-01T09:00:00Z', r.i, s.id, p.id, 100 + r.i, 201 + 2 * r.i, n.id, c.id,
             dep.id, true, 'spot', '11111111-1111-1111-1111-111111111111', sc.id, e.id,
-            jsonb_build_object('tool', 'doc', 'run', r.i), 'repeat ' || r.i, 'lab bench',
+            jsonb_build_object('tool', 'doc', 'run_id',
+                               '22222222-2222-2222-2222-222222222222'),
+            'repeat ' || r.i, 'lab bench',
             'someone@example.org', r.i = 2
        FROM generate_series(0, 2) AS r(i), data_streams d, sites s, parameters p, sensors n,
             sensor_calibrations c, sensor_deployments dep, standard_curves sc,
@@ -96,6 +109,45 @@ INSERT INTO reading_decisions (stream_id, time, replicate_index, kind, old, new,
      SELECT d.id, '2024-06-02T09:00:00Z', 0, 'verify', '{}'::jsonb, '{}'::jsonb,
             'someone@example.org', 'manual'
        FROM data_streams d WHERE d.source_key = 'doc-1';
+
+INSERT INTO replicate_audit_holds (id, stream_id, site_id, parameter_id, group_time, expected,
+                                   computed, delta, status, acknowledged_by, acknowledged_at,
+                                   manual_value, resolution, kind, tool)
+     SELECT '22222222-2222-2222-2222-222222222222', d.id, s.id, p.id, '2024-06-01T09:00:00Z',
+            jsonb_build_object('avg', 101), jsonb_build_object('avg', 101.5),
+            jsonb_build_object('avg', 0.5), 'acknowledged', 'someone@example.org',
+            '2024-06-03T10:00:00Z', 101.5, jsonb_build_object('choice', 'use_manual'),
+            'replicate_stats', 'doc'
+       FROM data_streams d, sites s, parameters p
+      WHERE d.source_key = 'doc-1' AND s.name = 'Martigny' AND p.code = 'doc';
+
+INSERT INTO annotations (site_id, parameter_id, start_time, end_time, text, category, created_by,
+                         audit_hold_id, standard_curve_id)
+     SELECT s.id, p.id, '2024-06-01T00:00:00Z', '2024-06-02T00:00:00Z', 'bubbles all morning',
+            'quality', 'someone@example.org', '22222222-2222-2222-2222-222222222222', sc.id
+       FROM sites s, parameters p, standard_curves sc
+      WHERE s.name = 'Martigny' AND p.code = 'doc' AND sc.source_key = 'curve-7';
+
+INSERT INTO notes (site_id, text, verified, created_by)
+     SELECT id, 'gate padlock code changed', true, 'someone@example.org'
+       FROM sites WHERE name = 'Martigny';
+
+INSERT INTO meteoswiss_subscriptions (site_id, station_abbr, variable, parameter_id)
+     SELECT s.id, 'MOB', 'prestas0', p.id
+       FROM sites s, parameters p WHERE s.name = 'Martigny' AND p.code = 'doc';
+
+INSERT INTO alarm_events (site_id, parameter_id, severity, max_severity, started_at,
+                          value_at_start, last_seen_at, last_value, acknowledged_at,
+                          acknowledged_by, measurement_type)
+     SELECT s.id, p.id, 2, 3, '2024-06-01T09:00:00Z', 480, '2024-06-01T11:00:00Z', 512,
+            '2024-06-01T12:00:00Z', 'someone@example.org', 'continuous'
+       FROM sites s, parameters p WHERE s.name = 'Martigny' AND p.code = 'doc';
+
+INSERT INTO status_events (stream_id, time, site_id, parameter_id, value, sensor_id)
+     SELECT d.id, '2024-06-02T09:05:00Z', s.id, p.id, 'unreachable', n.id
+       FROM data_streams d, sites s, parameters p, sensors n
+      WHERE d.source_key = 'doc-1' AND s.name = 'Martigny' AND p.code = 'doc'
+        AND n.serial_number = 'SN-1';
 ";
 
 /// Every column of a table, with the id references it carries replaced by the natural keys both
@@ -139,6 +191,65 @@ const ROWS: &[(&str, &str)] = &[
               FROM samples x
               JOIN sites s ON s.id = x.site_id
               JOIN parameters p ON p.id = x.parameter_id",
+    ),
+    (
+        "replicate_audit_holds",
+        r"SELECT ((to_jsonb(x) - 'stream_id' - 'site_id' - 'parameter_id')
+                    || jsonb_build_object('stream', d.source_system || '/' || d.source_key,
+                                          'site', lower(s.name), 'parameter', lower(p.code)))::text
+                     AS row
+              FROM replicate_audit_holds x
+              LEFT JOIN data_streams d ON d.id = x.stream_id
+              LEFT JOIN sites s ON s.id = x.site_id
+              LEFT JOIN parameters p ON p.id = x.parameter_id",
+    ),
+    (
+        "annotations",
+        r"SELECT ((to_jsonb(x) - 'site_id' - 'parameter_id' - 'standard_curve_id')
+                    || jsonb_build_object('site', lower(s.name), 'parameter', lower(p.code),
+                                          'curve', sc.source_key))::text AS row
+              FROM annotations x
+              JOIN sites s ON s.id = x.site_id
+              JOIN parameters p ON p.id = x.parameter_id
+              LEFT JOIN standard_curves sc ON sc.id = x.standard_curve_id",
+    ),
+    (
+        "notes",
+        r"SELECT ((to_jsonb(x) - 'site_id') || jsonb_build_object('site', lower(s.name)))::text
+                     AS row
+              FROM notes x
+              JOIN sites s ON s.id = x.site_id",
+    ),
+    (
+        "alarm_events",
+        r"SELECT ((to_jsonb(x) - 'site_id' - 'parameter_id')
+                    || jsonb_build_object('site', lower(s.name), 'parameter', lower(p.code)))::text
+                     AS row
+              FROM alarm_events x
+              JOIN sites s ON s.id = x.site_id
+              JOIN parameters p ON p.id = x.parameter_id",
+    ),
+    (
+        "status_events",
+        r"SELECT ((to_jsonb(x) - 'stream_id' - 'site_id' - 'parameter_id' - 'sensor_id')
+                    || jsonb_build_object('stream', d.source_system || '/' || d.source_key,
+                                          'site', lower(s.name), 'parameter', lower(p.code),
+                                          'sensor', n.serial_number))::text AS row
+              FROM status_events x
+              JOIN data_streams d ON d.id = x.stream_id
+              LEFT JOIN sites s ON s.id = x.site_id
+              LEFT JOIN parameters p ON p.id = x.parameter_id
+              LEFT JOIN sensors n ON n.id = x.sensor_id",
+    ),
+    (
+        "tool_runs",
+        r"SELECT ((to_jsonb(x) - 'created_at' - 'context')
+                    || jsonb_build_object('context', (x.context - 'site_id')
+                                                     || jsonb_build_object('site',
+                                                                           lower(s.name))))::text
+                     AS row
+              FROM tool_runs x
+              JOIN sites s ON s.id = (x.context ->> 'site_id')::uuid",
     ),
     (
         "public settings",
@@ -210,6 +321,18 @@ async fn a_dump_and_a_rebuilt_database_hold_the_same_curated_state() {
             wrong.push(format!("{table} gained {gained}"));
         }
     }
+    // The provenance blob carries the run id verbatim, so the run it names has to be in the
+    // rebuilt database under that id.
+    let orphaned = rows(
+        &target,
+        r"SELECT count(*)::text AS row FROM readings r
+           WHERE r.provenance ? 'run_id'
+             AND NOT EXISTS (SELECT 1 FROM tool_runs t
+                              WHERE t.id = (r.provenance ->> 'run_id')::uuid)",
+    )
+    .await
+    .join("");
+
     let unmatched = report.unmatched.join(", ");
     let refused = report.refused.join(", ");
     let counts = format!(
@@ -235,6 +358,21 @@ async fn a_dump_and_a_rebuilt_database_hold_the_same_curated_state() {
         "the rebuilt database matched every natural key, but the run reported: {unmatched}"
     );
     assert!(refused.is_empty(), "the cutover refused rows: {refused}");
+    assert_eq!(
+        orphaned, "0",
+        "carried readings name a tool run the rebuilt database does not hold"
+    );
+    assert_eq!(report.rows("tool_runs"), 1, "{counts}");
     assert_eq!(report.rows("readings"), 4, "{counts}");
     assert_eq!(report.rows("reading_decisions"), 4, "{counts}");
+    for table in [
+        "replicate_audit_holds",
+        "annotations",
+        "notes",
+        "meteoswiss_subscriptions",
+        "alarm_events",
+        "status_events",
+    ] {
+        assert_eq!(report.rows(table), 1, "{table} was not carried");
+    }
 }

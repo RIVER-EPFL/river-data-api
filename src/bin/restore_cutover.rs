@@ -8,8 +8,9 @@
 //! 2. `pg_restore` that dump into a scratch database on the new server.
 //! 3. Build the new database from the baseline migration and let the pairing plans and the sync
 //!    services mint its sites, parameters, streams and instruments.
-//! 4. Run this. It moves the samples, the readings, the curation ledger and the public API setups,
-//!    and prints every natural key the source holds that the rebuilt database does not.
+//! 4. Run this. It moves the samples, the readings, the curation ledger, the review queue, the
+//!    annotations, the site notes, the alarm episodes, the device status and the public API
+//!    setups, and prints every natural key the source holds that the rebuilt database does not.
 //! 5. Verify: `scripts/dbdiff.sh <scratch> <target>` compares the two per table.
 //!
 //! Nothing is carried by id. A reference the rebuilt database cannot match by natural key is

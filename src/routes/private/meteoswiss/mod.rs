@@ -6,8 +6,8 @@
 //!
 //! The source is public and needs no credentials, so it is a scheduled job here rather than a sync
 //! microservice: there is no enrollment to hold, no cursor the source can re-time, and nothing to
-//! deploy alongside the API. Which station serves a site is a property of the site
-//! (`sites.meteoswiss_station_abbr`), so the mapping is filled in by an operator and never coded.
+//! deploy alongside the API. A site subscribes per station and variable
+//! (`meteoswiss_subscriptions`), so the mapping is filled in by an operator and never coded.
 
 pub mod flows;
 pub mod models;

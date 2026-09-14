@@ -1,5 +1,5 @@
-//! Declaring a MeteoSwiss station on a site is the whole operator action: the pressure slot, the
-//! paired stream and the station instrument follow from it, and a re-published interval is a
+//! Subscribing a site to a MeteoSwiss station and variable is the whole operator action: the slot,
+//! the paired stream and the station instrument follow from it, and a re-published interval is a
 //! duplicate rather than a correction.
 //!
 //! Run with: cargo test --test data_streams meteoswiss
@@ -14,6 +14,7 @@ use serial_test::serial;
 use uuid::Uuid;
 
 const STATION: &str = "MOB";
+const VARIABLE: &str = "prestas0";
 
 /// The catalog row the migration seeds; the fixture cleanup truncates `parameters`, so a suite
 /// that has already run once starts without it.
@@ -27,10 +28,14 @@ async fn ensure_pressure_parameter(db: &DatabaseConnection) {
     .await;
 }
 
-async fn declare_station(db: &DatabaseConnection, site_id: &str, station: &str) {
+async fn subscribe(db: &DatabaseConnection, site_id: &str, station: &str) {
     crate::common::exec(
         db,
-        &format!("UPDATE sites SET meteoswiss_station_abbr = '{station}' WHERE id = '{site_id}'"),
+        &format!(
+            "INSERT INTO meteoswiss_subscriptions (site_id, station_abbr, variable, parameter_id) \
+             SELECT '{site_id}', '{station}', '{VARIABLE}', p.id FROM parameters p \
+              WHERE lower(p.code) = 'barometric_pressure'"
+        ),
     )
     .await;
 }
@@ -65,18 +70,18 @@ async fn meteoswiss_declaration_provisions_a_paired_pressure_stream() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     ensure_pressure_parameter(&db).await;
-    declare_station(&db, crate::common::fixtures::SITE1_ID, "  mob  ").await;
+    subscribe(&db, crate::common::fixtures::SITE1_ID, "  mob  ").await;
 
-    // The declaration is read back trimmed and upper-cased, so the URL and the instrument key are
+    // The subscription is read back trimmed and upper-cased, so the URL and the instrument key are
     // the same whatever an operator typed.
     let declared = subscribers(&db).await.unwrap();
     assert_eq!(declared.len(), 1);
     assert_eq!(declared[0].station, STATION);
+    assert_eq!(declared[0].variable, VARIABLE);
 
-    let parameter = parameter_id(&db)
-        .await
-        .unwrap()
-        .expect("the migration seeds barometric_pressure");
+    let parameter = declared[0]
+        .parameter_id
+        .expect("the subscription names the parameter it lands on");
     let stream_id = provision(&db, &declared[0], parameter).await.unwrap();
 
     let paired = scalar_i64(
@@ -120,14 +125,17 @@ async fn meteoswiss_readings_land_attributed_and_a_replay_inserts_nothing() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     ensure_pressure_parameter(&db).await;
-    declare_station(&db, crate::common::fixtures::SITE1_ID, STATION).await;
+    subscribe(&db, crate::common::fixtures::SITE1_ID, STATION).await;
 
+    let parameter = parameter_id(&db).await.unwrap().unwrap();
     let site = Subscriber {
+        subscription_id: Uuid::new_v4(),
         site_id: Uuid::parse_str(crate::common::fixtures::SITE1_ID).unwrap(),
         site_name: "Site 1".to_string(),
         station: STATION.to_string(),
+        variable: VARIABLE.to_string(),
+        parameter_id: Some(parameter),
     };
-    let parameter = parameter_id(&db).await.unwrap().unwrap();
     let stream_id = provision(&db, &site, parameter).await.unwrap();
     let sensor_id = instrument(&db, STATION).await.unwrap();
 
@@ -195,16 +203,18 @@ async fn meteoswiss_readings_land_attributed_and_a_replay_inserts_nothing() {
 
 #[tokio::test]
 #[serial]
-async fn a_site_with_no_station_is_not_a_subscriber() {
+async fn a_site_with_no_enabled_subscription_is_not_a_subscriber() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
 
+    ensure_pressure_parameter(&db).await;
     assert!(subscribers(&db).await.unwrap().is_empty());
-    declare_station(&db, crate::common::fixtures::SITE1_ID, "   ").await;
+    subscribe(&db, crate::common::fixtures::SITE1_ID, STATION).await;
+    crate::common::exec(&db, "UPDATE meteoswiss_subscriptions SET enabled = false").await;
     assert!(
         subscribers(&db).await.unwrap().is_empty(),
-        "a blank declaration is not a declaration"
+        "a subscription switched off is not fetched for"
     );
 }
 

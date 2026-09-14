@@ -18,8 +18,6 @@ use crate::routes::private::{data_streams, parameters, readings, sensors, site_p
 /// The catalog parameter the feed lands on. Nothing creates it: a tick that finds no such code
 /// in the catalog lands nothing and says so.
 pub(super) const PARAMETER_CODE: &str = "barometric_pressure";
-/// The SMN variable: station-level pressure, in hectopascals.
-pub(super) const VARIABLE: &str = "prestas0";
 const SOURCE_SYSTEM: &str = "meteoswiss";
 /// Rows per INSERT. Two placeholders per row plus four constants stays far inside the bind limit.
 const CHUNK: usize = 500;
@@ -85,14 +83,18 @@ pub fn recent_url(base: &str, station_abbr: &str) -> String {
     )
 }
 
+/// Every enabled subscription, ordered so a station's sites are read together.
 pub async fn subscribers<C: ConnectionTrait>(db: &C) -> Result<Vec<Subscriber>, DbErr> {
     Subscriber::find_by_statement(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
-        "SELECT id AS site_id, name AS site_name,
-                upper(btrim(meteoswiss_station_abbr)) AS station
-               FROM sites
-              WHERE btrim(coalesce(meteoswiss_station_abbr, '')) <> ''
-              ORDER BY name",
+        "SELECT sub.id AS subscription_id, sub.site_id, s.name AS site_name,
+                upper(btrim(sub.station_abbr)) AS station,
+                lower(btrim(sub.variable)) AS variable,
+                sub.parameter_id
+               FROM meteoswiss_subscriptions sub
+               JOIN sites s ON s.id = sub.site_id
+              WHERE sub.enabled
+              ORDER BY station, variable, s.name",
     ))
     .all(db)
     .await
@@ -129,7 +131,6 @@ pub async fn instrument<C: ConnectionTrait + sea_orm::TransactionTrait>(
         data_frequency: Set("high".to_string()),
         metadata: Set(Some(serde_json::json!({
             "station_abbr": station,
-            "variable": VARIABLE,
         }))),
         ..Default::default()
     };
@@ -145,8 +146,9 @@ pub async fn instrument<C: ConnectionTrait + sea_orm::TransactionTrait>(
     Ok(sensor.id)
 }
 
-/// The site's pressure slot and the stream feeding it, created on first sync. Declaring the station
-/// on the site is the whole operator action; the slot and the stream follow from it.
+/// The site's slot for the subscribed variable and the stream feeding it, created on first sync.
+/// Subscribing the site to a station and a variable is the whole operator action; the slot and the
+/// stream follow from it.
 pub async fn provision<C: ConnectionTrait + sea_orm::TransactionTrait>(
     db: &C,
     site: &Subscriber,
@@ -160,12 +162,17 @@ pub async fn provision<C: ConnectionTrait + sea_orm::TransactionTrait>(
     let site_parameter_id = match existing {
         Some(slot) => slot.id,
         None => {
+            // The slot is named and measured in whatever the catalog row says the variable is.
+            let parameter = parameters::Entity::find_by_id(parameter_id)
+                .one(db)
+                .await?
+                .ok_or_else(|| DbErr::Custom("The subscribed parameter is gone".to_string()))?;
             site_parameters::ActiveModel {
                 id: Set(Uuid::new_v4()),
                 site_id: Set(site.site_id),
                 parameter_id: Set(parameter_id),
-                name: Set(format!("{} Barometric Pressure", site.site_name)),
-                display_units: Set(Some("hPa".to_string())),
+                name: Set(format!("{} {}", site.site_name, parameter.name)),
+                display_units: Set(Some(parameter.default_units)),
                 sample_interval_sec: Set(Some(600)),
                 needs_review: Set(true),
                 ..Default::default()
@@ -176,14 +183,14 @@ pub async fn provision<C: ConnectionTrait + sea_orm::TransactionTrait>(
         }
     };
 
-    let source_key = format!("{}:{VARIABLE}:{}", site.station, site.site_id);
+    let source_key = format!("{}:{}:{}", site.station, site.variable, site.site_id);
     let mut register = data_streams::ActiveModel {
-        source_name: Set(Some(format!("{} {VARIABLE}", site.station))),
+        source_name: Set(Some(format!("{} {}", site.station, site.variable))),
         site_parameter_id: Set(Some(site_parameter_id)),
         measurement_type: Set(Some("continuous".to_string())),
         metadata: Set(serde_json::json!({
             "station": site.station,
-            "variable": VARIABLE,
+            "variable": site.variable,
             "decimal_places": 1,
         })),
         ..Default::default()
