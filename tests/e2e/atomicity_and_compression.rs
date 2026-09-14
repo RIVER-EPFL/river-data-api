@@ -332,14 +332,14 @@ async fn unpairing_a_stream_clears_readings_in_compressed_chunks() {
     );
 }
 
-// deleting a calibration or a deployment clears the readings FK with a bulk UPDATE that
-// carries neither a time restriction nor the decompression cap lift, so both deletes must still
+// Retiring a calibration and deleting a deployment each clear the readings FK with a bulk UPDATE
+// that carries neither a time restriction nor the decompression cap lift, so both must still
 // succeed over compressed history.
 #[tokio::test]
 #[serial]
-async fn deleting_a_calibration_or_deployment_rewrites_compressed_readings() {
+async fn retiring_a_calibration_or_deleting_a_deployment_rewrites_compressed_readings() {
     if !crate::common::profile::Service::Keycloak
-        .require("deleting_a_calibration_or_deployment_rewrites_compressed")
+        .require("retiring_a_calibration_or_deleting_a_deployment_rewrites_compressed")
         .await
     {
         return;
@@ -413,23 +413,35 @@ async fn deleting_a_calibration_or_deployment_rewrites_compressed_readings() {
     compress_day(&db, "2025-05-05").await;
     assert_cap_bites(&capped, "readings", &readings_for(&stream)).await;
 
-    let (status, body) = crate::common::delete_with_token(
+    // A curve that has corrected a reading is retired, never deleted (Q107), so what has to work
+    // against a compressed chunk is the retirement: it moves every reading it corrected onto
+    // whatever else covers them, and nothing else covers this history.
+    let (status, refused) = crate::common::delete_with_token(
         &app,
         &format!("/api/sensor_calibrations/{calibration}"),
         &manager,
     )
     .await;
     assert_eq!(
-        status, 204,
-        "a curve must be deletable when its readings are compressed: {body}"
+        status, 400,
+        "a curve with readings is retired, not deleted: {refused}"
     );
-    let (status, gone) = crate::common::get_with_token(
+
+    let (status, retired) = crate::common::post_json_parse_with_token(
         &app,
-        &format!("/api/sensor_calibrations/{calibration}"),
+        &format!("/api/sensor_calibrations/{calibration}/retire"),
+        &json!({ "reason": "plate refitted" }),
         &manager,
     )
     .await;
-    assert_eq!(status, 404, "the deleted curve is gone: {gone}");
+    assert_eq!(
+        status, 200,
+        "a curve must be retirable when its readings are compressed: {retired}"
+    );
+    assert_eq!(
+        retired["readings"], COMPRESSED_ROWS,
+        "every compressed reading the curve corrected is moved: {retired}"
+    );
     assert_eq!(
         e2e::count(
             &db,
@@ -437,7 +449,19 @@ async fn deleting_a_calibration_or_deployment_rewrites_compressed_readings() {
         )
         .await,
         0,
-        "no reading may still point at a deleted curve"
+        "no reading may still point at a retired curve"
+    );
+    // The row stays: it is the provenance of every value it produced.
+    let (status, kept) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sensor_calibrations/{calibration}"),
+        &manager,
+    )
+    .await;
+    assert_eq!(status, 200, "the retired curve is still there: {kept}");
+    assert!(
+        kept["retired_at"].is_string(),
+        "and is stamped retired: {kept}"
     );
     e2e::drain_jobs(&db, 60).await;
 

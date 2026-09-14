@@ -5,7 +5,8 @@
 //! min/Q10/Q90/max) and answers with an advisory warning and the distribution payload. The save
 //! proceeds — the warning gates nothing by force — but it is held to the check it names: values
 //! edited after the check are refused until re-checked. Authorization follows the documented
-//! layers: an intern may check (read) but not save (write).
+//! layers: an intern may check and may enter a field measurement, which lands unverified, but may
+//! not replace a stored one (Q21, M44).
 //!
 //! The quantile arithmetic, the cyclic month window and the fixed above-max classification are
 //! pinned in `tests/readings/seasonal_check.rs`; this story runs the workflow end to end against
@@ -90,15 +91,45 @@ async fn an_outlier_warns_and_the_save_is_held_to_its_check() {
     );
     let check_id = check["check_id"].as_str().expect("check id").to_string();
 
-    // The intern cannot save at all; the member can, and the warning is advisory.
     let save = json!({
         "site_id": track.site_id,
         "check_id": check_id,
         "readings": [{ "parameter_id": parameter_id, "value": 240.0, "time": "2025-06-20T09:30:00Z" }],
     });
+
+    // An intern enters a measurement of their own, at their own instant, and it lands unverified
+    // (Q21, M44). A value inside the season's range needs no check to name.
+    let intern_entry = json!({
+        "site_id": track.site_id,
+        "readings": [{ "parameter_id": parameter_id, "value": 12.0, "time": "2025-06-20T10:30:00Z" }],
+    });
+    let (status, entered) =
+        crate::common::post_json_with_token(&app, "/api/grab_samples", &intern_entry, &intern)
+            .await;
+    assert_eq!(status, 200, "an intern enters a measurement: {entered}");
+    assert_eq!(
+        e2e::count(
+            &db,
+            &format!(
+                "SELECT COUNT(*)::bigint AS n FROM readings \
+                 WHERE site_id = '{}' AND time = '2025-06-20T10:30:00Z' AND unverified",
+                track.site_id
+            ),
+        )
+        .await,
+        1,
+        "and it lands unverified, which is what nothing publishes"
+    );
+
+    // What an intern may not do is rewrite a stored value.
+    let mut replace = intern_entry.clone();
+    replace["mode"] = json!("replace");
     let (status, refused) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &save, &intern).await;
-    assert_eq!(status, 403, "an intern cannot save: {refused}");
+        crate::common::post_json_with_token(&app, "/api/grab_samples", &replace, &intern).await;
+    assert_eq!(
+        status, 403,
+        "an intern's entry cannot replace stored values: {refused}"
+    );
 
     // An edit after the check must re-check — the gate.
     let mut edited = save.clone();

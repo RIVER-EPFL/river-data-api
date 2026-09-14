@@ -814,9 +814,10 @@ async fn calibration_candidates_then_backfill_calibrations() {
     )
     .await;
 
-    // And beside it, a correction nothing accounts for: no instrument, no curve of either kind, yet
-    // a stored value that is not the raw one. It names no sensor, so no reprocess can reach it,
-    // which is exactly why it has to be reported rather than repaired.
+    // And beside it, a correction nothing accounts for: no curve of either kind, yet a stored value
+    // that is not the raw one. It takes its instrument from the stream it copies, so the curve's
+    // window covers it: it is reported before the backfill and repaired by it, with the number it
+    // held recorded in the ledger (Q114).
     crate::common::exec(
         &db,
         &format!(
@@ -844,8 +845,9 @@ async fn calibration_candidates_then_backfill_calibrations() {
     );
     assert_eq!(
         candidates["total_uncalibrated"].as_u64(),
-        Some(ingested),
-        "every reading the window covers but does not name is counted: {candidates}"
+        Some(ingested + 1),
+        "every reading the window covers but does not name is counted, the unaccounted \
+         correction among them: {candidates}"
     );
     let candidate = candidates["candidates"][0].clone();
     assert_eq!(
@@ -855,7 +857,7 @@ async fn calibration_candidates_then_backfill_calibrations() {
     );
     assert_eq!(
         candidate["uncalibrated_count"].as_u64(),
-        Some(ingested),
+        Some(ingested + 1),
         "with its own count: {candidates}"
     );
     assert_eq!(
@@ -909,7 +911,7 @@ async fn calibration_candidates_then_backfill_calibrations() {
     );
     assert_eq!(
         run["estimated_readings"].as_u64(),
-        Some(ingested),
+        Some(ingested + 1),
         "over its unstamped readings: {run}"
     );
     let job_id = run["job_id"]
@@ -979,8 +981,27 @@ async fn calibration_candidates_then_backfill_calibrations() {
         .expect("the orphaned correction is still stored");
     assert_eq!(
         orphan.calibrated_value,
-        Some(99.0),
-        "a value nobody can trace to a curve is reported, never overwritten"
+        Some(2.0 * orphan.raw_value + 5.0),
+        "a correction the curve's window covers is recomputed from that curve"
+    );
+    assert_eq!(
+        orphan.calibration_id,
+        Some(curve.id),
+        "and carries the curve it was recomputed from"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM reading_decisions \
+                  WHERE kind = 'reprocess' AND time = '{}' \
+                    AND (old->>'calibrated_value')::float8 = 99.0",
+                flow_dt(3600).to_rfc3339()
+            )
+        )
+        .await,
+        1,
+        "the number it held is in the ledger, so the repair is traceable and reversible"
     );
 
     let (status, cleared) =
@@ -1002,8 +1023,8 @@ async fn calibration_candidates_then_backfill_calibrations() {
     );
     assert_eq!(
         cleared["total_orphaned_corrections"].as_u64(),
-        Some(1),
-        "while the untraceable correction still stands, because nothing rewrote it: {cleared}"
+        Some(0),
+        "and the correction is accounted for, so nothing is left unexplained: {cleared}"
     );
 }
 
