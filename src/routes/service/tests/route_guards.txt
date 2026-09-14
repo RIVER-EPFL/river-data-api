@@ -85,6 +85,7 @@
 /readings/flag => require_write_data
 /readings/flag_range => require_write_data
 /readings/import_csv => require_write_data
+/readings/import_csv/chunk => require_write_data
 /readings/ledger => require_read_data
 /readings/provenance => require_read_data
 /readings/return => require_admin

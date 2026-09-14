@@ -620,6 +620,7 @@ fn table() -> Table {
             ("POST", "/api/readings/batch"),
             ("POST", "/api/status_events/batch"),
             ("POST", "/api/readings/import_csv"),
+            ("POST", "/api/readings/import_csv/chunk"),
             ("POST", "/api/collection_events/stage"),
             ("POST", "/api/collection_events/stage_many"),
             ("POST", "/api/collection_events/{id}/recompute"),

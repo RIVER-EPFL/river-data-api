@@ -277,6 +277,7 @@ pub fn validate_optional_time_range(
         private::data_streams::views::unpair_stream,
         private::data_streams::views::import_stream,
         private::readings::views::import_csv,
+        private::readings::views::import_csv_chunk,
         private::sensors::views::get_sensor_readings,
         private::sensors::views::get_sensor_deployment_bands,
         private::sensors::views::adopt_sensor,

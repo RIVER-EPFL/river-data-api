@@ -228,6 +228,7 @@ pub const CLEANUP_TRUNCATED_TABLES: &[&str] = &[
     "schedules",
     "change_audit",
     "csv_import_staging",
+    "csv_import_chunks",
     "annotations",
     "notes",
     "alarm_thresholds",

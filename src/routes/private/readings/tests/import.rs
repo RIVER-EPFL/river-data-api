@@ -89,3 +89,44 @@ fn test_timestamp_column_names_the_headers_it_saw_when_none_is_a_time() {
     assert!(refused.contains("Site_ID"), "{refused}");
     assert!(refused.contains("WaterTempdegC"), "{refused}");
 }
+
+// --- The site a row belongs to (M202) ---
+
+const SITE_A: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_00a1);
+const SITE_B: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_00b2);
+
+fn twelve_sites() -> SiteLookup {
+    SiteLookup {
+        by_id: HashSet::from([SITE_A, SITE_B]),
+        by_name: HashMap::from([("and".to_string(), SITE_A), ("vim".to_string(), SITE_B)]),
+    }
+}
+
+#[test]
+fn test_site_column_is_the_declared_one_or_the_files_own() {
+    let headers = ["Date", "Site_ID", "PAR1Lux_measured"];
+    assert_eq!(site_column_index(&headers, None), Ok(Some(1)));
+    assert_eq!(site_column_index(&headers, Some("site_id")), Ok(Some(1)));
+    // A file naming no site keeps the request's single target.
+    assert_eq!(site_column_index(&["Date", "Depth"], None), Ok(None));
+    // A declared column the file lacks is refused, not ignored.
+    assert!(site_column_index(&headers, Some("station")).is_err());
+}
+
+#[test]
+fn test_a_row_resolves_its_own_site_by_name_or_id() {
+    let sites = twelve_sites();
+    assert_eq!(resolve_row_site("AND", &sites, SITE_B), Ok(SITE_A));
+    assert_eq!(resolve_row_site(" vim ", &sites, SITE_A), Ok(SITE_B));
+    assert_eq!(
+        resolve_row_site(&SITE_A.to_string(), &sites, SITE_B),
+        Ok(SITE_A)
+    );
+    // An empty cell is the request's target; an unknown name is nobody's.
+    assert_eq!(resolve_row_site("", &sites, SITE_B), Ok(SITE_B));
+    let err = resolve_row_site("PEU", &sites, SITE_B).unwrap_err();
+    assert!(err.contains("PEU"), "{err}");
+    // A well-formed id no site carries does not pass as one.
+    let err = resolve_row_site(&Uuid::nil().to_string(), &sites, SITE_B).unwrap_err();
+    assert!(err.contains(&Uuid::nil().to_string()), "{err}");
+}

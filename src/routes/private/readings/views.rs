@@ -29,6 +29,7 @@ use super::models::*;
 use super::service::*;
 use crate::common::AppState;
 use crate::common::actor::label;
+use crate::common::authz::AccessScope;
 use crate::common::middleware::AuthContext;
 use crate::common::middleware::IsSyncService;
 use crate::common::middleware::ProjectScope;
@@ -3496,17 +3497,368 @@ pub async fn insert_grab_samples(
     }))
 }
 
-/// Import historical readings from a wide CSV for one site. Resolves columns to parameters
-/// (explicit mapping > public name > alias > catalog), skips derived outputs, inserts raw values
-/// idempotently, then recomputes derived parameters and refreshes aggregates. `dry_run` returns the
-/// resolution plan only. Requires `write_data`.
+/// `POST /api/readings/import_csv/chunk`, one slice of a file that does not fit in one request.
+/// The chunks accumulate as rows of `csv_import_chunks`; the import then names the session instead
+/// of carrying a body. The rows are the session, so an upload survives a restart and a chunk that
+/// reaches another replica appends to the same file. An upload that stops part-way is removed by
+/// the janitor after `IMPORT_SESSION_RETENTION_MINUTES`.
+#[utoipa::path(
+    post,
+    path = "/api/readings/import_csv/chunk",
+    request_body = ImportChunkRequest,
+    responses(
+        (status = 200, description = "The session and what it now holds", body = ImportChunkResponse),
+        (status = 400, description = "The session expired or was never opened"),
+        (status = 413, description = "Chunk exceeds the import body limit"),
+    ),
+    tag = "ingestion"
+)]
+pub async fn import_csv_chunk(
+    State(state): State<AppState>,
+    Json(req): Json<ImportChunkRequest>,
+) -> AppResult<Json<ImportChunkResponse>> {
+    let session_id = req.session_id.unwrap_or_else(Uuid::new_v4);
+    if req.session_id.is_some() {
+        require_open_session(&state.db, session_id).await?;
+    }
+    let bytes = append_chunk(&state.db, session_id, &req.chunk).await?;
+    Ok(Json(ImportChunkResponse { session_id, bytes }))
+}
+
+/// The file this request is about: the body's own text, or the chunks a prior upload staged.
+/// Either way the text is in `csv_import_chunks` under the returned session id, so a commit that
+/// re-sends the id imports exactly the file the plan was built from, on whichever replica takes it.
+async fn staged_csv(state: &AppState, req: &ImportCsvRequest) -> AppResult<(Arc<String>, Uuid)> {
+    if let Some(csv) = req.csv.as_deref() {
+        let sid = Uuid::new_v4();
+        append_chunk(&state.db, sid, csv).await?;
+        return Ok((Arc::new(csv.to_owned()), sid));
+    }
+    if let Some(sid) = req.session_id {
+        let text = staged_text(&state.db, sid).await?;
+        return Ok((Arc::new(text), sid));
+    }
+    Err(AppError::BadRequest(
+        "Provide either csv or session_id".into(),
+    ))
+}
+
+/// One site's rows lifted out of a multi-site file: the file it would have been on its own, and
+/// the line each of its rows came from, so an error still names the line the operator can see.
+struct SiteRows {
+    site_id: Uuid,
+    csv: String,
+    lines: Vec<usize>,
+}
+
+/// A file split by the site each row names. The site column itself is dropped from every share:
+/// it is the file's own bookkeeping, not a parameter column.
+struct SiteSplit {
+    shares: Vec<SiteRows>,
+    errors: Vec<RowError>,
+    error_count: usize,
+}
+
+/// Split a file by its site column, or `None` when it carries no such column and the request's
+/// single target stands.
+async fn split_by_site(
+    db: &sea_orm::DatabaseConnection,
+    csv_text: &str,
+    declared: Option<&str>,
+    fallback: Uuid,
+) -> AppResult<Option<SiteSplit>> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .trim(csv::Trim::All)
+        .flexible(true)
+        .from_reader(csv_text.as_bytes());
+    let headers = reader
+        .headers()
+        .map_err(|e| AppError::BadRequest(format!("Failed to read CSV header: {e}")))?
+        .clone();
+    let names: Vec<&str> = headers.iter().collect();
+    let Some(site_idx) =
+        crate::routes::private::readings::service::site_column_index(&names, declared)
+            .map_err(AppError::BadRequest)?
+    else {
+        return Ok(None);
+    };
+
+    let lookup = site_lookup(db).await?;
+    let header_row: Vec<&str> = names
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != site_idx)
+        .map(|(_, h)| *h)
+        .collect();
+
+    let mut writers: HashMap<Uuid, (csv::Writer<Vec<u8>>, Vec<usize>)> = HashMap::new();
+    let mut order: Vec<Uuid> = Vec::new();
+    let mut errors: Vec<RowError> = Vec::new();
+    let mut error_count = 0usize;
+    let mut line = 1usize;
+
+    for record in reader.records() {
+        line += 1;
+        let record = match record {
+            Ok(r) => r,
+            Err(e) => {
+                error_count += 1;
+                if errors.len() < MAX_ERRORS {
+                    errors.push(RowError {
+                        row: line,
+                        message: format!("CSV parse error: {e}"),
+                    });
+                }
+                continue;
+            }
+        };
+        let site_id = match crate::routes::private::readings::service::resolve_row_site(
+            record.get(site_idx).unwrap_or(""),
+            &lookup,
+            fallback,
+        ) {
+            Ok(id) => id,
+            Err(message) => {
+                error_count += 1;
+                if errors.len() < MAX_ERRORS {
+                    errors.push(RowError { row: line, message });
+                }
+                continue;
+            }
+        };
+        let entry = match writers.entry(site_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                order.push(site_id);
+                let mut writer = csv::Writer::from_writer(Vec::new());
+                writer
+                    .write_record(&header_row)
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                e.insert((writer, Vec::new()))
+            }
+        };
+        let cells: Vec<&str> = record
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != site_idx)
+            .map(|(_, c)| c)
+            .collect();
+        entry
+            .0
+            .write_record(&cells)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        entry.1.push(line);
+    }
+
+    let mut shares = Vec::with_capacity(order.len());
+    for site_id in order {
+        let (writer, lines) = writers.remove(&site_id).unwrap_or_else(|| {
+            unreachable!("a site in file order has a writer");
+        });
+        let bytes = writer
+            .into_inner()
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        shares.push(SiteRows {
+            site_id,
+            csv: String::from_utf8(bytes).map_err(|e| AppError::Internal(e.to_string()))?,
+            lines,
+        });
+    }
+    Ok(Some(SiteSplit {
+        shares,
+        errors,
+        error_count,
+    }))
+}
+
+/// The sites a file may name, by the two spellings the request-level `site` accepts.
+async fn site_lookup(
+    db: &sea_orm::DatabaseConnection,
+) -> AppResult<crate::routes::private::readings::service::SiteLookup> {
+    let rows = crate::routes::private::sites::Entity::find()
+        .all(db)
+        .await?;
+    let mut by_id = HashSet::with_capacity(rows.len());
+    let mut by_name = HashMap::with_capacity(rows.len());
+    for row in rows {
+        by_id.insert(row.id);
+        by_name.insert(row.name.to_lowercase(), row.id);
+    }
+    Ok(crate::routes::private::readings::service::SiteLookup { by_id, by_name })
+}
+
+/// Import every site a file names, each against its own slots, and answer with the file's totals
+/// plus what each site took.
+async fn import_every_site(
+    state: &AppState,
+    auth: &crate::common::middleware::AuthContext,
+    scope: &AccessScope,
+    req: ImportCsvRequest,
+    split: SiteSplit,
+    session_id: Uuid,
+) -> AppResult<Json<ImportCsvResponse>> {
+    if req.tool.is_some() {
+        return Err(AppError::BadRequest(
+            "A tool-entry file is one site's run sheet; import it without a site column".into(),
+        ));
+    }
+    // The seasonal check is one site's distribution and a commit is held to exactly the values
+    // one check screened, so a spot file naming several sites has no check to name. Continuous
+    // files, which is what the portals' high-frequency exports are, are not screened at all.
+    if req.measurement_type.as_deref() == Some("spot") {
+        return Err(AppError::BadRequest(
+            "A spot file is screened against one site's seasonal history; import it one site at \
+             a time"
+                .into(),
+        ));
+    }
+
+    let target = resolve_site_with_project(&state.db, &req.site).await?.0;
+    let sites: Vec<Uuid> = split.shares.iter().map(|s| s.site_id).collect();
+    // Every site up front: a token confined to one project must not stage half the file before
+    // the site it cannot reach refuses.
+    enforce_project_scope_for_sites(&state.db, scope, &sites).await?;
+
+    let base = ImportCsvRequest {
+        csv: None,
+        session_id: None,
+        site_column: None,
+        ..req
+    };
+
+    let mut totals = ImportCsvResponse {
+        site_id: target.id,
+        site_name: target.name,
+        dry_run: base.dry_run,
+        session_id: Some(session_id),
+        mapped_columns: HashMap::new(),
+        skipped_columns: Vec::new(),
+        unmapped_columns: Vec::new(),
+        warnings: Vec::new(),
+        row_count: 0,
+        replicate_groups: 0,
+        inserted_total: 0,
+        earliest: None,
+        latest: None,
+        derived_job_id: None,
+        derived_timestamps: 0,
+        duplicates: 0,
+        overlaps_identical: 0,
+        overlaps_differing: 0,
+        overwritten: 0,
+        overlap_sample: Vec::new(),
+        errors: split.errors,
+        error_count: split.error_count,
+        tool_runs_created: 0,
+        curves: Vec::new(),
+        check: None,
+        site_imports: Vec::new(),
+    };
+
+    for share in split.shares {
+        let per_site = ImportCsvRequest {
+            site: share.site_id.to_string(),
+            csv: Some(share.csv),
+            ..base.clone()
+        };
+        let Json(one) =
+            import_one_site(state.clone(), auth.clone(), scope.clone(), per_site).await?;
+
+        totals.site_imports.push(SiteImportOutcome {
+            site_id: one.site_id,
+            site_name: one.site_name.clone(),
+            row_count: one.row_count,
+            inserted_total: one.inserted_total,
+            derived_job_id: one.derived_job_id,
+        });
+
+        for (header, parameter) in one.mapped_columns {
+            totals.mapped_columns.insert(header, parameter);
+        }
+        merge_columns(&mut totals.skipped_columns, one.skipped_columns);
+        merge_columns(&mut totals.unmapped_columns, one.unmapped_columns);
+        for warning in one.warnings {
+            totals
+                .warnings
+                .push(format!("{}: {warning}", one.site_name));
+        }
+        totals.row_count += one.row_count;
+        totals.replicate_groups += one.replicate_groups;
+        totals.inserted_total += one.inserted_total;
+        totals.derived_timestamps += one.derived_timestamps;
+        totals.duplicates += one.duplicates;
+        totals.overlaps_identical += one.overlaps_identical;
+        totals.overlaps_differing += one.overlaps_differing;
+        totals.overwritten += one.overwritten;
+        totals.earliest = min_instant(totals.earliest, one.earliest);
+        totals.latest = max_instant(totals.latest, one.latest);
+        for diff in one.overlap_sample {
+            if totals.overlap_sample.len() < OVERLAP_SAMPLE_CAP {
+                totals.overlap_sample.push(diff);
+            }
+        }
+        // A share's rows are numbered from its own header, so each error is reported against the
+        // line of the file the operator uploaded.
+        totals.error_count += one.error_count;
+        for mut error in one.errors {
+            if totals.errors.len() >= MAX_ERRORS {
+                break;
+            }
+            if let Some(line) = share.lines.get(error.row.saturating_sub(2)) {
+                error.row = *line;
+            }
+            error.message = format!("{}: {}", one.site_name, error.message);
+            totals.errors.push(error);
+        }
+    }
+
+    if let [only] = totals.site_imports.as_slice() {
+        totals.derived_job_id = only.derived_job_id;
+    }
+    Ok(Json(totals))
+}
+
+fn merge_columns(into: &mut Vec<String>, from: Vec<String>) {
+    for column in from {
+        if !into.contains(&column) {
+            into.push(column);
+        }
+    }
+}
+
+fn min_instant(
+    a: Option<chrono::DateTime<chrono::Utc>>,
+    b: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (one, None) | (None, one) => one,
+    }
+}
+
+fn max_instant(
+    a: Option<chrono::DateTime<chrono::Utc>>,
+    b: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (one, None) | (None, one) => one,
+    }
+}
+
+/// Import historical readings from a wide CSV. Resolves columns to parameters (explicit mapping >
+/// public name > alias > catalog), skips derived outputs, inserts raw values idempotently, then
+/// recomputes derived parameters and refreshes aggregates. `dry_run` returns the resolution plan
+/// only. A file carrying a site column is split by site and each site's rows imported against
+/// their own slots. Requires `write_data`.
 #[utoipa::path(
     post,
     path = "/api/readings/import_csv",
     request_body = ImportCsvRequest,
     responses(
         (status = 200, description = "Import summary or dry-run plan", body = ImportCsvResponse),
-        (status = 400, description = "Unparseable CSV, missing DateTime column, or no resolvable parameter columns"),
+        (status = 400, description = "Unparseable CSV, missing DateTime column, an unusable site column, or no resolvable parameter columns"),
         (status = 404, description = "Site not found"),
         (status = 413, description = "Body exceeds 50MB limit"),
     ),
@@ -3518,35 +3870,27 @@ pub async fn import_csv(
     ProjectScope(scope): ProjectScope,
     Json(req): Json<ImportCsvRequest>,
 ) -> AppResult<Json<ImportCsvResponse>> {
+    let (csv_text, session_id) = staged_csv(&state, &req).await?;
+    let target = resolve_site_with_project(&state.db, &req.site).await?.0;
+    let split = split_by_site(&state.db, &csv_text, req.site_column.as_deref(), target.id).await?;
+    let Some(split) = split else {
+        return import_one_site(state, auth, scope, req).await;
+    };
+    import_every_site(&state, &auth, &scope, req, split, session_id).await
+}
+
+/// One site's share of a file: the whole import, for the single site `req.site` names.
+async fn import_one_site(
+    state: AppState,
+    auth: crate::common::middleware::AuthContext,
+    scope: AccessScope,
+    req: ImportCsvRequest,
+) -> AppResult<Json<ImportCsvResponse>> {
     crate::routes::private::readings::service::validate_measurement_type(
         req.measurement_type.as_deref(),
     )?;
 
-    // --- Resolve CSV text: from request body or staging cache ---------------------------------
-    let (csv_text, session_id) = if let Some(csv) = req.csv.as_deref() {
-        let sid = Uuid::new_v4();
-        let arc = Arc::new(csv.to_owned());
-        state
-            .import_staging
-            .insert(sid.to_string(), arc.clone())
-            .await;
-        (arc, sid)
-    } else if let Some(sid) = req.session_id {
-        let cached = state
-            .import_staging
-            .get(&sid.to_string())
-            .await
-            .ok_or_else(|| {
-                AppError::BadRequest(
-                    "Staging session expired or not found, re-upload the file".into(),
-                )
-            })?;
-        (cached, sid)
-    } else {
-        return Err(AppError::BadRequest(
-            "Provide either csv or session_id".into(),
-        ));
-    };
+    let (csv_text, session_id) = staged_csv(&state, &req).await?;
 
     let tz_offset =
         chrono::Duration::milliseconds((req.tz_offset_hours.unwrap_or(0.0) * 3_600_000.0) as i64);
@@ -4058,6 +4402,7 @@ pub async fn import_csv(
             tool_runs_created: 0,
             curves: Vec::new(),
             check,
+            site_imports: Vec::new(),
         }));
     }
 
@@ -4241,6 +4586,7 @@ pub async fn import_csv(
         tool_runs_created: 0,
         curves: Vec::new(),
         check,
+        site_imports: Vec::new(),
     }))
 }
 
@@ -4276,6 +4622,7 @@ pub fn readings_write_routes(state: &AppState) -> axum::Router {
         .route("/readings/batch", post(insert_batch_readings))
         .layer(RequestBodyLimitLayer::new(DATA_BODY_LIMIT))
         .route("/readings/import_csv", post(import_csv))
+        .route("/readings/import_csv/chunk", post(import_csv_chunk))
         .layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT))
         .route("/readings/edits/preview", post(preview))
         .route("/readings/edits", post(commit))

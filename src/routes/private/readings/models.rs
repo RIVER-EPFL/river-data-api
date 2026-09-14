@@ -2383,11 +2383,18 @@ pub enum CsvValueState {
     Corrected,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImportCsvRequest {
-    /// Target site, by UUID or case-insensitive name.
+    /// Target site, by UUID or case-insensitive name. With `site_column`, the site a row whose
+    /// cell is empty belongs to.
     pub site: String,
+    /// The column naming each row's site, for a file covering several sites: the portals'
+    /// high-frequency exports are one wide file per resolution with a `Site_ID` column. Each cell
+    /// is resolved like `site`, by UUID or case-insensitive name. Omitted, a header named
+    /// `site_id` or `site` is taken as one.
+    #[serde(default)]
+    pub site_column: Option<String>,
     /// Wide CSV text: a `DateTime`, `Date` or `Time` column plus one column per parameter.
     /// Optional when `session_id` references a previously uploaded CSV.
     #[serde(default)]
@@ -2438,6 +2445,42 @@ pub struct ImportCsvRequest {
     /// screen finds a value outside the recorded range.
     #[serde(default)]
     pub check_id: Option<Uuid>,
+}
+
+/// One slice of a file too large for a single request. The portals' `10min_data.csv` is 474 MB, an
+/// order of magnitude over the import body limit, so it arrives as appends against one staging
+/// session and is imported by naming that session.
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImportChunkRequest {
+    /// The session to append to. Omitted, a session is opened and its id returned; pass that id
+    /// on every later chunk and to the import itself.
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    /// The next slice of the file, in file order. The first chunk carries the header row, and a
+    /// slice ends where the caller chose: the session holds text, so a row split across two
+    /// chunks is rejoined by the append.
+    pub chunk: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ImportChunkResponse {
+    /// The session the file is accumulating in. Name it on the next chunk and on the import.
+    pub session_id: Uuid,
+    /// Bytes the session now holds.
+    pub bytes: usize,
+}
+
+/// One site's share of a multi-site import: what it took and the job that writes it. The scalar
+/// fields beside it are the file's totals.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SiteImportOutcome {
+    pub site_id: Uuid,
+    pub site_name: String,
+    pub row_count: usize,
+    pub inserted_total: usize,
+    #[schema(required)]
+    pub derived_job_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2504,6 +2547,10 @@ pub struct ImportCsvResponse {
     /// does not apply to (its history is spot readings).
     #[schema(required)]
     pub check: Option<ImportCheck>,
+    /// One entry per site a `site_column` file landed on, in the order they were imported. Empty
+    /// for a single-site file, whose totals are the scalar fields.
+    #[serde(default)]
+    pub site_imports: Vec<SiteImportOutcome>,
 }
 
 /// The seasonal Check gate's CSV arm: every cell the file will store as a spot reading, screened
@@ -2707,6 +2754,47 @@ pub mod import_staging {
         pub sensor_id: Option<Uuid>,
         pub calibration_id: Option<Uuid>,
         pub deployment_id: Option<Uuid>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// Where a chunked upload accumulates before the import parses it: one row per chunk, in the order
+/// they arrived. Durable and shared, so a session survives an eviction and a chunk that reaches
+/// another replica appends to the same file.
+pub mod import_chunk {
+    use crudcrate::EntityToModels;
+    use sea_orm::entity::prelude::*;
+
+    #[derive(
+        Clone,
+        Debug,
+        PartialEq,
+        DeriveEntityModel,
+        serde::Serialize,
+        serde::Deserialize,
+        EntityToModels,
+    )]
+    #[sea_orm(table_name = "csv_import_chunks")]
+    #[crudcrate(
+        api_struct = "CsvImportChunk",
+        name_singular = "csv_import_chunk",
+        name_plural = "csv_import_chunks"
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key)]
+        pub session_id: Uuid,
+        /// The chunk's position in the upload, which is the order the file is reassembled in.
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key)]
+        pub seq: i32,
+        pub chunk: String,
+        #[crudcrate(exclude(create, update))]
+        pub created_at: chrono::DateTime<chrono::Utc>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -78,6 +78,23 @@ async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
     crate::common::e2e::count(db, sql).await
 }
 
+/// Wait for a count query to reach `want`, then hold it to exactly that. Every row this test reads
+/// is written by the import worker, so a count read once is a race with the run that writes it.
+async fn await_count(db: &DatabaseConnection, sql: &str, want: i64, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let n = count(db, sql).await;
+        if n == want {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} (last count {n}, wanted {want})"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn a_csv_import_runs_the_calculations_that_read_what_it_landed() {
@@ -101,27 +118,21 @@ async fn a_csv_import_runs_the_calculations_that_read_what_it_landed() {
     .await;
     assert_eq!(status, 200, "import ({status}): {resp}");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let visits = count(
-            &db,
-            &format!(
-                "SELECT COUNT(*)::bigint FROM collection_events \
-                 WHERE site_id = '{SITE1_ID}' AND collected_at = '{AT}'"
-            ),
-        )
-        .await;
-        if visits > 0 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the import worker never staged the visit"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    // The visit row and the recompute job are two writes by the same worker run, so both are
+    // waited for; asserting the second the moment the first lands fails whenever the worker is
+    // between them.
+    await_count(
+        &db,
+        &format!(
+            "SELECT COUNT(*)::bigint FROM collection_events \
+             WHERE site_id = '{SITE1_ID}' AND collected_at = '{AT}'"
+        ),
+        1,
+        "the import worker never staged the visit",
+    )
+    .await;
 
-    let queued = count(
+    await_count(
         &db,
         &format!(
             "SELECT COUNT(*)::bigint FROM reprocessing_jobs j \
@@ -129,12 +140,10 @@ async fn a_csv_import_runs_the_calculations_that_read_what_it_landed() {
              WHERE j.trigger_type = 'event_recompute' \
                AND ce.site_id = '{SITE1_ID}' AND ce.collected_at = '{AT}'"
         ),
+        1,
+        "the value landed at a manual visit an enabled calculation reads, so its recompute is queued",
     )
     .await;
-    assert_eq!(
-        queued, 1,
-        "the value landed at a manual visit an enabled calculation reads, so its recompute is queued"
-    );
 
     crate::common::cleanup_test_db(&db).await;
 }

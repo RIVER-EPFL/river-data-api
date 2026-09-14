@@ -80,19 +80,18 @@ async fn csv_import_runs_on_worker_and_clears_staging() {
         "the worker deletes its staged rows on completion"
     );
 
-    let row = db
-        .query_one_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            format!("SELECT status FROM reprocessing_jobs WHERE id = '{job_id}'"),
-        ))
-        .await
-        .unwrap()
-        .unwrap();
-    let job_status: String = row.try_get("", "status").unwrap();
-    assert_eq!(
-        job_status, "completed",
-        "the csv_import job reaches completed"
-    );
+    // Staging is dropped inside the run, so the row can still read `running` for a moment after.
+    let completed = poll_count(
+        &db,
+        &format!(
+            "SELECT count(*) AS n FROM reprocessing_jobs \
+             WHERE id = '{job_id}' AND status = 'completed'"
+        ),
+        1,
+        10,
+    )
+    .await;
+    assert_eq!(completed, 1, "the csv_import job reaches completed");
 }
 
 const CSV_DUP_TS: &str = "DateTime,Dissolved_O2,DO_Temperature\n\

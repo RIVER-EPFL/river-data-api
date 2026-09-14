@@ -8093,6 +8093,47 @@
         ],
         "type": "object"
       },
+      "ImportChunkRequest": {
+        "additionalProperties": false,
+        "description": "One slice of a file too large for a single request. The portals' `10min_data.csv` is 474 MB, an\norder of magnitude over the import body limit, so it arrives as appends against one staging\nsession and is imported by naming that session.",
+        "properties": {
+          "chunk": {
+            "description": "The next slice of the file, in file order. The first chunk carries the header row, and a\nslice ends where the caller chose: the session holds text, so a row split across two\nchunks is rejoined by the append.",
+            "type": "string"
+          },
+          "session_id": {
+            "description": "The session to append to. Omitted, a session is opened and its id returned; pass that id\non every later chunk and to the import itself.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "chunk"
+        ],
+        "type": "object"
+      },
+      "ImportChunkResponse": {
+        "properties": {
+          "bytes": {
+            "description": "Bytes the session now holds.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "description": "The session the file is accumulating in. Name it on the next chunk and on the import.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "bytes"
+        ],
+        "type": "object"
+      },
       "ImportCsvRequest": {
         "additionalProperties": false,
         "properties": {
@@ -8165,8 +8206,15 @@
             ]
           },
           "site": {
-            "description": "Target site, by UUID or case-insensitive name.",
+            "description": "Target site, by UUID or case-insensitive name. With `site_column`, the site a row whose\ncell is empty belongs to.",
             "type": "string"
+          },
+          "site_column": {
+            "description": "The column naming each row's site, for a file covering several sites: the portals'\nhigh-frequency exports are one wide file per resolution with a `Site_ID` column. Each cell\nis resolved like `site`, by UUID or case-insensitive name. Omitted, a header named\n`site_id` or `site` is taken as one.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "tool": {
             "description": "Import the file as tool entry (S4a): each row's columns are inputs of this tool, the tool\nruns over every row, and the outputs are saved through the grab write path with the same\nserver-built provenance a typed entry gets (`source: csv_import`). Without it, columns are\ncatalog parameters and values import as-is.",
@@ -8318,6 +8366,13 @@
           "site_id": {
             "format": "uuid",
             "type": "string"
+          },
+          "site_imports": {
+            "description": "One entry per site a `site_column` file landed on, in the order they were imported. Empty\nfor a single-site file, whose totals are the scalar fields.",
+            "items": {
+              "$ref": "#/components/schemas/SiteImportOutcome"
+            },
+            "type": "array"
           },
           "site_name": {
             "type": "string"
@@ -21384,6 +21439,41 @@
           "data_start",
           "data_end",
           "reading_count"
+        ],
+        "type": "object"
+      },
+      "SiteImportOutcome": {
+        "description": "One site's share of a multi-site import: what it took and the job that writes it. The scalar\nfields beside it are the file's totals.",
+        "properties": {
+          "derived_job_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "inserted_total": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "row_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "site_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "site_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "site_id",
+          "site_name",
+          "row_count",
+          "inserted_total",
+          "derived_job_id"
         ],
         "type": "object"
       },
@@ -37331,7 +37421,7 @@
             "description": "Import summary or dry-run plan"
           },
           "400": {
-            "description": "Unparseable CSV, missing DateTime column, or no resolvable parameter columns"
+            "description": "Unparseable CSV, missing DateTime column, an unusable site column, or no resolvable parameter columns"
           },
           "404": {
             "description": "Site not found"
@@ -37340,7 +37430,44 @@
             "description": "Body exceeds 50MB limit"
           }
         },
-        "summary": "Import historical readings from a wide CSV for one site. Resolves columns to parameters\n(explicit mapping > public name > alias > catalog), skips derived outputs, inserts raw values\nidempotently, then recomputes derived parameters and refreshes aggregates. `dry_run` returns the\nresolution plan only. Requires `write_data`.",
+        "summary": "Import historical readings from a wide CSV. Resolves columns to parameters (explicit mapping >\npublic name > alias > catalog), skips derived outputs, inserts raw values idempotently, then\nrecomputes derived parameters and refreshes aggregates. `dry_run` returns the resolution plan\nonly. A file carrying a site column is split by site and each site's rows imported against\ntheir own slots. Requires `write_data`.",
+        "tags": [
+          "ingestion"
+        ]
+      }
+    },
+    "/api/readings/import_csv/chunk": {
+      "post": {
+        "operationId": "import_csv_chunk",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportChunkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportChunkResponse"
+                }
+              }
+            },
+            "description": "The session and what it now holds"
+          },
+          "400": {
+            "description": "The session expired or was never opened"
+          },
+          "413": {
+            "description": "Chunk exceeds the import body limit"
+          }
+        },
+        "summary": "`POST /api/readings/import_csv/chunk`, one slice of a file that does not fit in one request.\nThe chunks accumulate as rows of `csv_import_chunks`; the import then names the session instead\nof carrying a body. The rows are the session, so an upload survives a restart and a chunk that\nreaches another replica appends to the same file. An upload that stops part-way is removed by\nthe janitor after `IMPORT_SESSION_RETENTION_MINUTES`.",
         "tags": [
           "ingestion"
         ]

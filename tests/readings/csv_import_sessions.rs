@@ -377,8 +377,8 @@ async fn unresolvable_session_is_rejected_by_message_and_full_csv_retry_succeeds
     assert_eq!(status, 200, "preview ({status}): {preview}");
     let session = session_of(&preview);
 
-    // Staging is per-instance and in memory, so a session does not survive a restart or reach a
-    // second replica. The client sees the same failure it sees on expiry.
+    // Staging is rows of `csv_import_chunks`, so a session minted on one instance is the same
+    // session on the next: the file is where every replica reads it.
     let other_replica = kc::build_test_app_with_keycloak(fx.db.clone()).await;
     let (status, elsewhere) = crate::common::post_json_parse_with_token(
         &other_replica,
@@ -388,12 +388,8 @@ async fn unresolvable_session_is_rejected_by_message_and_full_csv_retry_succeeds
     )
     .await;
     assert_eq!(
-        status, 400,
-        "a session another instance minted is not honoured: {elsewhere}"
-    );
-    assert!(
-        error_of(&elsewhere).contains("expired"),
-        "the client branches on this substring to drop the session and retry: {elsewhere}"
+        status, 200,
+        "a session another instance minted resolves here: {elsewhere}"
     );
 
     let (status, unknown) = import(
@@ -406,10 +402,9 @@ async fn unresolvable_session_is_rejected_by_message_and_full_csv_retry_succeeds
     )
     .await;
     assert_eq!(status, 400, "an unknown session id is refused: {unknown}");
-    assert_eq!(
-        error_of(&unknown),
-        error_of(&elsewhere),
-        "an unknown and an unreachable session are indistinguishable, so one recovery branch covers both"
+    assert!(
+        error_of(&unknown).contains("expired"),
+        "the client branches on this substring to drop the session and retry: {unknown}"
     );
 
     let (status, neither) = import(&fx, &json!({ "site": fx.track.site_id })).await;

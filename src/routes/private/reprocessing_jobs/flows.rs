@@ -225,8 +225,8 @@ pub(crate) fn build(query: &sea_query::SelectStatement) -> Statement {
 // process-global `AppState` (`crate::common::global_app_state`), the same set-once handle pattern
 // the CrudCrate hooks use for the event sender.
 
-/// Fill missing derived readings, recompose values whose curve coefficients moved, and prune old
-/// tracked-job rows. The rollups are not its business: they serve their head from the raw rows and
+/// Fill missing derived readings, recompose values whose curve coefficients moved, and prune
+/// abandoned chunked uploads and old tracked-job rows. The rollups are not its business: they serve their head from the raw rows and
 /// each policy rematerialises the history hourly, so what this job refreshes is only the span its
 /// own writes moved.
 pub struct JanitorRun {
@@ -396,7 +396,18 @@ impl Job for JanitorRun {
             Err(e) => tracing::warn!(error = %e, "Janitor: curve drift sweep failed"),
         }
 
-        // 3. Tiered tracked-job retention (cheap deletes; idempotent to run every tick).
+        // 3. Abandoned chunked uploads. An upload that stops part-way leaves its text in
+        // `csv_import_chunks` and nothing else deletes it.
+        let sessions_pruned =
+            match crate::routes::private::readings::service::prune_import_sessions(db).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Janitor: pruning abandoned import sessions failed");
+                    0
+                }
+            };
+
+        // 4. Tiered tracked-job retention (cheap deletes; idempotent to run every tick).
         let pruned = janitor::prune_tracked_jobs(
             db,
             self.maintenance_retention_days,
@@ -411,6 +422,7 @@ impl Job for JanitorRun {
             JobReport::new()
                 .scope("full_scan", do_full)
                 .count("recomposed", recomposed)
+                .count("import_sessions_pruned", sessions_pruned)
                 .count("pruned", pruned),
         )
         .await;

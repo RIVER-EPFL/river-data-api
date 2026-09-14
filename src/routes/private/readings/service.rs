@@ -5539,6 +5539,98 @@ pub(super) async fn slot_identity(
     Ok(Some((row.code, row.name, row.units, row.decimal_places)))
 }
 
+/// How long a chunked upload's rows are kept before the janitor removes them. An upload that
+/// stops part-way leaves rows nothing will ever read, and a commit that names a session older
+/// than this is told to re-upload rather than given half a file.
+pub const IMPORT_SESSION_RETENTION_MINUTES: i64 = 60;
+
+/// The session a chunk names has to be one this upload opened, so a typo in a session id starts
+/// no second file under it.
+pub async fn require_open_session<C: ConnectionTrait>(db: &C, session_id: Uuid) -> AppResult<()> {
+    let held = import_chunk::Entity::find()
+        .filter(import_chunk::Column::SessionId.eq(session_id))
+        .count(db)
+        .await?;
+    if held == 0 {
+        return Err(AppError::BadRequest(
+            "Staging session expired or not found, start the upload again".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Append one chunk to a session and report what the session now holds. The sequence is the row
+/// count, so the chunks reassemble in the order they arrived whichever replica took each one.
+pub async fn append_chunk<C: ConnectionTrait>(
+    db: &C,
+    session_id: Uuid,
+    chunk: &str,
+) -> AppResult<usize> {
+    let seq = import_chunk::Entity::find()
+        .filter(import_chunk::Column::SessionId.eq(session_id))
+        .select_only()
+        .column_as(import_chunk::Column::Seq.max(), "seq")
+        .into_tuple::<Option<i32>>()
+        .one(db)
+        .await?
+        .flatten()
+        .map_or(0, |highest| highest + 1);
+    import_chunk::ActiveModel {
+        session_id: Set(session_id),
+        seq: Set(seq),
+        chunk: Set(chunk.to_string()),
+        ..Default::default()
+    }
+    .insert(db)
+    .await?;
+    staged_size(db, session_id).await
+}
+
+/// The bytes a session holds, counted in the database rather than by reassembling the file.
+async fn staged_size<C: ConnectionTrait>(db: &C, session_id: Uuid) -> AppResult<usize> {
+    let bytes = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COALESCE(SUM(octet_length(chunk)), 0)::bigint AS n \
+             FROM csv_import_chunks WHERE session_id = $1",
+            [session_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::Internal("the chunk size query returned no row".to_string()))?;
+    let n: i64 = bytes.try_get("", "n")?;
+    Ok(usize::try_from(n).unwrap_or(0))
+}
+
+/// The file a session holds, its chunks in the order they arrived.
+pub async fn staged_text<C: ConnectionTrait>(db: &C, session_id: Uuid) -> AppResult<String> {
+    let rows = import_chunk::Entity::find()
+        .filter(import_chunk::Column::SessionId.eq(session_id))
+        .order_by_asc(import_chunk::Column::Seq)
+        .all(db)
+        .await?;
+    if rows.is_empty() {
+        return Err(AppError::BadRequest(
+            "Staging session expired or not found, re-upload the file".to_string(),
+        ));
+    }
+    let mut text = String::with_capacity(rows.iter().map(|r| r.chunk.len()).sum());
+    for row in rows {
+        text.push_str(&row.chunk);
+    }
+    Ok(text)
+}
+
+/// Remove the chunks of every upload older than the retention, which is what stops an abandoned
+/// one keeping its bytes forever. Returns the rows removed.
+pub async fn prune_import_sessions<C: ConnectionTrait>(db: &C) -> AppResult<u64> {
+    let cutoff = Utc::now() - chrono::Duration::minutes(IMPORT_SESSION_RETENTION_MINUTES);
+    Ok(import_chunk::Entity::delete_many()
+        .filter(import_chunk::Column::CreatedAt.lt(cutoff))
+        .exec(db)
+        .await?
+        .rows_affected)
+}
+
 /// Keys per statement. A statement is one OR-chain, and each term carries `time = $n` equality, so
 /// chunk exclusion prunes; the bound is on statement size, not on correctness.
 pub(super) const KEYS_PER_STATEMENT: usize = 500;
@@ -7774,6 +7866,57 @@ pub(super) struct ColumnMapping {
     pub(super) conversion_offset: f64,
 }
 
+/// The sites a multi-site file may name, by the two spellings a request-level `site` accepts.
+pub(super) struct SiteLookup {
+    pub(super) by_id: std::collections::HashSet<Uuid>,
+    pub(super) by_name: HashMap<String, Uuid>,
+}
+
+impl SiteLookup {
+    /// The site a cell names, or `None` for a spelling no site answers to.
+    pub(super) fn resolve(&self, cell: &str) -> Option<Uuid> {
+        let cell = cell.trim();
+        if let Ok(id) = Uuid::parse_str(cell) {
+            return self.by_id.contains(&id).then_some(id);
+        }
+        self.by_name.get(&cell.to_lowercase()).copied()
+    }
+}
+
+/// The column a file names its rows' sites in: the one the caller declared, else a header called
+/// `site_id` or `site`. A declared column the file does not carry is an error rather than a
+/// silent single-site import, which is what wrote eleven sites' rows onto the twelfth.
+pub(super) fn site_column_index(
+    headers: &[&str],
+    declared: Option<&str>,
+) -> Result<Option<usize>, String> {
+    if let Some(name) = declared {
+        return headers
+            .iter()
+            .position(|h| h.eq_ignore_ascii_case(name))
+            .map(Some)
+            .ok_or_else(|| format!("site_column '{name}' is not a column of this file"));
+    }
+    Ok(headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("site_id") || h.eq_ignore_ascii_case("site")))
+}
+
+/// The site a row belongs to: the site its own cell names, else the request's target for an empty
+/// cell. An unknown spelling belongs to no site and is reported against the row.
+pub(super) fn resolve_row_site(
+    cell: &str,
+    lookup: &SiteLookup,
+    fallback: Uuid,
+) -> Result<Uuid, String> {
+    if cell.trim().is_empty() {
+        return Ok(fallback);
+    }
+    lookup
+        .resolve(cell)
+        .ok_or_else(|| format!("No site is named '{}'", cell.trim()))
+}
+
 /// Resolve a CSV timestamp cell to an instant. `tz_offset` is the zone the operator declared for
 /// the file and applies to the naive forms only: an RFC 3339 timestamp already carries its offset
 /// and is a resolved instant, so applying the declared zone to it would shift it a second time.
@@ -8516,6 +8659,7 @@ pub(super) async fn import_tool_csv(
         tool_runs_created,
         curves: curve_plan,
         check,
+        site_imports: Vec::new(),
     })
 }
 
