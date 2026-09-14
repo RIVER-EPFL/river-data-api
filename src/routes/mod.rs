@@ -187,7 +187,7 @@ pub fn validate_optional_time_range(
         private::notifications::views::test_send,
         private::notifications::views::get_health,
         private::notifications::views::refresh_health,
-        private::events::event_stream,
+        private::events::views::event_stream,
         private::change_audit::views::list_change_audit,
         private::me::get_me,
         private::me::get_my_sites,
