@@ -1,23 +1,11 @@
--- The reference rows the migration chain used to seed, kept here so the suites that read them
--- (the tool runner's `doc` script and the calculators' constants) still have them on a database
--- that starts blank. Applied once per process by `setup_test_db`, after the migrations.
+-- The reference rows the migration chain used to seed, kept here so the suite that reads them
+-- (the tool runner's `doc` script) still has them on a database that starts blank. Applied once
+-- per process by `setup_test_db`, after the migrations. The calculators' constants are not here:
+-- the baseline seeds those (Q102).
 --
 -- Dumped from a migrated database rather than written by hand, so the script text, its normalised
 -- manifest and test-case jsonb and its content hash are exact. The script row goes in naming no
 -- version, because the version it names is inserted after it.
-
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('714f9826-4216-42f2-ad6d-b8a95899bd85', 'gas_const_r_atm', 0.0820574, 'L*atm/(mol*K)', 'Ideal gas constant (R) in L*atm/(mol*K)', '2026-09-04 12:10:27.649872+00') ON CONFLICT DO NOTHING;
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('70b877bb-dc39-4627-a01f-1828148633c0', 'h_co2_29815k', 0.034733, 'M/atm', 'Henry volatility constant for CO2 at 298.15K', '2026-09-04 12:10:27.649872+00') ON CONFLICT DO NOTHING;
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('7343056a-4178-4e76-9b90-60e90cd687c6', 'c_const', 2400, 'K', 'Constant C of van''t Hoff equation (K)', '2026-09-04 12:10:27.649872+00') ON CONFLICT DO NOTHING;
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('697c695c-fab5-47e9-ad15-6ea4a35c1a72', 'vol_sa', 0.03, 'L', 'Volume of SA in syringe', '2026-09-04 12:10:27.898738+00') ON CONFLICT DO NOTHING;
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('f8c8b614-46c2-425d-87f2-5d99159311a4', 'vol_water', 0.03, 'L', 'Volume of water in syringe', '2026-09-04 12:10:27.898738+00') ON CONFLICT DO NOTHING;
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('377d50b9-75d5-4710-b2a8-1ea2c7b1a60a', 'lab_press_avg_atm', 0.957237, 'atm', 'Lab pressure (average of past years)', '2026-09-04 12:10:27.898738+00') ON CONFLICT DO NOTHING;
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('7f40c736-07dc-49a5-960e-260df897f793', 'lab_temp_avg_degC', 22.5, 'degC', 'Lab temp (average of past years)', '2026-09-04 12:10:27.898738+00') ON CONFLICT DO NOTHING;
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('22fede87-6784-4478-8cbf-bcc8e8ed4495', 'h_ch4_29815k', 0.00213, 'M/atm', 'Henry constant for CH4 at 298.15K', '2026-09-04 12:10:27.898738+00') ON CONFLICT DO NOTHING;
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('89eb1e90-2790-457f-bd91-43098934b44e', 'gas_const_r_mol', 8.31446, 'J/(K*mol)', 'Ideal gas constant (R) in J/(K*mol)', '2026-09-04 12:10:27.649872+00') ON CONFLICT DO NOTHING;
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('57db1913-d35d-41ec-ad26-d20ce46b4564', 'vial_volume', 12.168, 'mL', 'Max DIC vial volume', '2026-09-04 12:10:27.649872+00') ON CONFLICT DO NOTHING;
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('05a58e95-b3e5-46c5-aa8b-629ef217912a', 'h3po4_added', 0.3, 'mL', 'Volume of added H3PO4', '2026-09-04 12:10:27.649872+00') ON CONFLICT DO NOTHING;
-INSERT INTO public.constants (id, name, value, units, description, created_at) VALUES ('f3844df4-b718-4f45-a011-f588ed900c2c', 'ch4_in_sa', 2e-06, NULL, 'Fraction of CH4 in standard air (dimensionless)', '2026-09-04 12:10:27.649872+00') ON CONFLICT DO NOTHING;
 
 INSERT INTO public.tool_scripts (id, name, label, description, active_version_id, created_by, created_at, updated_at, enabled, engine, parameter_group_id) VALUES ('8183564e-05b4-4956-89d4-c8013cca066f', 'doc', 'DOC', 'Dissolved organic carbon: the analyser replicates are stored as readings, corrected through the chosen standard curve, and their mean and standard deviation are the served DOC.', NULL, 'seed', '2026-09-04 12:10:27.924083+00', '2026-09-04 12:10:27.924083+00', true, 'script', NULL) ON CONFLICT DO NOTHING;
 

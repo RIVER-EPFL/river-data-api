@@ -4,8 +4,8 @@ use sea_orm_migration::prelude::*;
 ///
 /// The schema below was generated from a fully migrated database rather than written by hand, and
 /// verified byte-identical to the chain it replaces with `scripts/dbdiff.sh` (public DDL, all 20
-/// TimescaleDB objects, per-table content hashes). It creates the schema and nothing else: a
-/// database starts blank, and every parameter, constant, tool script and instrument arrives
+/// TimescaleDB objects, per-table content hashes). It creates the schema and seeds the twelve
+/// portal constants below and nothing else: every parameter, tool script and instrument arrives
 /// through the plan or the form an operator validates (Q134).
 ///
 /// The migrations this folds in are deleted, not kept, and each flattening names the commit that
@@ -1901,12 +1901,43 @@ SELECT add_continuous_aggregate_policy('readings_monthly',
 
 "#;
 
+/// The twelve constants `calculation_functions.R` reads by name, with the values, units and
+/// descriptions of the CNET portal dump.
+///
+/// Q102's exception to Q134's blank database: an author writing `calcCO2` reaches for
+/// `gas_const_r_atm` and `h_co2_29815k` in the formula palette, and with no rows behind it the
+/// numbers go into the formula as bare literals pinned to that version. The ids are the dump's, so
+/// every deployment names the same constant by the same id, and `tests/tools/constants_parity.rs`
+/// holds the rows to the dump.
+///
+/// Idempotent on `constants_name_key`, so an operator's edit survives a re-run.
+const CONSTANTS_SEED: &str = r#"
+INSERT INTO public.constants (id, name, value, units, description) VALUES
+    ('714f9826-4216-42f2-ad6d-b8a95899bd85', 'gas_const_r_atm', 0.0820574, 'L*atm/(mol*K)', 'Ideal gas constant (R) in L*atm/(mol*K)'),
+    ('70b877bb-dc39-4627-a01f-1828148633c0', 'h_co2_29815k', 0.034733, 'M/atm', 'Henry volatility constant for CO2 at 298.15K'),
+    ('7343056a-4178-4e76-9b90-60e90cd687c6', 'c_const', 2400, 'K', 'Constant C of van''t Hoff equation (K)'),
+    ('697c695c-fab5-47e9-ad15-6ea4a35c1a72', 'vol_sa', 0.03, 'L', 'Volume of SA in syringe'),
+    ('f8c8b614-46c2-425d-87f2-5d99159311a4', 'vol_water', 0.03, 'L', 'Volume of water in syringe'),
+    ('377d50b9-75d5-4710-b2a8-1ea2c7b1a60a', 'lab_press_avg_atm', 0.957237, 'atm', 'Lab pressure (average of past years)'),
+    ('7f40c736-07dc-49a5-960e-260df897f793', 'lab_temp_avg_degC', 22.5, 'degC', 'Lab temp (average of past years)'),
+    ('22fede87-6784-4478-8cbf-bcc8e8ed4495', 'h_ch4_29815k', 0.00213, 'M/atm', 'Henry constant for CH4 at 298.15K'),
+    ('89eb1e90-2790-457f-bd91-43098934b44e', 'gas_const_r_mol', 8.31446, 'J/(K*mol)', 'Ideal gas constant (R) in J/(K*mol)'),
+    ('57db1913-d35d-41ec-ad26-d20ce46b4564', 'vial_volume', 12.168, 'mL', 'Max DIC vial volume'),
+    ('05a58e95-b3e5-46c5-aa8b-629ef217912a', 'h3po4_added', 0.3, 'mL', 'Volume of added H3PO4'),
+    ('f3844df4-b718-4f45-a011-f588ed900c2c', 'ch4_in_sa', 2e-06, NULL, 'Fraction of CH4 in standard air (dimensionless)')
+ON CONFLICT (name) DO NOTHING
+"#;
+
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .get_connection()
             .execute_unprepared(BASELINE)
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(CONSTANTS_SEED)
             .await?;
         Ok(())
     }
