@@ -131,7 +131,10 @@ fn test_every_cnet_formula_set_reproduces_its_golden_visit() {
         let name = calculation["name"].as_str().expect("name");
         let formulas: Vec<PinnedFormula> =
             serde_json::from_value(calculation["formulas"].clone()).expect("a stored formula set");
-        manifest_json(name, None, &formulas).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let replicated = replicated_codes(calculation);
+        let manifest = manifest_json(name, None, &formulas, &replicated)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_declares_every_family(name, &manifest, &formulas, &replicated);
         for case in calculation["cases"].as_array().expect("cases") {
             let context = format!("{name}, {}", case["name"].as_str().unwrap_or(""));
             let tolerance = case["tolerance"].as_f64().unwrap_or(DEFAULT_TOLERANCE);
@@ -167,6 +170,53 @@ fn test_every_cnet_formula_set_names_only_declared_constants() {
                 declared.contains_key(&constant),
                 "{}: {constant} is not a constant the portal carries",
                 calculation["name"]
+            );
+        }
+    }
+}
+
+/// The codes a set's golden cases supply several values of. Replicate-ness is the parameter's, so
+/// this stands in for the group's member rows.
+fn replicated_codes(calculation: &serde_json::Value) -> Vec<String> {
+    let mut codes: Vec<String> = Vec::new();
+    for case in calculation["cases"].as_array().into_iter().flatten() {
+        for (code, _) in case["replicates"].as_object().into_iter().flatten() {
+            if !codes.contains(code) {
+                codes.push(code.clone());
+            }
+        }
+    }
+    codes
+}
+
+/// Every family a formula walks is declared as the family, not as one number, whichever formula
+/// drives the walk: three of the six sets read a second family at the same letter.
+fn assert_declares_every_family(
+    name: &str,
+    manifest: &serde_json::Value,
+    formulas: &[PinnedFormula],
+    replicated: &[String],
+) {
+    let params = manifest["params"].as_array().expect("params");
+    for formula in formulas.iter().filter(|f| f.per_replicate.is_some()) {
+        for (_, code) in &formula.sources {
+            if !replicated.iter().any(|c| c == code) {
+                continue;
+            }
+            let declared = params
+                .iter()
+                .find(|p| p["parameter_code"].as_str() == Some(code.as_str()));
+            let declared = declared.unwrap_or_else(|| {
+                panic!(
+                    "{name}: {code} is walked by {} and is in no param: {manifest}",
+                    formula.code
+                )
+            });
+            assert_eq!(
+                declared["kind"], "replicates",
+                "{name}: {code} is entered several times and walked by {}, so the run carries the \
+                 family rather than one number: {declared}",
+                formula.code
             );
         }
     }

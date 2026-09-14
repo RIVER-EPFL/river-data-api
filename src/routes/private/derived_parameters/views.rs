@@ -26,6 +26,7 @@ use crate::common::scope::require_named_target;
 use crate::common::scope::require_sites_in_scope;
 use crate::error::AppError;
 use crate::error::AppResult;
+use crate::routes::private::derived_parameters::models::StepDependents;
 use crate::routes::private::readings;
 use crate::routes::private::readings::samples::models as samples;
 use crate::routes::private::reprocessing_jobs::models::QueuedJobResponse;
@@ -415,6 +416,32 @@ pub async fn preview_derived(
             errors: derived_errors,
         },
     }))
+}
+
+// --- What a step feeds ---
+
+/// Every calculation that reads this step, and the formulas inside each that name it (M208). A
+/// step mints no catalog parameter, so the parameter graph cannot answer this. Requires
+/// `read_data`.
+#[utoipa::path(
+    get,
+    path = "/api/derived_parameters/{id}/dependents",
+    params(("id" = Uuid, Path, description = "Formula UUID")),
+    responses(
+        (status = 200, description = "The calculations and formulas that read the step", body = StepDependents),
+        (status = 404, description = "No formula carries that id"),
+    ),
+    tag = "derived_parameters"
+)]
+pub async fn step_dependents(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<StepDependents>> {
+    let dependents =
+        crate::routes::private::derived_parameters::service::dependents_of_step(&state.db, id)
+            .await
+            .map_err(AppError::from)?;
+    Ok(Json(dependents))
 }
 
 // --- Recompute one definition ---

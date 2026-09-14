@@ -68,7 +68,9 @@ async fn is_standalone<C: ConnectionTrait>(db: &C, definition_id: Uuid) -> Resul
         .one(db)
         .await
         .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-    Ok(row.is_some_and(|d| d.tool_script_id.is_none()))
+    // A shared step also belongs to no calculation (Q156), and is not the continuous kind: it
+    // mints no parameter and the derived job has nothing of it to serve.
+    Ok(row.is_some_and(|d| d.tool_script_id.is_none() && !d.intermediate))
 }
 
 pub(crate) fn validate_formula(formula: &str) -> Result<(), ApiError> {
@@ -109,6 +111,224 @@ pub(crate) async fn resolve_variables<C: ConnectionTrait>(
     resolve_identifiers(db, &names).await
 }
 
+// --- Shared steps (Q156) ---
+
+/// What declaring a shared step does to the step's own row.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Promotion {
+    /// The step is owned by no calculation already: only the new declaration is written.
+    AlreadyShared,
+    /// The step was one calculation's own: it is released, and that calculation keeps reading it
+    /// through a declaration of its own.
+    Release { previous_owner: Uuid },
+}
+
+/// Whether a calculation may declare this step, and what the declaration does to its ownership.
+///
+/// A step the declaring calculation already owns is refused: releasing it would take the step out
+/// of the set that computes it and put it back through the declaration, which is a rename of the
+/// same state and reads as a mistake rather than a sharing.
+pub(crate) fn promotion(owner: Option<Uuid>, declaring: Uuid) -> Result<Promotion, String> {
+    match owner {
+        None => Ok(Promotion::AlreadyShared),
+        Some(owner) if owner == declaring => Err(
+            "This calculation already computes that step; a declaration is for a step another \
+             calculation wrote"
+                .to_string(),
+        ),
+        Some(previous_owner) => Ok(Promotion::Release { previous_owner }),
+    }
+}
+
+/// The steps a calculation reads through a declaration, as the formula rows themselves.
+pub(crate) async fn declared_steps<C: ConnectionTrait>(
+    db: &C,
+    tool_script_id: Uuid,
+) -> Result<Vec<super::models::definition::Model>, ApiError> {
+    let declared = super::models::shared_step::Entity::find()
+        .filter(super::models::shared_step::Column::ToolScriptId.eq(tool_script_id))
+        .all(db)
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+    if declared.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<Uuid> = declared.into_iter().map(|row| row.formula_id).collect();
+    super::models::definition::Entity::find()
+        .filter(super::models::definition::Column::Id.is_in(ids))
+        .order_by_asc(super::models::definition::Column::Ordinal)
+        .order_by_asc(super::models::definition::Column::Code)
+        .all(db)
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))
+}
+
+/// Everything that reads one step: the calculation that owns it, every calculation that declares
+/// it, and inside each, the formulas whose text names the step's code (M208). A step mints no
+/// catalog parameter, so it cannot be asked about through the parameter graph.
+pub async fn dependents_of_step<C: ConnectionTrait>(
+    db: &C,
+    formula_id: Uuid,
+) -> Result<super::models::StepDependents, ApiError> {
+    let step = super::models::definition::Entity::find_by_id(formula_id)
+        .one(db)
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?
+        .ok_or_else(|| ApiError::not_found("No formula carries that id".to_string(), None))?;
+
+    let declared = super::models::shared_step::Entity::find()
+        .filter(super::models::shared_step::Column::FormulaId.eq(formula_id))
+        .all(db)
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+
+    let mut script_ids: Vec<Uuid> = step.tool_script_id.into_iter().collect();
+    for declaration in &declared {
+        if !script_ids.contains(&declaration.tool_script_id) {
+            script_ids.push(declaration.tool_script_id);
+        }
+    }
+
+    let scripts = crate::routes::private::tools::models::script::Entity::find()
+        .filter(crate::routes::private::tools::models::script::Column::Id.is_in(script_ids.clone()))
+        .all(db)
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+    let formulas = crate::routes::private::tools::service::load_formulas(db, &script_ids)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string(), None))?;
+
+    let mut calculations = Vec::with_capacity(script_ids.len());
+    for script_id in script_ids {
+        let Some(script) = scripts.iter().find(|s| s.id == script_id) else {
+            continue;
+        };
+        let readers = formulas
+            .iter()
+            .filter(|(owner, formula)| {
+                *owner == script_id
+                    && formula.code != step.code
+                    && free_identifiers(&formula.formula).contains(&step.code)
+            })
+            .map(|(_, formula)| super::models::StepReader {
+                code: formula.code.clone(),
+                formula: formula.formula.clone(),
+            })
+            .collect();
+        calculations.push(super::models::StepDependent {
+            tool_script_id: script_id,
+            name: script.name.clone(),
+            label: script.label.clone(),
+            owns: step.tool_script_id == Some(script_id),
+            formulas: readers,
+        });
+    }
+
+    Ok(super::models::StepDependents {
+        formula_id,
+        code: step.code,
+        shared: step.tool_script_id.is_none(),
+        calculations,
+    })
+}
+
+pub struct SharedStepOperations;
+
+impl CRUDOperations for SharedStepOperations {
+    type Resource = super::models::shared_step::CalculationSharedStep;
+
+    /// A declaration names a step: a formula that computes an intermediate value and is not some
+    /// calculation's output. What it does to the step's ownership is decided here and applied
+    /// after the row lands.
+    async fn before_create<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        data: &<Self::Resource as CRUDResource>::CreateModel,
+    ) -> Result<(), ApiError> {
+        let step = super::models::definition::Entity::find_by_id(data.formula_id)
+            .one(db)
+            .await
+            .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?
+            .ok_or_else(|| ApiError::bad_request("No formula carries that id".to_string()))?;
+        if !step.intermediate {
+            return Err(ApiError::bad_request(format!(
+                "Formula '{}' is an output, not a step; a calculation reads an output as a \
+                 parameter",
+                step.code
+            )));
+        }
+        promotion(step.tool_script_id, data.tool_script_id).map_err(ApiError::bad_request)?;
+        Ok(())
+    }
+
+    /// The step becomes nobody's, and the calculation that wrote it keeps reading it the same way
+    /// the declaring one now does.
+    async fn after_create<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        entity: &mut Self::Resource,
+    ) -> Result<(), ApiError> {
+        let step = super::models::definition::Entity::find_by_id(entity.formula_id)
+            .one(db)
+            .await
+            .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?
+            .ok_or_else(|| ApiError::bad_request("No formula carries that id".to_string()))?;
+        let Promotion::Release { previous_owner } =
+            promotion(step.tool_script_id, entity.tool_script_id).map_err(ApiError::bad_request)?
+        else {
+            return Ok(());
+        };
+        release_step(db, entity.formula_id).await?;
+        declare_step(db, previous_owner, entity.formula_id).await?;
+        // Both calculations' pinned sets changed shape, so their versions are re-minted.
+        crate::routes::private::tools::service::mint_stale_formula_versions(db, None)
+            .await
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Take a step out of the calculation that wrote it: a shared step is owned by none.
+async fn release_step<C: ConnectionTrait>(db: &C, formula_id: Uuid) -> Result<(), ApiError> {
+    super::models::definition::Entity::update_many()
+        .col_expr(
+            super::models::definition::Column::ToolScriptId,
+            sea_orm::sea_query::Expr::value(Option::<Uuid>::None),
+        )
+        .filter(super::models::definition::Column::Id.eq(formula_id))
+        .exec(db)
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+    Ok(())
+}
+
+/// One calculation's reading of a shared step, written once however often it is asked for.
+async fn declare_step<C: ConnectionTrait>(
+    db: &C,
+    tool_script_id: Uuid,
+    formula_id: Uuid,
+) -> Result<(), ApiError> {
+    super::models::shared_step::Entity::insert(super::models::shared_step::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tool_script_id: Set(tool_script_id),
+        formula_id: Set(formula_id),
+        ..Default::default()
+    })
+    .on_conflict(
+        sea_orm::sea_query::OnConflict::columns([
+            super::models::shared_step::Column::ToolScriptId,
+            super::models::shared_step::Column::FormulaId,
+        ])
+        .do_nothing()
+        .to_owned(),
+    )
+    .try_insert()
+    .exec(db)
+    .await
+    .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+    Ok(())
+}
+
 /// What a formula is resolved in: the calculation whose earlier steps it may read, and the curve
 /// slot that binds its coefficients.
 pub(crate) struct FormulaContext<'a> {
@@ -117,9 +337,10 @@ pub(crate) struct FormulaContext<'a> {
     pub curve_slot: Option<&'a str>,
 }
 
-/// The codes of the calculation's other intermediates. A step stores nothing and mints no
-/// parameter, so its code names no reading: it reaches the formulas after it from the run, and
-/// recording it as a source would send the evaluation looking for a value the visit never holds.
+/// The codes of the steps this formula may read: the calculation's own intermediates and the
+/// shared steps it declares. A step stores nothing and mints no parameter, so its code names no
+/// reading: it reaches the formulas after it from the run, and recording it as a source would send
+/// the evaluation looking for a value the visit never holds.
 async fn steps_of<C: ConnectionTrait>(
     db: &C,
     context: &FormulaContext<'_>,
@@ -127,14 +348,20 @@ async fn steps_of<C: ConnectionTrait>(
     let Some(tool_script_id) = context.tool_script_id else {
         return Ok(Vec::new());
     };
-    super::models::definition::Entity::find()
+    let mut codes: Vec<String> = super::models::definition::Entity::find()
         .filter(super::models::definition::Column::ToolScriptId.eq(tool_script_id))
         .filter(super::models::definition::Column::Intermediate.eq(true))
         .filter(super::models::definition::Column::Code.ne(context.code))
         .all(db)
         .await
         .map(|rows| rows.into_iter().map(|row| row.code).collect())
-        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+    for step in declared_steps(db, tool_script_id).await? {
+        if step.code != context.code && !codes.contains(&step.code) {
+            codes.push(step.code);
+        }
+    }
+    Ok(codes)
 }
 
 /// The identifiers a formula reads, minus the two its curve slot binds.

@@ -318,6 +318,7 @@ pub fn validate_optional_time_range(
         private::derived_parameters::views::preview_derived,
         private::sensor_calibrations::views::recalculate_calibration,
         private::derived_parameters::views::recompute_derived,
+        private::derived_parameters::views::step_dependents,
         private::site_parameters::views::merge_site_parameters_handler,
         private::parameter_groups::views::group_definition,
         private::parameter_groups::views::declare_intermediates,

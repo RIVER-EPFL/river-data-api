@@ -2932,6 +2932,100 @@
         ],
         "type": "object"
       },
+      "CalculationSharedStepCreate": {
+        "properties": {
+          "formula_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "tool_script_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool_script_id",
+          "formula_id"
+        ],
+        "type": "object"
+      },
+      "CalculationSharedStepList": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "formula_id": {
+            "description": "The step it reads, which is a formula row owned by no calculation.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "tool_script_id": {
+            "description": "The calculation that reads the step.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tool_script_id",
+          "formula_id",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "CalculationSharedStepResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "formula_id": {
+            "description": "The step it reads, which is a formula row owned by no calculation.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "tool_script_id": {
+            "description": "The calculation that reads the step.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tool_script_id",
+          "formula_id",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "CalculationSharedStepUpdate": {
+        "properties": {
+          "formula_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool_script_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "CalibrationBackfillCandidate": {
         "properties": {
           "earliest_calibration_from": {
@@ -22975,6 +23069,67 @@
         ],
         "type": "object"
       },
+      "StationCandidate": {
+        "description": "One station offered to a picker: what the list holds, plus how far it is from the site being\nconfigured where that site has coordinates.",
+        "properties": {
+          "data_since": {
+            "format": "date",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "distance_km": {
+            "description": "Great-circle distance from the site, absent where either end has no coordinates.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "height_barometer_masl": {
+            "description": "The elevation the barometer sits at, which a station reporting no pressure leaves empty.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "height_masl": {
+            "description": "The station's own elevation, which every published station carries.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "latitude": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "longitude": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "station_abbr": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "station_abbr",
+          "name"
+        ],
+        "type": "object"
+      },
       "StatisticsResponse": {
         "properties": {
           "end": {
@@ -23090,6 +23245,84 @@
           "site",
           "events",
           "total"
+        ],
+        "type": "object"
+      },
+      "StepDependent": {
+        "description": "What a step feeds: one calculation that computes it, and the formulas inside that calculation\nwhose text reads the step's code.",
+        "properties": {
+          "formulas": {
+            "items": {
+              "$ref": "#/components/schemas/StepReader"
+            },
+            "type": "array"
+          },
+          "label": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "owns": {
+            "description": "Whether the calculation owns the step, rather than declaring one owned by nobody.",
+            "type": "boolean"
+          },
+          "tool_script_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool_script_id",
+          "name",
+          "label",
+          "owns",
+          "formulas"
+        ],
+        "type": "object"
+      },
+      "StepDependents": {
+        "description": "Everything that reads one step, which is what its page shows before its expression is edited.",
+        "properties": {
+          "calculations": {
+            "items": {
+              "$ref": "#/components/schemas/StepDependent"
+            },
+            "type": "array"
+          },
+          "code": {
+            "type": "string"
+          },
+          "formula_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "shared": {
+            "description": "True when the step belongs to no calculation, which is what makes it shareable (Q156).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "formula_id",
+          "code",
+          "shared",
+          "calculations"
+        ],
+        "type": "object"
+      },
+      "StepReader": {
+        "description": "One formula that reads the step.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "formula": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "formula"
         ],
         "type": "object"
       },
@@ -28377,6 +28610,494 @@
         "summary": "Get one api_token_audit_log"
       }
     },
+    "/api/calculation_shared_steps": {
+      "get": {
+        "description": "Retrieves all calculation_shared_steps.\n\nThis resource manages calculation_shared_step items\n\nAdditional sortable columns: \n- tool_script_id\n- formula_id\n- created_at.\n\nAdditional filterable columns: \n- tool_script_id\n- formula_id.",
+        "operationId": "get_all_calculation_shared_steps",
+        "parameters": [
+          {
+            "description": "JSON-encoded filter for querying resources.\n\nThis parameter supports various filtering options:\n- Free text search: `{\"q\": \"search text\"}`\n- Filtering by a single ID: `{\"id\": \"550e8400-e29b-41d4-a716-446655440000\"}`\n- Filtering by multiple IDs: `{\"id\": [\"550e8400-e29b-41d4-a716-446655440000\", \"550e8400-e29b-41d4-a716-446655440001\"]}`\n- Filtering on other columns: `{\"name\": \"example\"}`",
+            "example": {
+              "id": "550e8400-e29b-41d4-a716-446655440000",
+              "name": "example",
+              "q": "search text"
+            },
+            "in": "query",
+            "name": "filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Range for pagination in the format \"[start, end]\".\n\nExample: `[0,9]`",
+            "example": "[0,9]",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number for standard REST pagination (1-based).\n\nExample: `1`",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page for standard REST pagination.\n\nExample: `10`",
+            "example": 10,
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Sort order for the results in the format `[\"column\", \"order\"]`.\n\nExample: `[\"id\", \"ASC\"]`",
+            "example": "[\"id\", \"ASC\"]",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort column for standard REST format.\n\nExample: `title`",
+            "example": "title",
+            "in": "query",
+            "name": "sort_by",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Sort order for standard REST format (ASC or DESC).\n\nExample: `ASC`",
+            "example": "ASC",
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/CalculationSharedStepList"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "List of resources"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get all calculation_shared_steps"
+      },
+      "post": {
+        "description": "Creates a new calculation_shared_step.\n\nThis resource manages calculation_shared_step items",
+        "operationId": "create_one_calculation_shared_step",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CalculationSharedStepCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalculationSharedStepResponse"
+                }
+              }
+            },
+            "description": "Resource created successfully"
+          },
+          "409": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Duplicate record"
+          }
+        },
+        "summary": "Create one calculation_shared_step"
+      }
+    },
+    "/api/calculation_shared_steps/batch": {
+      "delete": {
+        "description": "Deletes many calculation_shared_steps by their IDs and returns array of deleted UUIDs.\n\nUse `?partial=true` for partial success mode (deletes valid items even if some fail).\n\nThis resource manages calculation_shared_step items",
+        "operationId": "delete_many_calculation_shared_steps",
+        "parameters": [
+          {
+            "description": "Enable partial success mode for batch operations.\n\nWhen `true`, the operation processes each item independently instead of\nusing all-or-nothing semantics. Items that succeed are committed even if\nother items fail.\n\nDefault: `false` (all-or-nothing)",
+            "example": false,
+            "in": "query",
+            "name": "partial",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Resources deleted successfully"
+          },
+          "207": {
+            "description": "Partial success - some items deleted, some failed"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Bad request - batch size exceeded"
+          },
+          "500": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Delete many calculation_shared_steps"
+      },
+      "patch": {
+        "description": "Updates multiple calculation_shared_steps in a batch. Limited to 100 items per request.\n\nUse `?partial=true` for partial success mode (commits successful items even if some fail).\n\nThis resource manages calculation_shared_step items",
+        "operationId": "update_many_calculation_shared_steps",
+        "parameters": [
+          {
+            "description": "Enable partial success mode for batch operations.\n\nWhen `true`, the operation processes each item independently instead of\nusing all-or-nothing semantics. Items that succeed are committed even if\nother items fail.\n\nDefault: `false` (all-or-nothing)",
+            "example": false,
+            "in": "query",
+            "name": "partial",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "$ref": "#/components/schemas/BatchUpdateRequest"
+                },
+                "type": "array"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/CalculationSharedStepResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Resources updated successfully"
+          },
+          "207": {
+            "description": "Partial success - some items updated, some failed"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Bad request - batch size exceeded or validation failed"
+          },
+          "404": {
+            "description": "One or more resources not found"
+          },
+          "409": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Duplicate record"
+          },
+          "500": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Update many calculation_shared_steps"
+      },
+      "post": {
+        "description": "Creates multiple calculation_shared_steps in a batch. Limited to 100 items per request.\n\nUse `?partial=true` for partial success mode (commits successful items even if some fail).\n\nThis resource manages calculation_shared_step items",
+        "operationId": "create_many_calculation_shared_steps",
+        "parameters": [
+          {
+            "description": "Enable partial success mode for batch operations.\n\nWhen `true`, the operation processes each item independently instead of\nusing all-or-nothing semantics. Items that succeed are committed even if\nother items fail.\n\nDefault: `false` (all-or-nothing)",
+            "example": false,
+            "in": "query",
+            "name": "partial",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "items": {
+                  "$ref": "#/components/schemas/CalculationSharedStepCreate"
+                },
+                "type": "array"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/CalculationSharedStepResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Resources created successfully"
+          },
+          "207": {
+            "description": "Partial success - some items created, some failed"
+          },
+          "400": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Bad request - batch size exceeded or validation failed"
+          },
+          "409": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Duplicate record"
+          },
+          "500": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Create many calculation_shared_steps"
+      }
+    },
+    "/api/calculation_shared_steps/{id}": {
+      "delete": {
+        "description": "Deletes one calculation_shared_step by its ID.\n\nThis resource manages calculation_shared_step items",
+        "operationId": "delete_one_calculation_shared_step",
+        "parameters": [
+          {
+            "description": "Resource identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Resource deleted successfully"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Delete one calculation_shared_step"
+      },
+      "get": {
+        "description": "Retrieves one calculation_shared_step by its ID.\n\nThis resource manages calculation_shared_step items",
+        "operationId": "get_one_calculation_shared_step",
+        "parameters": [
+          {
+            "description": "Resource identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalculationSharedStepResponse"
+                }
+              }
+            },
+            "description": "The requested resource"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "500": {
+            "description": "Internal Server Error"
+          }
+        },
+        "summary": "Get one calculation_shared_step"
+      },
+      "put": {
+        "description": "Updates one calculation_shared_step by its ID.\n\nThis resource manages calculation_shared_step items",
+        "operationId": "update_one_calculation_shared_step",
+        "parameters": [
+          {
+            "description": "Resource identifier",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CalculationSharedStepUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalculationSharedStepResponse"
+                }
+              }
+            },
+            "description": "Resource updated successfully"
+          },
+          "404": {
+            "description": "Resource not found"
+          },
+          "409": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Duplicate record"
+          }
+        },
+        "summary": "Update one calculation_shared_step"
+      }
+    },
     "/api/calculations/closure": {
       "get": {
         "operationId": "get_calculation_closure",
@@ -31253,6 +31974,42 @@
         "summary": "Update one calculation_formula"
       }
     },
+    "/api/derived_parameters/{id}/dependents": {
+      "get": {
+        "operationId": "step_dependents",
+        "parameters": [
+          {
+            "description": "Formula UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StepDependents"
+                }
+              }
+            },
+            "description": "The calculations and formulas that read the step"
+          },
+          "404": {
+            "description": "No formula carries that id"
+          }
+        },
+        "summary": "Every calculation that reads this step, and the formulas inside each that name it (M208). A\nstep mints no catalog parameter, so the parameter graph cannot answer this. Requires\n`read_data`.",
+        "tags": [
+          "derived_parameters"
+        ]
+      }
+    },
     "/api/events": {
       "get": {
         "operationId": "event_stream",
@@ -31584,6 +32341,57 @@
         "summary": "`GET /api/me/sites`, the caller's visible sites as a project → subproject → site tree, for the\nsidebar site navigator. Same visibility rule the CRUD scope filter enforces on `/api/sites`:\nadministrators see every project, other members see exactly their grant set. Keycloak-only,\nlike `/api/me`. Projects and subprojects without sites are omitted.",
         "tags": [
           "me"
+        ]
+      }
+    },
+    "/api/meteoswiss/stations": {
+      "get": {
+        "operationId": "list_stations",
+        "parameters": [
+          {
+            "description": "Part of an abbreviation or a name. Absent lists every station.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "The site being configured, whose coordinates rank the candidates.",
+            "in": "query",
+            "name": "site_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/StationCandidate"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Candidate stations, nearest first"
+          }
+        },
+        "summary": "The stations a site may subscribe to, nearest first. Requires `read_metadata`.",
+        "tags": [
+          "meteoswiss"
         ]
       }
     },

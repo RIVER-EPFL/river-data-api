@@ -32,7 +32,7 @@ use super::service::{
     canonical_hash, check_engine, check_manifest_against_catalog, check_manifest_codes_resolve,
     closure_subject, coverage_for, find_active_tool, lint_script, list_active_tools,
     load_parameter_catalog, load_script, load_version, manifest_finding, manifest_json,
-    normalise_name, render, run_stored_cases, run_tool_body, runner_runtime,
+    normalise_name, render, replicated_for, run_stored_cases, run_tool_body, runner_runtime,
     stored_version_content,
 };
 use crate::common::AppState;
@@ -499,8 +499,14 @@ pub async fn draft_run_formulas(
         )));
     }
     let formulas = pin_draft_formulas(&state.db, &payload.formulas).await?;
-    let manifest_value = manifest_json(&script.label, script.description.as_deref(), &formulas)
-        .map_err(AppError::BadRequest)?;
+    let replicated = replicated_for(&state.db, script.parameter_group_id).await?;
+    let manifest_value = manifest_json(
+        &script.label,
+        script.description.as_deref(),
+        &formulas,
+        &replicated,
+    )
+    .map_err(AppError::BadRequest)?;
     let manifest = parse_manifest(&manifest_value)
         .map_err(|e| AppError::BadRequest(format!("invalid manifest: {e}")))?;
     let body = render(&formulas).map_err(AppError::BadRequest)?;

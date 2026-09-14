@@ -8,6 +8,7 @@
 //!
 //! Run: cargo test --test tools cnet_authoring -- --test-threads=1
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 use sea_orm::DatabaseConnection;
@@ -25,13 +26,10 @@ const DEFAULT_TOLERANCE: f64 = 2e-5;
 const AT: &str = "2025-07-03T09:00:00Z";
 
 /// What the authoring surface cannot yet carry, and the refusal it must still produce. An entry
-/// whose set stops being refused fails this test, which is how it leaves: Q156 takes `pco2` out,
-/// and Q155 `nutrients` and `dic`.
-const BLOCKED: &[(&str, Stage, &str)] = &[
-    ("pco2", Stage::Save, "already exists"),
-    ("nutrients", Stage::Run, "must be number"),
-    ("dic", Stage::Run, "must be number"),
-];
+/// whose set stops being refused fails this test, which is how it leaves: `nutrients` and `dic`
+/// left when the manifest took a source's kind from the group that declares it replicated (Q155),
+/// and `pco2` left when a step could belong to no one calculation (Q156).
+const BLOCKED: &[(&str, Stage, &str)] = &[];
 
 /// Where a blocked set is refused: saving a formula, or running the set at the visit.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -95,6 +93,27 @@ async fn in_catalog(app: &axum::Router, code: &str, admin: &str) -> bool {
     })
 }
 
+/// The stored formula of this code, if one exists: what a declaration names.
+async fn step_id(app: &axum::Router, code: &str, admin: &str) -> Option<String> {
+    let filter = crate::common::e2e::percent_encode(&json!({ "code": code }).to_string());
+    let (status, body) = crate::common::get_json_with_token(
+        app,
+        &format!("/api/derived_parameters?filter={filter}"),
+        admin,
+    )
+    .await;
+    assert_eq!(status, 200, "GET /api/derived_parameters: {body}");
+    body.as_array()?
+        .iter()
+        .find(|row| {
+            row["code"]
+                .as_str()
+                .is_some_and(|c| c.eq_ignore_ascii_case(code))
+        })
+        .and_then(|row| row["id"].as_str())
+        .map(str::to_string)
+}
+
 fn id_of(created: &Value) -> String {
     created["id"]
         .as_str()
@@ -120,6 +139,21 @@ fn close(got: f64, want: f64, tolerance: f64) -> bool {
     (got - want).abs() <= tolerance * want.abs().max(1.0)
 }
 
+/// The codes the set's golden cases supply several values of, and how many. Replicate-ness is a
+/// property of the parameter in its group, so this is what the member row declares and what the
+/// manifest then reads to offer the family rather than one number (Q155).
+fn replicate_counts(calculation: &Value) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for case in calculation["cases"].as_array().into_iter().flatten() {
+        for (code, values) in case["replicates"].as_object().into_iter().flatten() {
+            let n = values.as_array().map_or(0, Vec::len);
+            let seen = counts.entry(code.clone()).or_default();
+            *seen = (*seen).max(n);
+        }
+    }
+    counts
+}
+
 /// Author one set exactly as the calculation page does: the group, the catalog parameters it
 /// reads, the intermediates it computes, the calculation itself, then a formula at a time.
 async fn author(
@@ -137,6 +171,7 @@ async fn author(
     )
     .await;
     let group_id = id_of(&group);
+    let replicated = replicate_counts(calculation);
 
     let produced: HashSet<String> = calculation["formulas"]
         .as_array()
@@ -160,18 +195,16 @@ async fn author(
         )
         .await
         {
-            post(
-                app,
-                "/api/parameter_group_members",
-                &json!({
-                    "group_id": group_id,
-                    "parameter_id": id_of(&created),
-                    "role": "measured",
-                    "ordinal": ordinal as i32,
-                }),
-                admin,
-            )
-            .await;
+            let mut member = json!({
+                "group_id": group_id,
+                "parameter_id": id_of(&created),
+                "role": "measured",
+                "ordinal": ordinal as i32,
+            });
+            if let Some(n) = replicated.get(&code) {
+                member["replicates"] = json!({ "suggested": n });
+            }
+            post(app, "/api/parameter_group_members", &member, admin).await;
         }
         known.insert(code);
     }
@@ -234,6 +267,21 @@ async fn author(
         )
         .await;
         if !(200..300).contains(&status) {
+            // A step another set already wrote is shared, not copied: this calculation declares
+            // that it reads it (Q156), which is what the page's "bring in a step" does.
+            if formula["intermediate"] == json!(true)
+                && let Some(formula_id) = step_id(app, code, admin).await
+            {
+                post(
+                    app,
+                    "/api/calculation_shared_steps",
+                    &json!({ "tool_script_id": script_id, "formula_id": formula_id }),
+                    admin,
+                )
+                .await;
+                known.insert(code.to_string());
+                continue;
+            }
             return Err(format!("{code}: {body}"));
         }
         known.insert(code.to_string());
@@ -275,7 +323,7 @@ fn site_sources(calculation: &Value) -> HashSet<String> {
 #[serial]
 async fn every_cnet_set_is_authorable_through_the_api_and_reproduces_its_golden_visit() {
     let fixture: Value = serde_json::from_str(FIXTURE).expect("the fixture parses");
-    let (_db, app, admin) = setup().await;
+    let (db, app, admin) = setup().await;
 
     for (name, value) in fixture["constants"].as_object().expect("constants") {
         post_or_find(
@@ -408,4 +456,24 @@ async fn every_cnet_set_is_authorable_through_the_api_and_reproduces_its_golden_
             );
         }
     }
+
+    // `bp` is a step of `field_data` and again of `pco2` in the fixture, which is why the set
+    // could not be authored at all before Q156. One step, owned by neither, read by both.
+    let steps = crate::common::e2e::count(
+        &db,
+        "SELECT count(*) FROM calculation_formulas \
+         WHERE code = 'bp' AND intermediate AND tool_script_id IS NULL",
+    )
+    .await;
+    assert_eq!(steps, 1, "bp is one step, owned by no calculation");
+    let readers = crate::common::e2e::count(
+        &db,
+        "SELECT count(*) FROM calculation_shared_steps s \
+         JOIN calculation_formulas f ON f.id = s.formula_id WHERE f.code = 'bp'",
+    )
+    .await;
+    assert_eq!(
+        readers, 2,
+        "field_data and pco2 each declare that they read it"
+    );
 }

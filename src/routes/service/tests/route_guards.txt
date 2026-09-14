@@ -38,6 +38,7 @@
 /commands/{id} => -
 /credentials => require_admin
 /credentials/{id}/revoke => require_admin
+/derived_parameters/{id}/dependents => require_read_data
 /enroll => -
 /events => -
 /events => require_read_data

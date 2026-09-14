@@ -393,8 +393,97 @@ pub(super) fn name_pairs(raw: &serde_json::Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// The formulas attached to the given calculations, as `(script_id, formula)` pairs.
+/// The formulas each calculation runs: the ones it owns, plus the shared steps it declares
+/// (Q156). A declared step is evaluated in every run that reads it, under its own code, because a
+/// single run has no other run's value to take.
 pub async fn load_formulas<C: ConnectionTrait>(
+    db: &C,
+    script_ids: &[Uuid],
+) -> AppResult<Vec<(Uuid, PinnedFormula)>> {
+    let mut formulas = load_own_formulas(db, script_ids).await?;
+    formulas.extend(load_declared_steps(db, script_ids).await?);
+    Ok(formulas)
+}
+
+/// A step's `(variable, parameter code)` readings and its `(variable, site column)` readings, the
+/// two shapes a `PinnedFormula` carries them in.
+type StepSources = (Vec<(String, String)>, Vec<(String, String)>);
+
+/// The steps the given calculations declare, as the same pairs their own formulas arrive in. One
+/// step declared by two calculations is one pair each.
+async fn load_declared_steps<C: ConnectionTrait>(
+    db: &C,
+    script_ids: &[Uuid],
+) -> AppResult<Vec<(Uuid, PinnedFormula)>> {
+    use crate::routes::private::derived_parameters::models::{definition, shared_step, source};
+
+    if script_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let declarations = shared_step::Entity::find()
+        .filter(shared_step::Column::ToolScriptId.is_in(script_ids.to_vec()))
+        .all(db)
+        .await?;
+    if declarations.is_empty() {
+        return Ok(Vec::new());
+    }
+    let formula_ids: Vec<Uuid> = declarations.iter().map(|d| d.formula_id).collect();
+    let steps = definition::Entity::find()
+        .filter(definition::Column::Id.is_in(formula_ids.clone()))
+        .all(db)
+        .await?;
+    let sources = source::Entity::find()
+        .filter(source::Column::DerivedDefinitionId.is_in(formula_ids))
+        .find_also_related(crate::routes::private::parameters::Entity)
+        .all(db)
+        .await?;
+
+    let mut by_formula: HashMap<Uuid, StepSources> = HashMap::new();
+    for (row, parameter) in sources {
+        let entry = by_formula.entry(row.derived_definition_id).or_default();
+        if let Some(parameter) = parameter {
+            entry.0.push((row.variable_name.clone(), parameter.code));
+        }
+        if let Some(column) = row.site_property {
+            entry.1.push((row.variable_name, column));
+        }
+    }
+    for pairs in by_formula.values_mut() {
+        pairs.0.sort();
+        pairs.1.sort();
+    }
+
+    let mut pairs = Vec::with_capacity(declarations.len());
+    for declaration in declarations {
+        let Some(step) = steps.iter().find(|s| s.id == declaration.formula_id) else {
+            continue;
+        };
+        let (sources, site_sources) = by_formula
+            .get(&step.id)
+            .cloned()
+            .unwrap_or_else(|| (Vec::new(), Vec::new()));
+        pairs.push((
+            declaration.tool_script_id,
+            PinnedFormula {
+                code: step.code.clone(),
+                label: step.name.clone(),
+                units: Some(step.units.clone()).filter(|u| !u.is_empty()),
+                formula: step.formula.clone(),
+                ordinal: step.ordinal,
+                output_parameter_code: None,
+                sources,
+                site_sources,
+                curve_slot: step.curve_slot.clone(),
+                per_replicate: step.per_replicate.clone(),
+                intermediate: step.intermediate,
+            },
+        ));
+    }
+    Ok(pairs)
+}
+
+/// The formulas the given calculations own, as `(script_id, formula)` pairs.
+async fn load_own_formulas<C: ConnectionTrait>(
     db: &C,
     script_ids: &[Uuid],
 ) -> AppResult<Vec<(Uuid, PinnedFormula)>> {
@@ -1739,10 +1828,12 @@ pub fn curve_slots(formulas: &[PinnedFormula]) -> Vec<String> {
 
 /// Formulas in the order they evaluate: producers before consumers, the same relation
 /// `dependency_order` and `build_evaluation_order` sort tools and derived parameters by. An
-/// edge A→B exists where A's output parameter is one of B's sources. `ordinal` then `code` is the
-/// tie-break among formulas nothing orders, never the order itself: it is hand-set, defaults to 0
-/// for every formula the authoring form creates, and ordering by it alone made a dependent formula
-/// read the store instead of the value just produced.
+/// edge A→B exists where A's output parameter is one of B's sources, and where A is a step whose
+/// code B names as a free identifier: a step reaches its readers under its own code and produces
+/// no parameter, so the identifier is the only thing that can order it. `ordinal` then `code` is
+/// the tie-break among formulas nothing orders, never the order itself: it is hand-set, defaults
+/// to 0 for every formula the authoring form creates, and ordering by it alone made a dependent
+/// formula read the store instead of the value just produced.
 ///
 /// A cycle has no runnable order and is returned naming its members, the way the other two engines
 /// answer one.
@@ -1758,6 +1849,20 @@ pub fn in_order(formulas: &[PinnedFormula]) -> Result<Vec<&PinnedFormula>, Strin
         .iter()
         .map(|f| f.sources.iter().map(|(_, p)| p.to_lowercase()).collect())
         .collect();
+    // What each formula names in its own text, which is how it reaches a step.
+    let names: Vec<Vec<String>> = candidates
+        .iter()
+        .map(|f| {
+            free_identifiers(&f.formula)
+                .into_iter()
+                .map(|i| i.to_lowercase())
+                .collect()
+        })
+        .collect();
+    let steps: Vec<Option<String>> = candidates
+        .iter()
+        .map(|f| f.intermediate.then(|| f.code.to_lowercase()))
+        .collect();
 
     let n = candidates.len();
     let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -1766,6 +1871,15 @@ pub fn in_order(formulas: &[PinnedFormula]) -> Result<Vec<&PinnedFormula>, Strin
             if a != b
                 && let Some(code) = produced
                 && consumes[b].contains(code)
+            {
+                deps[b].push(a);
+            }
+        }
+        for (a, step) in steps.iter().enumerate() {
+            if a != b
+                && let Some(code) = step
+                && names[b].contains(code)
+                && !deps[b].contains(&a)
             {
                 deps[b].push(a);
             }
@@ -1820,6 +1934,17 @@ pub(super) fn produced_before(
         .collect()
 }
 
+/// The replicated codes of the calculation's parameter group, empty where it declares none.
+pub async fn replicated_for<C: ConnectionTrait>(
+    db: &C,
+    parameter_group_id: Option<Uuid>,
+) -> AppResult<Vec<String>> {
+    let Some(group_id) = parameter_group_id else {
+        return Ok(Vec::new());
+    };
+    Ok(crate::routes::private::parameter_groups::service::replicated_codes(db, group_id).await?)
+}
+
 /// The manifest a formula calculation presents, in the same JSON shape an authored manifest is
 /// written in, so it parses and validates through the one manifest parser.
 ///
@@ -1827,15 +1952,28 @@ pub(super) fn produced_before(
 /// parameter an earlier formula produces: that value comes from the evaluation, not from the
 /// store, so declaring it would make a first run refuse for want of a reading nothing has written
 /// yet.
+///
+/// `replicated` names the catalog codes the calculation's parameter group holds several values of
+/// per visit. A source of one of those, read by a formula that walks the replicates, is the family
+/// rather than a number: the portal's own sets read a second family at the same letter, and the
+/// engine binds every family at each index. A family only ever read by a scalar formula stays a
+/// number and resolves to the group's served value, which is its mean (Q155).
 pub fn manifest_json(
     label: &str,
     description: Option<&str>,
     formulas: &[PinnedFormula],
+    replicated: &[String],
 ) -> Result<serde_json::Value, String> {
     let ordered = in_order(formulas)?;
     let driven: Vec<String> = ordered
         .iter()
         .filter_map(|f| f.per_replicate.clone())
+        .collect();
+    let is_replicated = |code: &str| replicated.iter().any(|c| c.eq_ignore_ascii_case(code));
+    let walked: Vec<&String> = ordered
+        .iter()
+        .filter(|f| f.per_replicate.is_some())
+        .flat_map(|f| f.sources.iter().map(|(variable, _)| variable))
         .collect();
     let mut params = Vec::new();
     let mut event_inputs = Vec::new();
@@ -1848,7 +1986,9 @@ pub fn manifest_json(
                 continue;
             }
             seen.push(variable.clone());
-            if driven.contains(variable) {
+            if driven.contains(variable)
+                || (walked.contains(&variable) && is_replicated(parameter_code))
+            {
                 // A variable a formula evaluates over is the family, not one number: the body
                 // carries the whole list, and the param names the parameter those readings are
                 // of. It is deliberately not an event input as well, because resolving one would
@@ -2324,9 +2464,10 @@ pub async fn calculations_fed_by(
 /// writes.
 ///
 /// A derived parameter attached to a calculation is already in the manifest graph, because a
-/// formula calculation presents one. A standalone definition (`tool_script_id IS NULL`) is the
-/// continuous kind the derived job and the janitor serve, and it has no manifest, so its
-/// dependants were invisible to the closure entirely.
+/// formula calculation presents one. A standalone definition (`tool_script_id IS NULL` and not a
+/// step) is the continuous kind the derived job and the janitor serve, and it has no manifest, so
+/// its dependants were invisible to the closure entirely. A shared step belongs to no calculation
+/// either (Q156) and is not one of these: it mints no parameter, so it writes no edge.
 pub(super) struct DerivedEdge {
     code: String,
     label: String,
@@ -2359,7 +2500,7 @@ pub(super) async fn derived_edges(db: &DatabaseConnection) -> AppResult<Vec<Deri
                       '[]'::jsonb) AS reads
                FROM calculation_formulas d
                LEFT JOIN parameters out ON out.id = d.output_parameter_id
-              WHERE d.tool_script_id IS NULL
+              WHERE d.tool_script_id IS NULL AND d.intermediate = false
               ORDER BY d.code"
                 .to_string(),
         ))
@@ -2865,6 +3006,7 @@ pub(super) struct CalculationRow {
     description: Option<String>,
     engine: Engine,
     active_version_id: Option<Uuid>,
+    parameter_group_id: Option<Uuid>,
 }
 
 pub(super) async fn load_calculation<C: ConnectionTrait>(
@@ -2882,6 +3024,7 @@ pub(super) async fn load_calculation<C: ConnectionTrait>(
         description: row.description,
         engine: Engine::parse(&row.engine).unwrap_or(Engine::Script),
         active_version_id: row.active_version_id,
+        parameter_group_id: row.parameter_group_id,
     }))
 }
 
@@ -2905,10 +3048,12 @@ pub async fn mint_formula_version<C: ConnectionTrait>(
         .into_iter()
         .map(|(_, f)| f)
         .collect();
+    let replicated = replicated_for(db, calculation.parameter_group_id).await?;
     let manifest = manifest_json(
         &calculation.label,
         calculation.description.as_deref(),
         &formulas,
+        &replicated,
     )
     .map_err(AppError::Conflict)?;
     let body = render(&formulas).map_err(AppError::Conflict)?;

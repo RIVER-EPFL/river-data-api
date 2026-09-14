@@ -1,8 +1,10 @@
 //! The three tables a calculation is made of: the formula and its output slot, the input
 //! parameters bound to its variable names, and the version history of the formula text.
 //!
-//! One file, three modules, because each is a SeaORM entity and an entity owns the names `Model`,
-//! `Entity` and `Column`.
+//! One file, a module per entity, because an entity owns the names `Model`, `Entity` and
+//! `Column`, plus the read shapes the calculation routes answer in.
+
+use uuid::Uuid;
 
 pub mod definition {
     use crudcrate::EntityToModels;
@@ -155,6 +157,95 @@ pub mod source {
     impl Related<crate::routes::private::parameters::Entity> for Entity {
         fn to() -> RelationDef {
             Relation::Parameter.def()
+        }
+    }
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// What a step feeds: one calculation that computes it, and the formulas inside that calculation
+/// whose text reads the step's code.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct StepDependent {
+    pub tool_script_id: Uuid,
+    pub name: String,
+    pub label: String,
+    /// Whether the calculation owns the step, rather than declaring one owned by nobody.
+    pub owns: bool,
+    pub formulas: Vec<StepReader>,
+}
+
+/// One formula that reads the step.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct StepReader {
+    pub code: String,
+    pub formula: String,
+}
+
+/// Everything that reads one step, which is what its page shows before its expression is edited.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct StepDependents {
+    pub formula_id: Uuid,
+    pub code: String,
+    /// True when the step belongs to no calculation, which is what makes it shareable (Q156).
+    pub shared: bool,
+    pub calculations: Vec<StepDependent>,
+}
+
+/// One calculation's declaration that it reads a shared step (Q156).
+///
+/// A shared step is a `calculation_formulas` row that is `intermediate` and owned by no
+/// calculation, so nothing about the step says who reads it. A row here is that reading: the
+/// declaring calculation evaluates the step in its own run, under the step's own code, and the
+/// step's inputs become inputs of that calculation.
+pub mod shared_step {
+    use crudcrate::EntityToModels;
+    use sea_orm::entity::prelude::*;
+
+    #[derive(
+        Clone,
+        Debug,
+        PartialEq,
+        DeriveEntityModel,
+        serde::Serialize,
+        serde::Deserialize,
+        EntityToModels,
+    )]
+    #[sea_orm(table_name = "calculation_shared_steps")]
+    #[crudcrate(
+        api_struct = "CalculationSharedStep",
+        name_singular = "calculation_shared_step",
+        name_plural = "calculation_shared_steps",
+        generate_router,
+        operations = crate::routes::private::derived_parameters::service::SharedStepOperations
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
+        pub id: Uuid,
+        /// The calculation that reads the step.
+        #[crudcrate(filterable, sortable)]
+        pub tool_script_id: Uuid,
+        /// The step it reads, which is a formula row owned by no calculation.
+        #[crudcrate(filterable, sortable)]
+        pub formula_id: Uuid,
+        #[crudcrate(exclude(create, update), sortable)]
+        pub created_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {
+        #[sea_orm(
+            belongs_to = "crate::routes::private::derived_parameters::models::definition::Entity",
+            from = "Column::FormulaId",
+            to = "crate::routes::private::derived_parameters::models::definition::Column::Id"
+        )]
+        CalculationFormula,
+    }
+
+    impl Related<crate::routes::private::derived_parameters::models::definition::Entity> for Entity {
+        fn to() -> RelationDef {
+            Relation::CalculationFormula.def()
         }
     }
 

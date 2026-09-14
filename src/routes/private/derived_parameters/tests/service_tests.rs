@@ -96,3 +96,34 @@ fn test_variables_of_refuses_a_coefficient_with_no_slot() {
 fn test_variables_of_reads_an_empty_slot_as_no_slot() {
     assert!(super::variables_of("raw * curve_intercept", Some("  ")).is_err());
 }
+
+// --- Declaring a shared step (Q156) ---
+
+const FIELD_DATA: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_00f1);
+const PCO2: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_00f2);
+
+#[test]
+fn test_declaring_an_owned_step_releases_it_to_its_previous_owner() {
+    // `bp` is `field_data`'s step until `pco2` declares it; then it is nobody's and `field_data`
+    // reads it through a declaration of its own.
+    assert_eq!(
+        super::promotion(Some(FIELD_DATA), PCO2),
+        Ok(super::Promotion::Release {
+            previous_owner: FIELD_DATA
+        })
+    );
+}
+
+#[test]
+fn test_declaring_a_step_that_is_already_shared_only_adds_the_reading() {
+    assert_eq!(
+        super::promotion(None, PCO2),
+        Ok(super::Promotion::AlreadyShared)
+    );
+}
+
+#[test]
+fn test_a_calculation_cannot_declare_its_own_step() {
+    let refused = super::promotion(Some(PCO2), PCO2).expect_err("its own step");
+    assert!(refused.contains("already computes"), "{refused}");
+}

@@ -133,10 +133,61 @@ fn test_a_dependency_orders_ahead_of_its_ordinal_and_its_code() {
     assert_eq!(codes(&shared_ordinal_chain()), vec!["k_h", "co2"]);
 }
 
+/// A step reaches the formulas after it under its own code, never through an output parameter, so
+/// the only thing that can order it is the identifier the reading formula names. Both are at the
+/// ordinal the authoring form creates, and the step's code sorts last.
+fn step_named_after_its_reader() -> Vec<PinnedFormula> {
+    let mut zz = formula("zz", 0, "field_bp * 1.0", None, &[("field_bp", "Field_BP")]);
+    zz.intermediate = true;
+    let aa = formula("aa", 0, "zz * 2", Some("aa"), &[]);
+    vec![zz, aa]
+}
+
+#[test]
+fn test_a_step_orders_ahead_of_the_formula_that_names_it() {
+    assert_eq!(codes(&step_named_after_its_reader()), vec!["zz", "aa"]);
+}
+
+/// The step edge is on the identifier, so the case it is written in does not decide the order.
+#[test]
+fn test_a_step_is_ordered_whatever_case_its_reader_names_it_in() {
+    let mut step = formula("Zz", 0, "field_bp * 1.0", None, &[("field_bp", "Field_BP")]);
+    step.intermediate = true;
+    let reader = formula("aa", 0, "ZZ * 2", Some("aa"), &[]);
+    assert_eq!(codes(&vec![step, reader]), vec!["Zz", "aa"]);
+}
+
+/// A step nothing reads is still a formula of the set, ordered by the tie-break like any other.
+#[test]
+fn test_an_unread_step_keeps_the_ordinal_tie_break() {
+    let mut step = formula("zz", 0, "field_bp * 1.0", None, &[("field_bp", "Field_BP")]);
+    step.intermediate = true;
+    let other = formula(
+        "aa",
+        0,
+        "field_bp * 3",
+        Some("aa"),
+        &[("field_bp", "Field_BP")],
+    );
+    assert_eq!(codes(&vec![step, other]), vec!["aa", "zz"]);
+}
+
+/// Two steps reading each other have no runnable order, and the cycle is named rather than
+/// silently dropped, the same way a parameter cycle is.
+#[test]
+fn test_two_steps_reading_each_other_are_a_cycle() {
+    let mut first = formula("aa", 0, "bb + 1", None, &[]);
+    first.intermediate = true;
+    let mut second = formula("bb", 0, "aa + 1", None, &[]);
+    second.intermediate = true;
+    let err = in_order(&vec![first, second]).expect_err("a cycle has no order");
+    assert!(err.contains("aa") && err.contains("bb"), "{err}");
+}
+
 #[test]
 fn test_a_produced_value_is_not_declared_an_event_input_whatever_the_codes_sort_to() {
-    let manifest =
-        manifest_json("Carbonate", None, &shared_ordinal_chain()).expect("the set has an order");
+    let manifest = manifest_json("Carbonate", None, &shared_ordinal_chain(), &[])
+        .expect("the set has an order");
     let event_inputs = manifest["event_inputs"].as_array().unwrap();
     assert_eq!(
         event_inputs.len(),
@@ -247,7 +298,7 @@ fn test_an_unparseable_formula_names_the_definition() {
 
 #[test]
 fn test_the_manifest_declares_every_source_as_an_event_input() {
-    let manifest = manifest_json("DOM", None, &dom()).expect("the set has an order");
+    let manifest = manifest_json("DOM", None, &dom(), &[]).expect("the set has an order");
     let event_inputs = manifest["event_inputs"].as_array().unwrap();
     assert_eq!(event_inputs.len(), 4);
     let params = manifest["params"].as_array().unwrap();
@@ -272,7 +323,7 @@ fn test_an_intermediate_feeds_the_next_formula_and_is_no_output() {
     let pco2 = formula("pco2", 2, "bp * 2", Some("pCO2_HS_uatm"), &[]);
     let set = vec![bp, pco2];
 
-    let manifest = manifest_json("pCO2", None, &set).expect("the set has an order");
+    let manifest = manifest_json("pCO2", None, &set, &[]).expect("the set has an order");
     let outputs = manifest["outputs"].as_array().unwrap();
     assert_eq!(outputs.len(), 1, "only what saves is an output: {manifest}");
     assert_eq!(outputs[0]["key"], "pco2");
@@ -303,7 +354,7 @@ fn test_a_site_source_is_a_site_input_and_not_an_event_input() {
         &[],
     );
     bp.site_sources = vec![("elevation".to_string(), "elevation".to_string())];
-    let manifest = manifest_json("Field Data", None, &[bp]).expect("the set has an order");
+    let manifest = manifest_json("Field Data", None, &[bp], &[]).expect("the set has an order");
 
     let site_inputs = manifest["site_inputs"].as_array().unwrap();
     assert_eq!(site_inputs.len(), 1, "{site_inputs:?}");
@@ -340,7 +391,7 @@ fn test_an_internally_produced_source_is_not_an_event_input() {
         ),
         formula("suva_x2", 2, "s * 2", Some("suva_x2"), &[("s", "suva")]),
     ];
-    let manifest = manifest_json("DOM", None, &chained).expect("the set has an order");
+    let manifest = manifest_json("DOM", None, &chained, &[]).expect("the set has an order");
     let event_inputs = manifest["event_inputs"].as_array().unwrap();
     assert_eq!(
         event_inputs.len(),
@@ -403,7 +454,7 @@ fn test_a_formula_naming_a_constant_evaluates_with_the_resolved_value() {
 
 #[test]
 fn test_the_manifest_declares_the_constants_the_formulas_read() {
-    let manifest = manifest_json("pCO2", None, &pco2()).expect("the set has an order");
+    let manifest = manifest_json("pCO2", None, &pco2(), &[]).expect("the set has an order");
     let declared = manifest["constants"].as_array().unwrap();
     assert_eq!(declared.len(), 2);
     assert_eq!(declared[0], "gas_const_r_atm");
@@ -412,7 +463,7 @@ fn test_the_manifest_declares_the_constants_the_formulas_read() {
 
 #[test]
 fn test_a_source_variable_is_not_declared_as_a_constant() {
-    let manifest = manifest_json("DOM", None, &dom()).expect("the set has an order");
+    let manifest = manifest_json("DOM", None, &dom(), &[]).expect("the set has an order");
     assert!(manifest["constants"].as_array().unwrap().is_empty());
 }
 
@@ -472,7 +523,7 @@ fn test_two_formulas_apply_two_curves_and_each_records_its_own() {
 
 #[test]
 fn test_the_manifest_declares_a_slot_per_curve_a_formula_names() {
-    let manifest = manifest_json("Chl a", None, &chla()).expect("the set has an order");
+    let manifest = manifest_json("Chl a", None, &chla(), &[]).expect("the set has an order");
     let declared = manifest["curves"].as_array().unwrap();
     assert_eq!(declared.len(), 2);
     assert_eq!(declared[0]["name"], "acid_curve");
@@ -638,8 +689,8 @@ fn test_the_two_zero_divisor_guards_produce_different_answers() {
 
 #[test]
 fn test_a_guard_function_is_not_mistaken_for_a_constant() {
-    let manifest =
-        manifest_json("Alkalinity", None, &pressure_selection()).expect("the set has an order");
+    let manifest = manifest_json("Alkalinity", None, &pressure_selection(), &[])
+        .expect("the set has an order");
     assert!(
         manifest["constants"].as_array().unwrap().is_empty(),
         "if/and/ge/le are the language: {manifest}"
@@ -705,7 +756,7 @@ fn test_a_visit_without_doc_still_produces_the_four_ratios() {
 
 #[test]
 fn test_no_formula_param_is_required_so_one_gap_does_not_refuse_the_calculation() {
-    let manifest = manifest_json("DOM", None, &dom()).expect("the set has an order");
+    let manifest = manifest_json("DOM", None, &dom(), &[]).expect("the set has an order");
     assert!(
         manifest["params"]
             .as_array()
@@ -850,7 +901,7 @@ fn test_the_manifest_declares_a_per_replicate_output() {
         ),
         formula("stage2", 2, "mean + 1", Some("S2"), &[("mean", "Mean")]),
     ];
-    let manifest = manifest_json("Two stage", None, &formulas).expect("manifest");
+    let manifest = manifest_json("Two stage", None, &formulas, &[]).expect("manifest");
     let outputs = manifest["outputs"].as_array().expect("outputs");
     assert_eq!(outputs[0]["per_replicate"], serde_json::json!(true));
     assert!(outputs[1].get("per_replicate").is_none());
@@ -885,7 +936,7 @@ fn test_a_scalar_formula_reads_a_per_replicate_output_from_the_store() {
         ),
         formula("stage2", 2, "s1 + 1", Some("S2"), &[("s1", "S1")]),
     ];
-    let manifest = manifest_json("Two stage", None, &formulas).expect("manifest");
+    let manifest = manifest_json("Two stage", None, &formulas, &[]).expect("manifest");
     let event_inputs = manifest["event_inputs"].as_array().expect("event_inputs");
     assert!(
         event_inputs
@@ -925,7 +976,7 @@ fn test_a_per_replicate_formula_reads_an_earlier_one_at_its_own_index() {
         ),
         per_replicate("stage2", 2, "s1 + 1", Some("S2"), &[("s1", "S1")], "s1"),
     ];
-    let manifest = manifest_json("Two stage", None, &formulas).expect("manifest");
+    let manifest = manifest_json("Two stage", None, &formulas, &[]).expect("manifest");
     assert!(
         !manifest["event_inputs"]
             .as_array()

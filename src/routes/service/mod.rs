@@ -24,12 +24,13 @@ use crate::routes::private::{
     change_audit::models::ChangeAudit,
     collection_events::CollectionEvent,
     constants::Constant,
-    meteoswiss::models::subscription::MeteoswissSubscription,
     data_streams::DataStream,
     data_streams::models::receipts::IngestReceipt,
     data_streams::pairing_plans::PairingPlan,
     derived_parameters::models::definition::CalculationFormula,
+    derived_parameters::models::shared_step::CalculationSharedStep,
     derived_parameters::models::source::DerivedParameterSource,
+    meteoswiss::models::subscription::MeteoswissSubscription,
     notes::Note,
     notifications::{NotificationLog, NotificationMute, NotificationState, NotificationSubscriber},
     parameter_groups::group_model::ParameterGroup,
@@ -218,6 +219,12 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .nest(
             "/derived_parameter_sources",
             admin_write_crud(DerivedParameterSource::router(db)),
+        )
+        // One calculation's declaration that it reads a step owned by no calculation (Q156). The
+        // list filtered by `formula_id` is what a step's own page reads to name its dependents.
+        .nest(
+            "/calculation_shared_steps",
+            admin_write_crud(CalculationSharedStep::router(db)),
         )
         .nest(
             "/parameter_groups",
@@ -482,6 +489,11 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             get(crate::routes::private::reprocessing_jobs::views::get_job_logs),
         )
         .route("/tools", get(tools::views::list_tools))
+        // What a step feeds: a step mints no parameter, so the closure above cannot answer for it.
+        .route(
+            "/derived_parameters/{id}/dependents",
+            get(derived_views::step_dependents),
+        )
         .route(
             "/calculations/closure",
             get(crate::routes::private::tools::views::get_calculation_closure),

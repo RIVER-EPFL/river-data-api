@@ -72,6 +72,16 @@ async fn codes_for_statistics_rule<C: ConnectionTrait>(
     let Some(code) = row.map(|p| p.code) else {
         return Ok((String::new(), Vec::new()));
     };
+    Ok((code, replicated_codes(db, group_id).await?))
+}
+
+/// The catalog codes of a group's members entered several times at a visit. Replicate-ness is a
+/// property of the parameter in its group, so this is what a manifest reads to decide whether a
+/// source carries one value or the whole family (Q155).
+pub async fn replicated_codes<C: ConnectionTrait>(
+    db: &C,
+    group_id: Uuid,
+) -> Result<Vec<String>, ApiError> {
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
@@ -87,7 +97,7 @@ async fn codes_for_statistics_rule<C: ConnectionTrait>(
         let code: String = row.try_get("", "code").map_err(ApiError::database)?;
         replicated.push(code);
     }
-    Ok((code, replicated))
+    Ok(replicated)
 }
 
 impl CRUDOperations for ParameterGroupOperations {

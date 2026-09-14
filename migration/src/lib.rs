@@ -10,6 +10,7 @@ mod m20260914_000006_meteoswiss_subscription_parameter;
 mod m20260914_000007_meteoswiss_fetch_state;
 mod m20260914_000008_csv_import_chunks;
 mod m20260914_000009_meteoswiss_stations;
+mod m20260914_000010_shared_steps;
 
 pub struct Migrator;
 
@@ -27,6 +28,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260914_000007_meteoswiss_fetch_state::Migration),
             Box::new(m20260914_000008_csv_import_chunks::Migration),
             Box::new(m20260914_000009_meteoswiss_stations::Migration),
+            Box::new(m20260914_000010_shared_steps::Migration),
         ]
     }
 }
