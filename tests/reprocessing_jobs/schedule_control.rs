@@ -795,8 +795,8 @@ async fn run_now_dedupes_within_the_second_snapshots_empty_tunables_and_writes_n
 /// genuine worker transition emits, for a run an operator asked for over HTTP, on data onboarded
 /// through the sensor-flow track.
 ///
-/// `refresh_aggregates` is the job under test: a run naming no window rematerialises every
-/// rollup over its whole history, which is the one thing an operator still asks for by hand.
+/// `reprocess_all` is the job under test: it reads no parameters, re-derives whatever slots the
+/// deployment timeline holds and returns, so the run reaches a terminal state on its own.
 #[tokio::test]
 #[serial]
 async fn sse_streams_the_completion_of_an_operator_requested_run() {
@@ -809,10 +809,9 @@ async fn sse_streams_the_completion_of_an_operator_requested_run() {
     let track = tracks::onboard_sensor_flow_track(&app, &admin).await;
     let stream_id = track.stream_ids[0].clone();
     let site_parameter_id = track.site_parameter_ids[0].clone();
-    let parameter_id = track.parameter_id("TrkFlowDO").to_string();
 
     // Pairing before any reading arrives means ingest attributes at write time and no backfill job
-    // is enqueued, so the aggregate stays unmaterialised until the operator's run.
+    // is enqueued, so the only job on the queue is the one the operator asks for.
     let (status, paired) = crate::common::post_json_with_token(
         &app,
         &format!("/api/streams/{stream_id}/pair"),
@@ -843,10 +842,6 @@ async fn sse_streams_the_completion_of_an_operator_requested_run() {
         "and land already attributed to the slot: {ingested}"
     );
 
-    let bucket_at: chrono::DateTime<Utc> = format!("{}T00:00:00Z", tracks::FLOW_BASE_DAY)
-        .parse()
-        .expect("the track's base day parses");
-
     // The feed is opened as an administrator: job events carry no project, so `event_stream` only
     // forwards them to an unrestricted principal.
     let stream_request = axum::http::Request::builder()
@@ -866,7 +861,7 @@ async fn sse_streams_the_completion_of_an_operator_requested_run() {
 
     let (status, run) = crate::common::post_json_parse_with_token(
         &app,
-        "/api/schedules/refresh_aggregates/run_now",
+        "/api/schedules/reprocess_all/run_now",
         &json!({}),
         &manager,
     )
@@ -896,9 +891,9 @@ async fn sse_streams_the_completion_of_an_operator_requested_run() {
         completed["status"], "completed",
         "the run finished rather than failing: {completed}"
     );
-    assert_eq!(
-        completed["readings_updated"], 0,
-        "an aggregate refresh rewrites no readings: {completed}"
+    assert!(
+        completed["readings_updated"].is_number(),
+        "the frame reports what the run touched: {completed}"
     );
     assert!(
         completed["error_message"].is_null(),
@@ -923,25 +918,7 @@ async fn sse_streams_the_completion_of_an_operator_requested_run() {
         "the stored row and the streamed frame agree: {job}"
     );
     assert_eq!(
-        job["trigger_type"], "refresh_aggregates",
+        job["trigger_type"], "reprocess_all",
         "the row is the run the operator asked for: {job}"
-    );
-
-    // A completed status is not evidence the rollups are right; the bucket's values are.
-    let bucket =
-        crate::common::e2e::hourly_bucket(&app, &admin, &track.site_id, &parameter_id, bucket_at)
-            .await;
-    assert!(
-        bucket.is_some(),
-        "the operator's run materialised the hourly bucket for the ingested cycle"
-    );
-    let (mean, readings_in_bucket) = bucket.expect("bucket present");
-    assert_eq!(
-        readings_in_bucket, 5,
-        "every reading of the cycle is counted"
-    );
-    assert!(
-        (mean - 202.0).abs() < 1e-9,
-        "the cycle's values 200..204 average 202, got {mean}"
     );
 }

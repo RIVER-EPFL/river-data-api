@@ -648,7 +648,6 @@ fn table() -> Table {
         TokenAccess::Same,
         Scope::DenyScopedToken,
         &[
-            ("POST", "/api/actions/refresh_aggregates"),
             ("POST", "/api/actions/reconcile_alarms"),
             ("POST", "/api/actions/backfill_attribution"),
             ("POST", "/api/actions/backfill_calibrations"),
@@ -1348,13 +1347,14 @@ fn every_row_names_a_route_that_still_exists() {
     let (routes, drift) = registered_routes(&ROUTE_SOURCES);
     let registered: std::collections::HashSet<String> =
         routes.into_iter().map(|(_, full)| full).collect();
-    // Only the sync surface is checked: every other prefix is served by nested routers whose paths
-    // are not route literals in these files, so their absence here means nothing.
+    // Only the prefixes whose paths are route literals in these files are checked: the rest are
+    // served by nested routers, so their absence here means nothing. `/api/actions/` is one of
+    // them, and a row naming an action route that was deleted is how this test earns its keep.
     let gone: Vec<&str> = table()
         .0
         .iter()
         .map(|r| r.declared)
-        .filter(|d| d.starts_with("/api/sync/"))
+        .filter(|d| d.starts_with("/api/sync/") || d.starts_with("/api/actions/"))
         .filter(|d| !registered.contains(*d) && !registered.contains(d.trim_end_matches('/')))
         .filter(|d| {
             ![

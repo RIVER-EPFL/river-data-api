@@ -1302,18 +1302,18 @@ async fn granted_members_receive_job_frames_on_the_event_stream() {
 
     let (status, queued) = crate::common::post_json_parse_with_token(
         &app,
-        "/api/actions/refresh_aggregates",
-        &json!({ "full": false }),
+        "/api/actions/rebuild_alarm_events",
+        &json!({ "site_id": scene.site_a }),
         &river,
     )
     .await;
     assert_eq!(
         status, 200,
-        "a River member triggers an aggregate refresh: {queued}"
+        "a River member rebuilds the alarm events of a site they are granted: {queued}"
     );
     let job_id = queued["job_id"]
         .as_str()
-        .unwrap_or_else(|| panic!("the refresh returns a tracked job id: {queued}"))
+        .unwrap_or_else(|| panic!("the rebuild returns a tracked job id: {queued}"))
         .to_string();
 
     let matches_job = |event: &str, json: &serde_json::Value| {

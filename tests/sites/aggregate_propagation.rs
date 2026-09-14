@@ -1357,9 +1357,9 @@ async fn continuous_aggregates_apply_their_filter_algebra_exactly() {
 
 /// December 2025. No HTTP route rewrites an existing reading's `raw_value` outside the sync-only
 /// overwrite ingest, so the edit is made at the storage layer, which is the layer the gap lives at.
-/// The intended behaviour is that the served bucket reflects the stored data; today nothing
-/// refreshes the rollups after such an edit, and `POST /actions/refresh_aggregates {full:true}` is
-/// the documented recovery. Both are asserted, so the recovery is proven even while the gap stands.
+/// The intended behaviour is that the served bucket reflects the stored data: the rollups read
+/// their open bucket from the raw rows, and every policy starts at NULL, so a bucket the edit
+/// falls in is rematerialised by the next hourly tick with nobody asking for it.
 #[tokio::test]
 #[serial]
 async fn editing_a_stored_raw_value_reaches_the_served_aggregate() {
@@ -1482,123 +1482,6 @@ async fn editing_a_stored_raw_value_reaches_the_served_aggregate() {
     assert_eq!(
         served_after_edit, corrected,
         "the corrected value reaches the served bucket with nobody asking for it: {after_edit}"
-    );
-}
-
-/// The same correction made underneath the API, which is the boundary of what a write path can
-/// promise: a continuous aggregate is materialised, and a statement the application never saw
-/// leaves it holding the old number until a refresh consumes the invalidation TimescaleDB recorded.
-/// `POST /actions/refresh_aggregates {full:true}` is that refresh, and it is above the intern level.
-#[tokio::test]
-#[serial]
-async fn a_stored_value_edited_out_of_band_is_recovered_by_a_full_refresh() {
-    let Some((db, app, admin, track)) = onboard("out_of_band_edit_recovery").await else {
-        return;
-    };
-    let river = member(&db, &track.project_id, RIVER.0, RIVER.1).await;
-    let intern = member(&db, &track.project_id, INTERN.0, INTERN.1).await;
-
-    let site1 = track.site_id.clone();
-    let flow = track.parameter_id("TrkFlowDO").to_string();
-
-    assert!(
-        jobs_settled(&db, 60).await,
-        "provisioning jobs settle before the readings land"
-    );
-    write_readings(
-        &app,
-        &river,
-        vec![
-            reading(&site1, &flow, "2025-12-10T08:00:00Z", 10.0),
-            reading(&site1, &flow, "2025-12-10T08:30:00Z", 20.0),
-        ],
-    )
-    .await;
-    assert!(
-        jobs_settled(&db, 60).await,
-        "the write's follow-on jobs settle before the baseline"
-    );
-    refresh_views(&db, "2025-11-01", "2026-01-15").await;
-
-    let day = ("2025-12-10T00:00:00Z", "2025-12-10T23:00:00Z");
-    let baseline = aggregates(&app, &intern, &site1, "hourly", day.0, day.1).await;
-    let start = bucket(&baseline, &flow, "2025-12-10T08:00:00Z", "baseline");
-    assert_eq!(start.avg, Some(15.0), "the mean of 10 and 20: {baseline}");
-
-    crate::common::exec(
-        &db,
-        &format!(
-            "UPDATE readings SET raw_value = 1000.0 \
-             WHERE site_id = '{site1}' AND parameter_id = '{flow}' \
-               AND time = '2025-12-10T08:00:00Z'::timestamptz"
-        ),
-    )
-    .await;
-    assert_eq!(
-        live_hourly(&db, &site1, &flow, "2025-12-10T08:00:00Z").await,
-        (Some(510.0), 2),
-        "the stored readings now average (1000 + 20) / 2"
-    );
-
-    let after_edit = aggregates(&app, &intern, &site1, "hourly", day.0, day.1).await;
-    assert_eq!(
-        bucket(&after_edit, &flow, "2025-12-10T08:00:00Z", "after the edit"),
-        start,
-        "no application code ran, so the materialised bucket still holds the old mean: {after_edit}"
-    );
-
-    let (status, denied) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/actions/refresh_aggregates",
-        &json!({ "full": true }),
-        &intern,
-    )
-    .await;
-    assert_eq!(
-        status, 403,
-        "triggering a refresh is above the intern level: {denied}"
-    );
-
-    let (status, queued) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/actions/refresh_aggregates",
-        &json!({ "full": true }),
-        &river,
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "a river member triggers the full refresh ({status}): {queued}"
-    );
-    let job_id = queued["job_id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the refresh returns its job id: {queued}"))
-        .to_string();
-    // Polled as an administrator, not as the river member who triggered it: `inject_project_scope`
-    // scopes `reprocessing_jobs` by `sensor_id IN (scoped sensors)`, and a refresh_aggregates job
-    // carries a NULL sensor_id, so the member who queued it gets a 404 on its own job.
-    assert_eq!(
-        e2e::poll_job(&app, &admin, &job_id, 120).await,
-        "completed",
-        "the full refresh job finishes"
-    );
-
-    let recovered_body = aggregates(&app, &intern, &site1, "hourly", day.0, day.1).await;
-    assert_eq!(
-        bucket(
-            &recovered_body,
-            &flow,
-            "2025-12-10T08:00:00Z",
-            "after the full refresh"
-        ),
-        Bucket {
-            avg: Some(510.0),
-            min: Some(20.0),
-            max: Some(1000.0),
-            count: 2,
-            flagged: 0
-        },
-        "the documented recovery reproduces the stored data exactly: {recovered_body}"
     );
 }
 

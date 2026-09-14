@@ -221,7 +221,6 @@ async fn scoped_key_denied_on_operator_and_global_actions() {
 
     let cases: &[(&str, serde_json::Value)] = &[
         ("/api/actions/reprocess_all", serde_json::json!({})),
-        ("/api/actions/refresh_aggregates", serde_json::json!({})),
         ("/api/actions/backfill_attribution", serde_json::json!({})),
         (
             "/api/sensors/00000000-0000-4000-c000-0000000000ff/adopt",

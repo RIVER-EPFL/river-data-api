@@ -109,28 +109,6 @@ async fn provision_pair_ingest_and_expose_publicly() {
         assert!((got[i] - v).abs() < 1e-6, "reading[{i}] {} != {v}", got[i]);
     }
 
-    // 6. Refresh continuous aggregates as a TRACKED job (WS3), then assert the hourly mean.
-    let (status, refresh) = crate::common::post_json_with_token(
-        &app,
-        "/api/actions/refresh_aggregates",
-        &serde_json::json!({ "full": true }),
-        &token,
-    )
-    .await;
-    assert!(
-        (200..300).contains(&status),
-        "refresh_aggregates ({status}): {refresh}"
-    );
-    let refresh: serde_json::Value = serde_json::from_str(&refresh).unwrap();
-    let job_id = refresh["job_id"]
-        .as_str()
-        .expect("refresh_aggregates should return a job_id");
-    let final_status = e2e::poll_job(&app, &token, job_id, 30).await;
-    assert_eq!(
-        final_status, "completed",
-        "aggregate refresh job should complete"
-    );
-
     let agg_uri = format!(
         "/api/sites/{site_id}/aggregates/hourly?start=2025-06-01T00:00:00Z&end=2025-06-01T00:59:00Z"
     );

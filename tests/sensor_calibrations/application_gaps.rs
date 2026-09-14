@@ -292,23 +292,6 @@ impl Fixture {
         body
     }
 
-    async fn refresh_aggregates(&self) {
-        let (status, body) = post_json_parse_with_token(
-            &self.app,
-            "/api/actions/refresh_aggregates",
-            &json!({ "full": true }),
-            &self.jwt,
-        )
-        .await;
-        assert_eq!(status, 200, "refresh aggregates ({status}): {body}");
-        let job_id = str_field(&body, "job_id");
-        let final_status = e2e::poll_job(&self.app, &self.jwt, &job_id, JOB_TIMEOUT_SECS).await;
-        assert_eq!(
-            final_status, "completed",
-            "the refresh job completes: {body}"
-        );
-    }
-
     async fn reprocess(&self) {
         let (status, body) = post_json_parse_with_token(
             &self.app,
@@ -401,7 +384,6 @@ async fn routine_ingest_serves_the_active_calibration() {
         "the sensor plot's calibrated series is corrected: {series}"
     );
 
-    f.refresh_aggregates().await;
     let agg = f.aggregates().await;
     let avg = e2e::field_for(&agg, &f.parameter, "avg");
     let early = bucket_index(&agg, BUCKET_BEFORE_CURVE_ENTRY);

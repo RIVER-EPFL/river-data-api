@@ -1,8 +1,8 @@
 //! E2E tests for tracked background actions.
 //!
 //! Covers the action endpoints that enqueue a worker-pool job and therefore
-//! create a visible `reprocessing_jobs` row: `/actions/reprocess`,
-//! `/actions/refresh_aggregates`, and `/actions/compute_derived`.
+//! create a visible `reprocessing_jobs` row: `/actions/reprocess` and
+//! `/actions/compute_derived`.
 //!
 //! Run: DATABASE_URL=postgresql://postgres:psql@localhost:5444/river_test \
 //!      cargo test --test reprocessing_jobs -- --test-threads=1
@@ -94,34 +94,6 @@ async fn reprocess_creates_tracked_job_for_seeded_sensor() {
     assert_eq!(row_sensor_id, sensor_id);
 
     crate::common::jobs::wait_for_job(&db, &job_id).await;
-    crate::common::cleanup_test_db(&db).await;
-}
-
-#[tokio::test]
-#[serial]
-async fn refresh_aggregates_creates_tracked_job() {
-    let (db, app, token) = setup().await;
-
-    let body = serde_json::json!({ "full": false });
-    let (status, text) =
-        crate::common::post_json_with_token(&app, "/api/actions/refresh_aggregates", &body, &token)
-            .await;
-
-    assert!(
-        (200..300).contains(&status),
-        "refresh_aggregates should return 2xx, got {status}: {text}"
-    );
-    let job_id = job_id_of(&text);
-    assert!(
-        job_exists(&db, &job_id).await,
-        "refresh_aggregates should create a tracked reprocessing_jobs row for {job_id}"
-    );
-
-    let terminal = crate::common::jobs::wait_for_job(&db, &job_id).await;
-    assert_eq!(
-        terminal, "completed",
-        "incremental refresh should complete, not fail"
-    );
     crate::common::cleanup_test_db(&db).await;
 }
 

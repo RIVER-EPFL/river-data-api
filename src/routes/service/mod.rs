@@ -30,9 +30,7 @@ use crate::routes::private::{
     derived_parameters::models::definition::CalculationFormula,
     derived_parameters::models::source::DerivedParameterSource,
     notes::Note,
-    notifications::{
-        NotificationLog, NotificationMute, NotificationState, NotificationSubscriber,
-    },
+    notifications::{NotificationLog, NotificationMute, NotificationState, NotificationSubscriber},
     parameter_groups::group_model::ParameterGroup,
     parameter_groups::member_model::ParameterGroupMember,
     parameters::Parameter,

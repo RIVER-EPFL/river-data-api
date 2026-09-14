@@ -174,22 +174,6 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
 
     // Continuous aggregates roll up only the sensor stream: the grab's 201 would drag the
     // hourly mean far off 12.5 if it leaked in.
-    let (status, refresh) = crate::common::post_json_with_token(
-        &app,
-        "/api/actions/refresh_aggregates",
-        &json!({ "full": true }),
-        &token,
-    )
-    .await;
-    assert!(
-        (200..300).contains(&status),
-        "refresh_aggregates ({status}): {refresh}"
-    );
-    let refresh: serde_json::Value = serde_json::from_str(&refresh).unwrap();
-    let job_id = refresh["job_id"].as_str().expect("tracked refresh job");
-    let final_status = e2e::poll_job(&app, &token, job_id, 30).await;
-    assert_eq!(final_status, "completed");
-
     let (status, agg) = crate::common::get_json_with_token(
         &app,
         &format!("/api/sites/{site}/aggregates/hourly?{RANGE}"),

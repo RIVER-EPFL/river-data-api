@@ -191,17 +191,6 @@ async fn run_action(app: &Router, jwt: &str, path: &str, body: &Value) -> Value 
     poll_job_view(app, jwt, &job_id, 60).await
 }
 
-/// The operator-facing full refresh, waited to a terminal state.
-async fn refresh_all(app: &Router, jwt: &str) -> Value {
-    run_action(
-        app,
-        jwt,
-        "/api/actions/refresh_aggregates",
-        &json!({ "full": true }),
-    )
-    .await
-}
-
 async fn jobs_settled(db: &DatabaseConnection, timeout_secs: u64) -> bool {
     let start = std::time::Instant::now();
     loop {
@@ -319,76 +308,6 @@ async fn merging_site_parameters_moves_the_rollups_with_the_readings() {
         e2e::hourly_bucket(&app, &admin, &track.site_id, &source, at).await,
         None,
         "and the absorbed parameter's rollup must be gone, not left standing on deleted readings"
-    );
-
-    crate::common::cleanup_test_db(&db).await;
-}
-
-/// a refresh whose `refresh_continuous_aggregate` call errors must fail its job, not report
-/// completed with no error.
-#[tokio::test]
-#[serial]
-async fn a_refresh_that_cannot_run_fails_its_job() {
-    let Some((db, app, admin)) = keycloak_app("failed_refresh_fails_job").await else {
-        return;
-    };
-
-    let track = tracks::onboard_csv_track(&app, &admin).await;
-    let parameter_id = track.parameter_id("TrkCsvDepth").to_string();
-    let day = "2026-03-12";
-    write_readings(
-        &app,
-        &admin,
-        vec![reading(
-            &track.site_id,
-            &parameter_id,
-            &format!("{day}T08:00:00Z"),
-            140.0,
-        )],
-    )
-    .await;
-    assert!(
-        jobs_settled(&db, 60).await,
-        "ingestion settles before the refresh is asked for"
-    );
-
-    // Renaming the view is the one deterministic way to make the CALL error. Everything between
-    // here and the rename back is kept assertion-free so the view is always restored.
-    crate::common::exec(
-        &db,
-        "ALTER MATERIALIZED VIEW readings_hourly RENAME TO readings_hourly_renamed",
-    )
-    .await;
-    let broken = refresh_all(&app, &admin).await;
-    crate::common::exec(
-        &db,
-        "ALTER MATERIALIZED VIEW readings_hourly_renamed RENAME TO readings_hourly",
-    )
-    .await;
-
-    assert_ne!(
-        broken["status"], "completed",
-        "a refresh that could not touch readings_hourly must not report success; a failed refresh \
-         is failed (and retried), not completed: {broken}"
-    );
-    assert!(
-        broken["error_message"]
-            .as_str()
-            .is_some_and(|m| !m.is_empty()),
-        "and it must carry the database's error, so an operator can see what went wrong: {broken}"
-    );
-
-    let healthy = refresh_all(&app, &admin).await;
-    assert_eq!(
-        healthy["status"], "completed",
-        "with the view back, the same request completes, so the failure above was the view and \
-         not the endpoint: {healthy}"
-    );
-    let at = instant(&format!("{day}T08:00:00Z"));
-    assert_eq!(
-        e2e::hourly_bucket(&app, &admin, &track.site_id, &parameter_id, at).await,
-        Some((140.0, 1)),
-        "and that completed refresh really materialised the bucket"
     );
 
     crate::common::cleanup_test_db(&db).await;
@@ -702,23 +621,10 @@ async fn an_incremental_refresh_covers_the_bucket_containing_its_start() {
     let daily = daily_bucket(&db, &site, &parameter_id, first).await;
     let weekly = weekly_bucket(&db, &site, &parameter_id, first).await;
 
-    let full = refresh_all(&app, &admin).await;
     assert_eq!(
-        full["status"], "completed",
-        "the control full refresh completes: {full}"
-    );
-    let hourly_first_full = e2e::hourly_bucket(&app, &admin, &site, &parameter_id, first).await;
-    let daily_full = daily_bucket(&db, &site, &parameter_id, first).await;
-
-    assert_eq!(
-        hourly_first_full,
-        Some((110.0, 1)),
-        "control: the 14:00 hourly bucket does materialise when the window covers it"
-    );
-    assert_eq!(
-        daily_full,
+        daily,
         Some((120.0, 2)),
-        "control: so does the day, holding the mean of 110 and 130"
+        "the day holds the mean of 110 and 130"
     );
     assert_eq!(
         weekly,
