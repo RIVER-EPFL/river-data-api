@@ -1212,6 +1212,119 @@ async fn site_targeted_actions_refuse_a_site_outside_the_callers_grants() {
     }
 }
 
+/// The five collection_events write routes sit in the router group whose comment says each
+/// handler self-enforces project scope, beside `/ingest` and `/grab_samples`, which do.
+#[tokio::test]
+#[serial]
+async fn collection_event_writes_refuse_a_site_outside_the_callers_grants() {
+    if !crate::common::profile::Service::Keycloak
+        .require("collection_event_writes_refuse_a_site_outside_the_callers_grants")
+        .await
+    {
+        return;
+    }
+    let db = fresh_db().await;
+    let app = kc::build_test_app_with_keycloak(db.clone()).await;
+    let admin = kc::get_keycloak_jwt("admin", "admin").await;
+    let scene = provision_two_projects(&app, &admin).await;
+    let river = member(&db, &scene.project_a, "river1", "riverdata-river").await;
+
+    let at = days_ago(1);
+    let mut visits = Vec::new();
+    for site in [&scene.site_a, &scene.site_b] {
+        let (status, body) = crate::common::post_json_parse_with_token(
+            &app,
+            "/api/collection_events/stage",
+            &json!({ "site_id": site, "collected_at": at }),
+            &admin,
+        )
+        .await;
+        assert_eq!(status, 200, "the administrator stages a visit: {body}");
+        visits.push(body["id"].as_str().expect("staged visit id").to_string());
+    }
+    let (visit_a, visit_b) = (visits[0].clone(), visits[1].clone());
+
+    let writes = |site: &str, visit: &str| {
+        vec![
+            (
+                "/api/collection_events/stage".to_string(),
+                json!({ "site_id": site, "collected_at": days_ago(3) }),
+            ),
+            (
+                "/api/collection_events/stage_many".to_string(),
+                json!({ "site_ids": [site], "collected_at": days_ago(4) }),
+            ),
+            (
+                format!("/api/collection_events/{visit}/recompute"),
+                json!({}),
+            ),
+            (
+                "/api/actions/event_recompute".to_string(),
+                json!({ "site_id": site }),
+            ),
+            (
+                "/api/actions/event_audit".to_string(),
+                json!({ "site_id": site }),
+            ),
+        ]
+    };
+
+    // Control: the sibling in the same router group already refuses the other project's site.
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": scene.site_b.as_str(),
+            "created_by": "river1",
+            "readings": [{
+                "parameter_id": scene.parameter.as_str(),
+                "value": 1.0,
+                "time": days_ago(5),
+            }],
+        }),
+        &river,
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "/grab_samples already refuses a site outside the caller's grants: {body}"
+    );
+
+    for (path, payload) in writes(&scene.site_a, &visit_a) {
+        let (status, body) =
+            crate::common::post_json_with_token(&app, &path, &payload, &river).await;
+        assert!(
+            (200..300).contains(&status),
+            "a River member drives {path} inside the granted project ({status}): {body}"
+        );
+    }
+
+    for (path, payload) in writes(&scene.site_b, &visit_b) {
+        let (status, body) =
+            crate::common::post_json_with_token(&app, &path, &payload, &river).await;
+        assert_eq!(
+            status, 403,
+            "{path} must refuse a site outside the caller's grants: {body}"
+        );
+    }
+
+    // A job naming no site runs over every project, which a granted member may not ask for.
+    for (path, payload) in [
+        (
+            "/api/actions/event_recompute",
+            json!({ "only_findings": true }),
+        ),
+        ("/api/actions/event_audit", json!({})),
+    ] {
+        let (status, body) =
+            crate::common::post_json_with_token(&app, path, &payload, &river).await;
+        assert_eq!(
+            status, 403,
+            "{path} over every project must refuse a granted member: {body}"
+        );
+    }
+}
+
 fn parse_sse_frames(text: &str) -> Vec<(String, serde_json::Value)> {
     let mut frames = Vec::new();
     let mut current_event: Option<String> = None;

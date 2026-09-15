@@ -28,7 +28,7 @@ use super::service::{
     self, limit_clause, paging, range_clause, visit_count_columns, visit_list_order,
 };
 use crate::common::AppState;
-use crate::common::middleware::ProjectScope;
+use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::common::paging::{Page, Window};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::collection_events::models as events;
@@ -57,6 +57,7 @@ use crate::routes::resolve_site;
 )]
 pub async fn recompute_collection_event(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<EnqueuedJobResponse>> {
@@ -64,6 +65,7 @@ pub async fn recompute_collection_event(
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Collection event {id} not found")))?;
+    enforce_project_scope_for_sites(&state.db, &scope, &[event.site_id]).await?;
     if !service::chain_may_run(&event.source) {
         return Err(AppError::BadRequest(
             "This visit was created by the portal sync, so calculations do not run at it. \
@@ -101,6 +103,7 @@ pub async fn recompute_collection_event(
 )]
 pub async fn stage_collection_event(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(req): Json<StageEventRequest>,
 ) -> AppResult<Json<StagedEvent>> {
@@ -113,6 +116,7 @@ pub async fn stage_collection_event(
             req.site_id
         )));
     }
+    enforce_project_scope_for_sites(&state.db, &scope, &[req.site_id]).await?;
     let actor = crate::common::actor::label(&auth);
     let staged = service::stage_visit(
         &state.db,
@@ -141,6 +145,7 @@ pub async fn stage_collection_event(
 )]
 pub async fn stage_collection_events(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(req): Json<StageEventsRequest>,
 ) -> AppResult<Json<Vec<StagedEvent>>> {
@@ -165,6 +170,7 @@ pub async fn stage_collection_events(
             names.join(", ")
         )));
     }
+    enforce_project_scope_for_sites(&state.db, &scope, &site_ids).await?;
     let actor = crate::common::actor::label(&auth);
     let txn = state.db.begin().await?;
     let mut staged = Vec::with_capacity(site_ids.len());
@@ -184,6 +190,25 @@ pub async fn stage_collection_events(
     Ok(Json(staged))
 }
 
+/// Hold a restricted caller to a site they were granted. A job over no site runs across every
+/// project, which only unrestricted access may ask for.
+async fn confine_to_scope(
+    db: &sea_orm::DatabaseConnection,
+    scope: &crate::common::authz::AccessScope,
+    site_id: Option<Uuid>,
+    what: &str,
+) -> AppResult<()> {
+    if !scope.is_restricted() {
+        return Ok(());
+    }
+    let Some(site_id) = site_id else {
+        return Err(AppError::Forbidden(format!(
+            "Name a site in your projects: a {what} over every project is outside your access"
+        )));
+    };
+    enforce_project_scope_for_sites(db, scope, &[site_id]).await
+}
+
 /// The scoped apply (ADR 0007): run the chain over every manual visit in a site and/or time
 /// range, or over the visits with open event findings, in one tracked job. This is the repair
 /// path for what the reactive hook does not see: a constant, a curve or a script activation. An
@@ -201,6 +226,7 @@ pub async fn stage_collection_events(
 )]
 pub async fn run_event_recompute(
     State(state): State<AppState>,
+    ProjectScope(access): ProjectScope,
     axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(req): Json<EventRecomputeRequest>,
 ) -> AppResult<Json<EnqueuedJobResponse>> {
@@ -229,6 +255,7 @@ pub async fn run_event_recompute(
     {
         return Err(AppError::NotFound(format!("Site {site_id} not found")));
     }
+    confine_to_scope(&state.db, &access, req.site_id, "recompute").await?;
     let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
         &state.db,
         "event_recompute",
@@ -261,15 +288,19 @@ pub async fn run_event_recompute(
 )]
 pub async fn run_event_audit(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Json(req): Json<EventAuditRequest>,
 ) -> AppResult<Json<EnqueuedJobResponse>> {
-    if let Some(id) = req.collection_event_id
-        && Entity::find_by_id(id).one(&state.db).await?.is_none()
-    {
-        return Err(AppError::NotFound(format!(
-            "Collection event {id} not found"
-        )));
+    let mut site_id = req.site_id;
+    if let Some(id) = req.collection_event_id {
+        let event = Entity::find_by_id(id)
+            .one(&state.db)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Collection event {id} not found")))?;
+        site_id = site_id.or(Some(event.site_id));
+        enforce_project_scope_for_sites(&state.db, &scope, &[event.site_id]).await?;
     }
+    confine_to_scope(&state.db, &scope, site_id, "audit").await?;
     let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
         &state.db,
         "event_audit",
