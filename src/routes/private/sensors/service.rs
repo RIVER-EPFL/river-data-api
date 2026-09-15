@@ -731,6 +731,45 @@ pub fn instrument_refusal(
     None
 }
 
+/// The same rule over the instruments one request names, in one query. A grab save carries an
+/// instrument per row, so asking per row would be a query per row on the entry path.
+pub async fn require_measuring_instruments<C: ConnectionTrait>(
+    db: &C,
+    sensor_ids: &[Uuid],
+    subject: &str,
+) -> AppResult<()> {
+    let mut wanted: Vec<Uuid> = sensor_ids.to_vec();
+    wanted.sort_unstable();
+    wanted.dedup();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let rows = Entity::find()
+        .filter(Column::Id.is_in(wanted.clone()))
+        .select_only()
+        .column(Column::Id)
+        .column(Column::Kind)
+        .column(Column::Name)
+        .column(Column::IsLabInstrument)
+        .column(Column::IsActive)
+        .into_tuple::<(Uuid, Option<String>, Option<String>, Option<bool>, Option<bool>)>()
+        .all(db)
+        .await?;
+    for id in &wanted {
+        let Some((_, stored_kind, name, is_lab_instrument, is_active)) =
+            rows.iter().find(|r| r.0 == *id)
+        else {
+            return Err(AppError::BadRequest(format!("Instrument {id} not found")));
+        };
+        let kind = InstrumentKind::of(stored_kind.as_deref(), *is_lab_instrument);
+        let name = name.clone().unwrap_or_else(|| id.to_string());
+        if let Some(message) = instrument_refusal(kind, *is_active, &name, subject) {
+            return Err(AppError::BadRequest(message));
+        }
+    }
+    Ok(())
+}
+
 /// Refuse an instrument nothing measures on, and one that has been retired, for the writes that
 /// name one: a slot's declaration and a deployment. `subject` names the write in the message,
 /// since the operator picked the row from a list and needs to be told why this one is not an

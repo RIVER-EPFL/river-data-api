@@ -7470,6 +7470,56 @@ pub(super) fn spot_group(
         .add(readings::Column::MeasurementType.eq(SPOT))
 }
 
+/// The groups that grew or shrank under a client between its read and its save. A replace rewrites
+/// the indexes it carries and retracts the stored ones it leaves out, so a group holding a
+/// replicate the client never saw is one the save must not be allowed to retract.
+pub(super) fn groups_changed(
+    expected: &[ExpectedGroup],
+    existing: &[ExistingGroup],
+) -> Vec<(Uuid, chrono::DateTime<chrono::Utc>)> {
+    expected
+        .iter()
+        .filter(|group| {
+            let stored: Vec<i16> = existing
+                .iter()
+                .find(|e| e.parameter_id == group.parameter_id && e.time == group.time)
+                .map(|e| e.replicates.iter().map(|r| r.replicate_index).collect())
+                .unwrap_or_default();
+            let mut read = group.replicate_indices.clone();
+            read.sort_unstable();
+            read.dedup();
+            let mut found = stored;
+            found.sort_unstable();
+            found.dedup();
+            read != found
+        })
+        .map(|group| (group.parameter_id, group.time))
+        .collect()
+}
+
+/// How many stored replicates an entry would move. A replace rewrites the keys the request names
+/// and retracts the stored replicates it leaves out, so a save carrying every stored replicate at
+/// the number it already holds moves none of them and only adds where nothing was stored.
+pub(super) fn stored_values_moved(
+    carried: &[(Uuid, chrono::DateTime<chrono::Utc>, i16, f64)],
+    existing: &[ExistingGroup],
+) -> usize {
+    existing
+        .iter()
+        .flat_map(|group| {
+            group.replicates.iter().map(move |replicate| {
+                carried.iter().any(|(parameter_id, time, index, value)| {
+                    *parameter_id == group.parameter_id
+                        && *time == group.time
+                        && *index == replicate.replicate_index
+                        && *value == replicate.raw_value
+                })
+            })
+        })
+        .filter(|unchanged| !unchanged)
+        .count()
+}
+
 pub(super) async fn fetch_existing_groups(
     db: &sea_orm::DatabaseConnection,
     site_id: Uuid,
@@ -9012,6 +9062,7 @@ pub(super) async fn import_tool_csv(
                 continue;
             }
             let request = GrabSampleRequest {
+            expected_replicates: None,
                 pending_inputs: false,
                 site_id: site.id,
                 created_by: Some(actor.clone()),

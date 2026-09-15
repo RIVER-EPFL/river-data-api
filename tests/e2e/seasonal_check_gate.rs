@@ -122,13 +122,41 @@ async fn an_outlier_warns_and_the_save_is_held_to_its_check() {
     );
 
     // What an intern may not do is rewrite a stored value.
-    let mut replace = intern_entry.clone();
-    replace["mode"] = json!("replace");
+    let mut rewrite = intern_entry.clone();
+    rewrite["mode"] = json!("replace");
+    rewrite["readings"][0]["value"] = json!(12.5);
     let (status, refused) =
-        crate::common::post_json_with_token(&app, "/api/grab_samples", &replace, &intern).await;
+        crate::common::post_json_with_token(&app, "/api/grab_samples", &rewrite, &intern).await;
     assert_eq!(
         status, 403,
         "an intern's entry cannot replace stored values: {refused}"
+    );
+
+    // A second repeat of the same measurement is an entry, not a rewrite (B295). The grid posts
+    // the whole replicate group, so the stored repeat travels with it at the number it already
+    // holds and the intern's new one lands beside it.
+    let mut second_repeat = intern_entry.clone();
+    second_repeat["mode"] = json!("replace");
+    second_repeat["readings"] = json!([
+        { "parameter_id": parameter_id, "value": 12.0, "time": "2025-06-20T10:30:00Z" },
+        { "parameter_id": parameter_id, "value": 13.5, "time": "2025-06-20T10:30:00Z" },
+    ]);
+    let (status, added) =
+        crate::common::post_json_with_token(&app, "/api/grab_samples", &second_repeat, &intern)
+            .await;
+    assert_eq!(status, 200, "an intern enters a second repeat: {added}");
+    assert_eq!(
+        e2e::count(
+            &db,
+            &format!(
+                "SELECT COUNT(*)::bigint AS n FROM readings \
+                 WHERE site_id = '{}' AND time = '2025-06-20T10:30:00Z' AND unverified",
+                track.site_id
+            ),
+        )
+        .await,
+        2,
+        "both repeats are the intern's, so both are unverified"
     );
 
     // An edit after the check must re-check — the gate.

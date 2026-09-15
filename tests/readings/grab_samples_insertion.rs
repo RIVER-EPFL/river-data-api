@@ -693,3 +693,54 @@ async fn a_hand_entered_triplicate_carries_its_curve_into_the_statistics() {
     assert!((min_value - 10.5).abs() < 1e-9);
     assert!((max_value - 16.5).abs() < 1e-9);
 }
+
+// A replace retracts the stored replicates it does not carry, so a save built before somebody
+// else added a repeat would drop that repeat without saying so. A request naming what it read is
+// refused instead.
+#[tokio::test]
+#[serial]
+async fn a_replace_from_a_stale_read_is_refused() {
+    let (app, token, _db) = setup().await;
+    let time = "2025-08-04T09:00:00Z";
+    let parameter_id = crate::common::GLOBAL_PARAM_TEMP_ID;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "readings": [
+                { "parameter_id": parameter_id, "value": 11.0, "time": time },
+                { "parameter_id": parameter_id, "value": 12.0, "time": time },
+            ]
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "two repeats are stored: {body}");
+
+    let stale = serde_json::json!({
+        "site_id": crate::common::SITE1_ID,
+        "mode": "replace",
+        "expected_replicates": [
+            { "parameter_id": parameter_id, "time": time, "replicate_indices": [0] }
+        ],
+        "readings": [{ "parameter_id": parameter_id, "value": 11.5, "time": time }]
+    });
+    let (status, refused) =
+        crate::common::post_json_with_token(&app, "/api/grab_samples", &stale, &token).await;
+    assert_eq!(
+        status, 409,
+        "the group grew since it was read, so the replace is refused: {refused}"
+    );
+
+    let mut fresh = stale.clone();
+    fresh["expected_replicates"][0]["replicate_indices"] = serde_json::json!([0, 1]);
+    fresh["readings"] = serde_json::json!([
+        { "parameter_id": parameter_id, "value": 11.5, "time": time },
+        { "parameter_id": parameter_id, "value": 12.0, "time": time },
+    ]);
+    let (status, written) =
+        crate::common::post_json_with_token(&app, "/api/grab_samples", &fresh, &token).await;
+    assert_eq!(status, 200, "a save that read the whole group writes: {written}");
+}

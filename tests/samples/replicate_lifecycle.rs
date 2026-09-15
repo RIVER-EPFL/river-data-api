@@ -191,8 +191,12 @@ async fn grab_repost_conflicts_then_replace_rewrites_the_group() {
     assert_eq!(status, 200, "replace ({status}): {body}");
     let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(
-        resp["replaced"], 3,
-        "the whole stored set is removed: {resp}"
+        resp["replaced"], 2,
+        "the replicates the save carries are rewritten: {resp}"
+    );
+    assert_eq!(
+        resp["withdrawn"], 1,
+        "and the one it dropped is withdrawn: {resp}"
     );
     assert_eq!(resp["inserted"], 2, "and the new set stored: {resp}");
 

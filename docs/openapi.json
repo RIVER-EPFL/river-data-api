@@ -6789,6 +6789,33 @@
         ],
         "type": "object"
       },
+      "ExpectedGroup": {
+        "additionalProperties": false,
+        "description": "The replicate indexes a client read for one group before it built its save.",
+        "properties": {
+          "parameter_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "replicate_indices": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "parameter_id",
+          "time",
+          "replicate_indices"
+        ],
+        "type": "object"
+      },
       "ExpectedParameter": {
         "properties": {
           "code": {
@@ -7388,6 +7415,16 @@
             "description": "Compute the preview and report existing groups without writing anything.",
             "type": "boolean"
           },
+          "expected_replicates": {
+            "description": "What the client believes each group it replaces already holds. A replace retracts the\nstored replicates it does not carry, so a save built from a stale read would retract a\nrepeat somebody else added in the meantime. Naming the indexes refuses that with a 409\ndescribing what is there instead; omitting the field writes without the check.",
+            "items": {
+              "$ref": "#/components/schemas/ExpectedGroup"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "label": {
             "description": "Stamped onto the samples rows this request creates or reuses.",
             "type": [
@@ -7496,6 +7533,11 @@
           "samples_created": {
             "minimum": 0,
             "type": "integer"
+          },
+          "withdrawn": {
+            "description": "Replicates stored at the instant that `mode: replace` withdrew because the save no longer\ncarries them: a cleared cell, or a pasted block narrower than what is there. The value\nstays readable and the stamp is reversible; nothing deletes.",
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
@@ -7504,6 +7546,7 @@
           "dry_run",
           "replaced",
           "kept_curated",
+          "withdrawn",
           "preview",
           "existing_groups"
         ],

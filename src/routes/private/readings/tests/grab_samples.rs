@@ -78,3 +78,137 @@ fn a_first_write_carries_only_what_the_request_says() {
         "a request that records nothing writes nothing"
     );
 }
+
+mod moved {
+    use super::super::{ExistingGroup, ExistingReplicate, stored_values_moved};
+    use chrono::{DateTime, TimeZone, Utc};
+    use uuid::Uuid;
+
+    fn at() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2025, 6, 20, 10, 30, 0).unwrap()
+    }
+
+    fn replicate(index: i16, raw_value: f64) -> ExistingReplicate {
+        ExistingReplicate {
+            replicate_index: index,
+            raw_value,
+            calibrated_value: None,
+            standard_curve_id: None,
+        }
+    }
+
+    fn group(parameter_id: Uuid, replicates: Vec<ExistingReplicate>) -> ExistingGroup {
+        ExistingGroup {
+            parameter_id,
+            time: at(),
+            replicates,
+        }
+    }
+
+    #[test]
+    fn a_new_replicate_beside_an_unchanged_one_moves_nothing() {
+        let doc = Uuid::new_v4();
+        let carried = [(doc, at(), 0, 12.0), (doc, at(), 1, 13.5)];
+        let existing = [group(doc, vec![replicate(0, 12.0)])];
+        assert_eq!(stored_values_moved(&carried, &existing), 0);
+    }
+
+    #[test]
+    fn a_different_number_at_a_stored_index_moves_it() {
+        let doc = Uuid::new_v4();
+        let carried = [(doc, at(), 0, 12.5)];
+        let existing = [group(doc, vec![replicate(0, 12.0)])];
+        assert_eq!(stored_values_moved(&carried, &existing), 1);
+    }
+
+    #[test]
+    fn a_stored_replicate_the_save_leaves_out_moves_because_the_replace_retracts_it() {
+        let doc = Uuid::new_v4();
+        let carried = [(doc, at(), 0, 12.0)];
+        let existing = [group(doc, vec![replicate(0, 12.0), replicate(1, 13.0)])];
+        assert_eq!(stored_values_moved(&carried, &existing), 1);
+    }
+
+    #[test]
+    fn another_parameter_s_stored_replicate_is_not_this_group_s() {
+        let doc = Uuid::new_v4();
+        let ph = Uuid::new_v4();
+        let carried = [(doc, at(), 0, 12.0)];
+        let existing = [
+            group(doc, vec![replicate(0, 12.0)]),
+            group(ph, vec![replicate(0, 7.1)]),
+        ];
+        assert_eq!(
+            stored_values_moved(&carried, &existing),
+            1,
+            "pH is stored and the save carries nothing for it, so the replace would retract it"
+        );
+    }
+}
+
+mod staleness {
+    use super::super::{ExistingGroup, ExistingReplicate, ExpectedGroup, groups_changed};
+    use chrono::{DateTime, TimeZone, Utc};
+    use uuid::Uuid;
+
+    fn at() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2025, 6, 20, 10, 30, 0).unwrap()
+    }
+
+    fn stored(parameter_id: Uuid, indices: &[i16]) -> ExistingGroup {
+        ExistingGroup {
+            parameter_id,
+            time: at(),
+            replicates: indices
+                .iter()
+                .map(|index| ExistingReplicate {
+                    replicate_index: *index,
+                    raw_value: 12.0,
+                    calibrated_value: None,
+                    standard_curve_id: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn read(parameter_id: Uuid, indices: &[i16]) -> ExpectedGroup {
+        ExpectedGroup {
+            parameter_id,
+            time: at(),
+            replicate_indices: indices.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_group_that_still_holds_what_was_read_has_not_changed() {
+        let doc = Uuid::new_v4();
+        assert!(groups_changed(&[read(doc, &[0, 1, 2])], &[stored(doc, &[0, 1, 2])]).is_empty());
+    }
+
+    #[test]
+    fn a_repeat_added_underneath_the_client_is_named() {
+        let doc = Uuid::new_v4();
+        assert_eq!(
+            groups_changed(&[read(doc, &[0, 1, 2])], &[stored(doc, &[0, 1, 2, 3])]),
+            vec![(doc, at())]
+        );
+    }
+
+    #[test]
+    fn a_group_emptied_underneath_the_client_is_named() {
+        let doc = Uuid::new_v4();
+        assert_eq!(groups_changed(&[read(doc, &[0])], &[]), vec![(doc, at())]);
+    }
+
+    #[test]
+    fn a_group_the_client_read_as_empty_and_still_is_has_not_changed() {
+        let doc = Uuid::new_v4();
+        assert!(groups_changed(&[read(doc, &[])], &[]).is_empty());
+    }
+
+    #[test]
+    fn order_is_not_a_change() {
+        let doc = Uuid::new_v4();
+        assert!(groups_changed(&[read(doc, &[2, 0, 1])], &[stored(doc, &[0, 1, 2])]).is_empty());
+    }
+}

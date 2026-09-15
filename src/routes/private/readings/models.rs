@@ -2231,7 +2231,22 @@ pub struct GrabSampleRequest {
     /// is recorded.
     #[serde(default)]
     pub sd_estimator: Option<String>,
+    /// What the client believes each group it replaces already holds. A replace retracts the
+    /// stored replicates it does not carry, so a save built from a stale read would retract a
+    /// repeat somebody else added in the meantime. Naming the indexes refuses that with a 409
+    /// describing what is there instead; omitting the field writes without the check.
+    #[serde(default)]
+    pub expected_replicates: Option<Vec<ExpectedGroup>>,
     pub readings: Vec<GrabSampleReading>,
+}
+
+/// The replicate indexes a client read for one group before it built its save.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedGroup {
+    pub parameter_id: Uuid,
+    pub time: chrono::DateTime<chrono::Utc>,
+    pub replicate_indices: Vec<i16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
@@ -2292,6 +2307,12 @@ pub struct GrabSampleResponse {
     #[serde(default)]
     #[schema(required)]
     pub kept_curated: usize,
+    /// Replicates stored at the instant that `mode: replace` withdrew because the save no longer
+    /// carries them: a cleared cell, or a pasted block narrower than what is there. The value
+    /// stays readable and the stamp is reversible; nothing deletes.
+    #[serde(default)]
+    #[schema(required)]
+    pub withdrawn: usize,
     /// What each reading stores: the measured value, the curves that apply and the value they
     /// produce together, computed by the code the write itself uses.
     pub preview: Vec<GrabPreview>,

@@ -1,7 +1,8 @@
 //! A grab save in `replace` mode rewrites only what the grab stream owns at the instant: rows
 //! another stream wrote at the same (site, parameter, time) survive, and a curated row on the grab
 //! stream (flagged, withdrawn, or carrying a hand-picked standard curve the request does not
-//! supply) is kept and raises a `source_modified` hold instead of being deleted.
+//! supply) is kept and raises a `source_modified` hold instead of being deleted. A replicate the
+//! save does not carry at all is withdrawn, reversibly, rather than deleted.
 //!
 //! Run: cargo test --test readings grab_replace_scope -- --test-threads=1
 
@@ -189,8 +190,12 @@ async fn replace_leaves_another_streams_rows_at_the_instant() {
     let (status, body) = save(&fx, &grab(&[40.0, 60.0], Some("replace"))).await;
     assert_eq!(status, 200, "second replace ({status}): {body}");
     assert_eq!(
-        body["replaced"], 3,
+        body["replaced"], 2,
         "only the grab stream's own rows are replaced: {body}"
+    );
+    assert_eq!(
+        body["withdrawn"], 1,
+        "the replicate the save dropped is withdrawn, not deleted: {body}"
     );
     assert_eq!(body["inserted"], 2);
     assert_eq!(
@@ -198,7 +203,7 @@ async fn replace_leaves_another_streams_rows_at_the_instant() {
         3,
         "the portal replicates still survive"
     );
-    assert_eq!(grab_rows(&fx).await, vec![(0, 40.0), (1, 60.0)]);
+    assert_eq!(grab_rows(&fx).await, vec![(0, 40.0), (1, 60.0), (2, 30.0)]);
     assert!(
         holds_on_grab_stream(&fx).await.is_empty(),
         "nothing curated, no hold"
@@ -285,9 +290,13 @@ async fn replace_keeps_a_withdrawn_replicate() {
 
     let (status, body) = save(&fx, &grab(&[40.0, 50.0], Some("replace"))).await;
     assert_eq!(status, 200, "replace ({status}): {body}");
-    assert_eq!(body["replaced"], 2, "{body}");
+    assert_eq!(body["replaced"], 1, "{body}");
     assert_eq!(body["kept_curated"], 1, "{body}");
-    assert_eq!(grab_rows(&fx).await, vec![(0, 40.0), (1, 20.0)]);
+    assert_eq!(
+        body["withdrawn"], 1,
+        "the replicate the save dropped: {body}"
+    );
+    assert_eq!(grab_rows(&fx).await, vec![(0, 40.0), (1, 20.0), (2, 30.0)]);
     assert_eq!(
         scalar_i64(
             &fx.db,
@@ -297,8 +306,8 @@ async fn replace_keeps_a_withdrawn_replicate() {
             )
         )
         .await,
-        1,
-        "the withdrawn stamp survives"
+        2,
+        "the withdrawn stamp survives, beside the one this save made"
     );
     let holds = holds_on_grab_stream(&fx).await;
     assert_eq!(holds.len(), 1, "{holds:?}");
@@ -363,4 +372,59 @@ async fn replace_keeps_a_hand_curved_replicate_unless_the_request_supplies_a_cur
     );
     assert_eq!(body["kept_curated"], 0, "{body}");
     assert_eq!(grab_rows(&fx).await, vec![(0, 70.0), (1, 80.0), (2, 90.0)]);
+}
+
+/// Scenario: a save carries fewer replicates than the instant already holds, because a cell was
+/// cleared or a pasted block is one column narrower than what is stored.
+///
+/// Expected behaviour: the replicates the save does not carry are withdrawn and stay readable,
+/// each with a `withdraw` decision to roll back from. Nothing deletes.
+#[tokio::test]
+#[serial]
+async fn replace_withdraws_the_replicates_the_save_does_not_carry() {
+    let fx = setup().await;
+    let (status, _) = save(&fx, &grab(&[10.0, 20.0, 30.0], None)).await;
+    assert_eq!(status, 200);
+
+    let (status, body) = save(&fx, &grab(&[40.0, 60.0], Some("replace"))).await;
+    assert_eq!(status, 200, "replace ({status}): {body}");
+    assert_eq!(
+        body["replaced"], 2,
+        "only the rewritten replicates are replaced: {body}"
+    );
+    assert_eq!(
+        body["withdrawn"], 1,
+        "the replicate the save dropped is withdrawn: {body}"
+    );
+    assert_eq!(
+        grab_rows(&fx).await,
+        vec![(0, 40.0), (1, 60.0), (2, 30.0)],
+        "the dropped replicate keeps its value"
+    );
+    assert_eq!(
+        scalar_i64(
+            &fx.db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM {}",
+                grab_rows_where("AND r.withdrawn_at IS NOT NULL AND r.replicate_index = 2")
+            )
+        )
+        .await,
+        1,
+        "and is withdrawn rather than deleted"
+    );
+    assert_eq!(
+        scalar_i64(
+            &fx.db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM reading_decisions d \
+                 JOIN data_streams s ON s.id = d.stream_id \
+                 WHERE s.source_system = 'grab_sample' AND d.time = '{T}' \
+                   AND d.replicate_index = 2 AND d.kind = 'withdraw'"
+            )
+        )
+        .await,
+        1,
+        "the retraction is on the ledger, to roll back from"
+    );
 }

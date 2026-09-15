@@ -271,3 +271,53 @@ async fn a_retired_instrument_cannot_be_declared_or_deployed() {
     .await;
     assert_eq!(status, 400, "adopt refuses a retired instrument: {body}");
 }
+
+/// A bookkeeping row records that nothing was declared, so it is not an answer to "what measured
+/// this", whichever list the operator picked it from. Same for a retired instrument.
+#[tokio::test]
+#[serial]
+async fn a_grab_cannot_name_a_bookkeeping_row_or_a_retired_instrument() {
+    let f = crate::common::seeded_app().await;
+    let (app, token, db) = (f.app, f.token, f.db);
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, name, kind, is_active, created_at) \
+             VALUES ('{LAB_INSTRUMENT}', 'CNET DOC channel', 'entry_channel', true, now()), \
+                    ('{SLOT_INSTRUMENT}', 'Retired probe', 'device', false, now())"
+        ),
+    )
+    .await;
+
+    for (instrument, expected) in [(LAB_INSTRUMENT, "entry_channel"), (SLOT_INSTRUMENT, "retired")] {
+        let (status, body) = crate::common::post_json_with_token(
+            &app,
+            "/api/grab_samples",
+            &serde_json::json!({
+                "site_id": crate::common::SITE1_ID,
+                "created_by": "lab",
+                "readings": [
+                    { "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID, "sensor_id": instrument,
+                      "value": 10.0, "time": TIME }
+                ]
+            }),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 400, "save ({status}): {body}");
+        assert!(body.contains(expected), "the refusal says why: {body}");
+    }
+
+    let stored = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT count(*) AS n FROM readings WHERE time = '{TIME}'"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(stored, 0, "nothing was stored");
+}

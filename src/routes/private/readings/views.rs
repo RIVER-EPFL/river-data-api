@@ -2821,6 +2821,18 @@ pub async fn insert_grab_samples(
     let fixed_estimators =
         tool_run_fixed_estimators(&state.db, payload.tool_run_id, &payload.readings).await?;
 
+    // What the operator picked, held to the same rule as a slot's declaration and a deployment:
+    // a bookkeeping row records that nothing was declared, and a retired instrument is not in the
+    // lab. The slot's own declaration is guarded where it is set, so only the request's pick is
+    // checked here.
+    let picked: Vec<Uuid> = payload.readings.iter().filter_map(|r| r.sensor_id).collect();
+    crate::routes::private::sensors::service::require_measuring_instruments(
+        &state.db,
+        &picked,
+        "named as what measured a grab sample",
+    )
+    .await?;
+
     // The chosen standard curves, admitted by the one rule every writer of `standard_curve_id`
     // uses. A grab is spot by construction, so the only claims this path can be refused for are an
     // unknown id, a curve fitted on another instrument, and a curve on a grab that names no
@@ -2950,26 +2962,61 @@ pub async fn insert_grab_samples(
             dry_run: true,
             replaced: 0,
             kept_curated: 0,
+            withdrawn: 0,
             preview,
             existing_groups,
             calculations,
         }));
     }
 
-    // An intern enters measurements; a stored value is someone else's to change (Q21).
+    // An intern enters measurements; a stored value is someone else's to change (Q21). A replace
+    // that carries every stored replicate at the number it already holds changes none of them: the
+    // entry grid posts the whole group, so a repeat typed into an empty cell arrives this way.
     if crate::routes::private::readings::service::entry_state(auth.highest_role().as_ref())
         .is_some()
         && payload.mode == Some(GrabWriteMode::Replace)
     {
-        return Err(AppError::Forbidden(
-            "An intern's entry cannot replace stored values; a manager rewrites them".to_string(),
-        ));
+        let carried: Vec<(Uuid, chrono::DateTime<chrono::Utc>, i16, f64)> = payload
+            .readings
+            .iter()
+            .zip(&preview)
+            .map(|(r, p)| (r.parameter_id, r.time, p.replicate_index, r.value))
+            .collect();
+        let moved = crate::routes::private::readings::service::stored_values_moved(
+            &carried,
+            &existing_groups,
+        );
+        if moved > 0 {
+            return Err(AppError::Forbidden(format!(
+                "An intern's entry cannot replace stored values; a manager rewrites them \
+                 ({moved} stored replicate(s) would move)"
+            )));
+        }
     }
     // A value computed from a pending measurement is pending too (M62): the chain says so.
     let entry_state = crate::routes::private::readings::service::entry_kind(
         payload.pending_inputs,
         auth.highest_role().as_ref(),
     );
+
+    // A save built from a stale read would retract a repeat added under it, so a client that says
+    // what it read is refused when a group no longer holds that.
+    if let Some(expected) = &payload.expected_replicates {
+        let changed =
+            crate::routes::private::readings::service::groups_changed(expected, &existing_groups);
+        if !changed.is_empty() {
+            let detail = serde_json::to_value(&existing_groups)
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            return Err(AppError::ConflictDetail {
+                message: format!(
+                    "{} replicate group(s) changed since they were read; re-read the visit and \
+                     save again",
+                    changed.len()
+                ),
+                detail,
+            });
+        }
+    }
 
     if !existing_groups.is_empty() && payload.mode != Some(GrabWriteMode::Replace) {
         let detail = serde_json::to_value(&existing_groups)
@@ -3072,14 +3119,14 @@ pub async fn insert_grab_samples(
     // One guarded transaction: a replace on a compressed chunk must not fail on the cap, and the
     // delete, the sample rows and the insert land together or not at all.
     let actor = crate::common::actor::label(&auth);
-    let (inserted, replaced, kept_curated, created_sample_ids, touched_events) =
+    let (inserted, replaced, kept_curated, withdrawn, created_sample_ids, touched_events) =
         crate::common::bulk_write::guarded(&state.db, async |txn| {
             // A replace deletes the rows carrying the group's label, notes, authorship and blob,
             // so they are captured first and restored onto the rewritten rows wherever the request
             // does not carry its own.
             let mut prior_facts: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), StoredFacts> =
                 HashMap::new();
-            let (replaced, kept_curated): (usize, usize) =
+            let (replaced, kept_curated, withdrawn): (usize, usize, usize) =
                 if payload.mode == Some(GrabWriteMode::Replace) {
                     // What the replace rewrites is decided before the rows go: a person's
                     // correction of a stored value, or the chain superseding an output with a
@@ -3174,6 +3221,7 @@ pub async fn insert_grab_samples(
                     // lands in the review queue.
                     let mut removed: u64 = 0;
                     let mut kept_total: usize = 0;
+                    let mut withdrawn: usize = 0;
                     for (parameter_id, time) in &groups {
                         let stream_id = stream_cache[parameter_id];
                         let supplies_curve = payload.readings.iter().zip(&preview).any(|(r, p)| {
@@ -3214,24 +3262,74 @@ pub async fn insert_grab_samples(
                             .await?;
                             kept_total += kept.len();
                         }
+                        // What the save carries is rewritten; what it leaves out is retracted,
+                        // never deleted. A cleared cell or a narrower pasted block is a person
+                        // saying the replicate is not part of the measurement any more, and the
+                        // stamp is reversible where a delete is not.
+                        let carried: Vec<i16> = payload
+                            .readings
+                            .iter()
+                            .zip(&preview)
+                            .filter(|(r, _)| r.parameter_id == *parameter_id && r.time == *time)
+                            .map(|(_, p)| p.replicate_index)
+                            .collect();
+                        let uncurved = |cond: Condition| {
+                            if supplies_curve {
+                                cond
+                            } else {
+                                cond.add(readings::Column::StandardCurveId.is_null())
+                            }
+                        };
+                        let dropped = crate::routes::private::readings::service::record_many(
+                            txn,
+                            crate::routes::private::readings::models::Kind::Withdraw,
+                            {
+                                use crate::routes::private::collection_events::flows::row;
+                                use crate::routes::private::readings::models::Column;
+                                use sea_orm::ExprTrait as _;
+                                let mut cond = Condition::all()
+                                    .add(row(Column::StreamId).eq(stream_id))
+                                    .add(row(Column::Time).eq(
+                                        sea_orm::prelude::DateTimeWithTimeZone::from(*time),
+                                    ))
+                                    .add(row(Column::MeasurementType).eq("spot"))
+                                    .add(row(Column::ReplicateIndex).is_not_in(carried.clone()))
+                                    .add(Expr::cust("r.is_flagged IS NOT TRUE"))
+                                    .add(row(Column::WithdrawnAt).is_null());
+                                if !supplies_curve {
+                                    cond = cond.add(row(Column::StandardCurveId).is_null());
+                                }
+                                cond
+                            },
+                            crate::routes::private::readings::service::NewValue::Literal(
+                                serde_json::json!({ "reason": "the save no longer carries this replicate" }),
+                            ),
+                            &actor,
+                            Some("dropped by a narrower entry"),
+                            crate::routes::private::readings::models::Origin::Manual,
+                            None,
+                        )
+                        .await?;
+                        withdrawn += usize::try_from(dropped.rows).unwrap_or(usize::MAX);
                         let res = readings::Entity::delete_many()
                             .filter(readings::Column::StreamId.eq(stream_id))
                             .filter(readings::Column::Time.eq(*time))
                             .filter(readings::Column::MeasurementType.eq("spot"))
+                            .filter(readings::Column::ReplicateIndex.is_in(carried))
                             .filter(Expr::cust("is_flagged IS NOT TRUE"))
                             .filter(readings::Column::WithdrawnAt.is_null())
-                            .filter(if supplies_curve {
-                                Condition::all()
-                            } else {
-                                Condition::all().add(readings::Column::StandardCurveId.is_null())
-                            })
+                            .filter(uncurved(Condition::all()))
                             .exec(txn)
                             .await?;
                         removed += res.rows_affected;
                     }
-                    (usize::try_from(removed).unwrap_or(usize::MAX), kept_total)
+                    (
+                        usize::try_from(removed).unwrap_or(usize::MAX),
+                        kept_total,
+                        withdrawn,
+                    )
                 } else {
-                    (0, 0)
+                    (0, 0, 0)
                 };
 
             // What each row records about the measurement, request first and the rewritten group's
@@ -3427,6 +3525,7 @@ pub async fn insert_grab_samples(
                 inserted,
                 replaced,
                 kept_curated,
+                withdrawn,
                 created_sample_ids,
                 touched_events,
             ))
@@ -3468,7 +3567,7 @@ pub async fn insert_grab_samples(
     .await?;
 
     let samples_created = created_sample_ids.len();
-    tracing::info!(total, inserted, replaced, kept_curated, samples_created, site = %site.name, "Grab samples inserted");
+    tracing::info!(total, inserted, replaced, kept_curated, withdrawn, samples_created, site = %site.name, "Grab samples inserted");
     Ok(Json(GrabSampleResponse {
         inserted,
         samples_created,
@@ -3476,6 +3575,7 @@ pub async fn insert_grab_samples(
         dry_run: false,
         replaced,
         kept_curated,
+        withdrawn,
         preview,
         existing_groups,
         calculations,

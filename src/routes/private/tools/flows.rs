@@ -595,6 +595,7 @@ pub async fn recompute_event(
             grants: std::sync::Arc::new(std::collections::HashSet::new()),
         };
         let request = GrabSampleRequest {
+            expected_replicates: None,
             site_id: event.site_id,
             pending_inputs: inputs_pending,
             created_by: Some(actor.to_string()),
