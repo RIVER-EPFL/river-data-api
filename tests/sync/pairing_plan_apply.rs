@@ -886,3 +886,143 @@ async fn a_register_row_colliding_with_an_instrument_attaches_instead_of_duplica
         "the attached row leaves the queue"
     );
 }
+
+/// Scenario: a plan whose entries create their own site and parameter is applied and then reverted.
+/// Expected behaviour: the revert unpairs the streams and unattributes their readings, and leaves
+/// every row the apply created standing, which is what `ConfirmStep` and `ApplyResults` tell the
+/// operator. The plan stays `reverted`, so the same entries cannot be applied a second time.
+#[tokio::test]
+#[serial]
+async fn revert_keeps_the_rows_the_apply_created() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let stream_id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
+             VALUES ('{stream_id}', 'vaisala', 'loc-create-1', 'Loc Create 1', true)"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO readings (stream_id, time, raw_value, replicate_index) \
+             VALUES ('{stream_id}', '2025-04-01T00:00:00Z', 3.0, 0)"
+        ),
+    )
+    .await;
+
+    let sites_before = count(&db, "sites").await;
+    let parameters_before = count(&db, "parameters").await;
+    let site_parameters_before = count(&db, "site_parameters").await;
+
+    let entries = serde_json::json!([{
+        "stream_id": stream_id,
+        "source_key": "loc-create-1",
+        "source_name": "Loc Create 1",
+        "action": "pair",
+        "project": { "id": crate::common::PROJECT_ID, "name": "Test Project", "create": false },
+        "site": { "id": null, "name": "Revert Site", "create": true, "latitude": null, "longitude": null, "altitude_m": null },
+        "parameter": { "id": null, "name": "Revert Parameter", "create": true, "units": "C", "group_key": null, "original_names": [] },
+        "confidence": "exact",
+        "warnings": [],
+        "original_parameter_name": null
+    }]);
+    let plan_id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO pairing_plans (id, source_system, status, summary, entries) \
+             VALUES ('{plan_id}', 'vaisala', 'draft', '{{}}'::jsonb, '{}'::jsonb)",
+            entries.to_string().replace('\'', "''")
+        ),
+    )
+    .await;
+
+    crate::common::plans::acknowledge_plan(&app, &token, &plan_id.to_string()).await;
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
+            .await;
+    assert!(
+        (200..300).contains(&status),
+        "apply should be 2xx, got {status}: {text}"
+    );
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await,
+        "completed"
+    );
+
+    assert_eq!(count(&db, "sites").await, sites_before + 1, "apply creates the site");
+    assert_eq!(
+        count(&db, "parameters").await,
+        parameters_before + 1,
+        "apply creates the parameter"
+    );
+    assert_eq!(
+        count(&db, "site_parameters").await,
+        site_parameters_before + 1,
+        "apply creates the slot"
+    );
+
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "revert", &token)
+            .await;
+    assert!(
+        (200..300).contains(&status),
+        "revert should be 2xx, got {status}: {text}"
+    );
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await,
+        "completed"
+    );
+
+    assert!(
+        scalar_opt_uuid(
+            &db,
+            &format!("SELECT site_parameter_id AS v FROM data_streams WHERE id = '{stream_id}'")
+        )
+        .await
+        .is_none(),
+        "revert unpairs the stream"
+    );
+    assert!(
+        scalar_opt_uuid(
+            &db,
+            &format!("SELECT site_id AS v FROM readings WHERE stream_id = '{stream_id}' LIMIT 1")
+        )
+        .await
+        .is_none(),
+        "revert unattributes the readings"
+    );
+
+    // What the operator is told stays: the created rows are not rolled back.
+    assert_eq!(
+        count(&db, "sites").await,
+        sites_before + 1,
+        "the created site survives the revert"
+    );
+    assert_eq!(
+        count(&db, "parameters").await,
+        parameters_before + 1,
+        "the created parameter survives the revert"
+    );
+    assert_eq!(
+        count(&db, "site_parameters").await,
+        site_parameters_before + 1,
+        "the created slot survives the revert"
+    );
+
+    // A reverted plan is terminal: the same entries cannot be applied again.
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
+            .await;
+    assert_eq!(status, 409, "re-applying a reverted plan is refused: {text}");
+
+    crate::common::cleanup_test_db(&db).await;
+}
