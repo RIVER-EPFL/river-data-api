@@ -428,7 +428,6 @@ async fn subscribing_to_a_station_the_list_does_not_hold_is_refused() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
-    crate::common::exec(&db, "DELETE FROM meteoswiss_stations").await;
 
     let typed = |abbr: &str| MeteoswissSubscriptionCreate {
         site_id: Uuid::parse_str(crate::common::fixtures::SITE1_ID).unwrap(),
@@ -478,7 +477,6 @@ async fn subscribing_to_a_station_the_list_does_not_hold_is_refused() {
 async fn the_station_list_is_maintained_rather_than_appended_to() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
-    crate::common::exec(&db, "DELETE FROM meteoswiss_stations").await;
 
     store_stations(
         &db,
@@ -538,7 +536,6 @@ async fn the_station_list_is_maintained_rather_than_appended_to() {
 async fn the_station_search_matches_an_abbreviation_or_a_name_in_any_case() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
-    crate::common::exec(&db, "DELETE FROM meteoswiss_stations").await;
     store_stations(
         &db,
         &[

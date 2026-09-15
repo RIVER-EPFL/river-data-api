@@ -58,7 +58,8 @@ async fn output_at(
         .unwrap_or_else(|| panic!("an output is stored at {at}"));
     (
         row.try_get::<Option<f64>>("", "value").expect("value"),
-        row.try_get::<Option<String>>("", "version").expect("version"),
+        row.try_get::<Option<String>>("", "version")
+            .expect("version"),
     )
 }
 
@@ -149,7 +150,10 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
         &admin,
     )
     .await;
-    assert!((200..300).contains(&status), "create the constant: {constant}");
+    assert!(
+        (200..300).contains(&status),
+        "create the constant: {constant}"
+    );
     let constant_id = e2e::id_of(&constant);
 
     let (status, created) = crate::common::post_json_parse_with_token(
@@ -159,7 +163,10 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
         &admin,
     )
     .await;
-    assert!((200..300).contains(&status), "create the calculation: {created}");
+    assert!(
+        (200..300).contains(&status),
+        "create the calculation: {created}"
+    );
     let script_id = e2e::id_of(&created);
 
     // The whole set in one request, which is what a save is: one version comes out of it (Q186).
@@ -191,9 +198,15 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
     };
 
     let saved = save("FverIn * 2 * fver_factor", false, None).await;
-    assert_eq!(saved["created"], 1, "the first save writes the formula: {saved}");
+    assert_eq!(
+        saved["created"], 1,
+        "the first save writes the formula: {saved}"
+    );
     assert_eq!(saved["version_no"], 1, "and mints one version: {saved}");
-    assert_eq!(saved["migrated"], false, "a first save supersedes nothing: {saved}");
+    assert_eq!(
+        saved["migrated"], false,
+        "a first save supersedes nothing: {saved}"
+    );
     let first_version = saved["version_id"].as_str().expect("a version").to_string();
 
     // The calculation mints its own output parameter (Q191), so the slot is declared after the
@@ -260,7 +273,10 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
     let saved = save("FverIn * 3 * fver_factor", false, Some(formula_id.clone())).await;
     assert_eq!(saved["updated"], 1, "the formula it named: {saved}");
     assert_eq!(saved["version_no"], 2, "one save, one version: {saved}");
-    assert_eq!(saved["migrated"], false, "the leaving arm migrates nothing: {saved}");
+    assert_eq!(
+        saved["migrated"], false,
+        "the leaving arm migrates nothing: {saved}"
+    );
     let second_version = saved["version_id"].as_str().expect("a version").to_string();
     e2e::drain_jobs(&db, 60).await;
     for at in VISITS {
@@ -285,7 +301,10 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
     // the three visits the first one produced are not in its scope and stay where they are.
     let saved = save("FverIn * 4 * fver_factor", true, Some(formula_id.clone())).await;
     assert_eq!(saved["version_no"], 3, "one save, one version: {saved}");
-    assert_eq!(saved["migrated"], true, "the correcting arm enqueues the migration: {saved}");
+    assert_eq!(
+        saved["migrated"], true,
+        "the correcting arm enqueues the migration: {saved}"
+    );
     let third_version = version_id(&db, &script_id, 3).await;
     assert_eq!(saved["version_id"], json!(third_version));
     e2e::drain_jobs(&db, 120).await;
@@ -305,9 +324,19 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
 
     // The move is in the ledger, naming the value it replaced and the run that replaced it.
     let moved = ledger_at(&db, &site_id, &output, LATER).await;
-    let (kind, was, reran) = moved.first().cloned().expect("the migration wrote a ledger row");
-    assert_eq!(kind, "chain", "the chain executor is what recomputed it: {moved:?}");
-    assert_eq!(was, Some(30.0), "the value the new version replaced: {moved:?}");
+    let (kind, was, reran) = moved
+        .first()
+        .cloned()
+        .expect("the migration wrote a ledger row");
+    assert_eq!(
+        kind, "chain",
+        "the chain executor is what recomputed it: {moved:?}"
+    );
+    assert_eq!(
+        was,
+        Some(30.0),
+        "the value the new version replaced: {moved:?}"
+    );
     assert!(reran, "and the run behind it moved: {moved:?}");
 
     // --- The constant ---
@@ -361,8 +390,15 @@ async fn a_save_arm_decides_whether_stored_values_stay_on_their_version_or_move(
         "10 * 4 * 2 at the later visit too"
     );
     let moved = ledger_at(&db, &site_id, &output, VISITS[0]).await;
-    let (kind, was, reran) = moved.first().cloned().expect("the constant edit wrote a ledger row");
+    let (kind, was, reran) = moved
+        .first()
+        .cloned()
+        .expect("the constant edit wrote a ledger row");
     assert_eq!(kind, "chain", "{moved:?}");
-    assert_eq!(was, Some(20.0), "the value the constant edit replaced: {moved:?}");
+    assert_eq!(
+        was,
+        Some(20.0),
+        "the value the constant edit replaced: {moved:?}"
+    );
     assert!(reran, "and the run behind it moved: {moved:?}");
 }

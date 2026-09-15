@@ -469,6 +469,52 @@ async fn the_arrival_of_the_current_value_is_the_correction_that_wrote_it() {
 const CHAIN_AT: &str = "2025-07-02T09:00:00Z";
 const CHAIN_GROUP_ID: &str = "00000000-0000-4000-c000-000000000202";
 
+/// Puts a chain parameter in the group and declares it at the site. `mint` also creates the
+/// catalog row; a calculation's output already has one.
+async fn declare_chain_parameter(
+    db: &DatabaseConnection,
+    id: &str,
+    code: &str,
+    ordinal: i32,
+    mint: bool,
+) {
+    if mint {
+        crate::common::exec(
+            db,
+            &format!(
+                "INSERT INTO parameters (id, code, name, default_units, category) \
+                 VALUES ('{id}', '{code}', '{code}', 'ppb', 'measurement')"
+            ),
+        )
+        .await;
+    }
+    for sql in [
+        format!(
+            "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
+             VALUES (gen_random_uuid(), '{CHAIN_GROUP_ID}', '{id}', {ordinal})"
+        ),
+        format!(
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active) \
+             VALUES (gen_random_uuid(), '{SITE1_ID}', '{id}', '{code}', 'lab', true)"
+        ),
+    ] {
+        crate::common::exec(db, &sql).await;
+    }
+}
+
+async fn minted_chain_output(db: &DatabaseConnection, code: &str) -> String {
+    db.query_one_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!("SELECT id FROM parameters WHERE lower(code) = lower('{code}')"),
+    ))
+    .await
+    .expect("the catalog reads")
+    .expect("the calculation minted its output")
+    .try_get::<uuid::Uuid>("", "id")
+    .expect("id")
+    .to_string()
+}
+
 /// A two-stage, three-replicate calculation over a measured family: `S1 = Peak * 2` per
 /// replicate, `S2 = S1 + 1` over the family's mean. Returns the three parameter ids.
 async fn seed_chain(
@@ -486,27 +532,8 @@ async fn seed_chain(
     ] {
         crate::common::exec(db, &sql).await;
     }
-    let mut ids = Vec::new();
-    for (code, ordinal) in [("Peak", 1), ("S1", 2), ("S2", 3)] {
-        let id = uuid::Uuid::new_v4().to_string();
-        for sql in [
-            format!(
-                "INSERT INTO parameters (id, code, name, default_units, category) \
-                 VALUES ('{id}', '{code}', '{code}', 'ppb', 'measurement')"
-            ),
-            format!(
-                "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
-                 VALUES (gen_random_uuid(), '{CHAIN_GROUP_ID}', '{id}', {ordinal})"
-            ),
-            format!(
-                "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active) \
-                 VALUES (gen_random_uuid(), '{SITE1_ID}', '{id}', '{code}', 'lab', true)"
-            ),
-        ] {
-            crate::common::exec(db, &sql).await;
-        }
-        ids.push(id);
-    }
+    let peak_id = uuid::Uuid::new_v4().to_string();
+    declare_chain_parameter(db, &peak_id, "Peak", 1, true).await;
     crate::common::exec(
         db,
         &format!(
@@ -540,7 +567,15 @@ async fn seed_chain(
             crate::common::post_json_with_token(app, "/api/derived_parameters", &body, token).await;
         assert!((200..300).contains(&status), "formula ({status}): {text}");
     }
-    (ids[0].clone(), ids[1].clone(), ids[2].clone())
+
+    // The calculation minted the two outputs; the site declares them under the ids it chose.
+    let mut minted = Vec::new();
+    for (code, ordinal) in [("S1", 2), ("S2", 3)] {
+        let id = minted_chain_output(db, code).await;
+        declare_chain_parameter(db, &id, code, ordinal, false).await;
+        minted.push(id);
+    }
+    (peak_id, minted[0].clone(), minted[1].clone())
 }
 
 async fn save_at_chain_instant(

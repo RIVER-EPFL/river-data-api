@@ -19,6 +19,14 @@ pub fn url_for(base: &str, database: &str) -> String {
     format!("{}/{database}{query}", &base[..cut])
 }
 
+/// The database name in a connection URL.
+#[must_use]
+pub fn name_of(url: &str) -> &str {
+    let cut = url.rfind('/').expect("a database name in DATABASE_URL") + 1;
+    let tail = &url[cut..];
+    tail.split('?').next().unwrap_or(tail)
+}
+
 /// A connection to the server's own `postgres` database, which is where a database is created and
 /// dropped from.
 pub async fn server(base: &str) -> DatabaseConnection {
@@ -50,4 +58,29 @@ pub async fn discard(server: &DatabaseConnection, name: &str) {
         .execute_unprepared(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
         .await
         .expect("drop the scratch database");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{name_of, url_for};
+
+    #[test]
+    fn test_name_of_reads_the_database_from_the_url() {
+        assert_eq!(
+            name_of("postgresql://postgres:psql@localhost:5444/river_test"),
+            "river_test"
+        );
+        assert_eq!(
+            name_of("postgresql://postgres:psql@localhost:5444/river_test?sslmode=disable"),
+            "river_test"
+        );
+    }
+
+    #[test]
+    fn test_url_for_keeps_the_query() {
+        assert_eq!(
+            url_for("postgresql://h:5444/river_test?sslmode=disable", "postgres"),
+            "postgresql://h:5444/postgres?sslmode=disable"
+        );
+    }
 }

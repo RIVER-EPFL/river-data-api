@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
-use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
+use sea_orm::{
+    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbErr, RuntimeErr, Statement,
+};
 use sea_orm_migration::MigratorTrait;
 
 /// The advisory-lock key one suite holds for its whole run. Advisory locks are per-database, so a
@@ -88,6 +90,93 @@ fn lock_session_url(url: &str) -> String {
     format!("{url}{separator}application_name={LOCK_SESSION_APPLICATION_NAME}")
 }
 
+/// The SQLSTATE Postgres answers a connection to a database that does not exist with.
+const UNDEFINED_DATABASE: &str = "3D000";
+
+/// The SQLSTATE a failed connection carries, when it carries one.
+fn sqlstate(err: &DbErr) -> Option<String> {
+    use std::ops::Deref;
+    let DbErr::Conn(RuntimeErr::SqlxError(e)) = err else {
+        return None;
+    };
+    let sea_orm::SqlxError::Database(e) = e.deref() else {
+        return None;
+    };
+    e.code().map(|code| code.into_owned())
+}
+
+/// How many times a connection-level failure is tried again before the harness gives up.
+const LOCK_SESSION_ATTEMPTS: u32 = 5;
+
+/// How long the harness waits between those attempts.
+const LOCK_SESSION_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Whether a failed connect is worth trying again: a failure at the transport, not an answer from
+/// the server. A reset on the first connect discards the whole binary's work, and the next connect
+/// a moment later succeeds.
+fn transient(err: &DbErr) -> bool {
+    use std::ops::Deref;
+    let DbErr::Conn(RuntimeErr::SqlxError(e)) = err else {
+        return false;
+    };
+    matches!(
+        e.deref(),
+        sea_orm::SqlxError::Io(_) | sea_orm::SqlxError::Tls(_) | sea_orm::SqlxError::PoolTimedOut
+    )
+}
+
+/// Connect, trying again on a failure at the transport rather than an answer from the server.
+async fn connect_retrying(opts: ConnectOptions, what: &str) -> DatabaseConnection {
+    let mut attempt = 1;
+    loop {
+        match Database::connect(opts.clone()).await {
+            Ok(db) => return db,
+            Err(e) if transient(&e) && attempt < LOCK_SESSION_ATTEMPTS => {
+                attempt += 1;
+                tokio::time::sleep(LOCK_SESSION_RETRY_DELAY).await;
+            }
+            Err(e) => panic!("Failed to connect to {what} in {attempt} attempts: {e}"),
+        }
+    }
+}
+
+/// Open the lock session, creating the database when it is not there yet.
+///
+/// The isolated-database recipe hands the suite an empty database and nothing more: the migrations
+/// and `tests/fixtures/reference_rows.sql` are the harness's own work. So a name that does not
+/// resolve is a database to make, not a run to fail; the alternative is every test in the binary
+/// failing setup with `3D000` after the server was restarted under it.
+async fn open_lock_session(url: &str) -> DatabaseConnection {
+    let mut opts = ConnectOptions::new(lock_session_url(url));
+    opts.max_connections(1)
+        .min_connections(1)
+        .sqlx_logging(false);
+    let mut attempt = 1;
+    loop {
+        match Database::connect(opts.clone()).await {
+            Ok(session) => return session,
+            Err(e) if sqlstate(&e).as_deref() == Some(UNDEFINED_DATABASE) => {
+                let name = crate::common::scratch::name_of(url);
+                let server = crate::common::scratch::server(url).await;
+                server
+                    .execute_unprepared(&format!("CREATE DATABASE {name}"))
+                    .await
+                    .expect("create the test database");
+                return Database::connect(opts).await.expect(
+                    "Failed to open the harness lock session on the database just created",
+                );
+            }
+            Err(e) if transient(&e) && attempt < LOCK_SESSION_ATTEMPTS => {
+                attempt += 1;
+                tokio::time::sleep(LOCK_SESSION_RETRY_DELAY).await;
+            }
+            Err(e) => {
+                panic!("Failed to open the harness lock session in {attempt} attempts: {e}")
+            }
+        }
+    }
+}
+
 /// Take the database for this process, waiting for whoever holds it.
 ///
 /// `cleanup_test_db` truncates tables a concurrent suite is reading, so two runners on one database
@@ -96,13 +185,7 @@ fn lock_session_url(url: &str) -> String {
 async fn hold_the_database(url: &str) {
     LOCK_SESSION
         .get_or_init(|| async {
-            let mut opts = ConnectOptions::new(lock_session_url(url));
-            opts.max_connections(1)
-                .min_connections(1)
-                .sqlx_logging(false);
-            let session = Database::connect(opts)
-                .await
-                .expect("Failed to open the harness lock session");
+            let session = open_lock_session(url).await;
 
             let deadline = Instant::now() + LOCK_WAIT;
             loop {
@@ -164,9 +247,7 @@ pub async fn setup_test_db() -> DatabaseConnection {
         .min_connections(1)
         .acquire_timeout(Duration::from_secs(30))
         .sqlx_logging(false);
-    let db = Database::connect(opts)
-        .await
-        .expect("Failed to connect to test database");
+    let db = connect_retrying(opts, "the test database").await;
 
     require_connection_headroom(&db, &url_for_message).await;
 
@@ -224,6 +305,7 @@ pub const CLEANUP_TRUNCATED_TABLES: &[&str] = &[
     "pairing_plans",
     "data_streams",
     "meteoswiss_fetch_state",
+    "meteoswiss_stations",
     "reprocessing_jobs",
     "schedules",
     "change_audit",
@@ -431,4 +513,37 @@ pub async fn assert_instrument_rule_holds(db: &DatabaseConnection) {
         unattributed, 0,
         "every reading names an instrument, or is derived"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DbErr, RuntimeErr, sqlstate, transient};
+
+    fn connect_error(e: sea_orm::SqlxError) -> DbErr {
+        DbErr::Conn(RuntimeErr::SqlxError(std::sync::Arc::new(e)))
+    }
+
+    #[test]
+    fn test_transient_accepts_a_reset_at_the_socket() {
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(transient(&connect_error(sea_orm::SqlxError::Io(reset))));
+        assert!(transient(&connect_error(sea_orm::SqlxError::PoolTimedOut)));
+    }
+
+    #[test]
+    fn test_transient_refuses_an_answer_from_the_server() {
+        assert!(!transient(&connect_error(sea_orm::SqlxError::RowNotFound)));
+        assert!(!transient(&DbErr::RecordNotFound("nothing".to_string())));
+    }
+
+    // The two classifications are read from the same error and must not overlap: a transport
+    // failure carries no SQLSTATE, so it never takes the create-the-database branch.
+    #[test]
+    fn test_a_transient_error_carries_no_sqlstate() {
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert_eq!(
+            sqlstate(&connect_error(sea_orm::SqlxError::Io(reset))),
+            None
+        );
+    }
 }

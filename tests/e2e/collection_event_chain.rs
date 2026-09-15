@@ -12,6 +12,21 @@ use serial_test::serial;
 use crate::common::e2e;
 use crate::common::keycloak as kc;
 
+/// The id of the catalog parameter a calculation minted for `code`.
+async fn minted_output(db: &sea_orm::DatabaseConnection, code: &str) -> String {
+    use sea_orm::ConnectionTrait;
+    db.query_one_raw(sea_orm::Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!("SELECT id FROM parameters WHERE lower(code) = lower('{code}')"),
+    ))
+    .await
+    .expect("the catalog reads")
+    .expect("the calculation minted its output")
+    .try_get::<uuid::Uuid>("", "id")
+    .expect("id")
+    .to_string()
+}
+
 const EVENT_TIME: &str = "2025-06-15T09:00:00Z";
 
 /// The three chained tools: A is typed entry, B reads A's saved output at the event, C reads B's.
@@ -409,11 +424,10 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
     // only through the manifest its formulas synthesise, so ChainPG holding the right number is
     // the assertion that the synthesised manifest produced the edge: it is reachable in one pass
     // only if F was ordered before G.
-    let pf = e2e::create_parameter(&app, &admin, "ChainPF", "Chain PF", "ppb").await;
     let pg = e2e::create_parameter(&app, &admin, "ChainPG", "Chain PG", "ppb").await;
     // A parameter belongs to one group, so the formula's output joins the group the chain already
-    // holds rather than a second one naming ChainPA again.
-    add_slot(&db, &app, &admin, &site_id, &group_id, &pf, 4).await;
+    // holds rather than a second one naming ChainPA again. ChainPF is minted by the formula
+    // itself (Q191), so its slot is declared once the formula below has created it.
     add_slot(&db, &app, &admin, &site_id, &group_id, &pg, 5).await;
     // A formula calculation is authored as a `tool_scripts` row bound to the group, then a formula
     // in it; the version is minted from the formula set rather than posted as a body.
@@ -449,6 +463,8 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
         (200..300).contains(&status),
         "the formula ({status}): {formula}"
     );
+    let pf = minted_output(&db, "ChainPF").await;
+    add_slot(&db, &app, &admin, &site_id, &group_id, &pf, 4).await;
 
     e2e::author_tool(
         &app,
