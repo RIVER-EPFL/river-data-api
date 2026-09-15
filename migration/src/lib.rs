@@ -13,6 +13,7 @@ mod m20260914_000009_meteoswiss_stations;
 mod m20260914_000010_shared_steps;
 mod m20260915_000001_drop_member_role;
 mod m20260915_000002_supersede_synced_visit_findings;
+mod m20260915_000003_visit_verification;
 
 pub struct Migrator;
 
@@ -46,6 +47,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260914_000010_shared_steps::Migration),
             Box::new(m20260915_000001_drop_member_role::Migration),
             Box::new(m20260915_000002_supersede_synced_visit_findings::Migration),
+            Box::new(m20260915_000003_visit_verification::Migration),
         ]
     }
 }

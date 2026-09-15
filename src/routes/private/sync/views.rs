@@ -1422,8 +1422,19 @@ pub async fn resolve_hold(
             }))
         }
         "estimator" => declare_estimator(&state, id, &payload, &by).await,
+        // The two rule on whatever the hold is about: a measurement an intern entered, or the
+        // field day they opened (Q21, Q177). The hold's own kind says which.
         "verify" | "reject" => {
-            rule_on_entry(&state, id, &payload.mode, payload.reason.as_deref(), &by).await
+            let kind = hold_model::Entity::find_by_id(id)
+                .one(&state.db)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("no replicate audit hold {id}")))?
+                .kind;
+            if kind == HoldKind::UnverifiedVisit.as_str() {
+                rule_on_visit(&state, id, &payload.mode, payload.reason.as_deref(), &by).await
+            } else {
+                rule_on_entry(&state, id, &payload.mode, payload.reason.as_deref(), &by).await
+            }
         }
         other => Err(AppError::BadRequest(format!(
             "unknown resolve mode '{other}'"

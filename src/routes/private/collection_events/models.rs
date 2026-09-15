@@ -34,6 +34,14 @@ pub struct Model {
     pub source: String,
     pub created_by: Option<String>,
     pub notes: Option<String>,
+    /// The field day itself is pending: staged by an intern, and nobody has ruled on whether it
+    /// should exist (Q177). Set at staging from the stager's level and cleared by the manager's
+    /// verify; verifying the visit verifies none of its measurements.
+    #[crudcrate(filterable, exclude(create, update))]
+    pub unverified: bool,
+    /// When the visit was rejected. Nothing deletes a visit: its readings are withdrawn beside it.
+    #[crudcrate(exclude(create, update), sortable)]
+    pub withdrawn_at: Option<chrono::DateTime<chrono::Utc>>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[crudcrate(exclude(create, update))]
@@ -93,6 +101,9 @@ pub struct StagedEvent {
     pub created_by: Option<String>,
     #[schema(required)]
     pub notes: Option<String>,
+    /// The field day is pending a manager's ruling. A visit already standing keeps the state it
+    /// had, so staging into someone else's verified visit does not reopen it.
+    pub unverified: bool,
     /// False when the visit already stood at this instant, so a second tool joins it.
     pub created: bool,
 }
@@ -170,6 +181,13 @@ pub struct VisitRow {
     pub parameters_filled: i64,
     /// Open event-audit findings at this visit.
     pub findings_open: i64,
+    /// The field day is pending a manager's ruling (Q177). Its measurements cannot be verified
+    /// until it is.
+    pub unverified: bool,
+    /// When the visit was rejected, its readings withdrawn beside it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub withdrawn_at: Option<DateTime<Utc>>,
     /// The visit's recompute state: `current` | `queued` | `running` | `failed` | `stale`.
     pub recompute: String,
     /// One cell per parameter measured at the visit (the wide portal row).
@@ -300,6 +318,13 @@ pub struct VisitListRow {
     pub parameters_filled: i64,
     /// Open findings at this visit.
     pub findings_open: i64,
+    /// The field day is pending a manager's ruling (Q177). Its measurements cannot be verified
+    /// until it is.
+    pub unverified: bool,
+    /// When the visit was rejected, its readings withdrawn beside it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub withdrawn_at: Option<DateTime<Utc>>,
     /// The visit's recompute state: `current` | `queued` | `running` | `failed` | `stale`.
     pub recompute: String,
 }
@@ -316,6 +341,13 @@ pub struct EventDetailResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub notes: Option<String>,
+    /// The field day is pending a manager's ruling (Q177). Its measurements cannot be verified
+    /// until it is.
+    pub unverified: bool,
+    /// When the visit was rejected, its readings withdrawn beside it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub withdrawn_at: Option<DateTime<Utc>>,
     /// The visit's recompute state: `current` | `queued` | `running` | `failed` | `stale`.
     pub recompute: String,
     pub cells: Vec<EventCell>,

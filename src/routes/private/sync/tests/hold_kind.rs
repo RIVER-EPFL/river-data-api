@@ -14,6 +14,7 @@ fn test_every_hold_kind_names_itself_once() {
         HoldKind::SourceIdentityChanged,
         HoldKind::CurveClaimStripped,
         HoldKind::UnverifiedEntry,
+        HoldKind::UnverifiedVisit,
     ];
     let mut names: Vec<&str> = all.iter().map(|k| k.as_str()).collect();
     names.sort_unstable();

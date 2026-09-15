@@ -328,6 +328,8 @@ pub enum HoldKind {
     CurveClaimStripped,
     /// A value was entered by hand and nobody has verified it yet.
     UnverifiedEntry,
+    /// A field day was opened by hand and nobody has ruled on whether it should exist.
+    UnverifiedVisit,
 }
 
 impl HoldKind {
@@ -343,6 +345,7 @@ impl HoldKind {
             Self::SourceIdentityChanged => "source_identity_changed",
             Self::CurveClaimStripped => "curve_claim_stripped",
             Self::UnverifiedEntry => "unverified_entry",
+            Self::UnverifiedVisit => "unverified_visit",
         }
     }
 

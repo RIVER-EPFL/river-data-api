@@ -5,7 +5,7 @@
 //!
 //! Run: cargo test --test readings collection_events -- --test-threads=1
 
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement, TransactionTrait};
 use serde_json::json;
 use serial_test::serial;
 use uuid::Uuid;
@@ -1054,5 +1054,295 @@ async fn a_refused_station_leaves_the_stations_already_saved_alone() {
         .await,
         0,
         "the refused station stored nothing"
+    );
+}
+
+/// Scenario: two technicians finish the same station and press Save in the same instant, so the
+/// second staging is already waiting on the first when it commits.
+///
+/// Expected behaviour: one of them creates the visit and the other is handed the visit that
+/// stands, rather than a refusal against a row it never attempted.
+#[tokio::test]
+#[serial]
+async fn a_visit_staged_twice_at_once_lands_on_one_row() {
+    let (db, app, token) = setup().await;
+
+    // The first technician's insert, committed only once the second is waiting on it.
+    let first = db.begin().await.expect("a transaction");
+    first
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "INSERT INTO collection_events (site_id, collected_at, source, created_by) \
+                 VALUES ('{SITE1_ID}', '{T1}', 'manual', 'first@example.org')"
+            ),
+        ))
+        .await
+        .expect("the first technician's visit");
+
+    let second = tokio::spawn({
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            crate::common::post_json_parse_with_token(
+                &app,
+                "/api/collection_events/stage",
+                &json!({ "site_id": SITE1_ID, "collected_at": T1 }),
+                &token,
+            )
+            .await
+        }
+    });
+    assert!(
+        staging_blocked(&db).await,
+        "the second staging never reached the conflicting insert, so the race was not run"
+    );
+    first.commit().await.expect("the first technician commits");
+
+    let (status, staged) = second.await.expect("the second staging returns");
+    assert_eq!(status, 200, "{staged}");
+    assert_eq!(
+        staged["created"], false,
+        "the second stager is handed the visit that stands: {staged}"
+    );
+    assert_eq!(staged["created_by"], "first@example.org");
+    assert_eq!(
+        scalar_i64(&db, "SELECT COUNT(*) AS n FROM collection_events").await,
+        1
+    );
+}
+
+/// The moment the race exists: the second staging's insert is waiting on the lock the first holds.
+async fn staging_blocked(db: &DatabaseConnection) -> bool {
+    for _ in 0..100 {
+        let waiting = scalar_i64(
+            db,
+            "SELECT COUNT(*) AS n FROM pg_stat_activity \
+              WHERE state = 'active' AND wait_event_type = 'Lock' \
+                AND query LIKE '%INSERT INTO collection_events%'",
+        )
+        .await;
+        if waiting > 0 {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// A visit's id and its verification state: pending a ruling, and withdrawn.
+async fn visit_state(db: &DatabaseConnection, time: &str) -> (String, bool, bool) {
+    db.query_one_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "SELECT id::text AS id, unverified, withdrawn_at IS NOT NULL AS withdrawn \
+               FROM collection_events \
+              WHERE site_id = '{SITE1_ID}' AND collected_at = '{time}'"
+        ),
+    ))
+    .await
+    .unwrap()
+    .map(|r| {
+        (
+            r.try_get::<String>("", "id").unwrap(),
+            r.try_get::<bool>("", "unverified").unwrap(),
+            r.try_get::<bool>("", "withdrawn").unwrap(),
+        )
+    })
+    .expect("the visit stands")
+}
+
+/// Stamp a visit pending and file the hold a manager rules on, as an intern's staging would.
+async fn hold_the_visit_open(db: &DatabaseConnection, event_id: &str, time: &str) -> String {
+    let hold = Uuid::new_v4().to_string();
+    crate::common::exec(
+        db,
+        &format!(
+            "UPDATE collection_events SET unverified = TRUE WHERE id = '{event_id}'"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO replicate_audit_holds \
+                 (id, stream_id, site_id, parameter_id, group_time, kind, expected, computed, \
+                  delta, status) \
+             VALUES ('{hold}', NULL, '{SITE1_ID}', NULL, '{time}', 'unverified_visit', \
+                     '{{\"state\": \"verified\"}}'::jsonb, \
+                     '{{\"state\": \"unverified\"}}'::jsonb, '{{}}'::jsonb, 'pending')"
+        ),
+    )
+    .await;
+    hold
+}
+
+async fn resolve_hold(app: &axum::Router, hold: &str, mode: &str, token: &str) -> (u16, String) {
+    crate::common::post_json_with_token(
+        app,
+        &format!("/api/sync/replicate_audit_holds/{hold}/resolve"),
+        &json!({ "mode": mode }),
+        token,
+    )
+    .await
+}
+
+/// The visit's own verification state (Q177). A field day an intern opens is pending until a
+/// manager rules on it, and until then its measurements cannot be verified either: what is in
+/// question is whether the visit happened at all.
+///
+/// The stager's level is a unit decision (`visit_lands_pending`); what only real SQL shows is that
+/// a verified stager raises no hold, that a rejection withdraws the readings with the visit, and
+/// that the entry ruling is refused while the visit stands unruled.
+#[tokio::test]
+#[serial]
+async fn a_verified_stager_opens_a_verified_field_day() {
+    let (db, app, token) = setup().await;
+
+    let (status, staged) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/collection_events/stage",
+        &json!({ "site_id": SITE1_ID, "collected_at": T1 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{staged}");
+    assert_eq!(staged["unverified"], false);
+    let (_, unverified, withdrawn) = visit_state(&db, T1).await;
+    assert!(!unverified, "a full-permission caller's visit needs no ruling");
+    assert!(!withdrawn);
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT COUNT(*) AS n FROM replicate_audit_holds WHERE kind = 'unverified_visit'"
+        )
+        .await,
+        0,
+        "no ruling is owed, so the review queue carries nothing"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn verifying_a_measurement_is_refused_while_its_field_day_is_unruled() {
+    let (db, app, token) = setup().await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": SITE1_ID,
+            "readings": [{ "parameter_id": GLOBAL_PARAM_DO_ID, "value": 9.0, "time": T1 }],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (event_id, _, _) = visit_state(&db, T1).await;
+    let visit_hold = hold_the_visit_open(&db, &event_id, T1).await;
+
+    let entry_hold = Uuid::new_v4().to_string();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO replicate_audit_holds \
+                 (id, stream_id, site_id, parameter_id, group_time, kind, expected, computed, \
+                  delta, status) \
+             VALUES ('{entry_hold}', NULL, '{SITE1_ID}', '{GLOBAL_PARAM_DO_ID}', '{T1}', \
+                     'unverified_entry', '{{\"state\": \"verified\"}}'::jsonb, \
+                     '{{\"state\": \"unverified\"}}'::jsonb, '{{}}'::jsonb, 'pending')"
+        ),
+    )
+    .await;
+
+    let (status, body) = resolve_hold(&app, &entry_hold, "verify", &token).await;
+    assert_eq!(status, 409, "the field day is ruled on first: {body}");
+    assert!(
+        body.contains(&event_id),
+        "the refusal names the visit: {body}"
+    );
+
+    // Verifying the field day releases the measurement's ruling, and verifies none of them: each
+    // value is its own entry with its own hold.
+    let (status, body) = resolve_hold(&app, &visit_hold, "verify", &token).await;
+    assert_eq!(status, 200, "{body}");
+    let (_, unverified, withdrawn) = visit_state(&db, T1).await;
+    assert!(!unverified, "the visit is accepted");
+    assert!(!withdrawn);
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM replicate_audit_holds \
+                  WHERE id = '{entry_hold}' AND status = 'pending'"
+            )
+        )
+        .await,
+        1,
+        "the measurement is still owed a ruling of its own"
+    );
+    let (status, body) = resolve_hold(&app, &entry_hold, "verify", &token).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+#[serial]
+async fn rejecting_a_field_day_withdraws_it_with_its_readings() {
+    let (db, app, token) = setup().await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": SITE1_ID,
+            "readings": [
+                { "parameter_id": GLOBAL_PARAM_DO_ID, "value": 9.0, "time": T1 },
+                { "parameter_id": GLOBAL_PARAM_TEMP_ID, "value": 4.2, "time": T1 },
+            ],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (event_id, _, _) = visit_state(&db, T1).await;
+    let hold = hold_the_visit_open(&db, &event_id, T1).await;
+
+    let (status, body) = resolve_hold(&app, &hold, "reject", &token).await;
+    assert_eq!(status, 200, "{body}");
+    let (_, unverified, withdrawn) = visit_state(&db, T1).await;
+    assert!(withdrawn, "the visit carries the rejection");
+    assert!(!unverified, "a rejected visit is no longer awaiting a ruling");
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM readings \
+                  WHERE collection_event_id = '{event_id}' AND withdrawn_at IS NULL"
+            )
+        )
+        .await,
+        0,
+        "every reading entered at the visit is withdrawn beside it"
+    );
+    // Nothing deletes: the readings and the visit are both still there to be re-asserted.
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM readings WHERE collection_event_id = '{event_id}'"
+            )
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!("SELECT COUNT(*) AS n FROM reading_decisions WHERE kind = 'reject' \
+                       AND time = '{T1}'")
+        )
+        .await,
+        2,
+        "each withdrawal is on the curation record"
     );
 }

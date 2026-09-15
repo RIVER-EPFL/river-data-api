@@ -264,38 +264,71 @@ pub async fn attach_collection_events<C: ConnectionTrait>(
 /// Find or create the visit at `(site_id, collected_at)`: the portal's New Entry, made
 /// idempotent. A visit already standing is returned as it is, `created` false, so two tools
 /// entering the same visit land on one row instead of racing the unique key.
+///
+/// `unverified` is the state a new visit lands in, from the stager's level (Q177). A visit already
+/// standing keeps the state it has: staging into a verified visit does not reopen it, and staging
+/// into a pending one does not rule on it.
 pub async fn stage_visit<C: ConnectionTrait>(
     conn: &C,
     site_id: Uuid,
     collected_at: DateTime<Utc>,
     actor: &str,
     notes: Option<&str>,
+    unverified: bool,
 ) -> AppResult<StagedEvent> {
     let collected_at = sea_orm::prelude::DateTimeWithTimeZone::from(collected_at);
+    // `DO UPDATE` rather than `DO NOTHING`: the insert then waits on the transaction it conflicts
+    // with and returns the row that won, where a second statement would still be reading the
+    // snapshot taken before that transaction committed and would find nothing. `xmax = 0` is true
+    // only of the tuple this statement inserted, which is what tells the two apart.
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "WITH staged AS (
-                 INSERT INTO collection_events (site_id, collected_at, source, created_by, notes)
-                 VALUES ($1, $2, 'manual', $3, $4)
-                 ON CONFLICT (site_id, collected_at) DO NOTHING
-                 RETURNING id, site_id, collected_at, source, created_by, notes, true AS created
-             )
-             SELECT * FROM staged
-             UNION ALL
-             SELECT id, site_id, collected_at, source, created_by, notes, false AS created
-             FROM collection_events
-             WHERE site_id = $1 AND collected_at = $2 AND NOT EXISTS (SELECT 1 FROM staged)",
+            "INSERT INTO collection_events (site_id, collected_at, source, created_by, notes, \
+                                            unverified)
+             VALUES ($1, $2, 'manual', $3, $4, $5)
+             ON CONFLICT (site_id, collected_at) DO UPDATE SET site_id = EXCLUDED.site_id
+             RETURNING id, site_id, collected_at, source, created_by, notes, unverified, \
+                       (xmax = 0) AS created",
             vec![
                 site_id.into(),
                 collected_at.into(),
                 actor.into(),
                 notes.into(),
+                unverified.into(),
             ],
         ))
         .await?
         .ok_or_else(|| AppError::Internal("Staging returned no visit".to_string()))?;
     Ok(StagedEvent::from_query_result(&row, "")?)
+}
+
+/// One review-queue row per field day an intern opened, so a manager rules on the visit beside
+/// every other finding. Keyed on the visit: a second staging at the same site and instant
+/// refreshes the open hold rather than filing a second one.
+pub async fn open_unverified_visit_hold<C: ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+    collected_at: DateTime<Utc>,
+    actor: &str,
+) -> AppResult<()> {
+    use crate::routes::private::sync::service as audit;
+    audit::upsert_hold(
+        conn,
+        &audit::Hold {
+            key: audit::HoldKey::Visit {
+                site_id,
+                group_time: collected_at,
+            },
+            kind: HoldKind::UnverifiedVisit,
+            expected: serde_json::json!({ "state": "verified" }),
+            computed: serde_json::json!({ "state": "unverified", "opened_by": actor }),
+            delta: serde_json::json!({}),
+            status: HoldStatus::Pending,
+            tool: None,
+        },
+    )
+    .await
 }
 
 /// The ids among `site_ids` that name no site, in the order given.

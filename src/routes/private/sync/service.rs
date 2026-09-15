@@ -789,6 +789,12 @@ pub enum HoldKey {
         parameter_id: Uuid,
         group_time: DateTime<Utc>,
     },
+    /// A visit: a site and an instant with no parameter, for a finding about the field day
+    /// itself rather than about any one of its slots.
+    Visit {
+        site_id: Uuid,
+        group_time: DateTime<Utc>,
+    },
     /// One standing hold per stream whatever the instant: the device behind the feed changed, and
     /// a second detection updates the standing row rather than adding one per sync cycle.
     StreamStanding { stream_id: Uuid },
@@ -848,6 +854,19 @@ impl Hold<'_> {
                     HoldStatus::Pending.as_str()
                 )))
                 .to_owned(),
+            ),
+            HoldKey::Visit {
+                site_id,
+                group_time,
+            } => (
+                vec![Column::SiteId, Column::GroupTime],
+                vec![Expr::val(site_id), instant(group_time)],
+                OnConflict::columns([Column::Kind, Column::SiteId, Column::GroupTime])
+                    .target_and_where(Expr::cust(format!(
+                        "stream_id IS NULL AND parameter_id IS NULL AND status = '{}'",
+                        HoldStatus::Pending.as_str()
+                    )))
+                    .to_owned(),
             ),
             HoldKey::StreamStanding { stream_id } => (
                 vec![Column::StreamId, Column::GroupTime],
@@ -1994,6 +2013,160 @@ pub(super) async fn accept_ours(state: &AppState, id: Uuid, by: &str) -> AppResu
     Ok(())
 }
 
+/// The visit at a site and instant, when one stands there.
+async fn visit_at<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+    at: sea_orm::prelude::DateTimeWithTimeZone,
+) -> AppResult<Option<collection_events::Model>> {
+    use collection_events::{Column, Entity};
+    Ok(Entity::find()
+        .filter(Column::SiteId.eq(site_id))
+        .filter(Column::CollectedAt.eq(at))
+        .one(conn)
+        .await?)
+}
+
+/// The field day happened: it is no longer awaiting a ruling. Its measurements are untouched.
+async fn accept_visit<C: sea_orm::ConnectionTrait>(conn: &C, visit_id: Uuid) -> AppResult<()> {
+    collection_events::Entity::update_many()
+        .col_expr(collection_events::Column::Unverified, Expr::val(false))
+        .filter(collection_events::Column::Id.eq(visit_id))
+        .exec(conn)
+        .await?;
+    Ok(())
+}
+
+/// Withdraw every reading entered at the visit. Each withdrawal is a decision on the record like
+/// any other (ADR 0008), so a reassert restores it.
+async fn withdraw_visit_readings<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    visit_id: Uuid,
+    by: &str,
+    reason: &str,
+) -> AppResult<u64> {
+    use crate::routes::private::collection_events::flows::row;
+    use crate::routes::private::readings::models::{Column, Kind, Origin};
+    use crate::routes::private::readings::service::{NewValue, record_many};
+    let rejected = record_many(
+        conn,
+        Kind::Reject,
+        sea_orm::Condition::all()
+            .add(row(Column::CollectionEventId).eq(visit_id))
+            .add(Expr::col((Alias::new("r"), Column::WithdrawnAt)).is_null()),
+        NewValue::Literal(serde_json::json!({ "reason": reason })),
+        by,
+        Some(reason),
+        Origin::Audit,
+        None,
+    )
+    .await?;
+    Ok(rejected.rows)
+}
+
+/// The field day should not have been opened. Nothing deletes it: the stamp is what a reader sees.
+async fn withdraw_visit<C: sea_orm::ConnectionTrait>(conn: &C, visit_id: Uuid) -> AppResult<()> {
+    collection_events::Entity::update_many()
+        .col_expr(collection_events::Column::Unverified, Expr::val(false))
+        .col_expr(collection_events::Column::WithdrawnAt, Expr::cust("NOW()"))
+        .filter(collection_events::Column::Id.eq(visit_id))
+        .exec(conn)
+        .await?;
+    Ok(())
+}
+
+/// Record the ruling on the hold, naming the visit it was about and how many readings moved with
+/// it.
+async fn decide_visit_hold<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    id: Uuid,
+    mode: &str,
+    status: &str,
+    by: &str,
+    visit_id: Uuid,
+    withdrawn: u64,
+) -> AppResult<()> {
+    hold_model::Entity::update_many()
+        .col_expr(hold_model::Column::Status, Expr::val(status))
+        .col_expr(hold_model::Column::AcknowledgedBy, Expr::val(by))
+        .col_expr(hold_model::Column::AcknowledgedAt, Expr::cust("NOW()"))
+        .col_expr(
+            hold_model::Column::Resolution,
+            Expr::cust_with_values(
+                "jsonb_build_object('mode', $1::text, 'by', $2::text, \
+                 'at', to_jsonb(NOW()), 'visit_id', $3::text, 'rows', $4::bigint)",
+                [
+                    sea_orm::Value::from(mode),
+                    sea_orm::Value::from(by),
+                    sea_orm::Value::from(visit_id.to_string()),
+                    sea_orm::Value::from(i64::try_from(withdrawn).unwrap_or(i64::MAX)),
+                ],
+            ),
+        )
+        .filter(hold_model::Column::Id.eq(id))
+        .exec(conn)
+        .await?;
+    Ok(())
+}
+
+/// Rule on an intern's field day (Q177): `verify` says the visit should exist, `reject` withdraws
+/// it with every reading attached to it. Nothing deletes a visit.
+///
+/// Verifying the visit verifies none of its measurements: each is its own entry with its own hold,
+/// and the visit being real says nothing about whether a number typed into it is.
+pub(super) async fn rule_on_visit(
+    state: &AppState,
+    id: Uuid,
+    mode: &str,
+    reason: Option<&str>,
+    by: &str,
+) -> AppResult<Json<ResolveHoldResponse>> {
+    let hold = hold_model::Entity::find_by_id(id)
+        .filter(hold_model::Column::Kind.eq(HoldKind::UnverifiedVisit.as_str()))
+        .filter(hold_model::Column::Status.is_in(HoldStatus::OPEN.map(HoldStatus::as_str)))
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("no pending unverified visit hold {id}")))?;
+    let Some(site_id) = hold.site_id else {
+        return Err(AppError::BadRequest(format!(
+            "unverified visit hold {id} names no site"
+        )));
+    };
+    let visit = visit_at(&state.db, site_id, hold.group_time)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "unverified visit hold {id} names no visit at {} on site {site_id}",
+                hold.group_time
+            ))
+        })?;
+    let reason = reason
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map_or_else(|| format!("unverified visit hold {id}"), String::from);
+    let verify = mode == "verify";
+    let status = if verify { "acknowledged" } else { "remediated" };
+    let withdrawn = crate::common::bulk_write::guarded(&state.db, async |txn| {
+        let withdrawn = if verify {
+            accept_visit(txn, visit.id).await?;
+            0
+        } else {
+            let rows = withdraw_visit_readings(txn, visit.id, by, &reason).await?;
+            withdraw_visit(txn, visit.id).await?;
+            rows
+        };
+        decide_visit_hold(txn, id, mode, status, by, visit.id, withdrawn).await?;
+        Ok(withdrawn)
+    })
+    .await?;
+    state.response_cache.invalidate_all();
+    Ok(Json(ResolveHoldResponse {
+        status: status.to_string(),
+        job_id: None,
+        samples_affected: Some(i64::try_from(withdrawn).unwrap_or(i64::MAX)),
+    }))
+}
+
 /// Rule on an intern's entry (Q21, M44): `verify` accepts it as it stands, `reject` withdraws it.
 /// Both are decisions on the record, so both are reversible: a rejected entry is re-asserted, and
 /// reopen returns the hold to review.
@@ -2018,6 +2191,16 @@ pub(super) async fn rule_on_entry(
             "unverified entry hold {id} names no slot"
         )));
     };
+    // The field day is ruled on first (Q177): a value entered at a visit nobody has accepted
+    // cannot be verified, because what is in question is whether the visit happened at all.
+    if let Some(visit) = visit_at(&state.db, site_id, group_time).await?
+        && visit.unverified
+    {
+        return Err(AppError::Conflict(format!(
+            "visit {} at {} is itself unverified; rule on the field day before its measurements",
+            visit.id, visit.collected_at
+        )));
+    }
     let reason = reason
         .map(str::trim)
         .filter(|r| !r.is_empty())

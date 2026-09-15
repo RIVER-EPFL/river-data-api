@@ -88,6 +88,30 @@ pub async fn recompute_collection_event(
     Ok(Json(EnqueuedJobResponse { job_id }))
 }
 
+/// Whether the field day this caller opens lands pending a manager's ruling (Q177): an intern
+/// may open one, and it is not a visit until somebody senior says it was. The same rule as an
+/// intern's measurement, read from the same place.
+fn visit_lands_pending(auth: &crate::common::middleware::AuthContext) -> bool {
+    crate::routes::private::readings::service::entry_state(auth.highest_role().as_ref()).is_some()
+}
+
+/// Find or create the visit, and file the manager's ruling when the field day lands pending: the
+/// two go together or neither does, so a pending visit is never left out of the review queue.
+async fn stage_and_queue<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+    collected_at: chrono::DateTime<chrono::Utc>,
+    actor: &str,
+    notes: Option<&str>,
+    pending: bool,
+) -> AppResult<StagedEvent> {
+    let visit = service::stage_visit(conn, site_id, collected_at, actor, notes, pending).await?;
+    if visit.created && visit.unverified {
+        service::open_unverified_visit_hold(conn, visit.site_id, visit.collected_at, actor).await?;
+    }
+    Ok(visit)
+}
+
 /// Stage a field visit: the portal's New Entry, made idempotent. A visit already standing at
 /// `(site_id, collected_at)` is returned as it is, so two tools entering the same visit land on
 /// one row instead of racing the unique key. Requires `write_data`.
@@ -118,14 +142,18 @@ pub async fn stage_collection_event(
     }
     enforce_project_scope_for_sites(&state.db, &scope, &[req.site_id]).await?;
     let actor = crate::common::actor::label(&auth);
-    let staged = service::stage_visit(
-        &state.db,
+    let pending = visit_lands_pending(&auth);
+    let txn = sea_orm::TransactionTrait::begin(&state.db).await?;
+    let staged = stage_and_queue(
+        &txn,
         req.site_id,
         req.collected_at,
         &actor,
         req.notes.as_deref(),
+        pending,
     )
     .await?;
+    txn.commit().await?;
     Ok(Json(staged))
 }
 
@@ -172,16 +200,18 @@ pub async fn stage_collection_events(
     }
     enforce_project_scope_for_sites(&state.db, &scope, &site_ids).await?;
     let actor = crate::common::actor::label(&auth);
+    let pending = visit_lands_pending(&auth);
     let txn = state.db.begin().await?;
     let mut staged = Vec::with_capacity(site_ids.len());
     for site_id in site_ids {
         staged.push(
-            service::stage_visit(
+            stage_and_queue(
                 &txn,
                 site_id,
                 req.collected_at,
                 &actor,
                 req.notes.as_deref(),
+                pending,
             )
             .await?,
         );
@@ -504,7 +534,7 @@ pub async fn list_site_visits(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT ce.id, ce.collected_at, ce.source, ce.created_by, ce.notes, \
-                        {counts} \
+                        ce.unverified, ce.withdrawn_at, {counts} \
                  FROM collection_events ce \
                  WHERE ce.site_id = $1{range} \
                  ORDER BY ce.collected_at DESC{limit}"
@@ -526,6 +556,8 @@ pub async fn list_site_visits(
             notes: r.notes,
             parameters_filled: r.filled,
             findings_open: r.findings_open,
+            unverified: r.unverified,
+            withdrawn_at: r.withdrawn_at,
             recompute: String::new(),
             cells: Vec::new(),
         })
@@ -802,7 +834,7 @@ pub async fn list_visits(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "SELECT ce.id, ce.site_id, s.name AS site_name, ce.collected_at, ce.source, \
-                        ce.created_by, ce.notes, {counts} \
+                        ce.created_by, ce.notes, ce.unverified, ce.withdrawn_at, {counts} \
                  FROM collection_events ce \
                  JOIN sites s ON s.id = ce.site_id \
                  {filter} \
@@ -826,6 +858,8 @@ pub async fn list_visits(
             notes: r.notes,
             parameters_filled: r.filled,
             findings_open: r.findings_open,
+            unverified: r.unverified,
+            withdrawn_at: r.withdrawn_at,
             recompute: String::new(),
         })
         .collect();
@@ -850,6 +884,8 @@ struct SiteVisitHeader {
     source: String,
     created_by: Option<String>,
     notes: Option<String>,
+    unverified: bool,
+    withdrawn_at: Option<DateTime<Utc>>,
     filled: i64,
     findings_open: i64,
 }
@@ -864,6 +900,8 @@ struct VisitHeader {
     source: String,
     created_by: Option<String>,
     notes: Option<String>,
+    unverified: bool,
+    withdrawn_at: Option<DateTime<Utc>>,
     filled: i64,
     findings_open: i64,
 }
@@ -1257,6 +1295,8 @@ pub async fn get_event_detail(
         source: event.source,
         created_by: event.created_by,
         notes: event.notes,
+        unverified: event.unverified,
+        withdrawn_at: event.withdrawn_at,
         recompute,
         cells,
     }))

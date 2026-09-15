@@ -3823,7 +3823,19 @@
             "description": "How the event came to exist. CRUD creation is always a person staging a visit; the sync\nattach path writes `portal_sync` rows directly.",
             "type": "string"
           },
+          "unverified": {
+            "description": "The field day itself is pending: staged by an intern, and nobody has ruled on whether it\nshould exist (Q177). Set at staging from the stager's level and cleared by the manager's\nverify; verifying the visit verifies none of its measurements.",
+            "type": "boolean"
+          },
           "updated_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "withdrawn_at": {
+            "description": "When the visit was rejected. Nothing deletes a visit: its readings are withdrawn beside it.",
             "format": "date-time",
             "type": [
               "string",
@@ -3838,6 +3850,8 @@
           "source",
           "created_by",
           "notes",
+          "unverified",
+          "withdrawn_at",
           "created_at",
           "updated_at"
         ],
@@ -3877,7 +3891,19 @@
             "description": "How the event came to exist. CRUD creation is always a person staging a visit; the sync\nattach path writes `portal_sync` rows directly.",
             "type": "string"
           },
+          "unverified": {
+            "description": "The field day itself is pending: staged by an intern, and nobody has ruled on whether it\nshould exist (Q177). Set at staging from the stager's level and cleared by the manager's\nverify; verifying the visit verifies none of its measurements.",
+            "type": "boolean"
+          },
           "updated_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "withdrawn_at": {
+            "description": "When the visit was rejected. Nothing deletes a visit: its readings are withdrawn beside it.",
             "format": "date-time",
             "type": [
               "string",
@@ -3892,6 +3918,8 @@
           "source",
           "created_by",
           "notes",
+          "unverified",
+          "withdrawn_at",
           "created_at",
           "updated_at"
         ],
@@ -6626,6 +6654,15 @@
           },
           "source": {
             "type": "string"
+          },
+          "unverified": {
+            "description": "The field day is pending a manager's ruling (Q177). Its measurements cannot be verified\nuntil it is.",
+            "type": "boolean"
+          },
+          "withdrawn_at": {
+            "description": "When the visit was rejected, its readings withdrawn beside it.",
+            "format": "date-time",
+            "type": "string"
           }
         },
         "required": [
@@ -6633,6 +6670,7 @@
           "site_id",
           "collected_at",
           "source",
+          "unverified",
           "recompute",
           "cells"
         ],
@@ -11870,6 +11908,15 @@
                 "source": {
                   "description": "'manual' | 'portal_sync'.",
                   "type": "string"
+                },
+                "unverified": {
+                  "description": "The field day is pending a manager's ruling (Q177). Its measurements cannot be verified\nuntil it is.",
+                  "type": "boolean"
+                },
+                "withdrawn_at": {
+                  "description": "When the visit was rejected, its readings withdrawn beside it.",
+                  "format": "date-time",
+                  "type": "string"
                 }
               },
               "required": [
@@ -11880,6 +11927,7 @@
                 "source",
                 "parameters_filled",
                 "findings_open",
+                "unverified",
                 "recompute"
               ],
               "type": "object"
@@ -22767,6 +22815,10 @@
           },
           "source": {
             "type": "string"
+          },
+          "unverified": {
+            "description": "The field day is pending a manager's ruling. A visit already standing keeps the state it\nhad, so staging into someone else's verified visit does not reopen it.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -22776,6 +22828,7 @@
           "source",
           "created_by",
           "notes",
+          "unverified",
           "created"
         ],
         "type": "object"
@@ -26334,6 +26387,15 @@
           "source": {
             "description": "'manual' | 'portal_sync'.",
             "type": "string"
+          },
+          "unverified": {
+            "description": "The field day is pending a manager's ruling (Q177). Its measurements cannot be verified\nuntil it is.",
+            "type": "boolean"
+          },
+          "withdrawn_at": {
+            "description": "When the visit was rejected, its readings withdrawn beside it.",
+            "format": "date-time",
+            "type": "string"
           }
         },
         "required": [
@@ -26344,6 +26406,7 @@
           "source",
           "parameters_filled",
           "findings_open",
+          "unverified",
           "recompute"
         ],
         "type": "object"
@@ -26388,6 +26451,15 @@
           "source": {
             "description": "'manual' | 'portal_sync'.",
             "type": "string"
+          },
+          "unverified": {
+            "description": "The field day is pending a manager's ruling (Q177). Its measurements cannot be verified\nuntil it is.",
+            "type": "boolean"
+          },
+          "withdrawn_at": {
+            "description": "When the visit was rejected, its readings withdrawn beside it.",
+            "format": "date-time",
+            "type": "string"
           }
         },
         "required": [
@@ -26396,6 +26468,7 @@
           "source",
           "parameters_filled",
           "findings_open",
+          "unverified",
           "recompute",
           "cells"
         ],
@@ -29629,7 +29702,7 @@
     },
     "/api/collection_events": {
       "get": {
-        "description": "Retrieves all collection_events.\n\nThis resource manages collection_event items\n\nAdditional sortable columns: \n- site_id\n- collected_at\n- created_at.\n\nAdditional filterable columns: \n- site_id\n- collected_at\n- source.",
+        "description": "Retrieves all collection_events.\n\nThis resource manages collection_event items\n\nAdditional sortable columns: \n- site_id\n- collected_at\n- withdrawn_at\n- created_at.\n\nAdditional filterable columns: \n- site_id\n- collected_at\n- source\n- unverified.",
         "operationId": "get_all_collection_events",
         "parameters": [
           {
