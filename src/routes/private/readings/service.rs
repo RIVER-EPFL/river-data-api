@@ -7932,6 +7932,64 @@ pub(super) async fn tool_run_fixed_estimators(
     Ok(by_parameter)
 }
 
+/// What a tool-run save may store for a named input of the run, and at which index.
+///
+/// A `replicates` input is an array: each position is a measurement, saved at its own index. A
+/// numeric input the manifest binds to a visit parameter (`event_inputs`) is one measurement the
+/// operator typed over, saved at index 0 as a correction of what the visit holds. Any other name
+/// is a run-only setting with nowhere to be written. Either way the value must be what the run
+/// consumed, so the stored number and the provenance cannot disagree.
+fn check_saved_input(
+    tool_name: &str,
+    inputs: &serde_json::Value,
+    event_input_params: &std::collections::HashSet<String>,
+    input: &str,
+    value: f64,
+    replicate_index: Option<i16>,
+) -> Result<(), String> {
+    if let Some(values) = inputs.get(input).and_then(serde_json::Value::as_array) {
+        let Some(index) = replicate_index else {
+            return Err(format!(
+                "Reading for input '{input}' needs the replicate_index it was entered at"
+            ));
+        };
+        let recorded = usize::try_from(index)
+            .ok()
+            .and_then(|i| values.get(i))
+            .and_then(serde_json::Value::as_f64);
+        if recorded != Some(value) {
+            return Err(format!(
+                "Value {value} is not what this {tool_name} run consumed at replicate {index} of \
+                 '{input}'"
+            ));
+        }
+        return Ok(());
+    }
+    let scalar = inputs.get(input).and_then(serde_json::Value::as_f64);
+    if let Some(recorded) = scalar.filter(|_| event_input_params.contains(input)) {
+        if replicate_index.is_some_and(|i| i != 0) {
+            return Err(format!(
+                "'{input}' is one measurement of this {tool_name} run, so it is saved at replicate 0"
+            ));
+        }
+        if recorded != value {
+            return Err(format!(
+                "Value {value} is not what this {tool_name} run consumed for '{input}'"
+            ));
+        }
+        return Ok(());
+    }
+    if scalar.is_some() {
+        return Err(format!(
+            "'{input}' is a setting of this {tool_name} run, not a measurement of this visit; \
+             only an input the calculation reads from the visit is saved"
+        ));
+    }
+    Err(format!(
+        "'{input}' is not a replicates input of this {tool_name} run"
+    ))
+}
+
 pub(super) async fn resolve_tool_run_provenance(
     db: &DatabaseConnection,
     tool_run_id: Option<Uuid>,
@@ -8016,8 +8074,9 @@ pub(super) async fn resolve_tool_run_provenance(
     // An output that reduces a replicates param is a display of the group the save is about to
     // write, not a measurement of its own. Storing it would put a mean in the readings the
     // `samples` trigger then takes a mean over. The manifest is the run's own pinned version.
-    let aggregate_outputs: std::collections::HashSet<String> = run_pinned_manifest(db, run_id)
-        .await?
+    let pinned = run_pinned_manifest(db, run_id).await?;
+    let aggregate_outputs: std::collections::HashSet<String> = pinned
+        .as_ref()
         .map(|m| {
             m.outputs
                 .iter()
@@ -8025,6 +8084,13 @@ pub(super) async fn resolve_tool_run_provenance(
                 .map(|o| o.key.clone())
                 .collect()
         })
+        .unwrap_or_default();
+    // The params the manifest fills from the visit's own readings. A numeric one of those is a
+    // measurement the operator may type over, and the save then corrects it (Q182); every other
+    // numeric param is a run-only setting and has nowhere to be written.
+    let event_input_params: std::collections::HashSet<String> = pinned
+        .as_ref()
+        .map(|m| m.event_inputs.iter().map(|e| e.param.clone()).collect())
         .unwrap_or_default();
 
     let run_applied_curves = curves.as_array().is_some_and(|c| !c.is_empty());
@@ -8038,27 +8104,15 @@ pub(super) async fn resolve_tool_run_provenance(
                     r.parameter_id
                 )));
             }
-            let Some(index) = r.replicate_index else {
-                return Err(AppError::BadRequest(format!(
-                    "Reading for input '{input}' needs the replicate_index it was entered at"
-                )));
-            };
-            let Some(values) = inputs.get(input).and_then(serde_json::Value::as_array) else {
-                return Err(AppError::BadRequest(format!(
-                    "'{input}' is not a replicates input of this {tool_name} run"
-                )));
-            };
-            let recorded = usize::try_from(index)
-                .ok()
-                .and_then(|i| values.get(i))
-                .and_then(serde_json::Value::as_f64);
-            if recorded != Some(r.value) {
-                return Err(AppError::BadRequest(format!(
-                    "Value {} is not what this {tool_name} run consumed at replicate {index} of \
-                     '{input}'",
-                    r.value
-                )));
-            }
+            check_saved_input(
+                &tool_name,
+                &inputs,
+                &event_input_params,
+                input,
+                r.value,
+                r.replicate_index,
+            )
+            .map_err(AppError::BadRequest)?;
             match saved_inputs.get(input) {
                 Some(existing) if existing != &serde_json::json!(r.parameter_id) => {
                     return Err(AppError::BadRequest(format!(

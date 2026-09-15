@@ -58,3 +58,52 @@ fn test_every_kind_a_writer_can_stamp_is_a_declared_kind() {
         );
     }
 }
+
+mod saved_inputs {
+    use super::super::check_saved_input;
+    use std::collections::HashSet;
+
+    fn bound(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    #[test]
+    fn test_a_replicate_is_checked_against_the_position_the_run_consumed() {
+        let inputs = serde_json::json!({ "doc": [120.0, 122.0] });
+        let none = bound(&[]);
+        assert!(check_saved_input("doc", &inputs, &none, "doc", 122.0, Some(1)).is_ok());
+        let err = check_saved_input("doc", &inputs, &none, "doc", 120.0, Some(1)).unwrap_err();
+        assert!(err.contains("consumed at replicate 1"), "{err}");
+        let err = check_saved_input("doc", &inputs, &none, "doc", 120.0, None).unwrap_err();
+        assert!(err.contains("needs the replicate_index"), "{err}");
+    }
+
+    #[test]
+    fn test_a_typed_over_event_input_is_saved_as_one_measurement() {
+        let inputs = serde_json::json!({ "temp": 14.0 });
+        let temp = bound(&["temp"]);
+        assert!(check_saved_input("pco2", &inputs, &temp, "temp", 14.0, Some(0)).is_ok());
+        assert!(check_saved_input("pco2", &inputs, &temp, "temp", 14.0, None).is_ok());
+        // The stored number is the one the run computed from.
+        let err = check_saved_input("pco2", &inputs, &temp, "temp", 10.0, Some(0)).unwrap_err();
+        assert!(err.contains("is not what this pco2 run consumed"), "{err}");
+        let err = check_saved_input("pco2", &inputs, &temp, "temp", 14.0, Some(1)).unwrap_err();
+        assert!(err.contains("saved at replicate 0"), "{err}");
+    }
+
+    #[test]
+    fn test_a_numeric_setting_the_manifest_binds_to_nothing_is_not_saveable() {
+        let inputs = serde_json::json!({ "volume": 40.0 });
+        let err = check_saved_input("doc", &inputs, &bound(&["temp"]), "volume", 40.0, Some(0))
+            .unwrap_err();
+        assert!(err.contains("is a setting of this doc run"), "{err}");
+    }
+
+    #[test]
+    fn test_a_name_the_run_never_carried_is_refused() {
+        let inputs = serde_json::json!({ "doc": [1.0] });
+        let err =
+            check_saved_input("doc", &inputs, &bound(&["temp"]), "temp", 1.0, Some(0)).unwrap_err();
+        assert!(err.contains("is not a replicates input"), "{err}");
+    }
+}

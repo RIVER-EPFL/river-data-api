@@ -7364,7 +7364,7 @@
         "additionalProperties": false,
         "properties": {
           "input": {
-            "description": "The named `replicates` input of the referenced tool run this reading stores: the measured\nvalue the run consumed at `replicate_index`, stored raw. A curve the run applied is not a\ncorrection of this row, so `standard_curve_id` is admitted here and the database applies\nit (ADR 0003).",
+            "description": "The named input of the referenced tool run this reading stores: the measured value the run\nconsumed at `replicate_index`, stored raw. A curve the run applied is not a correction of\nthis row, so `standard_curve_id` is admitted here and the database applies it (ADR 0003).\nA `replicates` input stores one reading per position; a numeric input the manifest binds to\na visit parameter (`event_inputs`) stores one at replicate 0, correcting what the visit\nholds. A numeric input the manifest binds to nothing is a run-only setting and is refused.",
             "type": [
               "string",
               "null"

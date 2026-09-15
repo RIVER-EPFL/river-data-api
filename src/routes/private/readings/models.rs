@@ -2269,10 +2269,12 @@ pub struct GrabSampleReading {
     /// `value` must be the run's value for that output.
     #[serde(default)]
     pub output: Option<String>,
-    /// The named `replicates` input of the referenced tool run this reading stores: the measured
-    /// value the run consumed at `replicate_index`, stored raw. A curve the run applied is not a
-    /// correction of this row, so `standard_curve_id` is admitted here and the database applies
-    /// it (ADR 0003).
+    /// The named input of the referenced tool run this reading stores: the measured value the run
+    /// consumed at `replicate_index`, stored raw. A curve the run applied is not a correction of
+    /// this row, so `standard_curve_id` is admitted here and the database applies it (ADR 0003).
+    /// A `replicates` input stores one reading per position; a numeric input the manifest binds to
+    /// a visit parameter (`event_inputs`) stores one at replicate 0, correcting what the visit
+    /// holds. A numeric input the manifest binds to nothing is a run-only setting and is refused.
     #[serde(default)]
     pub input: Option<String>,
     /// The standard curve the operator fitted for this measurement, typically per microplate. It is
