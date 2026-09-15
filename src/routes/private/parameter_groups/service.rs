@@ -67,6 +67,8 @@ async fn codes_for_statistics_rule<C: ConnectionTrait>(
 /// The catalog codes of a group's members entered several times at a visit. Replicate-ness is a
 /// property of the parameter in its group, so this is what a manifest reads to decide whether a
 /// source carries one value or the whole family (Q155).
+///
+/// [`replicated_member_codes`] is the same question asked of every group at once.
 pub async fn replicated_codes<C: ConnectionTrait>(
     db: &C,
     group_id: Uuid,
@@ -78,6 +80,28 @@ pub async fn replicated_codes<C: ConnectionTrait>(
                JOIN parameters p ON p.id = m.parameter_id \
               WHERE m.group_id = $1 AND m.replicates IS NOT NULL",
             [group_id.into()],
+        ))
+        .await
+        .map_err(ApiError::database)?;
+    let mut replicated = Vec::with_capacity(rows.len());
+    for row in rows {
+        let code: String = row.try_get("", "code").map_err(ApiError::database)?;
+        replicated.push(code);
+    }
+    Ok(replicated)
+}
+
+/// Every replicated member code, whichever group holds it. A parameter belongs to at most one
+/// group, so a code is replicated or it is not, and a calculation reading it needs no group of its
+/// own to find that out.
+pub async fn replicated_member_codes<C: ConnectionTrait>(db: &C) -> Result<Vec<String>, ApiError> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT p.code FROM parameter_group_members m \
+               JOIN parameters p ON p.id = m.parameter_id \
+              WHERE m.replicates IS NOT NULL",
+            [],
         ))
         .await
         .map_err(ApiError::database)?;
@@ -307,22 +331,6 @@ pub mod rules {
         }
     }
 
-    /// The group a calculation's minted output joins. A formula attached to a calculation publishes
-    /// into that calculation's group, so applying the group to a site declares the inputs and the
-    /// outputs together rather than the inputs alone. A standalone formula belongs to no
-    /// calculation, a calculation may be bound to no group, and a parameter some group already
-    /// holds keeps the placement it has; each of those joins nothing.
-    #[must_use]
-    pub fn output_group(
-        parameter_id: Uuid,
-        calculation_group: Option<Uuid>,
-        members: &[Member],
-    ) -> Option<Uuid> {
-        let group_id = calculation_group?;
-        may_add(parameter_id, members).ok()?;
-        Some(group_id)
-    }
-
     /// A parameter belongs to at most one group, so adding it anywhere else is refused.
     pub fn may_add(parameter_id: Uuid, members: &[Member]) -> Result<(), Refusal> {
         match members.iter().find(|m| m.parameter_id == parameter_id) {
@@ -484,42 +492,81 @@ pub async fn calculation_roles(
     Ok(roles)
 }
 
+/// The section each of a group's columns renders under, read from the calculations that name them.
+/// A calculation belongs to no group (Q169), so every active manifest is read and the sections it
+/// names are taken for the codes this group holds; the first calculation by name wins a code two
+/// of them section differently.
 pub(super) async fn manifest_sections(
     db: &sea_orm::DatabaseConnection,
     group_id: Uuid,
 ) -> AppResult<std::collections::HashMap<String, String>> {
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
+    let mut sections = std::collections::HashMap::new();
+    let held = member_codes(db, group_id).await?;
+    if held.is_empty() {
+        return Ok(sections);
+    }
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT v.manifest FROM tool_scripts s \
                JOIN tool_script_versions v ON v.id = s.active_version_id \
-              WHERE s.parameter_group_id = $1",
-            [group_id.into()],
+              ORDER BY s.name",
+            [],
         ))
         .await
         .map_err(AppError::Database)?;
-    let mut sections = std::collections::HashMap::new();
-    let Some(row) = row else {
-        return Ok(sections);
-    };
-    let manifest: serde_json::Value = row.try_get("", "manifest").map_err(AppError::Database)?;
-    let params = manifest
-        .get("params")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for param in params {
-        let (Some(code), Some(section)) = (
-            param
-                .get("parameter_code")
-                .and_then(serde_json::Value::as_str),
-            param.get("section").and_then(serde_json::Value::as_str),
-        ) else {
-            continue;
-        };
-        sections.insert(code.to_lowercase(), section.to_string());
+    for row in rows {
+        let manifest: serde_json::Value =
+            row.try_get("", "manifest").map_err(AppError::Database)?;
+        let params = manifest
+            .get("params")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for param in params {
+            let (Some(code), Some(section)) = (
+                param
+                    .get("parameter_code")
+                    .and_then(serde_json::Value::as_str),
+                param.get("section").and_then(serde_json::Value::as_str),
+            ) else {
+                continue;
+            };
+            let code = code.to_lowercase();
+            if !held.contains(&code) {
+                continue;
+            }
+            sections.entry(code).or_insert_with(|| section.to_string());
+        }
     }
     Ok(sections)
+}
+
+/// The catalog codes a group holds, lower-cased.
+async fn member_codes(
+    db: &sea_orm::DatabaseConnection,
+    group_id: Uuid,
+) -> AppResult<std::collections::HashSet<String>> {
+    let ids: Vec<Uuid> = super::member_model::Entity::find()
+        .select_only()
+        .column(super::member_model::Column::ParameterId)
+        .filter(super::member_model::Column::GroupId.eq(group_id))
+        .into_tuple::<Uuid>()
+        .all(db)
+        .await?;
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    Ok(crate::routes::private::parameters::Entity::find()
+        .select_only()
+        .column(crate::routes::private::parameters::Column::Code)
+        .filter(crate::routes::private::parameters::Column::Id.is_in(ids))
+        .into_tuple::<String>()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|code| code.to_lowercase())
+        .collect())
 }
 
 #[cfg(test)]

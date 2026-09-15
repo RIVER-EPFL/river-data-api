@@ -309,8 +309,7 @@ pub(super) fn stored_manifest(name: &str, raw: &serde_json::Value) -> AppResult<
 }
 
 pub(super) const ACTIVE_TOOL_SQL: &str = r"
-    SELECT s.id AS script_id, s.name, s.label, s.description, s.engine, s.parameter_group_id,
-           s.enabled,
+    SELECT s.id AS script_id, s.name, s.label, s.description, s.engine, s.enabled,
            v.id AS version_id, v.version_no, v.script, v.entry_function, v.manifest,
            v.content_hash
     FROM tool_scripts s
@@ -355,7 +354,6 @@ pub(super) struct StoredActiveTool {
     content_hash: String,
     manifest: serde_json::Value,
     engine: String,
-    parameter_group_id: Option<Uuid>,
 }
 
 pub(super) fn row_to_active(row: &sea_orm::QueryResult) -> AppResult<ActiveTool> {
@@ -372,7 +370,6 @@ pub(super) fn row_to_active(row: &sea_orm::QueryResult) -> AppResult<ActiveTool>
         content_hash: stored.content_hash,
         manifest,
         engine: Engine::parse(&stored.engine).unwrap_or(Engine::Script),
-        parameter_group_id: stored.parameter_group_id,
         formulas: Vec::new(),
         name: stored.name,
     })
@@ -1972,15 +1969,11 @@ pub(super) fn produced_before(
         .collect()
 }
 
-/// The replicated codes of the calculation's parameter group, empty where it declares none.
-pub async fn replicated_for<C: ConnectionTrait>(
-    db: &C,
-    parameter_group_id: Option<Uuid>,
-) -> AppResult<Vec<String>> {
-    let Some(group_id) = parameter_group_id else {
-        return Ok(Vec::new());
-    };
-    Ok(crate::routes::private::parameter_groups::service::replicated_codes(db, group_id).await?)
+/// The catalog codes entered several times at a visit, over every group. Replicate-ness is a
+/// property of a parameter in the group that holds it, and a parameter belongs to at most one
+/// group, so a code is replicated or it is not, whichever calculation reads it.
+pub async fn replicated_for<C: ConnectionTrait>(db: &C) -> AppResult<Vec<String>> {
+    Ok(crate::routes::private::parameter_groups::service::replicated_member_codes(db).await?)
 }
 
 /// The manifest a formula calculation presents, in the same JSON shape an authored manifest is
@@ -2525,13 +2518,11 @@ pub async fn stored_usage_of_constant(
     else {
         return Ok(None);
     };
-    Ok(Some(
-        crate::routes::private::tools::models::StoredUsage {
-            name: row.try_get("", "name")?,
-            visits: row.try_get("", "visits")?,
-            readings: row.try_get("", "readings")?,
-        },
-    ))
+    Ok(Some(crate::routes::private::tools::models::StoredUsage {
+        name: row.try_get("", "name")?,
+        visits: row.try_get("", "visits")?,
+        readings: row.try_get("", "readings")?,
+    }))
 }
 
 /// [`calculations_fed_by`] for any subject.
@@ -3210,7 +3201,6 @@ pub(super) struct CalculationRow {
     description: Option<String>,
     engine: Engine,
     active_version_id: Option<Uuid>,
-    parameter_group_id: Option<Uuid>,
 }
 
 pub(super) async fn load_calculation<C: ConnectionTrait>(
@@ -3228,7 +3218,6 @@ pub(super) async fn load_calculation<C: ConnectionTrait>(
         description: row.description,
         engine: Engine::parse(&row.engine).unwrap_or(Engine::Script),
         active_version_id: row.active_version_id,
-        parameter_group_id: row.parameter_group_id,
     }))
 }
 
@@ -3252,7 +3241,7 @@ pub async fn mint_formula_version<C: ConnectionTrait>(
         .into_iter()
         .map(|(_, f)| f)
         .collect();
-    let replicated = replicated_for(db, calculation.parameter_group_id).await?;
+    let replicated = replicated_for(db).await?;
     let manifest = manifest_json(
         &calculation.label,
         calculation.description.as_deref(),
@@ -3499,18 +3488,57 @@ pub(super) async fn ids_by_code<C: ConnectionTrait>(
     Ok(by_code)
 }
 
-/// The calculations bound to a group, as the reshape rules read them: name, inputs and outputs
-/// resolved from each calculation's *active* version. A calculation with no active version
-/// produces nothing yet and is not one.
+/// The calculations of a group: those whose active version reads or publishes one of its members.
+/// A calculation belongs to no group (Q169), so the tie between the two is the parameters they
+/// share. A calculation with no active version produces nothing yet and is not one.
 pub async fn calculations_of_group<C: ConnectionTrait>(
     db: &C,
     group_id: Uuid,
 ) -> AppResult<Vec<rules::Calculation>> {
+    let members = member_ids(db, group_id).await?;
+    if members.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(active_calculations(db)
+        .await?
+        .into_iter()
+        .filter_map(|calculation| {
+            let touches = calculation
+                .inputs
+                .iter()
+                .chain(calculation.outputs.iter())
+                .any(|id| members.contains(id));
+            touches.then_some(rules::Calculation {
+                group_id,
+                ..calculation
+            })
+        })
+        .collect())
+}
+
+/// The parameters a group holds.
+async fn member_ids<C: ConnectionTrait>(db: &C, group_id: Uuid) -> AppResult<Vec<Uuid>> {
+    use crate::routes::private::parameter_groups::member_model;
+    Ok(member_model::Entity::find()
+        .select_only()
+        .column(member_model::Column::ParameterId)
+        .filter(member_model::Column::GroupId.eq(group_id))
+        .into_tuple::<Uuid>()
+        .all(db)
+        .await?)
+}
+
+/// Every calculation that has an active version, with the parameters its manifest reads and
+/// publishes. `group_id` is nil: the caller is what a listing is for.
+pub(super) async fn active_calculations<C: ConnectionTrait>(
+    db: &C,
+) -> AppResult<Vec<rules::Calculation>> {
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT s.name, v.manifest FROM tool_scripts s                JOIN tool_script_versions v ON v.id = s.active_version_id               WHERE s.parameter_group_id = $1",
-            [group_id.into()],
+            "SELECT s.name, v.manifest FROM tool_scripts s \
+               JOIN tool_script_versions v ON v.id = s.active_version_id",
+            [],
         ))
         .await?;
     let mut out = Vec::with_capacity(rows.len());
@@ -3521,7 +3549,7 @@ pub async fn calculations_of_group<C: ConnectionTrait>(
         all.extend(output_codes.clone());
         let by_code = ids_by_code(db, &all).await?;
         out.push(rules::Calculation {
-            group_id,
+            group_id: Uuid::nil(),
             name,
             inputs: input_codes
                 .iter()
@@ -4124,7 +4152,6 @@ pub(super) fn version_as_tool(
         content_hash: version.content_hash.clone(),
         manifest,
         engine: Engine::Script,
-        parameter_group_id: None,
         formulas: Vec::new(),
     })
 }

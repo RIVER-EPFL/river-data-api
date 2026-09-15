@@ -39,6 +39,12 @@ pub struct Model {
     pub needs_review: bool,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The calculation that minted this row and no longer publishes it, where one did: a formula
+    /// ticked as a step still names this code while it publishes nothing, so the catalogue offers a
+    /// name nothing computes. Read from the formulas on every fetch, never stored.
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub unpublished_by: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

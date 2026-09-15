@@ -37,8 +37,8 @@ async fn seed_calculation(db: &DatabaseConnection) -> (String, String) {
              VALUES (gen_random_uuid(), '{GROUP_ID}', '{peak_id}', 1)"
         ),
         format!(
-            "INSERT INTO tool_scripts (name, label, engine, parameter_group_id, created_by) \
-             VALUES ('{CALCULATION}', 'Draft chain', 'formula', '{GROUP_ID}', 'test')"
+            "INSERT INTO tool_scripts (name, label, engine, created_by) \
+             VALUES ('{CALCULATION}', 'Draft chain', 'formula', 'test')"
         ),
     ] {
         crate::common::exec(db, &sql).await;

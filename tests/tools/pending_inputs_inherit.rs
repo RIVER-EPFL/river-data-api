@@ -33,22 +33,8 @@ async fn install_calculation(db: &DatabaseConnection, app: &axum::Router, token:
              VALUES (gen_random_uuid(), '{GROUP_ID}', '{GLOBAL_PARAM_TEMP_ID}', 1)"
         ),
         format!(
-            "INSERT INTO tool_scripts (name, label, engine, parameter_group_id, created_by) \
-             VALUES ('{CALCULATION}', 'Pending probe', 'formula', '{GROUP_ID}', 'test')"
-        ),
-    ] {
-        crate::common::exec(db, &sql).await;
-    }
-
-    let output_id = Uuid::new_v4().to_string();
-    for sql in [
-        format!(
-            "INSERT INTO parameters (id, code, name, default_units, category) \
-             VALUES ('{output_id}', '{OUTPUT_CODE}', '{OUTPUT_CODE}', 'ratio', 'measurement')"
-        ),
-        format!(
-            "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
-             VALUES (gen_random_uuid(), '{GROUP_ID}', '{output_id}', 2)"
+            "INSERT INTO tool_scripts (name, label, engine, created_by) \
+             VALUES ('{CALCULATION}', 'Pending probe', 'formula', 'test')"
         ),
     ] {
         crate::common::exec(db, &sql).await;
@@ -83,6 +69,28 @@ async fn install_calculation(db: &DatabaseConnection, app: &axum::Router, token:
         (200..300).contains(&status),
         "the formula mints a version ({status}): {body}"
     );
+
+    // The formula mints its output (Q191) and a person puts it in the group (Q189), so the group
+    // carries it only once both have happened.
+    let output_id = {
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("SELECT id FROM parameters WHERE lower(code) = lower('{OUTPUT_CODE}')"),
+            ))
+            .await
+            .expect("query")
+            .expect("the formula minted its output");
+        row.try_get::<Uuid>("", "id").expect("id").to_string()
+    };
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
+             VALUES (gen_random_uuid(), '{GROUP_ID}', '{output_id}', 2)"
+        ),
+    )
+    .await;
 
     let (status, applied) = crate::common::post_json_with_token(
         app,

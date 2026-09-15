@@ -64,6 +64,86 @@ impl CRUDOperations for ParameterOperations {
         reconcile_all_from_hook(db).await;
         Ok(())
     }
+
+    async fn after_get_one<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        entity: &mut Parameter,
+    ) -> Result<(), ApiError> {
+        let given_up = given_up_codes(db).await.map_err(ApiError::database)?;
+        entity.unpublished_by = unpublished_by(&entity.code, &given_up);
+        Ok(())
+    }
+
+    async fn after_get_all<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        entities: &mut Vec<<Parameter as crudcrate::CRUDResource>::ListModel>,
+    ) -> Result<(), ApiError> {
+        if entities.is_empty() {
+            return Ok(());
+        }
+        let given_up = given_up_codes(db).await.map_err(ApiError::database)?;
+        for entity in entities.iter_mut() {
+            entity.unpublished_by = unpublished_by(&entity.code, &given_up);
+        }
+        Ok(())
+    }
+}
+
+/// A formula that publishes no parameter and still names a code: the record of a catalog row a
+/// calculation minted and gave up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GivenUp {
+    pub code: String,
+    /// The calculation the formula belongs to, or the formula's own name where it is standalone.
+    pub calculation: String,
+}
+
+/// The calculation a parameter was minted by and is no longer published by, where the code is one
+/// a formula gave up. A code nothing gave up is an ordinary catalog row and reads as None.
+#[must_use]
+pub fn unpublished_by(code: &str, given_up: &[GivenUp]) -> Option<String> {
+    given_up
+        .iter()
+        .find(|row| row.code.eq_ignore_ascii_case(code.trim()))
+        .map(|row| row.calculation.clone())
+}
+
+/// Every formula publishing nothing, named by the calculation it belongs to. The formulas are the
+/// record: a given-up row no longer satisfies a join on `output_parameter_id`, so the code is what
+/// ties it back.
+async fn given_up_codes<C: ConnectionTrait>(db: &C) -> Result<Vec<GivenUp>, sea_orm::DbErr> {
+    use crate::routes::private::tools::models::script;
+    let formulas = definition::Entity::find()
+        .filter(definition::Column::OutputParameterId.is_null())
+        .all(db)
+        .await?;
+    if formulas.is_empty() {
+        return Ok(Vec::new());
+    }
+    let script_ids: Vec<Uuid> = formulas.iter().filter_map(|f| f.tool_script_id).collect();
+    let labels: std::collections::HashMap<Uuid, String> = if script_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        script::Entity::find()
+            .filter(script::Column::Id.is_in(script_ids))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|s| (s.id, s.label))
+            .collect()
+    };
+    Ok(formulas
+        .into_iter()
+        .map(|formula| GivenUp {
+            code: formula.code,
+            calculation: formula
+                .tool_script_id
+                .and_then(|id| labels.get(&id).cloned())
+                .unwrap_or(formula.name),
+        })
+        .collect())
 }
 
 // --- Absorbing one catalog parameter into another ---
@@ -472,3 +552,7 @@ async fn delete_parameter(txn: &impl ConnectionTrait, source_id: Uuid) -> AppRes
         .map_err(AppError::Database)?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tests/service.rs"]
+mod tests;

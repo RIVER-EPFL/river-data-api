@@ -17,7 +17,6 @@ fn tool(manifest: serde_json::Value) -> ActiveTool {
         content_hash: "hash".to_string(),
         manifest,
         engine: Engine::Script,
-        parameter_group_id: None,
         formulas: Vec::new(),
     }
 }

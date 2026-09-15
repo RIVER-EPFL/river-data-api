@@ -39,8 +39,8 @@ async fn seed_calculation(db: &DatabaseConnection) -> (String, String) {
              VALUES (gen_random_uuid(), '{GROUP_ID}', '{GLOBAL_PARAM_DO_ID}', 2)"
         ),
         format!(
-            "INSERT INTO tool_scripts (name, label, engine, parameter_group_id, created_by) \
-             VALUES ('{CALCULATION}', 'Partial probe', 'formula', '{GROUP_ID}', 'test')"
+            "INSERT INTO tool_scripts (name, label, engine, created_by) \
+             VALUES ('{CALCULATION}', 'Partial probe', 'formula', 'test')"
         ),
     ] {
         exec(db, &sql).await;
@@ -58,28 +58,30 @@ async fn seed_calculation(db: &DatabaseConnection) -> (String, String) {
     (script_id, GROUP_ID.to_string())
 }
 
-/// An output parameter of the calculation, declared at the site so the chain applies there.
-async fn declare_output(db: &DatabaseConnection, code: &str) -> String {
-    let parameter_id = Uuid::new_v4().to_string();
-    for sql in [
-        format!(
-            "INSERT INTO parameters (id, code, name, default_units, category) \
-             VALUES ('{parameter_id}', '{code}', '{code}', 'ratio', 'measurement')"
-        ),
-        format!(
-            "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
-             VALUES (gen_random_uuid(), '{GROUP_ID}', '{parameter_id}', 9)"
-        ),
-        format!(
+/// The parameter a saved formula minted, declared at the site so the chain applies there. A
+/// calculation mints its own output (Q191), so the slot is declared after the formula is added.
+async fn declare_slot(db: &DatabaseConnection, code: &str) -> String {
+    let parameter_id: Uuid = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT id FROM parameters WHERE lower(code) = lower('{code}')"),
+        ))
+        .await
+        .expect("the catalog reads")
+        .expect("the formula minted its output")
+        .try_get("", "id")
+        .expect("id");
+    exec(
+        db,
+        &format!(
             "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, \
                  entry_mode, display_units) \
              VALUES (gen_random_uuid(), '{SITE1_ID}', '{parameter_id}', '{code}', 'derived', \
                  'tool', 'ratio')"
         ),
-    ] {
-        exec(db, &sql).await;
-    }
-    parameter_id
+    )
+    .await;
+    parameter_id.to_string()
 }
 
 /// A visit holding temperature and nothing else.
@@ -139,9 +141,6 @@ async fn a_refused_output_of_a_set_that_saved_is_reported_rather_than_silent() {
     let f = crate::common::seeded_app().await;
     let db = f.db.clone();
     let (script_id, _) = seed_calculation(&db).await;
-    let computed = declare_output(&db, "partial_computed").await;
-    let refused = declare_output(&db, "partial_refused").await;
-
     for (code, formula, ordinal) in [
         ("partial_computed", "DO_Temperature * 2", 1),
         ("partial_refused", "Dissolved_O2 * 2", 2),
@@ -160,14 +159,20 @@ async fn a_refused_output_of_a_set_that_saved_is_reported_rather_than_silent() {
             &f.token,
         )
         .await;
-        assert!((200..300).contains(&status), "add {code} ({status}): {text}");
+        assert!(
+            (200..300).contains(&status),
+            "add {code} ({status}): {text}"
+        );
     }
+    let computed = declare_slot(&db, "partial_computed").await;
+    let refused = declare_slot(&db, "partial_refused").await;
 
     let event_id = seed_visit(&db).await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
-    let outcome = river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
-        .await
-        .expect("a refused output is not a failed recompute");
+    let outcome =
+        river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
+            .await
+            .expect("a refused output is not a failed recompute");
 
     assert_eq!(outcome.tools_run, 1, "the set ran and saved");
     assert!(outcome.readings_written >= 1, "the computed output landed");

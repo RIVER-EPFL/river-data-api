@@ -1,7 +1,7 @@
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
-    Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -11,7 +11,11 @@ use super::models::definition::CalculationFormula;
 use super::models::source;
 use crate::routes::private::constants;
 use crate::routes::private::parameters;
+use crate::routes::private::projects;
+use crate::routes::private::readings;
 use crate::routes::private::sensor_calibrations::service::{DerivedSlot, SlotPass};
+use crate::routes::private::site_parameters;
+use crate::routes::private::sites;
 use crate::routes::private::sync::hold_model;
 use crate::routes::private::sync::models::{HoldKind, HoldStatus};
 use crate::routes::private::sync::service::{Hold, HoldKey, upsert_hold};
@@ -688,13 +692,73 @@ async fn delete_sources<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Why a published output parameter's code cannot be renamed, if it cannot. The code is the CSV
+/// column header and the public API's identifier, so once values are stored under it or a project
+/// exposes it, renaming it breaks what somebody is already reading (Q183).
+fn rename_refusal(readings: u64, exposed_by: Option<&str>) -> Option<String> {
+    if readings > 0 {
+        return Some(format!("{readings} readings are stored under it"));
+    }
+    exposed_by.map(|project| format!("the project '{project}' publishes it"))
+}
+
+/// The number of readings stored under a catalog parameter.
+async fn readings_under<C: ConnectionTrait>(db: &C, parameter_id: Uuid) -> Result<u64, DbErr> {
+    readings::Entity::find()
+        .filter(readings::Column::ParameterId.eq(parameter_id))
+        .count(db)
+        .await
+}
+
+/// The name of a project publishing this parameter at one of its sites, if one does.
+async fn exposing_project<C: ConnectionTrait>(
+    db: &C,
+    parameter_id: Uuid,
+) -> Result<Option<String>, DbErr> {
+    let Some(slot) = site_parameters::Entity::find()
+        .filter(site_parameters::Column::ParameterId.eq(parameter_id))
+        .filter(site_parameters::Column::IsPublic.eq(true))
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(site) = sites::Entity::find_by_id(slot.site_id).one(db).await? else {
+        return Ok(None);
+    };
+    let Some(project_id) = site.project_id else {
+        return Ok(None);
+    };
+    Ok(projects::Entity::find_by_id(project_id)
+        .one(db)
+        .await?
+        .map(|project| project.name))
+}
+
+/// The catalog parameter a code already belongs to, other than this one.
+async fn code_held_by<C: ConnectionTrait>(
+    db: &C,
+    code: &str,
+    besides: Uuid,
+) -> Result<Option<parameters::Model>, DbErr> {
+    parameters::Entity::find()
+        .filter(code_matches(code))
+        .filter(parameters::Column::Id.ne(besides))
+        .one(db)
+        .await
+}
+
 /// The catalog row a definition's output owns, kept in step with the definition.
+///
+/// A code change is carried through to the catalog, because a calculation renamed on the page and
+/// a catalog row left under the old code are two names for one thing and nothing reports the
+/// divergence. It is refused once the code is published (Q183).
 async fn update_output_parameter<C: ConnectionTrait>(
     db: &C,
     parameter_id: Uuid,
     entity: &CalculationFormula,
-) -> Result<(), sea_orm::DbErr> {
-    parameters::Entity::update_many()
+) -> Result<(), ApiError> {
+    let mut update = parameters::Entity::update_many()
         .col_expr(
             parameters::Column::Name,
             sea_orm::sea_query::Expr::value(entity.name.clone()),
@@ -706,11 +770,72 @@ async fn update_output_parameter<C: ConnectionTrait>(
         .col_expr(
             parameters::Column::Description,
             sea_orm::sea_query::Expr::value(entity.description.clone().unwrap_or_default()),
-        )
+        );
+    let stored = parameters::Entity::find_by_id(parameter_id)
+        .one(db)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to read output parameter: {e}"), None))?;
+    if let Some(stored) = stored
+        && stored.code != entity.code
+    {
+        if let Some(reason) = published_reason(db, parameter_id).await? {
+            return Err(ApiError::bad_request(format!(
+                "the output parameter '{}' cannot be renamed to '{}': {reason}",
+                stored.code, entity.code
+            )));
+        }
+        if let Some(other) = code_held_by(db, &entity.code, parameter_id)
+            .await
+            .map_err(|e| ApiError::internal(format!("Failed to look up the code: {e}"), None))?
+        {
+            return Err(ApiError::conflict(format!(
+                "the code '{}' already belongs to the parameter '{}'",
+                entity.code, other.name
+            )));
+        }
+        update = update.col_expr(
+            parameters::Column::Code,
+            sea_orm::sea_query::Expr::value(entity.code.clone()),
+        );
+    }
+    update
         .filter(parameters::Column::Id.eq(parameter_id))
         .exec(db)
-        .await?;
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to update output parameter: {e}"), None))?;
     Ok(())
+}
+
+/// Why a catalog parameter's code is no longer free, when it is not.
+async fn published_reason<C: ConnectionTrait>(
+    db: &C,
+    parameter_id: Uuid,
+) -> Result<Option<String>, ApiError> {
+    let readings = readings_under(db, parameter_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to count readings: {e}"), None))?;
+    let exposed = exposing_project(db, parameter_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to read public slots: {e}"), None))?;
+    Ok(rename_refusal(readings, exposed.as_deref()))
+}
+
+/// Whether a calculation publishes this catalog parameter.
+async fn minted_by_calculation<C: ConnectionTrait>(
+    db: &C,
+    parameter_id: Uuid,
+) -> Result<bool, ApiError> {
+    super::models::definition::Entity::find()
+        .filter(super::models::definition::Column::OutputParameterId.eq(parameter_id))
+        .one(db)
+        .await
+        .map(|found| found.is_some())
+        .map_err(|e| {
+            ApiError::internal(
+                format!("Failed to look up the parameter's calculation: {e}"),
+                None,
+            )
+        })
 }
 
 /// Ensure a row in the `parameters` table exists for a derived definition's output,
@@ -740,12 +865,7 @@ async fn ensure_output_parameter<C: ConnectionTrait>(
     // Reuse existing link if present
     if let Some(existing_id) = entity.output_parameter_id {
         // Keep the parameter row in sync
-        update_output_parameter(db, existing_id, entity)
-            .await
-            .map_err(|e| {
-                ApiError::internal(format!("Failed to update output parameter: {e}"), None)
-            })?;
-        place_output_in_group(db, entity.tool_script_id, existing_id).await?;
+        update_output_parameter(db, existing_id, entity).await?;
         return Ok(Some(existing_id));
     }
 
@@ -757,11 +877,17 @@ async fn ensure_output_parameter<C: ConnectionTrait>(
         .map_err(|e| ApiError::internal(format!("Failed to lookup output parameter: {e}"), None))?;
 
     let param_id = if let Some(parameter) = existing {
-        update_output_parameter(db, parameter.id, entity)
-            .await
-            .map_err(|e| {
-                ApiError::internal(format!("Failed to update output parameter: {e}"), None)
-            })?;
+        // A calculation mints its own output. A code already in the catalog belongs to something
+        // somebody else declared, and a first save that overwrote its name and units would take it
+        // over silently (Q183, Q191).
+        if !minted_by_calculation(db, parameter.id).await? {
+            return Err(ApiError::conflict(format!(
+                "the code '{}' already belongs to the catalog parameter '{}', which no \
+                 calculation produces; choose another code",
+                entity.code, parameter.name
+            )));
+        }
+        update_output_parameter(db, parameter.id, entity).await?;
         parameter.id
     } else {
         parameters::ActiveModel {
@@ -790,65 +916,38 @@ async fn ensure_output_parameter<C: ConnectionTrait>(
         .await
         .map_err(|e| ApiError::internal(format!("Failed to link output parameter: {e}"), None))?;
 
-    place_output_in_group(db, entity.tool_script_id, param_id).await?;
-
     entity.output_parameter_id = Some(param_id);
     Ok(Some(param_id))
-}
-
-/// Put a calculation's output in the group that calculation reads and writes, so applying the
-/// group to a site declares the inputs and the outputs together and every calculation of the
-/// group applies there (M227).
-///
-/// The membership is filled, never moved: a parameter another group already holds keeps the
-/// placement it has, as it does when the sync places one. The output sits after the entries,
-/// which is where it is read.
-async fn place_output_in_group<C: ConnectionTrait>(
-    db: &C,
-    tool_script_id: Option<Uuid>,
-    parameter_id: Uuid,
-) -> Result<(), ApiError> {
-    use crate::routes::private::parameter_groups::member_model;
-    use crate::routes::private::parameter_groups::service::{all_members, rules};
-
-    let Some(script_id) = tool_script_id else {
-        return Ok(());
-    };
-    let calculation_group =
-        crate::routes::private::tools::models::script::Entity::find_by_id(script_id)
-            .one(db)
-            .await
-            .map_err(ApiError::database)?
-            .and_then(|script| script.parameter_group_id);
-    let members = all_members(db).await?;
-    let Some(group_id) = rules::output_group(parameter_id, calculation_group, &members) else {
-        return Ok(());
-    };
-
-    let last = member_model::Entity::find()
-        .filter(member_model::Column::GroupId.eq(group_id))
-        .order_by_desc(member_model::Column::Ordinal)
-        .one(db)
-        .await
-        .map_err(ApiError::database)?
-        .map_or(0, |member| member.ordinal);
-    member_model::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        group_id: Set(group_id),
-        parameter_id: Set(parameter_id),
-        ordinal: Set(last + 1),
-        ..Default::default()
-    }
-    .insert(db)
-    .await
-    .map_err(|e| ApiError::internal(format!("Failed to place output in its group: {e}"), None))?;
-    Ok(())
 }
 
 pub struct CalculationFormulaOperations;
 
 impl CRUDOperations for CalculationFormulaOperations {
     type Resource = CalculationFormula;
+
+    async fn after_get_one<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        entity: &mut CalculationFormula,
+    ) -> Result<(), ApiError> {
+        if let Some(parameter_id) = entity.output_parameter_id {
+            entity.code_locked = published_reason(db, parameter_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn after_get_all<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        entities: &mut Vec<<CalculationFormula as CRUDResource>::ListModel>,
+    ) -> Result<(), ApiError> {
+        for entity in entities.iter_mut() {
+            if let Some(parameter_id) = entity.output_parameter_id {
+                entity.code_locked = published_reason(db, parameter_id).await?;
+            }
+        }
+        Ok(())
+    }
 
     /// A slot naming this definition is left as it is: `entry_mode` is the site's own declaration
     /// that it computes the parameter, and it outlives whichever calculation produced it.

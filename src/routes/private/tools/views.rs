@@ -208,11 +208,11 @@ pub async fn create_script(
         // Never from the request: a self-asserted author is not a trail.
         created_by: Set(Some(crate::common::actor::label(&auth))),
         engine: Set(payload.engine.unwrap_or_else(|| "script".to_string())),
-        parameter_group_id: Set(payload.parameter_group_id),
         ..Default::default()
     };
     let created = model.insert(&state.db).await.map_err(|e| {
-        if e.to_string().contains("idx_tool_scripts_name") {
+        let message = e.to_string();
+        if message.contains("idx_tool_scripts_name") {
             AppError::Conflict(format!("a tool named '{name}' already exists"))
         } else {
             AppError::Database(e)
@@ -244,9 +244,6 @@ pub async fn update_script(
     }
     if let Some(enabled) = payload.enabled {
         model.enabled = Set(enabled);
-    }
-    if payload.parameter_group_id.is_some() {
-        model.parameter_group_id = Set(payload.parameter_group_id);
     }
     model.updated_at = Set(chrono::Utc::now());
     model.update(&state.db).await?;
@@ -526,7 +523,7 @@ pub async fn draft_run_formulas(
         )));
     }
     let formulas = pin_draft_formulas(&state.db, &payload.formulas).await?;
-    let replicated = replicated_for(&state.db, script.parameter_group_id).await?;
+    let replicated = replicated_for(&state.db).await?;
     let manifest_value = manifest_json(
         &script.label,
         script.description.as_deref(),

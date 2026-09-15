@@ -199,7 +199,6 @@ async fn author(
             "name": name,
             "label": name,
             "engine": "formula",
-            "parameter_group_id": group_id,
         }),
         admin,
     )
@@ -436,27 +435,14 @@ async fn every_cnet_set_is_authorable_through_the_api_and_reproduces_its_golden_
         "field_data and pco2 each declare that they read it"
     );
 
-    // Applying a group to a site has to declare the outputs beside the inputs, or every
-    // calculation of that group is not_applicable there (M227).
+    // A group is a filter over the grid's columns, so a minted output joins one when a person
+    // puts it there (Q189).
     let placed = crate::common::e2e::count(
         &db,
         "SELECT count(*) FROM calculation_formulas f \
-         JOIN tool_scripts s ON s.id = f.tool_script_id \
          JOIN parameter_group_members m ON m.parameter_id = f.output_parameter_id \
-          AND m.group_id = s.parameter_group_id \
          WHERE NOT f.intermediate",
     )
     .await;
-    assert_eq!(placed, 19, "the six sets publish 19 outputs into their groups");
-    let stranded = crate::common::e2e::count(
-        &db,
-        "SELECT count(*) FROM calculation_formulas f \
-         JOIN tool_scripts s ON s.id = f.tool_script_id \
-         WHERE NOT f.intermediate AND s.parameter_group_id IS NOT NULL \
-           AND NOT EXISTS (SELECT 1 FROM parameter_group_members m \
-                            WHERE m.parameter_id = f.output_parameter_id \
-                              AND m.group_id = s.parameter_group_id)",
-    )
-    .await;
-    assert_eq!(stranded, 0, "no output is left out of its calculation's group");
+    assert_eq!(placed, 0, "authoring the sets put no output in a group");
 }

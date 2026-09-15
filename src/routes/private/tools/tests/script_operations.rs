@@ -47,7 +47,6 @@ mod activation_arm {
     }
 }
 
-
 #[test]
 fn a_switched_off_calculation_is_not_run_by_name() {
     use super::admit_run;

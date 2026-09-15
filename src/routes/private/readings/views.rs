@@ -2825,7 +2825,11 @@ pub async fn insert_grab_samples(
     // a bookkeeping row records that nothing was declared, and a retired instrument is not in the
     // lab. The slot's own declaration is guarded where it is set, so only the request's pick is
     // checked here.
-    let picked: Vec<Uuid> = payload.readings.iter().filter_map(|r| r.sensor_id).collect();
+    let picked: Vec<Uuid> = payload
+        .readings
+        .iter()
+        .filter_map(|r| r.sensor_id)
+        .collect();
     crate::routes::private::sensors::service::require_measuring_instruments(
         &state.db,
         &picked,

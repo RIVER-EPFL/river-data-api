@@ -13,4 +13,5 @@ mod formula_validation_and_crud;
 mod formula_versions;
 mod janitor_gap_filler;
 mod lifecycle_define_assign_publish;
+mod output_parameter_code;
 mod shared_steps;

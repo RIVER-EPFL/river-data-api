@@ -510,8 +510,8 @@ async fn seed_chain(
     crate::common::exec(
         db,
         &format!(
-            "INSERT INTO tool_scripts (name, label, engine, parameter_group_id, created_by) \
-             VALUES ('chain', 'Chain', 'formula', '{CHAIN_GROUP_ID}', 'test')"
+            "INSERT INTO tool_scripts (name, label, engine, created_by) \
+             VALUES ('chain', 'Chain', 'formula', 'test')"
         ),
     )
     .await;

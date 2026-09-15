@@ -213,3 +213,38 @@ fn test_a_slot_that_computed_again_closes_its_finding_unless_it_also_refused() {
         "the partly refused slot still reports"
     );
 }
+
+/// Scenario: an author renames a calculation's code after the catalog parameter it publishes has
+/// been used.
+///
+/// Expected behaviour: the rename is refused with what is published, and the refusal names the
+/// readings count in preference to the project, because that is the larger claim on the code.
+mod rename {
+    use super::super::rename_refusal;
+
+    #[test]
+    fn test_rename_refusal_names_the_stored_readings() {
+        let reason = rename_refusal(412, None).expect("stored readings hold the code");
+        assert!(reason.contains("412"), "{reason}");
+    }
+
+    #[test]
+    fn test_rename_refusal_names_the_publishing_project() {
+        let reason = rename_refusal(0, Some("BREATHE")).expect("a public slot holds the code");
+        assert!(reason.contains("BREATHE"), "{reason}");
+    }
+
+    #[test]
+    fn test_rename_refusal_names_the_readings_when_both_hold_it() {
+        let reason = rename_refusal(7, Some("BREATHE")).expect("both hold the code");
+        assert!(
+            reason.contains('7') && !reason.contains("BREATHE"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn test_rename_refusal_passes_an_unpublished_code() {
+        assert!(rename_refusal(0, None).is_none());
+    }
+}

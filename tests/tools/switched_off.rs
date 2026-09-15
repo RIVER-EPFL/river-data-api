@@ -90,7 +90,10 @@ async fn a_switched_off_calculation_is_refused_by_name() {
         &f.token,
     )
     .await;
-    assert_eq!(status, 404, "a calculation that is not there is still absent: {body}");
+    assert_eq!(
+        status, 404,
+        "a calculation that is not there is still absent: {body}"
+    );
 }
 
 #[tokio::test]

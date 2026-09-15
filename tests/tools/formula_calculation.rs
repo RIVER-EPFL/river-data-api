@@ -53,8 +53,8 @@ async fn seed_calculation(db: &sea_orm::DatabaseConnection, group_id: &str) {
     crate::common::exec(
         db,
         &format!(
-            "INSERT INTO tool_scripts (name, label, engine, parameter_group_id, created_by) \
-             VALUES ('{CALCULATION}', 'Temperature ratio', 'formula', '{group_id}', 'test')"
+            "INSERT INTO tool_scripts (name, label, engine, created_by) \
+             VALUES ('{CALCULATION}', 'Temperature ratio', 'formula', 'test')"
         ),
     )
     .await;
@@ -90,27 +90,19 @@ async fn active_version(db: &sea_orm::DatabaseConnection) -> Option<(i32, String
     ))
 }
 
-/// The output parameter and its `output` membership exist before the formula does: a calculation
-/// writes only what its group declares it writes, and the catalog row is a manager's act.
-async fn declare_output(db: &sea_orm::DatabaseConnection, group_id: &str, code: &str) -> String {
-    let parameter_id = uuid::Uuid::new_v4().to_string();
-    crate::common::exec(
-        db,
-        &format!(
-            "INSERT INTO parameters (id, code, name, default_units, category) \
-             VALUES ('{parameter_id}', '{code}', '{code}', 'ratio', 'measurement')"
-        ),
-    )
-    .await;
-    crate::common::exec(
-        db,
-        &format!(
-            "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
-             VALUES (gen_random_uuid(), '{group_id}', '{parameter_id}', 9)"
-        ),
-    )
-    .await;
-    parameter_id
+/// The catalog parameter a saved formula minted for its code. A calculation mints its own output
+/// (Q191), so this is read after the formula is added, never inserted before it.
+async fn minted_output(db: &sea_orm::DatabaseConnection, code: &str) -> String {
+    db.query_one_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!("SELECT id FROM parameters WHERE lower(code) = lower('{code}')"),
+    ))
+    .await
+    .expect("the catalog reads")
+    .expect("the formula minted its output")
+    .try_get::<uuid::Uuid>("", "id")
+    .expect("id")
+    .to_string()
 }
 
 async fn add_formula(
@@ -144,7 +136,6 @@ async fn a_formula_edit_mints_and_activates_a_version() {
     let (db, app, token) = setup().await;
     seed_calculation(&db, group_id).await;
     let script_id = calculation_id(&db).await;
-    declare_output(&db, group_id, "temp_ratio_out").await;
     assert!(
         active_version(&db).await.is_none(),
         "a calculation with no formulas has no version"
@@ -201,7 +192,6 @@ async fn an_unchanged_formula_set_mints_nothing() {
     let (db, app, token) = setup().await;
     seed_calculation(&db, group_id).await;
     let script_id = calculation_id(&db).await;
-    declare_output(&db, group_id, "temp_ratio_out").await;
 
     let (status, text) = add_formula(
         &app,
@@ -242,7 +232,6 @@ async fn the_calculation_runs_its_formulas_without_the_runner() {
     let (db, app, token) = setup().await;
     seed_calculation(&db, group_id).await;
     let script_id = calculation_id(&db).await;
-    declare_output(&db, group_id, "temp_ratio_out").await;
     let (status, text) = add_formula(
         &app,
         &token,
@@ -281,7 +270,6 @@ async fn a_per_replicate_formula_produces_one_value_per_index() {
     let (db, app, token) = setup().await;
     seed_calculation(&db, group_id).await;
     let script_id = calculation_id(&db).await;
-    declare_output(&db, group_id, "temp_ratio_out").await;
     let (status, text) = crate::common::post_json_with_token(
         &app,
         "/api/derived_parameters",
@@ -327,7 +315,6 @@ async fn a_formula_edit_enqueues_its_own_audit() {
     let (db, app, token) = setup().await;
     seed_calculation(&db, group_id).await;
     let script_id = calculation_id(&db).await;
-    declare_output(&db, group_id, "temp_ratio_out").await;
 
     let audits = |db: sea_orm::DatabaseConnection| async move {
         db.query_one_raw(Statement::from_string(
@@ -444,7 +431,6 @@ async fn cleanup_removes_a_formula_calculation_with_its_sources() {
     let (db, app, token) = setup().await;
     seed_calculation(&db, group_id).await;
     let script_id = calculation_id(&db).await;
-    declare_output(&db, group_id, "temp_ratio_out").await;
     let (status, text) = add_formula(
         &app,
         &token,
@@ -508,7 +494,6 @@ async fn a_formula_reads_the_step_before_it() {
     let (db, app, token) = setup().await;
     seed_calculation(&db, group_id).await;
     let script_id = calculation_id(&db).await;
-    declare_output(&db, group_id, "temp_ratio_out").await;
 
     let (status, text) = crate::common::post_json_with_token(
         &app,
@@ -566,10 +551,7 @@ async fn a_formula_reads_the_step_before_it() {
 const VISIT_TIME: &str = "2025-07-02T08:00:00Z";
 
 /// A visit holding the two inputs, plus whatever the output slot already serves.
-async fn seed_visit(
-    db: &sea_orm::DatabaseConnection,
-    readings: &[(&str, f64)],
-) -> uuid::Uuid {
+async fn seed_visit(db: &sea_orm::DatabaseConnection, readings: &[(&str, f64)]) -> uuid::Uuid {
     let event_id = uuid::Uuid::new_v4();
     crate::common::exec(
         db,
@@ -654,8 +636,6 @@ async fn a_zero_divisor_refuses_the_output_and_leaves_the_stored_value() {
     let (db, app, token) = setup().await;
     seed_calculation(&db, group_id).await;
     let script_id = calculation_id(&db).await;
-    let output_id = declare_output(&db, group_id, "temp_ratio_out").await;
-    declare_slot(&db, &output_id).await;
     let (status, text) = add_formula(
         &app,
         &token,
@@ -666,6 +646,8 @@ async fn a_zero_divisor_refuses_the_output_and_leaves_the_stored_value() {
     )
     .await;
     assert!((200..300).contains(&status), "create ({status}): {text}");
+    let output_id = minted_output(&db, "temp_ratio_out").await;
+    declare_slot(&db, &output_id).await;
 
     let event_id = seed_visit(
         &db,
@@ -678,9 +660,10 @@ async fn a_zero_divisor_refuses_the_output_and_leaves_the_stored_value() {
     .await;
     let (_app, state) = crate::common::build_test_app_with_state(db.clone());
 
-    let outcome = river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
-        .await
-        .expect("a refused output is not a failed recompute");
+    let outcome =
+        river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
+            .await
+            .expect("a refused output is not a failed recompute");
     assert_eq!(outcome.readings_withdrawn, 0, "nothing was retracted");
     assert_eq!(
         served(&db, &output_id).await,

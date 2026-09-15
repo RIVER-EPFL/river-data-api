@@ -195,10 +195,7 @@ pub fn dependency_order(tools: &[ActiveTool], catalog: &ParameterCatalog) -> App
                 .collect()
         })
         .collect();
-    let consumed_codes: Vec<Vec<String>> = tools
-        .iter()
-        .map(|t| t.manifest.read_codes())
-        .collect();
+    let consumed_codes: Vec<Vec<String>> = tools.iter().map(|t| t.manifest.read_codes()).collect();
 
     let n = tools.len();
     let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n]; // deps[b] = producers b waits on
@@ -534,7 +531,9 @@ pub async fn recompute_event(
                 .unwrap_or_else(|| "the result is not a finite number".to_string());
             raise_skip(&state.db, &event, &tool.name, key, *parameter_id, &reason).await?;
             outcome.findings_raised += 1;
-            outcome.skipped.push((tool.name.clone(), format!("{key}: {reason}")));
+            outcome
+                .skipped
+                .push((tool.name.clone(), format!("{key}: {reason}")));
         }
 
         // An output the script computed as NA is a request to blank the column, so the stored
@@ -667,7 +666,9 @@ pub async fn recompute_event(
                 reason,
             )
             .await?;
-            outcome.skipped.push((tool.name.clone(), reason.to_string()));
+            outcome
+                .skipped
+                .push((tool.name.clone(), reason.to_string()));
         }
     }
 
@@ -871,7 +872,7 @@ pub(super) async fn pinned_tool(
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT v.tool_script_id, v.version_no, v.script, v.entry_function, v.manifest,
-                    v.content_hash, s.engine, s.parameter_group_id
+                    v.content_hash, s.engine
              FROM tool_script_versions v
              JOIN tool_scripts s ON s.id = v.tool_script_id
              WHERE v.id = $1",
@@ -906,7 +907,6 @@ pub(super) async fn pinned_tool(
         content_hash: row.content_hash,
         manifest,
         engine,
-        parameter_group_id: row.parameter_group_id,
         // The version body is the formula set, so a recompute under a pinned version runs the
         // formulas that version holds rather than the definitions as they stand today.
         formulas,
@@ -925,7 +925,6 @@ pub(super) struct PinnedVersionRow {
     content_hash: String,
     manifest: serde_json::Value,
     engine: String,
-    parameter_group_id: Option<Uuid>,
 }
 
 /// Whether every required param of a tool is answerable at the event without a person: a manifest

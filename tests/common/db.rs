@@ -327,11 +327,7 @@ pub async fn cleanup_test_db(db: &DatabaseConnection) {
            USING calculation_formulas d JOIN tool_scripts s ON s.id = d.tool_script_id \
            WHERE src.derived_definition_id = d.id AND s.created_by IS DISTINCT FROM 'seed'",
         "DELETE FROM tool_scripts WHERE created_by IS DISTINCT FROM 'seed'",
-        // Deleted rather than truncated: `tool_scripts.parameter_group_id` references
-        // `parameter_groups`, so a TRUNCATE ... CASCADE over the groups would take the seeded
-        // calculations with it.
         "DELETE FROM parameter_group_members",
-        "UPDATE tool_scripts SET parameter_group_id = NULL",
         "DELETE FROM parameter_groups",
     ];
 

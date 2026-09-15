@@ -262,7 +262,18 @@ pub struct GroupDefinition {
     pub description: Option<String>,
     pub ordinal: i32,
     pub members: Vec<DefinitionMember>,
-    /// The section labels, in the order their first column appears. Empty where the group's
-    /// calculation declares none.
+    /// The section labels, in the order their first column appears. Empty where no calculation
+    /// naming one of these columns declares a section.
     pub sections: Vec<String>,
+    /// The calculations that read or publish one of the members, by name. A calculation belongs to
+    /// no group (Q169), so the tie between the two is the parameters they share.
+    pub calculations: Vec<GroupCalculation>,
+}
+
+/// One calculation of a group's columns, as the group page lists it.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct GroupCalculation {
+    pub id: Uuid,
+    pub name: String,
+    pub label: String,
 }

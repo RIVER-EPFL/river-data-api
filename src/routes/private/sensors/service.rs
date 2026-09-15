@@ -752,7 +752,13 @@ pub async fn require_measuring_instruments<C: ConnectionTrait>(
         .column(Column::Name)
         .column(Column::IsLabInstrument)
         .column(Column::IsActive)
-        .into_tuple::<(Uuid, Option<String>, Option<String>, Option<bool>, Option<bool>)>()
+        .into_tuple::<(
+            Uuid,
+            Option<String>,
+            Option<String>,
+            Option<bool>,
+            Option<bool>,
+        )>()
         .all(db)
         .await?;
     for id in &wanted {

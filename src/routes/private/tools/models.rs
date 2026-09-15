@@ -104,9 +104,6 @@ pub mod script {
         /// `script` (R in the sandbox) or `formula` (the definitions attached to the calculation).
         #[crudcrate(filterable, sortable, on_create = "script".to_string())]
         pub engine: String,
-        /// The parameter group this calculation reads and writes. One calculation per group (Q43).
-        #[crudcrate(filterable)]
-        pub parameter_group_id: Option<Uuid>,
         /// The version history, newest first, without the code: a history is read to choose a
         /// version, and the content is fetched for the one that was chosen. Detail only, since a list
         /// of calculations is not a list of their versions.
@@ -1342,8 +1339,6 @@ pub struct ActiveTool {
     pub content_hash: String,
     pub manifest: Manifest,
     pub engine: Engine,
-    /// The parameter group this calculation reads and writes, when it declares one (M66).
-    pub parameter_group_id: Option<Uuid>,
     /// The formula engine's formulas, in no particular order; empty for a script calculation.
     pub formulas: Vec<PinnedFormula>,
 }
@@ -1370,14 +1365,13 @@ impl ActiveTool {
             content_hash,
             manifest,
             engine: Engine::Script,
-            parameter_group_id: None,
             formulas: Vec::new(),
         }
     }
 
     /// A formula calculation assembled from an unsaved formula set. The script row is the stored
-    /// one, so the run resolves against the calculation's own name and group; the version is nil
-    /// because no row carries these formulas.
+    /// one, so the run resolves against the calculation's own name; the version is nil because no
+    /// row carries these formulas.
     pub fn draft_formulas(
         script: &ToolScript,
         manifest: Manifest,
@@ -1396,7 +1390,6 @@ impl ActiveTool {
             content_hash,
             manifest,
             engine: Engine::Formula,
-            parameter_group_id: script.parameter_group_id,
             formulas,
         }
     }
@@ -1895,10 +1888,6 @@ pub struct CreateScriptRequest {
     /// versions are minted from the definitions attached to it.
     #[serde(default)]
     pub engine: Option<String>,
-    /// The parameter group whose members this calculation reads and writes. One calculation per
-    /// group (Q43).
-    #[serde(default)]
-    pub parameter_group_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1911,10 +1900,6 @@ pub struct UpdateScriptRequest {
     /// activation and fires at no visit until it is switched back on.
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// Bind the calculation to a parameter group. Omitted leaves the binding as it is, the way
-    /// the other fields of this request behave.
-    #[serde(default)]
-    pub parameter_group_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

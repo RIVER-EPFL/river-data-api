@@ -1,0 +1,149 @@
+//! Scenario: an author fixes the code of a calculation after saving it, and the catalog parameter
+//! the calculation publishes carries that code.
+//!
+//! Expected behaviour: the rename reaches the catalog while the code is unpublished, and is
+//! refused once readings are stored under it or a project exposes it (Q183). A first save whose
+//! code already belongs to a parameter no calculation produces is refused rather than adopting it
+//! (Q191).
+//!
+//! Run: cargo test --test derived_parameters output_parameter_code -- --test-threads=1
+
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use serial_test::serial;
+use uuid::Uuid;
+
+async fn define(app: &axum::Router, token: &str, code: &str) -> serde_json::Value {
+    let body = serde_json::json!({
+        "code": code,
+        "name": "Specific UV absorbance",
+        "units": "L/mg/m",
+        "formula": "Turbidity * 2",
+        "description": "a254 over DOC"
+    });
+    let (status, text) =
+        crate::common::post_json_with_token(app, "/api/derived_parameters", &body, token).await;
+    assert!((200..300).contains(&status), "define ({status}): {text}");
+    serde_json::from_str(&text).expect("the created calculation")
+}
+
+async fn rename(app: &axum::Router, token: &str, id: &str, code: &str) -> (u16, String) {
+    crate::common::put_json_with_token(
+        app,
+        &format!("/api/derived_parameters/{id}"),
+        &serde_json::json!({ "code": code }),
+        token,
+    )
+    .await
+}
+
+async fn catalog_code(db: &DatabaseConnection, parameter_id: Uuid) -> String {
+    db.query_one_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT code FROM parameters WHERE id = $1",
+        [parameter_id.into()],
+    ))
+    .await
+    .expect("the catalog reads")
+    .expect("the calculation minted a parameter")
+    .try_get::<String>("", "code")
+    .expect("code")
+}
+
+fn output_of(created: &serde_json::Value) -> Uuid {
+    Uuid::parse_str(
+        created["output_parameter_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the calculation publishes a parameter: {created}")),
+    )
+    .expect("a uuid")
+}
+
+#[tokio::test]
+#[serial]
+async fn an_unpublished_code_is_renamed_in_the_catalog_too() {
+    let f = crate::common::seeded_app().await;
+    let created = define(&f.app, &f.token, "suva").await;
+    let (id, output) = (created["id"].as_str().expect("id"), output_of(&created));
+    assert_eq!(catalog_code(&f.db, output).await, "suva");
+
+    let (status, body) = rename(&f.app, &f.token, id, "suva254").await;
+    assert!((200..300).contains(&status), "rename ({status}): {body}");
+    assert_eq!(
+        catalog_code(&f.db, output).await,
+        "suva254",
+        "the code is the CSV header and the public identifier, so the catalog carries the rename"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn a_code_with_readings_under_it_is_not_renamed() {
+    let f = crate::common::seeded_app().await;
+    let created = define(&f.app, &f.token, "suva_stored").await;
+    let (id, output) = (created["id"].as_str().expect("id"), output_of(&created));
+    f.db.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, \
+         replicate_index, measurement_type) \
+         SELECT d.id, $1, $2, '2024-06-01T09:00:00Z', 3.4, 0, 'derived' \
+           FROM data_streams d LIMIT 1",
+        [
+            Uuid::parse_str(crate::common::SITE1_ID).unwrap().into(),
+            output.into(),
+        ],
+    ))
+    .await
+    .expect("a stored derived reading");
+
+    let (status, body) = rename(&f.app, &f.token, id, "suva254").await;
+    assert_eq!(status, 400, "the rename is refused: {body}");
+    assert!(body.contains('1'), "the refusal names the count: {body}");
+    assert_eq!(catalog_code(&f.db, output).await, "suva_stored");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_code_a_project_publishes_is_not_renamed() {
+    let f = crate::common::seeded_app().await;
+    let created = define(&f.app, &f.token, "suva_public").await;
+    let (id, output) = (created["id"].as_str().expect("id"), output_of(&created));
+    f.db.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_public) \
+         VALUES (gen_random_uuid(), $1, $2, 'SUVA', 'derived', true)",
+        [
+            Uuid::parse_str(crate::common::SITE1_ID).unwrap().into(),
+            output.into(),
+        ],
+    ))
+    .await
+    .expect("a public slot");
+
+    let (status, body) = rename(&f.app, &f.token, id, "suva254").await;
+    assert_eq!(status, 400, "the rename is refused: {body}");
+    assert!(
+        body.contains("Test River Project"),
+        "the refusal names the project publishing it: {body}"
+    );
+    assert_eq!(catalog_code(&f.db, output).await, "suva_public");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_first_save_does_not_adopt_a_parameter_no_calculation_produces() {
+    let f = crate::common::seeded_app().await;
+    let body = serde_json::json!({
+        "code": "Turbidity",
+        "name": "Not turbidity",
+        "units": "L/mg/m",
+        "formula": "Dissolved_O2 * 2"
+    });
+    let (status, text) =
+        crate::common::post_json_with_token(&f.app, "/api/derived_parameters", &body, &f.token)
+            .await;
+    assert_eq!(status, 409, "the measurement is not taken over: {text}");
+    assert!(
+        text.contains("Turbidity"),
+        "the refusal names the parameter holding the code: {text}"
+    );
+}

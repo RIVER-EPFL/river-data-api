@@ -194,7 +194,10 @@ fn test_a_second_family_is_the_family_only_where_the_group_declares_it() {
         0,
         "NUT_NOx_avg - NUT_NO2_avg",
         Some("NUT_NO3_avg"),
-        &[("NUT_NOx_avg", "NUT_NOx_avg"), ("NUT_NO2_avg", "NUT_NO2_avg")],
+        &[
+            ("NUT_NOx_avg", "NUT_NOx_avg"),
+            ("NUT_NO2_avg", "NUT_NO2_avg"),
+        ],
         "NUT_NOx_avg",
     )];
     let kind_of = |manifest: &serde_json::Value, name: &str| {
@@ -771,7 +774,10 @@ fn test_a_non_finite_result_is_neither_stored_nor_cleared() {
             .unwrap()
             .contains("not a finite number")
     );
-    assert!(!results.contains_key("suva"), "nothing to store: {results:?}");
+    assert!(
+        !results.contains_key("suva"),
+        "nothing to store: {results:?}"
+    );
     assert!(
         partition_cleared(&mut results).is_empty(),
         "a refusal withdraws nothing"

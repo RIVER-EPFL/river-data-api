@@ -771,7 +771,12 @@ async fn a_pending_replicate_is_reported_as_pending() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|v| v["collected_at"].as_str().unwrap().starts_with("2025-06-01"))
+        .find(|v| {
+            v["collected_at"]
+                .as_str()
+                .unwrap()
+                .starts_with("2025-06-01")
+        })
         .expect("the first visit is listed");
     let dissolved = cell(row, GLOBAL_PARAM_DO_ID).expect("DO cell");
     assert_eq!(dissolved["n_total"], 2, "{dissolved}");
@@ -825,7 +830,12 @@ async fn a_single_measurement_counts_as_one() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|v| v["collected_at"].as_str().unwrap().starts_with("2025-06-01"))
+            .find(|v| {
+                v["collected_at"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("2025-06-01")
+            })
             .expect("the first visit is listed")
             .clone()
     };
@@ -841,7 +851,10 @@ async fn a_single_measurement_counts_as_one() {
         "a lone measurement is one measurement, not an unknown count: {temperature}"
     );
     let dissolved = cell(&first, GLOBAL_PARAM_DO_ID).expect("DO cell");
-    assert_eq!(dissolved["n"], 2, "the sample's own count still wins: {dissolved}");
+    assert_eq!(
+        dissolved["n"], 2,
+        "the sample's own count still wins: {dissolved}"
+    );
 
     crate::common::exec(
         &db,

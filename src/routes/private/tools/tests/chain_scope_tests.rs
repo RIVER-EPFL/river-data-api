@@ -243,7 +243,7 @@ fn a_constant_narrows_a_site_scope_and_binds_after_it() {
 /// covers one (Q175).
 #[test]
 fn the_audit_set_excludes_portal_sync_visits_too() {
-    let sql = crate::routes::private::tools::flows::audit_event_set(None, None, None, None)
-        .to_string();
+    let sql =
+        crate::routes::private::tools::flows::audit_event_set(None, None, None, None).to_string();
     assert!(sql.contains("portal_sync"), "{sql}");
 }

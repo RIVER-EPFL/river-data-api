@@ -252,7 +252,10 @@ async fn accepting_a_correction_reapplies_the_curve_the_reading_names() {
         .expect("the reading");
     let raw: f64 = row.try_get("", "raw_value").unwrap();
     let calibrated: Option<f64> = row.try_get("", "calibrated_value").unwrap();
-    assert!((raw - 11.5).abs() < 1e-9, "the correction is the new raw: {raw}");
+    assert!(
+        (raw - 11.5).abs() < 1e-9,
+        "the correction is the new raw: {raw}"
+    );
     // 2 * 11.5 + 1
     assert_eq!(
         calibrated,

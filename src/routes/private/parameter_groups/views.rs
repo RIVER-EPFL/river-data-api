@@ -4,7 +4,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
-use sea_orm::{ConnectionTrait, EntityTrait, Statement};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Statement};
 use uuid::Uuid;
 
 use super::models::*;
@@ -114,6 +114,7 @@ pub async fn group_definition(
             .unwrap_or(usize::MAX)
     });
     let sections = ordering::section_order(&columns);
+    let calculations = group_calculations(&state.db, id).await?;
 
     Ok(Json(GroupDefinition {
         id: header.id,
@@ -123,5 +124,38 @@ pub async fn group_definition(
         ordinal: header.ordinal,
         members,
         sections,
+        calculations,
     }))
+}
+
+/// The calculations of a group's columns: those whose active version reads or publishes one of its
+/// members, named as the page links them.
+async fn group_calculations(
+    db: &sea_orm::DatabaseConnection,
+    group_id: Uuid,
+) -> AppResult<Vec<GroupCalculation>> {
+    use crate::routes::private::tools::models::script;
+    let names: Vec<String> =
+        crate::routes::private::tools::service::calculations_of_group(db, group_id)
+            .await?
+            .into_iter()
+            .map(|calculation| calculation.name)
+            .collect();
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut rows: Vec<GroupCalculation> = script::Entity::find()
+        .filter(script::Column::Name.is_in(names))
+        .all(db)
+        .await
+        .map_err(AppError::Database)?
+        .into_iter()
+        .map(|row| GroupCalculation {
+            id: row.id,
+            name: row.name,
+            label: row.label,
+        })
+        .collect();
+    rows.sort_by(|a, b| a.label.cmp(&b.label));
+    Ok(rows)
 }

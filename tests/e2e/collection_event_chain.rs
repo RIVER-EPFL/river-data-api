@@ -420,8 +420,8 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO tool_scripts (name, label, engine, parameter_group_id, created_by) \
-             VALUES ('chain_f', 'Chain F', 'formula', '{group_id}', 'test')"
+            "INSERT INTO tool_scripts (name, label, engine, created_by) \
+             VALUES ('chain_f', 'Chain F', 'formula', 'test')"
         ),
     )
     .await;

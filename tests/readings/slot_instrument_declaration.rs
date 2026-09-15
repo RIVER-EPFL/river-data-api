@@ -290,7 +290,10 @@ async fn a_grab_cannot_name_a_bookkeeping_row_or_a_retired_instrument() {
     )
     .await;
 
-    for (instrument, expected) in [(LAB_INSTRUMENT, "entry_channel"), (SLOT_INSTRUMENT, "retired")] {
+    for (instrument, expected) in [
+        (LAB_INSTRUMENT, "entry_channel"),
+        (SLOT_INSTRUMENT, "retired"),
+    ] {
         let (status, body) = crate::common::post_json_with_token(
             &app,
             "/api/grab_samples",

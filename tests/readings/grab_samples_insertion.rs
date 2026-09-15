@@ -742,5 +742,8 @@ async fn a_replace_from_a_stale_read_is_refused() {
     ]);
     let (status, written) =
         crate::common::post_json_with_token(&app, "/api/grab_samples", &fresh, &token).await;
-    assert_eq!(status, 200, "a save that read the whole group writes: {written}");
+    assert_eq!(
+        status, 200,
+        "a save that read the whole group writes: {written}"
+    );
 }

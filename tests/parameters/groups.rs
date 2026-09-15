@@ -313,8 +313,8 @@ async fn the_document_carries_the_calculation_s_sections_without_reordering() {
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO tool_scripts (id, name, label, engine, parameter_group_id, created_by) \
-             VALUES ('{script_id}', 'dom_sections', 'DOM', 'script', '{group_id}', 'test')"
+            "INSERT INTO tool_scripts (id, name, label, engine, created_by) \
+             VALUES ('{script_id}', 'dom_sections', 'DOM', 'script', 'test')"
         ),
     )
     .await;
@@ -555,7 +555,7 @@ async fn an_output_member_cannot_leave_the_calculation_that_produces_it() {
     )
     .await;
     add_member(&app, &token, &dom_id, crate::common::GLOBAL_PARAM_DO_ID, 2).await;
-    seed_group_calculation(&db, &dom_id, "suva").await;
+    seed_group_calculation(&db, "suva").await;
 
     let id = member_id(&db, &dom_id, crate::common::GLOBAL_PARAM_DO_ID).await;
     let (status, text) = move_member(&app, &token, &id, &ions_id).await;
@@ -572,10 +572,11 @@ async fn an_output_member_cannot_leave_the_calculation_that_produces_it() {
     );
 }
 
-/// A calculation bound to `group_id` reading the seeded temperature and producing dissolved
-/// oxygen. `tool_scripts` is authored through Administrator-only routes, so the rows are written
-/// directly, as the formula suite does.
-async fn seed_group_calculation(db: &sea_orm::DatabaseConnection, group_id: &str, name: &str) {
+/// A calculation reading the seeded temperature and producing dissolved oxygen. It names no group:
+/// what makes it a calculation of a group is that a group holds those parameters (Q169).
+/// `tool_scripts` is authored through Administrator-only routes, so the rows are written directly,
+/// as the formula suite does.
+async fn seed_group_calculation(db: &sea_orm::DatabaseConnection, name: &str) {
     let manifest = json!({
         "params": [{ "name": "temp", "kind": "number", "parameter_code": "DO_Temperature" }],
         "outputs": [{ "name": "do", "suggested_parameter_code": "Dissolved_O2" }],
@@ -583,9 +584,9 @@ async fn seed_group_calculation(db: &sea_orm::DatabaseConnection, group_id: &str
     crate::common::exec(
         db,
         &format!(
-            "INSERT INTO tool_scripts (id, name, label, engine, parameter_group_id, created_by) \
+            "INSERT INTO tool_scripts (id, name, label, engine, created_by) \
              VALUES ('00000000-0000-4000-d000-0000000000a1', '{name}', '{name}', 'formula', \
-                     '{group_id}', 'test')"
+                     'test')"
         ),
     )
     .await;
@@ -666,5 +667,66 @@ async fn the_definition_carries_the_portal_calculation_a_member_was_computed_wit
     assert!(
         members[0].get("source_calculation").is_none(),
         "a column nothing computed carries none: {text}"
+    );
+}
+
+/// Scenario: a formula on a calculation bound to a group mints the parameter it publishes.
+///
+/// Expected behaviour: the parameter is minted and joins no group. A group is a filter over the
+/// grid's columns, and a member is put there by a person in the group settings (Q189); a
+/// membership nobody made also spends the one group a parameter is allowed.
+#[tokio::test]
+#[serial]
+async fn a_minted_output_joins_no_group() {
+    let (db, app, token) = setup().await;
+    create_group(&app, &token, "dom_mint").await;
+    let script_id = "00000000-0000-4000-c000-0000000002b1";
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO tool_scripts (id, name, label, engine, created_by) \
+             VALUES ('{script_id}', 'dom_mint', 'DOM', 'formula', 'test')"
+        ),
+    )
+    .await;
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": "dom_mint_out",
+            "name": "DOM mint out",
+            "units": "ratio",
+            "formula": "Dissolved_O2 / DO_Temperature",
+            "tool_script_id": script_id,
+            "ordinal": 1,
+        }),
+        &token,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "add formula ({status}): {text}"
+    );
+    let created: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let output = created["output_parameter_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the formula publishes a parameter: {created}"));
+
+    let members = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT count(*) AS n FROM parameter_group_members WHERE parameter_id = '{output}'"
+            ),
+        ))
+        .await
+        .expect("the membership reads")
+        .expect("a count")
+        .try_get::<i64>("", "n")
+        .expect("n");
+    assert_eq!(
+        members, 0,
+        "the minted output is in no group until somebody puts it in one"
     );
 }

@@ -661,12 +661,10 @@ fn uncarried(tables: Vec<String>) -> Vec<String> {
 /// catalogue is authored on the rebuilt database, so a report naming only what it carried says
 /// nothing about the tables somebody still has to account for.
 async fn not_carried<S: ConnectionTrait>(source: &S) -> Result<Vec<(String, usize)>, DbErr> {
-    let tables = Named::find_by_statement(sql(
-        "SELECT c.relname AS name
+    let tables = Named::find_by_statement(sql("SELECT c.relname AS name
            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
           WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
-          ORDER BY c.relname",
-    ))
+          ORDER BY c.relname"))
     .all(source)
     .await?
     .into_iter()

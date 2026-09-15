@@ -7,4 +7,5 @@
 mod common;
 
 mod change_audit;
+mod given_up_output;
 mod groups;

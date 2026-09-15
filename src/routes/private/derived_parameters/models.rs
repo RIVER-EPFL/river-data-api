@@ -67,6 +67,13 @@ pub mod definition {
         pub intermediate: bool,
         #[crudcrate(exclude(create, update), sortable)]
         pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+        /// Why this formula's code can no longer be changed, when it cannot. The catalog code is
+        /// the CSV column header and the public API's identifier, so once readings are stored under
+        /// the output parameter or a project publishes it, a rename is refused (Q183). NULL means
+        /// the code is still free.
+        #[sea_orm(ignore)]
+        #[crudcrate(non_db_attr = true, exclude(create, update), default = None)]
+        pub code_locked: Option<String>,
         #[sea_orm(ignore)]
         #[crudcrate(
             non_db_attr = true,

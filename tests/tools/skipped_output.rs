@@ -155,9 +155,10 @@ async fn setup(readings: &[(&str, f64)]) -> (DatabaseConnection, river_db::commo
 async fn a_step_whose_input_the_visit_lacks_is_reported_as_a_skipped_output() {
     let (db, state, event_id) = setup(&[]).await;
 
-    let outcome = river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
-        .await
-        .expect("a step that cannot run is not a failed recompute");
+    let outcome =
+        river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
+            .await
+            .expect("a step that cannot run is not a failed recompute");
     assert_eq!(outcome.tools_run, 0, "the runner was never reached");
     assert_eq!(outcome.findings_raised, 1, "one slot went unfilled");
     assert_eq!(
@@ -191,9 +192,10 @@ async fn a_step_whose_input_the_visit_lacks_is_reported_as_a_skipped_output() {
 async fn a_skipped_step_raises_nothing_for_an_output_that_already_has_a_value() {
     let (db, state, event_id) = setup(&[(GLOBAL_PARAM_DO_ID, 7.0)]).await;
 
-    let outcome = river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
-        .await
-        .expect("the recompute runs");
+    let outcome =
+        river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
+            .await
+            .expect("the recompute runs");
     assert_eq!(outcome.skipped.len(), 1, "the step still did not run");
     assert_eq!(outcome.findings_raised, 0);
     assert!(holds_on_output(&db).await.is_empty());

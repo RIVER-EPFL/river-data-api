@@ -674,10 +674,7 @@ fn table() -> Table {
     // Both audit routes refuse a scoped caller that names no site, which is the body's business and
     // not the gate's: an audit over every project is outside a scoped token's access whatever the
     // router allows. The probe names a site in the seed project, so the row tests the gate.
-    for declared in [
-        "/api/actions/event_audit",
-        "/api/actions/event_recompute",
-    ] {
+    for declared in ["/api/actions/event_audit", "/api/actions/event_recompute"] {
         t.add(
             "POST",
             declared,

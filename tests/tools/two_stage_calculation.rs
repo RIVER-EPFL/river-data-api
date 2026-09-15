@@ -19,7 +19,7 @@ const AT: &str = "2025-07-02T09:00:00Z";
 /// The group, its members and the calculation bound to it, written directly: `tool_scripts` is
 /// authored through Administrator-only routes and what this suite is about is what happens once a
 /// two-stage calculation exists.
-async fn seed_two_stage(db: &sea_orm::DatabaseConnection) -> (String, String, String) {
+async fn seed_two_stage(db: &sea_orm::DatabaseConnection) -> String {
     for sql in [
         format!("UPDATE tool_scripts SET active_version_id = NULL WHERE name = '{CALCULATION}'"),
         format!("DELETE FROM tool_scripts WHERE name = '{CALCULATION}'"),
@@ -35,36 +35,60 @@ async fn seed_two_stage(db: &sea_orm::DatabaseConnection) -> (String, String, St
     )
     .await;
 
-    let mut ids = Vec::new();
-    for (code, ordinal) in [("Peak", 1), ("S1", 2), ("S2", 3)] {
-        let id = uuid::Uuid::new_v4().to_string();
-        crate::common::exec(
-            db,
-            &format!(
-                "INSERT INTO parameters (id, code, name, default_units, category) \
-                 VALUES ('{id}', '{code}', '{code}', 'ppb', 'measurement')"
-            ),
-        )
-        .await;
-        crate::common::exec(
-            db,
-            &format!(
-                "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
-                 VALUES (gen_random_uuid(), '{GROUP_ID}', '{id}', {ordinal})"
-            ),
-        )
-        .await;
-        ids.push(id);
-    }
+    // Only the entry the family is measured into is declared here. S1 and S2 are minted by the
+    // formulas that publish them (Q191), and placed in the group afterwards (Q189).
+    let peak_id = uuid::Uuid::new_v4().to_string();
     crate::common::exec(
         db,
         &format!(
-            "INSERT INTO tool_scripts (name, label, engine, parameter_group_id, created_by) \
-             VALUES ('{CALCULATION}', 'Two stage', 'formula', '{GROUP_ID}', 'test')"
+            "INSERT INTO parameters (id, code, name, default_units, category) \
+             VALUES ('{peak_id}', 'Peak', 'Peak', 'ppb', 'measurement')"
         ),
     )
     .await;
-    (ids[0].clone(), ids[1].clone(), ids[2].clone())
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
+             VALUES (gen_random_uuid(), '{GROUP_ID}', '{peak_id}', 1)"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO tool_scripts (name, label, engine, created_by) \
+             VALUES ('{CALCULATION}', 'Two stage', 'formula', 'test')"
+        ),
+    )
+    .await;
+    peak_id
+}
+
+/// The parameter a saved formula minted, put in the group and given a slot at site 1, which is
+/// what a person does on the group page once the calculation publishes it.
+async fn place_output(db: &sea_orm::DatabaseConnection, code: &str, ordinal: i32) -> String {
+    let id = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT id FROM parameters WHERE lower(code) = lower('{code}')"),
+        ))
+        .await
+        .expect("query")
+        .expect("the formula minted its output")
+        .try_get::<uuid::Uuid>("", "id")
+        .expect("id")
+        .to_string();
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
+             VALUES (gen_random_uuid(), '{GROUP_ID}', '{id}', {ordinal})"
+        ),
+    )
+    .await;
+    configure_slot(db, &id, code).await;
+    id
 }
 
 async fn calculation_id(db: &sea_orm::DatabaseConnection) -> String {
@@ -109,11 +133,9 @@ async fn add_formula(
 async fn a_stage_one_family_is_stored_per_index_and_stage_two_reads_its_mean() {
     let f = crate::common::seeded_app().await;
     let (db, app, token) = (f.db, f.app, f.token);
-    let (peak_id, s1_id, s2_id) = seed_two_stage(&db).await;
+    let peak_id = seed_two_stage(&db).await;
     let script_id = calculation_id(&db).await;
-    for (id, name) in [(&peak_id, "Peak"), (&s1_id, "S1"), (&s2_id, "S2")] {
-        configure_slot(&db, id, name).await;
-    }
+    configure_slot(&db, &peak_id, "Peak").await;
 
     let (status, text) = add_formula(
         &app,
@@ -134,6 +156,8 @@ async fn a_stage_one_family_is_stored_per_index_and_stage_two_reads_its_mean() {
     )
     .await;
     assert!((200..300).contains(&status), "stage two ({status}): {text}");
+    let s1_id = place_output(&db, "S1", 2).await;
+    let _s2_id = place_output(&db, "S2", 3).await;
 
     // Stage one, over a three-member family.
     let (status, text) = crate::common::post_json_with_token(
@@ -250,11 +274,9 @@ async fn a_stage_one_family_is_stored_per_index_and_stage_two_reads_its_mean() {
 async fn a_gap_in_the_family_stays_a_gap() {
     let f = crate::common::seeded_app().await;
     let (db, app, token) = (f.db, f.app, f.token);
-    let (peak_id, s1_id, s2_id) = seed_two_stage(&db).await;
+    let peak_id = seed_two_stage(&db).await;
     let script_id = calculation_id(&db).await;
-    for (id, name) in [(&peak_id, "Peak"), (&s1_id, "S1"), (&s2_id, "S2")] {
-        configure_slot(&db, id, name).await;
-    }
+    configure_slot(&db, &peak_id, "Peak").await;
     let (status, text) = add_formula(
         &app,
         &token,
@@ -266,6 +288,7 @@ async fn a_gap_in_the_family_stays_a_gap() {
     )
     .await;
     assert!((200..300).contains(&status), "stage one ({status}): {text}");
+    let s1_id = place_output(&db, "S1", 2).await;
 
     let (status, text) = crate::common::post_json_with_token(
         &app,

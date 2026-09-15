@@ -958,7 +958,11 @@ async fn revert_keeps_the_rows_the_apply_created() {
         "completed"
     );
 
-    assert_eq!(count(&db, "sites").await, sites_before + 1, "apply creates the site");
+    assert_eq!(
+        count(&db, "sites").await,
+        sites_before + 1,
+        "apply creates the site"
+    );
     assert_eq!(
         count(&db, "parameters").await,
         parameters_before + 1,
@@ -1022,7 +1026,10 @@ async fn revert_keeps_the_rows_the_apply_created() {
     let (status, text) =
         crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
             .await;
-    assert_eq!(status, 409, "re-applying a reverted plan is refused: {text}");
+    assert_eq!(
+        status, 409,
+        "re-applying a reverted plan is refused: {text}"
+    );
 
     crate::common::cleanup_test_db(&db).await;
 }

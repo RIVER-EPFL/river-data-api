@@ -31,7 +31,6 @@ fn tool(name: &str, writes: &[&str], reads: &[&str]) -> ActiveTool {
         manifest: crate::routes::private::tools::models::parse_manifest(&manifest)
             .expect("the manifest parses"),
         engine: Engine::Script,
-        parameter_group_id: None,
         formulas: Vec::new(),
     }
 }

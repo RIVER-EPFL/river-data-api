@@ -30,7 +30,12 @@ async fn put_json_with_token(
         .expect("a request");
     let response = app.clone().oneshot(req).await.expect("a response");
     let status = response.status().as_u16();
-    let bytes = response.into_body().collect().await.expect("a body").to_bytes();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("a body")
+        .to_bytes();
     (status, String::from_utf8_lossy(&bytes).to_string())
 }
 
