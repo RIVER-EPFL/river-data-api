@@ -379,6 +379,41 @@ pub(super) fn disagrees(stored: f64, recomputed: f64) -> bool {
     (stored - recomputed).abs() / scale > STALE_REL_TOL
 }
 
+/// The readings one output of a run stores. A per-replicate output is an array, one entry per
+/// index of the variable it evaluated over, and each entry is a reading at that index; a gap
+/// stays a gap rather than closing up the indexes after it.
+pub(super) fn readings_for_output(
+    key: &str,
+    parameter_id: Uuid,
+    value: &serde_json::Value,
+    time: chrono::DateTime<chrono::Utc>,
+) -> Vec<GrabSampleReading> {
+    let reading = |value: f64, replicate_index: Option<i16>| GrabSampleReading {
+        input: None,
+        parameter_id,
+        sensor_id: None,
+        value,
+        time,
+        replicate_index,
+        output: Some(key.to_string()),
+        standard_curve_id: None,
+    };
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                Some(reading(item.as_f64()?, Some(i16::try_from(index).ok()?)))
+            })
+            .collect(),
+        other => other
+            .as_f64()
+            .map(|v| reading(v, None))
+            .into_iter()
+            .collect(),
+    }
+}
+
 /// Run every active tool whose inputs resolve at this event, in dependency order, saving the
 /// outputs through the grab write path. Each executed tool mints a real `tool_runs` row
 /// (`source = 'chain'`), so the recomputed values carry the same verified provenance a hand save
@@ -469,9 +504,9 @@ pub async fn recompute_event(
             },
         };
 
-        // Scalar outputs the run produced, saved to their resolved parameters. A per-replicate
-        // (array) output stays unsaved here: replicate identity is the source's column position,
-        // which a recompute has no authority to assign (Phase 5 carries intermediaries).
+        // The outputs the run produced, saved to their resolved parameters. A per-replicate
+        // (array) output is saved one reading per index, inheriting the position of the variable
+        // it evaluated over.
         // A slot an admin detached at this visit is a manual value until an input moves or it
         // is returned (Q40, Q47): the chain leaves it alone and says so.
         let mut owned_outputs: Vec<(String, Uuid)> = Vec::with_capacity(saved_outputs.len());
@@ -535,21 +570,9 @@ pub async fn recompute_event(
 
         let readings: Vec<GrabSampleReading> = owned_outputs
             .iter()
-            .filter_map(|(key, parameter_id)| {
-                result
-                    .results
-                    .get(key)
-                    .and_then(serde_json::Value::as_f64)
-                    .map(|value| GrabSampleReading {
-                        input: None,
-                        parameter_id: *parameter_id,
-                        sensor_id: None,
-                        value,
-                        time: event.collected_at,
-                        replicate_index: None,
-                        output: Some(key.clone()),
-                        standard_curve_id: None,
-                    })
+            .flat_map(|(key, parameter_id)| match result.results.get(key) {
+                Some(value) => readings_for_output(key, *parameter_id, value, event.collected_at),
+                None => Vec::new(),
             })
             .collect();
         if readings.is_empty() {
@@ -1386,3 +1409,7 @@ mod chain_scope_tests;
 #[cfg(test)]
 #[path = "tests/chain_skip_reason_tests.rs"]
 mod chain_skip_reason_tests;
+
+#[cfg(test)]
+#[path = "tests/chain_output_readings_tests.rs"]
+mod chain_output_readings_tests;
