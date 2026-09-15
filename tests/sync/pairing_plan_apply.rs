@@ -751,3 +751,138 @@ async fn the_source_register_becomes_instruments_only_when_a_plan_admits_it() {
         "the declined row stays a proposal for the next plan"
     );
 }
+
+/// Scenario: the source's register offers a probe whose serial an instrument in the inventory
+/// already carries, which is the shape a plan minting a device by serial leaves behind.
+///
+/// Expected behaviour: the row is not proposed admitted, it names the instrument it would
+/// duplicate, and attaching merges the register's serial, model and metadata onto that instrument
+/// rather than leaving two rows for one probe (Q76).
+#[tokio::test]
+#[serial]
+async fn a_register_row_colliding_with_an_instrument_attaches_instead_of_duplicating() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let stream_id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, metadata, is_active) \
+             VALUES ('{stream_id}', 'regsrc', 'FP1:Depth', 'FP1 - Depth', \
+                     '{{\"hierarchy\": {{\"project\": \"Test Project\", \"site\": \"Site 1\", \"parameter\": \"Depth\"}}, \"units\": \"mm\"}}'::jsonb, true)"
+        ),
+    )
+    .await;
+
+    // The probe the plan's device path already minted, under its own key and serial.
+    let existing = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, name, is_active, is_lab_instrument, serial_number, \
+                                  data_frequency, source_system, source_key) \
+             VALUES ('{existing}', 'FP1 turbidity', true, false, '919402', 'high', 'regsrc', 'device:919402')"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/sensors/proposals",
+        &serde_json::json!({
+            "source_system": "regsrc",
+            "instruments": [
+                { "source_key": "sensor_inventory:62", "name": "Turbidity probe FP1",
+                  "serial_number": "919402", "model": "OBS-3+", "is_lab_instrument": false,
+                  "metadata": { "station": "FP1", "installed_on": "2019-06-01" } }
+            ]
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "the register is offered: {body}");
+
+    let (status, plan) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/pairing-plans",
+        &serde_json::json!({ "source_system": "regsrc" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "create plan: {plan}");
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+    let offered = &plan["instrument_proposals"][0];
+    assert_eq!(
+        offered["admit"],
+        serde_json::json!(false),
+        "a row that would duplicate an instrument is not taken by default: {plan}"
+    );
+    assert_eq!(
+        offered["conflict"]["id"],
+        serde_json::json!(existing.to_string()),
+        "the row names the instrument it would duplicate: {plan}"
+    );
+
+    let (status, body) = crate::common::patch_plan_with_token(
+        &app,
+        &plan_id,
+        &serde_json::json!({
+            "instruments": [{ "source_key": "sensor_inventory:62", "admit": false,
+                              "attach_to": existing.to_string() }],
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "attach ({status}): {body}");
+
+    crate::common::plans::acknowledge_plan(&app, &token, &plan_id).await;
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id, "apply", &token).await;
+    assert!((200..300).contains(&status), "apply ({status}): {text}");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await,
+        "completed"
+    );
+
+    assert_eq!(
+        count(&db, "sensors WHERE serial_number = '919402'").await,
+        1,
+        "one probe, one row"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "sensors WHERE source_system = 'regsrc' AND source_key LIKE 'sensor_inventory:%'"
+        )
+        .await,
+        0,
+        "attaching mints nothing under the register's own key"
+    );
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT model, metadata FROM sensors WHERE id = '{existing}'"),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.try_get::<Option<String>>("", "model")
+            .unwrap()
+            .as_deref(),
+        Some("OBS-3+"),
+        "the register's model is merged onto the instrument"
+    );
+    let metadata: serde_json::Value = row.try_get("", "metadata").unwrap();
+    assert_eq!(metadata["station"], serde_json::json!("FP1"));
+
+    assert_eq!(
+        count(&db, "instrument_proposals WHERE source_system = 'regsrc'").await,
+        0,
+        "the attached row leaves the queue"
+    );
+}

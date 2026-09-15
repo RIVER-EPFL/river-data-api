@@ -2420,6 +2420,11 @@ pub async fn update_pairing_plan(
         }
     }
 
+    crate::routes::private::sync::service::apply_group_updates(
+        &mut entries,
+        &req.updates,
+        &catalog,
+    );
     apply_site_attribute_updates(&mut entries, &req.updates);
     apply_instrument_updates(&state, &plan.source_system, &mut entries, &req.updates).await?;
 
@@ -2440,6 +2445,7 @@ pub async fn update_pairing_plan(
             .find(|p| p.source_key == update.source_key)
         {
             proposal.admit = update.admit;
+            proposal.attach_to = update.attach_to;
         }
     }
 

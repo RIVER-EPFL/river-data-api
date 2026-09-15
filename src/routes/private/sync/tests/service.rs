@@ -1,8 +1,10 @@
 use super::{
-    BulkWhere, InstrumentCatalog, PlanCalculationRef, PlanEntry, apply_bulk_action,
-    family_parameter_suggestion, plan_calculation, resolve_parameter_instrument, select_entries,
+    BulkWhere, EntityCatalog, InstrumentCatalog, InstrumentNameConflict, PlanCalculationRef,
+    PlanEntry, PlanGroupRef, apply_bulk_action, apply_group_updates, family_parameter_suggestion,
+    group_code, plan_calculation, proposal_conflict, resolve_parameter_instrument, select_entries,
     stream_instrument_key,
 };
+use crate::routes::private::sync::models::PlanEntryUpdate;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -18,6 +20,7 @@ fn catalog(entries: &[(&str, Uuid)]) -> InstrumentCatalog {
             .map(|(key, id)| ((*key).to_string(), *id))
             .collect(),
         by_name: HashMap::new(),
+        by_serial: HashMap::new(),
         curves: HashMap::new(),
         defaulted: std::collections::HashSet::new(),
     }
@@ -378,4 +381,153 @@ fn test_plan_calculation_refuses_a_declaration_missing_either_half() {
     for metadata in cases {
         assert_eq!(plan_calculation(&metadata), None, "{metadata}");
     }
+}
+
+/// Scenario: the source's register offers a probe the inventory already holds, under the same
+/// name in one case and under the same serial in another.
+/// Expected behaviour: the row names the instrument it would duplicate, so the review can attach
+/// instead of leaving two rows for one probe (Q76). A name match is answered first: it is what a
+/// person reads in the inventory.
+#[test]
+fn test_a_register_row_names_the_instrument_it_would_duplicate() {
+    let named = Uuid::new_v4();
+    let serialled = Uuid::new_v4();
+    let mut c = catalog(&[]);
+    c.by_name.insert(
+        "doc".to_string(),
+        InstrumentNameConflict {
+            id: named,
+            name: "DOC".to_string(),
+            source_system: Some("cnet".to_string()),
+            has_readings: true,
+        },
+    );
+    c.by_serial.insert(
+        "SN-42".to_string(),
+        InstrumentNameConflict {
+            id: serialled,
+            name: "Probe 42".to_string(),
+            source_system: None,
+            has_readings: false,
+        },
+    );
+
+    assert_eq!(
+        proposal_conflict("doc", None, &c).map(|h| h.id),
+        Some(named),
+        "the name is matched case-insensitively"
+    );
+    assert_eq!(
+        proposal_conflict("Anything", Some(" SN-42 "), &c).map(|h| h.id),
+        Some(serialled),
+        "a serial another instrument carries is the same probe"
+    );
+    assert_eq!(
+        proposal_conflict("doc", Some("SN-42"), &c).map(|h| h.id),
+        Some(named),
+        "the name answers first"
+    );
+    assert!(proposal_conflict("Fresh", Some("SN-99"), &c).is_none());
+    assert!(
+        proposal_conflict("Fresh", Some("   "), &c).is_none(),
+        "a blank serial matches nothing"
+    );
+}
+
+/// A plan entry placed in a category the source declares.
+fn grouped_entry(parameter: &str, group_label: &str) -> PlanEntry {
+    let mut entry = plan_entry("Site 1", parameter, "high", 0);
+    entry.parameter.group = Some(PlanGroupRef {
+        id: None,
+        code: group_code(group_label),
+        label: group_label.to_string(),
+        ordinal: 0,
+        description: None,
+        create: true,
+    });
+    entry
+}
+
+fn update_group(
+    stream_id: Uuid,
+    label: Option<&str>,
+    description: Option<&str>,
+) -> PlanEntryUpdate {
+    serde_json::from_value(serde_json::json!({
+        "stream_id": stream_id,
+        "group_label": label,
+        "group_description": description,
+    }))
+    .expect("a plan entry update")
+}
+
+/// Scenario: the lab wants the portal's "Field data" category to read "Field measurements" before
+/// the plan is applied, and edits it on one of the columns it holds.
+///
+/// Expected behaviour: every column of that category is renamed, and the code follows the label so
+/// the apply creates one group under the new name.
+#[test]
+fn test_renaming_a_proposed_group_renames_every_column_of_its_category() {
+    let mut entries = vec![
+        grouped_entry("WTW_pH_1", "Field data"),
+        grouped_entry("Field_BP", "Field data"),
+        grouped_entry("DOC_ppb", "DOM"),
+    ];
+    let update = update_group(entries[1].stream_id, Some("Field measurements"), None);
+    apply_group_updates(&mut entries, &[update], &EntityCatalog::default());
+
+    let groups: Vec<(String, String)> = entries
+        .iter()
+        .map(|e| {
+            let g = e.parameter.group.as_ref().expect("a group");
+            (g.label.clone(), g.code.clone())
+        })
+        .collect();
+    assert_eq!(
+        groups,
+        vec![
+            (
+                "Field measurements".to_string(),
+                "field_measurements".to_string()
+            ),
+            (
+                "Field measurements".to_string(),
+                "field_measurements".to_string()
+            ),
+            ("DOM".to_string(), "dom".to_string()),
+        ]
+    );
+}
+
+/// Renaming onto the label of a group the database already holds joins that group instead of
+/// proposing a second one under a name it already carries.
+#[test]
+fn test_renaming_a_proposed_group_onto_an_existing_one_joins_it() {
+    let existing = Uuid::new_v4();
+    let catalog = EntityCatalog {
+        groups: vec![(existing, "dom".to_string())],
+        ..EntityCatalog::default()
+    };
+    let mut entries = vec![grouped_entry("DOC_ppb", "Dissolved organics")];
+    let update = update_group(entries[0].stream_id, Some("DOM"), None);
+    apply_group_updates(&mut entries, &[update], &catalog);
+
+    let group = entries[0].parameter.group.as_ref().expect("a group");
+    assert_eq!(group.id, Some(existing));
+    assert!(!group.create, "it joins the group that exists");
+}
+
+/// An empty description clears the source's own, which is how the review takes a description back
+/// rather than being unable to.
+#[test]
+fn test_a_blank_group_description_clears_it() {
+    let mut entries = vec![grouped_entry("WTW_pH_1", "Field data")];
+    entries[0].parameter.group.as_mut().unwrap().description = Some("from the portal".to_string());
+    let update = update_group(entries[0].stream_id, None, Some("   "));
+    apply_group_updates(&mut entries, &[update], &EntityCatalog::default());
+
+    assert_eq!(
+        entries[0].parameter.group.as_ref().unwrap().description,
+        None
+    );
 }

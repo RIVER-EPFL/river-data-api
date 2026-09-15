@@ -767,6 +767,10 @@ pub struct UpdatePairingPlanRequest {
 pub struct PlanProposalUpdate {
     pub source_key: String,
     pub admit: bool,
+    /// The instrument to merge this register row onto instead of creating one. Sent in place of
+    /// `admit` where the review answered a conflict by attaching.
+    #[serde(default)]
+    pub attach_to: Option<uuid::Uuid>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -846,6 +850,16 @@ pub struct PlanEntryUpdate {
     /// from `action`, so changing what an entry does is not the same as deciding it.
     #[serde(default)]
     pub acknowledged: Option<bool>,
+    /// Rename the parameter group the source's registry proposes for this column. The code is
+    /// re-slugged from the new label, so a rename onto an existing group's label joins that group
+    /// instead of creating one. Applied to every entry the same category placed, since a category
+    /// is one decision behind every column it holds.
+    #[serde(default)]
+    pub group_label: Option<String>,
+    /// Describe the proposed group. Applied to the same set as `group_label`; an empty string
+    /// clears the source's own description.
+    #[serde(default)]
+    pub group_description: Option<String>,
 }
 
 #[derive(Deserialize)]

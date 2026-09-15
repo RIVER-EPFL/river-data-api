@@ -41,7 +41,7 @@ pub async fn group_definition(
             "SELECT m.parameter_id, p.code, COALESCE(m.label, p.name) AS label, \
                     COALESCE(m.units, NULLIF(p.default_units, '')) AS units, \
                     COALESCE(m.description, p.description) AS description, \
-                    m.ordinal, m.replicates \
+                    m.ordinal, m.replicates, m.source_calculation \
                FROM parameter_group_members m \
                JOIN parameters p ON p.id = m.parameter_id \
               WHERE m.group_id = $1",
@@ -98,6 +98,7 @@ pub async fn group_definition(
             section,
             replicates: member.replicates,
             statistics,
+            source_calculation: member.source_calculation,
         });
     }
 

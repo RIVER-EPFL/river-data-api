@@ -5517,6 +5517,14 @@
             "description": "Display hint: the manifest section the group's calculation renders this field under. It\nlabels a run of columns and never reorders them.",
             "type": "string"
           },
+          "source_calculation": {
+            "additionalProperties": {},
+            "description": "What the source computed this column with: `{ function, inputs }`, the portal's own\ncalculation name and the columns it reads. It is the reference an author writes the formula\nagainst (Q149). Absent where nothing computed the column.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "statistics": {
             "$ref": "#/components/schemas/MemberStatistics",
             "description": "The mean and sd columns a replicated member also shows. Absent on a member entered once."
@@ -13971,6 +13979,20 @@
               "null"
             ]
           },
+          "group_description": {
+            "description": "Describe the proposed group. Applied to the same set as `group_label`; an empty string\nclears the source's own description.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "group_label": {
+            "description": "Rename the parameter group the source's registry proposes for this column. The code is\nre-slugged from the new label, so a rename onto an existing group's label joins that group\ninstead of creating one. Applied to every entry the same category placed, since a category\nis one decision behind every column it holds.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "instrument_clear": {
             "description": "Detach the instrument from every entry this one groups with. Attaching is `instrument_id`;\nthis is its inverse, since an absent `instrument_id` means \"unchanged\", not \"none\".",
             "type": [
@@ -14218,8 +14240,27 @@
         "description": "Create the lab instruments a plan's confirmed entries ask for, one per `source_key` however\nmany streams share it, and return them by that key. Find-or-create, so re-running an apply\nafter a partial failure resolves the same rows.\nOne row of a source's own instrument register, as the plan puts it to the operator.\n\nThe register is the only record of which probe carried which serial and when it was installed,\nand it goes with the portal, so it travels ahead of the plan and waits (M185). Admitting one is\nthe plan's act, like creating a site: nothing exists until the apply runs.",
         "properties": {
           "admit": {
-            "description": "Whether the apply creates it. Proposed admitted: the register is the lab's own record, so\nthe question is which rows to leave behind rather than which to take.",
+            "description": "Whether the apply creates it. Proposed admitted: the register is the lab's own record, so\nthe question is which rows to leave behind rather than which to take. A row that collides\nwith an instrument already in the inventory is proposed unadmitted instead, because taking\nit would leave two rows for one probe (Q76).",
             "type": "boolean"
+          },
+          "attach_to": {
+            "description": "The instrument the review chose to merge this register row onto instead of creating one.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "conflict": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/InstrumentNameConflict",
+                "description": "The instrument this row would duplicate, by name or by serial. The review answers it the\nway the parameter path answers a `name_conflict`: admit as a second instrument, or attach."
+              }
+            ]
           },
           "is_lab_instrument": {
             "type": "boolean"
@@ -14268,7 +14309,9 @@
           "notes",
           "is_lab_instrument",
           "metadata",
-          "admit"
+          "admit",
+          "conflict",
+          "attach_to"
         ],
         "type": "object"
       },
@@ -14504,6 +14547,14 @@
         "properties": {
           "admit": {
             "type": "boolean"
+          },
+          "attach_to": {
+            "description": "The instrument to merge this register row onto instead of creating one. Sent in place of\n`admit` where the review answered a conflict by attaching.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "source_key": {
             "type": "string"

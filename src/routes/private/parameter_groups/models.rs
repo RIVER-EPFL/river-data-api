@@ -206,6 +206,7 @@ pub struct MemberRow {
     pub description: Option<String>,
     pub ordinal: i32,
     pub replicates: Option<serde_json::Value>,
+    pub source_calculation: Option<serde_json::Value>,
 }
 
 /// What one slot declares for a member: the divisor and the places, both nullable.
@@ -244,6 +245,12 @@ pub struct DefinitionMember {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub statistics: Option<MemberStatistics>,
+    /// What the source computed this column with: `{ function, inputs }`, the portal's own
+    /// calculation name and the columns it reads. It is the reference an author writes the formula
+    /// against (Q149). Absent where nothing computed the column.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false, value_type = Option<std::collections::HashMap<String, serde_json::Value>>)]
+    pub source_calculation: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]

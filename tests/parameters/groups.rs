@@ -608,3 +608,63 @@ async fn seed_group_calculation(db: &sea_orm::DatabaseConnection, group_id: &str
     )
     .await;
 }
+
+/// Scenario: the plan recorded what the portal computed a column with, and the lab is about to
+/// author that calculation by hand (Q149).
+///
+/// Expected behaviour: the definition the calculation page reads carries the portal function and
+/// the columns it reads, so the author has the reference in front of them.
+#[tokio::test]
+#[serial]
+async fn the_definition_carries_the_portal_calculation_a_member_was_computed_with() {
+    let (db, app, token) = setup().await;
+    let group = create_group(&app, &token, "pco2").await;
+    let group_id = group["id"].as_str().unwrap().to_string();
+    add_member(
+        &app,
+        &token,
+        &group_id,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        0,
+    )
+    .await;
+    let (_, text) = add_member(
+        &app,
+        &token,
+        &group_id,
+        crate::common::GLOBAL_PARAM_DO_ID,
+        1,
+    )
+    .await;
+    let computed = serde_json::from_str::<serde_json::Value>(&text).expect("member body is JSON");
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE parameter_group_members \
+                SET source_calculation = '{{\"function\": \"calcPCO2\", \
+                                            \"inputs\": [\"WTW_pH_1\", \"Field_BP\"]}}'::jsonb \
+              WHERE id = '{}'",
+            computed["id"].as_str().unwrap()
+        ),
+    )
+    .await;
+
+    let (status, text) = crate::common::get_with_token(
+        &app,
+        &format!("/api/parameter_groups/{group_id}/definition"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "definition ({status}): {text}");
+    let doc: serde_json::Value = serde_json::from_str(&text).expect("definition is JSON");
+    let members = doc["members"].as_array().expect("members array");
+    assert_eq!(
+        members[1]["source_calculation"],
+        json!({ "function": "calcPCO2", "inputs": ["WTW_pH_1", "Field_BP"] }),
+        "the recorded portal calculation reaches the page: {text}"
+    );
+    assert!(
+        members[0].get("source_calculation").is_none(),
+        "a column nothing computed carries none: {text}"
+    );
+}

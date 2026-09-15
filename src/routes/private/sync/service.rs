@@ -2501,6 +2501,9 @@ pub struct InstrumentCatalog {
     /// collision is about what a person reads, so it does not stop at the source boundary: the
     /// lab's `DOC` may have arrived by hand or from another import.
     by_name: HashMap<String, InstrumentNameConflict>,
+    /// Every instrument by serial number, on the same reasoning as `by_name`: a register row
+    /// naming a serial another instrument already carries describes the same probe.
+    by_serial: HashMap<String, InstrumentNameConflict>,
     curves: HashMap<Uuid, Vec<PlanCurveRef>>,
     /// Instruments registration minted for a stream that named none, rather than ones a source or
     /// an operator attributed. They carry `metadata.minted_from_stream`
@@ -2516,6 +2519,30 @@ impl InstrumentCatalog {
     pub fn named(&self, name: &str) -> Option<InstrumentNameConflict> {
         self.by_name.get(&name.trim().to_lowercase()).cloned()
     }
+
+    /// The instrument already carrying this serial number, if any.
+    #[must_use]
+    pub fn holding_serial(&self, serial: &str) -> Option<InstrumentNameConflict> {
+        self.by_serial.get(serial.trim()).cloned()
+    }
+}
+
+/// The instrument an admitted register row would duplicate: the one already carrying its name,
+/// else the one already carrying its serial. Q76's attach-or-create choice is about what a person
+/// reads in the inventory, and two rows for one probe read the same whichever field matched.
+#[must_use]
+pub fn proposal_conflict(
+    name: &str,
+    serial: Option<&str>,
+    catalog: &InstrumentCatalog,
+) -> Option<InstrumentNameConflict> {
+    if let Some(hit) = catalog.named(name) {
+        return Some(hit);
+    }
+    serial
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| catalog.holding_serial(s))
 }
 
 /// A curve column's stem, normalised for comparison against an instrument label:
@@ -2587,6 +2614,25 @@ pub async fn load_instrument_catalog(
                 has_readings: with_readings.contains(&row.id),
             });
     }
+    let mut by_serial: HashMap<String, InstrumentNameConflict> = HashMap::new();
+    for row in &named_rows {
+        let Some(serial) = row
+            .serial_number
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        by_serial
+            .entry(serial.to_string())
+            .or_insert_with(|| InstrumentNameConflict {
+                id: row.id,
+                name: row.name.clone().unwrap_or_else(|| serial.to_string()),
+                source_system: row.source_system.clone(),
+                has_readings: with_readings.contains(&row.id),
+            });
+    }
 
     let mut by_id = HashMap::new();
     let mut labels = Vec::new();
@@ -2639,6 +2685,7 @@ pub async fn load_instrument_catalog(
         labels,
         by_source_key,
         by_name,
+        by_serial,
         curves,
         defaulted,
     })
@@ -3341,7 +3388,7 @@ pub async fn create_plan(
     let summary = compute_summary(&entries);
     // The register rows this source has offered and no plan has taken yet. Snapshotted onto the
     // plan so the review's decisions are the plan's, like every other proposal it carries.
-    let proposals = pending_instrument_proposals(db, source_system).await?;
+    let proposals = pending_instrument_proposals(db, source_system, &instruments).await?;
 
     let plan = pairing_plans::ActiveModel {
         id: Set(Uuid::new_v4()),
@@ -4136,8 +4183,17 @@ pub struct PlanInstrumentProposal {
     #[schema(required)]
     pub metadata: Option<serde_json::Value>,
     /// Whether the apply creates it. Proposed admitted: the register is the lab's own record, so
-    /// the question is which rows to leave behind rather than which to take.
+    /// the question is which rows to leave behind rather than which to take. A row that collides
+    /// with an instrument already in the inventory is proposed unadmitted instead, because taking
+    /// it would leave two rows for one probe (Q76).
     pub admit: bool,
+    /// The instrument this row would duplicate, by name or by serial. The review answers it the
+    /// way the parameter path answers a `name_conflict`: admit as a second instrument, or attach.
+    #[schema(required)]
+    pub conflict: Option<InstrumentNameConflict>,
+    /// The instrument the review chose to merge this register row onto instead of creating one.
+    #[schema(required)]
+    pub attach_to: Option<Uuid>,
 }
 
 /// The register rows waiting for this source, as the plan carries them.
@@ -4158,6 +4214,7 @@ pub struct PlanInstrumentProposals(pub Vec<PlanInstrumentProposal>);
 pub async fn pending_instrument_proposals<C: ConnectionTrait>(
     db: &C,
     source_system: &str,
+    catalog: &InstrumentCatalog,
 ) -> AppResult<Vec<PlanInstrumentProposal>> {
     let rows = proposal::Entity::find()
         .filter(proposal::Column::SourceSystem.eq(source_system))
@@ -4166,16 +4223,21 @@ pub async fn pending_instrument_proposals<C: ConnectionTrait>(
         .await?;
     let proposals = rows
         .into_iter()
-        .map(|row| PlanInstrumentProposal {
-            source_key: row.source_key,
-            name: row.name,
-            serial_number: row.serial_number,
-            manufacturer: row.manufacturer,
-            model: row.model,
-            notes: row.notes,
-            is_lab_instrument: row.is_lab_instrument,
-            metadata: row.metadata,
-            admit: true,
+        .map(|row| {
+            let conflict = proposal_conflict(&row.name, row.serial_number.as_deref(), catalog);
+            PlanInstrumentProposal {
+                admit: conflict.is_none(),
+                source_key: row.source_key,
+                name: row.name,
+                serial_number: row.serial_number,
+                manufacturer: row.manufacturer,
+                model: row.model,
+                notes: row.notes,
+                is_lab_instrument: row.is_lab_instrument,
+                metadata: row.metadata,
+                conflict,
+                attach_to: None,
+            }
         })
         .collect();
     Ok(proposals)
@@ -4189,21 +4251,42 @@ pub(super) async fn admit_instrument_proposals<C: ConnectionTrait>(
     proposals: &[PlanInstrumentProposal],
 ) -> AppResult<u32> {
     let mut created = 0u32;
-    for offered in proposals.iter().filter(|p| p.admit) {
-        let id = upsert_source_instrument(
-            txn,
-            source_system,
-            &offered.source_key,
-            &offered.name,
-            if offered.is_lab_instrument {
-                InstrumentKind::Lab
-            } else {
-                InstrumentKind::Device
-            },
-            "high",
-            offered.metadata.clone(),
-        )
-        .await?;
+    for offered in proposals
+        .iter()
+        .filter(|p| p.admit || p.attach_to.is_some())
+    {
+        // Attached, the register row describes an instrument the inventory already holds: its
+        // serial, model and metadata are merged onto that row rather than minting a second one.
+        let id = match offered.attach_to {
+            Some(existing) => existing,
+            None => {
+                upsert_source_instrument(
+                    txn,
+                    source_system,
+                    &offered.source_key,
+                    &offered.name,
+                    if offered.is_lab_instrument {
+                        InstrumentKind::Lab
+                    } else {
+                        InstrumentKind::Device
+                    },
+                    "high",
+                    offered.metadata.clone(),
+                )
+                .await?
+            }
+        };
+        if offered.attach_to.is_some()
+            && let Some(metadata) = &offered.metadata
+        {
+            txn.execute_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE sensors SET metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb \
+                  WHERE id = $1",
+                [id.into(), metadata.clone().into()],
+            ))
+            .await?;
+        }
         // The serial is claimed only where no other instrument holds it: METALP's register carries
         // one serial on two probes, and losing the instrument over that would be worse than storing
         // it without one.
@@ -4232,7 +4315,9 @@ pub(super) async fn admit_instrument_proposals<C: ConnectionTrait>(
             .filter(proposal::Column::SourceKey.eq(offered.source_key.clone()))
             .exec(txn)
             .await?;
-        created += 1;
+        if offered.attach_to.is_none() {
+            created += 1;
+        }
     }
     Ok(created)
 }
@@ -4863,6 +4948,7 @@ pub struct CatalogParam {
     pub reading_count: i64,
 }
 
+#[derive(Default)]
 pub struct EntityCatalog {
     pub projects: Vec<(Uuid, String)>,
     pub sites: Vec<(Uuid, String)>,
@@ -5522,6 +5608,56 @@ pub(super) fn instrument_key(entry: &crate::routes::private::sync::service::Plan
             format!("instrument:{}", instrument.source_key)
         }
         _ => instrument_scope(entry),
+    }
+}
+
+/// Rename the parameter group a plan proposes, across every entry the same category placed.
+///
+/// A category is one decision behind every column it holds, so renaming it on one entry renames it
+/// on all of them; leaving the others at the source's label would make the created group's name
+/// depend on which entry the apply read first. The code is re-slugged from the new label, which is
+/// what lets a rename onto an existing group's label join that group: [`reclassify_entry`] then
+/// resolves the new code against the catalog.
+pub(super) fn apply_group_updates(
+    entries: &mut [PlanEntry],
+    updates: &[PlanEntryUpdate],
+    catalog: &EntityCatalog,
+) {
+    for update in updates {
+        if update.group_label.is_none() && update.group_description.is_none() {
+            continue;
+        }
+        let Some(code) = entries
+            .iter()
+            .find(|e| e.stream_id == update.stream_id)
+            .and_then(|e| e.parameter.group.as_ref())
+            .map(|g| g.code.clone())
+        else {
+            continue;
+        };
+        let renamed: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.parameter.group.as_ref().is_some_and(|g| g.code == code))
+            .map(|(i, _)| i)
+            .collect();
+        for index in renamed {
+            let Some(group) = entries[index].parameter.group.as_mut() else {
+                continue;
+            };
+            if let Some(label) = &update.group_label {
+                let label = label.trim();
+                if !label.is_empty() {
+                    group.label = label.to_string();
+                    group.code = group_code(label);
+                }
+            }
+            if let Some(description) = &update.group_description {
+                let description = description.trim();
+                group.description = (!description.is_empty()).then(|| description.to_string());
+            }
+            reclassify_entry(&mut entries[index], catalog);
+        }
     }
 }
 
