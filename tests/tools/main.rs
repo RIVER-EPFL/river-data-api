@@ -15,6 +15,7 @@ mod formula_calculation;
 mod formula_draft_run;
 mod na_clears_output;
 mod output_parameters;
+mod pending_inputs_inherit;
 mod run_contract;
 mod runner_absent;
 mod scripts_authoring;

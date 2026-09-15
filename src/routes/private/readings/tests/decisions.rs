@@ -767,6 +767,31 @@ fn only_an_intern_enters_a_pending_measurement() {
 }
 
 #[test]
+fn a_value_computed_from_a_pending_measurement_is_pending_itself() {
+    use super::entry_kind;
+    use crate::common::authz::Role;
+    // The chain runs as whoever triggered it, and the inputs decide, not the level.
+    for role in [
+        None,
+        Some(Role::River),
+        Some(Role::Manager),
+        Some(Role::Administrator),
+    ] {
+        assert_eq!(
+            entry_kind(true, role.as_ref()),
+            Some(Kind::UnverifiedEntry),
+            "{role:?}"
+        );
+    }
+    assert_eq!(entry_kind(false, Some(&Role::Manager)), None);
+    assert_eq!(
+        entry_kind(false, Some(&Role::Intern)),
+        Some(Kind::UnverifiedEntry),
+        "verified inputs leave the writer's level deciding"
+    );
+}
+
+#[test]
 fn sync_owns_the_measurement_and_never_a_judgement() {
     use super::{is_judgement, judgements_on};
     for k in [

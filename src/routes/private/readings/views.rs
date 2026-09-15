@@ -2966,11 +2966,10 @@ pub async fn insert_grab_samples(
         ));
     }
     // A value computed from a pending measurement is pending too (M62): the chain says so.
-    let entry_state = if payload.pending_inputs {
-        Some(crate::routes::private::readings::models::Kind::UnverifiedEntry)
-    } else {
-        crate::routes::private::readings::service::entry_state(auth.highest_role().as_ref())
-    };
+    let entry_state = crate::routes::private::readings::service::entry_kind(
+        payload.pending_inputs,
+        auth.highest_role().as_ref(),
+    );
 
     if !existing_groups.is_empty() && payload.mode != Some(GrabWriteMode::Replace) {
         let detail = serde_json::to_value(&existing_groups)

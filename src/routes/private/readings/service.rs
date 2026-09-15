@@ -2375,6 +2375,19 @@ pub fn entry_state(highest_role: Option<&crate::common::authz::Role>) -> Option<
     }
 }
 
+/// The state an entry lands in: a value computed from a measurement still awaiting verification is
+/// pending itself (M62), whoever the chain ran as, and otherwise the writer's own level decides.
+#[must_use]
+pub fn entry_kind(
+    pending_inputs: bool,
+    highest_role: Option<&crate::common::authz::Role>,
+) -> Option<Kind> {
+    if pending_inputs {
+        return Some(Kind::UnverifiedEntry);
+    }
+    entry_state(highest_role)
+}
+
 /// After an entry lands: one `unverified_entry` per row it wrote, so the review queue and every
 /// exclusion read the same record the columns project from.
 pub async fn record_unverified_entries<C: ConnectionTrait>(
