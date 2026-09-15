@@ -1050,6 +1050,16 @@ async fn slot_instrument_name<C: ConnectionTrait>(
 ///
 /// `name_hint` is the slot name when the caller knows which slot the stream is being paired to;
 /// the import endpoint has no slot yet and passes `None`.
+/// The frequency a device feed's instrument is minted at. The stream's own declaration is the
+/// evidence: a device reporting one reading per visit declares `spot`, and an undeclared stream
+/// is a logger.
+pub(super) fn device_frequency(measurement_type: Option<&str>) -> &'static str {
+    if measurement_type == Some("spot") {
+        return "low";
+    }
+    "high"
+}
+
 pub async fn import_sensor_for_stream<C: ConnectionTrait>(
     db: &C,
     stream: &data_streams::Model,
@@ -1074,7 +1084,7 @@ pub async fn import_sensor_for_stream<C: ConnectionTrait>(
             &stream.source_key,
             &sensor_name,
             InstrumentKind::Device,
-            "high",
+            device_frequency(stream.measurement_type.as_deref()),
             metadata,
         )
         .await?;

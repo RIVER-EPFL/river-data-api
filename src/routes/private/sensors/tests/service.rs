@@ -232,3 +232,15 @@ mod instrument_refusal {
         assert!(message.contains("nothing was declared"), "{message}");
     }
 }
+
+/// Scenario: a device feed whose stream declares how often it reports.
+/// Expected behaviour: the minted instrument's frequency is the stream's declaration, so the
+/// classification chain says the same thing at the stream rung and the instrument rung.
+#[test]
+fn test_device_frequency_follows_the_stream_declaration() {
+    assert_eq!(device_frequency(Some("spot")), "low");
+    assert_eq!(device_frequency(Some("continuous")), "high");
+    assert_eq!(device_frequency(Some("derived")), "high");
+    // An undeclared stream is a logger, which is what every device feed was until one declared.
+    assert_eq!(device_frequency(None), "high");
+}
