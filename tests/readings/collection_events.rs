@@ -448,6 +448,20 @@ async fn an_event_with_readings_cannot_be_deleted() {
     .await;
     assert_eq!(status, 200, "{body}");
 
+    for patch in [
+        json!({ "collected_at": "2025-06-01T09:00:00Z" }),
+        json!({ "site_id": crate::common::SITE2_ID }),
+    ] {
+        let (status, body) = crate::common::put_json_with_token(
+            &app,
+            &format!("/api/collection_events/{event_id}"),
+            &patch,
+            &token,
+        )
+        .await;
+        assert_eq!(status, 409, "a visit with readings cannot move: {body}");
+    }
+
     let (status, body) = crate::common::delete_with_token(
         &app,
         &format!("/api/collection_events/{event_id}"),
@@ -504,6 +518,42 @@ async fn an_empty_event_can_be_deleted() {
         (200..300).contains(&status),
         "a visit nothing references is deletable: {body}"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn an_empty_event_can_move_but_not_onto_another_visit() {
+    let (_db, app, token) = setup().await;
+    let mut events = Vec::new();
+    for time in [T1, "2025-06-01T09:00:00Z"] {
+        let (status, event) = crate::common::post_json_parse_with_token(
+            &app,
+            "/api/collection_events/stage",
+            &json!({ "site_id": SITE1_ID, "collected_at": time }),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "{event}");
+        events.push(event["id"].as_str().unwrap().to_string());
+    }
+    let path = format!("/api/collection_events/{}", events[0]);
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &path,
+        &json!({ "collected_at": "2025-06-01T09:00:00Z" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains(&events[1]), "{body}");
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &path,
+        &json!({ "collected_at": "2025-06-01T10:00:00Z", "notes": "Corrected time" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
 }
 
 /// A stream paired to the wrong site is unpaired and paired again elsewhere. The readings must

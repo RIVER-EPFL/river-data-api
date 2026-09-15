@@ -5,14 +5,14 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use crudcrate::{ApiError, CRUDOperations};
+use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::sea_query::{
     Alias, Expr, ExprTrait, IntoTableRef, JoinType, OnConflict, PostgresQueryBuilder,
     Query as SeaQuery,
 };
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, Statement, TransactionTrait,
+    PaginatorTrait, QueryFilter, QuerySelect, Statement, TransactionTrait,
 };
 use uuid::Uuid;
 
@@ -42,6 +42,46 @@ async fn attached_readings<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<i64, 
 
 impl CRUDOperations for CollectionEventOperations {
     type Resource = CollectionEvent;
+
+    async fn before_update<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        id: Uuid,
+        data: &<CollectionEvent as CRUDResource>::UpdateModel,
+    ) -> Result<(), ApiError> {
+        use super::models::{Column, Entity};
+
+        let current = Entity::find_by_id(id)
+            .lock_exclusive()
+            .one(db)
+            .await
+            .map_err(ApiError::database)?
+            .ok_or_else(|| ApiError::not_found("collection event", Some(id.to_string())))?;
+        let site_id = data.site_id.flatten().unwrap_or(current.site_id);
+        let collected_at = data.collected_at.flatten().unwrap_or(current.collected_at);
+        if site_id == current.site_id && collected_at == current.collected_at {
+            return Ok(());
+        }
+        if attached_readings(db, id).await? > 0 {
+            return Err(ApiError::conflict(
+                "A visit holding readings cannot change site or time.",
+            ));
+        }
+        if let Some(existing) = Entity::find()
+            .filter(Column::SiteId.eq(site_id))
+            .filter(Column::CollectedAt.eq(collected_at))
+            .filter(Column::Id.ne(id))
+            .one(db)
+            .await
+            .map_err(ApiError::database)?
+        {
+            return Err(ApiError::conflict(format!(
+                "Visit {} already occupies this site and time.",
+                existing.id
+            )));
+        }
+        Ok(())
+    }
 
     async fn before_delete<C: ConnectionTrait + TransactionTrait>(
         &self,
