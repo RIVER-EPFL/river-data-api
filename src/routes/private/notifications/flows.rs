@@ -360,6 +360,80 @@ pub fn stale_slots_query() -> Statement {
     Statement::from_sql_and_values(PG, sql, values)
 }
 
+/// The last reading of one cadence of a slot and the age it is judged stale against, or `None`
+/// where the cadence is not judged at all.
+///
+/// A cadence that never produced data is not stale, it is unpaired or new. A grab cadence with no
+/// visible multi-day rhythm is not late against anything: grabs arrive in campaigns, so the
+/// expected gap is the widest of the recent ones rather than the last one, and two samples on one
+/// field day describe the campaign, not the cadence.
+fn judged_against(
+    last_time: Option<DateTime<Utc>>,
+    spot: bool,
+    spot_max_gap_seconds: Option<f64>,
+    base_threshold: Duration,
+) -> Option<(DateTime<Utc>, Duration)> {
+    let last_time = last_time?;
+    if !spot {
+        return Some((last_time, base_threshold));
+    }
+    let gap = Duration::seconds(spot_max_gap_seconds.unwrap_or(0.0) as i64);
+    (gap >= base_threshold).then(|| (last_time, gap * SPOT_STALE_INTERVAL_FACTOR))
+}
+
+/// Record every already-stale cadence of these slots as firing, announcing nothing.
+///
+/// A pairing brings a source's whole history in at once, and a slot whose readings stopped before
+/// river-data ever held them did not go stale on river-data's watch. Without this the first
+/// dispatcher tick after an apply announces every one of them: the CNET plan, whose stations
+/// stopped in 2025, fires 1,358 of these in a minute. Seeding the firing state means the first
+/// thing anybody hears about such a slot is the recovery, when data resumes.
+///
+/// Returns the number of cadences it suppressed.
+pub async fn suppress_stale_for_history(
+    db: &sea_orm::DatabaseConnection,
+    slots: &[(uuid::Uuid, uuid::Uuid)],
+    stale_data_threshold_hours: i64,
+) -> Result<usize, DbErr> {
+    if slots.is_empty() {
+        return Ok(0);
+    }
+    let wanted: std::collections::HashSet<(uuid::Uuid, uuid::Uuid)> =
+        slots.iter().copied().collect();
+    let base_threshold = Duration::hours(stale_data_threshold_hours);
+    let now = Utc::now();
+    let mut suppressed = 0;
+    for r in &db.query_all_raw(stale_slots_query()).await? {
+        let slot = StaleSlot::from_query_result(r, "")?;
+        if !wanted.contains(&(slot.site_id, slot.parameter_id)) {
+            continue;
+        }
+        for spot in [false, true] {
+            let Some((last_time, threshold)) = judged_against(
+                if spot {
+                    slot.last_spot
+                } else {
+                    slot.last_continuous
+                },
+                spot,
+                slot.spot_max_gap_seconds,
+                base_threshold,
+            ) else {
+                continue;
+            };
+            if now - last_time <= threshold {
+                continue;
+            }
+            let cadence = if spot { "spot" } else { "continuous" };
+            let key = format!("{}:{}:{cadence}", slot.site_id, slot.parameter_id);
+            if claim_insert(db, "stale_data", &key).await? {
+                suppressed += 1;
+            }
+        }
+    }
+    Ok(suppressed)
+}
+
 async fn stale_data(
     state: &AppState,
     channels: &[Box<dyn NotificationChannel>],
@@ -392,21 +466,13 @@ async fn stale_data(
         } = StaleSlot::from_query_result(r, "")?;
 
         for spot in [false, true] {
-            let Some(last_time) = (if spot { last_spot } else { last_continuous }) else {
-                continue; // this cadence never produced data, not "stale", just unpaired/new
-            };
-            let threshold = if spot {
-                // Grabs arrive in campaigns, so the expected gap is the widest of the recent ones,
-                // not the last one: two samples on one field day describe the campaign, not the
-                // cadence. A gap under the logger threshold means no multi-day cadence is visible
-                // yet, and there is nothing to be late against.
-                let gap = Duration::seconds(spot_max_gap_seconds.unwrap_or(0.0) as i64);
-                if gap < base_threshold {
-                    continue;
-                }
-                gap * SPOT_STALE_INTERVAL_FACTOR
-            } else {
-                base_threshold
+            let Some((last_time, threshold)) = judged_against(
+                if spot { last_spot } else { last_continuous },
+                spot,
+                spot_max_gap_seconds,
+                base_threshold,
+            ) else {
+                continue;
             };
 
             let cadence = if spot { "spot" } else { "continuous" };

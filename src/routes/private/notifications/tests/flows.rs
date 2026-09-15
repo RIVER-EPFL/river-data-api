@@ -95,3 +95,50 @@ mod claim_column {
         );
     }
 }
+
+mod judged_against_tests {
+    use super::super::judged_against;
+    use chrono::{Duration, Utc};
+
+    const BASE_HOURS: i64 = 6;
+
+    fn base() -> Duration {
+        Duration::hours(BASE_HOURS)
+    }
+
+    #[test]
+    fn test_a_cadence_that_never_produced_data_is_not_judged() {
+        assert!(judged_against(None, false, None, base()).is_none());
+        assert!(judged_against(None, true, Some(90_000.0), base()).is_none());
+    }
+
+    #[test]
+    fn test_a_continuous_cadence_is_judged_against_the_configured_threshold() {
+        let last = Utc::now() - Duration::hours(1);
+        assert_eq!(
+            judged_against(Some(last), false, None, base()),
+            Some((last, base()))
+        );
+    }
+
+    /// Two samples on one field day describe the campaign, not the cadence, so a slot whose widest
+    /// recent gap is under the logger threshold is not late against anything.
+    #[test]
+    fn test_a_grab_cadence_with_no_visible_rhythm_is_not_judged() {
+        let last = Utc::now() - Duration::days(400);
+        let within_a_day = (base() - Duration::hours(1)).num_seconds() as f64;
+        assert!(judged_against(Some(last), true, Some(within_a_day), base()).is_none());
+        assert!(judged_against(Some(last), true, None, base()).is_none());
+    }
+
+    /// A monthly campaign is late at three months, not at six hours.
+    #[test]
+    fn test_a_grab_cadence_is_judged_against_three_of_its_widest_recent_gaps() {
+        let last = Utc::now() - Duration::days(400);
+        let monthly = Duration::days(30);
+        assert_eq!(
+            judged_against(Some(last), true, Some(monthly.num_seconds() as f64), base()),
+            Some((last, monthly * 3))
+        );
+    }
+}

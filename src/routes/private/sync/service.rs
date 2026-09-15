@@ -3827,6 +3827,25 @@ pub async fn apply_plan(
             Some((r.site_id, r.parameter_id))
         })
         .collect();
+    // History that ended before river-data held it did not go stale on river-data's watch, so the
+    // first dispatcher tick after the apply announces none of it. Only the running service has the
+    // threshold; a process without one sends no notifications either.
+    if let Some(state) = crate::common::global_app_state() {
+        let suppressed = crate::routes::private::notifications::flows::suppress_stale_for_history(
+            db,
+            &slots,
+            state.config.stale_data_threshold_hours,
+        )
+        .await?;
+        if suppressed > 0 {
+            tracing::info!(
+                plan_id = %plan_id,
+                suppressed,
+                "apply_plan: slots whose history had already stopped start out silent",
+            );
+        }
+    }
+
     // Re-derivation runs as tracked jobs so a failure is visible and rerunnable rather than a log
     // line lost on restart.
     for (site_id, parameter_id) in slots {

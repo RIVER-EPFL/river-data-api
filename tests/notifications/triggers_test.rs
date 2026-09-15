@@ -691,3 +691,59 @@ async fn a_chain_run_that_skipped_nothing_is_silent() {
         "a run with nothing skipped raises no alert"
     );
 }
+
+/// Scenario: a portal pairing brings in a slot whose readings stopped a year before river-data
+/// ever held them, which is what applying the CNET plan does 1,358 times over.
+///
+/// Expected behaviour: the apply records the slot as already stale, so the first dispatcher tick
+/// announces nothing; the announcement that does arrive is the recovery, once data resumes.
+#[tokio::test]
+#[serial]
+async fn history_that_stopped_before_the_pairing_announces_nothing() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    crate::common::exec(&db, "DELETE FROM readings").await;
+    let stream = turb_stream(&db).await;
+    insert_reading(&db, &stream, "NOW() - INTERVAL '400 days'").await;
+
+    let suppressed = flows::suppress_stale_for_history(
+        &db,
+        &[(
+            uuid::Uuid::parse_str(crate::common::SITE1_ID).unwrap(),
+            uuid::Uuid::parse_str(crate::common::GLOBAL_PARAM_TURB_ID).unwrap(),
+        )],
+        state.config.stale_data_threshold_hours,
+    )
+    .await
+    .expect("suppress");
+    assert_eq!(suppressed, 1, "the one stopped cadence starts out silent");
+
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let channels: Vec<Box<dyn NotificationChannel>> =
+        vec![Box::new(MockChannel { sent: sent.clone() })];
+    flows::run(&state, &channels).await;
+    assert!(
+        kinds(&sent.lock().unwrap(), "stale_data").is_empty(),
+        "a decade-old stop is not news: {:?}",
+        sent.lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.subject.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(stale_state_count(&db).await, 1, "recorded, not announced");
+
+    // Data resumes: that is the first thing anybody hears about the slot.
+    insert_reading(&db, &stream, "NOW()").await;
+    sent.lock().unwrap().clear();
+    flows::run(&state, &channels).await;
+    let msgs = sent.lock().unwrap();
+    let recovered: Vec<_> = kinds(&msgs, "stale_data")
+        .into_iter()
+        .filter(|m| m.body.contains("flowing again"))
+        .collect();
+    assert_eq!(recovered.len(), 1, "one recovery notice");
+}
