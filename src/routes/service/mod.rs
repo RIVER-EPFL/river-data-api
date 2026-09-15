@@ -413,14 +413,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .layer(RequestBodyLimitLayer::new(DATA_BODY_LIMIT))
         .layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT))
         .route(
-            "/collection_events/stage",
-            post(crate::routes::private::collection_events::views::stage_collection_event),
-        )
-        .route(
-            "/collection_events/stage_many",
-            post(crate::routes::private::collection_events::views::stage_collection_events),
-        )
-        .route(
             "/collection_events/{id}/recompute",
             post(crate::routes::private::collection_events::views::recompute_collection_event),
         )
@@ -435,10 +427,19 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .layer(middleware::from_fn(require_write_data))
         .with_state(state.clone());
 
-    // Entering a field measurement. An intern reaches this and nothing else that writes: the
-    // save lands unverified and is refused a replace (Q21, M44).
+    // Entering a field measurement, and opening the field day it is entered at. An intern reaches
+    // these and nothing else that writes: the save lands unverified and is refused a replace
+    // (Q21, M44), and a visit they open is itself unverified until a manager rules on it (Q177).
     let field_entry_routes = Router::new()
         .route("/grab_samples", post(readings_views::insert_grab_samples))
+        .route(
+            "/collection_events/stage",
+            post(crate::routes::private::collection_events::views::stage_collection_event),
+        )
+        .route(
+            "/collection_events/stage_many",
+            post(crate::routes::private::collection_events::views::stage_collection_events),
+        )
         .layer(middleware::from_fn(require_enter_field_data))
         .with_state(state.clone());
 

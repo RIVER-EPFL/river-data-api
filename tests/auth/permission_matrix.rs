@@ -621,8 +621,6 @@ fn table() -> Table {
             ("POST", "/api/status_events/batch"),
             ("POST", "/api/readings/import_csv"),
             ("POST", "/api/readings/import_csv/chunk"),
-            ("POST", "/api/collection_events/stage"),
-            ("POST", "/api/collection_events/stage_many"),
             ("POST", "/api/collection_events/{id}/recompute"),
             ("POST", "/api/readings/edits/preview"),
             ("POST", "/api/readings/edits"),
@@ -635,11 +633,17 @@ fn table() -> Table {
         ],
     );
 
+    // Opening a field day is the same act as entering the values in it (Q177): an intern may stage
+    // a visit, and the visit they open is itself unverified until a manager rules on it.
     t.group(
         Capability::EnterFieldData,
         TokenAccess::Same,
         Scope::Open,
-        &[("POST", "/api/grab_samples")],
+        &[
+            ("POST", "/api/grab_samples"),
+            ("POST", "/api/collection_events/stage"),
+            ("POST", "/api/collection_events/stage_many"),
+        ],
     );
 
     t.group(
