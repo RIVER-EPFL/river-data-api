@@ -121,7 +121,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             TokenAccess::Same,
         )))
     };
-    // Global catalog (parameters, derived definitions/sources, alarm thresholds, constants,
+    // Global catalog (parameters, derived definitions/sources, alarm thresholds,
     // notification mutes): MANAGER members may write.
     let catalog_crud = |r: OpenApiRouter| -> OpenApiRouter {
         r.layer(middleware::from_fn(require_crud(
@@ -297,7 +297,9 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             admin_only_crud(NotificationSubscriber::router(db)),
         )
         .nest("/annotations", field_data_crud(Annotation::router(db)))
-        .nest("/constants", catalog_crud(Constant::router(db)))
+        // Q173: a constant feeds every formula that names it, so its creation and modification sit
+        // with the calculations rather than with the catalog rows a manager edits.
+        .nest("/constants", admin_write_crud(Constant::router(db)))
         .nest(
             "/meteoswiss_subscriptions",
             catalog_crud(MeteoswissSubscription::router(db)),

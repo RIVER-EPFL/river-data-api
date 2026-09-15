@@ -390,7 +390,7 @@ fn entities() -> Vec<Entity> {
             ..admin_only("notification_subscribers")
         },
         field_data("annotations", CrudScope::ProjectBound),
-        catalog("constants", CrudScope::Global),
+        admin_write("constants", CrudScope::Global),
         catalog("meteoswiss_subscriptions", CrudScope::Global),
         field_data("samples", CrudScope::ProjectBound),
         field_data("collection_events", CrudScope::Global),
