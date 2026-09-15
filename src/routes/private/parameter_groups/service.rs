@@ -33,7 +33,7 @@ async fn member_row<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<Option<Membe
 }
 
 /// Every membership row, reduced to what the reshape rules read.
-async fn all_members<C: ConnectionTrait>(db: &C) -> Result<Vec<Member>, ApiError> {
+pub(crate) async fn all_members<C: ConnectionTrait>(db: &C) -> Result<Vec<Member>, ApiError> {
     let rows = super::member_model::Entity::find()
         .all(db)
         .await
@@ -305,6 +305,22 @@ pub mod rules {
                 ),
             }
         }
+    }
+
+    /// The group a calculation's minted output joins. A formula attached to a calculation publishes
+    /// into that calculation's group, so applying the group to a site declares the inputs and the
+    /// outputs together rather than the inputs alone. A standalone formula belongs to no
+    /// calculation, a calculation may be bound to no group, and a parameter some group already
+    /// holds keeps the placement it has; each of those joins nothing.
+    #[must_use]
+    pub fn output_group(
+        parameter_id: Uuid,
+        calculation_group: Option<Uuid>,
+        members: &[Member],
+    ) -> Option<Uuid> {
+        let group_id = calculation_group?;
+        may_add(parameter_id, members).ok()?;
+        Some(group_id)
     }
 
     /// A parameter belongs to at most one group, so adding it anywhere else is refused.

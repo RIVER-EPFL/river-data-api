@@ -718,7 +718,19 @@ async fn ensure_output_parameter<C: ConnectionTrait>(
     // An intermediate is a step, not a measurement: nothing stores its value, so no parameter is
     // minted for it and a formula turned intermediate gives up the link it had.
     if entity.intermediate {
-        entity.output_parameter_id = None;
+        if entity.output_parameter_id.take().is_some() {
+            super::models::definition::Entity::update_many()
+                .col_expr(
+                    super::models::definition::Column::OutputParameterId,
+                    sea_orm::sea_query::Expr::value(Option::<Uuid>::None),
+                )
+                .filter(super::models::definition::Column::Id.eq(entity.id))
+                .exec(db)
+                .await
+                .map_err(|e| {
+                    ApiError::internal(format!("Failed to unlink output parameter: {e}"), None)
+                })?;
+        }
         return Ok(None);
     }
     // Reuse existing link if present
@@ -729,6 +741,7 @@ async fn ensure_output_parameter<C: ConnectionTrait>(
             .map_err(|e| {
                 ApiError::internal(format!("Failed to update output parameter: {e}"), None)
             })?;
+        place_output_in_group(db, entity.tool_script_id, existing_id).await?;
         return Ok(Some(existing_id));
     }
 
@@ -773,8 +786,60 @@ async fn ensure_output_parameter<C: ConnectionTrait>(
         .await
         .map_err(|e| ApiError::internal(format!("Failed to link output parameter: {e}"), None))?;
 
+    place_output_in_group(db, entity.tool_script_id, param_id).await?;
+
     entity.output_parameter_id = Some(param_id);
     Ok(Some(param_id))
+}
+
+/// Put a calculation's output in the group that calculation reads and writes, so applying the
+/// group to a site declares the inputs and the outputs together and every calculation of the
+/// group applies there (M227).
+///
+/// The membership is filled, never moved: a parameter another group already holds keeps the
+/// placement it has, as it does when the sync places one. The output sits after the entries,
+/// which is where it is read.
+async fn place_output_in_group<C: ConnectionTrait>(
+    db: &C,
+    tool_script_id: Option<Uuid>,
+    parameter_id: Uuid,
+) -> Result<(), ApiError> {
+    use crate::routes::private::parameter_groups::member_model;
+    use crate::routes::private::parameter_groups::service::{all_members, rules};
+
+    let Some(script_id) = tool_script_id else {
+        return Ok(());
+    };
+    let calculation_group = crate::routes::private::tools::models::script::Entity::find_by_id(
+        script_id,
+    )
+    .one(db)
+    .await
+    .map_err(ApiError::database)?
+    .and_then(|script| script.parameter_group_id);
+    let members = all_members(db).await?;
+    let Some(group_id) = rules::output_group(parameter_id, calculation_group, &members) else {
+        return Ok(());
+    };
+
+    let last = member_model::Entity::find()
+        .filter(member_model::Column::GroupId.eq(group_id))
+        .order_by_desc(member_model::Column::Ordinal)
+        .one(db)
+        .await
+        .map_err(ApiError::database)?
+        .map_or(0, |member| member.ordinal);
+    member_model::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        group_id: Set(group_id),
+        parameter_id: Set(parameter_id),
+        ordinal: Set(last + 1),
+        ..Default::default()
+    }
+    .insert(db)
+    .await
+    .map_err(|e| ApiError::internal(format!("Failed to place output in its group: {e}"), None))?;
+    Ok(())
 }
 
 pub struct CalculationFormulaOperations;

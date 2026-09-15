@@ -181,8 +181,8 @@ pub fn applies_at_site(saved_outputs: &[(String, Uuid)], declared: &HashSet<Uuid
 }
 
 /// Order tools so producers run before consumers: an edge A→B exists when one of A's outputs
-/// resolves to the catalog parameter one of B's `event_inputs` reads. A cycle is refused naming
-/// its members — two tools feeding each other have no runnable order.
+/// resolves to a catalog parameter B reads, whether as an event input or as a replicate family.
+/// A cycle is refused naming its members: two tools feeding each other have no runnable order.
 pub fn dependency_order(tools: &[ActiveTool], catalog: &ParameterCatalog) -> AppResult<Vec<usize>> {
     let produced_codes: Vec<Vec<String>> = tools
         .iter()
@@ -196,13 +196,7 @@ pub fn dependency_order(tools: &[ActiveTool], catalog: &ParameterCatalog) -> App
         .collect();
     let consumed_codes: Vec<Vec<String>> = tools
         .iter()
-        .map(|t| {
-            t.manifest
-                .event_inputs
-                .iter()
-                .map(|e| e.parameter_code.to_lowercase())
-                .collect()
-        })
+        .map(|t| t.manifest.read_codes())
         .collect();
 
     let n = tools.len();

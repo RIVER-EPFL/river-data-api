@@ -782,6 +782,10 @@ pub fn build(query: &sea_orm::sea_query::SelectStatement) -> Statement {
 /// The served spot value at one (site, parameter, instant): the sample mean, else the lowest
 /// unflagged replicate that is not withdrawn. Each of the three is an expression, so a statement
 /// resolving the parameter itself passes its own column where another passes a bound value.
+///
+/// `served::not_flagged` rather than `served::not_curated_out`: a calculation runs on what the
+/// operator just typed and marks its own output pending in turn, so an unverified entry is an
+/// input here where a chart or an export leaves it out. `common/served.rs` names this exception.
 #[must_use]
 pub fn served_spot_value_expr(site: Expr, parameter: Expr, instant: Expr) -> Expr {
     use sea_orm::sea_query::ExprTrait;
@@ -804,12 +808,8 @@ pub fn served_spot_value_expr(site: Expr, parameter: Expr, instant: Expr) -> Exp
         .and_where(Expr::col((r.clone(), readings::Column::SiteId)).eq(site))
         .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).eq(parameter))
         .and_where(Expr::col((r.clone(), readings::Column::Time)).eq(instant))
-        .and_where(
-            Expr::col((r.clone(), readings::Column::MeasurementType))
-                .eq(crate::routes::private::readings::service::SPOT),
-        )
-        .and_where(Expr::cust(r#""r"."is_flagged" IS NOT TRUE"#))
-        .and_where(Expr::col((r.clone(), readings::Column::WithdrawnAt)).is_null())
+        .cond_where(crate::common::served::spot_rows())
+        .cond_where(crate::common::served::not_flagged())
         .order_by((r, readings::Column::ReplicateIndex), Order::Asc)
         .limit(1)
         .to_owned();
@@ -2441,7 +2441,7 @@ pub async fn calculations_fed_by(
         return Ok(Vec::new());
     }
     let tools = list_active_tools(db).await?;
-    if tools.iter().all(|t| t.manifest.event_inputs.is_empty()) {
+    if tools.iter().all(|t| t.manifest.read_codes().is_empty()) {
         return Ok(Vec::new());
     }
     let catalog = load_parameter_catalog(db, tools.iter().map(|t| &t.manifest)).await?;
@@ -2619,8 +2619,8 @@ pub fn fed_closure(
     for &i in order {
         let tool = &tools[i];
         let mut reads: Vec<ImpactParameter> = Vec::new();
-        for e in &tool.manifest.event_inputs {
-            if let Some(roots) = reachable.get(&e.parameter_code.to_lowercase()) {
+        for code in tool.manifest.read_codes() {
+            if let Some(roots) = reachable.get(&code) {
                 for r in roots {
                     if !reads.iter().any(|x| x.parameter_id == r.parameter_id) {
                         reads.push(r.clone());

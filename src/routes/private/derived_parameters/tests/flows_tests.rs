@@ -31,6 +31,7 @@ fn test_gap_scan_is_the_anti_join_over_active_tool_slots() {
         r#""sp"."entry_mode" = 'tool'"#,
         r#"COALESCE("sp"."is_active", TRUE) = TRUE"#,
         r#"JOIN "calculation_formulas" AS "d""#,
+        r#""d"."tool_script_id" IS NULL"#,
         r#"JOIN "derived_parameter_sources" AS "dps""#,
         r#"NOT EXISTS(SELECT 1 FROM "readings" AS "r2""#,
         r#"ORDER BY "r"."site_id" ASC, "r"."time" ASC LIMIT 50000"#,

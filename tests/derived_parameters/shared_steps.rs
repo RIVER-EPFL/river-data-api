@@ -11,6 +11,29 @@ async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
     (f.db, f.app, f.token)
 }
 
+async fn put_json_with_token(
+    app: &axum::Router,
+    uri: &str,
+    body: &Value,
+    token: &str,
+) -> (u16, String) {
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let req = axum::http::Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("a request");
+    let response = app.clone().oneshot(req).await.expect("a response");
+    let status = response.status().as_u16();
+    let bytes = response.into_body().collect().await.expect("a body").to_bytes();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
 async fn post(app: &axum::Router, uri: &str, body: &Value, token: &str) -> Value {
     let (status, parsed) = crate::common::post_json_parse_with_token(app, uri, body, token).await;
     assert!(
@@ -215,4 +238,54 @@ async fn an_output_is_not_a_step_and_cannot_be_declared() {
     .await;
     assert_eq!(status, 400, "({status}): {refused}");
     assert!(refused.to_string().contains("an output"), "{refused}");
+}
+
+/// A formula that was an output and is then ticked as a step gives up the parameter it published:
+/// nothing stores a step's value, so a link left standing would keep the gap scan computing it
+/// and keep the group calling the catalog parameter an Output.
+#[tokio::test]
+#[serial]
+async fn a_formula_turned_into_a_step_gives_up_its_output_parameter() {
+    let (db, app, token) = setup().await;
+    let set = calculation(&db, "flip_set").await;
+
+    let formula = post(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": "was_an_output", "name": "Was an output", "units": "uM",
+            "formula": "Dissolved_O2 * 2", "tool_script_id": set, "ordinal": 0,
+        }),
+        &token,
+    )
+    .await;
+    assert!(
+        formula["output_parameter_id"].is_string(),
+        "an output publishes a catalog parameter: {formula}"
+    );
+
+    let (status, raw) = put_json_with_token(
+        &app,
+        &format!("/api/derived_parameters/{}", id_of(&formula)),
+        &json!({ "intermediate": true }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "({status}): {raw}");
+    let flipped: Value = serde_json::from_str(&raw).expect("JSON");
+    assert!(
+        flipped["output_parameter_id"].is_null(),
+        "the response gives up the link: {flipped}"
+    );
+
+    let stored = crate::common::e2e::scalar(
+        &db,
+        &format!(
+            "SELECT COALESCE(output_parameter_id::text, 'none') \
+               FROM calculation_formulas WHERE id = '{}'",
+            id_of(&formula)
+        ),
+    )
+    .await;
+    assert_eq!(stored, "none", "and so does the stored row");
 }

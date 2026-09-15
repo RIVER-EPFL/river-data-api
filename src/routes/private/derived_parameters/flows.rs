@@ -111,7 +111,8 @@ fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> SelectStatement {
             definition::Entity,
             d.clone(),
             Expr::col((d.clone(), definition::Column::OutputParameterId))
-                .equals((sp.clone(), site_parameters::Column::ParameterId)),
+                .equals((sp.clone(), site_parameters::Column::ParameterId))
+                .and(Expr::col((d.clone(), definition::Column::ToolScriptId)).is_null()),
         )
         .join_as(
             JoinType::Join,

@@ -10,12 +10,16 @@
 //!
 //! Every predicate here is written against the alias `r` on `readings`.
 //!
-//! Three neighbouring queries deliberately do not serve through these, and are not drift:
+//! Four neighbouring queries deliberately do not serve through these, and are not drift:
 //! the instrument diagnostic view (`sensors/readings.rs`) keeps flagged points visible because
 //! that is what it is for; the rollup population filter (`common/aggregates.rs`) mirrors the
 //! continuous aggregates' own definition, which lives in the migration and can only move with
-//! one; and the staleness probes (`notifications/triggers.rs`) ask when a slot last received
-//! anything, not what it serves.
+//! one; the staleness probes (`notifications/triggers.rs`) ask when a slot last received
+//! anything, not what it serves; and the calculation input resolver
+//! (`tools/service.rs::served_spot_value_expr`) serves a pending entry, because a calculation
+//! runs on what the operator just typed and marks its own output pending in turn. That one is
+//! built from [`spot_rows`] and [`not_flagged`] here, so the opt-out is the missing line rather
+//! than a copy of the rule.
 
 use sea_orm::Order;
 use sea_orm::sea_query::{Alias, Condition, Expr, ExprTrait, Func};
@@ -95,11 +99,17 @@ pub fn spot_rows() -> Condition {
         .add(col(readings::Column::WithdrawnAt).is_null())
 }
 
+/// A reading nobody has flagged. The half of [`NOT_CURATED_OUT`] that a surface serving pending
+/// entries still applies.
+#[must_use]
+pub fn not_flagged() -> Condition {
+    Condition::all().add(Expr::cust("r.is_flagged IS NOT TRUE"))
+}
+
 /// [`NOT_CURATED_OUT`] as a condition.
 #[must_use]
 pub fn not_curated_out() -> Condition {
-    Condition::all()
-        .add(Expr::cust("r.is_flagged IS NOT TRUE"))
+    not_flagged()
         // `NOT <col>` rather than `IS NOT TRUE`: the column is `NOT NULL`, so the two agree, and
         // the builder writes `IS NOT` with a bind, which Postgres will not parse.
         .add(col(readings::Column::Unverified).not())

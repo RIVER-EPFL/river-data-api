@@ -142,3 +142,21 @@ fn test_role_round_trips_through_its_stored_form() {
     }
     assert_eq!(Role::parse("derived"), None);
 }
+
+#[test]
+fn test_a_calculations_output_joins_the_calculations_group() {
+    // The six CNET sets publish 19 outputs; applying the group to a site has to declare them
+    // beside the inputs, or every calculation is not_applicable there.
+    assert_eq!(output_group(id(20), Some(id(1)), &[member(1, 10)]), Some(id(1)));
+}
+
+#[test]
+fn test_a_standalone_formula_joins_no_group() {
+    assert_eq!(output_group(id(20), None, &[member(1, 10)]), None);
+}
+
+#[test]
+fn test_an_output_a_group_already_holds_keeps_its_placement() {
+    assert_eq!(output_group(id(20), Some(id(1)), &[member(2, 20)]), None);
+    assert_eq!(output_group(id(20), Some(id(1)), &[member(1, 20)]), None);
+}

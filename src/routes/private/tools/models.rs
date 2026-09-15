@@ -924,6 +924,33 @@ pub struct ManifestSiteInput {
     pub required: bool,
 }
 
+impl Manifest {
+    /// Every catalog parameter code this calculation reads at a visit, lowercased: the event
+    /// inputs, plus the parameter each `replicates` param names. A replicate family is a read
+    /// edge like any other, even though it is never an event input (resolving one would put the
+    /// group's single served value into a field that holds the repeats).
+    #[must_use]
+    pub fn read_codes(&self) -> Vec<String> {
+        let mut codes: Vec<String> = self
+            .event_inputs
+            .iter()
+            .map(|e| e.parameter_code.to_lowercase())
+            .collect();
+        for p in &self.params {
+            if p.kind != "replicates" {
+                continue;
+            }
+            if let Some(code) = &p.parameter_code {
+                let code = code.to_lowercase();
+                if !codes.contains(&code) {
+                    codes.push(code);
+                }
+            }
+        }
+        codes
+    }
+}
+
 impl ManifestSiteInput {
     #[must_use]
     pub fn target(&self) -> &str {

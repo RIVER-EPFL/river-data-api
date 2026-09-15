@@ -15,6 +15,15 @@ fn expr_sql(e: Expr) -> String {
         .to_owned()
 }
 
+#[test]
+fn test_derived_work_query_selects_standalone_definitions() {
+    let sql = rendered(derived_work_query(Uuid::nil()));
+    assert!(
+        sql.contains(r#""d"."tool_script_id" IS NULL"#),
+        "calculation-owned formulas belong to the chain: {sql}"
+    );
+}
+
 /// The report and the split ask the same question at different moments: a reading whose curve
 /// belongs to another instrument. Keeping the predicate in one place is what stops the report
 /// listing rows the split would not have asked about.

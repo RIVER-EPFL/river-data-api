@@ -723,7 +723,7 @@ fn derived_work_query(site_id: Uuid) -> SelectStatement {
             JoinType::InnerJoin,
             calculation_formulas::Entity,
             d.clone(),
-            Expr::col((d, calculation_formulas::Column::OutputParameterId))
+            Expr::col((d.clone(), calculation_formulas::Column::OutputParameterId))
                 .equals((sp.clone(), site_parameters::Column::ParameterId)),
         )
         .join_as(
@@ -734,6 +734,7 @@ fn derived_work_query(site_id: Uuid) -> SelectStatement {
                 .equals((sp.clone(), site_parameters::Column::ParameterId)),
         )
         .and_where(Expr::col((sp.clone(), site_parameters::Column::SiteId)).eq(site_id))
+        .and_where(Expr::col((d, calculation_formulas::Column::ToolScriptId)).is_null())
         .and_where(Expr::col((sp, site_parameters::Column::EntryMode)).eq("tool"))
         .take()
 }

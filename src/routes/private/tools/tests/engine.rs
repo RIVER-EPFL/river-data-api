@@ -510,7 +510,10 @@ fn both_spellings_of_the_site_inputs_key_parse_the_same() {
 }
 
 /// The chain executor and the event-input resolver read the same instant, so both build this one
-/// expression. The predicates below are the spot serving contract.
+/// expression. The predicates below are the spot serving contract, minus the one curation rule a
+/// calculation deliberately opts out of: an unverified entry is an input here, because the run
+/// marks its own output pending in turn. `common/served.rs` names that exception; a drift in
+/// either direction fails here.
 #[test]
 fn test_served_spot_value_carries_the_serving_predicates() {
     use crate::routes::private::tools::service::{build, served_spot_value_expr};
@@ -532,8 +535,12 @@ fn test_served_spot_value_carries_the_serving_predicates() {
         assert!(sql.contains(r#"FROM "samples" AS "smp""#), "{sql}");
         assert!(sql.contains(r#""smp"."mean""#), "{sql}");
         assert!(sql.contains(r#""r"."measurement_type" = $"#), "{sql}");
-        assert!(sql.contains(r#""r"."is_flagged" IS NOT TRUE"#), "{sql}");
+        assert!(sql.contains("r.is_flagged IS NOT TRUE"), "{sql}");
         assert!(sql.contains(r#""r"."withdrawn_at" IS NULL"#), "{sql}");
+        assert!(
+            !sql.contains("unverified"),
+            "a pending entry is still an input to a calculation: {sql}"
+        );
         assert!(
             sql.contains(r#"ORDER BY "r"."replicate_index" ASC LIMIT $"#),
             "{sql}"
