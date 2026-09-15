@@ -310,6 +310,7 @@ pub(super) fn stored_manifest(name: &str, raw: &serde_json::Value) -> AppResult<
 
 pub(super) const ACTIVE_TOOL_SQL: &str = r"
     SELECT s.id AS script_id, s.name, s.label, s.description, s.engine, s.parameter_group_id,
+           s.enabled,
            v.id AS version_id, v.version_no, v.script, v.entry_function, v.manifest,
            v.content_hash
     FROM tool_scripts s
@@ -563,7 +564,7 @@ pub(super) async fn attach_formulas(
 }
 
 /// The calculation set: every enabled tool with an active version. A disabled tool is left out
-/// here, so the chain, the audit and the tools list do not see it; it can still be run by name.
+/// here, so the chain, the audit and the tools list do not see it.
 pub async fn list_active_tools(db: &DatabaseConnection) -> AppResult<Vec<ActiveTool>> {
     let rows = db
         .query_all_raw(Statement::from_string(
@@ -576,6 +577,17 @@ pub async fn list_active_tools(db: &DatabaseConnection) -> AppResult<Vec<ActiveT
     Ok(tools)
 }
 
+/// The switch a run by name is held to: a calculation switched off is refused, and the refusal
+/// names the switch rather than reporting the calculation missing (Q174).
+pub(super) fn admit_run(name: &str, enabled: bool) -> AppResult<()> {
+    if enabled {
+        return Ok(());
+    }
+    Err(AppError::Conflict(format!(
+        "Calculation '{name}' is switched off"
+    )))
+}
+
 pub async fn find_active_tool(db: &DatabaseConnection, name: &str) -> AppResult<ActiveTool> {
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
@@ -585,6 +597,7 @@ pub async fn find_active_tool(db: &DatabaseConnection, name: &str) -> AppResult<
         ))
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Unknown tool: {name}")))?;
+    admit_run(name, row.try_get::<bool>("", "enabled")?)?;
     let mut tools = vec![row_to_active(&row)?];
     attach_formulas(db, &mut tools).await?;
     Ok(tools.remove(0))

@@ -46,3 +46,18 @@ mod activation_arm {
         assert!(migration_job(true, "pco2", None).is_none());
     }
 }
+
+
+#[test]
+fn a_switched_off_calculation_is_not_run_by_name() {
+    use super::admit_run;
+    use crate::error::AppError;
+
+    assert!(admit_run("pco2", true).is_ok());
+    match admit_run("pco2", false) {
+        Err(AppError::Conflict(message)) => {
+            assert_eq!(message, "Calculation 'pco2' is switched off");
+        }
+        other => panic!("a switched-off calculation is refused by name: {other:?}"),
+    }
+}

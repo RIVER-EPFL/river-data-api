@@ -76,6 +76,7 @@ pub async fn list_tools(State(state): State<AppState>) -> AppResult<Json<Vec<Too
     responses(
         (status = 200, description = "Calculation result with `inputs_used` / `inputs_ignored` accounting", body = ToolResult),
         (status = 404, description = "Unknown tool name"),
+        (status = 409, description = "The calculation is switched off"),
         (status = 400, description = "Invalid input for this tool, or a script error"),
         (status = 503, description = "The tool runner is not configured or unreachable"),
     ),
