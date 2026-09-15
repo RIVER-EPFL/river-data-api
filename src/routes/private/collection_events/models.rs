@@ -116,6 +116,10 @@ pub struct EventRecomputeRequest {
     /// beside it.
     #[serde(default)]
     pub calculation: Option<String>,
+    /// Every visit a script version produced values at, as the stored provenance names it. A
+    /// scope of its own: this is what an author's migrate arm asks for.
+    #[serde(default)]
+    pub version: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

@@ -2100,7 +2100,14 @@ pub struct ValidateResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct ActivateRequest {}
+pub struct ActivateRequest {
+    /// What happens to the values the version being replaced produced (Q170). `false`, the
+    /// default, leaves them on that version: this activation is a new method, and the history
+    /// stands as it was computed. `true` is a correction: every visit the superseded version
+    /// produced values at is recomputed under the new one.
+    #[serde(default)]
+    pub migrate_stored: bool,
+}
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ActivateResponse {
@@ -2158,6 +2165,10 @@ pub struct RecomputeScope {
     /// Hold the findings arm to the ones one calculation raised. A narrowing, never a bound: a
     /// calculation names no window, so it cannot stand as a scope on its own.
     pub calculation: Option<String>,
+    /// A superseded script version, as the author's migrate arm names it. A bound, unlike
+    /// `calculation`: the visits a version produced values at are a finite set its provenance
+    /// names, and it stops growing the moment the version stops being active.
+    pub version: Option<Uuid>,
 }
 
 impl RecomputeScope {
@@ -2165,7 +2176,11 @@ impl RecomputeScope {
     /// accepted: "every visit there is" is not a repair, it is a global recompute (D6).
     #[must_use]
     pub fn is_bounded(&self) -> bool {
-        self.site_id.is_some() || self.start.is_some() || self.end.is_some() || self.only_findings
+        self.site_id.is_some()
+            || self.start.is_some()
+            || self.end.is_some()
+            || self.only_findings
+            || self.version.is_some()
     }
 
     /// The SELECT of visit ids this scope covers, oldest first. `portal_sync` visits are never
@@ -2189,6 +2204,15 @@ impl RecomputeScope {
         if let Some(end) = self.end {
             binds.push(sea_orm::prelude::DateTimeWithTimeZone::from(end).into());
             sql.push_str(&format!(" AND ce.collected_at <= ${}", binds.len()));
+        }
+        if let Some(version) = self.version {
+            binds.push(version.to_string().into());
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM readings r \
+                      WHERE r.collection_event_id = ce.id \
+                        AND r.provenance -> 'tool_version' ->> 'script_version_id' = ${})",
+                binds.len()
+            ));
         }
         if self.only_findings {
             sql.push_str(&format!(

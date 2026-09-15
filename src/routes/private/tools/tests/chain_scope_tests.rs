@@ -96,6 +96,7 @@ fn each_term_adds_its_clause_with_binds_in_order() {
         end: Some(at("2025-06-30T00:00:00Z")),
         only_findings: true,
         calculation: None,
+        version: None,
     };
     let (sql, binds) = scope.events_sql();
     assert!(sql.contains("ce.site_id = $1"));
@@ -132,6 +133,7 @@ fn a_site_and_range_without_only_findings_names_no_holds() {
         end: Some(at("2025-06-30T00:00:00Z")),
         only_findings: false,
         calculation: None,
+        version: None,
     };
     assert!(scope.is_bounded());
     let (sql, binds) = scope.events_sql();
@@ -154,4 +156,38 @@ fn a_site_alone_names_every_manual_visit_there() {
     assert!(!sql.contains("ce.collected_at >="), "{sql}");
     assert!(sql.contains("ce.site_id = $1"));
     assert_eq!(binds.len(), 1);
+}
+
+/// A superseded script version is a bound of its own: the visits it produced values at are a
+/// finite set the provenance names, which is what an author's migrate arm has to cover.
+#[test]
+fn a_superseded_version_is_a_scope_and_selects_by_provenance() {
+    let scope = RecomputeScope {
+        version: Some(Uuid::new_v4()),
+        ..Default::default()
+    };
+    assert!(scope.is_bounded());
+    let (sql, binds) = scope.events_sql();
+    assert!(!sql.contains("replicate_audit_holds"), "{sql}");
+    assert!(
+        sql.contains("'tool_version' ->> 'script_version_id' = $1"),
+        "{sql}"
+    );
+    assert!(sql.contains("r.collection_event_id = ce.id"), "{sql}");
+    assert_eq!(binds.len(), 1);
+}
+
+/// The version is a bound, not a narrowing of the findings arm: a migrate has to reach the visits
+/// nothing has been raised about, which is most of them.
+#[test]
+fn a_version_narrows_a_site_scope_rather_than_replacing_it() {
+    let scope = RecomputeScope {
+        site_id: Some(Uuid::new_v4()),
+        version: Some(Uuid::new_v4()),
+        ..Default::default()
+    };
+    let (sql, binds) = scope.events_sql();
+    assert!(sql.contains("ce.site_id = $1"), "{sql}");
+    assert!(sql.contains("script_version_id' = $2"), "{sql}");
+    assert_eq!(binds.len(), 2);
 }

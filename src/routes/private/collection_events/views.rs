@@ -236,6 +236,7 @@ pub async fn run_event_recompute(
         end: req.end,
         only_findings: req.only_findings,
         calculation: req.calculation.clone(),
+        version: req.version,
     };
     if !scope.is_bounded() {
         return Err(AppError::BadRequest(
@@ -267,6 +268,7 @@ pub async fn run_event_recompute(
             "end": req.end,
             "only_findings": req.only_findings,
             "calculation": req.calculation,
+            "version": req.version,
             "actor": crate::common::actor::label(&auth),
         }),
         None,

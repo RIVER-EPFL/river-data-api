@@ -1171,6 +1171,7 @@ impl Job for EventRecompute {
                 .get("calculation")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
+            version: as_uuid("version"),
         };
         if !scope.is_bounded() {
             return Err(DbErr::Custom(

@@ -737,7 +737,7 @@ pub async fn activate_version(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Path((id, vid)): Path<(Uuid, Uuid)>,
-    Json(_payload): Json<ActivateRequest>,
+    Json(payload): Json<ActivateRequest>,
 ) -> AppResult<Json<ActivateResponse>> {
     let version = load_version(&state, id, vid).await?;
     if version.validated_at.is_none() {
@@ -796,9 +796,18 @@ pub async fn activate_version(
         .await?;
     txn.commit().await?;
     let script = load_script(&state, id).await?;
-    // Same policy as a formula edit and a constant edit: the stored outputs of this calculation may
-    // now disagree with what it computes, so the edit reports and a person repairs.
+    // The audit is the backstop under either arm: it reports what the activation left disagreeing.
     audit_after_activation(&state.db, &script.name).await;
+    // The correcting arm reaches exactly the visits the superseded version produced values at
+    // (Q170). It is enqueued after the commit, so a failure here leaves the activation standing
+    // and the audit's findings say what was not repaired.
+    super::service::recompute_after_activation(
+        &state.db,
+        payload.migrate_stored,
+        &script.name,
+        current.active_version_id,
+    )
+    .await;
     Ok(Json(ActivateResponse { script, lint }))
 }
 

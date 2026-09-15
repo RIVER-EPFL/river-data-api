@@ -3244,6 +3244,51 @@ pub async fn audit_after_activation<C: ConnectionTrait>(db: &C, name: &str) {
     }
 }
 
+/// What an activation enqueues to repair the values the version it replaced produced (Q170).
+///
+/// `None` on the leaving arm, and on a first activation, which supersedes nothing. On the
+/// correcting arm the scope is the superseded version id: the visits it produced values at are a
+/// finite set its provenance names, and it stops growing the moment the activation commits.
+#[must_use]
+pub fn migration_job(
+    migrate_stored: bool,
+    name: &str,
+    superseded: Option<Uuid>,
+) -> Option<(serde_json::Value, String)> {
+    if !migrate_stored {
+        return None;
+    }
+    let superseded = superseded?;
+    Some((
+        serde_json::json!({ "version": superseded, "calculation": name }),
+        format!("event_recompute:version:{superseded}"),
+    ))
+}
+
+/// Enqueue what [`migration_job`] decided, if anything.
+pub async fn recompute_after_activation<C: ConnectionTrait>(
+    db: &C,
+    migrate_stored: bool,
+    name: &str,
+    superseded: Option<Uuid>,
+) {
+    let Some((params, key)) = migration_job(migrate_stored, name, superseded) else {
+        return;
+    };
+    if let Err(e) = crate::routes::private::reprocessing_jobs::service::enqueue(
+        db,
+        "event_recompute",
+        None,
+        None,
+        &params,
+        Some(&key),
+    )
+    .await
+    {
+        tracing::warn!(error = %e, calculation = %name, "failed to enqueue the version migration");
+    }
+}
+
 pub(super) async fn activate<C: ConnectionTrait>(
     db: &C,
     script_id: Uuid,
