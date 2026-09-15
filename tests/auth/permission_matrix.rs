@@ -626,8 +626,6 @@ fn table() -> Table {
             ("POST", "/api/collection_events/stage"),
             ("POST", "/api/collection_events/stage_many"),
             ("POST", "/api/collection_events/{id}/recompute"),
-            ("POST", "/api/actions/event_audit"),
-            ("POST", "/api/actions/event_recompute"),
             ("POST", "/api/readings/edits/preview"),
             ("POST", "/api/readings/edits"),
             ("POST", "/api/readings/edits/{id}/rollback"),
@@ -671,6 +669,24 @@ fn table() -> Table {
             ("POST", "/api/actions/rebuild_alarm_events"),
         ],
     );
+    // Both audit routes refuse a scoped caller that names no site, which is the body's business and
+    // not the gate's: an audit over every project is outside a scoped token's access whatever the
+    // router allows. The probe names a site in the seed project, so the row tests the gate.
+    for declared in [
+        "/api/actions/event_audit",
+        "/api/actions/event_recompute",
+    ] {
+        t.add(
+            "POST",
+            declared,
+            declared.to_string(),
+            Capability::WriteData,
+            TokenAccess::Same,
+            Scope::Open,
+        );
+        t.with_body(serde_json::json!({ "site_id": SITE1_ID }));
+    }
+
     t.add(
         "POST",
         "/api/actions/compute_derived",
@@ -696,6 +712,7 @@ fn table() -> Table {
             ("GET", "/api/reprocessing_jobs/{id}/logs"),
             ("GET", "/api/tools"),
             ("GET", "/api/calculations/closure"),
+            ("GET", "/api/calculations/health"),
             ("GET", "/api/derived_parameters/{id}/dependents"),
             ("POST", "/api/tools/{tool_name}/calculate"),
             ("POST", "/api/readings/seasonal_check"),
