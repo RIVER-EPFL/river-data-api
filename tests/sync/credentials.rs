@@ -399,3 +399,58 @@ async fn a_service_speaks_for_the_source_system_its_credential_declares() {
         2
     );
 }
+
+/// Scenario: a portal sync service enrolled for METALP registers a stream claiming CNET's
+/// provenance.
+///
+/// Expected behaviour: refused, and nothing is written under the claimed system.
+/// `(source_system, source_key)` is the key a source holds its own rows by and the registration
+/// upserts on it, so an accepted claim would take over the other portal's stream, pairing and all.
+/// A service that names no system at all is fine: its declaration answers the question.
+#[tokio::test]
+#[serial]
+async fn a_service_cannot_register_another_portals_stream() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (app, _state) = crate::common::build_test_app_with_state(db.clone());
+    let (metalp_token, _) =
+        crate::common::seed_sync_session_token_declaring(&db, Some("metalp")).await;
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/streams/register",
+        &serde_json::json!({
+            "source_system": "cnet",
+            "source_key": "S01:DOC_ppb",
+            "source_name": "DOC at S01",
+        }),
+        &metalp_token,
+    )
+    .await;
+    assert_eq!(status, 403, "claiming another source ({status}): {body}");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*)::bigint AS c FROM data_streams WHERE source_system = 'cnet'"
+        )
+        .await,
+        0,
+        "nothing was written under the claimed system"
+    );
+
+    // Naming none, the declaration is what the row is keyed under.
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/streams/register",
+        &serde_json::json!({
+            "source_system": "",
+            "source_key": "S01:DOC_ppb",
+            "source_name": "DOC at S01",
+        }),
+        &metalp_token,
+    )
+    .await;
+    assert_eq!(status, 200, "its own source ({status}): {body}");
+    assert_eq!(body["source_system"], "metalp");
+}
