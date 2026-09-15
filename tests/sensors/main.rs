@@ -6,8 +6,9 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
-mod import_adopt_swap_lifecycle;
+mod adopt_swap_lifecycle;
 mod instrument_kinds;
+mod instrument_proposals;
 mod instruments_overview;
 mod lab_instrument_row;
 mod last_used_by_parameter;
@@ -15,6 +16,5 @@ mod list_latest_reading;
 mod manufacturer_range;
 mod multi_parameter_channel;
 mod read_endpoints;
-mod sensor_register;
 mod standard_curve_register;
 mod swap_reattributes;

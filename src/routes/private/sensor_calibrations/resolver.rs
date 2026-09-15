@@ -1,7 +1,7 @@
 //! The one answer to "which calibration covers this reading, and what does it do to the raw value".
 //!
-//! Every path that needs the answer, the write paths (`/ingest`, `/grab_samples`, stream import)
-//! and the set-based reprocess UPDATEs, ranks the candidate curves with the SQL
+//! Every path that needs the answer, the write paths (`/ingest`, `/grab_samples`) and the
+//! set-based reprocess UPDATEs, ranks the candidate curves with the SQL
 //! [`pick_calibration_query`] emits. There is one ranking, so a value stored at write time and the
 //! value a later reprocess would recompute are the same number by construction rather than by
 //! agreement between two hand-kept implementations.
@@ -20,18 +20,16 @@
 use chrono::{DateTime, Utc};
 use sea_orm::Order;
 use sea_orm::sea_query::{
-    Alias, Condition, Expr, ExprTrait as _, Func, IntoIden, IntoTableRef, JoinType,
-    PostgresQueryBuilder, Query as SeaQuery, SelectStatement, TableRef, UpdateStatement,
+    Alias, Expr, ExprTrait as _, Func, IntoIden, JoinType, PostgresQueryBuilder, Query as SeaQuery,
+    SelectStatement, TableRef,
 };
 
 use super::models as model;
-use crate::routes::private::readings::models as readings;
 use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use super::service::{Curve, calibrated_value};
-use crate::common::bulk_write;
+use super::service::Curve;
 use crate::error::AppResult;
 
 /// A `LATERAL` subquery selecting `(id, slope, intercept)` of the one calibration covering reading
@@ -219,114 +217,6 @@ pub async fn resolve_many<C: ConnectionTrait>(
         }
     }
     Ok(out)
-}
-
-/// Attribute a stream's readings to `sensor_id`, by window, and report how many that moved.
-///
-/// `POST /streams/{id}/import` adopts a stream's instrument into inventory; this is the readings
-/// half. Each reading takes the curve whose window covers its own time, not the sensor's newest
-/// curve, and is corrected with that curve's coefficients. No curve is created for the history being
-/// adopted: an instrument with none, or with none covering this stretch of time, is an ordinary
-/// state, and those readings simply keep what they had until a reprocess resolves them.
-///
-/// Since registration attaches an instrument and the insert trigger stamps every row from its
-/// stream, an unowned reading is the exception rather than the rule, so the row set is the stream's
-/// own rows and the count is what actually changed: a row newly owned, or one whose curve the
-/// window resolved differently. A second import reports nothing.
-///
-/// Spot rows take the owner and nothing else: a grab is corrected at entry (`/grab_samples`),
-/// against the base curve resolved then and the standard curve the operator picked, and re-stamping
-/// a windowed curve here would claim provenance the served value does not carry.
-pub async fn attribute_stream_by_window<C>(
-    db: &C,
-    stream_id: Uuid,
-    sensor_id: Uuid,
-) -> AppResult<u64>
-where
-    C: ConnectionTrait + sea_orm::TransactionTrait,
-{
-    let touched =
-        bulk_write::guarded_mutation(db, attribute_by_window_query(stream_id, sensor_id)).await?;
-    Ok(touched.rows)
-}
-
-/// The statement `attribute_stream_by_window` runs, built so its row set and its change predicate
-/// can be read without a database.
-fn attribute_by_window_query(stream_id: Uuid, sensor_id: Uuid) -> UpdateStatement {
-    let tgt = Alias::new("tgt");
-    let r = Alias::new("r");
-    let cw = Alias::new("cw");
-    let windowed = super::service::calibration_derivable("tgt");
-    let value = calibrated_value(
-        Expr::cust("tgt.raw_value"),
-        Expr::cust("picked.slope"),
-        Expr::cust("picked.intercept"),
-    );
-
-    // One row per reading of the stream, with the curve whose window covers its own time.
-    let picked = SeaQuery::select()
-        .expr_as(Expr::cust("r.stream_id"), Alias::new("p_stream_id"))
-        .expr_as(Expr::cust("r.time"), Alias::new("p_time"))
-        .expr_as(
-            Expr::cust("r.replicate_index"),
-            Alias::new("p_replicate_index"),
-        )
-        .expr_as(Expr::cust("cw.id"), Alias::new("cal_id"))
-        .expr(Expr::cust("cw.slope"))
-        .expr(Expr::cust("cw.intercept"))
-        .from_as(readings::Entity, r.clone())
-        .join_lateral(
-            JoinType::LeftJoin,
-            pick_calibration_query_owned(
-                Expr::cust_with_values("c.sensor_id = $1", [sensor_id]),
-                None,
-            ),
-            cw.clone(),
-            Condition::all().add(Expr::cust("true")),
-        )
-        .and_where(Expr::cust_with_values("r.stream_id = $1", [stream_id]))
-        .and_where(Expr::cust_with_values(
-            "(r.sensor_id IS NULL OR r.sensor_id = $1)",
-            [sensor_id],
-        ))
-        .take();
-
-    SeaQuery::update()
-        .table(readings::Entity.into_table_ref().alias(tgt))
-        .value(Alias::new("sensor_id"), sensor_id)
-        .value(
-            Alias::new("calibration_id"),
-            Expr::case(
-                windowed.clone(),
-                Expr::cust("COALESCE(picked.cal_id, tgt.calibration_id)"),
-            )
-            .finally(Expr::cust("tgt.calibration_id")),
-        )
-        .value(
-            Alias::new("calibrated_value"),
-            Expr::case(
-                Expr::cust("picked.cal_id IS NOT NULL").and(windowed.clone()),
-                value,
-            )
-            .finally(Expr::cust("tgt.calibrated_value")),
-        )
-        .from(TableRef::SubQuery(
-            Box::new(picked),
-            Alias::new("picked").into_iden(),
-        ))
-        .and_where(Expr::cust("tgt.stream_id = picked.p_stream_id"))
-        .and_where(Expr::cust("tgt.time = picked.p_time"))
-        .and_where(Expr::cust("tgt.replicate_index = picked.p_replicate_index"))
-        .and_where(
-            Expr::cust_with_values("tgt.sensor_id IS DISTINCT FROM $1", [sensor_id]).or(
-                Expr::cust("picked.cal_id IS NOT NULL")
-                    .and(windowed)
-                    .and(Expr::cust(
-                        "tgt.calibration_id IS DISTINCT FROM picked.cal_id",
-                    )),
-            ),
-        )
-        .take()
 }
 
 #[cfg(test)]

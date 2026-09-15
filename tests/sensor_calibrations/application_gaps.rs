@@ -49,10 +49,6 @@ const CONTINUOUS_TIME: &str = "2025-06-02T09:30:00Z";
 const SECOND_CURVE_FROM: &str = "2025-06-05T00:00:00Z";
 const MIXED_PARAMETER_TIME: &str = "2025-06-10T09:00:00Z";
 
-const EARLY_READING: &str = "2025-06-02T00:00:00Z";
-const LATE_READING: &str = "2025-06-12T00:00:00Z";
-const LATE_CURVE_FROM: &str = "2025-06-10T00:00:00Z";
-
 const WINDOW_START: &str = "2025-06-01T00:00:00Z";
 const WINDOW_END: &str = "2025-06-15T00:00:00Z";
 
@@ -221,21 +217,6 @@ impl Fixture {
             "create curve {slope}x+{intercept} from {valid_from} ({status}): {body}"
         );
         e2e::id_of(&body)
-    }
-
-    /// Every curve a sensor carries.
-    async fn calibrations_of(&self, sensor_id: &str) -> Vec<Value> {
-        let filter = e2e::percent_encode(&format!(r#"{{"sensor_id":"{sensor_id}"}}"#));
-        let (status, body) = get_json_with_token(
-            &self.app,
-            &format!("/api/sensor_calibrations?filter={filter}"),
-            &self.jwt,
-        )
-        .await;
-        assert_eq!(status, 200, "list curves of {sensor_id} ({status}): {body}");
-        body.as_array()
-            .unwrap_or_else(|| panic!("the calibration list is an array: {body}"))
-            .clone()
     }
 
     async fn calibration(&self, calibration: &str) -> Value {
@@ -689,121 +670,6 @@ async fn grab_readings_receive_their_resolved_curve() {
         continuous[0],
         25.0,
         "the continuous control is corrected by the same curve after the reprocess",
-    );
-}
-
-// importing a stream's instrument stamps each reading with the curve whose window covers it, and
-// leaves a reading no window covers uncorrected.
-#[tokio::test]
-#[serial]
-async fn stream_import_attributes_each_reading_to_its_covering_curve() {
-    if !crate::common::profile::Service::Keycloak
-        .require("stream_import_attributes_each_reading_to_its_covering_curve")
-        .await
-    {
-        return;
-    }
-    let f = onboard().await;
-    f.ingest(&f.stream, &[(EARLY_READING, 10.0), (LATE_READING, 10.0)])
-        .await;
-
-    let early_curve = f.create_curve(&f.parameter, 2.0, 5.0, CURVE_FROM).await;
-    let late_curve = f
-        .create_curve(&f.parameter, 3.0, 0.0, LATE_CURVE_FROM)
-        .await;
-    assert!(
-        sl::wait_for_reprocessing(&f.db, as_uuid(&f.sensor), WAIT).await,
-        "the curve creates settle before the import"
-    );
-
-    f.link(&f.stream).await;
-    let (status, imported) = post_json_parse_with_token(
-        &f.app,
-        &format!("/api/streams/{}/import", f.stream),
-        &json!({}),
-        &f.jwt,
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "import the stream's instrument ({status}): {imported}"
-    );
-    assert_eq!(
-        str_field(&imported, "sensor_id"),
-        f.sensor,
-        "import reuses the instrument the stream is linked to: {imported}"
-    );
-    assert_eq!(
-        imported["attributed"], 2,
-        "the stream is unpaired, so its readings were staged as they were written and the import \
-         is what stamps them: {imported}"
-    );
-
-    let rows = sl::get_readings(&f.db, as_uuid(&f.stream)).await;
-    assert_eq!(rows.len(), 2, "the stream holds both readings");
-    assert_eq!(
-        rows[0].calibration_id,
-        Some(as_uuid(&early_curve)),
-        "the June 2 reading carries the curve whose window covers it"
-    );
-    assert_eq!(
-        rows[1].calibration_id,
-        Some(as_uuid(&late_curve)),
-        "the June 12 reading carries the later curve, which does cover it"
-    );
-    for (i, row) in rows.iter().enumerate() {
-        assert_eq!(
-            row.sensor_id,
-            Some(as_uuid(&f.sensor)),
-            "row {i} is attributed to the imported instrument"
-        );
-    }
-
-    // A stream with no instrument mints one. The instrument is all it mints: an import adopts
-    // history, it does not decide how that history was corrected.
-    let fresh_stream = f.register("appgap-import-fresh").await;
-    f.ingest(&fresh_stream, &[(EARLY_READING, 20.0)]).await;
-    let (status, imported) = post_json_parse_with_token(
-        &f.app,
-        &format!("/api/streams/{fresh_stream}/import"),
-        &json!({}),
-        &f.jwt,
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "import a stream with no linked instrument ({status}): {imported}"
-    );
-    let fresh_sensor = str_field(&imported, "sensor_id");
-    assert_ne!(
-        fresh_sensor, f.sensor,
-        "a stream with no instrument mints its own: {imported}"
-    );
-    assert_eq!(
-        imported["attributed"], 1,
-        "the row was staged while the stream was unpaired, so the import stamps it with the \
-         instrument it adopts: {imported}"
-    );
-
-    let fresh_rows = sl::get_readings(&f.db, as_uuid(&fresh_stream)).await;
-    assert_eq!(fresh_rows.len(), 1, "the fresh stream holds its reading");
-    assert_eq!(
-        fresh_rows[0].sensor_id,
-        Some(as_uuid(&fresh_sensor)),
-        "the reading is attributed to the instrument the import created"
-    );
-    assert_eq!(
-        fresh_rows[0].calibration_id, None,
-        "which has no curve, so the reading names none"
-    );
-    assert_eq!(
-        fresh_rows[0].calibrated_value, None,
-        "and serves no corrected value"
-    );
-    assert_eq!(
-        f.calibrations_of(&fresh_sensor).await.len(),
-        0,
-        "and the import created no curve alongside the instrument"
     );
 }
 

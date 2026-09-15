@@ -36,33 +36,6 @@ fn test_source_instrument_name_falls_back_without_a_hint() {
 
 use super::*;
 
-#[test]
-fn claims_a_free_serial() {
-    assert_eq!(
-        serial_to_claim(Some("919402"), None),
-        Some("919402".to_string())
-    );
-}
-
-#[test]
-fn leaves_a_held_serial_alone() {
-    assert_eq!(serial_to_claim(Some("919402"), Some(Uuid::nil())), None);
-}
-
-#[test]
-fn treats_an_absent_or_blank_serial_as_none() {
-    assert_eq!(serial_to_claim(None, None), None);
-    assert_eq!(serial_to_claim(Some("   "), None), None);
-}
-
-#[test]
-fn trims_the_claimed_serial() {
-    assert_eq!(
-        serial_to_claim(Some(" 4000138 "), None),
-        Some("4000138".to_string())
-    );
-}
-
 /// Scenario: the instrument enrichment reads are built rather than written out.
 /// Expected behaviour: each keeps the shape that makes it cheap, so a renamed column fails the
 /// build and a lost window or `DISTINCT ON` fails here.

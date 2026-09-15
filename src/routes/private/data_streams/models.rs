@@ -305,24 +305,6 @@ fn default_metadata() -> serde_json::Value {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct ImportStreamRequest {
-    /// Legacy field, ignored: a sensor is imported parameter-free (parameter is bound at
-    /// deploy/grab time). Retained so existing callers keep deserializing.
-    #[serde(default)]
-    pub parameter_id: Option<Uuid>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ImportStreamResponse {
-    pub stream: DataStream,
-    pub sensor_id: Uuid,
-    /// Readings the import moved: newly owned by the instrument, or re-corrected because the
-    /// window resolved a different curve. Zero where the stream's rows already say what the import
-    /// would say, which is the ordinary case now that registration attaches an instrument.
-    pub attributed: u64,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
 pub struct PairStreamRequest {
     pub site_parameter_id: Uuid,
 }

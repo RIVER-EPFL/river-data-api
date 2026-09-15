@@ -118,7 +118,6 @@
 /sensor_calibrations/{id}/window => require_read_data
 /sensors/last_used => require_read_data
 /sensors/proposals => deny_scoped_token+require_admin_or_token_write_metadata
-/sensors/register => deny_scoped_token+require_admin_or_token_write_metadata
 /sensors/retag_frequency => deny_scoped_token+require_manage_sensors
 /sensors/{id}/curve_usage => require_read_data
 /sensors/{id}/deployment_bands => require_read_data
@@ -137,7 +136,6 @@
 /status_events/batch => require_write_data
 /streams/register => deny_scoped_token+require_admin_or_token_write_metadata
 /streams/retag => deny_scoped_token+require_admin_or_token_write_metadata
-/streams/{id}/import => deny_scoped_token+require_admin_or_token_write_metadata
 /streams/{id}/pair => deny_scoped_token+require_admin_or_token_write_metadata
 /streams/{id}/preview => require_read_metadata
 /streams/{id}/receipts => require_read_metadata

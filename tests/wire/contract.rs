@@ -10,7 +10,7 @@ use river_db::routes::private::data_streams::models::{
     ColumnAssignment, RegisterStreamRequest, ReplicateSpec,
 };
 use river_db::routes::private::notes::models::NoteItem;
-use river_db::routes::private::sensors::models::RegisterSensorRequest;
+use river_db::routes::private::sensors::models::ProposeInstrumentsRequest;
 use river_db::routes::private::standard_curves::models::RegisterStandardCurveRequest;
 
 fn at(s: &str) -> DateTime<Utc> {
@@ -30,9 +30,9 @@ fn refuses<D: serde::de::DeserializeOwned>(mut json: serde_json::Value) -> bool 
 }
 
 /// A client sends what core declares; the API adds only `source_system`, so everything the client
-/// can say about an instrument has to arrive through the flattened struct, cadence included.
+/// can say about an instrument has to arrive through core's struct, cadence included.
 #[test]
-fn an_instrument_registration_arrives_whole() {
+fn an_instrument_proposal_arrives_whole() {
     let sent = SensorUpsert {
         source_key: "sensor_inventory:62".to_string(),
         name: "DOC corr".to_string(),
@@ -44,37 +44,22 @@ fn an_instrument_registration_arrives_whole() {
         data_frequency: Some("low".to_string()),
         metadata: Some(json!({ "bench": 2 })),
     };
-    let mut body = serde_json::to_value(&sent).expect("the upsert serialises");
-    body["source_system"] = json!("cnet");
-    let got: RegisterSensorRequest = serde_json::from_value(body).expect("the API reads it");
+    let body = json!({ "source_system": "cnet", "instruments": [sent] });
+    let got: ProposeInstrumentsRequest = serde_json::from_value(body).expect("the API reads it");
 
     assert_eq!(got.source_system, "cnet");
-    assert_eq!(got.instrument.source_key, sent.source_key);
-    assert_eq!(got.instrument.name, sent.name);
-    assert_eq!(got.instrument.serial_number, sent.serial_number);
-    assert_eq!(got.instrument.manufacturer, sent.manufacturer);
-    assert_eq!(got.instrument.model, sent.model);
-    assert_eq!(got.instrument.notes, sent.notes);
-    assert_eq!(got.instrument.is_lab_instrument, sent.is_lab_instrument);
-    assert_eq!(got.instrument.data_frequency.as_deref(), Some("low"));
-    assert_eq!(got.instrument.metadata, sent.metadata);
-}
-
-/// Core requires the flag; this route has always let a caller omit it, and tightening the wire to
-/// adopt core's struct would refuse registrations that work today.
-#[test]
-fn an_instrument_registration_may_omit_the_lab_flag() {
-    let got: RegisterSensorRequest = serde_json::from_value(json!({
-        "source_system": "metalp",
-        "source_key": "sensor_inventory:7",
-        "name": "TURB probe",
-    }))
-    .expect("the API reads a registration without the flag");
-    assert!(!got.instrument.is_lab_instrument);
-    assert_eq!(
-        got.instrument.data_frequency, None,
-        "an undeclared cadence stays undeclared; the route resolves its own default"
-    );
+    let [got] = got.instruments.as_slice() else {
+        panic!("one instrument arrives");
+    };
+    assert_eq!(got.source_key, sent.source_key);
+    assert_eq!(got.name, sent.name);
+    assert_eq!(got.serial_number, sent.serial_number);
+    assert_eq!(got.manufacturer, sent.manufacturer);
+    assert_eq!(got.model, sent.model);
+    assert_eq!(got.notes, sent.notes);
+    assert_eq!(got.is_lab_instrument, sent.is_lab_instrument);
+    assert_eq!(got.data_frequency.as_deref(), Some("low"));
+    assert_eq!(got.metadata, sent.metadata);
 }
 
 /// A curve's `notes` is one of the three fields that had drifted: the API held the column and core
@@ -187,13 +172,24 @@ fn a_replicate_declaration_carries_no_assignments() {
     assert_eq!(declared.source_columns, stored.declared.source_columns);
 }
 
-/// Reaching a core struct through a flattened wrapper must not lose its refusal: unknown fields
-/// are refused, not dropped, on every write-path request that carried the attribute.
+/// Carrying a core struct inside a request body must not lose its refusal: unknown fields are
+/// refused, not dropped, on every write-path request that carried the attribute.
 #[test]
 fn the_receivers_that_refuse_an_unknown_field() {
-    assert!(refuses::<RegisterSensorRequest>(json!({
-        "source_system": "cnet", "source_key": "sensor_inventory:62", "name": "DOC corr",
+    assert!(refuses::<ProposeInstrumentsRequest>(json!({
+        "source_system": "cnet", "instruments": [],
     })));
+    assert!(
+        serde_json::from_value::<ProposeInstrumentsRequest>(json!({
+            "source_system": "cnet",
+            "instruments": [{
+                "source_key": "sensor_inventory:62", "name": "DOC corr",
+                "is_lab_instrument": false, "a_field_the_sender_gained": 1,
+            }],
+        }))
+        .is_err(),
+        "an unknown field inside a proposed instrument is refused, not dropped"
+    );
     assert!(refuses::<NoteItem>(json!({
         "source_key": "notes:1", "site_name": "FP1", "text": "x", "verified": false,
     })));

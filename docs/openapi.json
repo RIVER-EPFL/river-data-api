@@ -8649,42 +8649,6 @@
         ],
         "type": "object"
       },
-      "ImportStreamRequest": {
-        "properties": {
-          "parameter_id": {
-            "description": "Legacy field, ignored: a sensor is imported parameter-free (parameter is bound at\ndeploy/grab time). Retained so existing callers keep deserializing.",
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
-      "ImportStreamResponse": {
-        "properties": {
-          "attributed": {
-            "description": "Readings the import moved: newly owned by the instrument, or re-corrected because the\nwindow resolved a different curve. Zero where the stream's rows already say what the import\nwould say, which is the ordinary case now that registration attaches an instrument.",
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "sensor_id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "stream": {
-            "$ref": "#/components/schemas/DataStream"
-          }
-        },
-        "required": [
-          "stream",
-          "sensor_id",
-          "attributed"
-        ],
-        "type": "object"
-      },
       "IngestReading": {
         "additionalProperties": false,
         "properties": {
@@ -17071,52 +17035,6 @@
           "endpoint",
           "p256dh",
           "auth"
-        ],
-        "type": "object"
-      },
-      "RegisterSensorRequest": {
-        "allOf": [
-          {
-            "$ref": "#/components/schemas/SensorUpsert"
-          },
-          {
-            "properties": {
-              "source_system": {
-                "description": "The sync source the instrument comes from, e.g. \"metalp\".",
-                "type": "string"
-              }
-            },
-            "required": [
-              "source_system"
-            ],
-            "type": "object"
-          }
-        ],
-        "description": "One instrument from a source's own register. The instrument's own fields are\n`river_data_core::models::SensorUpsert`, which the sync services build from; the API adds the\nsource the caller is speaking for, and supplies the `is_lab_instrument` default this route has\nalways accepted an omitted flag under."
-      },
-      "RegisterSensorResponse": {
-        "properties": {
-          "created": {
-            "description": "False when the provenance key already named an instrument, in which case nothing on it was\nchanged.",
-            "type": "boolean"
-          },
-          "id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "serial_claimed_by": {
-            "description": "The instrument already holding the serial this registration offered, when that is why the\nserial was not claimed. The source's register is wrong or the two rows are one instrument;\neither way it is a person's call, so the registration succeeds and says so.",
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "id",
-          "created",
-          "serial_claimed_by"
         ],
         "type": "object"
       },
@@ -42013,38 +41931,6 @@
         ]
       }
     },
-    "/api/sensors/register": {
-      "post": {
-        "description": "A source that has no stream for an instrument has no other way to introduce it: every other\ninstrument in the system is minted as a side effect of registering the stream that names it.\nA portal's instrument register is exactly that case, so this is its wire.",
-        "operationId": "register_sensor",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RegisterSensorRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RegisterSensorResponse"
-                }
-              }
-            },
-            "description": "Instrument registered (created or already present)"
-          }
-        },
-        "summary": "Upsert an instrument by provenance. Requires `write_metadata` (sync session tokens carry it).",
-        "tags": [
-          "sensors"
-        ]
-      }
-    },
     "/api/sensors/retag_frequency": {
       "post": {
         "operationId": "retag_frequency",
@@ -45600,52 +45486,6 @@
           }
         },
         "summary": "Classify data streams' measurement_type in bulk, the sensorless-stream counterpart of\n`POST /sensors/retag_frequency` (portal imports like metalp/nomis carry no sensor to hang the\nclassification on). Requires `write_metadata`.",
-        "tags": [
-          "streams"
-        ]
-      }
-    },
-    "/api/streams/{id}/import": {
-      "post": {
-        "operationId": "import_stream",
-        "parameters": [
-          {
-            "description": "Stream UUID",
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ImportStreamRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ImportStreamResponse"
-                }
-              }
-            },
-            "description": "Sensor imported; attribution count returned"
-          },
-          "404": {
-            "description": "Stream not found"
-          }
-        },
-        "summary": "Import a stream's sensor into inventory WITHOUT deploying it to a site. Creates or reuses the\nsensor by serial number alone (import is parameter-free; a parameter is bound at deploy or grab\ntime), links it to the stream, and stamps `sensor_id` plus whichever curve covers each reading\non the stream's site-less readings (an instrument with no curve leaves them uncorrected; the\nreadings stay un-attributed to any site until an explicit adopt). Idempotent: re-import reuses\nthe same sensor and only fills readings missing this attribution. Requires `write_metadata`.",
         "tags": [
           "streams"
         ]

@@ -498,44 +498,6 @@ pub struct SensorDeploymentBandsResponse {
     pub bands: Vec<SensorDeploymentBand>,
 }
 
-/// One instrument from a source's own register. The instrument's own fields are
-/// `river_data_core::models::SensorUpsert`, which the sync services build from; the API adds the
-/// source the caller is speaking for, and supplies the `is_lab_instrument` default this route has
-/// always accepted an omitted flag under.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct RegisterSensorRequest {
-    /// The sync source the instrument comes from, e.g. "metalp".
-    pub source_system: String,
-    #[serde(flatten)]
-    pub instrument: river_data_core::models::SensorUpsert,
-}
-
-impl<'de> Deserialize<'de> for RegisterSensorRequest {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let (source_system, instrument) = crate::routes::private::wire::with_source_system(
-            deserializer,
-            &[("is_lab_instrument", serde_json::json!(false))],
-        )?;
-        Ok(Self {
-            source_system,
-            instrument,
-        })
-    }
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct RegisterSensorResponse {
-    pub id: Uuid,
-    /// False when the provenance key already named an instrument, in which case nothing on it was
-    /// changed.
-    pub created: bool,
-    /// The instrument already holding the serial this registration offered, when that is why the
-    /// serial was not claimed. The source's register is wrong or the two rows are one instrument;
-    /// either way it is a person's call, so the registration succeeds and says so.
-    #[schema(required)]
-    pub serial_claimed_by: Option<Uuid>,
-}
-
 /// A source's whole instrument register, offered for a plan to admit.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]

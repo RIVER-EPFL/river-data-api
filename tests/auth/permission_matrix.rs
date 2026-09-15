@@ -583,12 +583,10 @@ fn table() -> Table {
         &[
             ("POST", "/api/streams/register"),
             ("POST", "/api/standard_curves/register"),
-            ("POST", "/api/sensors/register"),
             ("POST", "/api/sensors/proposals"),
             ("POST", "/api/notes/register"),
             ("POST", "/api/annotations/register"),
             ("POST", "/api/streams/retag"),
-            ("POST", "/api/streams/{id}/import"),
             ("POST", "/api/streams/{id}/pair"),
             ("POST", "/api/streams/{id}/unpair"),
         ],

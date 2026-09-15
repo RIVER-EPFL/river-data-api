@@ -36,7 +36,6 @@ use crate::routes::private::standard_curves;
 use crate::routes::private::{data_streams, parameters, sensors, site_parameters, sites};
 
 use super::models::*;
-use super::service::*;
 
 /// Resolve the `(site, parameter)` site_parameter, creating it when missing (if allowed). Mirrors
 /// the sync path's helper so an adopted sensor's data lands under the same junction config.
@@ -1516,103 +1515,6 @@ pub async fn get_sensor_deployment_bands(
         .collect::<AppResult<Vec<_>>>()?;
 
     Ok(Json(SensorDeploymentBandsResponse { sensor_id, bands }))
-}
-
-/// The cadence a registration declares, or the default this route has always applied.
-fn declared_frequency(instrument: &river_data_core::models::SensorUpsert) -> &str {
-    instrument.data_frequency.as_deref().unwrap_or("high")
-}
-
-async fn serial_holder<C: ConnectionTrait>(db: &C, serial: &str) -> AppResult<Option<Uuid>> {
-    Ok(sensors::Entity::find()
-        .filter(sensors::Column::SerialNumber.eq(serial))
-        .one(db)
-        .await?
-        .map(|s| s.id))
-}
-
-/// Upsert an instrument by provenance. Requires `write_metadata` (sync session tokens carry it).
-///
-/// A source that has no stream for an instrument has no other way to introduce it: every other
-/// instrument in the system is minted as a side effect of registering the stream that names it.
-/// A portal's instrument register is exactly that case, so this is its wire.
-#[utoipa::path(
-    post,
-    path = "/api/sensors/register",
-    request_body = RegisterSensorRequest,
-    responses(
-        (status = 200, description = "Instrument registered (created or already present)", body = RegisterSensorResponse),
-    ),
-    tag = "sensors"
-)]
-pub async fn register_sensor(
-    State(state): State<AppState>,
-    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
-    Json(payload): Json<RegisterSensorRequest>,
-) -> AppResult<Json<RegisterSensorResponse>> {
-    let source_system = crate::common::provenance::source_system(&auth, &payload.source_system)?;
-    let instrument = &payload.instrument;
-    if instrument.source_key.trim().is_empty() {
-        return Err(AppError::BadRequest(
-            "source_key identifies the instrument and cannot be empty".to_string(),
-        ));
-    }
-    let data_frequency = declared_frequency(instrument);
-    if !matches!(data_frequency, "high" | "low") {
-        return Err(AppError::BadRequest(format!(
-            "data_frequency must be 'high' or 'low', got '{data_frequency}'"
-        )));
-    }
-
-    let existing = sensors::Entity::find()
-        .filter(sensors::Column::SourceSystem.eq(source_system.clone()))
-        .filter(sensors::Column::SourceKey.eq(instrument.source_key.clone()))
-        .one(&state.db)
-        .await?;
-    if let Some(current) = existing {
-        return Ok(Json(RegisterSensorResponse {
-            id: current.id,
-            created: false,
-            serial_claimed_by: None,
-        }));
-    }
-
-    let id = upsert_source_instrument(
-        &state.db,
-        &source_system,
-        &instrument.source_key,
-        &instrument.name,
-        if instrument.is_lab_instrument {
-            InstrumentKind::Lab
-        } else {
-            InstrumentKind::Device
-        },
-        data_frequency,
-        instrument.metadata.clone(),
-    )
-    .await?;
-
-    let held_by = match instrument.serial_number.as_deref().map(str::trim) {
-        Some(s) if !s.is_empty() => serial_holder(&state.db, s).await?,
-        _ => None,
-    };
-    let serial = serial_to_claim(instrument.serial_number.as_deref(), held_by);
-
-    let mut active = sensors::ActiveModel {
-        id: Set(id),
-        ..Default::default()
-    };
-    active.serial_number = Set(serial);
-    active.manufacturer = Set(instrument.manufacturer.clone());
-    active.model = Set(instrument.model.clone());
-    active.notes = Set(instrument.notes.clone());
-    active.update(&state.db).await?;
-
-    Ok(Json(RegisterSensorResponse {
-        id,
-        created: true,
-        serial_claimed_by: held_by,
-    }))
 }
 
 /// Store a source's instrument register as proposals. Requires `write_metadata`.

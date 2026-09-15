@@ -14,10 +14,10 @@ use uuid::Uuid;
 use super::flows::retire_slot;
 use super::models::receipts;
 use super::models::{
-    ImportStreamRequest, ImportStreamResponse, PairStreamRequest, PairStreamResponse,
-    PreviewInstant, PreviewReplicate, ReceiptRow, ReceiptsQuery, ReceiptsResponse,
-    RegisterStreamRequest, RetagStreamsRequest, RetagStreamsResponse, SlotScope,
-    StreamPreviewResponse, StreamStatsResponse, UnpairStreamResponse,
+    PairStreamRequest, PairStreamResponse, PreviewInstant, PreviewReplicate, ReceiptRow,
+    ReceiptsQuery, ReceiptsResponse, RegisterStreamRequest, RetagStreamsRequest,
+    RetagStreamsResponse, SlotScope, StreamPreviewResponse, StreamStatsResponse,
+    UnpairStreamResponse,
 };
 use super::service::{
     PreviewRow, StoredStreamStats, latest_raw_value_query, preview_estimator, preview_query,
@@ -30,7 +30,6 @@ use crate::common::paging::Window;
 use crate::common::scope;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::data_streams::DataStream;
-use crate::routes::private::sensor_calibrations;
 use crate::routes::private::sensors;
 use crate::routes::private::sensors::service::{
     close_sensor_deployment, create_sensor_for_stream, extract_vaisala_device_serial,
@@ -486,60 +485,6 @@ pub async fn validate_declared_sensor(
     Ok(())
 }
 
-/// Import a stream's sensor into inventory WITHOUT deploying it to a site. Creates or reuses the
-/// sensor by serial number alone (import is parameter-free; a parameter is bound at deploy or grab
-/// time), links it to the stream, and stamps `sensor_id` plus whichever curve covers each reading
-/// on the stream's site-less readings (an instrument with no curve leaves them uncorrected; the
-/// readings stay un-attributed to any site until an explicit adopt). Idempotent: re-import reuses
-/// the same sensor and only fills readings missing this attribution. Requires `write_metadata`.
-#[utoipa::path(
-    post,
-    path = "/api/streams/{id}/import",
-    params(("id" = Uuid, Path, description = "Stream UUID")),
-    request_body = ImportStreamRequest,
-    responses(
-        (status = 200, description = "Sensor imported; attribution count returned", body = ImportStreamResponse),
-        (status = 404, description = "Stream not found"),
-    ),
-    tag = "streams"
-)]
-pub async fn import_stream(
-    State(state): State<AppState>,
-    Path(stream_id): Path<Uuid>,
-    Json(_payload): Json<ImportStreamRequest>,
-) -> AppResult<Json<ImportStreamResponse>> {
-    use crate::routes::private::sensors::service::import_sensor_for_stream;
-    let db = &state.db;
-
-    let stream = data_streams::Entity::find_by_id(stream_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
-
-    // Import is parameter-free: a sensor is a device, its parameter is bound at deploy/grab time.
-    let ctx = import_sensor_for_stream(db, &stream, None).await?;
-
-    // Stamp sensor/calibration on site-less readings only; do NOT touch
-    // site_id/parameter_id/deployment_id (those are set at adopt). Idempotent.
-    //
-    // Each reading takes the curve whose window covers its OWN time, not the sensor's newest one,
-    // so an import of deep history does not stamp today's curve across all of it.
-    let attributed =
-        sensor_calibrations::resolver::attribute_stream_by_window(db, stream_id, ctx.sensor_id)
-            .await?;
-
-    let updated = data_streams::Entity::find_by_id(stream_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| AppError::Internal("Failed to fetch updated stream".to_string()))?;
-
-    Ok(Json(ImportStreamResponse {
-        stream: super::service::with_assignments(updated),
-        sensor_id: ctx.sensor_id,
-        attributed,
-    }))
-}
-
 /// A claim that waited out `lock_timeout` is another request pairing the same stream, which is a
 /// conflict the caller can retry, not a server fault.
 fn claim_error(e: sea_orm::DbErr) -> AppError {
@@ -893,7 +838,6 @@ pub fn read_routes() -> Router<AppState> {
 pub fn write_routes() -> Router<AppState> {
     Router::new()
         .route("/streams/retag", post(retag_streams))
-        .route("/streams/{id}/import", post(import_stream))
         .route("/streams/{id}/pair", post(pair_stream))
         .route("/streams/{id}/unpair", post(unpair_stream))
         .layer(middleware::from_fn(

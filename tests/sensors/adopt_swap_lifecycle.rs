@@ -1,6 +1,6 @@
-//! Import vs Adopt vs Swap (Phase 2): a stream's sensor is imported into inventory without a site,
-//! then explicitly adopted to a site slot (which backfills its readings by window), the slot is
-//! single-occupancy, and a swap ends one sensor and starts another at the same instant.
+//! Adopt vs Swap (Phase 2): an instrument that owns a stream's readings but no site is explicitly
+//! adopted to a site slot (which backfills its readings by window), the slot is single-occupancy,
+//! and a swap ends one sensor and starts another at the same instant.
 //!
 //! Run: cargo test --test sensors -- --test-threads=1
 
@@ -9,38 +9,40 @@ use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 use uuid::Uuid;
 
-/// Create an UNPAIRED stream (no site_parameter, no sensor) with site-less readings.
-async fn seed_unpaired_stream(db: &sea_orm::DatabaseConnection, source_key: &str) -> Uuid {
+/// A stream owned by `sensor_id` and paired to nothing: its readings carry the instrument but no
+/// site, which is the state an adopt exists to resolve.
+async fn seed_unadopted_stream(
+    db: &sea_orm::DatabaseConnection,
+    source_key: &str,
+    sensor_id: Uuid,
+) -> Uuid {
     let stream = Uuid::new_v4();
     crate::common::exec(
         db,
         &format!(
-            // Explicitly instrument-less: the harness defaults `sensor_id` to the fixture
-            // instrument, and this stream is the state an import exists to repair.
             "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active, sensor_id) \
-             VALUES ('{stream}', 'test', '{source_key}', 'Imp {source_key}', true, NULL)"
+             VALUES ('{stream}', 'test', '{source_key}', 'Imp {source_key}', true, '{sensor_id}')"
         ),
     )
     .await;
-    // The rows predate the instrument rule, which is the state an import exists to repair and the
-    // only way to reach it: nothing writes an unattributed reading any more.
-    let rows: Vec<String> = (0..6)
-        .map(|i| {
-            format!(
-                "INSERT INTO readings (stream_id, time, raw_value, replicate_index) \
-                 VALUES ('{stream}', '2025-06-01T00:{:02}:00Z', {}, 0)",
+    for i in 0..6 {
+        crate::common::exec(
+            db,
+            &format!(
+                "INSERT INTO readings (stream_id, time, raw_value, replicate_index, sensor_id) \
+                 VALUES ('{stream}', '2025-06-01T00:{:02}:00Z', {}, 0, '{sensor_id}')",
                 i * 10,
                 10.0 + f64::from(i)
-            )
-        })
-        .collect();
-    crate::common::db::seed_before_instrument_rule(db, &rows).await;
+            ),
+        )
+        .await;
+    }
     stream
 }
 
 #[tokio::test]
 #[serial]
-async fn import_then_adopt_backfills_by_window() {
+async fn adopt_backfills_by_window() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     sl::seed_base_entities(&db).await;
@@ -49,56 +51,19 @@ async fn import_then_adopt_backfills_by_window() {
     let site1 = Uuid::parse_str(crate::common::SITE1_ID).unwrap();
     let temp = Uuid::parse_str(crate::common::GLOBAL_PARAM_TEMP_ID).unwrap();
 
-    let stream = seed_unpaired_stream(&db, "import-adopt").await;
-
-    // IMPORT: sensor created, readings get sensor_id but NO site/deployment.
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        &format!("/api/streams/{stream}/import"),
-        &serde_json::json!({ "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID }),
-        &token,
-    )
-    .await;
-    assert!((200..300).contains(&status), "import ({status}): {body}");
-    let imp: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(
-        imp["attributed"].as_u64().unwrap(),
-        6,
-        "all six readings attributed"
-    );
-    let sensor_id = imp["sensor_id"].as_str().unwrap().to_string();
-
-    // The rule holds again only if the import left nothing unattributed behind.
-    crate::common::db::assert_instrument_rule_holds(&db).await;
+    let sensor = sl::create_sensor(&db, "adopt-backfill", crate::common::GLOBAL_PARAM_TEMP_ID).await;
+    let sensor_id = sensor.id;
+    let stream = seed_unadopted_stream(&db, "adopt-backfill", sensor_id).await;
 
     let rows = sl::get_readings(&db, stream).await;
     assert_eq!(rows.len(), 6);
     for r in &rows {
-        assert!(r.sensor_id.is_some(), "import stamps sensor_id");
-        assert_eq!(r.site_id, None, "import does NOT attribute to a site");
-        assert_eq!(r.deployment_id, None, "import does NOT deploy");
+        assert!(r.sensor_id.is_some(), "the instrument owns its readings");
+        assert_eq!(r.site_id, None, "nothing is attributed to a site yet");
+        assert_eq!(r.deployment_id, None, "nothing is deployed yet");
     }
-    // Re-import is idempotent.
-    let (_s, body2) = crate::common::post_json_with_token(
-        &app,
-        &format!("/api/streams/{stream}/import"),
-        &serde_json::json!({ "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID }),
-        &token,
-    )
-    .await;
-    let imp2: serde_json::Value = serde_json::from_str(&body2).unwrap();
-    assert_eq!(
-        imp2["attributed"].as_u64().unwrap(),
-        0,
-        "re-import attributes nothing new"
-    );
-    assert_eq!(
-        imp2["sensor_id"].as_str().unwrap(),
-        sensor_id,
-        "same sensor reused"
-    );
 
-    // ADOPT: deploy from before the first reading → reprocess backfills site + deployment + parameter.
+    // ADOPT: deploy from before the first reading -> reprocess backfills site + deployment + parameter.
     let (status, body) = crate::common::post_json_with_token(
         &app,
         &format!("/api/sensors/{sensor_id}/adopt"),

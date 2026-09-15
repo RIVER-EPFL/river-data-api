@@ -1041,15 +1041,6 @@ async fn slot_instrument_name<C: ConnectionTrait>(
     Ok(Some(format!("{} {}", row.site_name, row.parameter_name)))
 }
 
-/// Import-only: create or reuse the instrument for a stream and resolve its latest calibration,
-/// WITHOUT deploying it to a site. The "imported, not adopted" state: readings get `sensor_id`
-/// (and the instrument's latest curve, if it has one) but no `deployment_id`/`site_id` until an
-/// explicit adopt. Idempotent: reuses the stream's linked instrument, else the one already holding
-/// the stream's channel identity, else mints it (race-safe via [`upsert_source_instrument`]).
-/// Updates `data_streams.sensor_id`.
-///
-/// `name_hint` is the slot name when the caller knows which slot the stream is being paired to;
-/// the import endpoint has no slot yet and passes `None`.
 /// The frequency a device feed's instrument is minted at. The stream's own declaration is the
 /// evidence: a device reporting one reading per visit declares `spot`, and an undeclared stream
 /// is a logger.
@@ -1060,6 +1051,12 @@ pub(super) fn device_frequency(measurement_type: Option<&str>) -> &'static str {
     "high"
 }
 
+/// Create or reuse the device instrument feeding a stream, WITHOUT deploying it to a site: the
+/// readings get `sensor_id` but no `deployment_id`/`site_id` until an explicit adopt. Idempotent:
+/// reuses the stream's linked instrument, else mints it (race-safe via
+/// [`upsert_source_instrument`]). Updates `data_streams.sensor_id`.
+///
+/// `name_hint` is the slot name when the caller knows which slot the stream is being paired to.
 pub async fn import_sensor_for_stream<C: ConnectionTrait>(
     db: &C,
     stream: &data_streams::Model,
@@ -1483,22 +1480,6 @@ pub async fn raise_source_identity_hold<C: ConnectionTrait>(
         },
     )
     .await
-}
-
-/// The three window queries this module makes, each as the row its SELECT returns.
-/// Which serial a newly minted instrument may claim.
-///
-/// `idx_sensors_serial_unique` is partial and unique, so a serial already on another row cannot be
-/// written to this one. The registration is not refused over it: the source's register is what it
-/// is (METALP's has `919402` on two stations' turbidity probes), and losing the whole instrument
-/// over a duplicated serial would be worse than storing it without one.
-#[must_use]
-pub fn serial_to_claim(offered: Option<&str>, held_by: Option<Uuid>) -> Option<String> {
-    let offered = offered.map(str::trim).filter(|s| !s.is_empty())?;
-    match held_by {
-        Some(_) => None,
-        None => Some(offered.to_string()),
-    }
 }
 
 #[cfg(test)]

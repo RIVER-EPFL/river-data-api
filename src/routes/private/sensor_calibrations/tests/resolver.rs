@@ -1,4 +1,5 @@
 use super::*;
+use crate::routes::private::sensor_calibrations::service::calibrated_value;
 
 /// The ranking, rendered, so a test can read what a caller's statement carries.
 fn pick_sql(sensor_expr: &str) -> String {
@@ -10,29 +11,6 @@ fn expr_sql(e: Expr) -> String {
     use sea_orm::sea_query::{PostgresQueryBuilder, Query};
     let sql = Query::select().expr(e).to_string(PostgresQueryBuilder);
     sql.trim_start_matches("SELECT ").to_owned()
-}
-
-#[test]
-fn the_import_reads_the_streams_own_rows_and_writes_only_what_moves() {
-    let stream = uuid::Uuid::from_u128(1);
-    let sensor = uuid::Uuid::from_u128(2);
-    let sql = super::attribute_by_window_query(stream, sensor)
-        .to_string(sea_orm::sea_query::PostgresQueryBuilder);
-    assert!(
-        sql.contains(&format!(
-            "r.stream_id = '{stream}') AND ((r.sensor_id IS NULL OR r.sensor_id = '{sensor}')"
-        )),
-        "the row set is the stream's unowned rows and the ones this instrument already owns: \
-         {sql}"
-    );
-    assert!(
-        sql.contains(&format!("tgt.sensor_id IS DISTINCT FROM '{sensor}'")),
-        "a row already owned is only rewritten for its curve: {sql}"
-    );
-    assert!(
-        sql.contains("tgt.calibration_id IS DISTINCT FROM picked.cal_id"),
-        "so the count reports rows that moved rather than rows that matched: {sql}"
-    );
 }
 
 #[test]
