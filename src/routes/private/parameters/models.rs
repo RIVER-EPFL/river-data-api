@@ -31,7 +31,7 @@ pub struct Model {
     pub category: String,
     #[crudcrate(sortable)]
     pub description: Option<String>,
-    #[crudcrate(filterable)]
+    #[crudcrate(filterable, on_create = Vec::new())]
     pub aliases: Vec<String>,
     /// Set on catalog entries created mechanically (the analyte seed); cleared by a manager
     /// confirming or merging the parameter.

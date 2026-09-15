@@ -7,5 +7,6 @@
 mod common;
 
 mod change_audit;
+mod create_without_aliases;
 mod given_up_output;
 mod groups;

@@ -15,7 +15,7 @@ use sea_orm::{
     FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
@@ -3874,6 +3874,13 @@ pub async fn apply_plan(
         .map(|p| (p.id, p.name))
         .collect();
 
+    let accepted_objects: HashSet<String> = plan
+        .accepted_objects
+        .0
+        .iter()
+        .map(|a| a.key.clone())
+        .collect();
+
     let mut caches = EntityCaches {
         projects: HashMap::new(),
         groups: HashMap::new(),
@@ -3951,9 +3958,15 @@ pub async fn apply_plan(
             counters.streams_skipped += 1;
             continue;
         }
-        let (site_parameter_id, parameter_id) =
-            resolve_plan_entry(&txn, entry, &plan.source_system, &mut caches, &mut counters)
-                .await?;
+        let (site_parameter_id, parameter_id) = resolve_plan_entry(
+            &txn,
+            entry,
+            &plan.source_system,
+            &mut caches,
+            &mut counters,
+            &accepted_objects,
+        )
+        .await?;
         let instrument_id = entry
             .instrument
             .as_ref()
@@ -4076,6 +4089,7 @@ pub(super) async fn resolve_plan_entry<C: ConnectionTrait>(
     source_system: &str,
     caches: &mut EntityCaches,
     counters: &mut ApplyCounters,
+    accepted_objects: &HashSet<String>,
 ) -> AppResult<(Uuid, Uuid)> {
     let project_id = resolve_or_create_project(
         txn,
@@ -4100,6 +4114,7 @@ pub(super) async fn resolve_plan_entry<C: ConnectionTrait>(
         &mut caches.params,
         &mut caches.param_names,
         &mut counters.params_created,
+        accepted_objects,
     )
     .await?;
     if let Some(group) = entry.parameter.group.as_ref() {
@@ -5464,6 +5479,7 @@ pub(super) async fn resolve_or_create_param(
     cache: &mut HashMap<String, Uuid>,
     param_names: &mut HashMap<Uuid, String>,
     created_count: &mut u32,
+    accepted_objects: &HashSet<String>,
 ) -> AppResult<Uuid> {
     if let Some(id) = param_ref.id {
         return Ok(id);
@@ -5528,8 +5544,7 @@ pub(super) async fn resolve_or_create_param(
             .unwrap_or_else(|| param_ref.name.clone())),
         default_units: Set(param_ref.units.clone()),
         category: Set(category),
-        // Mechanically created from a sync source; a manager confirms or merges it later.
-        needs_review: Set(true),
+        needs_review: Set(minted_param_needs_review(accepted_objects, &param_ref.name)),
         description: Set(None),
         aliases: Set(aliases),
         created_at: Set(Some(Utc::now())),
@@ -5540,6 +5555,15 @@ pub(super) async fn resolve_or_create_param(
     cache.insert(key, id);
     param_names.insert(id, param_ref.name.clone());
     Ok(id)
+}
+
+/// Whether a parameter this apply mints is still waiting on a manager.
+///
+/// The review accepts each object the plan creates before the apply is allowed to run, and that
+/// acceptance is the review the flag asks for. A mint no acceptance covers is mechanical, and
+/// stays flagged.
+pub(super) fn minted_param_needs_review(accepted_objects: &HashSet<String>, name: &str) -> bool {
+    !accepted_objects.contains(&format!("parameter:{name}"))
 }
 
 pub(super) fn infer_category(_name: &str) -> String {

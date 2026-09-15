@@ -1,11 +1,11 @@
 use super::{
     BulkWhere, EntityCatalog, InstrumentCatalog, InstrumentNameConflict, PlanCalculationRef,
     PlanEntry, PlanGroupRef, apply_bulk_action, apply_group_updates, family_parameter_suggestion,
-    group_code, plan_calculation, proposal_conflict, resolve_parameter_instrument, select_entries,
-    stream_instrument_key,
+    group_code, minted_param_needs_review, plan_calculation, proposal_conflict,
+    resolve_parameter_instrument, select_entries, stream_instrument_key,
 };
 use crate::routes::private::sync::models::PlanEntryUpdate;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 fn catalog(entries: &[(&str, Uuid)]) -> InstrumentCatalog {
@@ -529,5 +529,23 @@ fn test_a_blank_group_description_clears_it() {
     assert_eq!(
         entries[0].parameter.group.as_ref().unwrap().description,
         None
+    );
+}
+
+/// The review's acceptance of the object is the review the flag asks for, so an accepted mint
+/// lands clear and one nobody accepted stays flagged.
+#[test]
+fn test_minted_param_needs_review_follows_the_accepted_objects() {
+    let accepted: HashSet<String> = ["parameter:Turbidity".to_string()].into_iter().collect();
+
+    assert!(!minted_param_needs_review(&accepted, "Turbidity"));
+    assert!(minted_param_needs_review(&accepted, "CDOM"));
+    assert!(
+        minted_param_needs_review(&accepted, "turbidity"),
+        "the key is the name the review card carried, matched as it was written"
+    );
+    assert!(
+        minted_param_needs_review(&HashSet::new(), "Turbidity"),
+        "a plan with nothing accepted mints nothing reviewed"
     );
 }

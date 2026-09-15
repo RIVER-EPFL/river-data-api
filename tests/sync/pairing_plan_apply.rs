@@ -1033,3 +1033,84 @@ async fn revert_keeps_the_rows_the_apply_created() {
 
     crate::common::cleanup_test_db(&db).await;
 }
+
+/// Scenario: the review accepts one of the two parameters a plan would create, and applies.
+///
+/// Expected behaviour: the accepted one lands reviewed, because the acceptance is the review the
+/// flag waits for; the one nobody accepted is still mechanical and keeps the flag.
+#[tokio::test]
+#[serial]
+async fn an_accepted_parameter_lands_without_the_review_flag() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    for (key, column) in [("rev-a", "Accepted_Param"), ("rev-b", "Unaccepted_Param")] {
+        let stream_id = Uuid::new_v4();
+        let metadata = serde_json::json!({
+            "hierarchy": { "project": "Test Project", "site": "Site 1", "parameter": column },
+            "units": "-",
+        });
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO data_streams (id, source_system, source_key, source_name, metadata, is_active) \
+                 VALUES ('{stream_id}', 'revsrc', '{key}', 'Site 1 - {column}', '{}'::jsonb, true)",
+                metadata.to_string().replace('\'', "''")
+            ),
+        )
+        .await;
+    }
+
+    let plan = crate::common::plans::create_plan(&app, &token, "revsrc").await;
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+    let (status, text) = crate::common::patch_json_with_token(
+        &app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &serde_json::json!({
+            "expected_version": plan["version"],
+            "objects": [{ "key": "parameter:Accepted_Param", "accepted": true }],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "accepting one object: {text}");
+
+    crate::common::plans::acknowledge_plan(&app, &token, &plan_id).await;
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&app, &plan_id, "apply", &token).await;
+    assert!((200..300).contains(&status), "apply ({status}): {text}");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await,
+        "completed"
+    );
+
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT code, needs_review FROM parameters \
+             WHERE code IN ('Accepted_Param', 'Unaccepted_Param') ORDER BY code"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    let flagged: Vec<(String, bool)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.try_get::<String>("", "code").unwrap(),
+                row.try_get::<bool>("", "needs_review").unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        flagged,
+        vec![
+            ("Accepted_Param".to_string(), false),
+            ("Unaccepted_Param".to_string(), true),
+        ],
+        "the accepted parameter is reviewed, the other is not"
+    );
+}
