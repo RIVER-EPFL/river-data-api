@@ -157,7 +157,7 @@ pub(super) fn expected(extra: &[&str]) -> String {
 pub fn measurement_type_rejection(value: Option<&str>) -> Option<String> {
     match value {
         None => None,
-        Some(other) => MeasurementType::from_str(other).is_none().then(|| {
+        Some(other) => MeasurementType::parse(other).is_none().then(|| {
             format!(
                 "invalid measurement_type '{other}' (expected {})",
                 expected(&[])
@@ -176,7 +176,7 @@ pub fn validate_measurement_type(value: Option<&str>) -> Result<(), AppError> {
 /// read it, so a stored job row replayed by rerun is held to the same vocabulary as the request
 /// that made it.
 pub fn retag_target_rejection(value: &str) -> Option<String> {
-    (MeasurementType::from_str(value).is_none() && value != RETAG_DECLARED).then(|| {
+    (MeasurementType::parse(value).is_none() && value != RETAG_DECLARED).then(|| {
         format!(
             "invalid measurement_type '{value}' (expected {})",
             expected(&[RETAG_DECLARED])

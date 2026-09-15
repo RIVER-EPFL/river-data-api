@@ -146,7 +146,7 @@ pub async fn heartbeat(
         ));
     }
 
-    if ServiceStatus::from_str(&req.status).is_none() {
+    if ServiceStatus::parse(&req.status).is_none() {
         let valid: Vec<&str> = ServiceStatus::ALL.iter().map(|s| s.as_str()).collect();
         return Err(AppError::BadRequest(format!(
             "Invalid status '{}'. Valid: {}",
@@ -248,7 +248,7 @@ pub async fn create_sync_event(
     }
 
     if let Some(ref event_type) = req.event_type
-        && SyncEventType::from_str(event_type).is_none()
+        && SyncEventType::parse(event_type).is_none()
     {
         let valid: Vec<&str> = SyncEventType::ALL.iter().map(|v| v.as_str()).collect();
         return Err(AppError::BadRequest(format!(
@@ -259,7 +259,7 @@ pub async fn create_sync_event(
     }
 
     if let Some(ref status) = req.status
-        && SyncEventStatus::from_str(status).is_none()
+        && SyncEventStatus::parse(status).is_none()
     {
         let valid: Vec<&str> = SyncEventStatus::ALL.iter().map(|v| v.as_str()).collect();
         return Err(AppError::BadRequest(format!(
@@ -334,7 +334,7 @@ pub async fn update_sync_event(
     let service_id = event.service_id;
     let mut active: events::ActiveModel = event.into();
 
-    let parsed_status = req.status.as_deref().and_then(SyncEventStatus::from_str);
+    let parsed_status = req.status.as_deref().and_then(SyncEventStatus::parse);
     let is_terminal = parsed_status.is_some_and(|s| s.is_terminal());
     let is_success = parsed_status.is_some_and(|s| s.is_success());
 
