@@ -537,6 +537,10 @@ pub async fn list_site_visits(
                 "COUNT(*) FILTER (WHERE r.withdrawn_at IS NOT NULL)::bigint",
                 "n_withdrawn",
             ),
+            agg(
+                "COUNT(*) FILTER (WHERE r.unverified IS TRUE)::bigint",
+                "n_unverified",
+            ),
             agg("MAX(s.n)", "sample_n"),
             agg("MAX(s.stdev)", "stdev"),
             agg("MAX(s.median)", "median"),
@@ -625,6 +629,7 @@ pub async fn list_site_visits(
                 n_total: c.n_total,
                 n_flagged: c.n_flagged,
                 n_withdrawn: c.n_withdrawn,
+                n_unverified: c.n_unverified,
                 n: c.sample_n,
                 stdev: c.stdev,
                 median: c.median,
@@ -657,6 +662,7 @@ pub async fn list_site_visits(
                         n_total: 0,
                         n_flagged: 0,
                         n_withdrawn: 0,
+                        n_unverified: 0,
                         n: None,
                         stdev: None,
                         median: None,
@@ -845,6 +851,7 @@ struct CellRow {
     n_total: i64,
     n_flagged: i64,
     n_withdrawn: i64,
+    n_unverified: i64,
     sample_n: Option<i32>,
     stdev: Option<f64>,
     median: Option<f64>,
@@ -886,6 +893,7 @@ struct DetailRow {
     calibration_id: Option<Uuid>,
     standard_curve_id: Option<Uuid>,
     sensor_id: Option<Uuid>,
+    unverified: bool,
     has_provenance: Option<bool>,
     provenance_kind: Option<String>,
     tool: Option<String>,
@@ -989,6 +997,7 @@ pub async fn get_event_detail(
         .column((r.clone(), readings::Column::CalibrationId))
         .column((r.clone(), readings::Column::StandardCurveId))
         .column((r.clone(), readings::Column::SensorId))
+        .column((r.clone(), readings::Column::Unverified))
         .expr_as(
             Expr::col((r.clone(), readings::Column::Provenance)).is_not_null(),
             Alias::new("has_provenance"),
@@ -1078,6 +1087,7 @@ pub async fn get_event_detail(
             calibration_id: r.calibration_id,
             standard_curve_id: r.standard_curve_id,
             sensor_id: r.sensor_id,
+            unverified: r.unverified,
         };
         let same_cell = cells
             .last_mut()

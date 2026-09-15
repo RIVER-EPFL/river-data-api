@@ -730,3 +730,68 @@ async fn the_per_visit_recompute_refuses_a_synced_visit_and_the_audit_does_not()
     .await;
     assert_eq!(status, 200, "the audit still covers a synced visit: {body}");
 }
+
+/// Scenario: an intern's entry, which lands unverified and which the sample trigger counts none of.
+///
+/// Expected behaviour: both grids say so. The values are on screen with `n = 0` beside them, and
+/// nothing but the ledger would otherwise say why the statistics are empty.
+#[tokio::test]
+#[serial]
+async fn a_pending_replicate_is_reported_as_pending() {
+    let (db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE readings SET unverified = true \
+             WHERE site_id = '{SITE1_ID}' AND time = '{T1}' \
+               AND parameter_id = '{GLOBAL_PARAM_DO_ID}'"
+        ),
+    )
+    .await;
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let row = body["visits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["collected_at"].as_str().unwrap().starts_with("2025-06-01"))
+        .expect("the first visit is listed");
+    let dissolved = cell(row, GLOBAL_PARAM_DO_ID).expect("DO cell");
+    assert_eq!(dissolved["n_total"], 2, "{dissolved}");
+    assert_eq!(
+        dissolved["n_unverified"], 2,
+        "the cell says how many of its replicates are pending: {dissolved}"
+    );
+    let temperature = cell(row, GLOBAL_PARAM_TEMP_ID).expect("TEMP cell");
+    assert_eq!(
+        temperature["n_unverified"], 0,
+        "a verified cell says zero rather than nothing: {temperature}"
+    );
+
+    let event_id = row["id"].as_str().unwrap();
+    let (status, detail) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/collection_events/{event_id}/detail"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{detail}");
+    let replicates = detail["cells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["parameter_id"] == GLOBAL_PARAM_DO_ID)
+        .expect("the DO cell")["replicates"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(replicates.len(), 2, "{detail}");
+    assert!(
+        replicates.iter().all(|r| r["unverified"] == true),
+        "each pending replicate carries its state: {detail}"
+    );
+}

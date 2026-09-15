@@ -186,6 +186,9 @@ pub struct VisitCell {
     pub n_total: i64,
     pub n_flagged: i64,
     pub n_withdrawn: i64,
+    /// Replicates entered but not yet verified. The sample trigger counts none of them, so a
+    /// cell whose replicates are all pending serves `n = 0` beside values that are on screen.
+    pub n_unverified: i64,
     /// The group's statistics, so a triplicate and a single measurement do not render identically.
     /// `n` counts what the mean stands on, which is `n_total` less the exclusions.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -416,6 +419,8 @@ pub struct CellReplicate {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub withdrawn_at: Option<DateTime<Utc>>,
+    /// A pending entry: stored and shown, counted by no statistic and served nowhere (Q18, Q21).
+    pub unverified: bool,
     /// The base calibration this replicate was corrected with, null when none was.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]

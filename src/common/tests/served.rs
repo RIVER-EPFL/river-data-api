@@ -88,3 +88,37 @@ fn a_served_arm_is_its_cadence_arm_plus_the_curation_rule() {
         }
     }
 }
+
+/// The aliased form is the same rule against a caller's own name for `readings`. The builder
+/// writes two of the clauses differently (an alias cannot be spelled into text), so those two are
+/// mapped before the comparison; everything else must appear as [`SERVED_SPOT`] writes it.
+#[test]
+fn the_aliased_spot_arm_carries_every_predicate_the_r_form_does() {
+    use sea_orm::sea_query::{Alias, PostgresQueryBuilder, Query};
+
+    let built = sea_orm::sea_query::QueryStatementWriter::to_string(
+        &Query::select()
+            .expr(Expr::val(1))
+            .cond_where(served_spot_at(&Alias::new("g")))
+            .to_owned(),
+        PostgresQueryBuilder,
+    )
+    .replace('"', "");
+
+    for clause in SERVED_SPOT.split(" AND ") {
+        let same = clause
+            .trim()
+            .replace("r.", "g.")
+            // `NOT <col>`: the column is `NOT NULL`, and the builder spells `IS NOT` with a bind.
+            .replace("g.unverified IS NOT TRUE", "NOT g.unverified")
+            // A nullable boolean, so the builder writes the rule as the pair it is.
+            .replace(
+                "g.is_flagged IS NOT TRUE",
+                "g.is_flagged <> TRUE OR g.is_flagged IS NULL",
+            );
+        assert!(
+            built.contains(&same),
+            "'{clause}' is missing from the aliased form: {built}"
+        );
+    }
+}

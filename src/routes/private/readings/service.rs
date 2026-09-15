@@ -514,8 +514,8 @@ pub const MIN_REPLICATES: usize = 2;
 /// A `(site, parameter, instant)` group forms a `samples` row when it carries two or more spot
 /// readings on a paired slot, whoever wrote them and whatever they declared.
 ///
-/// A spot instant with no sample row is by definition a single measurement, which is why serving,
-/// the visits grid and every export derive n = 1 from the reading rather than from a row here.
+/// A spot instant with no sample row is by definition a single measurement, which is why serving
+/// and every export derive n = 1 from the reading rather than from a row here.
 #[must_use]
 pub const fn forms_sample(replicates: usize) -> bool {
     replicates >= MIN_REPLICATES
@@ -923,8 +923,8 @@ pub fn method() -> SeasonalMethod {
             "Same site and parameter, entry month ±{WINDOW_MONTHS} months (cyclic, so December \
              is two months from February), across every year of stored history."
         ),
-        pooled: "Spot (grab) readings only. Flagged and withdrawn readings are excluded. \
-                 Replicates enter as individual values, not as their sample mean.",
+        pooled: "Spot (grab) readings only. Flagged, withdrawn and pending (unverified) readings \
+                 are excluded. Replicates enter as individual values, not as their sample mean.",
         value: "The stored raw value, compared against the entered number as typed; \
                 corrections enter on neither side.",
         statistics: "Minimum, maximum, and the 10th and 90th percentiles of the pooled values \

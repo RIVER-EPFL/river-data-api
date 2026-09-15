@@ -128,16 +128,20 @@ pub fn served_spot() -> Condition {
 }
 
 /// [`SERVED_SPOT`] against a caller's own alias for `readings`, for a query that does not use `r`.
+/// Every clause the `r` form carries is here, spelled by the builder rather than as text because
+/// the alias is the caller's.
 #[must_use]
 pub fn served_spot_at(alias: &Alias) -> Condition {
+    let at = |column| Expr::col((alias.clone(), column));
     Condition::all()
-        .add(Expr::col((alias.clone(), readings::Column::MeasurementType)).eq("spot"))
+        .add(at(readings::Column::MeasurementType).eq("spot"))
         .add(
-            Expr::col((alias.clone(), readings::Column::IsFlagged))
+            at(readings::Column::IsFlagged)
                 .ne(true)
-                .or(Expr::col((alias.clone(), readings::Column::IsFlagged)).is_null()),
+                .or(at(readings::Column::IsFlagged).is_null()),
         )
-        .add(Expr::col((alias.clone(), readings::Column::WithdrawnAt)).is_null())
+        .add(at(readings::Column::WithdrawnAt).is_null())
+        .add(at(readings::Column::Unverified).not())
 }
 
 /// [`SPOT_INSTANT_KEY`] as the `DISTINCT ON` columns.

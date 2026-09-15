@@ -42,6 +42,7 @@ fn the_method_describes_every_class_and_the_window_it_queries() {
     }
     // The exclusions the query applies are the ones the text names.
     assert!(m.pooled.contains("Flagged") && m.pooled.contains("withdrawn"));
+    assert!(m.pooled.contains("unverified"));
     assert!(m.value.contains("raw"));
 }
 
