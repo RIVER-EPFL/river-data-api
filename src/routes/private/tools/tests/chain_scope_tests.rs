@@ -120,3 +120,38 @@ fn a_range_alone_binds_two_and_names_no_site() {
     assert!(sql.contains(">= $1") && sql.contains("<= $2"));
     assert_eq!(binds.len(), 2);
 }
+
+/// The set a backfill asks for: every manual visit at a site, in a window, whether or not a
+/// finding was ever raised there. A calculation that has never run raises nothing, so the
+/// findings arm cannot reach the visits it has to compute at.
+#[test]
+fn a_site_and_range_without_only_findings_names_no_holds() {
+    let scope = RecomputeScope {
+        site_id: Some(Uuid::new_v4()),
+        start: Some(at("2025-06-01T00:00:00Z")),
+        end: Some(at("2025-06-30T00:00:00Z")),
+        only_findings: false,
+        calculation: None,
+    };
+    assert!(scope.is_bounded());
+    let (sql, binds) = scope.events_sql();
+    assert!(!sql.contains("replicate_audit_holds"), "{sql}");
+    assert!(sql.contains("ce.site_id = $1"));
+    assert!(sql.contains("ce.collected_at >= $2"));
+    assert!(sql.contains("ce.collected_at <= $3"));
+    assert_eq!(binds.len(), 3);
+}
+
+/// A site alone is a scope: the whole history of entered visits there.
+#[test]
+fn a_site_alone_names_every_manual_visit_there() {
+    let scope = RecomputeScope {
+        site_id: Some(Uuid::new_v4()),
+        ..Default::default()
+    };
+    let (sql, binds) = scope.events_sql();
+    assert!(!sql.contains("replicate_audit_holds"), "{sql}");
+    assert!(!sql.contains("ce.collected_at >="), "{sql}");
+    assert!(sql.contains("ce.site_id = $1"));
+    assert_eq!(binds.len(), 1);
+}
