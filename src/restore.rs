@@ -7,6 +7,12 @@
 //! against the target by the natural key the two databases share, and a reference with no match
 //! on the target is dropped and reported rather than guessed at.
 //!
+//! What is carried is `CARRIED`, and the report names every other public table the dump holds rows
+//! in so that nothing is left behind silently. The calculation catalogue (`tool_scripts`,
+//! `tool_script_versions`, `tool_script_activations`, `calculation_formulas` and
+//! `derived_parameter_sources`) is on that list by decision: it is authored on the rebuilt database
+//! through `/tool_scripts` after the restore, not carried (Q176).
+//!
 //! No column is named here. A carried table's columns come from the target's own catalog and the
 //! rows travel as `jsonb`, so a column added to `readings` after this was written is carried
 //! without anybody remembering to add it, and a uuid column pointing somewhere this file does not
@@ -279,6 +285,11 @@ pub struct Restored {
     /// One line per natural key the source holds and the target does not, per reference dropped,
     /// and per id column this file does not know where to point.
     pub unmatched: Vec<String>,
+    /// Tables the source holds rows in that this cutover does not carry, with their row counts.
+    /// The rebuild mints its own sites, parameters, streams and instruments, and the calculation
+    /// catalogue is authored on the rebuilt database afterwards, so what is here is what somebody
+    /// still has to account for rather than a list of losses.
+    pub not_carried: Vec<(String, usize)>,
 }
 
 impl Restored {
@@ -627,6 +638,55 @@ async fn move_public_settings<S: ConnectionTrait>(
     Ok(())
 }
 
+#[derive(FromQueryResult)]
+struct Named {
+    name: String,
+}
+
+#[derive(FromQueryResult)]
+struct Counted {
+    rows: i64,
+}
+
+/// The names of `tables` that `CARRIED` does not name, in the order they arrived.
+fn uncarried(tables: Vec<String>) -> Vec<String> {
+    tables
+        .into_iter()
+        .filter(|name| !CARRIED.iter().any(|table| table.table == name))
+        .collect()
+}
+
+/// Every table the source holds rows in that this cutover leaves behind, with its row count.
+/// The rebuild mints the sites, parameters, streams and instruments itself and the calculation
+/// catalogue is authored on the rebuilt database, so a report naming only what it carried says
+/// nothing about the tables somebody still has to account for.
+async fn not_carried<S: ConnectionTrait>(source: &S) -> Result<Vec<(String, usize)>, DbErr> {
+    let tables = Named::find_by_statement(sql(
+        "SELECT c.relname AS name
+           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+          ORDER BY c.relname",
+    ))
+    .all(source)
+    .await?
+    .into_iter()
+    .map(|table| table.name)
+    .collect();
+    let mut left = Vec::new();
+    for name in uncarried(tables) {
+        let counted = Counted::find_by_statement(sql(&format!(
+            "SELECT count(*)::bigint AS rows FROM public.\"{name}\""
+        )))
+        .one(source)
+        .await?
+        .map_or(0, |counted| usize::try_from(counted.rows).unwrap_or(0));
+        if counted > 0 {
+            left.push((name, counted));
+        }
+    }
+    Ok(left)
+}
+
 /// Carry the curated state of `source` into `target`, which is a database built from the baseline
 /// and rebuilt to the point where its streams, sites, parameters and instruments exist.
 ///
@@ -681,6 +741,11 @@ pub async fn restore(
             maps.insert(table.table, map);
         }
     }
+    report.not_carried = not_carried(source).await?;
     transaction.commit().await?;
     Ok(report)
 }
+
+#[cfg(test)]
+#[path = "tests/restore.rs"]
+mod tests;

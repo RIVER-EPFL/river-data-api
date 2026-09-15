@@ -143,6 +143,9 @@ INSERT INTO alarm_events (site_id, parameter_id, severity, max_severity, started
             '2024-06-01T12:00:00Z', 'someone@example.org', 'continuous'
        FROM sites s, parameters p WHERE s.name = 'Martigny' AND p.code = 'doc';
 
+INSERT INTO tool_scripts (name, label, description, created_by)
+     VALUES ('doc', 'DOC', 'Dissolved organic carbon', 'someone@example.org');
+
 INSERT INTO status_events (stream_id, time, site_id, parameter_id, value, sensor_id)
      SELECT d.id, '2024-06-02T09:05:00Z', s.id, p.id, 'unreachable', n.id
        FROM data_streams d, sites s, parameters p, sensors n
@@ -333,6 +336,11 @@ async fn a_dump_and_a_rebuilt_database_hold_the_same_curated_state() {
     .await
     .join("");
 
+    let left_behind: Vec<String> = report
+        .not_carried
+        .iter()
+        .map(|(table, rows)| format!("{rows} {table}"))
+        .collect();
     let unmatched = report.unmatched.join(", ");
     let refused = report.refused.join(", ");
     let counts = format!(
@@ -365,6 +373,15 @@ async fn a_dump_and_a_rebuilt_database_hold_the_same_curated_state() {
     assert_eq!(report.rows("tool_runs"), 1, "{counts}");
     assert_eq!(report.rows("readings"), 4, "{counts}");
     assert_eq!(report.rows("reading_decisions"), 4, "{counts}");
+    assert!(
+        left_behind.contains(&"1 tool_scripts".to_string()),
+        "the calculation catalogue is authored after the restore, so the run has to say it was \
+         not carried: {left_behind:?}"
+    );
+    assert!(
+        !left_behind.iter().any(|line| line.ends_with(" readings")),
+        "a table the cutover carries is not left behind: {left_behind:?}"
+    );
     for table in [
         "replicate_audit_holds",
         "annotations",

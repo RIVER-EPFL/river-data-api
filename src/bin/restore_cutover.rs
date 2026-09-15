@@ -10,8 +10,12 @@
 //!    services mint its sites, parameters, streams and instruments.
 //! 4. Run this. It moves the samples, the readings, the curation ledger, the review queue, the
 //!    annotations, the site notes, the alarm episodes, the device status and the public API
-//!    setups, and prints every natural key the source holds that the rebuilt database does not.
-//! 5. Verify: `scripts/dbdiff.sh <scratch> <target>` compares the two per table.
+//!    setups, and prints every natural key the source holds that the rebuilt database does not,
+//!    followed by every table the dump holds rows in that it did not carry.
+//! 5. Author the calculations on the rebuilt database through `/tool_scripts`. The catalogue is
+//!    not carried, which is why `tool_scripts` and `calculation_formulas` are on the not-carried
+//!    list.
+//! 6. Verify: `scripts/dbdiff.sh <scratch> <target>` compares the two per table.
 //!
 //! Nothing is carried by id. A reference the rebuilt database cannot match by natural key is
 //! reported, and the run writes nothing at all if it fails partway.
@@ -40,6 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     for line in &report.unmatched {
         println!("unmatched: {line}");
+    }
+    for (table, rows) in &report.not_carried {
+        println!("not carried: {rows} {table}");
     }
     Ok(())
 }
