@@ -16,8 +16,9 @@ use super::models::{
 };
 use super::service::{
     ParameterCatalog, ResolvedRun, build, execute_resolved, list_active_tools,
-    load_parameter_catalog, parse_pinned, resolve_event_inputs, resolve_run, resolve_site_inputs,
-    run_active_tool, run_fingerprint, runner_runtime, served_spot_value_expr,
+    load_parameter_catalog, parse_pinned, resolve_event_inputs, resolve_replicate_inputs,
+    resolve_run, resolve_site_inputs, run_active_tool, run_fingerprint, runner_runtime,
+    served_spot_value_expr,
 };
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
@@ -308,6 +309,16 @@ pub(super) fn body_for_run(
         body = inputs.clone();
         for e in &tool.manifest.event_inputs {
             body.remove(&e.param);
+        }
+        // A replicate family is re-read from the store too: keeping the prior run's list would
+        // recompute the same numbers after the visit's repeats moved.
+        for p in tool
+            .manifest
+            .params
+            .iter()
+            .filter(|p| p.kind == "replicates")
+        {
+            body.remove(&p.name);
         }
         for s in &tool.manifest.site_inputs {
             body.remove(s.target());
@@ -1005,6 +1016,14 @@ pub(super) async fn inputs_exist(
     resolve_event_inputs(
         &state.db,
         &tool.name,
+        &tool.manifest,
+        Some(event.site_id),
+        Some(event.collected_at),
+        &mut body,
+    )
+    .await?;
+    resolve_replicate_inputs(
+        &state.db,
         &tool.manifest,
         Some(event.site_id),
         Some(event.collected_at),

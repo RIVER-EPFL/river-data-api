@@ -3453,6 +3453,10 @@
             "format": "uuid",
             "type": "string"
           },
+          "sensor_kind": {
+            "description": "What that instrument is: `device` | `lab` | `source_parameter` | `entry_channel`. The two\nbookkeeping kinds record that nothing was declared, so a write may not name one and the\ngrid does not offer one back as a declaration.",
+            "type": "string"
+          },
           "standard_curve_id": {
             "description": "The standard curve applied on top of the base calibration, null when none was.",
             "format": "uuid",
@@ -12599,7 +12603,10 @@
             "items": {
               "type": "string"
             },
-            "type": "array"
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "category": {
             "type": [
@@ -12634,8 +12641,7 @@
         },
         "required": [
           "code",
-          "name",
-          "aliases"
+          "name"
         ],
         "type": "object"
       },
@@ -26327,6 +26333,34 @@
           "commit",
           "built_at",
           "public_api_contract"
+        ],
+        "type": "object"
+      },
+      "VersionUsage": {
+        "description": "What one version of a calculation has already produced: the readings whose stored provenance\nnames it, and the visits those readings belong to. A version that produced nothing carries\nzeros, because \"nothing stored\" and \"not counted\" are different claims.",
+        "properties": {
+          "readings": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "version_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "version_no": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "visits": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version_id",
+          "version_no",
+          "visits",
+          "readings"
         ],
         "type": "object"
       },
@@ -50614,6 +50648,42 @@
           }
         },
         "summary": "Run an unsaved formula set at a visit, in place of the calculation's stored formulas.",
+        "tags": [
+          "tool_scripts"
+        ]
+      }
+    },
+    "/api/tool_scripts/{id}/version_usage": {
+      "get": {
+        "description": "Read before a save or an activation, which offers the author the choice between leaving those\nvalues on the version that produced them and recomputing them under the new one.",
+        "operationId": "list_version_usage",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/VersionUsage"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "summary": "What each version of the calculation has already produced, newest first. Requires\nAdministrator.",
         "tags": [
           "tool_scripts"
         ]

@@ -36,6 +36,7 @@ use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::samples::models as samples;
+use crate::routes::private::sensors::models::{self as sensors, InstrumentKind};
 use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::resolve_site;
@@ -975,6 +976,8 @@ struct DetailRow {
     calibration_id: Option<Uuid>,
     standard_curve_id: Option<Uuid>,
     sensor_id: Option<Uuid>,
+    sensor_kind: Option<String>,
+    sensor_is_lab: Option<bool>,
     unverified: bool,
     has_provenance: Option<bool>,
     provenance_kind: Option<String>,
@@ -1029,6 +1032,7 @@ pub async fn get_event_detail(
     let p = Alias::new("p");
     let ds = Alias::new("ds");
     let s_ = Alias::new("s");
+    let sn = Alias::new("sn");
     let mut detail_query = SeaQuery::select();
     detail_query
         .column((r.clone(), readings::Column::ParameterId))
@@ -1079,6 +1083,14 @@ pub async fn get_event_detail(
         .column((r.clone(), readings::Column::CalibrationId))
         .column((r.clone(), readings::Column::StandardCurveId))
         .column((r.clone(), readings::Column::SensorId))
+        .expr_as(
+            Expr::col((sn.clone(), sensors::Column::Kind)),
+            Alias::new("sensor_kind"),
+        )
+        .expr_as(
+            Expr::col((sn.clone(), sensors::Column::IsLabInstrument)),
+            Alias::new("sensor_is_lab"),
+        )
         .column((r.clone(), readings::Column::Unverified))
         .expr_as(
             Expr::col((r.clone(), readings::Column::Provenance)).is_not_null(),
@@ -1107,6 +1119,13 @@ pub async fn get_event_detail(
             s_.clone(),
             Expr::col((s_.clone(), samples::Column::Id))
                 .equals((r.clone(), readings::Column::SampleId)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            sensors::Entity,
+            sn.clone(),
+            Expr::col((sn.clone(), sensors::Column::Id))
+                .equals((r.clone(), readings::Column::SensorId)),
         )
         .and_where(Expr::col((r.clone(), readings::Column::CollectionEventId)).eq(id))
         .order_by((p.clone(), parameters::Column::Code), Order::Asc)
@@ -1169,6 +1188,11 @@ pub async fn get_event_detail(
             calibration_id: r.calibration_id,
             standard_curve_id: r.standard_curve_id,
             sensor_id: r.sensor_id,
+            sensor_kind: r.sensor_id.map(|_| {
+                InstrumentKind::of(r.sensor_kind.as_deref(), r.sensor_is_lab)
+                    .as_str()
+                    .to_string()
+            }),
             unverified: r.unverified,
         };
         let same_cell = cells

@@ -473,6 +473,12 @@ pub struct CellReplicate {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub sensor_id: Option<Uuid>,
+    /// What that instrument is: `device` | `lab` | `source_parameter` | `entry_channel`. The two
+    /// bookkeeping kinds record that nothing was declared, so a write may not name one and the
+    /// grid does not offer one back as a declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub sensor_kind: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

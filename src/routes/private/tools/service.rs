@@ -893,6 +893,105 @@ pub async fn resolve_event_inputs(
     Ok(resolved)
 }
 
+/// One stored replicate of a family: its index and the value it serves.
+#[derive(FromQueryResult)]
+struct StoredReplicate {
+    replicate_index: i16,
+    value: Option<f64>,
+}
+
+/// Fill the `replicates` params from the visit's stored replicate family, where the request did
+/// not carry the list. A family is what a formula walking the repeats reads, so the whole list is
+/// bound rather than the group's served value: position is the replicate index, and an index the
+/// visit holds no live reading of is a gap.
+///
+/// `served::not_flagged` rather than `served::not_curated_out`, the same exception
+/// [`served_spot_value_expr`] documents: a calculation runs on what the operator just typed.
+pub async fn resolve_replicate_inputs(
+    db: &DatabaseConnection,
+    manifest: &Manifest,
+    site_id: Option<Uuid>,
+    collected_at: Option<chrono::DateTime<chrono::Utc>>,
+    body: &mut serde_json::Map<String, serde_json::Value>,
+) -> AppResult<Vec<serde_json::Value>> {
+    let (Some(site_id), Some(collected_at)) = (site_id, collected_at) else {
+        return Ok(Vec::new());
+    };
+    let mut resolved = Vec::new();
+    for param in &manifest.params {
+        if param.kind != "replicates" || body.get(&param.name).is_some_and(|v| !v.is_null()) {
+            continue;
+        }
+        let Some(parameter_code) = &param.parameter_code else {
+            continue;
+        };
+        let Some(parameter_id) = catalog_parameter_id(db, parameter_code).await? else {
+            continue;
+        };
+        let family = stored_replicates(db, site_id, parameter_id, collected_at).await?;
+        if family.is_empty() {
+            continue;
+        }
+        let values: Vec<serde_json::Value> = family
+            .iter()
+            .map(|v| v.map_or(serde_json::Value::Null, |n| serde_json::json!(n)))
+            .collect();
+        body.insert(param.name.clone(), serde_json::Value::Array(values.clone()));
+        resolved.push(serde_json::json!({
+            "param": param.name,
+            "parameter_code": parameter_code,
+            "parameter_id": parameter_id,
+            "replicate_indexes": (0..values.len()).collect::<Vec<usize>>(),
+            "value": values,
+        }));
+    }
+    Ok(resolved)
+}
+
+/// The live, unflagged spot readings of one parameter at one instant, by replicate index. The
+/// list is as long as the highest index stored, so a missing index reads as a gap rather than
+/// shifting the ones after it.
+async fn stored_replicates(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    instant: chrono::DateTime<chrono::Utc>,
+) -> AppResult<Vec<Option<f64>>> {
+    use sea_orm::sea_query::ExprTrait;
+    let r = crate::common::served::r();
+    let query = Query::select()
+        .column((r.clone(), readings::Column::ReplicateIndex))
+        .expr_as(
+            Func::coalesce([
+                Expr::col((r.clone(), readings::Column::CalibratedValue)),
+                Expr::col((r.clone(), readings::Column::RawValue)),
+            ]),
+            Alias::new("value"),
+        )
+        .from_as(readings::Entity, r.clone())
+        .and_where(Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
+        .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).eq(parameter_id))
+        .and_where(
+            Expr::col((r.clone(), readings::Column::Time))
+                .eq(sea_orm::prelude::DateTimeWithTimeZone::from(instant)),
+        )
+        .cond_where(crate::common::served::spot_rows())
+        .cond_where(crate::common::served::not_flagged())
+        .order_by((r, readings::Column::ReplicateIndex), Order::Asc)
+        .to_owned();
+    let rows = db.query_all_raw(build(&query)).await?;
+    let mut family: Vec<Option<f64>> = Vec::new();
+    for row in rows {
+        let stored = StoredReplicate::from_query_result(&row, "")?;
+        let index = usize::try_from(stored.replicate_index).unwrap_or(0);
+        if family.len() <= index {
+            family.resize(index + 1, None);
+        }
+        family[index] = stored.value;
+    }
+    Ok(family)
+}
+
 /// Validate a request body against the tool's manifest, resolve its constants and curves, and
 /// execute the script in the runner.
 pub async fn run_active_tool(
@@ -1037,7 +1136,7 @@ pub async fn resolve_run(
     // resolved one fills the gap, and a manifest default is the last resort.
     let site_inputs =
         resolve_site_inputs(&state.db, &tool.name, manifest, site_id, &mut body).await?;
-    let event_inputs = resolve_event_inputs(
+    let mut event_inputs = resolve_event_inputs(
         &state.db,
         &tool.name,
         manifest,
@@ -1046,6 +1145,9 @@ pub async fn resolve_run(
         &mut body,
     )
     .await?;
+    event_inputs.extend(
+        resolve_replicate_inputs(&state.db, manifest, site_id, collected_at, &mut body).await?,
+    );
 
     // Defaults land before requiredness so a condition reads the same values the runner will,
     // whatever order the params are declared in.

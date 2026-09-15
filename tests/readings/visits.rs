@@ -476,6 +476,41 @@ async fn a_cell_reports_how_its_readings_reached_the_store() {
     );
 }
 
+/// Scenario: a value typed into the grid, which the store attributes to the slot's own entry
+/// channel because nothing was declared.
+///
+/// Expected behaviour: each replicate says what kind of instrument it names, so the grid can tell
+/// a probe from a bookkeeping row it may not name back on a save.
+#[tokio::test]
+#[serial]
+async fn a_replicate_says_what_kind_of_instrument_it_names() {
+    let (_db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let event_id = body["visits"][0]["id"]
+        .as_str()
+        .expect("a visit is listed")
+        .to_string();
+
+    let (status, detail) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/collection_events/{event_id}/detail"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{detail}");
+    let replicate = &detail["cells"][0]["replicates"][0];
+    assert!(replicate["sensor_id"].is_string(), "{detail}");
+    assert_eq!(
+        replicate["sensor_kind"], "entry_channel",
+        "a hand entry names the slot's own channel, and the grid is told so: {detail}"
+    );
+}
+
 /// Fifty-five empty visits on top of the two with readings, so the default page size the list
 /// used to apply would truncate the answer.
 async fn stage_many_visits(db: &DatabaseConnection) {

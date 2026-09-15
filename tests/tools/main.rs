@@ -20,6 +20,7 @@ mod na_clears_output;
 mod output_parameters;
 mod partial_skip;
 mod pending_inputs_inherit;
+mod replicate_family_inputs;
 mod run_contract;
 mod runner_absent;
 mod scripts_authoring;
