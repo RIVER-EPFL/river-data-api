@@ -12,6 +12,7 @@ use sea_orm::{
 use uuid::Uuid;
 
 use crate::common::sync_state;
+use crate::routes::private::derived_parameters::service::DerivedPass;
 use crate::routes::private::readings;
 use crate::routes::private::reprocessing_jobs::flows::{
     as_db_err, build, optional_uuid, required_uuid,
@@ -186,6 +187,7 @@ pub async fn run_once(
 
     let mut filled: i64 = 0;
     let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut refused = DerivedPass::default();
     for (i, row) in rows.iter().enumerate() {
         if ctx.is_some_and(JobContext::is_cancelled) {
             break;
@@ -198,7 +200,8 @@ pub async fn run_once(
         )
         .await
         {
-            Ok(()) => {
+            Ok(slots) => {
+                refused.record(&slots, utc_time);
                 filled += 1;
                 min_filled = Some(min_filled.map_or(utc_time, |m| Ord::min(m, utc_time)));
             }
@@ -217,6 +220,7 @@ pub async fn run_once(
             .await
             .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
     }
+    let refused_slots = refused.report(db).await?;
     if let Some(ctx) = ctx {
         ctx.set_progress(total, Some(total)).await;
         ctx.report(
@@ -224,7 +228,8 @@ pub async fn run_once(
                 .scope_opt("earliest_filled", min_filled.map(|t| t.to_rfc3339()))
                 .scope("capped_at_limit", total as usize >= MAX_GAPS_PER_RUN)
                 .count("gaps_found", total)
-                .count("filled", filled),
+                .count("filled", filled)
+                .count("refused_slots", refused_slots),
         )
         .await;
         ctx.info(&format!("Filled {filled} of {total} derived gaps"))
@@ -527,6 +532,7 @@ impl Job for DerivedRecompute {
             let mut min_filled: Option<chrono::DateTime<chrono::Utc>> = None;
             let mut filled_sites: std::collections::BTreeSet<Uuid> =
                 std::collections::BTreeSet::new();
+            let mut refused = DerivedPass::default();
             for (i, row) in rows.iter().enumerate() {
                 if ctx.is_cancelled() {
                     break;
@@ -535,7 +541,8 @@ impl Job for DerivedRecompute {
                 let site_id = instant.site_id;
                 let utc_time = instant.time.with_timezone(&chrono::Utc);
                 match recalculate_derived_at_timestamp(ctx.db(), site_id, utc_time).await {
-                    Ok(()) => {
+                    Ok(slots) => {
+                        refused.record(&slots, utc_time);
                         filled += 1;
                         min_filled = Some(min_filled.map_or(utc_time, |m| Ord::min(m, utc_time)));
                         filled_sites.insert(site_id);
@@ -559,6 +566,7 @@ impl Job for DerivedRecompute {
                 }
             }
             ctx.set_progress(total, Some(total)).await;
+            let refused_slots = refused.report(ctx.db()).await?;
             ctx.report(
                 JobReport::new()
                     .scope_opt(
@@ -569,7 +577,8 @@ impl Job for DerivedRecompute {
                     )
                     .scope_opt("earliest_filled", min_filled.map(|t| t.to_rfc3339()))
                     .count("timestamps", total)
-                    .count("filled", filled),
+                    .count("filled", filled)
+                    .count("refused_slots", refused_slots),
             )
             .await;
             tracing::info!(total, filled, "Derived parameter recomputation complete");
@@ -606,6 +615,7 @@ impl Job for DerivedAssignment {
 
         let mut filled = 0i64;
         let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut refused = DerivedPass::default();
         for row in &rows {
             if ctx.is_cancelled() {
                 break;
@@ -613,10 +623,8 @@ impl Job for DerivedAssignment {
             let utc = InstantRow::from_query_result(row, "")?
                 .time
                 .with_timezone(&chrono::Utc);
-            if recalculate_derived_at_timestamp(ctx.db(), site_id, utc)
-                .await
-                .is_ok()
-            {
+            if let Ok(slots) = recalculate_derived_at_timestamp(ctx.db(), site_id, utc).await {
+                refused.record(&slots, utc);
                 filled += 1;
                 earliest = Some(earliest.map_or(utc, |e| Ord::min(e, utc)));
             }
@@ -629,13 +637,15 @@ impl Job for DerivedAssignment {
             announce_derived_write(&ctx, site_id, i32::try_from(filled).unwrap_or(i32::MAX));
         }
 
+        let refused_slots = refused.report(ctx.db()).await?;
         ctx.report(
             JobReport::new()
                 .scope("derived_definition_id", def_id.to_string())
                 .scope("site_id", site_id.to_string())
                 .scope_opt("earliest_filled", earliest.map(|t| t.to_rfc3339()))
                 .count("timestamps", rows.len())
-                .count("filled", filled),
+                .count("filled", filled)
+                .count("refused_slots", refused_slots),
         )
         .await;
         tracing::info!(%def_id, %site_id, filled, "Derived assignment backfill completed");
@@ -684,15 +694,20 @@ impl Job for SiteTimestampsDerived {
 
         let mut progress = 0i32;
         let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut refused = DerivedPass::default();
         'outer: for (site_id, timestamps) in &work {
             for time in timestamps {
                 if ctx.is_cancelled() {
                     break 'outer;
                 }
-                if let Err(e) = recalculate_derived_at_timestamp(ctx.db(), *site_id, *time).await {
-                    tracing::warn!(error = %e, site_id = %site_id, time = %time, "Failed to compute derived values");
-                } else {
-                    earliest = Some(earliest.map_or(*time, |e| Ord::min(e, *time)));
+                match recalculate_derived_at_timestamp(ctx.db(), *site_id, *time).await {
+                    Ok(slots) => {
+                        refused.record(&slots, *time);
+                        earliest = Some(earliest.map_or(*time, |e| Ord::min(e, *time)));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, site_id = %site_id, time = %time, "Failed to compute derived values");
+                    }
                 }
                 progress += 1;
                 if progress % 500 == 0 {
@@ -715,12 +730,14 @@ impl Job for SiteTimestampsDerived {
             }
         }
         ctx.set_progress(progress, Some(total)).await;
+        let refused_slots = refused.report(ctx.db()).await?;
         ctx.report(
             JobReport::new()
                 .scope("sites", work.len())
                 .scope_opt("earliest_computed", earliest.map(|t| t.to_rfc3339()))
                 .count("timestamps", total)
-                .count("computed", progress),
+                .count("computed", progress)
+                .count("refused_slots", refused_slots),
         )
         .await;
         tracing::info!(computed = progress, "Derived computation complete");
@@ -766,16 +783,21 @@ impl Job for IngestDerived {
 
         let mut progress = 0i32;
         let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+        let mut refused = DerivedPass::default();
         for time in timestamps {
             if ctx.is_cancelled() {
                 break;
             }
-            if let Err(e) = recalculate_derived_at_timestamp(ctx.db(), site_id, time).await {
-                tracing::warn!(error = %e, site_id = %site_id, time = %time, "Failed to auto-compute derived values after ingest");
-            } else {
-                earliest = Some(
-                    earliest.map_or(time, |e: chrono::DateTime<chrono::Utc>| Ord::min(e, time)),
-                );
+            match recalculate_derived_at_timestamp(ctx.db(), site_id, time).await {
+                Ok(slots) => {
+                    refused.record(&slots, time);
+                    earliest = Some(
+                        earliest.map_or(time, |e: chrono::DateTime<chrono::Utc>| Ord::min(e, time)),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, site_id = %site_id, time = %time, "Failed to auto-compute derived values after ingest");
+                }
             }
             progress += 1;
             if progress % 500 == 0 {
@@ -790,6 +812,7 @@ impl Job for IngestDerived {
             announce_derived_write(&ctx, site_id, progress);
         }
         ctx.set_progress(progress, Some(total)).await;
+        refused.report(ctx.db()).await?;
         Ok(i64::from(progress))
     }
 }

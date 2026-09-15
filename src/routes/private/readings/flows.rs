@@ -588,16 +588,22 @@ impl CsvImport {
                 Some(derived_total),
             )
             .await;
+            let mut refused =
+                crate::routes::private::derived_parameters::service::DerivedPass::default();
             for (i, time) in distinct_ts.iter().enumerate() {
                 if ctx.is_cancelled() {
                     break;
                 }
-                let _ = recalculate_derived_at_timestamp(ctx.db(), site_id, *time).await;
+                if let Ok(slots) = recalculate_derived_at_timestamp(ctx.db(), site_id, *time).await
+                {
+                    refused.record(&slots, *time);
+                }
                 if (i + 1) % 500 == 0 {
                     let prog = i32::try_from(models.len() + i + 1).unwrap_or(i32::MAX);
                     ctx.set_progress(prog, Some(derived_total)).await;
                 }
             }
+            refused.report(ctx.db()).await?;
 
             // An import is a person entering visits after the fact, so the rollups are refreshed
             // from the earliest instant it landed, and a failure there fails the job: a swallowed

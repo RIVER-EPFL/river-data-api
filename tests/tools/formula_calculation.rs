@@ -562,3 +562,164 @@ async fn a_formula_reads_the_step_before_it() {
         .unwrap_or_else(|| panic!("no result: {text}"));
     assert!((value - 6.0).abs() < 1e-12, "8 / 2 + 2: {text}");
 }
+
+const VISIT_TIME: &str = "2025-07-02T08:00:00Z";
+
+/// A visit holding the two inputs, plus whatever the output slot already serves.
+async fn seed_visit(
+    db: &sea_orm::DatabaseConnection,
+    readings: &[(&str, f64)],
+) -> uuid::Uuid {
+    let event_id = uuid::Uuid::new_v4();
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO collection_events (id, site_id, collected_at, source) \
+             VALUES ('{event_id}', '{}', '{VISIT_TIME}', 'manual')",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    for (parameter_id, value) in readings {
+        let stream_id = uuid::Uuid::new_v4();
+        crate::common::exec(
+            db,
+            &format!(
+                "INSERT INTO data_streams (id, source_system, source_key, is_active) \
+                 VALUES ('{stream_id}', 'grab_sample', '{stream_id}', true)"
+            ),
+        )
+        .await;
+        crate::common::exec(
+            db,
+            &format!(
+                "INSERT INTO readings (stream_id, site_id, parameter_id, time, replicate_index, \
+                     raw_value, measurement_type, collection_event_id) \
+                 VALUES ('{stream_id}', '{}', '{parameter_id}', '{VISIT_TIME}', 0, {value}, \
+                     'spot', '{event_id}')",
+                crate::common::SITE1_ID
+            ),
+        )
+        .await;
+    }
+    event_id
+}
+
+/// The slot the calculation writes, as the site declares it.
+async fn declare_slot(db: &sea_orm::DatabaseConnection, parameter_id: &str) {
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, display_units, \
+                 units_name, decimal_places, is_active) \
+             VALUES (gen_random_uuid(), '{}', '{parameter_id}', 'temp_ratio_out', 'ratio', \
+                 'ratio', 3, true)",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+}
+
+/// What the output slot serves at the visit, and whether it was retracted.
+async fn served(db: &sea_orm::DatabaseConnection, parameter_id: &str) -> Option<(f64, bool)> {
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT raw_value, withdrawn_at IS NOT NULL AS withdrawn FROM readings \
+                  WHERE site_id = '{}' AND parameter_id = '{parameter_id}' \
+                    AND time = '{VISIT_TIME}'",
+                crate::common::SITE1_ID
+            ),
+        ))
+        .await
+        .expect("query")?;
+    Some((
+        row.try_get::<Option<f64>>("", "raw_value")
+            .expect("raw_value")
+            .expect("a value"),
+        row.try_get("", "withdrawn").expect("withdrawn"),
+    ))
+}
+
+/// Scenario: a visit where the divisor was entered as 0, so the formula computes Inf.
+///
+/// Expected behaviour: the output is refused (Q172). The value the slot already serves stands,
+/// nothing is withdrawn, and a `skipped_output` finding names the arithmetic. An Inf reaching
+/// `serde_json` becomes null, which is the portal's NA and would retract the stored value.
+#[tokio::test]
+#[serial]
+async fn a_zero_divisor_refuses_the_output_and_leaves_the_stored_value() {
+    let group_id = "00000000-0000-4000-c000-000000000107";
+    let (db, app, token) = setup().await;
+    seed_calculation(&db, group_id).await;
+    let script_id = calculation_id(&db).await;
+    let output_id = declare_output(&db, group_id, "temp_ratio_out").await;
+    declare_slot(&db, &output_id).await;
+    let (status, text) = add_formula(
+        &app,
+        &token,
+        &script_id,
+        "temp_ratio_out",
+        "DO_Temperature / Dissolved_O2",
+        1,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create ({status}): {text}");
+
+    let event_id = seed_visit(
+        &db,
+        &[
+            (crate::common::GLOBAL_PARAM_TEMP_ID, 8.0),
+            (crate::common::GLOBAL_PARAM_DO_ID, 0.0),
+            (output_id.as_str(), 4.0),
+        ],
+    )
+    .await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    let outcome = river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
+        .await
+        .expect("a refused output is not a failed recompute");
+    assert_eq!(outcome.readings_withdrawn, 0, "nothing was retracted");
+    assert_eq!(
+        served(&db, &output_id).await,
+        Some((4.0, false)),
+        "the stored value stands and stays served"
+    );
+
+    let hold = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT kind, status, expected->>'reason' AS reason FROM replicate_audit_holds \
+                  WHERE site_id = '{}' AND parameter_id = '{output_id}' \
+                    AND group_time = '{VISIT_TIME}'",
+                crate::common::SITE1_ID
+            ),
+        ))
+        .await
+        .expect("query")
+        .expect("the refusal is on the record");
+    assert_eq!(
+        hold.try_get::<String>("", "kind").expect("kind"),
+        "skipped_output"
+    );
+    assert_eq!(
+        hold.try_get::<String>("", "status").expect("status"),
+        "pending"
+    );
+    let reason = hold
+        .try_get::<Option<String>>("", "reason")
+        .expect("reason")
+        .expect("a reason");
+    assert!(
+        reason.contains("not a finite number"),
+        "the finding says what the arithmetic did: {reason}"
+    );
+    assert!(
+        outcome.findings_raised >= 1,
+        "the run reports the finding: {}",
+        outcome.findings_raised
+    );
+}

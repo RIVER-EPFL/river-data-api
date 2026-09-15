@@ -92,6 +92,18 @@ pub fn slot(
         .add(Column::GroupTime.eq(DateTimeWithTimeZone::from(at)))
 }
 
+/// Every finding standing against one slot whatever the instant it names.
+///
+/// A continuous derived refusal names the first instant the formula stopped computing (Q172), so
+/// what closes it is the slot computing again anywhere in the run, not at that one instant.
+#[must_use]
+pub fn slot_at_any_instant(site_id: Uuid, parameter_id: Uuid) -> sea_orm::Condition {
+    sea_orm::Condition::all()
+        .add(Column::StreamId.is_null())
+        .add(Column::SiteId.eq(site_id))
+        .add(Column::ParameterId.eq(parameter_id))
+}
+
 /// Narrow a slot predicate to the findings in one status.
 #[must_use]
 pub fn in_status(

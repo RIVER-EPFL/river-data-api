@@ -127,3 +127,89 @@ fn test_a_calculation_cannot_declare_its_own_step() {
     let refused = super::promotion(Some(PCO2), PCO2).expect_err("its own step");
     assert!(refused.contains("already computes"), "{refused}");
 }
+
+// --- Refused instants, one finding per slot ---
+
+use crate::routes::private::sensor_calibrations::service::{DerivedSlot, SlotPass};
+
+fn pass(site: Uuid, parameter: Uuid, pass: SlotPass) -> DerivedSlot {
+    DerivedSlot {
+        site_id: site,
+        parameter_id: parameter,
+        definition_id: Uuid::from_u128(9),
+        pass,
+    }
+}
+
+fn refusal(site: Uuid, parameter: Uuid) -> DerivedSlot {
+    pass(site, parameter, SlotPass::Refused)
+}
+
+fn stored(site: Uuid, parameter: Uuid) -> DerivedSlot {
+    pass(site, parameter, SlotPass::Stored)
+}
+
+fn instant(hour: u32) -> chrono::DateTime<chrono::Utc> {
+    chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 6, 1, hour, 0, 0).unwrap()
+}
+
+/// Scenario: an input is corrected so a formula divides by zero over a run of instants.
+///
+/// Expected behaviour: one finding per slot carrying how many instants refused, keyed on the
+/// first of them (Q172), never one finding per instant.
+#[test]
+fn test_a_run_of_refused_instants_is_one_finding_per_slot() {
+    let site = Uuid::from_u128(1);
+    let one = Uuid::from_u128(2);
+    let two = Uuid::from_u128(3);
+    let mut refused = super::DerivedPass::default();
+    for hour in [9, 10, 11] {
+        refused.record(&[refusal(site, one)], instant(hour));
+    }
+    refused.record(&[refusal(site, two)], instant(10));
+
+    let holds = refused.holds();
+    assert_eq!(holds.len(), 2, "two slots, four instants");
+    let first = &holds[0];
+    assert_eq!(first.computed["instants"], 3);
+    assert_eq!(first.computed["from"], serde_json::json!(instant(9)));
+    assert_eq!(first.computed["to"], serde_json::json!(instant(11)));
+    assert_eq!(
+        first.key,
+        crate::routes::private::sync::service::HoldKey::Slot {
+            site_id: site,
+            parameter_id: one,
+            group_time: instant(9),
+        },
+        "the finding names where the formula stopped computing"
+    );
+    assert_eq!(holds[1].computed["instants"], 1);
+}
+
+/// A pass that refused nothing writes nothing.
+#[test]
+fn test_a_pass_with_no_refusals_raises_no_finding() {
+    assert!(super::DerivedPass::default().holds().is_empty());
+}
+
+/// Scenario: the input a divide by zero came from is corrected, and the slot computes again.
+///
+/// Expected behaviour: the finding standing on that slot is the run's to close. A slot that both
+/// stored and refused in the same run keeps its finding: some of its instants still have no value.
+#[test]
+fn test_a_slot_that_computed_again_closes_its_finding_unless_it_also_refused() {
+    let site = Uuid::from_u128(1);
+    let repaired = Uuid::from_u128(2);
+    let partly = Uuid::from_u128(3);
+    let mut run = super::DerivedPass::default();
+    run.record(&[stored(site, repaired)], instant(9));
+    run.record(&[stored(site, partly)], instant(9));
+    run.record(&[refusal(site, partly)], instant(10));
+
+    assert_eq!(run.resolved(), vec![(site, repaired)]);
+    assert_eq!(
+        run.holds().len(),
+        1,
+        "the partly refused slot still reports"
+    );
+}

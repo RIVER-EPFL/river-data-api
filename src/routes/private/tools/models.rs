@@ -230,6 +230,11 @@ pub struct ToolResult {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     #[schema(value_type = Vec<std::collections::HashMap<String, serde_json::Value>>)]
     pub skipped: Vec<serde_json::Value>,
+    /// Outputs whose formula produced a number that is not finite. The calculation divided by
+    /// zero, so the output is refused: it is in neither `results` nor `cleared`, the value already
+    /// stored at the visit stands, and `skipped` carries the reason (Q172).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub refused: Vec<String>,
     pub inputs_used: Vec<String>,
     pub inputs_ignored: Vec<String>,
     /// The constant values the server resolved and passed to the runner, by name.
@@ -1489,6 +1494,10 @@ pub struct RunOutcome {
     /// Formulas that did not run, as `{output, reason}`. An input a visit does not hold costs
     /// that one output and nothing else, so the run records which and why.
     pub skipped: Vec<serde_json::Value>,
+    /// Outputs a formula refused because its result was not a finite number. Neither a value nor
+    /// an NA: nothing is stored and nothing is withdrawn, and the chain raises a `skipped_output`
+    /// finding naming the arithmetic (Q172). Each names its reason in `skipped` too.
+    pub refused: Vec<String>,
     pub inputs_used: Vec<String>,
     pub inputs_ignored: Vec<String>,
     pub curves: Vec<CurveSnapshot>,
@@ -1669,15 +1678,17 @@ pub struct Curve {
     pub intercept: f64,
 }
 
-/// What one formula of a run produced. `value` is `None` for a value computed as not-a-number,
-/// which is the portal's NA and clears the stored value; `skipped` says the formula never ran,
-/// which names no output at all.
+/// What one formula of a run produced, in three states. `value` is `None` for a value computed as
+/// not-a-number, which is the portal's NA and clears the stored value; `skipped` says the formula
+/// never ran, which names no output at all; `refused` says it ran and produced a number that is
+/// not finite, which stores nothing and leaves the value already at the visit standing (Q172).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Evaluated {
     pub code: String,
     pub value: Option<f64>,
     pub curve_slot: Option<String>,
     pub skipped: Option<String>,
+    pub refused: bool,
     /// The variables the formula read, by name, in the order the formula names them. Empty when
     /// the formula was skipped.
     pub bindings: Vec<(String, f64)>,
@@ -1765,6 +1776,8 @@ pub enum Subject {
     },
     /// A calculation, by name: what its own outputs feed downstream.
     Calculation(String),
+    /// One constant, by id: the parameters the calculations declaring it publish.
+    Constant(Uuid),
 }
 
 /// A version's content after Postgres has had its say about the JSON halves: the bytes to store
@@ -1790,6 +1803,8 @@ pub struct ClosureQuery {
     pub stream_id: Option<Uuid>,
     /// A calculation by name: what its own outputs feed downstream.
     pub calculation: Option<String>,
+    /// A constant whose consequences are being asked about: where is this value used.
+    pub constant_id: Option<Uuid>,
     /// Confine the coverage counts to one site. Every site when omitted.
     pub site_id: Option<Uuid>,
     /// Include the per-slot coverage of every calculation input and output. Off by default: it is
@@ -1842,6 +1857,22 @@ pub struct ClosureResponse {
     /// Coverage per calculation input and output, when `include_coverage` asked for it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub coverage: Vec<SlotCoverage>,
+    /// What the subject has already been used to compute, from the stored provenance rather than
+    /// from the manifests. Present for a constant, which is the subject asked about before an edit
+    /// that would move every one of these values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub stored: Option<StoredUsage>,
+}
+
+/// How much of the record a subject is written into: the visits and the readings whose stored
+/// provenance names it.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StoredUsage {
+    /// The name the provenance records the subject under.
+    pub name: String,
+    pub visits: i64,
+    pub readings: i64,
 }
 
 pub struct ToolScriptOperations;
@@ -2169,6 +2200,10 @@ pub struct RecomputeScope {
     /// `calculation`: the visits a version produced values at are a finite set its provenance
     /// names, and it stops growing the moment the version stops being active.
     pub version: Option<Uuid>,
+    /// One constant by name: the visits whose stored provenance records it as an input. A bound in
+    /// its own right, because a corrected constant names exactly the visits computed from the old
+    /// value and no window a person could supply would be as precise.
+    pub constant: Option<String>,
 }
 
 impl RecomputeScope {
@@ -2181,6 +2216,7 @@ impl RecomputeScope {
             || self.end.is_some()
             || self.only_findings
             || self.version.is_some()
+            || self.constant.is_some()
     }
 
     /// The SELECT of visit ids this scope covers, oldest first. `portal_sync` visits are never
@@ -2211,6 +2247,15 @@ impl RecomputeScope {
                 " AND EXISTS (SELECT 1 FROM readings r \
                       WHERE r.collection_event_id = ce.id \
                         AND r.provenance -> 'tool_version' ->> 'script_version_id' = ${})",
+                binds.len()
+            ));
+        }
+        if let Some(name) = &self.constant {
+            binds.push(name.clone().into());
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM readings r \
+                      WHERE r.collection_event_id = ce.id \
+                        AND jsonb_exists(r.provenance -> 'constants', ${}))",
                 binds.len()
             ));
         }

@@ -888,12 +888,12 @@ async fn constant_id(db: &DatabaseConnection, name: &str) -> String {
     .to_string()
 }
 
-async fn queued_audits(db: &DatabaseConnection) -> Vec<serde_json::Value> {
+async fn queued_of_kind(db: &DatabaseConnection, kind: &str) -> Vec<serde_json::Value> {
     db.query_all_raw(Statement::from_string(
         DatabaseBackend::Postgres,
-        "SELECT params FROM reprocessing_jobs WHERE trigger_type = 'event_audit' \
-         ORDER BY created_at"
-            .to_string(),
+        format!(
+            "SELECT params FROM reprocessing_jobs WHERE trigger_type = '{kind}' ORDER BY created_at"
+        ),
     ))
     .await
     .unwrap()
@@ -902,13 +902,17 @@ async fn queued_audits(db: &DatabaseConnection) -> Vec<serde_json::Value> {
     .collect()
 }
 
-/// Editing a constant changes what every calculation declaring it would produce today, so the save
-/// files the report-only audit naming it. Nothing is rewritten by the save; repair stays a scoped
-/// recompute someone asks for. A units or description edit changes no calculation and audits
-/// nothing.
+/// Scenario: an administrator corrects a constant's value, so every stored output computed from
+/// the old one states a number nothing supports any more.
+///
+/// Expected behaviour: the save enqueues the recompute scoped to that constant, which is the
+/// migrate arm Q170 chose: a constant carries no versions, so there is no "new measurements only"
+/// side to offer. The job names the value on each side, which is what makes the ledger rows the
+/// recompute writes readable back to this edit. A units or description edit changes no calculation
+/// and recomputes nothing.
 #[tokio::test]
 #[serial]
-async fn a_constant_value_edit_queues_one_audit_naming_it() {
+async fn a_constant_value_edit_queues_one_recompute_naming_it() {
     let (db, app, token) = setup().await;
     let id = constant_id(&db, "xO2").await;
 
@@ -921,7 +925,7 @@ async fn a_constant_value_edit_queues_one_audit_naming_it() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert!(
-        queued_audits(&db).await.is_empty(),
+        queued_of_kind(&db, "event_recompute").await.is_empty(),
         "a description edit changes no calculation"
     );
 
@@ -933,9 +937,15 @@ async fn a_constant_value_edit_queues_one_audit_naming_it() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    let queued = queued_audits(&db).await;
-    assert_eq!(queued.len(), 1, "one audit for the change: {queued:?}");
+    let queued = queued_of_kind(&db, "event_recompute").await;
+    assert_eq!(queued.len(), 1, "one recompute for the change: {queued:?}");
     assert_eq!(queued[0]["constant"], "xO2");
+    assert_eq!(queued[0]["previous_value"], 0.209446);
+    assert_eq!(queued[0]["value"], 0.2095);
+    assert!(
+        queued_of_kind(&db, "event_audit").await.is_empty(),
+        "the recompute repairs what the audit would only have reported"
+    );
 
     // The key coalesces only while the run is still waiting: a claim releases it, because a change
     // landing mid-run needs a run of its own. The worker pool is live here, so the pending state is
@@ -943,7 +953,7 @@ async fn a_constant_value_edit_queues_one_audit_naming_it() {
     crate::common::exec(
         &db,
         "UPDATE reprocessing_jobs SET status = 'queued', lease_expires_at = NULL, \
-         dedupe_key = 'event_audit:constant:xO2' WHERE trigger_type = 'event_audit'",
+         dedupe_key = 'event_recompute:constant:xO2' WHERE trigger_type = 'event_recompute'",
     )
     .await;
 
@@ -956,9 +966,9 @@ async fn a_constant_value_edit_queues_one_audit_naming_it() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
-        queued_audits(&db).await.len(),
+        queued_of_kind(&db, "event_recompute").await.len(),
         1,
-        "the pending audit already covers this constant"
+        "the pending recompute already covers this constant"
     );
 }
 

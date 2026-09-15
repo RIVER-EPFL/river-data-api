@@ -678,8 +678,8 @@ async fn the_cross_site_list_reports_fill_and_findings() {
 /// Scenario: the lab opens a CNET station whose history was synced, expands a 2025 visit and
 /// presses Recompute tools.
 ///
-/// Expected behaviour: refused, naming where the correction belongs (Q41). The audit is
-/// report-only and stays open to the same visit.
+/// Expected behaviour: refused, naming where the correction belongs (Q41). The audit takes the
+/// request and raises nothing there: it reports on the set the repair can repair (Q175).
 #[tokio::test]
 #[serial]
 async fn the_per_visit_recompute_refuses_a_synced_visit_and_the_audit_does_not() {
@@ -728,7 +728,20 @@ async fn the_per_visit_recompute_refuses_a_synced_visit_and_the_audit_does_not()
         &token,
     )
     .await;
-    assert_eq!(status, 200, "the audit still covers a synced visit: {body}");
+    assert_eq!(status, 200, "the audit takes the request: {body}");
+    crate::common::e2e::drain_jobs(&db, 60).await;
+    let raised = crate::common::e2e::scalar(
+        &db,
+        &format!(
+            "SELECT count(*)::text AS v FROM replicate_audit_holds \
+              WHERE site_id = '{SITE1_ID}' AND group_time = '2025-06-04T08:00:00Z'"
+        ),
+    )
+    .await;
+    assert_eq!(
+        raised, "0",
+        "a synced visit is the portal's, so the audit raises nothing against it"
+    );
 }
 
 /// Scenario: an intern's entry, which lands unverified and which the sample trigger counts none of.

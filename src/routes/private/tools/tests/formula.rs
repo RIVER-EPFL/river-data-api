@@ -718,7 +718,15 @@ fn test_the_two_zero_divisor_guards_produce_different_answers() {
         &[("a254", "a254"), ("doc", "doc_avg_ppb")],
     )];
     let suva_result = run(&suva, &inputs(&[("a254", 2.0), ("doc", 0.0)]));
-    assert_eq!(suva_result[0].value, Some(f64::INFINITY));
+    assert_eq!(suva_result[0].value, None);
+    assert!(suva_result[0].refused, "Inf is refused, not stored");
+    assert!(
+        suva_result[0]
+            .skipped
+            .as_deref()
+            .unwrap()
+            .contains("not a finite number")
+    );
 
     let ratio = vec![formula(
         "c_a",
@@ -729,6 +737,108 @@ fn test_the_two_zero_divisor_guards_produce_different_answers() {
     )];
     let ratio_result = run(&ratio, &inputs(&[("c", 3.0), ("a", 0.0)]));
     assert_eq!(ratio_result[0].value, None, "a zero divisor is NA, not Inf");
+    assert!(!ratio_result[0].refused, "NA is a clear, not a refusal");
+}
+
+/// Scenario: DOC entered as 0 at a visit, the SUVA shape the portal's R computes as Inf.
+/// Expected behaviour: the output is refused (Q172). It reaches neither the result map, where a
+/// value would overwrite the stored reading, nor the cleared list, which withdraws it; the reason
+/// travels as a skip. `serde_json` maps a non-finite float to null, so the whole distinction is
+/// lost unless the engine settles it before the JSON boundary.
+#[test]
+fn test_a_non_finite_result_is_neither_stored_nor_cleared() {
+    let suva = vec![formula(
+        "suva",
+        1,
+        "a254 / doc * 100",
+        Some("suva"),
+        &[("a254", "a254"), ("doc", "doc_avg_ppb")],
+    )];
+    let produced = evaluate_over_replicates(
+        &suva,
+        &inputs(&[("a254", 2.0), ("doc", 0.0)]),
+        &replicates(&[]),
+        &constants(&[]),
+        &curves(&[]),
+    )
+    .expect("the set evaluates");
+    let (mut results, skipped, refused) = collect_produced(produced);
+    assert_eq!(refused, vec!["suva".to_string()]);
+    assert_eq!(skipped[0]["output"], "suva");
+    assert!(
+        skipped[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not a finite number")
+    );
+    assert!(!results.contains_key("suva"), "nothing to store: {results:?}");
+    assert!(
+        partition_cleared(&mut results).is_empty(),
+        "a refusal withdraws nothing"
+    );
+}
+
+/// The NA the same boundary must keep clearing: an explicit null is the portal's blanked column.
+#[test]
+fn test_an_na_result_still_clears_the_stored_value() {
+    let ratio = vec![formula(
+        "c_a",
+        1,
+        "if(eq(a, 0), na, c / a)",
+        Some("dom_c_a"),
+        &[("c", "peak_c"), ("a", "peak_a")],
+    )];
+    let produced = evaluate_over_replicates(
+        &ratio,
+        &inputs(&[("c", 3.0), ("a", 0.0)]),
+        &replicates(&[]),
+        &constants(&[]),
+        &curves(&[]),
+    )
+    .expect("the set evaluates");
+    let (mut results, skipped, refused) = collect_produced(produced);
+    assert!(refused.is_empty());
+    assert!(skipped.is_empty());
+    assert_eq!(partition_cleared(&mut results), vec!["c_a".to_string()]);
+}
+
+/// A formula reading a refused output has no value to read, so it skips with it rather than
+/// evaluating against a stale number, and the outputs beside it are still produced.
+#[test]
+fn test_a_formula_reading_a_refused_output_skips_with_it() {
+    let mut set = vec![formula(
+        "suva",
+        1,
+        "a254 / doc * 100",
+        Some("suva"),
+        &[("a254", "a254"), ("doc", "doc_avg_ppb")],
+    )];
+    set.push(formula(
+        "suva_scaled",
+        2,
+        "suva * 2",
+        Some("suva_scaled"),
+        &[("suva", "suva")],
+    ));
+    set.push(formula(
+        "c_a",
+        3,
+        "c / a",
+        Some("dom_c_a"),
+        &[("c", "peak_c"), ("a", "peak_a")],
+    ));
+    let results = run(
+        &set,
+        &inputs(&[("a254", 2.0), ("doc", 0.0), ("c", 3.0), ("a", 1.5)]),
+    );
+    let scaled = results
+        .iter()
+        .find(|e| e.code == "suva_scaled")
+        .expect("the output is named");
+    assert_eq!(scaled.value, None);
+    assert!(!scaled.refused, "it never evaluated: it skipped");
+    assert!(scaled.skipped.as_deref().unwrap().contains("suva"));
+    assert_eq!(value_of(&results, "c_a"), Some(2.0));
 }
 
 #[test]

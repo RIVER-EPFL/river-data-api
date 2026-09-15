@@ -124,6 +124,7 @@ pub(super) async fn store_run(
         results,
         cleared: outcome.cleared,
         skipped: outcome.skipped,
+        refused: outcome.refused,
         inputs_used: outcome.inputs_used,
         inputs_ignored: outcome.inputs_ignored,
         constants,
@@ -522,6 +523,20 @@ pub async fn recompute_event(
                 owned_outputs.push((key.clone(), *parameter_id));
             }
         }
+        // An output whose formula produced a number that is not finite is refused, not cleared
+        // (Q172): the value stored at this visit stands and stays served, so the finding is the
+        // only thing that says the calculation divided by zero.
+        for (key, parameter_id) in &owned_outputs {
+            if !result.refused.iter().any(|r| r == key) {
+                continue;
+            }
+            let reason = skipped_reason(&result.skipped, key)
+                .unwrap_or_else(|| "the result is not a finite number".to_string());
+            raise_skip(&state.db, &event, &tool.name, key, *parameter_id, &reason).await?;
+            outcome.findings_raised += 1;
+            outcome.skipped.push((tool.name.clone(), format!("{key}: {reason}")));
+        }
+
         // An output the script computed as NA is a request to blank the column, so the stored
         // value is withdrawn rather than left standing beside a run that did not produce it. A
         // person's ruling on the row is not overridden: those keep their value and their hold.
@@ -571,8 +586,15 @@ pub async fn recompute_event(
             .collect();
         if readings.is_empty() {
             let reason = "run produced no savable output".to_string();
+            // A refused output already carries the arithmetic that stopped it; the generic reason
+            // would replace it with a vaguer one.
+            let unexplained: Vec<(String, Uuid)> = saved_outputs
+                .iter()
+                .filter(|(key, _)| !result.refused.iter().any(|r| r == key))
+                .cloned()
+                .collect();
             outcome.findings_raised +=
-                record_skip(&state.db, &event, &tool.name, &saved_outputs, &reason).await?;
+                record_skip(&state.db, &event, &tool.name, &unexplained, &reason).await?;
             outcome.skipped.push((tool.name.clone(), reason));
             continue;
         }
@@ -627,6 +649,26 @@ pub async fn recompute_event(
             outcome.findings_closed +=
                 supersede_findings(&state.db, &event, *parameter_id).await? as usize;
         }
+        // A set whose other outputs saved takes none of the whole-tool skip arms, so the outputs
+        // the engine refused are filed here, one per slot, under the reason it gave.
+        for skip in &result.skipped {
+            let Some((output, reason)) = skipped_entry(skip) else {
+                continue;
+            };
+            let Some((_, parameter_id)) = saved_outputs.iter().find(|(code, _)| code == output)
+            else {
+                continue;
+            };
+            outcome.findings_raised += record_skip(
+                &state.db,
+                &event,
+                &tool.name,
+                &[(output.to_string(), *parameter_id)],
+                reason,
+            )
+            .await?;
+            outcome.skipped.push((tool.name.clone(), reason.to_string()));
+        }
     }
 
     Ok(outcome)
@@ -680,6 +722,15 @@ pub(super) async fn upsert_finding(
     .await
 }
 
+/// Why the run reported this output as a step that did not run.
+fn skipped_reason(skipped: &[serde_json::Value], output: &str) -> Option<String> {
+    skipped.iter().find_map(|entry| {
+        (entry.get("output")?.as_str()? == output)
+            .then(|| entry.get("reason")?.as_str().map(str::to_string))
+            .flatten()
+    })
+}
+
 /// A step that did not run is a fact about the visit, not only about the run that skipped it: the
 /// outputs it would have produced are absent, and the reason belongs where it outlives the job
 /// row the counts are pruned with. An output some other path already filled is not reported.
@@ -698,34 +749,58 @@ pub(super) async fn record_skip(
         {
             continue;
         }
-        // The absence is now explained, so the audit's account of the same slot gives way to it.
-        supersede(
-            db,
-            hold_model::of_kinds(
-                hold_model::in_status(
-                    hold_model::slot(event.site_id, *parameter_id, event.collected_at),
-                    HoldStatus::Pending,
-                ),
-                &[HoldKind::MissingOutput, HoldKind::StaleOutput],
-            ),
-        )
-        .await?;
-        upsert_finding(
-            db,
-            HoldKind::SkippedOutput,
-            event,
-            *parameter_id,
-            tool,
-            FindingPayload {
-                expected: serde_json::json!({ "output": output, "reason": reason }),
-                computed: serde_json::json!({}),
-                delta: serde_json::json!({}),
-            },
-        )
-        .await?;
+        raise_skip(db, event, tool, output, *parameter_id, reason).await?;
         raised += 1;
     }
     Ok(raised)
+}
+
+/// The output and the reason a run's `skipped` entry names, as `evaluate_set` writes it.
+pub(super) fn skipped_entry(entry: &serde_json::Value) -> Option<(&str, &str)> {
+    Some((
+        entry.get("output")?.as_str()?,
+        entry.get("reason")?.as_str()?,
+    ))
+}
+
+/// Report one output as a step that did not run, whatever the slot already holds.
+///
+/// A refused output (Q172) keeps the value stored at the visit, so the finding is the only thing
+/// that says the calculation divided by zero: it is raised against a served slot too, which is
+/// what separates this from [`record_skip`].
+pub(super) async fn raise_skip(
+    db: &DatabaseConnection,
+    event: &EventContext,
+    tool: &str,
+    output: &str,
+    parameter_id: Uuid,
+    reason: &str,
+) -> AppResult<()> {
+    // The absence is now explained, so the audit's account of the same slot gives way to it.
+    supersede(
+        db,
+        hold_model::of_kinds(
+            hold_model::in_status(
+                hold_model::slot(event.site_id, parameter_id, event.collected_at),
+                HoldStatus::Pending,
+            ),
+            &[HoldKind::MissingOutput, HoldKind::StaleOutput],
+        ),
+    )
+    .await?;
+    upsert_finding(
+        db,
+        HoldKind::SkippedOutput,
+        event,
+        parameter_id,
+        tool,
+        FindingPayload {
+            expected: serde_json::json!({ "output": output, "reason": reason }),
+            computed: serde_json::json!({}),
+            delta: serde_json::json!({}),
+        },
+    )
+    .await
 }
 
 /// Whether the executor already reported this slot as a step that did not run. The skip carries
@@ -918,6 +993,9 @@ pub async fn audit_event(
     order: &[usize],
     counts: &mut AuditCounts,
 ) -> AppResult<()> {
+    // The report covers what the repair covers: a calculation the site declared none of the
+    // outputs of does not apply here, so its absent output is not a finding (Q98).
+    let declared = declared_parameters(&state.db, event.site_id).await?;
     for &i in order {
         let tool = &tools[i];
         let saved_outputs: Vec<(String, Uuid)> = tool
@@ -927,6 +1005,9 @@ pub async fn audit_event(
             .filter_map(|o| catalog.resolve(o).map(|p| (o.key.clone(), p.id)))
             .collect();
         if saved_outputs.is_empty() {
+            continue;
+        }
+        if !applies_at_site(&saved_outputs, &declared) {
             continue;
         }
 
@@ -1172,6 +1253,10 @@ impl Job for EventRecompute {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
             version: as_uuid("version"),
+            constant: params
+                .get("constant")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
         };
         if !scope.is_bounded() {
             return Err(DbErr::Custom(
@@ -1218,6 +1303,7 @@ impl Job for EventRecompute {
                 .scope_opt("end", scope.end.map(|t| t.to_rfc3339()))
                 .scope("only_findings", scope.only_findings)
                 .scope_opt("calculation", scope.calculation.clone())
+                .scope_opt("constant", scope.constant.clone())
                 .count("events_in_scope", events.len())
                 .count("events_recomputed", events_recomputed)
                 .count("tools_run", tools_run)
@@ -1284,7 +1370,13 @@ pub(super) fn audit_event_set(
     let mut query = Query::select();
     query
         .column(collection_events::Column::Id)
-        .from(collection_events::Entity);
+        .from(collection_events::Entity)
+        // A synced visit is the portal's, and the repair refuses one (Q41), so the audit that
+        // would raise findings against it covers the same set the recompute does (Q175).
+        .and_where(
+            Expr::col(collection_events::Column::Source)
+                .ne(crate::routes::private::collection_events::service::PORTAL_SYNC),
+        );
     if let Some(id) = event_id {
         query.and_where(Expr::col(collection_events::Column::Id).eq(id));
     } else if let Some(site) = site_id {

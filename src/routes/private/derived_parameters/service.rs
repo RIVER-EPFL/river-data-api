@@ -4,13 +4,17 @@ use sea_orm::{
     Statement, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use super::models::definition::CalculationFormula;
 use super::models::source;
 use crate::routes::private::constants;
 use crate::routes::private::parameters;
+use crate::routes::private::sensor_calibrations::service::{DerivedSlot, SlotPass};
+use crate::routes::private::sync::hold_model;
+use crate::routes::private::sync::models::{HoldKind, HoldStatus};
+use crate::routes::private::sync::service::{Hold, HoldKey, upsert_hold};
 use crate::routes::private::tools::service::{CURVE_VARIABLES, free_identifiers};
 
 /// A formula's content hash: sha256 over the text itself, so one text is one version however it
@@ -810,13 +814,12 @@ async fn place_output_in_group<C: ConnectionTrait>(
     let Some(script_id) = tool_script_id else {
         return Ok(());
     };
-    let calculation_group = crate::routes::private::tools::models::script::Entity::find_by_id(
-        script_id,
-    )
-    .one(db)
-    .await
-    .map_err(ApiError::database)?
-    .and_then(|script| script.parameter_group_id);
+    let calculation_group =
+        crate::routes::private::tools::models::script::Entity::find_by_id(script_id)
+            .one(db)
+            .await
+            .map_err(ApiError::database)?
+            .and_then(|script| script.parameter_group_id);
     let members = all_members(db).await?;
     let Some(group_id) = rules::output_group(parameter_id, calculation_group, &members) else {
         return Ok(());
@@ -1003,6 +1006,141 @@ impl CRUDOperations for CalculationFormulaOperations {
         crate::routes::private::tools::service::mint_stale_formula_versions(db, None)
             .await
             .map_err(|e| ApiError::bad_request(e.to_string()))
+    }
+}
+
+/// What one derived run did to each slot it touched: the refusals it must report, and the slots
+/// that produced a value and so close a refusal standing from an earlier run.
+///
+/// A divide by zero over a week of instants is one fact about the formula, not a thousand facts
+/// about instants (Q172), so a run reports each slot once, carrying how many instants refused and
+/// the span they cover. The hold names the first of them: `replicate_audit_holds.group_time` is
+/// NOT NULL and the live-unique index for a stream-less finding is
+/// `(kind, site_id, parameter_id, group_time)`, so a finding with no instant is not a thing the
+/// table can hold, and the first refused instant is where the formula stopped computing.
+#[derive(Default)]
+pub struct DerivedPass {
+    refused: HashMap<(Uuid, Uuid), Tally>,
+    stored: HashSet<(Uuid, Uuid)>,
+}
+
+struct Tally {
+    definition_id: Uuid,
+    instants: usize,
+    first: chrono::DateTime<chrono::Utc>,
+    last: chrono::DateTime<chrono::Utc>,
+}
+
+impl DerivedPass {
+    pub fn record(&mut self, slots: &[DerivedSlot], time: chrono::DateTime<chrono::Utc>) {
+        for slot in slots {
+            let key = (slot.site_id, slot.parameter_id);
+            match slot.pass {
+                SlotPass::Stored => {
+                    self.stored.insert(key);
+                }
+                SlotPass::Refused => {
+                    self.refused
+                        .entry(key)
+                        .and_modify(|tally| {
+                            tally.instants += 1;
+                            tally.first = Ord::min(tally.first, time);
+                            tally.last = Ord::max(tally.last, time);
+                        })
+                        .or_insert(Tally {
+                            definition_id: slot.definition_id,
+                            instants: 1,
+                            first: time,
+                            last: time,
+                        });
+                }
+            }
+        }
+    }
+
+    /// The slots whose refusal is over: they produced a value in this run and refused nowhere in
+    /// it. A slot that did both still has instants a person has not seen, so its finding stands.
+    #[must_use]
+    pub fn resolved(&self) -> Vec<(Uuid, Uuid)> {
+        let mut slots: Vec<(Uuid, Uuid)> = self
+            .stored
+            .iter()
+            .filter(|key| !self.refused.contains_key(key))
+            .copied()
+            .collect();
+        slots.sort();
+        slots
+    }
+
+    /// One `skipped_output` finding per slot, as the hold each is written as.
+    #[must_use]
+    pub fn holds(&self) -> Vec<Hold<'static>> {
+        let mut holds: Vec<Hold<'static>> = self
+            .refused
+            .iter()
+            .map(|((site_id, parameter_id), tally)| Hold {
+                key: HoldKey::Slot {
+                    site_id: *site_id,
+                    parameter_id: *parameter_id,
+                    group_time: tally.first,
+                },
+                kind: HoldKind::SkippedOutput,
+                expected: serde_json::json!({
+                    "reason": "the formula computed a value that is not finite",
+                    "derived_definition_id": tally.definition_id,
+                }),
+                computed: serde_json::json!({
+                    "instants": tally.instants,
+                    "from": tally.first,
+                    "to": tally.last,
+                }),
+                delta: serde_json::json!({}),
+                status: HoldStatus::Pending,
+                tool: None,
+            })
+            .collect();
+        holds.sort_by_key(|hold| match hold.key {
+            HoldKey::Slot {
+                site_id,
+                parameter_id,
+                ..
+            } => (site_id, parameter_id),
+            _ => (Uuid::nil(), Uuid::nil()),
+        });
+        holds
+    }
+
+    /// Raise one finding per refused slot and close the findings the run repaired. Returns how
+    /// many findings were raised.
+    pub async fn report(&self, db: &sea_orm::DatabaseConnection) -> Result<usize, sea_orm::DbErr> {
+        let holds = self.holds();
+        for hold in &holds {
+            upsert_hold(db, hold)
+                .await
+                .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+        }
+        for (site_id, parameter_id) in self.resolved() {
+            hold_model::Entity::update_many()
+                .col_expr(
+                    hold_model::Column::Status,
+                    sea_orm::sea_query::Expr::value(HoldStatus::Superseded.as_str()),
+                )
+                // A null tool is what says the finding is this engine's: a calculation's skip at
+                // a visit names the calculation, and is the chain's to close.
+                .filter(
+                    hold_model::of_kinds(
+                        hold_model::in_status(
+                            hold_model::slot_at_any_instant(site_id, parameter_id),
+                            HoldStatus::Pending,
+                        ),
+                        &[HoldKind::SkippedOutput],
+                    )
+                    .add(hold_model::Column::Tool.is_null()),
+                )
+                .exec(db)
+                .await?;
+        }
+        Ok(holds.len())
     }
 }
 

@@ -120,6 +120,9 @@ pub struct EventRecomputeRequest {
     /// scope of its own: this is what an author's migrate arm asks for.
     #[serde(default)]
     pub version: Option<Uuid>,
+    /// Only visits whose stored provenance names this constant. A scope in its own right.
+    #[serde(default)]
+    pub constant: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

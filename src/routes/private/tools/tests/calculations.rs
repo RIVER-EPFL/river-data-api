@@ -20,6 +20,7 @@ fn query() -> ClosureQuery {
         site_parameter_id: None,
         stream_id: None,
         calculation: None,
+        constant_id: None,
         site_id: None,
         include_coverage: false,
     }
@@ -44,6 +45,22 @@ fn each_subject_is_recognised_from_the_field_that_names_it() {
         closure_subject(&ClosureQuery { calculation: Some("doc".into()), ..query() }).unwrap(),
         Subject::Calculation(name) if name == "doc"
     ));
+    // Where is this constant used: the one subject an administrator asks from, before correcting
+    // a molar weight every stored output was computed with.
+    assert!(matches!(
+        closure_subject(&ClosureQuery { constant_id: Some(id), ..query() }).unwrap(),
+        Subject::Constant(got) if got == id
+    ));
+}
+
+#[test]
+fn a_constant_beside_another_subject_is_refused() {
+    let q = ClosureQuery {
+        constant_id: Some(uuid::Uuid::new_v4()),
+        calculation: Some("doc".into()),
+        ..query()
+    };
+    assert!(closure_subject(&q).is_err());
 }
 
 #[test]

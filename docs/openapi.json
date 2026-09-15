@@ -49,6 +49,12 @@
         "type": "object"
       },
       "ActivateRequest": {
+        "properties": {
+          "migrate_stored": {
+            "description": "What happens to the values the version being replaced produced (Q170). `false`, the\ndefault, leaves them on that version: this activation is a new method, and the history\nstands as it was computed. `true` is a correction: every visit the superseded version\nproduced values at is recomputed under the new one.",
+            "type": "boolean"
+          }
+        },
         "type": "object"
       },
       "ActivateResponse": {
@@ -3743,6 +3749,10 @@
               "$ref": "#/components/schemas/SlotCoverage"
             },
             "type": "array"
+          },
+          "stored": {
+            "$ref": "#/components/schemas/StoredUsage",
+            "description": "What the subject has already been used to compute, from the stored provenance rather than\nfrom the manifests. Present for a constant, which is the subject asked about before an edit\nthat would move every one of these values."
           }
         },
         "required": [
@@ -6638,6 +6648,13 @@
               "null"
             ]
           },
+          "constant": {
+            "description": "Only visits whose stored provenance names this constant. A scope in its own right.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "end": {
             "description": "Visits collected at or before this instant.",
             "format": "date-time",
@@ -6661,6 +6678,14 @@
           "start": {
             "description": "Visits collected at or after this instant.",
             "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "description": "Every visit a script version produced values at, as the stored provenance names it. A\nscope of its own: this is what an author's migrate arm asks for.",
+            "format": "uuid",
             "type": [
               "string",
               "null"
@@ -23468,6 +23493,29 @@
         ],
         "type": "object"
       },
+      "StoredUsage": {
+        "description": "How much of the record a subject is written into: the visits and the readings whose stored\nprovenance names it.",
+        "properties": {
+          "name": {
+            "description": "The name the provenance records the subject under.",
+            "type": "string"
+          },
+          "readings": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "visits": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "visits",
+          "readings"
+        ],
+        "type": "object"
+      },
       "StreamPreviewResponse": {
         "properties": {
           "instants": {
@@ -25038,6 +25086,13 @@
             "type": "array"
           },
           "inputs_used": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "refused": {
+            "description": "Outputs whose formula produced a number that is not finite. The calculation divided by\nzero, so the output is refused: it is in neither `results` nor `cleared`, the value already\nstored at the visit stands, and `skipped` carries the reason (Q172).",
             "items": {
               "type": "string"
             },
@@ -29306,6 +29361,19 @@
             "name": "calculation",
             "required": false,
             "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "A constant whose consequences are being asked about: where is this value used.",
+            "in": "query",
+            "name": "constant_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
               "type": [
                 "string",
                 "null"

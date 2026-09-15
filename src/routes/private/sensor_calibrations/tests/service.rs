@@ -344,3 +344,32 @@ fn an_unguarded_absent_input_skips_the_instant() {
     let skipped = bind_derived_variables("altitude_m / 2", &[], &site, &HashMap::new());
     assert_eq!(skipped, Err("no value for altitude_m".to_string()));
 }
+
+mod non_finite_results {
+    use crate::routes::private::sensor_calibrations::service::{DerivedOutcome, derived_outcome};
+
+    /// Scenario: an input is corrected so the formula evaluates to NA at an instant whose slot
+    /// already holds a number from an earlier pass.
+    ///
+    /// Expected behaviour: NA is the formula saying there is no value, so the slot is cleared and
+    /// stops serving a number the formula no longer produces (Q172).
+    #[test]
+    fn na_clears_the_slot_rather_than_leaving_the_old_value() {
+        assert_eq!(derived_outcome(f64::NAN), DerivedOutcome::Clear);
+    }
+
+    /// A divide by zero says the formula could not compute, not that the quantity is absent, so
+    /// the value that stands is left alone until the input is corrected (Q172).
+    #[test]
+    fn a_divide_by_zero_refuses_and_leaves_the_stored_value_standing() {
+        assert_eq!(derived_outcome(f64::INFINITY), DerivedOutcome::Refuse);
+        assert_eq!(derived_outcome(f64::NEG_INFINITY), DerivedOutcome::Refuse);
+    }
+
+    #[test]
+    fn a_finite_result_is_stored_at_the_value_the_formula_produced() {
+        assert_eq!(derived_outcome(4.2), DerivedOutcome::Store(4.2));
+        assert_eq!(derived_outcome(0.0), DerivedOutcome::Store(0.0));
+        assert_eq!(derived_outcome(-1.5), DerivedOutcome::Store(-1.5));
+    }
+}

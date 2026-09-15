@@ -887,21 +887,51 @@ async fn source_parameter_ids_for_definition(
         .collect())
 }
 
+/// What one derived slot's pass did at one instant. The instant is the caller's, which is what
+/// lets a run report a slot once for the whole pass rather than once per instant (Q172).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotPass {
+    /// A value was written.
+    Stored,
+    /// The formula produced a number that is not finite: the divide by zero, refused.
+    Refused,
+}
+
+/// One slot of a site, and what the pass did there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DerivedSlot {
+    pub site_id: Uuid,
+    pub parameter_id: Uuid,
+    pub definition_id: Uuid,
+    pub pass: SlotPass,
+}
+
+/// Recompute every derived slot of a site at one instant, returning the slots that stored a value
+/// and the slots that refused. A slot that had nothing to do here is in neither.
 pub async fn recalculate_derived_at_timestamp(
     db: &DatabaseConnection,
     site_id: Uuid,
     time: chrono::DateTime<chrono::Utc>,
-) -> Result<(), sea_orm::DbErr> {
+) -> Result<Vec<DerivedSlot>, sea_orm::DbErr> {
     let work_items = fetch_derived_work_items(db, site_id).await?;
     if work_items.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let ordered = build_evaluation_order(db, &work_items).await?;
+    let mut passes = Vec::new();
     for idx in ordered {
-        evaluate_and_upsert_derived(db, &work_items[idx], time).await?;
+        let item = &work_items[idx];
+        if let Some(pass) = evaluate_and_upsert_derived(db, item, time).await? {
+            passes.push(DerivedSlot {
+                site_id: item.derived_site_id,
+                parameter_id: item.derived_parameter_id,
+                definition_id: item.derived_definition_id,
+                pass,
+            });
+        }
     }
-    Ok(())
+    Ok(passes)
 }
 
 /// A built query as the statement sea-orm executes.
@@ -1114,6 +1144,34 @@ fn unattribute_statement(
         .take()
 }
 
+/// What a derived pass does with the number the formula produced at one instant (Q172).
+///
+/// NaN is NA: the formula says there is no value here, so nothing is stored and whatever the slot
+/// holds from an earlier pass is cleared. `withdrawn_at` is confined to spot rows by
+/// `readings_withdrawn_spot_only`, so clearing a derived row is the unattribution the recalled
+/// input arm already uses.
+///
+/// Inf and -Inf are a refusal, not an NA: a divide by zero says the formula could not compute
+/// here, which is not the same as saying the quantity is absent. Nothing is stored and the value
+/// that stands stays served until the input is corrected.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DerivedOutcome {
+    Store(f64),
+    Clear,
+    Refuse,
+}
+
+#[must_use]
+pub fn derived_outcome(result: f64) -> DerivedOutcome {
+    if result.is_nan() {
+        DerivedOutcome::Clear
+    } else if result.is_infinite() {
+        DerivedOutcome::Refuse
+    } else {
+        DerivedOutcome::Store(result)
+    }
+}
+
 /// Clear the site off a stored derived row, the unattributed state a recalled input leaves it in.
 async fn unattribute_derived_at(
     db: &DatabaseConnection,
@@ -1252,20 +1310,22 @@ fn derived_upsert(
         .take()
 }
 
+/// Evaluate one derived slot at one instant and store what it produced. The outcome is the
+/// caller's to report; `None` is a pass with nothing to say about this slot.
 async fn evaluate_and_upsert_derived(
     db: &DatabaseConnection,
     item: &DerivedWork,
     time: chrono::DateTime<chrono::Utc>,
-) -> Result<(), sea_orm::DbErr> {
+) -> Result<Option<SlotPass>, sea_orm::DbErr> {
     let Some(resolved) = resolve_variables_for_derived(db, item, time).await? else {
         // The inputs no longer resolve at this instant, so the stored derived value is the output
         // of a measurement that is not served any more. It leaves the site the same way its input
         // did rather than staying in the aggregates and the public arm.
         unattribute_derived_at(db, item, time).await?;
-        return Ok(());
+        return Ok(None);
     };
     let Some(variables) = resolved else {
-        return Ok(());
+        return Ok(None);
     };
 
     let result = match evaluate_formula(&item.formula, &variables) {
@@ -1278,12 +1338,17 @@ async fn evaluate_and_upsert_derived(
                 error,
                 "Derived formula failed to evaluate"
             );
-            return Ok(());
+            return Ok(None);
         }
     };
-    if !result.is_finite() {
-        return Ok(());
-    }
+    let result = match derived_outcome(result) {
+        DerivedOutcome::Store(value) => value,
+        DerivedOutcome::Clear => {
+            unattribute_derived_at(db, item, time).await?;
+            return Ok(None);
+        }
+        DerivedOutcome::Refuse => return Ok(Some(SlotPass::Refused)),
+    };
 
     let stream_id = get_or_create_derived_stream(db, item).await?;
     // The row names the formula text it was made with, so a later edit cannot rewrite the story of
@@ -1314,7 +1379,7 @@ async fn evaluate_and_upsert_derived(
     if born {
         record_derived_arrival(db, stream_id, time).await?;
     }
-    Ok(())
+    Ok(Some(SlotPass::Stored))
 }
 
 /// Record the arrival of a derived value, the state it arrived in read from the row itself.
@@ -1901,16 +1966,19 @@ pub async fn reprocess(
     // The cascade runs over what this run moved, not over every instant in the scope: a derived
     // value at (site, time) is a function of the served values, and those changed only where a
     // statement above wrote. Costing a query per instant, the difference is the whole run.
+    let mut refused = crate::routes::private::derived_parameters::service::DerivedPass::default();
     for (site_id, utc_time) in cascade {
-        if let Err(e) = recalculate_derived_at_timestamp(db, site_id, utc_time).await {
-            tracing::warn!(
+        match recalculate_derived_at_timestamp(db, site_id, utc_time).await {
+            Ok(slots) => refused.record(&slots, utc_time),
+            Err(e) => tracing::warn!(
                 error = %e,
                 site_id = %site_id,
                 time = %utc_time,
                 "Failed to cascade reprocessing to derived parameter"
-            );
+            ),
         }
     }
+    refused.report(db).await?;
 
     let since = readings::Entity::find()
         .filter(scope.refresh_condition())

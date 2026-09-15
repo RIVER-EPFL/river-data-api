@@ -126,9 +126,19 @@ pub async fn get_calculation_closure(
         Vec::new()
     };
 
+    // A constant is asked about before it is edited, so the answer says what has already been
+    // computed from it, not only what would read it today.
+    let stored = match &subject {
+        crate::routes::private::tools::models::Subject::Constant(id) => {
+            crate::routes::private::tools::service::stored_usage_of_constant(&state.db, *id).await?
+        }
+        _ => None,
+    };
+
     Ok(Json(ClosureResponse {
         calculations,
         coverage,
+        stored,
     })
     .into_response())
 }

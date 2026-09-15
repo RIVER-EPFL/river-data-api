@@ -6,6 +6,7 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod audit_applicability;
 mod calculation_closure;
 mod calculators;
 mod cnet_authoring;
@@ -15,6 +16,7 @@ mod formula_calculation;
 mod formula_draft_run;
 mod na_clears_output;
 mod output_parameters;
+mod partial_skip;
 mod pending_inputs_inherit;
 mod run_contract;
 mod runner_absent;

@@ -490,3 +490,110 @@ async fn the_health_of_a_calculation_counts_its_open_findings_and_their_visits()
     assert_eq!(b["stale_visits"], 1);
     assert_eq!(b["skipped_outputs"], 1);
 }
+
+/// Scenario: an administrator is about to correct a molar weight and asks where it is used. The
+/// manifests say what would read it today; the stored provenance says what was already computed
+/// from it.
+///
+/// Expected behaviour: the closure names the calculations declaring the constant, so it answers in
+/// the same shape as every other subject, and carries the counts of visits and readings whose
+/// provenance records it, which is what says how much a correction moves.
+#[tokio::test]
+#[serial]
+async fn a_constant_names_the_calculations_declaring_it_and_what_it_already_computed() {
+    let (db, app, token) = setup().await;
+
+    // The chain's first calculation declares the constant; the second does not.
+    db.execute_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        r#"UPDATE tool_script_versions v
+              SET manifest = jsonb_set(v.manifest, '{constants}', '["closure_k"]'::jsonb)
+             FROM tool_scripts s
+            WHERE v.tool_script_id = s.id AND s.name = 'closure_a'"#
+            .to_string(),
+    ))
+    .await
+    .expect("the constant is declared");
+    crate::common::exec(
+        &db,
+        "INSERT INTO constants (id, name, value, units, description) \
+         VALUES (gen_random_uuid(), 'closure_k', 1.5, NULL, 'a closure fixture') \
+         ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .await;
+    let constant_id = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM constants WHERE name = 'closure_k'".to_string(),
+        ))
+        .await
+        .unwrap()
+        .expect("the constant")
+        .try_get::<uuid::Uuid>("", "id")
+        .unwrap();
+
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/calculations/closure?constant_id={constant_id}"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let names: Vec<&str> = body["calculations"]
+        .as_array()
+        .expect("calculations")
+        .iter()
+        .filter_map(|c| c["tool"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["closure_a", "closure_b"],
+        "the declaring calculation and what its output feeds: {body}"
+    );
+    assert_eq!(body["stored"]["name"], "closure_k");
+    assert_eq!(
+        body["stored"]["readings"], 0,
+        "nothing has been computed from it yet: {body}"
+    );
+
+    // One stored reading whose provenance records the constant, at one visit.
+    let event = uuid::Uuid::new_v4();
+    let stream = uuid::Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO collection_events (id, site_id, collected_at, source) \
+             VALUES ('{event}', '{SITE1_ID}', '{AT}', 'manual')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, is_active) \
+             VALUES ('{stream}', 'test-closure', 'closure-const', true)"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO readings \
+                 (stream_id, time, replicate_index, raw_value, site_id, parameter_id, \
+                  collection_event_id, measurement_type, provenance) \
+             VALUES ('{stream}', '{AT}', 0, 1.0, '{SITE1_ID}', '{GLOBAL_PARAM_DO_ID}', \
+                     '{event}', 'spot', '{{\"constants\": {{\"closure_k\": 1.5}}}}'::jsonb)"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/calculations/closure?constant_id={constant_id}"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["stored"]["readings"], 1, "{body}");
+    assert_eq!(body["stored"]["visits"], 1, "{body}");
+}

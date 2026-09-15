@@ -1137,6 +1137,7 @@ pub async fn execute_resolved(
     // The engine decides only how the arithmetic is done. Everything after this point, the
     // cleared outputs, the manifest aggregates, the inputs the run records, is one path.
     let mut skipped: Vec<serde_json::Value> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
     let mut trace: Vec<TraceStep> = Vec::new();
     let raw = if tool.engine == Engine::Formula {
         let numbers: std::collections::HashMap<String, f64> = effective_inputs
@@ -1182,27 +1183,9 @@ pub async fn execute_resolved(
             traceback: Vec::new(),
         })?;
         trace = steps;
-        let mut results = serde_json::Map::new();
-        for entry in produced {
-            match entry {
-                Produced::Scalar(evaluated) => {
-                    if let Some(reason) = evaluated.skipped {
-                        skipped.push(
-                            serde_json::json!({ "output": evaluated.code, "reason": reason }),
-                        );
-                        continue;
-                    }
-                    // A value the formula computed as NA is an explicit null, which clears the
-                    // stored value; a skipped formula names no output at all.
-                    results.insert(evaluated.code, serde_json::json!(evaluated.value));
-                }
-                // One value per replicate index, gaps kept in place, which is the shape the save
-                // path already verifies a reading's value against leaf by leaf.
-                Produced::PerReplicate { code, values, .. } => {
-                    results.insert(code, serde_json::json!(values));
-                }
-            }
-        }
+        let (results, did_not_run, not_finite) = collect_produced(produced);
+        skipped = did_not_run;
+        refused = not_finite;
         serde_json::Value::Object(results)
     } else {
         execute_script(
@@ -1267,6 +1250,7 @@ pub async fn execute_resolved(
         results,
         cleared,
         skipped,
+        refused,
         inputs_used,
         inputs_ignored,
         curves: curve_snapshots,
@@ -1278,6 +1262,45 @@ pub async fn execute_resolved(
         collected_at,
         trace,
     })
+}
+
+/// Split what the formula engine produced into the map the save path reads, the formulas that did
+/// not run, and the outputs refused as not finite.
+///
+/// A value the formula computed as NA is an explicit null, which clears the stored value; a
+/// skipped formula names no output at all; a refused one names its output and why, and is absent
+/// from the map so nothing reads it as a clear.
+pub(super) fn collect_produced(
+    produced: Vec<Produced>,
+) -> (
+    serde_json::Map<String, serde_json::Value>,
+    Vec<serde_json::Value>,
+    Vec<String>,
+) {
+    let mut results = serde_json::Map::new();
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+    let mut refused: Vec<String> = Vec::new();
+    for entry in produced {
+        match entry {
+            Produced::Scalar(evaluated) => {
+                let Some(reason) = evaluated.skipped else {
+                    results.insert(evaluated.code, serde_json::json!(evaluated.value));
+                    continue;
+                };
+                if evaluated.refused {
+                    refused.push(evaluated.code.clone());
+                }
+                skipped.push(serde_json::json!({ "output": evaluated.code, "reason": reason }));
+            }
+            // One value per replicate index, gaps kept in place, which is the shape the save
+            // path already verifies a reading's value against leaf by leaf. A refused index is a
+            // gap too: that repeat is not written and whatever stands at it is left alone.
+            Produced::PerReplicate { code, values, .. } => {
+                results.insert(code, serde_json::json!(values));
+            }
+        }
+    }
+    (results, skipped, refused)
 }
 
 /// Split the script's result map into the values it produced and the outputs it cleared.
@@ -2192,6 +2215,7 @@ pub(super) fn evaluate_set(
                 value: None,
                 curve_slot: formula.curve_slot.clone(),
                 skipped: Some(reason),
+                refused: false,
                 bindings: Vec::new(),
             });
             continue;
@@ -2202,6 +2226,22 @@ pub(super) fn evaluate_set(
             .into_iter()
             .filter_map(|name| variables.get(&name).map(|v| (name, *v)))
             .collect();
+        // A result that is a number but not a finite one, an Inf from a zero divisor, is neither
+        // a value nor an NA: the output is refused (Q172). Nothing is stored, nothing is
+        // withdrawn, the formulas reading it skip in turn, and the chain says the arithmetic
+        // divided by zero. The guard is here so the value never reaches serde_json, which maps a
+        // non-finite float to null and would make it indistinguishable from an NA.
+        if value.is_infinite() {
+            results.push(Evaluated {
+                code: formula.code.clone(),
+                value: None,
+                curve_slot: formula.curve_slot.clone(),
+                skipped: Some(format!("computed as {value}, not a finite number")),
+                refused: true,
+                bindings,
+            });
+            continue;
+        }
         // NaN is the portal's NA: computed, and not a number. It clears the stored value rather
         // than feeding the next formula, which would turn one NA into a whole calculation of them.
         // A per-replicate value is one repeat, so it travels only to a later per-replicate formula
@@ -2226,6 +2266,7 @@ pub(super) fn evaluate_set(
             value: (!value.is_nan()).then_some(value),
             curve_slot: formula.curve_slot.clone(),
             skipped: None,
+            refused: false,
             bindings,
         });
     }
@@ -2406,6 +2447,30 @@ pub async fn parameters_of(db: &DatabaseConnection, subject: &Subject) -> AppRes
               WHERE s.name = $1",
             vec![name.clone().into()],
         ),
+        // A constant is an input to whichever active calculations declare it, so the subject
+        // reduces to what those calculations read: the walk then returns the declaring
+        // calculations themselves and everything downstream of them, which is what a correction
+        // moves. Their outputs would return only the downstream half. The manifest's `constants`
+        // is a name list, so the join is on the constant's name rather than its id, and the read
+        // codes are `event_inputs` plus every `replicates` param, matching `Manifest::read_codes`.
+        Subject::Constant(id) => (
+            "SELECT DISTINCT p.id AS p
+               FROM constants c
+               JOIN tool_script_versions v
+                 ON jsonb_exists(COALESCE(v.manifest->'constants', '[]'::jsonb), c.name)
+               JOIN tool_scripts s ON s.active_version_id = v.id
+               CROSS JOIN LATERAL (
+                 SELECT e->>'parameter_code' AS code
+                   FROM jsonb_array_elements(COALESCE(v.manifest->'event_inputs', '[]'::jsonb)) e
+                 UNION ALL
+                 SELECT r->>'parameter_code'
+                   FROM jsonb_array_elements(COALESCE(v.manifest->'params', '[]'::jsonb)) r
+                  WHERE r->>'kind' = 'replicates'
+               ) reads
+               JOIN parameters p ON LOWER(p.code) = LOWER(reads.code)
+              WHERE c.id = $1",
+            vec![(*id).into()],
+        ),
     };
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
@@ -2419,6 +2484,41 @@ pub async fn parameters_of(db: &DatabaseConnection, subject: &Subject) -> AppRes
         ids.push(row.try_get::<Uuid>("", "p")?);
     }
     Ok(ids)
+}
+
+/// What a constant has already been used to compute: the readings whose stored provenance records
+/// it as an input, and the visits those readings belong to.
+///
+/// Read from the provenance rather than from the manifests, because a manifest says what would be
+/// read today and the question before an edit is what was read then.
+pub async fn stored_usage_of_constant(
+    db: &DatabaseConnection,
+    id: Uuid,
+) -> AppResult<Option<crate::routes::private::tools::models::StoredUsage>> {
+    let Some(row) = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT c.name AS name,
+                    COUNT(DISTINCT r.collection_event_id)::bigint AS visits,
+                    COUNT(r.*)::bigint AS readings
+               FROM constants c
+               LEFT JOIN readings r
+                 ON jsonb_exists(r.provenance -> 'constants', c.name)
+              WHERE c.id = $1
+              GROUP BY c.name",
+            vec![id.into()],
+        ))
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        crate::routes::private::tools::models::StoredUsage {
+            name: row.try_get("", "name")?,
+            visits: row.try_get("", "visits")?,
+            readings: row.try_get("", "readings")?,
+        },
+    ))
 }
 
 /// [`calculations_fed_by`] for any subject.
@@ -3056,13 +3156,15 @@ pub(super) fn closure_subject(query: &ClosureQuery) -> AppResult<Subject> {
         query.site_parameter_id.is_some(),
         query.stream_id.is_some(),
         query.calculation.is_some(),
+        query.constant_id.is_some(),
     ]
     .into_iter()
     .filter(|n| *n)
     .count();
     if named > 1 {
         return Err(AppError::BadRequest(
-            "name one subject: calibration_id, site_parameter_id, stream_id or calculation"
+            "name one subject: calibration_id, site_parameter_id, stream_id, calculation or \
+             constant_id"
                 .to_string(),
         ));
     }
@@ -3080,6 +3182,9 @@ pub(super) fn closure_subject(query: &ClosureQuery) -> AppResult<Subject> {
     }
     if let Some(name) = &query.calculation {
         return Ok(Subject::Calculation(name.clone()));
+    }
+    if let Some(id) = query.constant_id {
+        return Ok(Subject::Constant(id));
     }
     Ok(Subject::Parameters(parse_ids(
         query.parameter_ids.as_deref(),
@@ -3226,8 +3331,9 @@ pub fn audit_dedupe_key(name: &str) -> String {
 /// A calculation's active version changed, so every output it has stored may disagree with what it
 /// computes now. Nothing is rewritten: the edit enqueues the report-only `event_audit`, scoped to
 /// the visits whose provenance names this calculation, and repair stays the scoped
-/// `event_recompute` a person asks for. This is the policy `constants/operations.rs` already
-/// applies to a constant edit, which is the same kind of change.
+/// `event_recompute` a person asks for. A reading names the version that computed it, so leaving it
+/// on that version is a readable state; a constant carries no versions, which is why
+/// `constants/service.rs` recomputes instead of reporting.
 pub async fn audit_after_activation<C: ConnectionTrait>(db: &C, name: &str) {
     let key = audit_dedupe_key(name);
     if let Err(e) = crate::routes::private::reprocessing_jobs::service::enqueue(

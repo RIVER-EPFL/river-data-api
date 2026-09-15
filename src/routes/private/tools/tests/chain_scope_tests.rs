@@ -97,6 +97,7 @@ fn each_term_adds_its_clause_with_binds_in_order() {
         only_findings: true,
         calculation: None,
         version: None,
+        constant: None,
     };
     let (sql, binds) = scope.events_sql();
     assert!(sql.contains("ce.site_id = $1"));
@@ -134,6 +135,7 @@ fn a_site_and_range_without_only_findings_names_no_holds() {
         only_findings: false,
         calculation: None,
         version: None,
+        constant: None,
     };
     assert!(scope.is_bounded());
     let (sql, binds) = scope.events_sql();
@@ -190,4 +192,58 @@ fn a_version_narrows_a_site_scope_rather_than_replacing_it() {
     assert!(sql.contains("ce.site_id = $1"), "{sql}");
     assert!(sql.contains("script_version_id' = $2"), "{sql}");
     assert_eq!(binds.len(), 2);
+}
+
+/// Scenario: a constant's value is corrected, so every visit whose stored provenance names that
+/// constant holds a value computed from the old one.
+///
+/// Expected behaviour: the constant is a bound in its own right. It names a set of visits without
+/// a site or a range, which is what lets the correction repair exactly what it moved rather than
+/// waiting for a person to name a window.
+#[test]
+fn a_constant_is_a_scope_on_its_own() {
+    assert!(
+        RecomputeScope {
+            constant: Some("molar_mass_c".to_string()),
+            ..Default::default()
+        }
+        .is_bounded()
+    );
+}
+
+#[test]
+fn a_constant_selects_the_visits_whose_provenance_names_it() {
+    let (sql, binds) = RecomputeScope {
+        constant: Some("molar_mass_c".to_string()),
+        ..Default::default()
+    }
+    .events_sql();
+    assert!(sql.contains("jsonb_exists"), "{sql}");
+    assert!(sql.contains("'constants'"), "{sql}");
+    assert!(sql.contains("$1"), "{sql}");
+    assert_eq!(binds.len(), 1);
+}
+
+/// A constant narrows a site-and-range scope rather than replacing it: a correction confined to
+/// one site repairs that site's visits naming the constant and no others.
+#[test]
+fn a_constant_narrows_a_site_scope_and_binds_after_it() {
+    let (sql, binds) = RecomputeScope {
+        site_id: Some(Uuid::new_v4()),
+        constant: Some("molar_mass_c".to_string()),
+        ..Default::default()
+    }
+    .events_sql();
+    assert!(sql.contains("ce.site_id = $1"), "{sql}");
+    assert!(sql.contains("$2"), "{sql}");
+    assert_eq!(binds.len(), 2);
+}
+
+/// The audit reports on the set the repair can repair: a synced visit is the portal's, so neither
+/// covers one (Q175).
+#[test]
+fn the_audit_set_excludes_portal_sync_visits_too() {
+    let sql = crate::routes::private::tools::flows::audit_event_set(None, None, None, None)
+        .to_string();
+    assert!(sql.contains("portal_sync"), "{sql}");
 }

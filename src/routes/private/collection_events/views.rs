@@ -237,10 +237,13 @@ pub async fn run_event_recompute(
         only_findings: req.only_findings,
         calculation: req.calculation.clone(),
         version: req.version,
+        constant: req.constant.clone(),
     };
     if !scope.is_bounded() {
         return Err(AppError::BadRequest(
-            "A recompute needs a scope: a site, a time range, or only_findings".to_string(),
+            "A recompute needs a scope: a site, a time range, a script version, a constant, or \
+             only_findings"
+                .to_string(),
         ));
     }
     if let (Some(start), Some(end)) = (req.start, req.end)
@@ -269,6 +272,7 @@ pub async fn run_event_recompute(
             "only_findings": req.only_findings,
             "calculation": req.calculation,
             "version": req.version,
+            "constant": req.constant,
             "actor": crate::common::actor::label(&auth),
         }),
         None,
