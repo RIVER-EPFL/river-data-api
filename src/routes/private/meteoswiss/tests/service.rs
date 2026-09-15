@@ -1,7 +1,7 @@
 use super::{
     ATTRIBUTION, VARIABLES, archive_hrefs, attributions, distance_km, insert_chunk, latest, latin1,
-    rank_stations, recent_url, require_declared, series, stac_item_url, stations, stations_url,
-    variable,
+    listed_station, rank_stations, recent_url, require_declared, series, stac_item_url, stations,
+    stations_url, variable,
 };
 use crate::routes::private::meteoswiss::models::{Point, station, subscription};
 use chrono::{TimeZone, Utc};
@@ -398,6 +398,33 @@ fn stac_item() -> serde_json::Value {
             .collect(),
         ),
     })
+}
+
+/// Scenario: an operator types the station abbreviation reporting for a site.
+/// Expected behaviour: a station the published list holds is accepted whatever its case and
+/// spacing, and one it does not hold is refused with the abbreviations nearest what was typed.
+#[test]
+fn test_only_a_listed_station_can_be_subscribed_to() {
+    let published = vec![
+        listed("MOB", "Montagnier, Bagnes", Some(MOB)),
+        listed("SIO", "Sion", Some(SIO)),
+        listed("ABO", "Adelboden", Some(ABO)),
+    ];
+    assert!(listed_station("MOB", &published).is_ok());
+    assert!(listed_station("  mob ", &published).is_ok());
+
+    let refusal = listed_station("MOP", &published).expect_err("no station is published as MOP");
+    let message = format!("{refusal:?}");
+    assert!(str::contains(&message, "MOP"), "{message}");
+    assert!(str::contains(&message, "MOB"), "{message}");
+    assert!(str::contains(&message, "Montagnier, Bagnes"), "{message}");
+}
+
+/// The list is refreshed on every pass and empty before the first, which is not a reason to stand
+/// between an operator and a subscription.
+#[test]
+fn test_an_empty_station_list_accepts_any_abbreviation() {
+    assert!(listed_station("MOP", &[]).is_ok());
 }
 
 #[test]

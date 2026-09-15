@@ -417,6 +417,59 @@ fn station(abbr: &str, name: &str, barometer: Option<f64>) -> StationRow {
     }
 }
 
+/// Scenario: an operator types the abbreviation of the station reporting for a site.
+/// Expected behaviour: an abbreviation the maintained list holds is accepted, a typo is refused
+/// naming the nearest, and a list not yet fetched refuses nothing.
+#[tokio::test]
+#[serial]
+async fn subscribing_to_a_station_the_list_does_not_hold_is_refused() {
+    use crudcrate::CRUDOperations;
+
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    crate::common::exec(&db, "DELETE FROM meteoswiss_stations").await;
+
+    let typed = |abbr: &str| MeteoswissSubscriptionCreate {
+        site_id: Uuid::parse_str(crate::common::fixtures::SITE1_ID).unwrap(),
+        station_abbr: abbr.to_string(),
+        variable: VARIABLE.to_string(),
+        enabled: Some(true),
+    };
+    MeteoswissSubscriptionOperations
+        .before_create(&db, &typed("MOP"))
+        .await
+        .expect("a list not yet fetched stands between nobody and a subscription");
+
+    store_stations(
+        &db,
+        &[
+            station(STATION, "Montagnier, Bagnes", Some(840.0)),
+            station("SIO", "Sion", Some(482.0)),
+        ],
+    )
+    .await
+    .unwrap();
+
+    MeteoswissSubscriptionOperations
+        .before_create(&db, &typed(STATION))
+        .await
+        .expect("the station the list holds");
+    MeteoswissSubscriptionOperations
+        .before_create(&db, &typed("  mob "))
+        .await
+        .expect("the same station, as it was typed");
+
+    let refusal = MeteoswissSubscriptionOperations
+        .before_create(&db, &typed("MOP"))
+        .await
+        .expect_err("MOP is not published");
+    let message = format!("{refusal:?}");
+    assert!(str::contains(&message, "MOP"), "{message}");
+    assert!(str::contains(&message, STATION), "{message}");
+    assert!(str::contains(&message, "Montagnier, Bagnes"), "{message}");
+}
+
 /// Scenario: MeteoSwiss re-publish the station list every day, and the job reads it every pass.
 /// Expected behaviour: a station already held is updated where it moved, not duplicated, so the
 /// abbreviation a subscription names keeps meaning one row.

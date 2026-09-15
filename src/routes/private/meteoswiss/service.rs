@@ -16,7 +16,8 @@ use sea_orm::{
 use uuid::Uuid;
 
 use super::models::{
-    ExternalSource, Fetched, Point, Series, StationCandidate, StationRow, Subscriber, subscription,
+    ExternalSource, Fetched, Point, Series, StationCandidate, StationRow, Subscriber, station,
+    subscription,
 };
 use crate::routes::private::reprocessing_jobs::service as jobs;
 use crate::routes::private::{data_streams, parameters, readings, sensors, site_parameters};
@@ -737,13 +738,15 @@ pub struct MeteoswissSubscriptionOperations;
 impl crudcrate::CRUDOperations for MeteoswissSubscriptionOperations {
     type Resource = super::models::subscription::MeteoswissSubscription;
 
-    /// A variable the feed does not publish lands nowhere, so it is refused by name.
+    /// A variable the feed does not publish lands nowhere, and a station it does not list is read
+    /// for ever at a 404, so both are refused by name.
     async fn before_create<C: ConnectionTrait + sea_orm::TransactionTrait>(
         &self,
-        _db: &C,
+        db: &C,
         data: &<Self::Resource as crudcrate::CRUDResource>::CreateModel,
     ) -> Result<(), crudcrate::ApiError> {
-        require_declared(&data.variable)
+        require_declared(&data.variable)?;
+        require_listed_station(db, &data.station_abbr).await
     }
 
     /// The catalog row is the subscription's own: it is resolved, minted where the catalog does
@@ -768,12 +771,15 @@ impl crudcrate::CRUDOperations for MeteoswissSubscriptionOperations {
 
     async fn before_update<C: ConnectionTrait + sea_orm::TransactionTrait>(
         &self,
-        _db: &C,
+        db: &C,
         _id: Uuid,
         data: &<Self::Resource as crudcrate::CRUDResource>::UpdateModel,
     ) -> Result<(), crudcrate::ApiError> {
-        match data.variable.as_ref().and_then(Option::as_ref) {
-            Some(name) => require_declared(name),
+        if let Some(name) = data.variable.as_ref().and_then(Option::as_ref) {
+            require_declared(name)?;
+        }
+        match data.station_abbr.as_ref().and_then(Option::as_ref) {
+            Some(abbr) => require_listed_station(db, abbr).await,
             None => Ok(()),
         }
     }
@@ -834,6 +840,82 @@ fn declaration(name: &str) -> Result<&'static Variable, crudcrate::ApiError> {
 
 fn require_declared(name: &str) -> Result<(), crudcrate::ApiError> {
     declaration(name).map(|_| ())
+}
+
+/// A station out of the published list, read from the list as it stands.
+async fn require_listed_station<C: ConnectionTrait>(
+    db: &C,
+    abbr: &str,
+) -> Result<(), crudcrate::ApiError> {
+    let listed = search_stations(db, None)
+        .await
+        .map_err(crudcrate::ApiError::database)?;
+    listed_station(abbr, &listed)
+}
+
+/// The abbreviations a refusal offers instead of the one that was typed.
+const NEAREST_STATIONS: usize = 3;
+
+/// A subscription names a station the published list holds. The list is maintained from the
+/// metadata file on every pass and is empty until the first one, where an abbreviation passes
+/// rather than the feed's absence standing between an operator and a subscription.
+fn listed_station(abbr: &str, listed: &[station::Model]) -> Result<(), crudcrate::ApiError> {
+    let typed = abbr.trim().to_uppercase();
+    let held = listed
+        .iter()
+        .any(|station| station.station_abbr.trim().to_uppercase() == typed);
+    if listed.is_empty() || held {
+        return Ok(());
+    }
+    Err(unlisted(&typed, listed))
+}
+
+fn unlisted(typed: &str, listed: &[station::Model]) -> crudcrate::ApiError {
+    let nearest: Vec<String> = nearest_stations(typed, listed)
+        .into_iter()
+        .map(|station| format!("{} ({})", station.station_abbr, station.name))
+        .collect();
+    crudcrate::ApiError::bad_request(format!(
+        "MeteoSwiss list no station '{typed}'; nearest: {}",
+        nearest.join(", ")
+    ))
+}
+
+/// The listed stations closest to what was typed, by edit distance on the abbreviation and then by
+/// name, so a refusal carries the one the operator meant.
+fn nearest_stations<'a>(typed: &str, listed: &'a [station::Model]) -> Vec<&'a station::Model> {
+    let mut by_distance: Vec<(usize, &station::Model)> = listed
+        .iter()
+        .map(|station| {
+            (
+                edit_distance(typed, &station.station_abbr.trim().to_uppercase()),
+                station,
+            )
+        })
+        .collect();
+    by_distance.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+    by_distance
+        .into_iter()
+        .take(NEAREST_STATIONS)
+        .map(|(_, station)| station)
+        .collect()
+}
+
+/// Levenshtein distance, over the two abbreviations a typo separates.
+fn edit_distance(from: &str, to: &str) -> usize {
+    let to: Vec<char> = to.chars().collect();
+    let mut row: Vec<usize> = (0..=to.len()).collect();
+    for (i, a) in from.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, b) in to.iter().enumerate() {
+            let cost = usize::from(a != *b);
+            let replace = diagonal + cost;
+            diagonal = row[j + 1];
+            row[j + 1] = replace.min(row[j] + 1).min(diagonal + 1);
+        }
+    }
+    row[to.len()]
 }
 
 fn undeclared(name: &str) -> crudcrate::ApiError {
