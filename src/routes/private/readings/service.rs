@@ -6555,7 +6555,14 @@ pub async fn run<'a>(
     }
 
     if !plan.recompute_events.is_empty() {
-        flows::enqueue_for(sink.db, &written.touched_events, actor, axes.writer).await?;
+        // The rows are committed, so a failure here is reported rather than returned: a 500 reads
+        // as a failed save and the operator writes the same values again. A visit whose recompute
+        // was never queued is raised by the event audit as a missing or stale output.
+        if let Err(e) =
+            flows::enqueue_for(sink.db, &written.touched_events, actor, axes.writer).await
+        {
+            tracing::warn!(error = %e, "recompute enqueue after a write failed");
+        }
     }
 
     for slot in &plan.announce {

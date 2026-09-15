@@ -27,6 +27,7 @@ mod entity_list;
 mod flag_range_dry_run;
 mod grab_replace_scope;
 mod grab_samples_insertion;
+mod grab_save_survives_enqueue_failure;
 mod guarded_bulk_write;
 mod ingest_dedup_and_visibility;
 mod ingest_forms_samples;
