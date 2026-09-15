@@ -1,8 +1,9 @@
 //! The site-parameter handlers: applying a parameter group to a site, and declaring or retagging
 //! a slot's sd estimator.
 //!
-//! Under Q98 a calculation applies at a site when the group's output slots are configured there,
-//! so the site parameters *are* the declaration and `apply_group` is the flow that writes it. One
+//! A calculation applies at a site when the site declares what it reads (Q193, narrowing Q98), so
+//! the site parameters *are* the declaration and `apply_group` is the flow that writes it; the
+//! output slots follow, minted by the run that first computes them. One
 //! action per group rather than one per member: pCO2, DIC and Chl a carry roughly 45 stage-1
 //! intermediates between them (Q95), and there are 23 CNET stations. Applying twice adds only what
 //! is missing, so a group that grows is applied again rather than diffed by hand.

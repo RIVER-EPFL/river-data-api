@@ -50,9 +50,9 @@ pub struct Model {
     pub is_active: Option<bool>,
     #[crudcrate(filterable, on_create = false)]
     pub is_public: Option<bool>,
-    /// Carried by slots a tool save minted before Q98 made the site parameters the declaration;
-    /// cleared by a manager confirming the slot from the site's Parameters tab. Nothing sets it
-    /// any more.
+    /// Carried by a slot the chain minted where the site declared the calculation's inputs and
+    /// not its output (Q193); cleared by a manager confirming the slot from the site's Parameters
+    /// tab.
     #[crudcrate(filterable, sortable, on_create = false)]
     pub needs_review: bool,
     /// How this slot's replicate standard deviation is defined: 'sample' (divisor n-1) or

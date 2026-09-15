@@ -615,8 +615,9 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         )
         // A declaration change recomputes the slot's stored samples, the same act as the audit
         // resolution's slot scope, so it carries the same MANAGER gate rather than catalog CRUD.
-        // Applying a group is what declares a site's calculations (Q98), so it carries the same
-        // MANAGER gate the other slot-shaping actions do.
+        // Applying a group is what declares a site's calculations (Q98, narrowed by Q193: the
+        // inputs are the declaration), so it carries the same MANAGER gate the other slot-shaping
+        // actions do.
         .route(
             "/sites/{site_id}/parameter_groups",
             post(crate::routes::private::site_parameters::views::apply_group),

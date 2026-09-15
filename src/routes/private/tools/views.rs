@@ -25,20 +25,25 @@ use super::models::{
     CreateVersionResponse, DraftRunFailure, DraftRunFailureKind, DraftRunRequest, DraftRunResponse,
     DraftRunResults, Engine, FormulaDraftRunRequest, FormulaDraftRunResponse,
     FormulaDraftRunResults, InspectScriptRequest, InspectScriptResponse, LintFinding,
-    MissingConstant, ToolDescriptor, ToolResult, UpdateScriptRequest, ValidateResponse,
-    parse_manifest, reconcile_manifest,
+    MissingConstant, SaveFormulaSetRequest, SaveFormulaSetResponse, SavedFormula, ToolDescriptor,
+    ToolResult, UpdateScriptRequest, ValidateResponse, VersionUsage, parse_manifest,
+    reconcile_manifest,
 };
 use super::service::{
-    LIST_LIMIT, audit_after_activation, calculation_health, calculation_slots,
+    FormulaWrite, LIST_LIMIT, audit_after_activation, calculation_health, calculation_slots,
     calculations_fed_by_subject, canonical_hash, check_engine, check_manifest_against_catalog,
     check_manifest_codes_resolve, closure_subject, coverage_for, find_active_tool, lint_script,
     list_active_tools, load_parameter_catalog, load_script, load_version, manifest_finding,
-    manifest_json, normalise_name, render, replicated_for, run_stored_cases, run_tool_body,
-    runner_runtime, stored_version_content,
+    manifest_json, mint_formula_version, normalise_name, plan_formula_set, render, replicated_for,
+    run_stored_cases, run_tool_body, runner_runtime, stored_version_content,
 };
 use crate::common::AppState;
 use crate::common::middleware::AuthContext;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::derived_parameters::models::definition as formula_entity;
+use crate::routes::private::derived_parameters::models::definition::{
+    CalculationFormula, CalculationFormulaCreate, CalculationFormulaUpdate,
+};
 use crate::routes::private::derived_parameters::service::{
     resolve_identifiers, validate_formula, variables_of,
 };
@@ -819,6 +824,161 @@ pub async fn activate_version(
     Ok(Json(ActivateResponse { script, lint }))
 }
 
+/// A saved formula as a create: the calculation is the path's, and an omitted name or unit takes
+/// the code, which is what the calculation page sends when an author leaves the field blank.
+fn create_model(script_id: Uuid, f: &SavedFormula) -> CalculationFormulaCreate {
+    CalculationFormulaCreate {
+        code: f.code.clone(),
+        name: f.name.clone().unwrap_or_else(|| f.code.clone()),
+        units: f.units.clone().unwrap_or_default(),
+        formula: f.formula.clone(),
+        description: f.description.clone(),
+        tool_script_id: Some(script_id),
+        ordinal: Some(f.ordinal),
+        curve_slot: f.curve_slot.clone(),
+        per_replicate: f.per_replicate.clone(),
+        intermediate: Some(f.intermediate),
+    }
+}
+
+/// A saved formula as an update. The set is the whole truth, so every field is written, including
+/// the ones the author cleared: a curve slot removed from the form is removed from the row.
+fn update_model(f: &SavedFormula) -> CalculationFormulaUpdate {
+    CalculationFormulaUpdate {
+        code: Some(Some(f.code.clone())),
+        name: Some(Some(f.name.clone().unwrap_or_else(|| f.code.clone()))),
+        units: Some(Some(f.units.clone().unwrap_or_default())),
+        formula: Some(Some(f.formula.clone())),
+        description: Some(f.description.clone()),
+        tool_script_id: None,
+        ordinal: Some(Some(f.ordinal)),
+        curve_slot: Some(f.curve_slot.clone()),
+        per_replicate: Some(f.per_replicate.clone()),
+        intermediate: Some(Some(f.intermediate)),
+    }
+}
+
+/// Save a formula calculation's whole formula set as one version.
+///
+/// The set is the request: a formula carrying an `id` updates that row, one without an id is
+/// created, and a stored formula the set leaves out is deleted. One version is minted from the
+/// resulting set and activated, whatever the save touched, so an author's version history reads as
+/// their decisions rather than as their keystrokes (Q186). `migrate_stored` chooses what happens to
+/// the values the superseded version produced (Q170). Requires Administrator.
+#[utoipa::path(
+    post,
+    path = "/api/tool_scripts/{id}/formulas",
+    params(("id" = Uuid, Path, description = "Calculation UUID")),
+    request_body = SaveFormulaSetRequest,
+    responses(
+        (status = 200, description = "The set is saved and one version activated", body = SaveFormulaSetResponse),
+        (status = 400, description = "A formula the set refuses, or a calculation that is not formula-engined"),
+        (status = 404, description = "No such calculation"),
+    ),
+    tag = "tool_scripts")]
+pub async fn save_formula_set(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<SaveFormulaSetRequest>,
+) -> AppResult<Json<SaveFormulaSetResponse>> {
+    let script = load_script(&state, id).await?;
+    if Engine::parse(&script.engine) != Some(Engine::Formula) {
+        return Err(AppError::BadRequest(format!(
+            "{} is a {} calculation; a formula set saves on a formula calculation",
+            script.name, script.engine
+        )));
+    }
+
+    let actor = crate::common::actor::label(&auth);
+    let txn = state.db.begin().await?;
+    // The calculation is locked for the save: the version being superseded is what the migration
+    // names, so a concurrent save must not slip between reading it and minting the new one.
+    let current = script_entity::Entity::find_by_id(id)
+        .lock_exclusive()
+        .one(&txn)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Tool script {id} not found")))?;
+    let superseded = current.active_version_id;
+
+    let stored: Vec<(Uuid, String)> = formula_entity::Entity::find()
+        .filter(formula_entity::Column::ToolScriptId.eq(id))
+        .order_by_asc(formula_entity::Column::Ordinal)
+        .order_by_asc(formula_entity::Column::Code)
+        .all(&txn)
+        .await?
+        .into_iter()
+        .map(|f| (f.id, f.code))
+        .collect();
+    let named: Vec<(Option<Uuid>, String)> = payload
+        .formulas
+        .iter()
+        .map(|f| (f.id, f.code.clone()))
+        .collect();
+    let writes = plan_formula_set(&stored, &named).map_err(AppError::BadRequest)?;
+
+    let mut created = 0usize;
+    let mut updated = 0usize;
+    let mut deleted = 0usize;
+    for write in writes {
+        match write {
+            FormulaWrite::Delete(formula_id) => {
+                CalculationFormula::delete(&txn, formula_id).await?;
+                deleted += 1;
+            }
+            FormulaWrite::Create(i) => {
+                CalculationFormula::create(&txn, create_model(id, &payload.formulas[i])).await?;
+                created += 1;
+            }
+            FormulaWrite::Update(formula_id, i) => {
+                CalculationFormula::update(&txn, formula_id, update_model(&payload.formulas[i]))
+                    .await?;
+                updated += 1;
+            }
+        }
+    }
+
+    // One version for the whole save, whatever it touched.
+    let version_id = mint_formula_version(&txn, id, Some(&actor)).await?;
+    txn.commit().await?;
+
+    let version_no = match version_id {
+        Some(vid) => super::models::version::Entity::find_by_id(vid)
+            .one(&state.db)
+            .await?
+            .map(|v| v.version_no),
+        None => None,
+    };
+
+    // The audit is the backstop under either arm: it reports what the save left disagreeing.
+    audit_after_activation(&state.db, &script.name).await;
+    let migrated = payload.migrate_stored && superseded.is_some() && version_id != superseded;
+    super::service::recompute_after_activation(&state.db, migrated, &script.name, superseded).await;
+
+    Ok(Json(SaveFormulaSetResponse {
+        version_id,
+        version_no,
+        created,
+        updated,
+        deleted,
+        migrated,
+    }))
+}
+
+/// What each version of the calculation has already produced, newest first. Requires
+/// Administrator.
+///
+/// Read before a save or an activation, which offers the author the choice between leaving those
+/// values on the version that produced them and recomputing them under the new one.
+#[utoipa::path(get, path = "/api/tool_scripts/{id}/version_usage", params(("id" = Uuid, Path)),
+    responses((status = 200, body = [VersionUsage])), tag = "tool_scripts")]
+pub async fn list_version_usage(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<VersionUsage>>> {
+    Ok(Json(super::service::version_usage(&state.db, id).await?))
+}
+
 /// The script's activation history, newest first. Requires Administrator.
 #[utoipa::path(get, path = "/api/tool_scripts/{id}/activations", params(("id" = Uuid, Path)),
     responses((status = 200, body = [ActivationRecord])), tag = "tool_scripts")]
@@ -861,6 +1021,7 @@ pub fn script_routes() -> Router<AppState> {
         .route("/tool_scripts", get(list_scripts).post(create_script))
         .route("/tool_scripts/{id}", get(get_script).patch(update_script))
         .route("/tool_scripts/draft_run", post(draft_run))
+        .route("/tool_scripts/{id}/formulas", post(save_formula_set))
         .route(
             "/tool_scripts/{id}/formulas/draft_run",
             post(draft_run_formulas),
@@ -877,6 +1038,7 @@ pub fn script_routes() -> Router<AppState> {
             post(activate_version),
         )
         .route("/tool_scripts/{id}/activations", get(list_activations))
+        .route("/tool_scripts/{id}/version_usage", get(list_version_usage))
         .layer(middleware::from_fn(
             crate::common::middleware::require_admin,
         ))

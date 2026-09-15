@@ -11,6 +11,7 @@ use sea_orm::EntityTrait;
 use sea_orm::PaginatorTrait;
 use sea_orm::QueryFilter;
 use sea_orm::QuerySelect;
+use sea_orm::Set;
 use sea_orm::Statement;
 use sea_orm::TransactionTrait;
 use sea_orm::sea_query::Alias;
@@ -288,6 +289,58 @@ async fn definition_producing<C: ConnectionTrait>(
         .one(db)
         .await
         .map_err(ApiError::database)
+}
+
+/// The slot a publishing run mints at a site that declared the calculation's inputs but not its
+/// output (Q193). It carries `needs_review` until a manager confirms it from the site's Parameters
+/// tab, it computes rather than being typed into, and it is not public. `None` when the site
+/// already holds the slot.
+pub async fn mint_tool_slot<C: ConnectionTrait>(
+    db: &C,
+    site_id: Uuid,
+    parameter_id: Uuid,
+) -> AppResult<Option<Uuid>> {
+    use crate::routes::private::parameters::models as parameters;
+    let held = Entity::find()
+        .filter(Column::SiteId.eq(site_id))
+        .filter(Column::ParameterId.eq(parameter_id))
+        .select_only()
+        .column(Column::Id)
+        .into_tuple::<Uuid>()
+        .one(db)
+        .await?;
+    if held.is_some() {
+        return Ok(None);
+    }
+    let parameter = parameters::Entity::find_by_id(parameter_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Parameter {parameter_id} not found")))?;
+    let slot = super::models::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        instrument_sensor_id: Set(None),
+        site_id: Set(site_id),
+        parameter_id: Set(parameter_id),
+        name: Set(parameter.name),
+        sensor_type: Set(String::new()),
+        display_units: Set(Some(parameter.default_units)),
+        units_name: Set(None),
+        units_min: Set(None),
+        units_max: Set(None),
+        decimal_places: Set(None),
+        channel_id: Set(None),
+        sample_interval_sec: Set(None),
+        is_active: Set(Some(true)),
+        is_public: Set(Some(false)),
+        needs_review: Set(true),
+        sd_estimator: Set(None),
+        entry_mode: Set("tool".to_string()),
+        variable_mappings: Set(None),
+        created_at: Set(Some(chrono::Utc::now())),
+        updated_at: Set(Some(chrono::Utc::now())),
+        discovered_at: Set(Some(chrono::Utc::now())),
+    };
+    Ok(Some(slot.insert(db).await?.id))
 }
 
 /// Load the catalog rows for a set of parameter ids, keyed by parameter id.

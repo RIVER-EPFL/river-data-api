@@ -1157,9 +1157,7 @@ async fn hold_the_visit_open(db: &DatabaseConnection, event_id: &str, time: &str
     let hold = Uuid::new_v4().to_string();
     crate::common::exec(
         db,
-        &format!(
-            "UPDATE collection_events SET unverified = TRUE WHERE id = '{event_id}'"
-        ),
+        &format!("UPDATE collection_events SET unverified = TRUE WHERE id = '{event_id}'"),
     )
     .await;
     crate::common::exec(
@@ -1209,7 +1207,10 @@ async fn a_verified_stager_opens_a_verified_field_day() {
     assert_eq!(status, 200, "{staged}");
     assert_eq!(staged["unverified"], false);
     let (_, unverified, withdrawn) = visit_state(&db, T1).await;
-    assert!(!unverified, "a full-permission caller's visit needs no ruling");
+    assert!(
+        !unverified,
+        "a full-permission caller's visit needs no ruling"
+    );
     assert!(!withdrawn);
     assert_eq!(
         scalar_i64(
@@ -1311,7 +1312,10 @@ async fn rejecting_a_field_day_withdraws_it_with_its_readings() {
     assert_eq!(status, 200, "{body}");
     let (_, unverified, withdrawn) = visit_state(&db, T1).await;
     assert!(withdrawn, "the visit carries the rejection");
-    assert!(!unverified, "a rejected visit is no longer awaiting a ruling");
+    assert!(
+        !unverified,
+        "a rejected visit is no longer awaiting a ruling"
+    );
     assert_eq!(
         scalar_i64(
             &db,
@@ -1328,9 +1332,7 @@ async fn rejecting_a_field_day_withdraws_it_with_its_readings() {
     assert_eq!(
         scalar_i64(
             &db,
-            &format!(
-                "SELECT COUNT(*) AS n FROM readings WHERE collection_event_id = '{event_id}'"
-            )
+            &format!("SELECT COUNT(*) AS n FROM readings WHERE collection_event_id = '{event_id}'")
         )
         .await,
         2
@@ -1338,8 +1340,10 @@ async fn rejecting_a_field_day_withdraws_it_with_its_readings() {
     assert_eq!(
         scalar_i64(
             &db,
-            &format!("SELECT COUNT(*) AS n FROM reading_decisions WHERE kind = 'reject' \
-                       AND time = '{T1}'")
+            &format!(
+                "SELECT COUNT(*) AS n FROM reading_decisions WHERE kind = 'reject' \
+                       AND time = '{T1}'"
+            )
         )
         .await,
         2,

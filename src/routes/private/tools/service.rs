@@ -144,6 +144,11 @@ pub async fn load_parameter_catalog<'a>(
                 codes.push(code.to_lowercase());
             }
         }
+        // The codes a calculation reads at a visit are catalog rows like any other: the chain's
+        // applicability test resolves them through here (Q193).
+        for input in &manifest.event_inputs {
+            codes.push(input.parameter_code.to_lowercase());
+        }
     }
     let mut catalog = ParameterCatalog::default();
     if ids.is_empty() && codes.is_empty() {
@@ -2525,6 +2530,45 @@ pub async fn stored_usage_of_constant(
     }))
 }
 
+/// What each of a calculation's versions has already produced: the readings whose stored
+/// provenance names the version, and the visits those readings belong to. Every version of the
+/// calculation is a row, newest first, so a history states zero rather than omitting the versions
+/// nothing was stored under.
+///
+/// Read from the provenance rather than from the activations, because an activation says which
+/// version was live and the question before a save is which values that version left behind.
+pub async fn version_usage(
+    db: &DatabaseConnection,
+    script_id: Uuid,
+) -> AppResult<Vec<crate::routes::private::tools::models::VersionUsage>> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT v.id AS version_id,
+                    v.version_no AS version_no,
+                    COUNT(DISTINCT r.collection_event_id)::bigint AS visits,
+                    COUNT(r.*)::bigint AS readings
+               FROM tool_script_versions v
+               LEFT JOIN readings r
+                 ON r.provenance -> 'tool_version' ->> 'script_version_id' = v.id::text
+              WHERE v.tool_script_id = $1
+              GROUP BY v.id, v.version_no
+              ORDER BY v.version_no DESC",
+            vec![script_id.into()],
+        ))
+        .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(crate::routes::private::tools::models::VersionUsage {
+                version_id: row.try_get("", "version_id")?,
+                version_no: row.try_get("", "version_no")?,
+                visits: row.try_get("", "visits")?,
+                readings: row.try_get("", "readings")?,
+            })
+        })
+        .collect()
+}
+
 /// [`calculations_fed_by`] for any subject.
 pub async fn calculations_fed_by_subject(
     db: &DatabaseConnection,
@@ -3300,6 +3344,77 @@ pub async fn mint_formula_version<C: ConnectionTrait>(
     )
     .await?;
     Ok(Some(version_id))
+}
+
+/// What a set-level save does to one formula of the set it was given.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FormulaWrite {
+    /// The payload row at this position, which named no stored row.
+    Create(usize),
+    /// The stored row this payload position names.
+    Update(Uuid, usize),
+    /// A stored row the payload does not name.
+    Delete(Uuid),
+}
+
+/// The writes a set-level save makes, given the calculation's stored formulas and the id and code
+/// each payload position carries. The save is the whole set, so a stored row the payload leaves
+/// out is deleted; deletes come first, so a code the save moves from one formula to another is
+/// free by the time the create needs it.
+///
+/// A row the payload replaces under the same code is updated in place rather than deleted and
+/// created. The catalog parameter a formula mints is found by that code, and a delete leaves it
+/// behind with no calculation pointing at it, which the create then reads as somebody else's
+/// parameter and refuses.
+///
+/// # Errors
+/// An id the calculation does not hold, or one named twice.
+pub fn plan_formula_set(
+    stored: &[(Uuid, String)],
+    payload: &[(Option<Uuid>, String)],
+) -> Result<Vec<FormulaWrite>, String> {
+    let mut named: Vec<Uuid> = Vec::with_capacity(payload.len());
+    for id in payload.iter().filter_map(|(id, _)| id.as_ref()) {
+        if !stored.iter().any(|(stored_id, _)| stored_id == id) {
+            return Err(format!("formula {id} does not belong to this calculation"));
+        }
+        if named.contains(id) {
+            return Err(format!("formula {id} appears twice in the set"));
+        }
+        named.push(*id);
+    }
+
+    // A dropped row and a new row sharing a code are the same output under a new formula, paired
+    // one to one in the order they appear.
+    let mut claimed: Vec<usize> = Vec::new();
+    let mut adopted: Vec<(Uuid, usize)> = Vec::new();
+    for (stored_id, code) in stored.iter().filter(|(id, _)| !named.contains(id)) {
+        let taken = payload.iter().enumerate().position(|(i, (id, payload_code))| {
+            id.is_none() && payload_code == code && !claimed.contains(&i)
+        });
+        if let Some(i) = taken {
+            claimed.push(i);
+            adopted.push((*stored_id, i));
+        }
+    }
+
+    let mut writes: Vec<FormulaWrite> = stored
+        .iter()
+        .filter(|(id, _)| {
+            !named.contains(id) && !adopted.iter().any(|(adopted_id, _)| adopted_id == id)
+        })
+        .map(|(id, _)| FormulaWrite::Delete(*id))
+        .collect();
+    writes.extend(payload.iter().enumerate().map(|(i, (id, _))| match id {
+        Some(id) => FormulaWrite::Update(*id, i),
+        None => adopted
+            .iter()
+            .find(|(_, position)| *position == i)
+            .map_or(FormulaWrite::Create(i), |(adopted_id, _)| {
+                FormulaWrite::Update(*adopted_id, i)
+            }),
+    }));
+    Ok(writes)
 }
 
 /// Re-mint every formula calculation whose formula set no longer matches its active version.

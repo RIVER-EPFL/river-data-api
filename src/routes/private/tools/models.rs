@@ -1868,6 +1868,17 @@ pub struct StoredUsage {
     pub readings: i64,
 }
 
+/// What one version of a calculation has already produced: the readings whose stored provenance
+/// names it, and the visits those readings belong to. A version that produced nothing carries
+/// zeros, because "nothing stored" and "not counted" are different claims.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VersionUsage {
+    pub version_id: Uuid,
+    pub version_no: i32,
+    pub visits: i64,
+    pub readings: i64,
+}
+
 pub struct ToolScriptOperations;
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2023,6 +2034,56 @@ pub struct DraftFormula {
     pub intermediate: bool,
 }
 
+/// One formula of a set-level save. An `id` names a stored formula of this calculation, which the
+/// save updates; a formula without one is created, and a stored formula the set leaves out is
+/// deleted.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SavedFormula {
+    #[serde(default)]
+    pub id: Option<Uuid>,
+    pub code: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub units: Option<String>,
+    pub formula: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub ordinal: i32,
+    #[serde(default)]
+    pub curve_slot: Option<String>,
+    #[serde(default)]
+    pub per_replicate: Option<String>,
+    #[serde(default)]
+    pub intermediate: bool,
+}
+
+/// Save a formula calculation's whole set, as one version (Q186).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SaveFormulaSetRequest {
+    pub formulas: Vec<SavedFormula>,
+    /// What happens to the values the version being replaced produced (Q170). `false`, the
+    /// default, leaves them on that version. `true` is a correction: every visit the superseded
+    /// version produced values at is recomputed under the new one.
+    #[serde(default)]
+    pub migrate_stored: bool,
+}
+
+/// What one set-level save wrote.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SaveFormulaSetResponse {
+    /// The version the save minted, or the one it matched: a save that changes nothing mints none.
+    #[schema(required)]
+    pub version_id: Option<Uuid>,
+    #[schema(required)]
+    pub version_no: Option<i32>,
+    pub created: usize,
+    pub updated: usize,
+    pub deleted: usize,
+    /// Whether the migration of the superseded version's values was enqueued.
+    pub migrated: bool,
+}
+
 /// Run a formula calculation's unsaved formula set at a visit. The formulas replace the stored
 /// set for this run only; nothing is written.
 #[derive(Debug, Deserialize, ToSchema)]
@@ -2162,10 +2223,13 @@ pub struct RecomputeOutcome {
     pub skipped: Vec<(String, String)>,
     /// `skipped_output` findings raised because a step did not run and its outputs are absent.
     pub findings_raised: usize,
-    /// Tools the site never declared: their output slots are not configured here, so they do not
-    /// apply at this site at all (Q98). Distinct from `skipped`, which is an input that did not
-    /// resolve on a tool that does apply.
+    /// Tools the site never declared: it holds no slot for what they read and none for what they
+    /// write, so they do not apply here at all (Q98, narrowed by Q193). Distinct from `skipped`,
+    /// which is an input that did not resolve on a tool that does apply.
     pub not_applicable: Vec<String>,
+    /// Output slots minted at the site because the run published where the site declared the
+    /// inputs and not the output (Q193). Each carries `needs_review` until a manager confirms it.
+    pub slots_minted: usize,
     /// Tools whose prior run at this event consumed exactly what a fresh run would, under the
     /// same script version, with its outputs still served: left alone, no run minted.
     pub unchanged: Vec<String>,

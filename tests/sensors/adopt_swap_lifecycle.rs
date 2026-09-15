@@ -51,7 +51,8 @@ async fn adopt_backfills_by_window() {
     let site1 = Uuid::parse_str(crate::common::SITE1_ID).unwrap();
     let temp = Uuid::parse_str(crate::common::GLOBAL_PARAM_TEMP_ID).unwrap();
 
-    let sensor = sl::create_sensor(&db, "adopt-backfill", crate::common::GLOBAL_PARAM_TEMP_ID).await;
+    let sensor =
+        sl::create_sensor(&db, "adopt-backfill", crate::common::GLOBAL_PARAM_TEMP_ID).await;
     let sensor_id = sensor.id;
     let stream = seed_unadopted_stream(&db, "adopt-backfill", sensor_id).await;
 

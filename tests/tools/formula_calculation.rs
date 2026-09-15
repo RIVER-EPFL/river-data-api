@@ -706,3 +706,116 @@ async fn a_zero_divisor_refuses_the_output_and_leaves_the_stored_value() {
         outcome.findings_raised
     );
 }
+
+/// Scenario: an author edits a three-formula calculation and saves it.
+///
+/// Expected behaviour: the set the save sent is the set the calculation holds, and the save
+/// activates a version of it (Q186). Authoring is Administrator-only, so the save carries a JWT.
+#[tokio::test]
+#[serial]
+async fn a_set_save_writes_the_whole_set_and_activates_a_version() {
+    if !crate::common::profile::Service::Keycloak
+        .require("a_set_save_writes_the_whole_set_and_activates_a_version")
+        .await
+    {
+        return;
+    }
+    let group_id = "00000000-0000-4000-c000-000000000109";
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    seed_calculation(&db, group_id).await;
+    let script_id = calculation_id(&db).await;
+    // A calculation mints its own outputs (Q191): nothing is declared for set_a..c first.
+    let app = crate::common::keycloak::build_test_app_with_keycloak(db.clone()).await;
+    let admin =
+        crate::common::keycloak::member_jwt("setadmin", "setadmin", "riverdata-admin").await;
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/tool_scripts/{script_id}/formulas"),
+        &json!({
+            "formulas": [
+                { "code": "set_a", "units": "ratio", "formula": "DO_Temperature / Dissolved_O2", "ordinal": 1 },
+                { "code": "set_b", "units": "ratio", "formula": "DO_Temperature * 2", "ordinal": 2 },
+                { "code": "set_c", "units": "ratio", "formula": "Dissolved_O2 + 1", "ordinal": 3 }
+            ]
+        }),
+        &admin,
+    )
+    .await;
+    assert!((200..300).contains(&status), "save ({status}): {text}");
+    let saved: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(saved["created"], 3, "three formulas were created: {text}");
+    assert_eq!(saved["deleted"], 0, "and nothing was deleted: {text}");
+    assert_eq!(formula_codes(&db).await, ["set_a", "set_b", "set_c"]);
+    let (_version_no, body) = active_version(&db).await.expect("a version was minted");
+    for formula in [
+        "DO_Temperature / Dissolved_O2",
+        "DO_Temperature * 2",
+        "Dissolved_O2 + 1",
+    ] {
+        assert!(
+            body.contains(formula),
+            "the version carries {formula}: {body}"
+        );
+    }
+
+    // The set is the request: the save drops what it leaves out and updates what it names.
+    let keep = formula_id(&db, "set_a").await;
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/tool_scripts/{script_id}/formulas"),
+        &json!({
+            "formulas": [
+                { "id": keep, "code": "set_a", "units": "ratio", "formula": "DO_Temperature / 2", "ordinal": 1 }
+            ]
+        }),
+        &admin,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "second save ({status}): {text}"
+    );
+    let saved: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(saved["updated"], 1, "the formula it named: {text}");
+    assert_eq!(saved["deleted"], 2, "the two it left out: {text}");
+    assert_eq!(formula_codes(&db).await, ["set_a"]);
+    let (_version_no, body) = active_version(&db).await.expect("a version");
+    assert!(
+        body.contains("DO_Temperature / 2"),
+        "the active version is the saved set: {body}"
+    );
+}
+
+/// The calculation's formula codes, in evaluation order.
+async fn formula_codes(db: &sea_orm::DatabaseConnection) -> Vec<String> {
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT f.code FROM calculation_formulas f \
+                   JOIN tool_scripts s ON s.id = f.tool_script_id \
+                  WHERE s.name = '{CALCULATION}' ORDER BY f.ordinal"
+            ),
+        ))
+        .await
+        .expect("query");
+    rows.into_iter()
+        .map(|r| r.try_get::<String>("", "code").expect("code"))
+        .collect()
+}
+
+async fn formula_id(db: &sea_orm::DatabaseConnection, code: &str) -> String {
+    db.query_one_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!("SELECT id FROM calculation_formulas WHERE code = '{code}'"),
+    ))
+    .await
+    .expect("query")
+    .expect("the formula")
+    .try_get::<uuid::Uuid>("", "id")
+    .expect("id")
+    .to_string()
+}

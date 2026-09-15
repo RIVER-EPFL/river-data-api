@@ -25,8 +25,8 @@ fn test_visits_filename_is_site_and_range() {
 /// A field day is pending by the same rule a measurement is (Q177): the stager's level decides it,
 /// and an API token, which carries bits rather than a level, opens a verified visit.
 mod visit_state {
-    use crate::common::middleware::AuthContext;
     use crate::common::authz::Role;
+    use crate::common::middleware::AuthContext;
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -42,12 +42,16 @@ mod visit_state {
 
     #[test]
     fn test_an_interns_field_day_lands_pending() {
-        assert!(super::super::visit_lands_pending(&member(vec![Role::Intern])));
+        assert!(super::super::visit_lands_pending(&member(vec![
+            Role::Intern
+        ])));
     }
 
     #[test]
     fn test_a_river_members_field_day_lands_verified() {
-        assert!(!super::super::visit_lands_pending(&member(vec![Role::River])));
+        assert!(!super::super::visit_lands_pending(&member(vec![
+            Role::River
+        ])));
         assert!(!super::super::visit_lands_pending(&member(vec![
             Role::Intern,
             Role::Manager
@@ -56,9 +60,11 @@ mod visit_state {
 
     #[test]
     fn test_a_token_opens_a_verified_field_day() {
-        assert!(!super::super::visit_lands_pending(&AuthContext::SyncService {
-            service_id: uuid::Uuid::new_v4(),
-            source_system: Some("cnet".to_string()),
-        }));
+        assert!(!super::super::visit_lands_pending(
+            &AuthContext::SyncService {
+                service_id: uuid::Uuid::new_v4(),
+                source_system: Some("cnet".to_string()),
+            }
+        ));
     }
 }

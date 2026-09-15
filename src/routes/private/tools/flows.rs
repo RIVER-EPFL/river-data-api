@@ -173,12 +173,33 @@ pub async fn declared_parameters(
         .collect())
 }
 
-/// Whether a calculation applies at a site: the site holds a slot for at least one of its outputs.
-/// One is enough because a tool whose outputs are partly declared is a tool the site wants and a
-/// slot it is missing, which the save reports; none at all is a tool nobody asked for here.
+/// Whether a calculation applies at a site (Q193): the site declares every parameter the
+/// calculation reads, so declaring the inputs declares the outputs and the run mints the output
+/// slot it needs. Q98's test stands beside it rather than being dropped: a site that already
+/// holds one of the outputs keeps the calculation, which is what a calculation reading nothing
+/// but site properties and constants has.
 #[must_use]
-pub fn applies_at_site(saved_outputs: &[(String, Uuid)], declared: &HashSet<Uuid>) -> bool {
+pub fn applies_at_site(
+    read_inputs: &[Uuid],
+    saved_outputs: &[(String, Uuid)],
+    declared: &HashSet<Uuid>,
+) -> bool {
+    if !read_inputs.is_empty() && read_inputs.iter().all(|id| declared.contains(id)) {
+        return true;
+    }
     saved_outputs.iter().any(|(_, id)| declared.contains(id))
+}
+
+/// The catalog ids of the parameters a calculation reads at a visit, for the applicability test.
+/// A code the catalog does not hold resolves to nothing and is left out: it is a read the site
+/// cannot declare, and `resolve_run` reports it as the skip it is.
+#[must_use]
+pub fn read_inputs(tool: &ActiveTool, catalog: &ParameterCatalog) -> Vec<Uuid> {
+    tool.manifest
+        .read_codes()
+        .iter()
+        .filter_map(|code| catalog.resolve_code(code).map(|p| p.id))
+        .collect()
 }
 
 /// Order tools so producers run before consumers: an edge A→B exists when one of A's outputs
@@ -428,13 +449,14 @@ pub async fn recompute_event(
         skipped: Vec::new(),
         findings_raised: 0,
         not_applicable: Vec::new(),
+        slots_minted: 0,
         unchanged: Vec::new(),
     };
 
-    // A calculation applies at a site when the site holds slots for its outputs (Q98): the site
-    // parameters are the declaration, so the calculation set is filtered by them before the
-    // dependency order is walked, rather than every enabled tool being run wherever its inputs
-    // happen to resolve.
+    // A calculation applies at a site when the site declares what it reads (Q193, narrowing Q98):
+    // the site parameters are still the declaration, so the calculation set is filtered by them
+    // before the dependency order is walked, rather than every enabled tool being run wherever
+    // its inputs happen to resolve. The output slot follows from the inputs, minted by the run.
     let declared = declared_parameters(&state.db, event.site_id).await?;
 
     for i in order {
@@ -448,7 +470,7 @@ pub async fn recompute_event(
         if saved_outputs.is_empty() {
             continue;
         }
-        if !applies_at_site(&saved_outputs, &declared) {
+        if !applies_at_site(&read_inputs(tool, &catalog), &saved_outputs, &declared) {
             outcome.not_applicable.push(tool.name.clone());
             continue;
         }
@@ -607,6 +629,24 @@ pub async fn recompute_event(
             .map(|r| r.try_get("", "p"))
             .transpose()?
             .unwrap_or(false);
+
+        // The site declared the inputs, so it gets the column the run publishes (Q193). The slot
+        // is minted needing review, so a manager confirms it from the site's Parameters tab.
+        for (key, parameter_id) in &owned_outputs {
+            if declared.contains(parameter_id) || result.results.get(key).is_none() {
+                continue;
+            }
+            if crate::routes::private::site_parameters::service::mint_tool_slot(
+                &state.db,
+                event.site_id,
+                *parameter_id,
+            )
+            .await?
+            .is_some()
+            {
+                outcome.slots_minted += 1;
+            }
+        }
 
         let auth = crate::common::middleware::AuthContext::Keycloak {
             roles: Vec::new(),
@@ -992,8 +1032,9 @@ pub async fn audit_event(
     order: &[usize],
     counts: &mut AuditCounts,
 ) -> AppResult<()> {
-    // The report covers what the repair covers: a calculation the site declared none of the
-    // outputs of does not apply here, so its absent output is not a finding (Q98).
+    // The report covers what the repair covers: a calculation the site declares nothing of,
+    // neither what it reads nor what it writes, does not apply here, so its absent output is not
+    // a finding (Q98, narrowed by Q193).
     let declared = declared_parameters(&state.db, event.site_id).await?;
     for &i in order {
         let tool = &tools[i];
@@ -1006,7 +1047,7 @@ pub async fn audit_event(
         if saved_outputs.is_empty() {
             continue;
         }
-        if !applies_at_site(&saved_outputs, &declared) {
+        if !applies_at_site(&read_inputs(tool, catalog), &saved_outputs, &declared) {
             continue;
         }
 
@@ -1230,6 +1271,7 @@ impl Job for EventRecompute {
                     .count("readings_withdrawn", outcome.readings_withdrawn)
                     .count("tools_skipped", outcome.skipped.len())
                     .count("findings_raised", outcome.findings_raised)
+                    .count("slots_minted", outcome.slots_minted)
                     .count("tools_unchanged", outcome.unchanged.len())
                     .count("findings_closed", outcome.findings_closed),
             )
@@ -1271,6 +1313,7 @@ impl Job for EventRecompute {
         let mut tools_skipped = 0usize;
         let mut findings_raised = 0usize;
         let mut findings_closed = 0usize;
+        let mut slots_minted = 0usize;
         for event_id in &events {
             if ctx.is_cancelled() {
                 break;
@@ -1286,6 +1329,7 @@ impl Job for EventRecompute {
             tools_skipped += outcome.skipped.len();
             findings_raised += outcome.findings_raised;
             findings_closed += outcome.findings_closed;
+            slots_minted += outcome.slots_minted;
             for (tool, reason) in &outcome.skipped {
                 ctx.log(
                     "info",
@@ -1310,6 +1354,7 @@ impl Job for EventRecompute {
                 .count("readings_withdrawn", readings_withdrawn)
                 .count("tools_skipped", tools_skipped)
                 .count("findings_raised", findings_raised)
+                .count("slots_minted", slots_minted)
                 .count("tools_unchanged", tools_unchanged)
                 .count("findings_closed", findings_closed),
         )

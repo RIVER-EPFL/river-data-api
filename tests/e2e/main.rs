@@ -12,6 +12,7 @@ mod calibration_spanning_two_sites;
 mod collection_event_chain;
 mod csv_as_tool_entry;
 mod deployment_backdate_two_sites;
+mod formula_save_arms;
 mod full_public_data_workflow;
 mod ingest_and_pairing_attribution;
 mod instrument_grab_alongside_sensor;

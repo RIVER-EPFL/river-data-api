@@ -2778,9 +2778,10 @@ pub async fn insert_grab_samples(
         .filter_map(|sp| sp.instrument_sensor_id.map(|sid| (sp.parameter_id, sid)))
         .collect();
 
-    // A site declares which calculations apply to it by holding their output slots (Q98), so a
-    // save landing on a slot the site does not carry is refused rather than minting one: a mint
-    // here would create the declaration it is meant to be checked against.
+    // A hand save is held to the slots the site carries: one landing on a slot the site does not
+    // carry is refused rather than minting one, because a mint here would create the declaration
+    // it is meant to be checked against (Q98, kept by Q193). A publishing run is the other case,
+    // and mints its output slot where the site declares the inputs it read.
     for r in &payload.readings {
         if !valid_param_ids.contains(&r.parameter_id) {
             return Err(AppError::BadRequest(format!(

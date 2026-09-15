@@ -60,3 +60,109 @@ fn a_switched_off_calculation_is_not_run_by_name() {
         other => panic!("a switched-off calculation is refused by name: {other:?}"),
     }
 }
+
+use super::{FormulaWrite, plan_formula_set};
+
+fn id(n: u128) -> uuid::Uuid {
+    uuid::Uuid::from_u128(n)
+}
+
+fn row(n: u128, code: &str) -> (uuid::Uuid, String) {
+    (id(n), code.to_string())
+}
+
+fn kept(n: u128, code: &str) -> (Option<uuid::Uuid>, String) {
+    (Some(id(n)), code.to_string())
+}
+
+fn fresh(code: &str) -> (Option<uuid::Uuid>, String) {
+    (None, code.to_string())
+}
+
+#[test]
+fn test_a_set_save_updates_what_it_names_and_deletes_what_it_leaves_out() {
+    let stored = [row(1, "a"), row(2, "b"), row(3, "c")];
+    let writes = plan_formula_set(&stored, &[kept(2, "b"), fresh("d"), kept(1, "a")])
+        .expect("planned");
+    assert_eq!(
+        writes,
+        vec![
+            FormulaWrite::Delete(id(3)),
+            FormulaWrite::Update(id(2), 0),
+            FormulaWrite::Create(1),
+            FormulaWrite::Update(id(1), 2),
+        ],
+        "the row nobody named is deleted, and the deletes come before the writes that may reuse \
+         its code"
+    );
+}
+
+#[test]
+fn test_a_replaced_formula_keeps_its_row_when_the_code_is_the_same() {
+    // Scenario: the author rewrites one formula in the editor and saves the set without its id.
+    // Expected behaviour: the output the code names keeps its row, so the catalog parameter it
+    // mints is never released and re-claimed.
+    let stored = [row(1, "temp_ratio_out")];
+    assert_eq!(
+        plan_formula_set(&stored, &[fresh("temp_ratio_out")]).expect("planned"),
+        vec![FormulaWrite::Update(id(1), 0)]
+    );
+}
+
+#[test]
+fn test_a_dropped_code_taken_by_a_new_formula_pairs_one_to_one() {
+    let stored = [row(1, "x"), row(2, "x"), row(3, "y")];
+    assert_eq!(
+        plan_formula_set(&stored, &[fresh("x"), fresh("z")]).expect("planned"),
+        vec![
+            FormulaWrite::Delete(id(2)),
+            FormulaWrite::Delete(id(3)),
+            FormulaWrite::Update(id(1), 0),
+            FormulaWrite::Create(1),
+        ],
+        "one dropped row takes one new row of its code; the second keeps its delete"
+    );
+}
+
+#[test]
+fn test_a_code_moved_onto_a_named_formula_still_deletes_the_row_it_left() {
+    let stored = [row(1, "x"), row(2, "y")];
+    assert_eq!(
+        plan_formula_set(&stored, &[kept(2, "x")]).expect("planned"),
+        vec![FormulaWrite::Delete(id(1)), FormulaWrite::Update(id(2), 0)],
+        "the code is free by the time the update needs it"
+    );
+}
+
+#[test]
+fn test_an_empty_set_deletes_every_formula() {
+    let stored = [row(1, "a"), row(2, "b")];
+    assert_eq!(
+        plan_formula_set(&stored, &[]).expect("planned"),
+        vec![FormulaWrite::Delete(id(1)), FormulaWrite::Delete(id(2))]
+    );
+}
+
+#[test]
+fn test_a_first_save_creates_every_formula() {
+    assert_eq!(
+        plan_formula_set(&[], &[fresh("a"), fresh("b")]).expect("planned"),
+        vec![FormulaWrite::Create(0), FormulaWrite::Create(1)]
+    );
+}
+
+#[test]
+fn test_a_set_save_refuses_a_formula_of_another_calculation() {
+    let err = plan_formula_set(&[row(1, "a")], &[kept(9, "a")]).expect_err("refused");
+    assert!(
+        err.contains(&id(9).to_string()),
+        "the error names it: {err}"
+    );
+}
+
+#[test]
+fn test_a_set_save_refuses_the_same_formula_twice() {
+    let err = plan_formula_set(&[row(1, "a"), row(2, "b")], &[kept(1, "a"), kept(1, "a")])
+        .expect_err("refused");
+    assert!(err.contains("twice"), "{err}");
+}

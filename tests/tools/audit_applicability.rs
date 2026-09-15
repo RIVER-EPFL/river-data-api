@@ -1,5 +1,7 @@
-//! The audit reports on the set the repair can repair: a calculation whose outputs a site declares
-//! none of does not apply there (Q98), so its absent output is not a finding.
+//! The audit reports on the set the repair can repair: a calculation whose inputs a site declares
+//! applies there and its absent output is a finding, whether or not the site already holds the
+//! output slot (Q193, narrowing Q98); one whose inputs the site does not hold does not apply, so
+//! its absent output is not a finding.
 //!
 //! No R runs here: the audit decides applicability before any runner is reached.
 //!
@@ -170,19 +172,49 @@ async fn setup() -> (DatabaseConnection, river_db::common::AppState, Uuid) {
 
 #[tokio::test]
 #[serial]
-async fn a_calculation_the_site_declared_nothing_of_raises_no_finding() {
+async fn a_calculation_whose_inputs_the_site_holds_reports_its_absent_output() {
     let (db, state, event_id) = setup().await;
     audit(&state, event_id).await;
     assert_eq!(
         findings_on_output(&db).await,
-        0,
-        "the site holds no slot for the output, so the calculation does not apply here"
+        1,
+        "the site declares what the calculation reads, so the recompute can repair this and the \
+         audit says so; the output slot is the run's to mint"
     );
 }
 
 #[tokio::test]
 #[serial]
-async fn the_same_calculation_reports_its_absent_output_where_the_site_declared_it() {
+async fn a_calculation_whose_inputs_the_site_lacks_raises_no_finding() {
+    let (db, state, event_id) = setup().await;
+    // The probe now reads a parameter no site declares, so it belongs to no site here.
+    exec(
+        &db,
+        "INSERT INTO parameters (id, code, name, default_units, category)
+         VALUES (gen_random_uuid(), 'AuditProbeUnheld', 'Audit probe unheld', 'ppb', 'measurement')",
+        vec![],
+    )
+    .await;
+    exec(
+        &db,
+        "UPDATE tool_script_versions
+            SET manifest = jsonb_set(manifest, '{event_inputs}',
+                '[{\"param\": \"t\", \"parameter_code\": \"AuditProbeUnheld\"}]'::jsonb)
+          WHERE tool_script_id = (SELECT id FROM tool_scripts WHERE name = $1)",
+        vec![TOOL.into()],
+    )
+    .await;
+    audit(&state, event_id).await;
+    assert_eq!(
+        findings_on_output(&db).await,
+        0,
+        "the site declares neither what the calculation reads nor what it writes"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn the_same_calculation_reports_its_absent_output_where_the_site_declared_the_slot() {
     let (db, state, event_id) = setup().await;
     declare_output_slot(&db).await;
     audit(&state, event_id).await;
