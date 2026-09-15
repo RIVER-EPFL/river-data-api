@@ -26379,6 +26379,10 @@
             "description": "Every replicate in the group is flagged.",
             "type": "boolean"
           },
+          "has_provenance": {
+            "description": "A tool run stands behind this measurement. Q8 sends such a value back into its tool to be\ncorrected, and a value with none through the edit primitive, so the grid needs to know\nwhich arm a cell takes before it offers an edit.",
+            "type": "boolean"
+          },
           "max": {
             "format": "double",
             "type": "number"
@@ -26418,6 +26422,13 @@
             "format": "uuid",
             "type": "string"
           },
+          "replicates": {
+            "description": "Every stored replicate, in index order, singletons included. The listing carries them so a\nparameter's column opens to its repeats from what the grid already holds (Q200).",
+            "items": {
+              "$ref": "#/components/schemas/VisitReplicate"
+            },
+            "type": "array"
+          },
           "sd_estimator": {
             "description": "Which divisor produced `stdev`, and what chose it.",
             "type": "string"
@@ -26428,6 +26439,10 @@
           "stdev": {
             "format": "double",
             "type": "number"
+          },
+          "tool": {
+            "description": "The blob's tool name, when one exists.",
+            "type": "string"
           },
           "value": {
             "description": "The served value: sample mean, else the lowest live replicate.",
@@ -26446,7 +26461,9 @@
           "n_total",
           "n_flagged",
           "n_withdrawn",
-          "n_unverified"
+          "n_unverified",
+          "replicates",
+          "has_provenance"
         ],
         "type": "object"
       },
@@ -26511,6 +26528,44 @@
           "findings_open",
           "unverified",
           "recompute"
+        ],
+        "type": "object"
+      },
+      "VisitReplicate": {
+        "description": "One replicate of a listing's cell: enough to draw the expanded column and to seed the edit\nmodel, and no more. The curves, instruments and flag reasons behind it stay on\n`/collection_events/{id}/detail`, which is what the point record reads.",
+        "properties": {
+          "flagged": {
+            "type": "boolean"
+          },
+          "replicate_index": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "stream_id": {
+            "description": "The feed this replicate came in on. With the instant and the index it is the key a\ncorrection is made against, so it sits on the replicate rather than on the cell: two\nstreams can serve one slot and a correction must name the right one.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "unverified": {
+            "description": "A pending entry: stored and shown, counted by no statistic and served nowhere.",
+            "type": "boolean"
+          },
+          "value": {
+            "description": "The corrected value where the reading carries one, else the raw value.",
+            "format": "double",
+            "type": "number"
+          },
+          "withdrawn": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "replicate_index",
+          "stream_id",
+          "value",
+          "flagged",
+          "withdrawn",
+          "unverified"
         ],
         "type": "object"
       },

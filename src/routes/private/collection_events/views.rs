@@ -21,7 +21,8 @@ use uuid::Uuid;
 use super::models::{
     CellFinding, CellReplicate, CellSample, EnqueuedJobResponse, Entity, EventAuditRequest,
     EventCell, EventDetailResponse, EventRecomputeRequest, ExpectedParameter, StageEventRequest,
-    StageEventsRequest, StagedEvent, VisitCell, VisitListQuery, VisitListRow, VisitRow,
+    StageEventsRequest, StagedEvent, VisitCell, VisitListQuery, VisitListRow, VisitReplicate,
+    VisitRow,
     VisitsQuery, VisitsResponse,
 };
 use super::service::{
@@ -625,6 +626,34 @@ pub async fn list_site_visits(
             agg("MAX(s.max_value)", "max_value"),
             agg("MAX(s.sd_estimator)", "sd_estimator"),
             agg("MAX(s.sd_estimator_source)", "sd_estimator_source"),
+            // The replicates themselves, as parallel arrays in one index order: a composite array
+            // would decode by hand, and the four are read back together or not at all.
+            agg(
+                "ARRAY_AGG(r.replicate_index ORDER BY r.replicate_index)",
+                "replicate_indexes",
+            ),
+            agg(
+                "ARRAY_AGG(COALESCE(r.calibrated_value, r.raw_value) ORDER BY r.replicate_index)",
+                "replicate_values",
+            ),
+            agg(
+                "ARRAY_AGG(r.is_flagged IS TRUE ORDER BY r.replicate_index)",
+                "replicate_flagged",
+            ),
+            agg(
+                "ARRAY_AGG(r.withdrawn_at IS NOT NULL ORDER BY r.replicate_index)",
+                "replicate_withdrawn",
+            ),
+            agg(
+                "ARRAY_AGG(r.unverified IS TRUE ORDER BY r.replicate_index)",
+                "replicate_unverified",
+            ),
+            agg(
+                "ARRAY_AGG(r.stream_id ORDER BY r.replicate_index)",
+                "replicate_streams",
+            ),
+            agg("BOOL_OR(r.provenance IS NOT NULL)", "has_provenance"),
+            agg("MAX(r.provenance ->> 'tool')", "tool"),
         ] {
             cell_query.expr_as(expr, name);
         }
@@ -698,6 +727,7 @@ pub async fn list_site_visits(
             std::collections::HashMap::new();
         for c in &cell_rows {
             let c = CellRow::from_query_result(c, "")?;
+            let replicates = replicates_of(&c);
             by_event.entry(c.event_id).or_default().push(VisitCell {
                 parameter_id: c.parameter_id,
                 value: c.value,
@@ -716,6 +746,9 @@ pub async fn list_site_visits(
                 sd_estimator_source: c.sd_estimator_source,
                 finding: None,
                 finding_count: None,
+                replicates,
+                has_provenance: c.has_provenance.unwrap_or(false),
+                tool: c.tool,
             });
         }
         for visit in &mut visits {
@@ -749,6 +782,9 @@ pub async fn list_site_visits(
                         sd_estimator_source: None,
                         finding: Some(kind.clone()),
                         finding_count: (*n > 1).then_some(*n),
+                        replicates: Vec::new(),
+                        has_provenance: false,
+                        tool: None,
                     });
                 }
             }
@@ -942,6 +978,32 @@ struct CellRow {
     max_value: Option<f64>,
     sd_estimator: Option<String>,
     sd_estimator_source: Option<String>,
+    replicate_indexes: Vec<i16>,
+    replicate_values: Vec<f64>,
+    replicate_flagged: Vec<bool>,
+    replicate_withdrawn: Vec<bool>,
+    replicate_unverified: Vec<bool>,
+    replicate_streams: Vec<Uuid>,
+    has_provenance: Option<bool>,
+    tool: Option<String>,
+}
+
+/// The five parallel arrays one `ARRAY_AGG` group returns, read back as replicates. They come out
+/// of one group over one ordering, so position `i` is the same replicate in each.
+fn replicates_of(row: &CellRow) -> Vec<VisitReplicate> {
+    row.replicate_indexes
+        .iter()
+        .zip(&row.replicate_values)
+        .enumerate()
+        .map(|(i, (replicate_index, value))| VisitReplicate {
+            replicate_index: *replicate_index,
+            value: *value,
+            stream_id: row.replicate_streams.get(i).copied().unwrap_or_default(),
+            flagged: row.replicate_flagged.get(i).copied().unwrap_or(false),
+            withdrawn: row.replicate_withdrawn.get(i).copied().unwrap_or(false),
+            unverified: row.replicate_unverified.get(i).copied().unwrap_or(false),
+        })
+        .collect()
 }
 
 /// One replicate row of a visit's grid, as the detail query selects it. The fold below groups

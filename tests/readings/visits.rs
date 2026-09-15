@@ -95,6 +95,54 @@ async fn the_list_is_the_wide_portal_row() {
     );
 }
 
+/// Expected behaviour: the listing carries the replicates behind each cell, in index order,
+/// singletons included, so a parameter's column opens to its repeats without a second fetch, and
+/// each one names the stream a correction against it keys on.
+#[tokio::test]
+#[serial]
+async fn a_listed_cell_carries_its_replicates_and_what_a_correction_keys_on() {
+    let (_db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let visits = body["visits"].as_array().unwrap();
+
+    let do_cell = cell(&visits[1], GLOBAL_PARAM_DO_ID).expect("DO cell at T1");
+    let replicates = do_cell["replicates"].as_array().unwrap();
+    assert_eq!(replicates.len(), 2, "the duplicate lists both: {do_cell}");
+    assert_eq!(replicates[0]["replicate_index"], 0);
+    assert_eq!(replicates[0]["value"], 10.0);
+    assert_eq!(replicates[1]["replicate_index"], 1);
+    assert_eq!(replicates[1]["value"], 12.0);
+    assert_eq!(replicates[0]["flagged"], false);
+    assert_eq!(replicates[0]["withdrawn"], false);
+
+    assert_eq!(
+        replicates[0]["stream_id"], replicates[1]["stream_id"],
+        "both repeats came in on the slot's own feed: {do_cell}"
+    );
+    assert!(
+        replicates[0]["stream_id"].is_string(),
+        "a correction keys on the stream, so the listing names it: {do_cell}"
+    );
+    assert_eq!(
+        do_cell["has_provenance"], false,
+        "nothing computed this, so Q8 corrects it in place rather than through a tool: {do_cell}"
+    );
+
+    let temp_cell = cell(&visits[1], GLOBAL_PARAM_TEMP_ID).expect("Temp cell at T1");
+    let single = temp_cell["replicates"].as_array().unwrap();
+    assert_eq!(
+        single.len(),
+        1,
+        "a measurement taken once lists one entry, not none: {temp_cell}"
+    );
+    assert_eq!(single[0]["value"], 4.2);
+}
+
 #[tokio::test]
 #[serial]
 async fn the_detail_grid_shows_replicates_and_sample_stats() {

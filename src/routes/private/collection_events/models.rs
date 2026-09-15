@@ -246,6 +246,35 @@ pub struct VisitCell {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub finding_count: Option<i64>,
+    /// Every stored replicate, in index order, singletons included. The listing carries them so a
+    /// parameter's column opens to its repeats from what the grid already holds (Q200).
+    pub replicates: Vec<VisitReplicate>,
+    /// A tool run stands behind this measurement. Q8 sends such a value back into its tool to be
+    /// corrected, and a value with none through the edit primitive, so the grid needs to know
+    /// which arm a cell takes before it offers an edit.
+    pub has_provenance: bool,
+    /// The blob's tool name, when one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub tool: Option<String>,
+}
+
+/// One replicate of a listing's cell: enough to draw the expanded column and to seed the edit
+/// model, and no more. The curves, instruments and flag reasons behind it stay on
+/// `/collection_events/{id}/detail`, which is what the point record reads.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VisitReplicate {
+    pub replicate_index: i16,
+    /// The feed this replicate came in on. With the instant and the index it is the key a
+    /// correction is made against, so it sits on the replicate rather than on the cell: two
+    /// streams can serve one slot and a correction must name the right one.
+    pub stream_id: Uuid,
+    /// The corrected value where the reading carries one, else the raw value.
+    pub value: f64,
+    pub flagged: bool,
+    pub withdrawn: bool,
+    /// A pending entry: stored and shown, counted by no statistic and served nowhere.
+    pub unverified: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
