@@ -16,10 +16,12 @@ use sea_orm::{Condition, ConnectionTrait, DbErr, EntityTrait, Statement, Transac
 use uuid::Uuid;
 
 use super::models::{Backfilled, SlotScope};
-use super::service::{release_slot_rows, resolve_retire_target};
+use super::service::{referenced_event_pairs, release_slot_rows, resolve_retire_target};
 use crate::common::bulk_write::{self, TouchedRange};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::collection_events::flows::touched_events;
+use crate::routes::private::collection_events::flows::{
+    TouchedEvent, events_from_pairs, touched_events,
+};
 use crate::routes::private::collection_events::service::{EventSource, attach_collection_events};
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::readings::models as readings;
@@ -195,6 +197,14 @@ pub async fn backfill<C: ConnectionTrait>(
     })
 }
 
+/// What a slot teardown moved and which visits lost an input.
+pub struct RetiredSlot {
+    /// The reading span removed from the rollups.
+    pub touched: TouchedRange,
+    /// Visits to recompute after the teardown commits.
+    pub touched_events: Vec<TouchedEvent>,
+}
+
 /// Release everything a slot owns, in one transaction with the decompression cap lifted, and queue
 /// the rollup rebuild that has to follow it.
 ///
@@ -215,16 +225,25 @@ pub async fn backfill<C: ConnectionTrait>(
 pub async fn retire_slot<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     scope: SlotScope,
-) -> AppResult<TouchedRange> {
-    let touched = bulk_write::guarded(db, async |txn| {
+) -> AppResult<RetiredSlot> {
+    let retired = bulk_write::guarded(db, async |txn| {
         let Some(target) = resolve_retire_target(txn, scope).await? else {
-            return Ok(TouchedRange::default());
+            return Ok(RetiredSlot {
+                touched: TouchedRange::default(),
+                touched_events: Vec::new(),
+            });
         };
-        release_slot_rows(txn, &target).await
+        let pairs = referenced_event_pairs(txn, &target).await?;
+        let touched_events = events_from_pairs(txn, &pairs).await?;
+        let touched = release_slot_rows(txn, &target).await?;
+        Ok(RetiredSlot {
+            touched,
+            touched_events,
+        })
     })
     .await?;
 
-    if let Some((from, until)) = touched.span() {
+    if let Some((from, until)) = retired.touched.span() {
         let trigger_id = match scope {
             SlotScope::Stream(id) | SlotScope::SiteParameter(id) => id,
         };
@@ -239,7 +258,7 @@ pub async fn retire_slot<C: ConnectionTrait + TransactionTrait>(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     }
-    Ok(touched)
+    Ok(retired)
 }
 
 /// The status a guarded plan job's work leaves behind, read before it runs.

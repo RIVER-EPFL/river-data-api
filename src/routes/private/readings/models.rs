@@ -700,6 +700,7 @@ impl Kind {
                 | Self::Withdraw
                 | Self::Reassert
                 | Self::Reject
+                | Self::SlotMove
                 | Self::ValueCorrection
                 | Self::CurveRetire
                 | Self::Rollback

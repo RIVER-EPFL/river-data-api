@@ -230,6 +230,7 @@ fn the_kinds_that_move_a_served_value_fire_the_recompute() {
         Kind::Unflag,
         Kind::Withdraw,
         Kind::Reassert,
+        Kind::SlotMove,
         Kind::ValueCorrection,
     ] {
         assert!(k.fires_recompute(), "{k:?}");

@@ -186,7 +186,7 @@ pub async fn merge_parameters(
         ));
     }
 
-    let (response, touched) = bulk_write::guarded(db, async |txn| {
+    let (response, touched, touched_events) = bulk_write::guarded(db, async |txn| {
         validate_both_parameters_exist(txn, source_id, target_id).await?;
         refuse_on_collision(txn, MoveScope::EverySite, source_id, target_id).await?;
         refuse_derived_cycle(txn, source_id, target_id).await?;
@@ -212,6 +212,9 @@ pub async fn merge_parameters(
         )
         .await?;
 
+        let touched = moved.touched.merge(swept.touched);
+        let mut touched_events = moved.touched_events;
+        touched_events.extend(swept.touched_events);
         Ok((
             MergeParametersResponse {
                 sites_merged,
@@ -220,12 +223,20 @@ pub async fn merge_parameters(
                 streams_updated: moved.streams,
                 source_deleted: true,
             },
-            moved.touched.merge(swept.touched),
+            touched,
+            touched_events,
         ))
     })
     .await?;
 
     refresh_moved_rollups(db, touched).await?;
+    crate::routes::private::collection_events::flows::enqueue_for(
+        db,
+        &touched_events,
+        actor,
+        crate::routes::private::collection_events::flows::Writer::Person,
+    )
+    .await?;
     Ok(response)
 }
 
@@ -236,6 +247,7 @@ struct MergeTotals {
     /// Streams re-pointed at a surviving site_parameter.
     streams: u64,
     touched: TouchedRange,
+    touched_events: Vec<crate::routes::private::collection_events::flows::TouchedEvent>,
 }
 
 async fn validate_both_parameters_exist(
@@ -302,6 +314,7 @@ async fn merge_site_parameters_per_site(
             totals.readings += moved.readings;
             totals.streams += streams;
             totals.touched = totals.touched.merge(moved.touched);
+            totals.touched_events.extend(moved.touched_events);
             sites_merged += 1;
         } else {
             site_parameters::Entity::update_many()
@@ -325,6 +338,7 @@ async fn merge_site_parameters_per_site(
 
             totals.readings += moved.readings;
             totals.touched = totals.touched.merge(moved.touched);
+            totals.touched_events.extend(moved.touched_events);
             sites_reassigned += 1;
         }
     }

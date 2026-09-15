@@ -525,7 +525,7 @@ pub async fn merge_site_parameters(
         ));
     }
 
-    let (response, touched) = bulk_write::guarded(db, async |txn| {
+    let (response, touched, touched_events) = bulk_write::guarded(db, async |txn| {
         let (source_site_id, source_param_id, target_site_id, target_param_id) =
             validate_merge_candidates(txn, source_id, target_id).await?;
         if source_site_id != target_site_id {
@@ -572,11 +572,19 @@ pub async fn merge_site_parameters(
                 source_deleted: true,
             },
             moved.touched,
+            moved.touched_events,
         ))
     })
     .await?;
 
     refresh_moved_rollups(db, touched).await?;
+    crate::routes::private::collection_events::flows::enqueue_for(
+        db,
+        &touched_events,
+        actor,
+        crate::routes::private::collection_events::flows::Writer::Person,
+    )
+    .await?;
     Ok(response)
 }
 

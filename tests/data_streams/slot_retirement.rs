@@ -74,7 +74,10 @@ async fn retiring_a_stream_counts_only_the_rows_it_releases() {
         .await
         .expect("retiring a stream's rows");
 
-    assert_eq!(touched.rows, 3, "only the attributed rows are released");
+    assert_eq!(
+        touched.touched.rows, 3,
+        "only the attributed rows are released"
+    );
     assert_eq!(attributed_count(&db, stream).await, 0);
     assert_eq!(
         e2e::count(
@@ -86,6 +89,7 @@ async fn retiring_a_stream_counts_only_the_rows_it_releases() {
         "releasing a slot hides readings from the rollups, it does not delete them"
     );
     let (min_time, max_time) = touched
+        .touched
         .span()
         .expect("a non-empty release reports its span");
     assert_eq!(min_time.to_rfc3339(), format!("{HOUR}:00:00+00:00"));
@@ -108,14 +112,108 @@ async fn retiring_a_stream_a_second_time_releases_nothing() {
         retire_slot(&db, SlotScope::Stream(stream))
             .await
             .expect("first release")
+            .touched
             .rows,
         1
     );
     let again = retire_slot(&db, SlotScope::Stream(stream))
         .await
         .expect("a second release is not an error");
-    assert!(again.is_empty(), "nothing is left to release");
-    assert!(again.span().is_none(), "and so no rollup window is implied");
+    assert!(again.touched.is_empty(), "nothing is left to release");
+    assert!(
+        again.touched.span().is_none(),
+        "and so no rollup window is implied"
+    );
+
+    cleanup_test_db(&db).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn retiring_a_stream_recomputes_the_visits_it_empties() {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let output_parameter = Uuid::new_v4();
+    let output_slot = Uuid::new_v4();
+    let calculation = Uuid::new_v4();
+    let version = Uuid::new_v4();
+    for statement in [
+        format!(
+            "INSERT INTO parameters (id, code, name, default_units, category) \
+             VALUES ('{output_parameter}', 'RetireOutput', 'Retire output', 'x', 'measurement')"
+        ),
+        format!(
+            "INSERT INTO site_parameters \
+                 (id, site_id, parameter_id, name, sensor_type, entry_mode, is_active) \
+             VALUES ('{output_slot}', '{SITE1_ID}', '{output_parameter}', \
+                     'Retire output', 'derived', 'tool', true)"
+        ),
+        format!(
+            "INSERT INTO tool_scripts (id, name, label, created_by) \
+             VALUES ('{calculation}', 'retire_output', 'Retire output', 'test')"
+        ),
+        format!(
+            r#"INSERT INTO tool_script_versions
+                   (id, tool_script_id, version_no, script, entry_function, manifest, test_cases,
+                    content_hash, created_by, validated_at)
+               VALUES ('{version}', '{calculation}', 1, 'tool <- function(...) list()', 'tool',
+                       '{{"label":"Retire output","params":[{{"name":"t","label":"Temperature","kind":"number","required":true}}],"event_inputs":[{{"param":"t","parameter_code":"DO_Temperature"}}],"outputs":[]}}'::jsonb,
+                       '{{}}'::jsonb, 'retire-output-v1', 'test', now())"#
+        ),
+        format!(
+            "UPDATE tool_scripts SET active_version_id = '{version}' WHERE id = '{calculation}'"
+        ),
+    ] {
+        exec(&db, &statement).await;
+    }
+
+    let source = create_paired_stream(&db, "retire-visit-input", PARAM_S1_TEMP_ID).await;
+    let output = create_paired_stream(&db, "retire-visit-output", &output_slot.to_string()).await;
+    let event = Uuid::new_v4();
+    for statement in [
+        format!(
+            "INSERT INTO collection_events (id, site_id, collected_at, source) \
+             VALUES ('{event}', '{SITE1_ID}', '{HOUR}:00:00Z', 'manual')"
+        ),
+        format!(
+            "INSERT INTO readings \
+                 (stream_id, site_id, parameter_id, time, raw_value, replicate_index, \
+                  measurement_type, collection_event_id) \
+             VALUES \
+                 ('{source}', '{SITE1_ID}', '{GLOBAL_PARAM_TEMP_ID}', '{HOUR}:00:00Z', 10, 0, \
+                  'spot', '{event}'), \
+                 ('{output}', '{SITE1_ID}', '{output_parameter}', '{HOUR}:00:00Z', 20, 0, \
+                  'spot', '{event}')"
+        ),
+    ] {
+        exec(&db, &statement).await;
+    }
+
+    let token = seed_api_token(&db, full_permissions(), None).await;
+    let app = build_test_app(db.clone());
+    let (status, body) = post_json_with_token(
+        &app,
+        &format!("/api/streams/{source}/unpair"),
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "unpair ({status}): {body}");
+
+    assert_eq!(
+        e2e::count(
+            &db,
+            &format!(
+                "SELECT COUNT(*)::bigint FROM reprocessing_jobs \
+                 WHERE trigger_type = 'event_recompute' AND trigger_id = '{event}'"
+            )
+        )
+        .await,
+        1,
+        "the stored output is recomputed after one of its inputs leaves the visit"
+    );
 
     cleanup_test_db(&db).await;
 }
@@ -164,7 +262,7 @@ async fn retiring_a_slot_releases_every_stream_and_deletes_its_orphaned_samples(
     .expect("retiring the slot");
 
     assert_eq!(
-        touched.rows, 3,
+        touched.touched.rows, 3,
         "the slot owns every row attributed to it, whichever stream wrote it"
     );
     assert_eq!(attributed_count(&db, logger).await, 0);
@@ -243,13 +341,14 @@ async fn retiring_a_slot_that_is_already_gone_is_not_an_error() {
     let touched = retire_slot(&db, SlotScope::SiteParameter(Uuid::new_v4()))
         .await
         .expect("an unresolvable slot reports an empty range rather than failing");
-    assert!(touched.is_empty());
+    assert!(touched.touched.is_empty());
 
     let never_used = create_unpaired_stream(&db, "retire-empty").await;
     assert!(
         retire_slot(&db, SlotScope::Stream(never_used))
             .await
             .expect("a stream with no rows is not an error")
+            .touched
             .is_empty()
     );
 

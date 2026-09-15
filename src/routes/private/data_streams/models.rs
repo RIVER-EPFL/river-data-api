@@ -491,13 +491,15 @@ pub enum MoveScope {
 }
 
 /// Rows a slot move carried, and the span the moved readings cover.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SlotMove {
     pub readings: u64,
     pub status_events: u64,
     /// Feeds the caller's post-commit rollup refresh; the rollups group by `parameter_id`, so both
     /// the source's and the survivor's buckets are recomputed by the same window.
     pub touched: TouchedRange,
+    /// Visits whose inputs moved, for the post-commit calculation hook.
+    pub touched_events: Vec<crate::routes::private::collection_events::flows::TouchedEvent>,
 }
 
 /// One committed windowed ingest pass.

@@ -703,17 +703,17 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
     // Every reading re-pointed is a slot-move decision (ADR 0008), recorded before the move so
     // the record holds the slot it came from.
     {
-        let moved = {
+        let rows = {
             use crate::routes::private::collection_events::flows::row;
             use crate::routes::private::readings::models::Column;
             sea_orm::Condition::all()
                 .add(row(Column::ParameterId).eq(source_param))
                 .add_option(site.map(|site_id| row(Column::SiteId).eq(site_id)))
         };
-        crate::routes::private::readings::service::record_many(
+        let recorded = crate::routes::private::readings::service::record_many(
             conn,
             crate::routes::private::readings::models::Kind::SlotMove,
-            moved,
+            rows,
             crate::routes::private::readings::service::NewValue::Literal(
                 serde_json::json!({ "parameter_id": target_param }),
             ),
@@ -723,6 +723,7 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
             Some(Uuid::new_v4()),
         )
         .await?;
+        moved.touched_events = recorded.touched_events;
     }
 
     let mut on_source =
@@ -938,6 +939,43 @@ async fn referenced_ids<C: ConnectionTrait>(
         .iter()
         .map(|row| row.try_get::<Uuid>("", "id"))
         .collect::<Result<Vec<_>, _>>()?)
+}
+
+pub(super) async fn referenced_event_pairs<C: ConnectionTrait>(
+    conn: &C,
+    target: &RetireTarget,
+) -> AppResult<Vec<(Uuid, Uuid)>> {
+    let event = readings_model::Column::CollectionEventId;
+    let parameter = readings_model::Column::ParameterId;
+    let (sql, values) = SeaQuery::select()
+        .distinct()
+        .column(event)
+        .column(parameter)
+        .from(readings_model::Entity)
+        .cond_where(
+            target
+                .rows
+                .clone()
+                .add(Expr::col(event).is_not_null())
+                .add(Expr::col(parameter).is_not_null()),
+        )
+        .take()
+        .build(PostgresQueryBuilder);
+    conn.query_all_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+        values,
+    ))
+    .await?
+    .iter()
+    .map(|row| {
+        Ok((
+            row.try_get("", "collection_event_id")?,
+            row.try_get("", "parameter_id")?,
+        ))
+    })
+    .collect::<Result<Vec<_>, sea_orm::DbErr>>()
+    .map_err(AppError::Database)
 }
 
 /// The claim a pairing makes on a stream.

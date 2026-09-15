@@ -752,7 +752,15 @@ pub async fn unpair_stream(
 
     // Release the stream's rows from the slot: one transaction, cap lifted, rollup rebuild queued
     // as a tracked job. The slot itself survives; only this stream stops feeding it.
-    let cleared = retire_slot(db, SlotScope::Stream(stream_id)).await?.rows;
+    let retired = retire_slot(db, SlotScope::Stream(stream_id)).await?;
+    crate::routes::private::collection_events::flows::enqueue_for(
+        db,
+        &retired.touched_events,
+        &crate::common::actor::current().unwrap_or_else(|| "system".to_string()),
+        crate::routes::private::collection_events::flows::Writer::Person,
+    )
+    .await?;
+    let cleared = retired.touched.rows;
 
     // Open reviews lose their reviewer along with the slot; they wait as deferred until the
     // stream is paired again.
