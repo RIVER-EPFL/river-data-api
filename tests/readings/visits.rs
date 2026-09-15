@@ -795,3 +795,58 @@ async fn a_pending_replicate_is_reported_as_pending() {
         "each pending replicate carries its state: {detail}"
     );
 }
+
+/// Scenario: one measurement at a visit, which forms no `samples` row.
+///
+/// Expected behaviour: the visit grid counts it as one, the way the serving arm already does.
+/// A cell whose only replicate is excluded counts none, and a cell with no readings at all
+/// counts nothing.
+#[tokio::test]
+#[serial]
+async fn a_single_measurement_counts_as_one() {
+    let (db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+
+    let row = |body: &serde_json::Value| -> serde_json::Value {
+        body["visits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["collected_at"].as_str().unwrap().starts_with("2025-06-01"))
+            .expect("the first visit is listed")
+            .clone()
+    };
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let first = row(&body);
+    let temperature = cell(&first, GLOBAL_PARAM_TEMP_ID).expect("TEMP cell");
+    assert_eq!(temperature["n_total"], 1, "{temperature}");
+    assert_eq!(
+        temperature["n"], 1,
+        "a lone measurement is one measurement, not an unknown count: {temperature}"
+    );
+    let dissolved = cell(&first, GLOBAL_PARAM_DO_ID).expect("DO cell");
+    assert_eq!(dissolved["n"], 2, "the sample's own count still wins: {dissolved}");
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE readings SET is_flagged = true, flag_reason = 'outlier' \
+             WHERE site_id = '{SITE1_ID}' AND time = '{T1}' \
+               AND parameter_id = '{GLOBAL_PARAM_TEMP_ID}'"
+        ),
+    )
+    .await;
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let reflagged = row(&body);
+    let temperature = cell(&reflagged, GLOBAL_PARAM_TEMP_ID).expect("TEMP cell");
+    assert_eq!(
+        temperature["n"], 0,
+        "the count is what the mean would stand on: {temperature}"
+    );
+}

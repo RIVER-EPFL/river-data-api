@@ -572,7 +572,14 @@ pub async fn list_site_visits(
                 "COUNT(*) FILTER (WHERE r.unverified IS TRUE)::bigint",
                 "n_unverified",
             ),
-            agg("MAX(s.n)", "sample_n"),
+            // A single measurement forms no `samples` row, and the serving arm reports it as
+            // n = 1 (`routes/public/views.rs`). Count what the mean would stand on, so the two
+            // surfaces agree and a lone excluded replicate still says zero.
+            agg(
+                "COALESCE(MAX(s.n), COUNT(*) FILTER (WHERE r.unverified IS NOT TRUE \
+                   AND r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL)::int)",
+                "sample_n",
+            ),
             agg("MAX(s.stdev)", "stdev"),
             agg("MAX(s.median)", "median"),
             agg("MAX(s.min_value)", "min_value"),
