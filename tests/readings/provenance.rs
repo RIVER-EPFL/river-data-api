@@ -553,21 +553,21 @@ async fn seed_chain(
         .try_get::<uuid::Uuid>("", "id")
         .expect("id")
         .to_string();
-    for body in [
-        json!({
-            "code": "S1", "name": "S1", "units": "ppb", "formula": "Peak * 2",
-            "ordinal": 1, "per_replicate": "Peak", "tool_script_id": script_id,
-        }),
-        json!({
-            "code": "S2", "name": "S2", "units": "ppb", "formula": "S1 + 1",
-            "ordinal": 2, "tool_script_id": script_id,
-        }),
-    ] {
-        let (status, text) =
-            crate::common::post_json_with_token(app, "/api/derived_parameters", &body, token).await;
-        assert!((200..300).contains(&status), "formula ({status}): {text}");
-    }
-
+    let (status, text) = crate::common::save_formula_set(
+        app,
+        token,
+        &script_id,
+        json!([
+            { "code": "S1", "name": "S1", "units": "ppb", "formula": "Peak * 2",
+              "ordinal": 1, "per_replicate": "Peak" },
+            { "code": "S2", "name": "S2", "units": "ppb", "formula": "S1 + 1", "ordinal": 2 }
+        ]),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "the formulas ({status}): {text}"
+    );
     // The calculation minted the two outputs; the site declares them under the ids it chose.
     let mut minted = Vec::new();
     for (code, ordinal) in [("S1", 2), ("S2", 3)] {

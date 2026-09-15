@@ -141,29 +141,19 @@ async fn a_refused_output_of_a_set_that_saved_is_reported_rather_than_silent() {
     let f = crate::common::seeded_app().await;
     let db = f.db.clone();
     let (script_id, _) = seed_calculation(&db).await;
-    for (code, formula, ordinal) in [
-        ("partial_computed", "DO_Temperature * 2", 1),
-        ("partial_refused", "Dissolved_O2 * 2", 2),
-    ] {
-        let (status, text) = crate::common::post_json_with_token(
-            &f.app,
-            "/api/derived_parameters",
-            &serde_json::json!({
-                "code": code,
-                "name": code,
-                "units": "ratio",
-                "formula": formula,
-                "tool_script_id": script_id,
-                "ordinal": ordinal,
-            }),
-            &f.token,
-        )
-        .await;
-        assert!(
-            (200..300).contains(&status),
-            "add {code} ({status}): {text}"
-        );
-    }
+    let (status, text) = crate::common::save_formula_set(
+        &f.app,
+        &f.token,
+        &script_id,
+        serde_json::json!([
+            { "code": "partial_computed", "name": "partial_computed", "units": "ratio",
+              "formula": "DO_Temperature * 2", "ordinal": 1 },
+            { "code": "partial_refused", "name": "partial_refused", "units": "ratio",
+              "formula": "Dissolved_O2 * 2", "ordinal": 2 }
+        ]),
+    )
+    .await;
+    assert!((200..300).contains(&status), "the set ({status}): {text}");
     let computed = declare_slot(&db, "partial_computed").await;
     let refused = declare_slot(&db, "partial_refused").await;
 

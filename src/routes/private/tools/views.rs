@@ -864,7 +864,8 @@ fn update_model(f: &SavedFormula) -> CalculationFormulaUpdate {
 /// created, and a stored formula the set leaves out is deleted. One version is minted from the
 /// resulting set and activated, whatever the save touched, so an author's version history reads as
 /// their decisions rather than as their keystrokes (Q186). `migrate_stored` chooses what happens to
-/// the values the superseded version produced (Q170). Requires Administrator.
+/// the values the superseded version produced (Q170). Requires Administrator, or a token with
+/// `write_metadata`, which is what a formula row is written under.
 #[utoipa::path(
     post,
     path = "/api/tool_scripts/{id}/formulas",
@@ -1021,7 +1022,6 @@ pub fn script_routes() -> Router<AppState> {
         .route("/tool_scripts", get(list_scripts).post(create_script))
         .route("/tool_scripts/{id}", get(get_script).patch(update_script))
         .route("/tool_scripts/draft_run", post(draft_run))
-        .route("/tool_scripts/{id}/formulas", post(save_formula_set))
         .route(
             "/tool_scripts/{id}/formulas/draft_run",
             post(draft_run_formulas),
@@ -1041,5 +1041,20 @@ pub fn script_routes() -> Router<AppState> {
         .route("/tool_scripts/{id}/version_usage", get(list_version_usage))
         .layer(middleware::from_fn(
             crate::common::middleware::require_admin,
+        ))
+        .merge(formula_set_route())
+}
+
+/// The formula set save, behind the gate a formula row is already written through.
+///
+/// A formula calculation is arithmetic over the catalog, not remote code, and its rows are CRUD
+/// under `write_metadata` (Q196). Minting the set's version is the same act, so the save takes the
+/// same callers; `created_by` on the version is the token's label, which resolves to the
+/// administrator who minted the token.
+fn formula_set_route() -> Router<AppState> {
+    Router::new()
+        .route("/tool_scripts/{id}/formulas", post(save_formula_set))
+        .layer(middleware::from_fn(
+            crate::common::middleware::require_admin_or_token_write_metadata,
         ))
 }

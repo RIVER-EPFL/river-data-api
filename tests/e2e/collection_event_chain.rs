@@ -449,14 +449,14 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
         .find(|s| s["name"] == "chain_f")
         .map(|s| s["id"].as_str().unwrap().to_string())
         .expect("chain_f is listed");
-    let (status, formula) = crate::common::post_json_with_token(
+    let (status, formula) = crate::common::save_formula_set(
         &app,
-        "/api/derived_parameters",
-        &json!({
-            "code": "ChainPF", "name": "ChainPF", "units": "ppb",
-            "formula": "ChainPA * 2", "tool_script_id": chain_f_id, "ordinal": 1,
-        }),
         &admin,
+        &chain_f_id,
+        json!([{
+            "code": "ChainPF", "name": "ChainPF", "units": "ppb",
+            "formula": "ChainPA * 2", "ordinal": 1,
+        }]),
     )
     .await;
     assert!(

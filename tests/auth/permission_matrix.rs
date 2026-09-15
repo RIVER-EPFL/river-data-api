@@ -592,6 +592,16 @@ fn table() -> Table {
         ],
     );
 
+    // The formula set save: a formula calculation is arithmetic over the catalog, and its rows are
+    // written under the same `write_metadata` (Q196). No scope layer, because a calculation belongs
+    // to no project.
+    t.group(
+        Capability::Admin,
+        TokenAccess::Bit(TokenBit::WriteMetadata),
+        Scope::Open,
+        &[("POST", "/api/tool_scripts/{id}/formulas")],
+    );
+
     t.group(
         Capability::ReadMetadata,
         TokenAccess::Same,

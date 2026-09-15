@@ -50555,7 +50555,7 @@
     },
     "/api/tool_scripts/{id}/formulas": {
       "post": {
-        "description": "The set is the request: a formula carrying an `id` updates that row, one without an id is\ncreated, and a stored formula the set leaves out is deleted. One version is minted from the\nresulting set and activated, whatever the save touched, so an author's version history reads as\ntheir decisions rather than as their keystrokes (Q186). `migrate_stored` chooses what happens to\nthe values the superseded version produced (Q170). Requires Administrator.",
+        "description": "The set is the request: a formula carrying an `id` updates that row, one without an id is\ncreated, and a stored formula the set leaves out is deleted. One version is minted from the\nresulting set and activated, whatever the save touched, so an author's version history reads as\ntheir decisions rather than as their keystrokes (Q186). `migrate_stored` chooses what happens to\nthe values the superseded version produced (Q170). Requires Administrator, or a token with\n`write_metadata`, which is what a formula row is written under.",
         "operationId": "save_formula_set",
         "parameters": [
           {

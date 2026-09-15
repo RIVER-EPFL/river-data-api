@@ -162,15 +162,15 @@ async fn published(db: &sea_orm::DatabaseConnection, parameter_id: &str) -> Vec<
     .collect()
 }
 
+/// The calculation's formula, saved as the set it is: the save is what mints the version the run
+/// reads.
 async fn add_formula(
     app: &axum::Router,
     token: &str,
     script_id: &str,
     body: serde_json::Value,
 ) -> (u16, String) {
-    let mut payload = body;
-    payload["tool_script_id"] = json!(script_id);
-    crate::common::post_json_with_token(app, "/api/derived_parameters", &payload, token).await
+    crate::common::save_formula_set(app, token, script_id, json!([body])).await
 }
 
 #[tokio::test]
@@ -191,7 +191,7 @@ async fn the_chain_reads_the_stored_family_and_publishes_one_output_per_index() 
         }),
     )
     .await;
-    assert!((200..300).contains(&status), "create ({status}): {text}");
+    assert!((200..300).contains(&status), "save ({status}): {text}");
     let output_id = minted_output(&db, "co2_dry_ppm").await;
     configure_slot(&db, &output_id, "co2_dry_ppm").await;
 
@@ -236,7 +236,7 @@ async fn a_missing_index_leaves_a_gap_rather_than_shifting_the_family() {
         }),
     )
     .await;
-    assert!((200..300).contains(&status), "create ({status}): {text}");
+    assert!((200..300).contains(&status), "save ({status}): {text}");
     let output_id = minted_output(&db, "co2_dry_ppm").await;
     configure_slot(&db, &output_id, "co2_dry_ppm").await;
 

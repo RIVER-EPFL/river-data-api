@@ -117,15 +117,15 @@ async fn configure_slot(db: &sea_orm::DatabaseConnection, parameter_id: &str, na
     .await;
 }
 
-async fn add_formula(
+/// The calculation's formulas, saved as the set they are: the save is what mints the version the
+/// run reads.
+async fn save_set(
     app: &axum::Router,
     token: &str,
     script_id: &str,
-    body: serde_json::Value,
+    formulas: serde_json::Value,
 ) -> (u16, String) {
-    let mut payload = body;
-    payload["tool_script_id"] = json!(script_id);
-    crate::common::post_json_with_token(app, "/api/derived_parameters", &payload, token).await
+    crate::common::save_formula_set(app, token, script_id, formulas).await
 }
 
 #[tokio::test]
@@ -137,25 +137,21 @@ async fn a_stage_one_family_is_stored_per_index_and_stage_two_reads_its_mean() {
     let script_id = calculation_id(&db).await;
     configure_slot(&db, &peak_id, "Peak").await;
 
-    let (status, text) = add_formula(
+    let (status, text) = save_set(
         &app,
         &token,
         &script_id,
-        json!({
-            "code": "S1", "name": "S1", "units": "ppb",
-            "formula": "Peak * 2", "ordinal": 1, "per_replicate": "Peak",
-        }),
+        json!([
+            { "code": "S1", "name": "S1", "units": "ppb",
+              "formula": "Peak * 2", "ordinal": 1, "per_replicate": "Peak" },
+            { "code": "S2", "name": "S2", "units": "ppb", "formula": "S1 + 1", "ordinal": 2 }
+        ]),
     )
     .await;
-    assert!((200..300).contains(&status), "stage one ({status}): {text}");
-    let (status, text) = add_formula(
-        &app,
-        &token,
-        &script_id,
-        json!({ "code": "S2", "name": "S2", "units": "ppb", "formula": "S1 + 1", "ordinal": 2 }),
-    )
-    .await;
-    assert!((200..300).contains(&status), "stage two ({status}): {text}");
+    assert!(
+        (200..300).contains(&status),
+        "the two stages ({status}): {text}"
+    );
     let s1_id = place_output(&db, "S1", 2).await;
     let _s2_id = place_output(&db, "S2", 3).await;
 
@@ -277,14 +273,14 @@ async fn a_gap_in_the_family_stays_a_gap() {
     let peak_id = seed_two_stage(&db).await;
     let script_id = calculation_id(&db).await;
     configure_slot(&db, &peak_id, "Peak").await;
-    let (status, text) = add_formula(
+    let (status, text) = save_set(
         &app,
         &token,
         &script_id,
-        json!({
+        json!([{
             "code": "S1", "name": "S1", "units": "ppb",
             "formula": "Peak * 2", "ordinal": 1, "per_replicate": "Peak",
-        }),
+        }]),
     )
     .await;
     assert!((200..300).contains(&status), "stage one ({status}): {text}");

@@ -3519,27 +3519,6 @@ pub fn plan_formula_set(
     Ok(writes)
 }
 
-/// Re-mint every formula calculation whose formula set no longer matches its active version.
-/// Idempotent, and cheap: the mint is a no-op when the content hash already matches, so this is
-/// what the definition hooks call, including after a delete where the calculation the definition
-/// belonged to is no longer readable from the row.
-pub async fn mint_stale_formula_versions<C: ConnectionTrait>(
-    db: &C,
-    actor: Option<&str>,
-) -> AppResult<()> {
-    let ids: Vec<Uuid> = script::Entity::find()
-        .select_only()
-        .column(script::Column::Id)
-        .filter(script::Column::Engine.eq("formula"))
-        .into_tuple()
-        .all(db)
-        .await?;
-    for id in ids {
-        mint_formula_version(db, id, actor).await?;
-    }
-    Ok(())
-}
-
 /// The dedupe key an edit to one calculation audits under, so a burst of formula edits coalesces
 /// into one audit the way a burst of constant edits does.
 #[must_use]

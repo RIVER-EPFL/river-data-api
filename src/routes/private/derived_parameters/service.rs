@@ -34,7 +34,7 @@ fn formula_hash(formula: &str) -> String {
 ///
 /// An edit is a new calculation rather than a correction of the old one (Q89), so the text a
 /// stored value was made with stays recoverable. A definition attached to a calculation is
-/// versioned by `tool_script_versions` instead, through `mint_stale_formula_versions`, so this
+/// versioned by `tool_script_versions` instead, minted once per save of its formula set, so this
 /// covers only the standalone kind the per-reading engine serves.
 async fn mint_derived_version<C: ConnectionTrait>(
     db: &C,
@@ -288,10 +288,13 @@ impl CRUDOperations for SharedStepOperations {
         };
         release_step(db, entity.formula_id).await?;
         declare_step(db, previous_owner, entity.formula_id).await?;
-        // Both calculations' pinned sets changed shape, so their versions are re-minted.
-        crate::routes::private::tools::service::mint_stale_formula_versions(db, None)
-            .await
-            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        // A declaration changes the shape of both calculations' pinned sets, and it is the whole
+        // act, so each is minted once here rather than by a sweep over every formula calculation.
+        for calculation in [previous_owner, entity.tool_script_id] {
+            crate::routes::private::tools::service::mint_formula_version(db, calculation, None)
+                .await
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        }
         Ok(())
     }
 }
@@ -1000,10 +1003,6 @@ impl CRUDOperations for CalculationFormulaOperations {
         // is a step of the calculation and measures nothing, so it mints none (M180).
         ensure_output_parameter(db, entity).await?;
 
-        // A formula of a calculation is part of its version, so the calculation is re-minted.
-        crate::routes::private::tools::service::mint_stale_formula_versions(db, None)
-            .await
-            .map_err(|e| ApiError::bad_request(e.to_string()))?;
         if is_standalone(db, entity.id).await? {
             mint_derived_version(db, entity.id, &entity.formula, None).await?;
         }
@@ -1071,9 +1070,6 @@ impl CRUDOperations for CalculationFormulaOperations {
         // Keep the output parameter in sync; an intermediate has none to keep.
         ensure_output_parameter(db, entity).await?;
 
-        crate::routes::private::tools::service::mint_stale_formula_versions(db, None)
-            .await
-            .map_err(|e| ApiError::bad_request(e.to_string()))?;
         if is_standalone(db, entity.id).await? {
             mint_derived_version(db, entity.id, &entity.formula, None).await?;
         }
@@ -1095,16 +1091,6 @@ impl CRUDOperations for CalculationFormulaOperations {
             .collect();
 
         Ok(())
-    }
-
-    async fn after_delete<C: ConnectionTrait + TransactionTrait>(
-        &self,
-        db: &C,
-        _id: Uuid,
-    ) -> Result<(), ApiError> {
-        crate::routes::private::tools::service::mint_stale_formula_versions(db, None)
-            .await
-            .map_err(|e| ApiError::bad_request(e.to_string()))
     }
 }
 

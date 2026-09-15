@@ -87,6 +87,25 @@ pub async fn post_json(app: &Router, uri: &str, body: &serde_json::Value) -> (u1
     (status, text)
 }
 
+/// Author a formula calculation's whole formula set, which is the act that mints its version.
+///
+/// A formula row written through `/derived_parameters` mints none, so a suite that runs a formula
+/// calculation authors it here.
+pub async fn save_formula_set(
+    app: &Router,
+    token: &str,
+    script_id: &str,
+    formulas: serde_json::Value,
+) -> (u16, String) {
+    post_json_with_token(
+        app,
+        &format!("/api/tool_scripts/{script_id}/formulas"),
+        &serde_json::json!({ "formulas": formulas }),
+        token,
+    )
+    .await
+}
+
 pub async fn post_json_with_token(
     app: &Router,
     uri: &str,

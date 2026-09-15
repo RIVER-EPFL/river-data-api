@@ -105,6 +105,8 @@ async fn minted_output(db: &sea_orm::DatabaseConnection, code: &str) -> String {
     .to_string()
 }
 
+/// Author the calculation as one formula, through the save route: a formula row written through
+/// CRUD mints no version, and the version is what the calculation runs.
 async fn add_formula(
     app: &axum::Router,
     token: &str,
@@ -113,25 +115,22 @@ async fn add_formula(
     formula: &str,
     ordinal: i32,
 ) -> (u16, String) {
-    crate::common::post_json_with_token(
+    crate::common::save_formula_set(
         app,
-        "/api/derived_parameters",
-        &json!({
-            "code": code,
-            "name": code,
-            "units": "ratio",
-            "formula": formula,
-            "tool_script_id": script_id,
-            "ordinal": ordinal,
-        }),
         token,
+        script_id,
+        json!([{ "code": code, "name": code, "units": "ratio", "formula": formula, "ordinal": ordinal }]),
     )
     .await
 }
 
+/// Scenario: an author saves a calculation's formula set, then saves an edit of it.
+///
+/// Expected behaviour: each save is one version, activated, carrying the set as saved. The save is
+/// the act that mints; the rows it writes on the way mint nothing of their own.
 #[tokio::test]
 #[serial]
-async fn a_formula_edit_mints_and_activates_a_version() {
+async fn a_set_save_mints_and_activates_a_version() {
     let group_id = "00000000-0000-4000-c000-000000000101";
     let (db, app, token) = setup().await;
     seed_calculation(&db, group_id).await;
@@ -150,7 +149,7 @@ async fn a_formula_edit_mints_and_activates_a_version() {
         1,
     )
     .await;
-    assert!((200..300).contains(&status), "create ({status}): {text}");
+    assert!((200..300).contains(&status), "save ({status}): {text}");
 
     let (version_no, body) = active_version(&db).await.expect("a version was minted");
     assert_eq!(version_no, 1);
@@ -159,23 +158,21 @@ async fn a_formula_edit_mints_and_activates_a_version() {
         "the version body is the formula set: {body}"
     );
 
-    let created: serde_json::Value = serde_json::from_str(&text).expect("JSON");
-    let definition_id = created["id"].as_str().unwrap();
-    let (status, text) = crate::common::put_json_with_token(
+    let formula = formula_id(&db, "temp_ratio_out").await;
+    let (status, text) = crate::common::save_formula_set(
         &app,
-        &format!("/api/derived_parameters/{definition_id}"),
-        &json!({
+        &token,
+        &script_id,
+        json!([{
+            "id": formula,
             "code": "temp_ratio_out",
-            "name": "temp_ratio_out",
             "units": "ratio",
             "formula": "Dissolved_O2 / DO_Temperature",
-            "tool_script_id": script_id,
             "ordinal": 1,
-        }),
-        &token,
+        }]),
     )
     .await;
-    assert!((200..300).contains(&status), "update ({status}): {text}");
+    assert!((200..300).contains(&status), "edit ({status}): {text}");
 
     let (version_no, body) = active_version(&db).await.expect("a second version");
     assert_eq!(version_no, 2, "the edit minted a version");
@@ -185,6 +182,134 @@ async fn a_formula_edit_mints_and_activates_a_version() {
     );
 }
 
+/// Scenario: a formula row is written through its CRUD route, which is what the entity list and
+/// the older forms do.
+///
+/// Expected behaviour: the row is written and nothing is minted. One save is one version (Q186),
+/// so a version comes from the save route and from nowhere else; a row write that minted one made
+/// the history a list of keystrokes, and re-minted every other formula calculation besides.
+#[tokio::test]
+#[serial]
+async fn a_formula_row_written_through_crud_mints_no_version() {
+    let group_id = "00000000-0000-4000-c000-000000000111";
+    let (db, app, token) = setup().await;
+    seed_calculation(&db, group_id).await;
+    let script_id = calculation_id(&db).await;
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": "temp_ratio_out",
+            "name": "temp_ratio_out",
+            "units": "ratio",
+            "formula": "DO_Temperature / Dissolved_O2",
+            "tool_script_id": script_id,
+            "ordinal": 1,
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create ({status}): {text}");
+    assert_eq!(
+        formula_codes(&db).await,
+        ["temp_ratio_out"],
+        "the row is written"
+    );
+    assert!(
+        active_version(&db).await.is_none(),
+        "and no version was minted by the row"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) FROM tool_script_activations a \
+                   JOIN tool_scripts s ON s.id = a.tool_script_id WHERE s.name = '{CALCULATION}'"
+            )
+        )
+        .await,
+        0,
+        "nor an activation"
+    );
+}
+
+/// Scenario: a three-formula calculation saved in one go, by a service token rather than a person.
+///
+/// Expected behaviour: one version and one activation, not one per row. The version's
+/// `created_by` is the token's label, which resolves through `api_tokens.created_by` to the
+/// administrator who minted it (Q196).
+#[tokio::test]
+#[serial]
+async fn a_set_save_mints_one_version_and_one_activation() {
+    let group_id = "00000000-0000-4000-c000-000000000112";
+    let (db, app, token) = setup().await;
+    seed_calculation(&db, group_id).await;
+    let script_id = calculation_id(&db).await;
+
+    let (status, text) = crate::common::save_formula_set(
+        &app,
+        &token,
+        &script_id,
+        json!([
+            { "code": "set_a", "units": "ratio", "formula": "DO_Temperature / Dissolved_O2", "ordinal": 1 },
+            { "code": "set_b", "units": "ratio", "formula": "DO_Temperature * 2", "ordinal": 2 },
+            { "code": "set_c", "units": "ratio", "formula": "Dissolved_O2 + 1", "ordinal": 3 }
+        ]),
+    )
+    .await;
+    assert!((200..300).contains(&status), "save ({status}): {text}");
+    assert_eq!(formula_codes(&db).await, ["set_a", "set_b", "set_c"]);
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) FROM tool_script_versions v JOIN tool_scripts s ON s.id = \
+                 v.tool_script_id WHERE s.name = '{CALCULATION}'"
+            )
+        )
+        .await,
+        1,
+        "three formulas, one version"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) FROM tool_script_activations a JOIN tool_scripts s ON s.id = \
+                 a.tool_script_id WHERE s.name = '{CALCULATION}'"
+            )
+        )
+        .await,
+        1,
+        "and one activation"
+    );
+
+    let created_by = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT v.created_by FROM tool_script_versions v \
+                   JOIN tool_scripts s ON s.id = v.tool_script_id WHERE s.name = '{CALCULATION}'"
+            ),
+        ))
+        .await
+        .expect("query")
+        .expect("the version")
+        .try_get::<Option<String>>("", "created_by")
+        .expect("created_by")
+        .expect("the save names who made it");
+    assert!(
+        created_by.contains("token"),
+        "the minting is attributed to the token that made it: {created_by}"
+    );
+}
+
+/// Scenario: the same formula set is saved twice, which is what a form does when nothing was
+/// changed before pressing save.
+///
+/// Expected behaviour: the second save mints nothing. The content hash is what a version is keyed
+/// on, so an unchanged set is the version that is already active.
 #[tokio::test]
 #[serial]
 async fn an_unchanged_formula_set_mints_nothing() {
@@ -202,25 +327,27 @@ async fn an_unchanged_formula_set_mints_nothing() {
         1,
     )
     .await;
-    assert!((200..300).contains(&status), "create ({status}): {text}");
-    let created: serde_json::Value = serde_json::from_str(&text).expect("JSON");
-    let definition_id = created["id"].as_str().unwrap();
+    assert!((200..300).contains(&status), "save ({status}): {text}");
 
-    let (status, text) = crate::common::put_json_with_token(
+    // The second save is the form's own set: the formula it already holds, unchanged.
+    let (status, text) = crate::common::save_formula_set(
         &app,
-        &format!("/api/derived_parameters/{definition_id}"),
-        &json!({
+        &token,
+        &script_id,
+        json!([{
+            "id": formula_id(&db, "temp_ratio_out").await,
             "code": "temp_ratio_out",
-            "name": "temp_ratio_out",
             "units": "ratio",
             "formula": "DO_Temperature / Dissolved_O2",
-            "tool_script_id": script_id,
             "ordinal": 1,
-        }),
-        &token,
+        }]),
     )
     .await;
-    assert!((200..300).contains(&status), "update ({status}): {text}");
+    assert!(
+        (200..300).contains(&status),
+        "second save ({status}): {text}"
+    );
+
     let (version_no, _) = active_version(&db).await.expect("the first version");
     assert_eq!(version_no, 1, "the same formula set is the same version");
 }
@@ -270,22 +397,20 @@ async fn a_per_replicate_formula_produces_one_value_per_index() {
     let (db, app, token) = setup().await;
     seed_calculation(&db, group_id).await;
     let script_id = calculation_id(&db).await;
-    let (status, text) = crate::common::post_json_with_token(
+    let (status, text) = crate::common::save_formula_set(
         &app,
-        "/api/derived_parameters",
-        &json!({
+        &token,
+        &script_id,
+        json!([{
             "code": "temp_ratio_out",
-            "name": "temp_ratio_out",
             "units": "ratio",
             "formula": "DO_Temperature * 2",
-            "tool_script_id": script_id,
             "ordinal": 1,
             "per_replicate": "DO_Temperature",
-        }),
-        &token,
+        }]),
     )
     .await;
-    assert!((200..300).contains(&status), "create ({status}): {text}");
+    assert!((200..300).contains(&status), "save ({status}): {text}");
 
     let (status, text) = crate::common::post_json_with_token(
         &app,
@@ -341,27 +466,24 @@ async fn a_formula_edit_enqueues_its_own_audit() {
         1,
     )
     .await;
-    assert!((200..300).contains(&status), "create ({status}): {text}");
-    let created: serde_json::Value = serde_json::from_str(&text).expect("JSON");
-    let definition_id = created["id"].as_str().unwrap();
+    assert!((200..300).contains(&status), "save ({status}): {text}");
     let after_create = audits(db.clone()).await;
     assert!(
         after_create >= 1,
         "the first version is an activation and audits: {after_create}"
     );
 
-    let (status, text) = crate::common::put_json_with_token(
+    let (status, text) = crate::common::save_formula_set(
         &app,
-        &format!("/api/derived_parameters/{definition_id}"),
-        &json!({
+        &token,
+        &script_id,
+        json!([{
+            "id": formula_id(&db, "temp_ratio_out").await,
             "code": "temp_ratio_out",
-            "name": "temp_ratio_out",
             "units": "ratio",
             "formula": "Dissolved_O2 / DO_Temperature",
-            "tool_script_id": script_id,
             "ordinal": 1,
-        }),
-        &token,
+        }]),
     )
     .await;
     assert!((200..300).contains(&status), "edit ({status}): {text}");
@@ -495,33 +617,17 @@ async fn a_formula_reads_the_step_before_it() {
     seed_calculation(&db, group_id).await;
     let script_id = calculation_id(&db).await;
 
-    let (status, text) = crate::common::post_json_with_token(
-        &app,
-        "/api/derived_parameters",
-        &json!({
-            "code": "half_temp",
-            "name": "half_temp",
-            "units": "ratio",
-            "formula": "DO_Temperature / 2",
-            "tool_script_id": script_id,
-            "ordinal": 1,
-            "intermediate": true,
-        }),
-        &token,
-    )
-    .await;
-    assert!((200..300).contains(&status), "the step ({status}): {text}");
-
-    let (status, text) = add_formula(
+    let (status, text) = crate::common::save_formula_set(
         &app,
         &token,
         &script_id,
-        "temp_ratio_out",
-        "half_temp + Dissolved_O2",
-        2,
+        json!([
+            { "code": "half_temp", "units": "ratio", "formula": "DO_Temperature / 2", "ordinal": 1, "intermediate": true },
+            { "code": "temp_ratio_out", "units": "ratio", "formula": "half_temp + Dissolved_O2", "ordinal": 2 }
+        ]),
     )
     .await;
-    assert!((200..300).contains(&status), "create ({status}): {text}");
+    assert!((200..300).contains(&status), "save ({status}): {text}");
 
     let sources = crate::common::e2e::count(
         &db,

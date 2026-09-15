@@ -111,18 +111,17 @@ async fn a_run_publishing_where_the_site_declares_its_inputs_mints_the_output_sl
     let db = f.db.clone();
     let script_id = seed_calculation(&db).await;
 
-    let (status, text) = crate::common::post_json_with_token(
+    let (status, text) = crate::common::save_formula_set(
         &f.app,
-        "/api/derived_parameters",
-        &serde_json::json!({
+        &f.token,
+        &script_id,
+        serde_json::json!([{
             "code": OUTPUT_CODE,
             "name": OUTPUT_CODE,
             "units": "ratio",
             "formula": "DO_Temperature * 2",
-            "tool_script_id": script_id,
             "ordinal": 1,
-        }),
-        &f.token,
+        }]),
     )
     .await;
     assert!(
@@ -197,18 +196,17 @@ async fn a_calculation_whose_inputs_the_site_lacks_is_still_not_applicable() {
         ),
     )
     .await;
-    let (status, text) = crate::common::post_json_with_token(
+    let (status, text) = crate::common::save_formula_set(
         &f.app,
-        "/api/derived_parameters",
-        &serde_json::json!({
+        &f.token,
+        &script_id,
+        serde_json::json!([{
             "code": OUTPUT_CODE,
             "name": OUTPUT_CODE,
             "units": "ratio",
             "formula": "Unheld_input * 2",
-            "tool_script_id": script_id,
             "ordinal": 1,
-        }),
-        &f.token,
+        }]),
     )
     .await;
     assert!(

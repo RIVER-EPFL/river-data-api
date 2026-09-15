@@ -51,18 +51,17 @@ async fn install_calculation(db: &DatabaseConnection, app: &axum::Router, token:
             .expect("the calculation");
         row.try_get::<Uuid>("", "id").expect("id").to_string()
     };
-    let (status, body) = crate::common::post_json_with_token(
+    let (status, body) = crate::common::save_formula_set(
         app,
-        "/api/derived_parameters",
-        &json!({
+        token,
+        &script_id,
+        json!([{
             "code": OUTPUT_CODE,
             "name": OUTPUT_CODE,
             "units": "ratio",
             "formula": "DO_Temperature * 2",
-            "tool_script_id": script_id,
             "ordinal": 1,
-        }),
-        token,
+        }]),
     )
     .await;
     assert!(
