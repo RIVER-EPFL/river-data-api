@@ -37,15 +37,15 @@ async fn seed_calculation(db: &sea_orm::DatabaseConnection, group_id: &str) {
         ),
     )
     .await;
-    for (parameter, role, ordinal) in [
-        (crate::common::GLOBAL_PARAM_TEMP_ID, "measured", 1),
-        (crate::common::GLOBAL_PARAM_DO_ID, "measured", 2),
+    for (parameter, ordinal) in [
+        (crate::common::GLOBAL_PARAM_TEMP_ID, 1),
+        (crate::common::GLOBAL_PARAM_DO_ID, 2),
     ] {
         crate::common::exec(
             db,
             &format!(
-                "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
-                 VALUES (gen_random_uuid(), '{group_id}', '{parameter}', '{role}', {ordinal})"
+                "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
+                 VALUES (gen_random_uuid(), '{group_id}', '{parameter}', {ordinal})"
             ),
         )
         .await;
@@ -105,8 +105,8 @@ async fn declare_output(db: &sea_orm::DatabaseConnection, group_id: &str, code: 
     crate::common::exec(
         db,
         &format!(
-            "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
-             VALUES (gen_random_uuid(), '{group_id}', '{parameter_id}', 'output', 9)"
+            "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
+             VALUES (gen_random_uuid(), '{group_id}', '{parameter_id}', 9)"
         ),
     )
     .await;

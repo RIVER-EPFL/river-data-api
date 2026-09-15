@@ -135,8 +135,8 @@ async fn a_route_that_owns_its_transaction_names_the_writer() {
         ),
         format!(
             "INSERT INTO parameter_group_members \
-                 (id, group_id, parameter_id, ordinal, role, created_at) \
-             VALUES (gen_random_uuid(), '{group_id}', '{parameter_id}', 0, 'output', NOW())"
+                 (id, group_id, parameter_id, ordinal, created_at) \
+             VALUES (gen_random_uuid(), '{group_id}', '{parameter_id}', 0, NOW())"
         ),
     ] {
         crate::common::exec(&db, &statement).await;

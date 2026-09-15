@@ -66,6 +66,7 @@ use crate::error::AppError;
 use crate::error::AppResult;
 use crate::routes::private::data_streams;
 use crate::routes::private::parameter_groups::member_model;
+use crate::routes::private::parameter_groups::service::rules::Role;
 use crate::routes::private::parameters;
 use crate::routes::private::readings::samples;
 use crate::routes::private::site_parameters;
@@ -365,13 +366,21 @@ pub async fn apply_group(
             .map(|p| (p.id, p.code))
             .collect();
 
+    // The role follows from the calculations, never from the membership row (Q135).
+    let roles =
+        crate::routes::private::parameter_groups::service::calculation_roles(&state.db).await?;
     let rows: Vec<GroupMember> = members
         .iter()
         .map(|m| {
             (
                 m.parameter_id,
                 codes.get(&m.parameter_id).cloned().unwrap_or_default(),
-                m.role.clone(),
+                roles
+                    .get(&m.parameter_id)
+                    .copied()
+                    .unwrap_or(Role::EntryOnly)
+                    .as_str()
+                    .to_string(),
             )
         })
         .collect();

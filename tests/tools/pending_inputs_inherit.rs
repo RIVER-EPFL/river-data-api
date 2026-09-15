@@ -29,8 +29,8 @@ async fn install_calculation(db: &DatabaseConnection, app: &axum::Router, token:
              VALUES ('{GROUP_ID}', 'pending', 'Pending', 1)"
         ),
         format!(
-            "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
-             VALUES (gen_random_uuid(), '{GROUP_ID}', '{GLOBAL_PARAM_TEMP_ID}', 'measured', 1)"
+            "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
+             VALUES (gen_random_uuid(), '{GROUP_ID}', '{GLOBAL_PARAM_TEMP_ID}', 1)"
         ),
         format!(
             "INSERT INTO tool_scripts (name, label, engine, parameter_group_id, created_by) \
@@ -47,8 +47,8 @@ async fn install_calculation(db: &DatabaseConnection, app: &axum::Router, token:
              VALUES ('{output_id}', '{OUTPUT_CODE}', '{OUTPUT_CODE}', 'ratio', 'measurement')"
         ),
         format!(
-            "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
-             VALUES (gen_random_uuid(), '{GROUP_ID}', '{output_id}', 'output', 2)"
+            "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
+             VALUES (gen_random_uuid(), '{GROUP_ID}', '{output_id}', 2)"
         ),
     ] {
         crate::common::exec(db, &sql).await;

@@ -51,9 +51,8 @@ pub async fn group_definition(
         .map_err(AppError::Database)?;
 
     let sections_by_code = manifest_sections(&state.db, id).await?;
-    // The role follows from the calculations, never from the stored column (Q135): a parameter a
-    // formula writes is an output, one a formula reads is measured, the rest are entered and read
-    // by nothing.
+    // The role follows from the calculations (Q135): a parameter a formula writes is an output,
+    // one a formula reads is measured, the rest are entered and read by nothing.
     let roles = calculation_roles(&state.db).await?;
     let declared = match query.site_id {
         Some(site_id) => site_declarations(&state.db, id, site_id).await?,
@@ -125,4 +124,3 @@ pub async fn group_definition(
         sections,
     }))
 }
-

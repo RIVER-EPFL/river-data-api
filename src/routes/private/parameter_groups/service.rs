@@ -9,9 +9,9 @@ use sea_orm::{
 use uuid::Uuid;
 
 use self::rules::{Member, Role};
+use super::models::SlotDeclaration;
 use super::models::group_model::ParameterGroup;
 use super::models::member_model::ParameterGroupMember;
-use super::models::SlotDeclaration;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::derived_parameters::models::{definition, source};
 
@@ -26,13 +26,9 @@ async fn member_row<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<Option<Membe
     else {
         return Ok(None);
     };
-    let Some(role) = Role::parse(&row.role) else {
-        return Ok(None);
-    };
     Ok(Some(Member {
         group_id: row.group_id,
         parameter_id: row.parameter_id,
-        role,
     }))
 }
 
@@ -42,19 +38,13 @@ async fn all_members<C: ConnectionTrait>(db: &C) -> Result<Vec<Member>, ApiError
         .all(db)
         .await
         .map_err(ApiError::database)?;
-    let mut members = Vec::with_capacity(rows.len());
-    for row in rows {
-        // A role outside the vocabulary is a corrupt row, not a decode failure.
-        let Some(role) = Role::parse(&row.role) else {
-            continue;
-        };
-        members.push(Member {
+    Ok(rows
+        .into_iter()
+        .map(|row| Member {
             group_id: row.group_id,
             parameter_id: row.parameter_id,
-            role,
-        });
-    }
-    Ok(members)
+        })
+        .collect())
 }
 
 /// The candidate's catalog code, and the codes of the group's members entered several times. The
@@ -149,12 +139,6 @@ impl CRUDOperations for ParameterGroupMemberOperations {
         db: &C,
         data: &<ParameterGroupMember as CRUDResource>::CreateModel,
     ) -> Result<(), ApiError> {
-        if Role::parse(&data.role).is_none() {
-            return Err(ApiError::bad_request(format!(
-                "role {} is not measured, entry_only or output",
-                data.role
-            )));
-        }
         rules::may_add(data.parameter_id, &all_members(db).await?)
             .map_err(|refusal| ApiError::bad_request(refusal.to_string()))?;
         let (code, replicated) =
@@ -164,22 +148,14 @@ impl CRUDOperations for ParameterGroupMemberOperations {
             .map_err(|refusal| ApiError::bad_request(refusal.to_string()))
     }
 
-    /// The role CHECK is the backstop; this names the value instead of raising a raw 500. A move
-    /// between groups is the reshape, so it is held to [`rules::may_move`]: an `output` does not
-    /// leave while a calculation in its group still writes it.
+    /// A move between groups is the reshape, so it is held to [`rules::may_move`]: a parameter does
+    /// not leave while a calculation in its group still writes it.
     async fn before_update<C: ConnectionTrait + TransactionTrait>(
         &self,
         db: &C,
         id: Uuid,
         data: &<ParameterGroupMember as CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
-        if let Some(Some(role)) = data.role.as_ref()
-            && Role::parse(role).is_none()
-        {
-            return Err(ApiError::bad_request(format!(
-                "role {role} is not measured, entry_only or output"
-            )));
-        }
         let Some(Some(to_group)) = data.group_id else {
             return Ok(());
         };
@@ -244,8 +220,8 @@ pub mod ordering {
 
 pub mod rules {
     //! The reshape rules for a parameter group, as pure decisions over its members and the
-    //! calculations attached to it. The database holds the unique membership and the role CHECK; these
-    //! are the rules SQL cannot state, and the CRUD hooks are their only callers.
+    //! calculations attached to it. The database holds the unique membership; these are the rules
+    //! SQL cannot state, and the CRUD hooks are their only callers.
 
     use std::fmt;
 
@@ -286,7 +262,6 @@ pub mod rules {
     pub struct Member {
         pub group_id: Uuid,
         pub parameter_id: Uuid,
-        pub role: Role,
     }
 
     /// A calculation attached to a group, naming the parameters it consumes and produces.
@@ -382,9 +357,6 @@ pub mod rules {
         if member.group_id == to_group {
             return Ok(());
         }
-        if member.role != Role::Output {
-            return Ok(());
-        }
         match calculations
             .iter()
             .find(|c| c.group_id == member.group_id && c.outputs.contains(&member.parameter_id))
@@ -405,9 +377,9 @@ pub mod rules {
         Ok(())
     }
 
-    /// What a parameter is to the calculations, which is what its role says (Q135).
+    /// What a parameter is to the calculations (Q135).
     ///
-    /// The role is read off the calculations, never set by hand: a parameter one writes is an output,
+    /// The role is read off the calculations, never stored: a parameter one writes is an output,
     /// one a calculation reads is measured, and a parameter no calculation touches is entered and read
     /// by nothing. A calculation may read any catalog parameter, so a group is a way to list many
     /// parameters together, not a boundary a calculation is confined to.
@@ -463,7 +435,7 @@ pub(super) async fn site_declarations(
 /// One pass over every formula and its sources, since a group's definition is read for a page and
 /// the calculation set is catalog-sized. A formula's output parameter is its own; its inputs are
 /// the `derived_parameter_sources` rows naming it.
-pub(super) async fn calculation_roles(
+pub async fn calculation_roles(
     db: &sea_orm::DatabaseConnection,
 ) -> AppResult<std::collections::HashMap<Uuid, Role>> {
     let mut roles = std::collections::HashMap::new();

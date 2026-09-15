@@ -33,22 +33,18 @@ async fn group_with_members(db: &sea_orm::DatabaseConnection) -> (Uuid, Vec<Stri
         fresh.push(id);
     }
 
-    let members: Vec<(usize, String, &str)> = vec![
-        (
-            0,
-            crate::common::GLOBAL_PARAM_TEMP_ID.to_string(),
-            "measured",
-        ),
-        (1, fresh[0].clone(), "output"),
-        (2, fresh[1].clone(), "output"),
+    let members: Vec<(usize, String)> = vec![
+        (0, crate::common::GLOBAL_PARAM_TEMP_ID.to_string()),
+        (1, fresh[0].clone()),
+        (2, fresh[1].clone()),
     ];
-    for (ordinal, parameter_id, role) in members {
+    for (ordinal, parameter_id) in members {
         db.execute_raw(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
                 "INSERT INTO parameter_group_members \
-                 (id, group_id, parameter_id, ordinal, role, created_at) \
-                 VALUES (gen_random_uuid(), '{group_id}', '{parameter_id}', {ordinal}, '{role}', NOW())"
+                 (id, group_id, parameter_id, ordinal, created_at) \
+                 VALUES (gen_random_uuid(), '{group_id}', '{parameter_id}', {ordinal}, NOW())"
             ),
         ))
         .await

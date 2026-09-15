@@ -83,7 +83,7 @@ async fn a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findin
         &admin,
         &site_id,
         "scope_group",
-        &[(pa.as_str(), "measured"), (pb.as_str(), "output")],
+        &[pa.as_str(), pb.as_str()],
     )
     .await;
     let (status, applied) = crate::common::post_json_with_token(
@@ -352,7 +352,7 @@ async fn a_correction_cascades_is_recorded_and_is_reversible() {
         &admin,
         &site_id,
         "edit_group",
-        &[(pa.as_str(), "measured"), (pb.as_str(), "output")],
+        &[pa.as_str(), pb.as_str()],
     )
     .await;
     e2e::author_tool(

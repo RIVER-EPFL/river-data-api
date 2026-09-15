@@ -36,11 +36,7 @@ async fn seed_two_stage(db: &sea_orm::DatabaseConnection) -> (String, String, St
     .await;
 
     let mut ids = Vec::new();
-    for (code, role, ordinal) in [
-        ("Peak", "measured", 1),
-        ("S1", "output", 2),
-        ("S2", "output", 3),
-    ] {
+    for (code, ordinal) in [("Peak", 1), ("S1", 2), ("S2", 3)] {
         let id = uuid::Uuid::new_v4().to_string();
         crate::common::exec(
             db,
@@ -53,8 +49,8 @@ async fn seed_two_stage(db: &sea_orm::DatabaseConnection) -> (String, String, St
         crate::common::exec(
             db,
             &format!(
-                "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
-                 VALUES (gen_random_uuid(), '{GROUP_ID}', '{id}', '{role}', {ordinal})"
+                "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
+                 VALUES (gen_random_uuid(), '{GROUP_ID}', '{id}', {ordinal})"
             ),
         )
         .await;

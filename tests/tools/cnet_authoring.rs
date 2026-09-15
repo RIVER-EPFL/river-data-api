@@ -182,7 +182,6 @@ async fn author(
             let mut member = json!({
                 "group_id": group_id,
                 "parameter_id": id_of(&created),
-                "role": "measured",
                 "ordinal": ordinal as i32,
             });
             if let Some(n) = replicated.get(&code) {

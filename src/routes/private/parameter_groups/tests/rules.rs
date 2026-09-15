@@ -5,11 +5,10 @@ fn id(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
 
-fn member(group: u128, parameter: u128, role: Role) -> Member {
+fn member(group: u128, parameter: u128) -> Member {
     Member {
         group_id: id(group),
         parameter_id: id(parameter),
-        role,
     }
 }
 
@@ -24,7 +23,7 @@ fn dom_calculation() -> Calculation {
 
 #[test]
 fn test_may_add_refuses_a_parameter_another_group_holds() {
-    let members = [member(1, 10, Role::Measured)];
+    let members = [member(1, 10)];
     assert_eq!(
         may_add(id(10), &members),
         Err(Refusal::AlreadyGrouped { group_id: id(1) })
@@ -63,7 +62,7 @@ fn test_may_add_code_accepts_a_statistic_of_a_member_no_group_replicates() {
 
 #[test]
 fn test_may_move_refuses_an_output_its_group_produces() {
-    let output = member(1, 20, Role::Output);
+    let output = member(1, 20);
     assert_eq!(
         may_move(output, id(2), &[dom_calculation()]),
         Err(Refusal::ProducedHere {
@@ -74,34 +73,31 @@ fn test_may_move_refuses_an_output_its_group_produces() {
 
 #[test]
 fn test_may_move_allows_an_output_nothing_produces() {
-    let orphan = member(1, 21, Role::Output);
+    let orphan = member(1, 21);
     assert_eq!(may_move(orphan, id(2), &[dom_calculation()]), Ok(()));
 }
 
 #[test]
 fn test_may_move_allows_a_measured_member_a_calculation_reads() {
-    let input = member(1, 10, Role::Measured);
+    let input = member(1, 10);
     assert_eq!(may_move(input, id(2), &[dom_calculation()]), Ok(()));
 }
 
 #[test]
 fn test_may_move_within_the_group_is_a_reorder() {
-    let output = member(1, 20, Role::Output);
+    let output = member(1, 20);
     assert_eq!(may_move(output, id(1), &[dom_calculation()]), Ok(()));
 }
 
 #[test]
 fn test_may_move_ignores_a_calculation_in_another_group() {
-    let output = member(2, 20, Role::Output);
+    let output = member(2, 20);
     assert_eq!(may_move(output, id(3), &[dom_calculation()]), Ok(()));
 }
 
 #[test]
 fn test_may_delete_refuses_a_group_with_members() {
-    let members = [
-        member(1, 10, Role::Measured),
-        member(1, 11, Role::EntryOnly),
-    ];
+    let members = [member(1, 10), member(1, 11)];
     assert_eq!(
         may_delete(id(1), &members),
         Err(Refusal::GroupHasMembers { count: 2 })
@@ -110,7 +106,7 @@ fn test_may_delete_refuses_a_group_with_members() {
 
 #[test]
 fn test_may_delete_accepts_an_empty_group() {
-    let members = [member(2, 10, Role::Measured)];
+    let members = [member(2, 10)];
     assert_eq!(may_delete(id(1), &members), Ok(()));
     assert_eq!(may_delete(id(1), &[]), Ok(()));
 }

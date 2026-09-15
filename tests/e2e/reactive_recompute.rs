@@ -81,7 +81,7 @@ async fn a_value_landing_at_a_visit_runs_the_calculation_that_reads_it() {
         &admin,
         &site_id,
         "react_group",
-        &[(pa.as_str(), "measured"), (pb.as_str(), "output")],
+        &[pa.as_str(), pb.as_str()],
     )
     .await;
     e2e::author_tool(
@@ -348,7 +348,7 @@ async fn detach_edit_reengage_and_return_on_an_output_slot() {
         &admin,
         &site_id,
         "own_react_group",
-        &[(pa.as_str(), "measured"), (pb.as_str(), "output")],
+        &[pa.as_str(), pb.as_str()],
     )
     .await;
     e2e::author_tool(

@@ -481,8 +481,8 @@ async fn apply_reports_its_progress_over_the_plan_s_entries() {
 /// holds no parameter groups.
 ///
 /// Expected behaviour: the plan proposes the group, the apply creates it once for every column of
-/// that category and places each parameter in it at the position and role the registry gives,
-/// and a parameter an operator has already placed keeps the placement it has.
+/// that category and places each parameter in it at the position the registry gives, and a
+/// parameter an operator has already placed keeps the placement it has.
 #[tokio::test]
 #[serial]
 async fn apply_creates_the_group_the_source_registry_names() {
@@ -492,13 +492,12 @@ async fn apply_creates_the_group_the_source_registry_names() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    for (key, column, ordinal, role, calculation) in [
-        ("cat-a", "WTW_pH_1", 3, "measured", serde_json::Value::Null),
+    for (key, column, ordinal, calculation) in [
+        ("cat-a", "WTW_pH_1", 3, serde_json::Value::Null),
         (
             "cat-b",
             "Field_BP",
             8,
-            "output",
             serde_json::json!({ "function": "calcPCO2", "inputs": ["WTW_pH_1"] }),
         ),
     ] {
@@ -510,7 +509,6 @@ async fn apply_creates_the_group_the_source_registry_names() {
                 "column_name": column,
                 "category": "Field data",
                 "category_ordinal": ordinal,
-                "role": role,
                 "description": "from field sheet",
                 "source_calculation": calculation,
             },
@@ -575,7 +573,7 @@ async fn apply_creates_the_group_the_source_registry_names() {
     let rows = db
         .query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT p.code AS code, m.ordinal AS ordinal, m.role AS role, g.code AS group_code, \
+            "SELECT p.code AS code, m.ordinal AS ordinal, g.code AS group_code, \
                     m.source_calculation AS source_calculation \
              FROM parameter_group_members m \
              JOIN parameter_groups g ON g.id = m.group_id \
@@ -585,13 +583,12 @@ async fn apply_creates_the_group_the_source_registry_names() {
         ))
         .await
         .unwrap();
-    let placed: Vec<(String, i32, String, String)> = rows
+    let placed: Vec<(String, i32, String)> = rows
         .iter()
         .map(|row| {
             (
                 row.try_get::<String>("", "code").unwrap(),
                 row.try_get::<i32>("", "ordinal").unwrap(),
-                row.try_get::<String>("", "role").unwrap(),
                 row.try_get::<String>("", "group_code").unwrap(),
             )
         })
@@ -599,10 +596,10 @@ async fn apply_creates_the_group_the_source_registry_names() {
     assert_eq!(
         placed,
         vec![
-            ("WTW_pH_1".into(), 3, "measured".into(), "field_data".into()),
-            ("Field_BP".into(), 8, "output".into(), "field_data".into()),
+            ("WTW_pH_1".into(), 3, "field_data".into()),
+            ("Field_BP".into(), 8, "field_data".into()),
         ],
-        "both columns land in the one group, at the registry's positions and roles"
+        "both columns land in the one group, at the registry's positions"
     );
     let recorded: Vec<Option<serde_json::Value>> = rows
         .iter()
@@ -617,7 +614,7 @@ async fn apply_creates_the_group_the_source_registry_names() {
             None,
             Some(serde_json::json!({ "function": "calcPCO2", "inputs": ["WTW_pH_1"] })),
         ],
-        "the output member records what the source computed it with, the measured one nothing"
+        "the computed member records what the source computed it with, the entered one nothing"
     );
 
     let groups = db

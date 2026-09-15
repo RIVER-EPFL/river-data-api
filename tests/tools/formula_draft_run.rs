@@ -33,8 +33,8 @@ async fn seed_calculation(db: &DatabaseConnection) -> (String, String) {
              VALUES ('{peak_id}', 'Peak', 'Peak', 'ppb', 'measurement')"
         ),
         format!(
-            "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
-             VALUES (gen_random_uuid(), '{GROUP_ID}', '{peak_id}', 'measured', 1)"
+            "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
+             VALUES (gen_random_uuid(), '{GROUP_ID}', '{peak_id}', 1)"
         ),
         format!(
             "INSERT INTO tool_scripts (name, label, engine, parameter_group_id, created_by) \

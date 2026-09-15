@@ -112,15 +112,11 @@ pub mod member_model {
         pub parameter_id: Uuid,
         #[crudcrate(filterable, sortable, on_create = 0)]
         pub ordinal: i32,
-        /// `measured`, `entry_only` or `output`, held by a DB CHECK and by
-        /// [`super::rules::Role`].
-        #[crudcrate(filterable, sortable)]
-        pub role: String,
         /// The replicate spec for a member entered several times at one visit.
         pub replicates: Option<serde_json::Value>,
-        /// What the source computed an `output` member with: `{ function, inputs }`, the portal's
-        /// own calculation and the columns it reads. NULL where nothing computed the column, or
-        /// where the source declares no calculation.
+        /// What the source computed this member with: `{ function, inputs }`, the portal's own
+        /// calculation and the columns it reads. NULL where nothing computed the column, or where
+        /// the source declares no calculation.
         pub source_calculation: Option<serde_json::Value>,
         /// Per-group presentation overrides. NULL means the catalog parameter's own. Decimal places
         /// are not among them: they are declared per slot, never per group (Q120).
@@ -263,4 +259,3 @@ pub struct GroupDefinition {
     /// calculation declares none.
     pub sections: Vec<String>,
 }
-

@@ -333,13 +333,12 @@ fn test_apply_bulk_action_never_pairs_an_entry_with_no_slot() {
 /// Scenario: CNET declares on the descriptor for `CO2_HS_Um_avg` the portal function that writes
 /// it and the columns that function reads.
 /// Expected behaviour: the plan carries both, so the member row states what the portal computed
-/// and an output still waiting for a formula set is the one carrying nothing.
+/// and a column still waiting for a formula set is the one carrying nothing.
 #[test]
 fn test_plan_calculation_carries_the_declared_function_and_its_inputs() {
     let metadata = serde_json::json!({
         "parameter": {
             "column_name": "CO2_HS_Um_avg",
-            "role": "output",
             "source_calculation": {
                 "function": "calcPCO2",
                 "inputs": ["lab_co2_co2ppm", "WTW_Temp_degC_1", "Field_BP"],
@@ -363,7 +362,7 @@ fn test_plan_calculation_carries_the_declared_function_and_its_inputs() {
 #[test]
 fn test_plan_calculation_refuses_a_declaration_missing_either_half() {
     let cases = [
-        serde_json::json!({ "parameter": { "role": "measured" } }),
+        serde_json::json!({ "parameter": { "column_name": "WTW_pH_1" } }),
         serde_json::json!({ "parameter": { "source_calculation": null } }),
         serde_json::json!({ "parameter": { "source_calculation": { "inputs": ["a"] } } }),
         serde_json::json!({

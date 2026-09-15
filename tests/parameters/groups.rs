@@ -2,8 +2,8 @@
 //!
 //! The move and delete decisions themselves are unit-tested in
 //! `routes::private::parameter_groups::rules`; what only real SQL can show is the unique
-//! membership, the role CHECK, the history trigger firing on every writer, and the document the
-//! endpoint assembles from a group and the catalog.
+//! membership, the history trigger firing on every writer, and the document the endpoint
+//! assembles from a group and the catalog.
 
 use sea_orm::{ConnectionTrait, Statement};
 use serde_json::json;
@@ -34,7 +34,6 @@ async fn add_member(
     token: &str,
     group_id: &str,
     parameter_id: &str,
-    role: &str,
     ordinal: i32,
 ) -> (u16, String) {
     crate::common::post_json_with_token(
@@ -43,7 +42,6 @@ async fn add_member(
         &json!({
             "group_id": group_id,
             "parameter_id": parameter_id,
-            "role": role,
             "ordinal": ordinal,
         }),
         token,
@@ -73,15 +71,8 @@ async fn a_parameter_belongs_to_at_most_one_group() {
     let dom_id = dom["id"].as_str().unwrap();
     let ions_id = ions["id"].as_str().unwrap();
 
-    let (status, text) = add_member(
-        &app,
-        &token,
-        dom_id,
-        crate::common::GLOBAL_PARAM_TEMP_ID,
-        "measured",
-        0,
-    )
-    .await;
+    let (status, text) =
+        add_member(&app, &token, dom_id, crate::common::GLOBAL_PARAM_TEMP_ID, 0).await;
     assert!((200..300).contains(&status), "first add ({status}): {text}");
 
     let (status, text) = add_member(
@@ -89,7 +80,6 @@ async fn a_parameter_belongs_to_at_most_one_group() {
         &token,
         ions_id,
         crate::common::GLOBAL_PARAM_TEMP_ID,
-        "measured",
         0,
     )
     .await;
@@ -98,23 +88,6 @@ async fn a_parameter_belongs_to_at_most_one_group() {
         text.contains(dom_id),
         "the refusal names the group that holds it: {text}"
     );
-}
-
-#[tokio::test]
-#[serial]
-async fn a_role_outside_the_three_is_refused() {
-    let (_db, app, token) = setup().await;
-    let group = create_group(&app, &token, "dom").await;
-    let (status, text) = add_member(
-        &app,
-        &token,
-        group["id"].as_str().unwrap(),
-        crate::common::GLOBAL_PARAM_TEMP_ID,
-        "derived",
-        0,
-    )
-    .await;
-    assert_eq!(status, 400, "unknown role should be refused: {text}");
 }
 
 #[tokio::test]
@@ -128,7 +101,6 @@ async fn a_group_with_members_is_not_deleted() {
         &token,
         &group_id,
         crate::common::GLOBAL_PARAM_TEMP_ID,
-        "measured",
         0,
     )
     .await;
@@ -160,7 +132,6 @@ async fn every_change_appends_a_history_row() {
         &token,
         &group_id,
         crate::common::GLOBAL_PARAM_TEMP_ID,
-        "measured",
         0,
     )
     .await;
@@ -172,7 +143,7 @@ async fn every_change_appends_a_history_row() {
     let (status, text) = crate::common::put_json_with_token(
         &app,
         &format!("/api/parameter_group_members/{member_id}"),
-        &json!({ "role": "entry_only" }),
+        &json!({ "label": "Dissolved organic matter" }),
         &token,
     )
     .await;
@@ -181,7 +152,7 @@ async fn every_change_appends_a_history_row() {
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT change, old_value->>'role' AS old_role, new_value->>'role' AS new_role \
+            "SELECT change, old_value->>'label' AS old_label, new_value->>'label' AS new_label \
                FROM change_audit \
               WHERE subject = 'parameter_group:' || $1 AND change = 'member_update'",
             [group_id.as_str().into()],
@@ -189,10 +160,10 @@ async fn every_change_appends_a_history_row() {
         .await
         .expect("history query")
         .expect("an update row");
-    let old_role: Option<String> = row.try_get("", "old_role").unwrap();
-    let new_role: Option<String> = row.try_get("", "new_role").unwrap();
-    assert_eq!(old_role.as_deref(), Some("measured"));
-    assert_eq!(new_role.as_deref(), Some("entry_only"));
+    let old_label: Option<String> = row.try_get("", "old_label").unwrap();
+    let new_label: Option<String> = row.try_get("", "new_label").unwrap();
+    assert_eq!(old_label, None);
+    assert_eq!(new_label.as_deref(), Some("Dissolved organic matter"));
 }
 
 #[tokio::test]
@@ -207,7 +178,6 @@ async fn the_definition_document_is_the_group_in_its_own_order() {
         &token,
         &group_id,
         crate::common::GLOBAL_PARAM_DO_ID,
-        "output",
         2,
     )
     .await;
@@ -216,7 +186,6 @@ async fn the_definition_document_is_the_group_in_its_own_order() {
         &token,
         &group_id,
         crate::common::GLOBAL_PARAM_TEMP_ID,
-        "measured",
         1,
     )
     .await;
@@ -312,7 +281,6 @@ async fn the_document_carries_the_calculation_s_sections_without_reordering() {
         &token,
         &group_id,
         crate::common::GLOBAL_PARAM_DO_ID,
-        "measured",
         1,
     )
     .await;
@@ -321,7 +289,6 @@ async fn the_document_carries_the_calculation_s_sections_without_reordering() {
         &token,
         &group_id,
         crate::common::GLOBAL_PARAM_TEMP_ID,
-        "measured",
         2,
     )
     .await;
@@ -473,7 +440,6 @@ async fn a_measured_member_moves_and_the_readings_do_not() {
         &token,
         &dom_id,
         crate::common::GLOBAL_PARAM_TEMP_ID,
-        "measured",
         1,
     )
     .await;
@@ -533,7 +499,6 @@ async fn a_split_leaves_every_member_in_exactly_one_group() {
             &token,
             &whole_id,
             parameter,
-            "measured",
             i32::try_from(ordinal).expect("small"),
         )
         .await;
@@ -586,19 +551,10 @@ async fn an_output_member_cannot_leave_the_calculation_that_produces_it() {
         &token,
         &dom_id,
         crate::common::GLOBAL_PARAM_TEMP_ID,
-        "measured",
         1,
     )
     .await;
-    add_member(
-        &app,
-        &token,
-        &dom_id,
-        crate::common::GLOBAL_PARAM_DO_ID,
-        "output",
-        2,
-    )
-    .await;
+    add_member(&app, &token, &dom_id, crate::common::GLOBAL_PARAM_DO_ID, 2).await;
     seed_group_calculation(&db, &dom_id, "suva").await;
 
     let id = member_id(&db, &dom_id, crate::common::GLOBAL_PARAM_DO_ID).await;
@@ -652,4 +608,3 @@ async fn seed_group_calculation(db: &sea_orm::DatabaseConnection, group_id: &str
     )
     .await;
 }
-

@@ -2916,18 +2916,16 @@ pub struct PlanGroupRef {
     pub label: String,
     /// The member's position within the group.
     pub ordinal: i32,
-    /// `measured` | `entry_only` | `output`, as the source's calculations make it.
-    pub role: String,
     #[schema(required)]
     pub description: Option<String>,
     pub create: bool,
 }
 
-/// What the source computed an `output` column with: its own calculation function and the columns
-/// that function reads.
+/// What the source computed a column with: its own calculation function and the columns that
+/// function reads.
 ///
-/// The role says a column is computed; this says what computed it, which is the statement a
-/// formula set is authored against and the one an output still waiting for one is missing.
+/// It is the statement a formula set is authored against, and the one an output still waiting for
+/// one is missing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanCalculationRef {
     /// The source's own function name, verbatim (`calcPCO2`).
@@ -2964,11 +2962,6 @@ pub fn plan_group(metadata: &serde_json::Value) -> Option<PlanGroupRef> {
     if label.is_empty() {
         return None;
     }
-    let role = param
-        .get("role")
-        .and_then(|v| v.as_str())
-        .filter(|r| matches!(*r, "measured" | "entry_only" | "output"))
-        .unwrap_or("entry_only");
     Some(PlanGroupRef {
         id: None,
         code: group_code(label),
@@ -2978,7 +2971,6 @@ pub fn plan_group(metadata: &serde_json::Value) -> Option<PlanGroupRef> {
             .and_then(serde_json::Value::as_i64)
             .and_then(|o| i32::try_from(o).ok())
             .unwrap_or(0),
-        role: role.to_string(),
         description: param
             .get("description")
             .and_then(|v| v.as_str())
@@ -3950,7 +3942,6 @@ pub(super) async fn place_in_group<C: ConnectionTrait>(
         group_id: Set(group_id),
         parameter_id: Set(parameter_id),
         ordinal: Set(group.ordinal),
-        role: Set(group.role.clone()),
         description: Set(group.description.clone()),
         source_calculation: Set(source_calculation),
         ..Default::default()

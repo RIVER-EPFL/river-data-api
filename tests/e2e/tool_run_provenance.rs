@@ -328,7 +328,7 @@ async fn a_site_input_resolves_from_the_site_and_a_missing_property_is_refused()
         &admin,
         &track.site_id,
         "alt_echo_group",
-        &[(echo_param.as_str(), "output")],
+        &[echo_param.as_str()],
     )
     .await;
     crate::common::e2e::author_tool(
@@ -641,7 +641,7 @@ async fn a_run_cannot_be_saved_onto_another_visit() {
         &admin,
         &track.site_id,
         "ctx_echo_group",
-        &[(echo_param.as_str(), "output")],
+        &[echo_param.as_str()],
     )
     .await;
     let (status, applied) = crate::common::post_json_with_token(

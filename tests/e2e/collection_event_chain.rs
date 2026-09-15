@@ -80,12 +80,12 @@ async fn declare_chain_slots(
         ),
     )
     .await;
-    for (parameter, role, ordinal) in [(pa, "measured", 1), (pb, "output", 2), (pc, "output", 3)] {
+    for (parameter, ordinal) in [(pa, 1), (pb, 2), (pc, 3)] {
         crate::common::exec(
             db,
             &format!(
-                "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
-                 VALUES (gen_random_uuid(), '{group_id}', '{parameter}', '{role}', {ordinal})"
+                "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
+                 VALUES (gen_random_uuid(), '{group_id}', '{parameter}', {ordinal})"
             ),
         )
         .await;
@@ -115,8 +115,8 @@ async fn add_slot(
     crate::common::exec(
         db,
         &format!(
-            "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
-             VALUES (gen_random_uuid(), '{group_id}', '{parameter}', 'output', {ordinal})"
+            "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
+             VALUES (gen_random_uuid(), '{group_id}', '{parameter}', {ordinal})"
         ),
     )
     .await;

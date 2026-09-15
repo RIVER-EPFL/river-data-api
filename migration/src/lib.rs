@@ -11,6 +11,7 @@ mod m20260914_000007_meteoswiss_fetch_state;
 mod m20260914_000008_csv_import_chunks;
 mod m20260914_000009_meteoswiss_stations;
 mod m20260914_000010_shared_steps;
+mod m20260915_000001_drop_member_role;
 
 pub struct Migrator;
 
@@ -29,6 +30,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260914_000008_csv_import_chunks::Migration),
             Box::new(m20260914_000009_meteoswiss_stations::Migration),
             Box::new(m20260914_000010_shared_steps::Migration),
+            Box::new(m20260915_000001_drop_member_role::Migration),
         ]
     }
 }

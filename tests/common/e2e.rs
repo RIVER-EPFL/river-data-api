@@ -295,15 +295,15 @@ pub async fn assign_site_parameter_minimal(
 }
 
 /// The slots a site carries, declared the way the portal declares them: a parameter group holding
-/// each parameter in its role, applied to the site. A grab save refuses a parameter the site does
-/// not carry (Q98), so a story that saves tool output declares the outputs here first.
+/// each parameter, applied to the site. A grab save refuses a parameter the site does not carry
+/// (Q98), so a story that saves tool output declares the outputs here first.
 pub async fn declare_site_slots(
     db: &sea_orm::DatabaseConnection,
     app: &Router,
     token: &str,
     site_id: &str,
     code: &str,
-    members: &[(&str, &str)],
+    members: &[&str],
 ) -> String {
     let group_id = uuid::Uuid::new_v4().to_string();
     crate::common::exec(
@@ -314,12 +314,12 @@ pub async fn declare_site_slots(
         ),
     )
     .await;
-    for (ordinal, (parameter, role)) in members.iter().enumerate() {
+    for (ordinal, parameter) in members.iter().enumerate() {
         crate::common::exec(
             db,
             &format!(
-                "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
-                 VALUES (gen_random_uuid(), '{group_id}', '{parameter}', '{role}', {})",
+                "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
+                 VALUES (gen_random_uuid(), '{group_id}', '{parameter}', {})",
                 ordinal + 1
             ),
         )

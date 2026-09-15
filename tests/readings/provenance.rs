@@ -487,11 +487,7 @@ async fn seed_chain(
         crate::common::exec(db, &sql).await;
     }
     let mut ids = Vec::new();
-    for (code, role, ordinal) in [
-        ("Peak", "measured", 1),
-        ("S1", "output", 2),
-        ("S2", "output", 3),
-    ] {
+    for (code, ordinal) in [("Peak", 1), ("S1", 2), ("S2", 3)] {
         let id = uuid::Uuid::new_v4().to_string();
         for sql in [
             format!(
@@ -499,8 +495,8 @@ async fn seed_chain(
                  VALUES ('{id}', '{code}', '{code}', 'ppb', 'measurement')"
             ),
             format!(
-                "INSERT INTO parameter_group_members (id, group_id, parameter_id, role, ordinal) \
-                 VALUES (gen_random_uuid(), '{CHAIN_GROUP_ID}', '{id}', '{role}', {ordinal})"
+                "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
+                 VALUES (gen_random_uuid(), '{CHAIN_GROUP_ID}', '{id}', {ordinal})"
             ),
             format!(
                 "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active) \

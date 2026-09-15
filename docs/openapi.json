@@ -12813,9 +12813,6 @@
             "type": "string"
           },
           "replicates": {},
-          "role": {
-            "type": "string"
-          },
           "source_calculation": {},
           "units": {
             "type": [
@@ -12826,8 +12823,7 @@
         },
         "required": [
           "group_id",
-          "parameter_id",
-          "role"
+          "parameter_id"
         ],
         "type": "object"
       },
@@ -12869,12 +12865,8 @@
           "replicates": {
             "description": "The replicate spec for a member entered several times at one visit."
           },
-          "role": {
-            "description": "`measured`, `entry_only` or `output`, held by a DB CHECK and by\n[`super::rules::Role`].",
-            "type": "string"
-          },
           "source_calculation": {
-            "description": "What the source computed an `output` member with: `{ function, inputs }`, the portal's\nown calculation and the columns it reads. NULL where nothing computed the column, or\nwhere the source declares no calculation."
+            "description": "What the source computed this member with: `{ function, inputs }`, the portal's own\ncalculation and the columns it reads. NULL where nothing computed the column, or where\nthe source declares no calculation."
           },
           "units": {
             "type": [
@@ -12888,7 +12880,6 @@
           "group_id",
           "parameter_id",
           "ordinal",
-          "role",
           "replicates",
           "source_calculation",
           "label",
@@ -12936,12 +12927,8 @@
           "replicates": {
             "description": "The replicate spec for a member entered several times at one visit."
           },
-          "role": {
-            "description": "`measured`, `entry_only` or `output`, held by a DB CHECK and by\n[`super::rules::Role`].",
-            "type": "string"
-          },
           "source_calculation": {
-            "description": "What the source computed an `output` member with: `{ function, inputs }`, the portal's\nown calculation and the columns it reads. NULL where nothing computed the column, or\nwhere the source declares no calculation."
+            "description": "What the source computed this member with: `{ function, inputs }`, the portal's own\ncalculation and the columns it reads. NULL where nothing computed the column, or where\nthe source declares no calculation."
           },
           "units": {
             "type": [
@@ -12955,7 +12942,6 @@
           "group_id",
           "parameter_id",
           "ordinal",
-          "role",
           "replicates",
           "source_calculation",
           "label",
@@ -13001,12 +12987,6 @@
             ]
           },
           "replicates": {},
-          "role": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "source_calculation": {},
           "units": {
             "type": [
@@ -13594,7 +13574,7 @@
         "type": "array"
       },
       "PlanCalculationRef": {
-        "description": "What the source computed an `output` column with: its own calculation function and the columns\nthat function reads.\n\nThe role says a column is computed; this says what computed it, which is the statement a\nformula set is authored against and the one an output still waiting for one is missing.",
+        "description": "What the source computed a column with: its own calculation function and the columns that\nfunction reads.\n\nIt is the statement a formula set is authored against, and the one an output still waiting for\none is missing.",
         "properties": {
           "function": {
             "description": "The source's own function name, verbatim (`calcPCO2`).",
@@ -14120,10 +14100,6 @@
             "description": "The member's position within the group.",
             "format": "int32",
             "type": "integer"
-          },
-          "role": {
-            "description": "`measured` | `entry_only` | `output`, as the source's calculations make it.",
-            "type": "string"
           }
         },
         "required": [
@@ -14131,7 +14107,6 @@
           "code",
           "label",
           "ordinal",
-          "role",
           "description",
           "create"
         ],
@@ -35476,7 +35451,7 @@
     },
     "/api/parameter_group_members": {
       "get": {
-        "description": "Retrieves all parameter_group_members.\n\nThis resource manages parameter_group_member items\n\nAdditional sortable columns: \n- group_id\n- ordinal\n- role\n- created_at.\n\nAdditional filterable columns: \n- group_id\n- parameter_id\n- ordinal\n- role.",
+        "description": "Retrieves all parameter_group_members.\n\nThis resource manages parameter_group_member items\n\nAdditional sortable columns: \n- group_id\n- ordinal\n- created_at.\n\nAdditional filterable columns: \n- group_id\n- parameter_id\n- ordinal.",
         "operationId": "get_all_parameter_group_members",
         "parameters": [
           {
