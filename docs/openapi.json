@@ -18683,7 +18683,9 @@
         },
         "required": [
           "job_name",
-          "manual_run"
+          "manual_run",
+          "interval_seconds",
+          "enabled"
         ],
         "type": "object"
       },
@@ -23248,7 +23250,13 @@
         },
         "required": [
           "station_abbr",
-          "name"
+          "name",
+          "data_since",
+          "height_masl",
+          "height_barometer_masl",
+          "latitude",
+          "longitude",
+          "distance_km"
         ],
         "type": "object"
       },

@@ -391,6 +391,7 @@ fn entities() -> Vec<Entity> {
         },
         field_data("annotations", CrudScope::ProjectBound),
         catalog("constants", CrudScope::Global),
+        catalog("meteoswiss_subscriptions", CrudScope::Global),
         field_data("samples", CrudScope::ProjectBound),
         field_data("collection_events", CrudScope::Global),
         // A job is enqueued by the worker and driven by the rerun and cancel actions below; the
@@ -723,6 +724,8 @@ fn table() -> Table {
             ("GET", "/api/schedules"),
             ("GET", "/api/schedules/{job_name}"),
             ("GET", "/api/schedules/{job_name}/audit"),
+            ("GET", "/api/schedules/runnable"),
+            ("GET", "/api/meteoswiss/stations"),
         ],
     );
 

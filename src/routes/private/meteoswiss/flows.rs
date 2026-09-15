@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use super::models::{Fetched, Point, Subscriber};
 use super::service::{
-    advance_cursor, cursor, fetch, insert, instrument, latest, provision, recent_url, series,
-    stations, stations_url, store_stations, subscribers,
+    advance_cursor, archive_hrefs, cursor, fetch, insert, instrument, latest, provision,
+    recent_url, series, stac_item_url, stations, stations_url, store_stations, subscribers,
 };
 use crate::config::Config;
 use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport, Schedule};
@@ -54,19 +54,28 @@ fn http_client(timeout_seconds: u64) -> Result<reqwest::Client, DbErr> {
         .map_err(|e| DbErr::Custom(format!("Failed to build the MeteoSwiss client: {e}")))
 }
 
-/// Land the points a pass read for one subscription, from its stream's cursor forward.
+/// Which of a file's points a pass lands: what the stream has not seen, or the whole file, which is
+/// what a backfill reads because its points are older than the cursor by construction.
+#[derive(Clone, Copy, PartialEq)]
+enum Backlog {
+    FromCursor,
+    Everything,
+}
+
+/// Land the points a pass read for one subscription.
 async fn land(
     ctx: &JobContext,
     site: &Subscriber,
     station: &str,
     points: &[Point],
     landed: &mut Landed,
+    backlog: Backlog,
 ) -> Result<(), DbErr> {
     let stream_id = provision(ctx.db(), site, site.parameter_id).await?;
     let cursor = cursor(ctx.db(), stream_id).await?;
     let fresh: Vec<&Point> = points
         .iter()
-        .filter(|p| cursor.is_none_or(|c| p.time > c))
+        .filter(|p| backlog == Backlog::Everything || cursor.is_none_or(|c| p.time > c))
         .collect();
     if fresh.is_empty() {
         return Ok(());
@@ -249,6 +258,7 @@ impl Job for MeteoswissSync {
                         &station,
                         std::slice::from_ref(point),
                         &mut landed,
+                        Backlog::FromCursor,
                     )
                     .await?;
                 }
@@ -360,7 +370,15 @@ impl Job for MeteoswissRecent {
                 blank += series.blank;
                 unreadable += series.unreadable;
                 for site in sites {
-                    land(&ctx, &site, &station, &series.points, &mut landed).await?;
+                    land(
+                        &ctx,
+                        &site,
+                        &station,
+                        &series.points,
+                        &mut landed,
+                        Backlog::FromCursor,
+                    )
+                    .await?;
                 }
             }
         }
@@ -373,6 +391,142 @@ impl Job for MeteoswissRecent {
                 .count("stations_failed", stations_failed)
                 .count("stations_unchanged", unchanged)
                 .count("variables_failed", variables_failed)
+                .count("readings_inserted", landed.inserted)
+                .count("blank_cells", blank)
+                .count("unreadable_rows", unreadable),
+        )
+        .await;
+        Ok(i64::try_from(landed.inserted).unwrap_or(i64::MAX))
+    }
+}
+
+/// Read every archive a station publishes and land it under the same streams, so a subscription
+/// made today carries the history a correction of an old grab sample needs.
+///
+/// Enqueued once per (station, variable) when a site subscribes, and rerunnable: the inserts do
+/// nothing on conflict, so a second run re-reads the same files and writes only what is missing.
+pub struct MeteoswissBackfill {
+    stac_url: String,
+    timeout_seconds: u64,
+}
+
+impl MeteoswissBackfill {
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            stac_url: config.meteoswiss_stac_url.clone(),
+            timeout_seconds: config.meteoswiss_timeout_seconds,
+        }
+    }
+}
+
+#[async_trait]
+impl Job for MeteoswissBackfill {
+    fn name(&self) -> &'static str {
+        "meteoswiss_backfill"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let station = ctx
+            .params()
+            .get("station")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| DbErr::Custom("meteoswiss_backfill needs a station".to_string()))?
+            .to_uppercase();
+        let variable = ctx
+            .params()
+            .get("variable")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| DbErr::Custom("meteoswiss_backfill needs a variable".to_string()))?
+            .to_lowercase();
+
+        // Every site reading this station and variable takes the same files, so the archives are
+        // read once and landed at each.
+        let sites: Vec<Subscriber> = subscribers(ctx.db())
+            .await?
+            .into_iter()
+            .filter(|s| s.station == station && s.variable == variable)
+            .collect();
+        if sites.is_empty() {
+            ctx.report(JobReport::new().count("archives", 0usize)).await;
+            return Ok(0);
+        }
+
+        let client = http_client(self.timeout_seconds)?;
+        let item_url = stac_item_url(&self.stac_url, &station);
+        let item = match fetch(ctx.db(), &client, &item_url).await {
+            Ok(Fetched::Body(body)) => serde_json::from_str::<serde_json::Value>(&body)
+                .map_err(|e| DbErr::Custom(format!("{item_url}: {e}")))?,
+            // The item is unchanged since the last backfill of this station, and the archives it
+            // lists are read below on their own ETags.
+            Ok(Fetched::Unchanged) => serde_json::Value::Null,
+            Err(e) => return Err(DbErr::Custom(format!("MeteoSwiss station item: {e}"))),
+        };
+        let hrefs = archive_hrefs(&item).map_err(|e| DbErr::Custom(format!("{item_url}: {e}")))?;
+
+        let mut landed = Landed::default();
+        let mut archives_read = 0usize;
+        let mut archives_failed = 0usize;
+        let mut blank = 0usize;
+        let mut unreadable = 0usize;
+
+        for href in hrefs {
+            if ctx.is_cancelled() {
+                break;
+            }
+            let body = match fetch(ctx.db(), &client, &href).await {
+                Ok(Fetched::Body(body)) => body,
+                Ok(Fetched::Unchanged) => continue,
+                Err(e) => {
+                    archives_failed += 1;
+                    ctx.log(
+                        "warn",
+                        "Could not read a MeteoSwiss archive",
+                        serde_json::json!({ "url": href, "error": e }),
+                    )
+                    .await;
+                    continue;
+                }
+            };
+            let series = match series(&body, &variable) {
+                Ok(series) => series,
+                Err(e) => {
+                    archives_failed += 1;
+                    ctx.log(
+                        "warn",
+                        "Could not read a MeteoSwiss archive",
+                        serde_json::json!({ "url": href, "error": e }),
+                    )
+                    .await;
+                    continue;
+                }
+            };
+            archives_read += 1;
+            blank += series.blank;
+            unreadable += series.unreadable;
+            for site in &sites {
+                land(
+                    &ctx,
+                    site,
+                    &station,
+                    &series.points,
+                    &mut landed,
+                    Backlog::Everything,
+                )
+                .await?;
+            }
+            ctx.set_progress(i32::try_from(archives_read).unwrap_or(i32::MAX), None)
+                .await;
+        }
+
+        refresh(&ctx, &landed).await?;
+        ctx.report(
+            JobReport::new()
+                .scope("station", station.clone())
+                .scope("variable", variable.clone())
+                .scope_opt("since", landed.earliest.map(|t| t.to_rfc3339()))
+                .count("archives", archives_read)
+                .count("archives_failed", archives_failed)
                 .count("readings_inserted", landed.inserted)
                 .count("blank_cells", blank)
                 .count("unreadable_rows", unreadable),

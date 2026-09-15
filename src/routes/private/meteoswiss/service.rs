@@ -18,6 +18,7 @@ use uuid::Uuid;
 use super::models::{
     ExternalSource, Fetched, Point, Series, StationCandidate, StationRow, Subscriber, subscription,
 };
+use crate::routes::private::reprocessing_jobs::service as jobs;
 use crate::routes::private::{data_streams, parameters, readings, sensors, site_parameters};
 
 const SOURCE_SYSTEM: &str = "meteoswiss";
@@ -158,6 +159,39 @@ fn column(columns: &[&str], name: &str) -> Result<usize, String> {
         .iter()
         .position(|c| c.eq_ignore_ascii_case(name))
         .ok_or_else(|| format!("column {name:?} is not in the header"))
+}
+
+/// The STAC item describing one station: what the collection publishes for it, as hrefs.
+#[must_use]
+pub fn stac_item_url(base: &str, station_abbr: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        station_abbr.trim().to_lowercase()
+    )
+}
+
+/// The archives a station's STAC item lists at the ten-minute resolution, oldest decade first,
+/// with the recent file last. Anything else the collection publishes (daily, hourly, monthly and
+/// yearly aggregates, and the `_t_now` file the ten-minute pass already covers) is not history.
+pub fn archive_hrefs(item: &serde_json::Value) -> Result<Vec<String>, String> {
+    let assets = item
+        .get("assets")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("the STAC item lists no assets")?;
+    let mut hrefs: Vec<(String, String)> = assets
+        .iter()
+        .filter(|(key, _)| key.contains("_t_historical_") || key.ends_with("_t_recent.csv"))
+        .filter_map(|(key, asset)| {
+            asset
+                .get("href")
+                .and_then(serde_json::Value::as_str)
+                .map(|href| (key.clone(), href.to_string()))
+        })
+        .collect();
+    // `_t_recent` sorts after every decade, so the pass reads oldest to newest.
+    hrefs.sort();
+    Ok(hrefs.into_iter().map(|(_, href)| href).collect())
 }
 
 /// The published path for one station's recent file, under the OGD collection base URL.
@@ -723,11 +757,13 @@ impl crudcrate::CRUDOperations for MeteoswissSubscriptionOperations {
         let parameter_id = catalog_parameter(db, declared).await?;
         let mut active: super::models::subscription::ActiveModel = data.into();
         active.parameter_id = Set(parameter_id);
-        active
+        let subscription = active
             .insert(db)
             .await
             .map(Self::Resource::from)
-            .map_err(crudcrate::ApiError::database)
+            .map_err(crudcrate::ApiError::database)?;
+        enqueue_backfill(db, &subscription.station_abbr, &subscription.variable).await?;
+        Ok(subscription)
     }
 
     async fn before_update<C: ConnectionTrait + sea_orm::TransactionTrait>(
@@ -764,6 +800,31 @@ impl crudcrate::CRUDOperations for MeteoswissSubscriptionOperations {
         entity.parameter_id = parameter_id;
         Ok(())
     }
+}
+
+/// The history a subscription needs, once per station and variable however many sites read it.
+///
+/// The recurring pass starts at the stream's cursor, so a subscription made today would otherwise
+/// begin today and a grab sample from 2018 would have no pressure at its instant for ever.
+async fn enqueue_backfill<C: ConnectionTrait>(
+    db: &C,
+    station: &str,
+    variable: &str,
+) -> Result<(), crudcrate::ApiError> {
+    let station = station.trim().to_uppercase();
+    let variable = variable.trim().to_lowercase();
+    let key = format!("meteoswiss_backfill:{station}:{variable}");
+    jobs::enqueue(
+        db,
+        "meteoswiss_backfill",
+        None,
+        None,
+        &serde_json::json!({ "station": station, "variable": variable }),
+        Some(&key),
+    )
+    .await
+    .map_err(crudcrate::ApiError::database)?;
+    Ok(())
 }
 
 /// The declaration for a subscribed variable, as a refusal where the feed publishes no such thing.

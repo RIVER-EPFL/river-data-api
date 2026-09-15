@@ -911,3 +911,88 @@ async fn a_constant_value_edit_queues_one_audit_naming_it() {
         "the pending audit already covers this constant"
     );
 }
+
+/// Scenario: a field day's block is pasted into the batch grid and saved. Each station is staged
+/// and written on its own, so a station the API refuses reports why and the stations already
+/// written stay written (M51).
+///
+/// Expected behaviour: the first station's visit holds its reading; the second is refused naming
+/// the parameter its site does not configure, and nothing of it is stored.
+#[tokio::test]
+#[serial]
+async fn a_refused_station_leaves_the_stations_already_saved_alone() {
+    let (db, app, token) = setup().await;
+    let site2 = crate::common::SITE2_ID;
+
+    for site in [SITE1_ID, site2] {
+        let (status, body) = crate::common::post_json_with_token(
+            &app,
+            "/api/collection_events/stage",
+            &json!({ "site_id": site, "collected_at": T1 }),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+    }
+
+    let save = |site: &'static str| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            crate::common::post_json_with_token(
+                &app,
+                "/api/grab_samples",
+                &json!({
+                    "site_id": site,
+                    "mode": "replace",
+                    "readings": [{
+                        "parameter_id": crate::common::GLOBAL_PARAM_DEPTH_ID,
+                        "value": 1.5,
+                        "time": T1,
+                        "replicate_index": 0,
+                    }],
+                }),
+                &token,
+            )
+            .await
+        }
+    };
+
+    let (status, body) = save(SITE1_ID).await;
+    assert_eq!(status, 200, "{body}");
+
+    // The downstream station carries no Depth slot, so its row of the block is refused.
+    let (status, body) = save(site2).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.contains("not configured for site"),
+        "the refusal names what the site does not carry: {body}"
+    );
+
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM readings \
+                 WHERE site_id = '{SITE1_ID}' AND parameter_id = '{depth}' AND time = '{T1}'",
+                depth = crate::common::GLOBAL_PARAM_DEPTH_ID,
+            ),
+        )
+        .await,
+        1,
+        "the station saved before the refusal keeps its reading"
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM readings \
+                 WHERE site_id = '{site2}' AND parameter_id = '{depth}' AND time = '{T1}'",
+                depth = crate::common::GLOBAL_PARAM_DEPTH_ID,
+            ),
+        )
+        .await,
+        0,
+        "the refused station stored nothing"
+    );
+}

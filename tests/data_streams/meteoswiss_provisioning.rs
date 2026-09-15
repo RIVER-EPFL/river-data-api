@@ -512,3 +512,50 @@ async fn the_station_search_matches_an_abbreviation_or_a_name_in_any_case() {
     assert_eq!(search_stations(&db, None).await.unwrap().len(), 2);
     assert_eq!(search_stations(&db, Some("  ")).await.unwrap().len(), 2);
 }
+
+/// Scenario: two sites subscribe to the same station and variable.
+/// Expected behaviour: the history is read once, not once per site, and the job that reads it is
+/// queued by the subscription rather than waited for.
+#[tokio::test]
+#[serial]
+async fn subscribing_queues_one_history_backfill_per_station_and_variable() {
+    use crudcrate::CRUDOperations;
+    use river_db::routes::private::meteoswiss::models::subscription::MeteoswissSubscriptionCreate;
+    use river_db::routes::private::meteoswiss::service::MeteoswissSubscriptionOperations;
+
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+
+    for site_id in [
+        crate::common::fixtures::SITE1_ID,
+        crate::common::fixtures::SITE2_ID,
+    ] {
+        MeteoswissSubscriptionOperations
+            .perform_create(
+                &db,
+                MeteoswissSubscriptionCreate {
+                    site_id: Uuid::parse_str(site_id).unwrap(),
+                    station_abbr: STATION.to_string(),
+                    variable: VARIABLE.to_string(),
+                    enabled: Some(true),
+                },
+            )
+            .await
+            .expect("subscribe the site");
+    }
+
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT count(*) AS n FROM reprocessing_jobs \
+                  WHERE trigger_type = 'meteoswiss_backfill' \
+                    AND dedupe_key = 'meteoswiss_backfill:{STATION}:{VARIABLE}'"
+            ),
+        )
+        .await,
+        1,
+        "one run reads the archives every site subscribed to them shares"
+    );
+}

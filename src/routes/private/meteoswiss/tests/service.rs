@@ -1,6 +1,7 @@
 use super::{
-    ATTRIBUTION, VARIABLES, attributions, distance_km, insert_chunk, latest, latin1, rank_stations,
-    recent_url, require_declared, series, stations, stations_url, variable,
+    ATTRIBUTION, VARIABLES, archive_hrefs, attributions, distance_km, insert_chunk, latest, latin1,
+    rank_stations, recent_url, require_declared, series, stac_item_url, stations, stations_url,
+    variable,
 };
 use crate::routes::private::meteoswiss::models::{Point, station, subscription};
 use chrono::{TimeZone, Utc};
@@ -368,4 +369,68 @@ fn test_a_candidate_carries_both_elevations() {
     let ranked = rank_stations(vec![listed("SIO", "Sion", Some(SIO))], None);
     assert_eq!(ranked[0].height_masl, Some(500.0));
     assert_eq!(ranked[0].height_barometer_masl, Some(501.0));
+}
+
+/// The assets a station's STAC item lists, as published: the ten-minute archives are named by
+/// decade, and the collection publishes daily, hourly, monthly and yearly files beside them.
+fn stac_item() -> serde_json::Value {
+    let asset = |name: &str| {
+        (
+            name.to_string(),
+            serde_json::json!({
+                "href": format!("https://data.geo.admin.ch/ch.meteoschweiz.ogd-smn/mob/{name}")
+            }),
+        )
+    };
+    serde_json::json!({
+        "id": "mob",
+        "assets": serde_json::Value::Object(
+            [
+                asset("ogd-smn_mob_t_recent.csv"),
+                asset("ogd-smn_mob_t_historical_2020-2029.csv"),
+                asset("ogd-smn_mob_t_historical_2010-2019.csv"),
+                asset("ogd-smn_mob_t_now.csv"),
+                asset("ogd-smn_mob_d_historical.csv"),
+                asset("ogd-smn_mob_h_historical_2010-2019.csv"),
+                asset("ogd-smn_mob_m.csv"),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    })
+}
+
+#[test]
+fn test_stac_item_url_names_the_station_the_way_the_collection_does() {
+    assert_eq!(
+        stac_item_url(
+            "https://data.geo.admin.ch/api/stac/v1/collections/x/items/",
+            " MOB "
+        ),
+        "https://data.geo.admin.ch/api/stac/v1/collections/x/items/mob"
+    );
+}
+
+#[test]
+fn test_archive_hrefs_are_the_ten_minute_files_oldest_first() {
+    let hrefs = archive_hrefs(&stac_item()).expect("the item lists assets");
+    let names: Vec<&str> = hrefs
+        .iter()
+        .map(|href| href.rsplit('/').next().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "ogd-smn_mob_t_historical_2010-2019.csv",
+            "ogd-smn_mob_t_historical_2020-2029.csv",
+            "ogd-smn_mob_t_recent.csv",
+        ],
+        "the hourly, daily, monthly and _t_now files are not history"
+    );
+}
+
+#[test]
+fn test_archive_hrefs_refuses_an_item_with_no_assets() {
+    let refusal = archive_hrefs(&serde_json::Value::Null).expect_err("nothing to read");
+    assert!(str::contains(&refusal, "assets"), "{refusal}");
 }

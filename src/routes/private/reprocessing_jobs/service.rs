@@ -66,6 +66,7 @@ pub const MAINTENANCE: &[&str] = &[
     "alarm_backfill",
     "meteoswiss_sync",
     "meteoswiss_recent",
+    "meteoswiss_backfill",
 ];
 
 /// Triggered by a configuration change rather than by a person.
@@ -183,8 +184,10 @@ pub struct RunnableJob {
     pub job_name: String,
     pub manual_run: ManualRun,
     /// Absent where the kind has no schedule at all, which the page reads as on demand.
+    #[schema(required)]
     pub interval_seconds: Option<i64>,
     /// Whether the cadence is switched on, where it has one.
+    #[schema(required)]
     pub enabled: Option<bool>,
 }
 
@@ -350,6 +353,7 @@ pub const CANCELLABLE: &[&str] = &[
     "event_recompute",
     "meteoswiss_sync",
     "meteoswiss_recent",
+    "meteoswiss_backfill",
 ];
 
 /// The recurring services [`register_scheduled_services`] adds. They carry a cadence
@@ -740,6 +744,11 @@ pub fn register_scheduled_services(registry: &mut JobRegistry, config: &crate::c
     ));
     registry.register(Arc::new(
         crate::routes::private::meteoswiss::flows::MeteoswissRecent::from_config(config),
+    ));
+    // Not recurring: one run per (station, variable), enqueued when a site subscribes. It carries
+    // the collection's URLs from `Config`, which is why it is registered here.
+    registry.register(Arc::new(
+        crate::routes::private::meteoswiss::flows::MeteoswissBackfill::from_config(config),
     ));
 
     // The policy tables in `registry` are keyed by trigger_type and cannot construct these, so the

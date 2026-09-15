@@ -100,6 +100,8 @@ pub struct Config {
     pub meteoswiss_base_url: String,
     /// The all-stations latest-values file, republished every ten minutes.
     pub meteoswiss_latest_url: String,
+    /// The STAC items of the SMN collection, one per station, listing its published archives.
+    pub meteoswiss_stac_url: String,
     pub meteoswiss_interval_seconds: u64,
     pub meteoswiss_recent_interval_seconds: u64,
     pub meteoswiss_timeout_seconds: u64,
@@ -205,6 +207,7 @@ impl Config {
             tools_runner_timeout_seconds: 60,
             meteoswiss_base_url: String::new(),
             meteoswiss_latest_url: String::new(),
+            meteoswiss_stac_url: String::new(),
             meteoswiss_interval_seconds: 600,
             meteoswiss_recent_interval_seconds: 86_400,
             meteoswiss_timeout_seconds: 30,
@@ -356,6 +359,12 @@ impl Config {
                 "METEOSWISS_LATEST_URL",
                 "https://data.geo.admin.ch/ch.meteoschweiz.messwerte-aktuell/VQHA80.csv",
             ),
+            meteoswiss_stac_url: string_or(
+                "METEOSWISS_STAC_URL",
+                "https://data.geo.admin.ch/api/stac/v1/collections/ch.meteoschweiz.ogd-smn/items",
+            )
+            .trim_end_matches('/')
+            .to_string(),
             meteoswiss_interval_seconds: parse_or("METEOSWISS_INTERVAL_SECONDS", 600),
             meteoswiss_recent_interval_seconds: parse_or(
                 "METEOSWISS_RECENT_INTERVAL_SECONDS",

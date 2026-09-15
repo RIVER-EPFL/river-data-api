@@ -124,14 +124,20 @@ pub struct StationRow {
 pub struct StationCandidate {
     pub station_abbr: String,
     pub name: String,
+    #[schema(required)]
     pub data_since: Option<chrono::NaiveDate>,
     /// The station's own elevation, which every published station carries.
+    #[schema(required)]
     pub height_masl: Option<f64>,
     /// The elevation the barometer sits at, which a station reporting no pressure leaves empty.
+    #[schema(required)]
     pub height_barometer_masl: Option<f64>,
+    #[schema(required)]
     pub latitude: Option<f64>,
+    #[schema(required)]
     pub longitude: Option<f64>,
     /// Great-circle distance from the site, absent where either end has no coordinates.
+    #[schema(required)]
     pub distance_km: Option<f64>,
 }
 

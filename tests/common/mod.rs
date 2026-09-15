@@ -157,6 +157,7 @@ pub fn test_config() -> Config {
         deployment: river_db::config::Deployment::Local,
         meteoswiss_base_url: "http://127.0.0.1:1/ogd-smn".to_string(),
         meteoswiss_latest_url: "http://127.0.0.1:1/messwerte-aktuell/VQHA80.csv".to_string(),
+        meteoswiss_stac_url: "http://127.0.0.1:1/stac/items".to_string(),
         meteoswiss_interval_seconds: 600,
         meteoswiss_recent_interval_seconds: 86_400,
         meteoswiss_timeout_seconds: 1,
