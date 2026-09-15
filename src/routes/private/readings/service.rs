@@ -4465,6 +4465,24 @@ pub async fn decide<C: ConnectionTrait>(
             )
             .await?;
         }
+        // The decision trigger nulls `calibrated_value` for every correction naming `raw_value`,
+        // so the accepted rows are put back through the curves they name here, in the transaction
+        // that moved them. Left to the janitor's drift sweep, the uncorrected raw number is served
+        // in the meantime and the move is recorded as a curve drift rather than as this decision.
+        if !pending.is_empty() {
+            let mut stream_ids: Vec<Uuid> = pending.iter().map(|p| p.stream_id).collect();
+            stream_ids.sort_unstable();
+            stream_ids.dedup();
+            let first = pending.iter().map(|p| p.time).min().expect("non-empty");
+            let last = pending.iter().map(|p| p.time).max().expect("non-empty");
+            crate::routes::private::sensor_calibrations::service::recompose_from_own_curves(
+                conn,
+                Expr::cust("TRUE"),
+                "r.stream_id = ANY($1) AND r.time >= $2 AND r.time <= $3",
+                vec![stream_ids.into(), first.into(), last.into()],
+            )
+            .await?;
+        }
         response.accepted = pending.len();
     } else {
         response.rejected = pending.len();

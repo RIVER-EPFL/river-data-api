@@ -156,3 +156,109 @@ async fn a_granted_manager_decides_their_own_projects_proposals_and_no_others() 
 
     crate::common::cleanup_test_db(&db).await;
 }
+
+/// Scenario: a grab reading corrected by a hand-picked standard curve; the source changes the raw
+/// value, the diff proposes it, and a manager accepts.
+///
+/// Expected behaviour: the served value is the new raw number put back through the curve the row
+/// names. The decision trigger nulls `calibrated_value` whenever a correction names `raw_value`, so
+/// an accept that does not recompose leaves the uncorrected raw number being served until the next
+/// janitor sweep, which then records the move as a curve drift rather than as this decision.
+#[tokio::test]
+#[serial]
+async fn accepting_a_correction_reapplies_the_curve_the_reading_names() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let sensor = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sensors (id, name, is_active, source_system, source_key) \
+             VALUES ('{sensor}', 'Curve instrument', true, 'curvesrc', 'curvesrc:1')"
+        ),
+    )
+    .await;
+    // value = 2 * raw + 1
+    let curve = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO standard_curves (id, sensor_id, name, slope, intercept) \
+             VALUES ('{curve}', '{sensor}', 'Lab curve', 2.0, 1.0)"
+        ),
+    )
+    .await;
+
+    let stream = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, site_parameter_id, sensor_id, is_active) \
+             VALUES ('{stream}', 'curvesrc', 'curve-key', '{PARAM_S1_TEMP_ID}', '{sensor}', true)"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO readings \
+                 (stream_id, time, replicate_index, raw_value, calibrated_value, site_id, \
+                  parameter_id, sensor_id, standard_curve_id, measurement_type) \
+             VALUES ('{stream}', '{AT}', 0, 10.0, 21.0, \
+                     (SELECT site_id FROM site_parameters WHERE id = '{PARAM_S1_TEMP_ID}'), \
+                     '{GLOBAL_PARAM_TEMP_ID}', '{sensor}', '{curve}', 'spot')"
+        ),
+    )
+    .await;
+
+    let proposal = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reading_change_proposals \
+                 (id, stream_id, time, replicate_index, proposed_raw_value, stored_raw_value, \
+                  proposed_standard_curve_id, stored_standard_curve_id) \
+             VALUES ('{proposal}', '{stream}', '{AT}', 0, 11.5, 10.0, '{curve}', '{curve}')"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/sync/change_proposals/decide",
+        &json!({ "ids": [proposal], "decision": "accept" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "accept ({status}): {body}");
+    assert_eq!(status_of(&db, proposal).await, "accepted");
+
+    let row = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT raw_value, calibrated_value FROM readings \
+                 WHERE stream_id = '{stream}' AND time = '{AT}' AND replicate_index = 0"
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the reading");
+    let raw: f64 = row.try_get("", "raw_value").unwrap();
+    let calibrated: Option<f64> = row.try_get("", "calibrated_value").unwrap();
+    assert!((raw - 11.5).abs() < 1e-9, "the correction is the new raw: {raw}");
+    // 2 * 11.5 + 1
+    assert_eq!(
+        calibrated,
+        Some(24.0),
+        "the served value is the correction put back through the row's own curve"
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}
