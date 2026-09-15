@@ -184,6 +184,50 @@ fn test_two_steps_reading_each_other_are_a_cycle() {
     assert!(err.contains("aa") && err.contains("bb"), "{err}");
 }
 
+/// Scenario: nutrients, `NUT_NO3_avg = NUT_NOx_avg - NUT_NO2_avg`, walked at the same letter.
+/// Expected behaviour: the group's declaration is what makes the second source the family. Without
+/// it the source is a number, which resolves to the mean and averages the family away.
+#[test]
+fn test_a_second_family_is_the_family_only_where_the_group_declares_it() {
+    let nutrients = vec![per_replicate(
+        "NUT_NO3_avg",
+        0,
+        "NUT_NOx_avg - NUT_NO2_avg",
+        Some("NUT_NO3_avg"),
+        &[("NUT_NOx_avg", "NUT_NOx_avg"), ("NUT_NO2_avg", "NUT_NO2_avg")],
+        "NUT_NOx_avg",
+    )];
+    let kind_of = |manifest: &serde_json::Value, name: &str| {
+        manifest["params"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is declared"))["kind"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let declared = manifest_json(
+        "Nutrients",
+        None,
+        &nutrients,
+        &["NUT_NOx_avg".to_string(), "NUT_NO2_avg".to_string()],
+    )
+    .expect("the set has an order");
+    assert_eq!(kind_of(&declared, "NUT_NOx_avg"), "replicates");
+    assert_eq!(kind_of(&declared, "NUT_NO2_avg"), "replicates");
+    assert!(
+        declared["event_inputs"].as_array().unwrap().is_empty(),
+        "a family is not an event input as well: {declared:?}"
+    );
+
+    let undeclared = manifest_json("Nutrients", None, &nutrients, &["NUT_NOx_avg".to_string()])
+        .expect("the set has an order");
+    assert_eq!(kind_of(&undeclared, "NUT_NO2_avg"), "number");
+}
+
 #[test]
 fn test_a_produced_value_is_not_declared_an_event_input_whatever_the_codes_sort_to() {
     let manifest = manifest_json("Carbonate", None, &shared_ordinal_chain(), &[])
