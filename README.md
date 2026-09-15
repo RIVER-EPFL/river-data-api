@@ -52,6 +52,11 @@ Migrations run on startup. The API is at `http://localhost:3000` and its documen
 - Migrations are a workspace member (`migration/`), applied on startup and runnable by hand
   with `cargo run -p migration -- up`
 
+After a baseline flatten, rebuild an existing dev database. Back up anything to preserve
+for `restore_cutover` first, then run `docker compose down -v && docker compose up -d`
+from `river-data-ui`. This deletes the compose volumes; sync restores stream registrations
+and staged readings. Startup refuses recorded migrations absent from the checkout.
+
 ## Data model
 
 The path a measurement takes, generated from the migrated database:

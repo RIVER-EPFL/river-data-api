@@ -107,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .execute_unprepared("SELECT pg_advisory_unlock(8526340921)")
         .await;
     lock_db.close().await?;
-    migrate_result?;
+    migrate_result.map_err(migration::startup_error)?;
     tracing::info!("Migrations completed");
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
