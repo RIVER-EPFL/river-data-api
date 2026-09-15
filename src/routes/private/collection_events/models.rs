@@ -112,6 +112,10 @@ pub struct EventRecomputeRequest {
     /// Only visits with an open missing- or stale-output finding.
     #[serde(default)]
     pub only_findings: bool,
+    /// Hold the findings to the ones one calculation raised. A narrowing, so it needs a scope
+    /// beside it.
+    #[serde(default)]
+    pub calculation: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

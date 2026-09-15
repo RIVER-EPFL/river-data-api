@@ -225,6 +225,9 @@ pub async fn run(state: &AppState, channels: &[Box<dyn NotificationChannel>]) {
     if let Err(e) = derived_computed(state, channels).await {
         tracing::warn!(error = %e, "derived-computed trigger failed");
     }
+    if let Err(e) = steps_skipped(state, channels).await {
+        tracing::warn!(error = %e, "skipped-step trigger failed");
+    }
     if let Err(e) = operational_digests(state, channels).await {
         tracing::warn!(error = %e, "operational-digest trigger failed");
     }
@@ -919,6 +922,41 @@ async fn derived_computed(
              the formula version it was made with, on the reading."
         ),
         // The fill spans every slot with a gap, so it carries no single scope.
+        slot: None,
+    };
+    let _ = deliver(state, channels, &msg, None).await;
+    Ok(())
+}
+
+/// Calculation steps the chain could not run, counted from the `event_recompute` runs that raised
+/// them (Q108). Each skip is a `skipped_output` finding in the review queue, and the queue is only
+/// found by people who already know it exists, so the run says so when it happens rather than
+/// waiting for the backlog digest.
+async fn steps_skipped(
+    state: &AppState,
+    channels: &[Box<dyn NotificationChannel>],
+) -> Result<(), DbErr> {
+    let db = &state.db;
+    let since = state_get(db, "steps_skipped", "all")
+        .await?
+        .map(|(_, at)| at)
+        .unwrap_or_else(|| Utc::now() - Duration::hours(CURVE_DRIFT_WINDOW_HOURS));
+    let raised = job_total_since(db, "event_recompute", Some("findings_raised"), since).await?;
+    if raised == 0 {
+        state_clear(db, "steps_skipped", "all").await?;
+        return Ok(());
+    }
+    if !claim_cas(db, "steps_skipped", "all", since).await? {
+        return Ok(());
+    }
+    let msg = OutgoingMessage {
+        kind: "steps_skipped",
+        subject: format!("RIVER Data: {raised} calculation step(s) skipped"),
+        body: format!(
+            "⚠️ {raised} calculation step(s) did not run at a visit, so their outputs are absent. \
+             Each one is a finding under Data Streams, Audits, naming the step and why it stopped."
+        ),
+        // The runs span every visit the scope covered, so the alert carries no single slot.
         slot: None,
     };
     let _ = deliver(state, channels, &msg, None).await;

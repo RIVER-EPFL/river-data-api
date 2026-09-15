@@ -60,6 +60,21 @@ impl CRUDOperations for CollectionEventOperations {
     }
 }
 
+/// The `source` a visit the sync created carries.
+pub const PORTAL_SYNC: &str = "portal_sync";
+
+/// Whether a calculation may run at a visit with this source (Q41): a visit the sync created is
+/// the portal's to recompute for as long as the two run side by side, and a correction there
+/// belongs in the portal.
+///
+/// Every door into the chain asks this one function: the enqueue a write goes through, the SELECT
+/// a scoped apply walks, and the per-visit route. A door that decides for itself is how the
+/// boundary came to hold on two of the three.
+#[must_use]
+pub fn chain_may_run(source: &str) -> bool {
+    source != PORTAL_SYNC
+}
+
 /// How the event came to exist, decided by the writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventSource {
@@ -81,9 +96,9 @@ impl EventSource {
     fn sql(self) -> String {
         match self {
             Self::Manual => "'manual'".to_string(),
-            Self::PortalSync => "'portal_sync'".to_string(),
+            Self::PortalSync => format!("'{PORTAL_SYNC}'"),
             Self::ByStreamOrigin => format!(
-                "CASE WHEN {} THEN 'portal_sync' ELSE 'manual' END",
+                "CASE WHEN {} THEN '{PORTAL_SYNC}' ELSE 'manual' END",
                 any_sync_origin_sql()
             ),
         }

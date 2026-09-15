@@ -1540,7 +1540,9 @@ pub async fn insert_batch_readings(
     let calculations = {
         let mut touched: Vec<Uuid> = touched_events
             .iter()
-            .filter(|e| e.source != "portal_sync")
+            .filter(|e| {
+                crate::routes::private::collection_events::service::chain_may_run(&e.source)
+            })
             .flat_map(|e| e.parameter_ids.iter().copied())
             .collect();
         touched.sort_unstable();

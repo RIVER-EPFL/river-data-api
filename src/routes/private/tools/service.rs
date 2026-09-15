@@ -4,7 +4,7 @@
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::sea_query::{Alias, Expr, Func, JoinType, Order, PostgresQueryBuilder, Query};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
     FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use sea_orm_migration::sea_orm::DbErr;
@@ -22,13 +22,13 @@ use super::models::script::{self, ToolScript};
 use super::models::version as version_entity;
 use super::models::version::{ToolScriptVersion, ToolScriptVersionList};
 use super::models::{
-    ActiveTool, CalculationImpact, CaseResult, CatalogFindings, ClosureQuery, Curve, CurveSnapshot,
-    Engine, Evaluated, ImpactParameter, LintFinding, Manifest, ManifestCurve, ManifestEventInput,
-    ManifestOutput, ManifestParam, ManifestSiteInput, MissingConstant, ParamWhen, ParseCheck,
-    ParseError, PinnedFormula, Produced, ResolvedBy, ResolvedCurve, ResolvedParameter, RunOutcome,
-    RunnerRuntime, ScannedName, ScriptInspection, ScriptScan, SlotCoverage, StoredVersionContent,
-    Subject, ToolScriptOperations, TraceCell, TraceStep, ValidateResponse, kind_accepts,
-    parse_manifest,
+    ActiveTool, CalculationHealth, CalculationImpact, CaseResult, CatalogFindings, ClosureQuery,
+    Curve, CurveSnapshot, Engine, Evaluated, ImpactParameter, LintFinding, Manifest, ManifestCurve,
+    ManifestEventInput, ManifestOutput, ManifestParam, ManifestSiteInput, MissingConstant,
+    ParamWhen, ParseCheck, ParseError, PinnedFormula, Produced, ResolvedBy, ResolvedCurve,
+    ResolvedParameter, RunOutcome, RunnerRuntime, ScannedName, ScriptInspection, ScriptScan,
+    SlotCoverage, StoredVersionContent, Subject, ToolScriptOperations, TraceCell, TraceStep,
+    ValidateResponse, kind_accepts, parse_manifest,
 };
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
@@ -40,6 +40,8 @@ use crate::routes::private::sensor_calibrations::service::evaluate_formula;
 use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::sites::models as sites;
 use crate::routes::private::standard_curves::models as standard_curves;
+use crate::routes::private::sync::hold_model;
+use crate::routes::private::sync::models::{HoldKind, HoldStatus};
 use crate::routes::private::sync::service as replicate_audit;
 
 #[derive(Debug, Clone, sea_orm::FromQueryResult)]
@@ -2960,6 +2962,90 @@ pub async fn coverage_for(
         .map(|r| SlotCoverage::from_query_result(r, ""))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(coverage)
+}
+
+/// The open event-audit findings each calculation is carrying, and the visits they sit on.
+///
+/// Two grouped reads over the review queue: one counts the findings by kind, the other names the
+/// visits, so a visit carrying three findings of one calculation counts once. A finding no
+/// calculation raised (`tool` NULL) belongs to no row here.
+pub async fn calculation_health(db: &DatabaseConnection) -> AppResult<Vec<CalculationHealth>> {
+    #[derive(Debug, FromQueryResult)]
+    struct KindCount {
+        tool: String,
+        kind: String,
+        findings: i64,
+    }
+    #[derive(Debug, FromQueryResult)]
+    struct VisitRow {
+        tool: String,
+    }
+
+    let open = || {
+        hold_model::of_kinds(
+            Condition::all()
+                .add(hold_model::Column::StreamId.is_null())
+                .add(hold_model::Column::Tool.is_not_null())
+                .add(hold_model::Column::Status.eq(HoldStatus::Pending.as_str())),
+            &HoldKind::EVENT_AUDIT,
+        )
+    };
+
+    let counts = hold_model::Entity::find()
+        .filter(open())
+        .select_only()
+        .column(hold_model::Column::Tool)
+        .column(hold_model::Column::Kind)
+        .column_as(hold_model::Column::Id.count(), "findings")
+        .group_by(hold_model::Column::Tool)
+        .group_by(hold_model::Column::Kind)
+        .into_model::<KindCount>()
+        .all(db)
+        .await?;
+
+    // One row per (calculation, visit): the grouping is the distinct count, so the visits are
+    // tallied here rather than counted twice by a finding that shares a slot.
+    let visits = hold_model::Entity::find()
+        .filter(open())
+        .select_only()
+        .column(hold_model::Column::Tool)
+        .group_by(hold_model::Column::Tool)
+        .group_by(hold_model::Column::SiteId)
+        .group_by(hold_model::Column::GroupTime)
+        .into_model::<VisitRow>()
+        .all(db)
+        .await?;
+
+    fn entry<'a>(
+        map: &'a mut HashMap<String, CalculationHealth>,
+        tool: &str,
+    ) -> &'a mut CalculationHealth {
+        map.entry(tool.to_string())
+            .or_insert_with(|| CalculationHealth {
+                tool: tool.to_string(),
+                stale_visits: 0,
+                missing_outputs: 0,
+                stale_outputs: 0,
+                skipped_outputs: 0,
+            })
+    }
+
+    let mut by_tool: HashMap<String, CalculationHealth> = HashMap::new();
+    for row in &counts {
+        let health = entry(&mut by_tool, &row.tool);
+        match row.kind.as_str() {
+            k if k == HoldKind::MissingOutput.as_str() => health.missing_outputs = row.findings,
+            k if k == HoldKind::StaleOutput.as_str() => health.stale_outputs = row.findings,
+            k if k == HoldKind::SkippedOutput.as_str() => health.skipped_outputs = row.findings,
+            _ => {}
+        }
+    }
+    for row in &visits {
+        entry(&mut by_tool, &row.tool).stale_visits += 1;
+    }
+    let mut out: Vec<CalculationHealth> = by_tool.into_values().collect();
+    out.sort_by(|a, b| a.tool.cmp(&b.tool));
+    Ok(out)
 }
 
 /// Which subject the query names. One relation, four subjects (M126): the four are mutually

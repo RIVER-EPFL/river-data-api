@@ -20,20 +20,21 @@ use super::models::script as script_entity;
 use super::models::script::{ToolScript, ToolScriptList};
 use super::models::version::ToolScriptVersion;
 use super::models::{
-    ActivateRequest, ActivateResponse, ActivationRecord, ActiveTool, ClosureQuery, ClosureResponse,
-    CreateScriptRequest, CreateVersionRequest, CreateVersionResponse, DraftRunFailure,
-    DraftRunFailureKind, DraftRunRequest, DraftRunResponse, DraftRunResults, Engine,
-    FormulaDraftRunRequest, FormulaDraftRunResponse, FormulaDraftRunResults, InspectScriptRequest,
-    InspectScriptResponse, LintFinding, MissingConstant, ToolDescriptor, ToolResult,
-    UpdateScriptRequest, ValidateResponse, parse_manifest, reconcile_manifest,
+    ActivateRequest, ActivateResponse, ActivationRecord, ActiveTool, CalculationHealth,
+    ClosureQuery, ClosureResponse, CreateScriptRequest, CreateVersionRequest,
+    CreateVersionResponse, DraftRunFailure, DraftRunFailureKind, DraftRunRequest, DraftRunResponse,
+    DraftRunResults, Engine, FormulaDraftRunRequest, FormulaDraftRunResponse,
+    FormulaDraftRunResults, InspectScriptRequest, InspectScriptResponse, LintFinding,
+    MissingConstant, ToolDescriptor, ToolResult, UpdateScriptRequest, ValidateResponse,
+    parse_manifest, reconcile_manifest,
 };
 use super::service::{
-    LIST_LIMIT, audit_after_activation, calculation_slots, calculations_fed_by_subject,
-    canonical_hash, check_engine, check_manifest_against_catalog, check_manifest_codes_resolve,
-    closure_subject, coverage_for, find_active_tool, lint_script, list_active_tools,
-    load_parameter_catalog, load_script, load_version, manifest_finding, manifest_json,
-    normalise_name, render, replicated_for, run_stored_cases, run_tool_body, runner_runtime,
-    stored_version_content,
+    LIST_LIMIT, audit_after_activation, calculation_health, calculation_slots,
+    calculations_fed_by_subject, canonical_hash, check_engine, check_manifest_against_catalog,
+    check_manifest_codes_resolve, closure_subject, coverage_for, find_active_tool, lint_script,
+    list_active_tools, load_parameter_catalog, load_script, load_version, manifest_finding,
+    manifest_json, normalise_name, render, replicated_for, run_stored_cases, run_tool_body,
+    runner_runtime, stored_version_content,
 };
 use crate::common::AppState;
 use crate::common::middleware::AuthContext;
@@ -130,6 +131,21 @@ pub async fn get_calculation_closure(
         coverage,
     })
     .into_response())
+}
+
+/// The open event-audit findings each calculation is carrying, and how many visits they sit on.
+#[utoipa::path(
+    get,
+    path = "/api/calculations/health",
+    responses(
+        (status = 200, description = "Open findings per calculation", body = [CalculationHealth]),
+    ),
+    tag = "tools"
+)]
+pub async fn get_calculation_health(
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<CalculationHealth>>> {
+    Ok(Json(calculation_health(&state.db).await?))
 }
 
 /// List every calculation with its live version and how many versions it has. Requires

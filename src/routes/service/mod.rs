@@ -499,6 +499,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             get(crate::routes::private::tools::views::get_calculation_closure),
         )
         .route(
+            "/calculations/health",
+            get(crate::routes::private::tools::views::get_calculation_health),
+        )
+        .route(
             "/tools/{tool_name}/calculate",
             post(tools::views::calculate_tool),
         )
@@ -569,10 +573,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     // these); the write_metadata token bit is preserved for automation scripts. Scoped tokens are
     // denied (a logger key has no reason to trigger a global reprocess/merge).
     let operator_action_routes = Router::new()
-        .route(
-            "/parameter_groups/{id}/intermediates",
-            post(crate::routes::private::parameter_groups::views::declare_intermediates),
-        )
         .route(
             "/actions/sensor_calibrations/{id}/recalculate",
             post(calibration_views::recalculate_calibration),

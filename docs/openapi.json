@@ -2859,6 +2859,40 @@
         },
         "type": "object"
       },
+      "CalculationHealth": {
+        "description": "How one calculation is standing: the open event-audit findings against its outputs, and the\nvisits they sit on, which is the set an \"apply to the stale visits\" run would cover.",
+        "properties": {
+          "missing_outputs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "skipped_outputs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "stale_outputs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "stale_visits": {
+            "description": "Visits carrying at least one open finding this calculation raised.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "tool": {
+            "description": "The calculation's name, as the findings record it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool",
+          "stale_visits",
+          "missing_outputs",
+          "stale_outputs",
+          "skipped_outputs"
+        ],
+        "type": "object"
+      },
       "CalculationImpact": {
         "description": "One calculation a set of parameters feeds.",
         "properties": {
@@ -5387,50 +5421,6 @@
         ],
         "type": "object"
       },
-      "DeclareIntermediatesRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "intermediates": {
-            "items": {
-              "$ref": "#/components/schemas/DeclaredIntermediate"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "intermediates"
-        ],
-        "type": "object"
-      },
-      "DeclareIntermediatesResponse": {
-        "properties": {
-          "declared": {
-            "items": {
-              "$ref": "#/components/schemas/DeclaredResult"
-            },
-            "type": "array"
-          },
-          "group_id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "members_created": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "parameters_created": {
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "group_id",
-          "declared",
-          "parameters_created",
-          "members_created"
-        ],
-        "type": "object"
-      },
       "DeclareSdEstimatorRequest": {
         "additionalProperties": false,
         "properties": {
@@ -5478,65 +5468,6 @@
           "estimator",
           "previous",
           "samples_affected"
-        ],
-        "type": "object"
-      },
-      "DeclaredIntermediate": {
-        "additionalProperties": false,
-        "description": "One intermediate, as the group declares it.",
-        "properties": {
-          "code": {
-            "description": "The catalog code, which is the identity: a re-declaration finds the same row.",
-            "type": "string"
-          },
-          "description": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "name": {
-            "type": "string"
-          },
-          "replicates": {
-            "description": "The replicate spec of the family this intermediate is computed over, member-shaped, so a\nstage-1 output entered at several indexes carries its statistics like any other family."
-          },
-          "units": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "code",
-          "name"
-        ],
-        "type": "object"
-      },
-      "DeclaredResult": {
-        "properties": {
-          "code": {
-            "type": "string"
-          },
-          "member_created": {
-            "description": "Whether this call added the membership, rather than finding it.",
-            "type": "boolean"
-          },
-          "parameter_created": {
-            "description": "Whether this call created the catalog parameter, rather than finding it.",
-            "type": "boolean"
-          },
-          "parameter_id": {
-            "format": "uuid",
-            "type": "string"
-          }
-        },
-        "required": [
-          "code",
-          "parameter_id",
-          "parameter_created",
-          "member_created"
         ],
         "type": "object"
       },
@@ -6687,6 +6618,13 @@
       "EventRecomputeRequest": {
         "additionalProperties": false,
         "properties": {
+          "calculation": {
+            "description": "Hold the findings to the ones one calculation raised. A narrowing, so it needs a scope\nbeside it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "end": {
             "description": "Visits collected at or before this instant.",
             "format": "date-time",
@@ -29338,6 +29276,30 @@
         ]
       }
     },
+    "/api/calculations/health": {
+      "get": {
+        "operationId": "get_calculation_health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/CalculationHealth"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Open findings per calculation"
+          }
+        },
+        "summary": "The open event-audit findings each calculation is carrying, and how many visits they sit on.",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
     "/api/change_audit": {
       "get": {
         "operationId": "list_change_audit",
@@ -30141,11 +30103,14 @@
             },
             "description": "The tracked recompute job"
           },
+          "400": {
+            "description": "The visit was created by the portal sync"
+          },
           "404": {
             "description": "Unknown collection event"
           }
         },
-        "summary": "Recompute a collection event's tool outputs on demand: the chain executor runs every active\ntool whose inputs resolve at this event, in dependency order, and saves the outputs through\nthe grab write path with fresh server-built provenance. Tracked job. Requires `write_data`.",
+        "summary": "Recompute a collection event's tool outputs on demand: the chain executor runs every active\ntool whose inputs resolve at this event, in dependency order, and saves the outputs through\nthe grab write path with fresh server-built provenance. A visit the sync created is refused\n(Q41). Tracked job. Requires `write_data`.",
         "tags": [
           "collection_events"
         ]
@@ -36528,55 +36493,6 @@
         "summary": "GET /api/parameter_groups/{id}/definition",
         "tags": [
           "parameter_groups"
-        ]
-      }
-    },
-    "/api/parameter_groups/{id}/intermediates": {
-      "post": {
-        "operationId": "declare_intermediates",
-        "parameters": [
-          {
-            "description": "Parameter group id",
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DeclareIntermediatesRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DeclareIntermediatesResponse"
-                }
-              }
-            },
-            "description": ""
-          },
-          "400": {
-            "description": "A code the catalog holds under another group"
-          },
-          "404": {
-            "description": "Unknown group"
-          }
-        },
-        "summary": "`POST /parameter_groups/{id}/intermediates`: declare the intermediates a group's calculation\ncomputes, minting the catalog parameters it names and adding them to the group.",
-        "tags": [
-          "parameters"
         ]
       }
     },

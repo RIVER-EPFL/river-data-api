@@ -392,3 +392,101 @@ async fn two_subjects_at_once_are_refused() {
     .await;
     assert_eq!(status, 400, "{body}");
 }
+
+/// Scenario: the Toolbox needs to say, on a calculation's row, how much is standing against it and
+/// how many visits an apply would cover.
+///
+/// Expected behaviour: only the open event-audit findings a calculation raised are counted, each
+/// kind on its own, and a visit carrying two of them counts once.
+#[tokio::test]
+#[serial]
+async fn the_health_of_a_calculation_counts_its_open_findings_and_their_visits() {
+    let (db, app, token) = setup().await;
+    let second = "2025-02-11T08:00:00Z";
+    let third = "2025-02-12T08:00:00Z";
+    let hold = |kind: &str, parameter: &str, at: &str, status: &str, tool: &str| {
+        format!(
+            "INSERT INTO replicate_audit_holds \
+               (group_time, expected, computed, delta, status, kind, site_id, parameter_id, tool) \
+             VALUES ('{at}', '{{}}', '{{}}', '{{}}', '{status}', '{kind}', \
+                     '{SITE1_ID}', '{parameter}', {tool})"
+        )
+    };
+    for sql in [
+        hold(
+            "stale_output",
+            GLOBAL_PARAM_TEMP_ID,
+            AT,
+            "pending",
+            "'closure_a'",
+        ),
+        hold(
+            "missing_output",
+            GLOBAL_PARAM_DO_ID,
+            AT,
+            "pending",
+            "'closure_a'",
+        ),
+        hold(
+            "missing_output",
+            GLOBAL_PARAM_DO_ID,
+            second,
+            "pending",
+            "'closure_a'",
+        ),
+        // Decided, so it is no longer standing against the calculation.
+        hold(
+            "stale_output",
+            GLOBAL_PARAM_DO_ID,
+            third,
+            "acknowledged",
+            "'closure_a'",
+        ),
+        // A finding no calculation raised belongs to no row.
+        hold(
+            "missing_output",
+            GLOBAL_PARAM_DO_ID,
+            third,
+            "pending",
+            "NULL",
+        ),
+        hold(
+            "skipped_output",
+            GLOBAL_PARAM_DO_ID,
+            AT,
+            "pending",
+            "'closure_b'",
+        ),
+    ] {
+        db.execute_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+        ))
+        .await
+        .expect("a finding");
+    }
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, "/api/calculations/health", &token).await;
+    assert_eq!(status, 200, "{body}");
+    let rows = body.as_array().expect("a list");
+    let of = |name: &str| {
+        rows.iter()
+            .find(|r| r["tool"] == name)
+            .unwrap_or_else(|| panic!("{name} is listed: {body}"))
+            .clone()
+    };
+
+    let a = of("closure_a");
+    assert_eq!(
+        a["stale_visits"], 2,
+        "the two instants, not the three holds"
+    );
+    assert_eq!(a["stale_outputs"], 1);
+    assert_eq!(a["missing_outputs"], 2);
+    assert_eq!(a["skipped_outputs"], 0);
+
+    let b = of("closure_b");
+    assert_eq!(b["stale_visits"], 1);
+    assert_eq!(b["skipped_outputs"], 1);
+}

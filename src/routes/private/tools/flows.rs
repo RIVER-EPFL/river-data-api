@@ -1149,6 +1149,10 @@ impl Job for EventRecompute {
                 .get("only_findings")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
+            calculation: params
+                .get("calculation")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
         };
         if !scope.is_bounded() {
             return Err(DbErr::Custom(
@@ -1194,6 +1198,7 @@ impl Job for EventRecompute {
                 .scope_opt("start", scope.start.map(|t| t.to_rfc3339()))
                 .scope_opt("end", scope.end.map(|t| t.to_rfc3339()))
                 .scope("only_findings", scope.only_findings)
+                .scope_opt("calculation", scope.calculation.clone())
                 .count("events_in_scope", events.len())
                 .count("events_recomputed", events_recomputed)
                 .count("tools_run", tools_run)

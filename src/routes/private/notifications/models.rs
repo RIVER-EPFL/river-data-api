@@ -41,7 +41,7 @@ pub struct Channel {
 /// Every kind the triggers emit, as the channel it is subscribed through. A kind absent from here
 /// would reach every enabled recipient with no way to decline, which is what the tests below hold
 /// the triggers to.
-pub const CHANNELS: [Channel; 17] = [
+pub const CHANNELS: [Channel; 18] = [
     Channel {
         kind: "alarm_opened",
         label: "Alarm opened",
@@ -88,6 +88,12 @@ pub const CHANNELS: [Channel; 17] = [
         kind: "holds_open",
         label: "Review queue",
         description: "Audit holds waiting for somebody to decide them.",
+        on_by_default: false,
+    },
+    Channel {
+        kind: "steps_skipped",
+        label: "Skipped calculation steps",
+        description: "A calculation step that did not run at a visit, leaving its outputs absent.",
         on_by_default: false,
     },
     Channel {

@@ -11,10 +11,9 @@ use uuid::Uuid;
 use self::rules::{Member, Role};
 use super::models::group_model::ParameterGroup;
 use super::models::member_model::ParameterGroupMember;
-use super::models::{Plan, SlotDeclaration};
+use super::models::SlotDeclaration;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::derived_parameters::models::{definition, source};
-use crate::routes::private::parameters;
 
 pub struct ParameterGroupOperations;
 
@@ -538,26 +537,6 @@ pub(super) async fn manifest_sections(
 #[cfg(test)]
 #[path = "tests/definition.rs"]
 mod tests;
-
-/// Fold what exists into what each declared code needs. Codes are compared case-insensitively,
-/// which is how the catalog's uniqueness is defined (`UNIQUE (LOWER(code))`).
-#[must_use]
-pub fn plan_for(code: &str, catalog: &[(String, Uuid)], members: &[Uuid]) -> Plan {
-    let existing = catalog
-        .iter()
-        .find(|(c, _)| c.eq_ignore_ascii_case(code))
-        .map(|(_, id)| *id);
-    Plan {
-        mint_parameter: existing.is_none(),
-        add_member: existing.is_none_or(|id| !members.contains(&id)),
-    }
-}
-
-/// `LOWER(code) = ANY($1)`, matched against codes the caller already lowered.
-pub(super) fn lowered_code_in(codes: &[String]) -> sea_orm::sea_query::SimpleExpr {
-    use sea_orm::sea_query::{Expr, ExprTrait, Func};
-    Expr::expr(Func::lower(Expr::col(parameters::Column::Code))).is_in(codes.iter().cloned())
-}
 
 #[cfg(test)]
 #[path = "tests/ordering.rs"]

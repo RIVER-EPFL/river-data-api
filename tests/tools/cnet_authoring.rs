@@ -77,22 +77,6 @@ async fn post_or_find(app: &axum::Router, uri: &str, body: &Value, admin: &str) 
     Some(parsed)
 }
 
-/// Whether the catalog already holds a parameter of this code.
-async fn in_catalog(app: &axum::Router, code: &str, admin: &str) -> bool {
-    let filter = crate::common::e2e::percent_encode(&json!({ "code": code }).to_string());
-    let (status, body) =
-        crate::common::get_json_with_token(app, &format!("/api/parameters?filter={filter}"), admin)
-            .await;
-    assert_eq!(status, 200, "GET /api/parameters: {body}");
-    // The filter matches a code that contains the one asked for, so `bp` comes back holding
-    // `Field_BP`: the row wanted is the one whose code is the code.
-    body.as_array().expect("a list of rows").iter().any(|row| {
-        row["code"]
-            .as_str()
-            .is_some_and(|c| c.eq_ignore_ascii_case(code))
-    })
-}
-
 /// The stored formula of this code, if one exists: what a declaration names.
 async fn step_id(app: &axum::Router, code: &str, admin: &str) -> Option<String> {
     let filter = crate::common::e2e::percent_encode(&json!({ "code": code }).to_string());
@@ -155,7 +139,7 @@ fn replicate_counts(calculation: &Value) -> HashMap<String, usize> {
 }
 
 /// Author one set exactly as the calculation page does: the group, the catalog parameters it
-/// reads, the intermediates it computes, the calculation itself, then a formula at a time.
+/// reads, the calculation itself, then a formula at a time.
 async fn author(
     app: &axum::Router,
     admin: &str,
@@ -207,30 +191,6 @@ async fn author(
             post(app, "/api/parameter_group_members", &member, admin).await;
         }
         known.insert(code);
-    }
-
-    let mut intermediates: Vec<Value> = Vec::new();
-    for formula in calculation["formulas"].as_array().expect("formulas") {
-        if formula["intermediate"] != json!(true) {
-            continue;
-        }
-        let code = formula["code"].as_str().expect("code");
-        // A step another calculation has already declared is the same catalog row, and one group
-        // holds it.
-        if in_catalog(app, code, admin).await {
-            continue;
-        }
-        intermediates
-            .push(json!({ "code": code, "name": formula["label"].as_str().unwrap_or(code) }));
-    }
-    if !intermediates.is_empty() {
-        post(
-            app,
-            &format!("/api/parameter_groups/{group_id}/intermediates"),
-            &json!({ "intermediates": intermediates }),
-            admin,
-        )
-        .await;
     }
 
     let script = post(

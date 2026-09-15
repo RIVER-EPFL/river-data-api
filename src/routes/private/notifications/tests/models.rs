@@ -27,6 +27,7 @@ fn test_every_emitted_kind_has_a_channel() {
         "changes_pending",
         "curve_drift",
         "derived_computed",
+        "steps_skipped",
     ] {
         assert!(!on_by_default(kind), "'{kind}' is asked for, not assumed");
     }

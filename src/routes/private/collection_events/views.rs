@@ -42,13 +42,15 @@ use crate::routes::resolve_site;
 
 /// Recompute a collection event's tool outputs on demand: the chain executor runs every active
 /// tool whose inputs resolve at this event, in dependency order, and saves the outputs through
-/// the grab write path with fresh server-built provenance. Tracked job. Requires `write_data`.
+/// the grab write path with fresh server-built provenance. A visit the sync created is refused
+/// (Q41). Tracked job. Requires `write_data`.
 #[utoipa::path(
     post,
     path = "/api/collection_events/{id}/recompute",
     params(("id" = Uuid, Path, description = "Collection event id")),
     responses(
         (status = 200, description = "The tracked recompute job", body = EnqueuedJobResponse),
+        (status = 400, description = "The visit was created by the portal sync"),
         (status = 404, description = "Unknown collection event"),
     ),
     tag = "collection_events"
@@ -62,6 +64,13 @@ pub async fn recompute_collection_event(
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Collection event {id} not found")))?;
+    if !service::chain_may_run(&event.source) {
+        return Err(AppError::BadRequest(
+            "This visit was created by the portal sync, so calculations do not run at it. \
+             Correct the value in the portal, which recomputes its own outputs."
+                .to_string(),
+        ));
+    }
     let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
         &state.db,
         "event_recompute",
@@ -200,6 +209,7 @@ pub async fn run_event_recompute(
         start: req.start,
         end: req.end,
         only_findings: req.only_findings,
+        calculation: req.calculation.clone(),
     };
     if !scope.is_bounded() {
         return Err(AppError::BadRequest(
@@ -229,6 +239,7 @@ pub async fn run_event_recompute(
             "start": req.start,
             "end": req.end,
             "only_findings": req.only_findings,
+            "calculation": req.calculation,
             "actor": crate::common::actor::label(&auth),
         }),
         None,

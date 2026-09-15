@@ -1795,6 +1795,19 @@ pub struct SlotCoverage {
     pub run_sources: Vec<String>,
 }
 
+/// How one calculation is standing: the open event-audit findings against its outputs, and the
+/// visits they sit on, which is the set an "apply to the stale visits" run would cover.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CalculationHealth {
+    /// The calculation's name, as the findings record it.
+    pub tool: String,
+    /// Visits carrying at least one open finding this calculation raised.
+    pub stale_visits: i64,
+    pub missing_outputs: i64,
+    pub stale_outputs: i64,
+    pub skipped_outputs: i64,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ClosureResponse {
     /// The calculations the named parameters feed, in the order the chain would run them.
@@ -2115,6 +2128,9 @@ pub struct RecomputeScope {
     pub start: Option<chrono::DateTime<chrono::Utc>>,
     pub end: Option<chrono::DateTime<chrono::Utc>>,
     pub only_findings: bool,
+    /// Hold the findings arm to the ones one calculation raised. A narrowing, never a bound: a
+    /// calculation names no window, so it cannot stand as a scope on its own.
+    pub calculation: Option<String>,
 }
 
 impl RecomputeScope {
@@ -2126,11 +2142,14 @@ impl RecomputeScope {
     }
 
     /// The SELECT of visit ids this scope covers, oldest first. `portal_sync` visits are never
-    /// in scope (Q41); `only_findings` holds the set to visits with an open event finding.
+    /// in scope (Q41); `only_findings` holds the set to visits with an open event finding, and a
+    /// `calculation` beside it to the findings that calculation raised.
     #[must_use]
     pub fn events_sql(&self) -> (String, Vec<sea_orm::Value>) {
-        let mut sql =
-            String::from("SELECT ce.id FROM collection_events ce WHERE ce.source <> 'portal_sync'");
+        let mut sql = format!(
+            "SELECT ce.id FROM collection_events ce WHERE ce.source <> '{portal_sync}'",
+            portal_sync = crate::routes::private::collection_events::service::PORTAL_SYNC
+        );
         let mut binds: Vec<sea_orm::Value> = Vec::new();
         if let Some(site_id) = self.site_id {
             binds.push(site_id.into());
@@ -2149,9 +2168,15 @@ impl RecomputeScope {
                 " AND EXISTS (SELECT 1 FROM replicate_audit_holds h \
                       WHERE h.stream_id IS NULL AND h.status = '{pending}' \
                         AND h.kind IN {kinds} \
-                        AND h.site_id = ce.site_id AND h.group_time = ce.collected_at)",
+                        AND h.site_id = ce.site_id AND h.group_time = ce.collected_at{tool})",
                 pending = HoldStatus::Pending.as_str(),
-                kinds = HoldKind::sql_list(&HoldKind::EVENT_AUDIT)
+                kinds = HoldKind::sql_list(&HoldKind::EVENT_AUDIT),
+                tool = if let Some(name) = &self.calculation {
+                    binds.push(name.clone().into());
+                    format!(" AND h.tool = ${}", binds.len())
+                } else {
+                    String::new()
+                }
             ));
         }
         sql.push_str(" ORDER BY ce.collected_at");

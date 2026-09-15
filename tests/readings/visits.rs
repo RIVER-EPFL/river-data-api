@@ -674,3 +674,59 @@ async fn the_cross_site_list_reports_fill_and_findings() {
     assert_eq!(visits[0]["collected_at"], T1, "most findings first: {body}");
     assert_eq!(visits[1]["findings_open"], 0);
 }
+
+/// Scenario: the lab opens a CNET station whose history was synced, expands a 2025 visit and
+/// presses Recompute tools.
+///
+/// Expected behaviour: refused, naming where the correction belongs (Q41). The audit is
+/// report-only and stays open to the same visit.
+#[tokio::test]
+#[serial]
+async fn the_per_visit_recompute_refuses_a_synced_visit_and_the_audit_does_not() {
+    let (db, app, token) = setup().await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO collection_events (site_id, collected_at, source) \
+             VALUES ('{SITE1_ID}', '2025-06-04T08:00:00Z', 'portal_sync')"
+        ),
+    )
+    .await;
+    let synced: String = crate::common::e2e::scalar(
+        &db,
+        &format!(
+            "SELECT id::text AS v FROM collection_events \
+              WHERE site_id = '{SITE1_ID}' AND collected_at = '2025-06-04T08:00:00Z'"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/collection_events/{synced}/recompute"),
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("portal sync"),
+        "the refusal says why: {body}"
+    );
+    let queued = crate::common::e2e::scalar(
+        &db,
+        "SELECT count(*)::text AS v FROM reprocessing_jobs \
+          WHERE trigger_type = 'event_recompute'",
+    )
+    .await;
+    assert_eq!(queued, "0", "the refusal queues nothing");
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/actions/event_audit",
+        &serde_json::json!({ "collection_event_id": synced }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "the audit still covers a synced visit: {body}");
+}

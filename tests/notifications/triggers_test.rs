@@ -612,3 +612,82 @@ async fn the_upkeep_arms_each_report_what_they_did() {
         "the same work is not announced twice"
     );
 }
+
+/// Scenario: a chain run reaches a step whose inputs do not resolve, records the skip as a
+/// `skipped_output` finding and completes (Q108, M142).
+///
+/// Expected behaviour: the skips are announced once, counted across the runs that raised them,
+/// with the page they are reviewed on, and the same skips are not announced again.
+#[tokio::test]
+#[serial]
+async fn skipped_calculation_steps_are_announced_once_per_batch() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    crate::common::exec(
+        &db,
+        "INSERT INTO reprocessing_jobs (trigger_type, status, completed_at, detail) VALUES \
+           ('event_recompute', 'completed', NOW(), \
+            '{\"counts\": {\"findings_raised\": 2, \"readings_written\": 4}}'::jsonb), \
+           ('event_recompute', 'completed', NOW(), \
+            '{\"counts\": {\"findings_raised\": 1, \"readings_written\": 0}}'::jsonb)",
+    )
+    .await;
+
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let channels: Vec<Box<dyn NotificationChannel>> =
+        vec![Box::new(MockChannel { sent: sent.clone() })];
+    flows::run(&state, &channels).await;
+
+    {
+        let msgs = sent.lock().unwrap();
+        let skipped = kinds(&msgs, "steps_skipped");
+        assert_eq!(skipped.len(), 1, "the skips are announced once: {msgs:?}");
+        assert!(
+            skipped[0].subject.contains("3 calculation step(s)"),
+            "the count spans the runs that raised them: {}",
+            skipped[0].subject
+        );
+        assert!(
+            skipped[0].body.contains("Audits"),
+            "the message says where they are reviewed: {}",
+            skipped[0].body
+        );
+    }
+
+    sent.lock().unwrap().clear();
+    flows::run(&state, &channels).await;
+    assert!(
+        kinds(&sent.lock().unwrap(), "steps_skipped").is_empty(),
+        "the same skips are not announced twice"
+    );
+}
+
+/// A run that skipped nothing says nothing.
+#[tokio::test]
+#[serial]
+async fn a_chain_run_that_skipped_nothing_is_silent() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    crate::common::exec(
+        &db,
+        "INSERT INTO reprocessing_jobs (trigger_type, status, completed_at, detail) VALUES \
+           ('event_recompute', 'completed', NOW(), \
+            '{\"counts\": {\"findings_raised\": 0, \"readings_written\": 6}}'::jsonb)",
+    )
+    .await;
+
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let channels: Vec<Box<dyn NotificationChannel>> =
+        vec![Box::new(MockChannel { sent: sent.clone() })];
+    flows::run(&state, &channels).await;
+    assert!(
+        kinds(&sent.lock().unwrap(), "steps_skipped").is_empty(),
+        "a run with nothing skipped raises no alert"
+    );
+}

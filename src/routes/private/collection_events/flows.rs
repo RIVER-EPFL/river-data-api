@@ -145,7 +145,7 @@ pub async fn enqueue_for(
     }
     let candidates: Vec<&TouchedEvent> = events
         .iter()
-        .filter(|e| e.source != "portal_sync")
+        .filter(|e| super::service::chain_may_run(&e.source))
         .collect();
     if candidates.is_empty() {
         return Ok(Vec::new());

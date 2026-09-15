@@ -756,7 +756,6 @@ fn table() -> Table {
             ("POST", "/api/schedules/{job_name}/run_now"),
             ("POST", "/api/site_parameters/{id}/declare_sd_estimator"),
             ("POST", "/api/actions/retag_sd_estimator"),
-            ("POST", "/api/parameter_groups/{id}/intermediates"),
             ("POST", "/api/sensor_calibrations/{id}/retire"),
             ("POST", "/api/sensor_calibrations/{id}/unretire"),
             ("POST", "/api/standard_curves/{id}/retire"),

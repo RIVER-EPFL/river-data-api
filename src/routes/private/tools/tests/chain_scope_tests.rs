@@ -52,12 +52,50 @@ fn portal_sync_visits_are_excluded_whatever_the_scope() {
 }
 
 #[test]
+fn a_calculation_narrows_the_findings_arm_and_binds_its_name() {
+    let (sql, binds) = RecomputeScope {
+        only_findings: true,
+        calculation: Some("pco2".to_string()),
+        ..Default::default()
+    }
+    .events_sql();
+    assert!(sql.contains("AND h.tool = $1"), "{sql}");
+    assert_eq!(binds.len(), 1);
+}
+
+#[test]
+fn a_calculation_alone_is_not_a_scope() {
+    assert!(
+        !RecomputeScope {
+            calculation: Some("pco2".to_string()),
+            ..Default::default()
+        }
+        .is_bounded()
+    );
+}
+
+/// The narrowing belongs to the findings arm alone: a site-and-range scope names its own visits,
+/// and a calculation there would silently drop the ones it has raised nothing about.
+#[test]
+fn a_calculation_without_only_findings_adds_no_clause() {
+    let (sql, binds) = RecomputeScope {
+        site_id: Some(Uuid::new_v4()),
+        calculation: Some("pco2".to_string()),
+        ..Default::default()
+    }
+    .events_sql();
+    assert!(!sql.contains("h.tool"), "{sql}");
+    assert_eq!(binds.len(), 1, "the site is the only bind");
+}
+
+#[test]
 fn each_term_adds_its_clause_with_binds_in_order() {
     let scope = RecomputeScope {
         site_id: Some(Uuid::new_v4()),
         start: Some(at("2025-06-01T00:00:00Z")),
         end: Some(at("2025-06-30T00:00:00Z")),
         only_findings: true,
+        calculation: None,
     };
     let (sql, binds) = scope.events_sql();
     assert!(sql.contains("ce.site_id = $1"));
