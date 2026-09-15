@@ -53,6 +53,7 @@
 /keycloak => -
 /me => -
 /me/sites => -
+/meteoswiss/stations => require_read_metadata
 /notes/register => deny_scoped_token+require_admin_or_token_write_metadata
 /notifications => -
 /notifications/channels => require_read_data
@@ -108,6 +109,7 @@
 /reprocessing_jobs/{id}/logs => require_read_data
 /reprocessing_jobs/{id}/rerun => deny_scoped_token+require_manage_sensors
 /roles => require_admin
+/schedules/runnable => require_read_metadata
 /schedules/{job_name}/audit => require_read_metadata
 /schedules/{job_name}/run_now => deny_scoped_token+require_manage_sensors
 /search => require_read_metadata

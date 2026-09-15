@@ -74,12 +74,12 @@ fn default_schedules_lists_only_recurring_services() {
 #[test]
 fn every_policy_name_is_a_registered_job() {
     let r = build_registry();
-    // The recurring services need a Config to build; `register_scheduled_services` asserts it
-    // registered exactly the names below, so taking them from the const is not taking them on
-    // trust.
+    // The services built from Config cannot be constructed here; `register_scheduled_services`
+    // asserts it registered exactly the names below, so taking them from the const is not taking
+    // them on trust.
     let registered: std::collections::HashSet<&str> = r
         .names()
-        .chain(SCHEDULED_SERVICE_NAMES.iter().copied())
+        .chain(CONFIG_BUILT_SERVICE_NAMES.iter().copied())
         .collect();
 
     let policy_names = MAINTENANCE

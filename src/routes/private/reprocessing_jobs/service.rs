@@ -356,10 +356,12 @@ pub const CANCELLABLE: &[&str] = &[
     "meteoswiss_backfill",
 ];
 
-/// The recurring services [`register_scheduled_services`] adds. They carry a cadence
-/// from `Config`, so a unit test cannot build them; `register_scheduled_services` asserts at
-/// startup that it registered exactly these, which is what keeps the list honest.
-pub const SCHEDULED_SERVICE_NAMES: &[&str] = &[
+/// Every job [`register_scheduled_services`] adds. They are built from `Config`, so a unit test
+/// cannot construct them; `register_scheduled_services` asserts at startup that it registered
+/// exactly these, which is what keeps the list honest. Most carry a cadence, but a job registered
+/// there and left out of this list is invisible to the policy check, so the list is what is
+/// registered rather than what recurs.
+pub const CONFIG_BUILT_SERVICE_NAMES: &[&str] = &[
     "janitor_service",
     "alarm_sweep",
     "sync_event_sweep",
@@ -370,6 +372,7 @@ pub const SCHEDULED_SERVICE_NAMES: &[&str] = &[
     "dispatch_notifications",
     "meteoswiss_sync",
     "meteoswiss_recent",
+    "meteoswiss_backfill",
 ];
 
 // --- The Job contract and its registry ---
@@ -753,10 +756,10 @@ pub fn register_scheduled_services(registry: &mut JobRegistry, config: &crate::c
 
     // The policy tables in `registry` are keyed by trigger_type and cannot construct these, so the
     // name list they check against is verified here instead of drifting quietly.
-    for name in SCHEDULED_SERVICE_NAMES {
+    for name in CONFIG_BUILT_SERVICE_NAMES {
         assert!(
             registry.get(name).is_some(),
-            "registry::SCHEDULED_SERVICE_NAMES lists {name:?}, which no service registered under"
+            "registry::CONFIG_BUILT_SERVICE_NAMES lists {name:?}, which no service registered under"
         );
     }
 }
