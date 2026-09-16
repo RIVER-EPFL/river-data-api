@@ -1,6 +1,20 @@
+use chrono::{TimeZone, Utc};
+use sea_orm::sea_query::PostgresQueryBuilder;
+use uuid::Uuid;
+
 use super::{
     PROVENANCE_KINDS, classify_source, provenance_kind_for_run, provenance_kind_for_stream,
+    slot_holds_query, stream_holds_query,
 };
+
+#[test]
+fn test_a_hold_on_a_record_names_its_calculation() {
+    let at = Utc.with_ymd_and_hms(2026, 8, 2, 10, 0, 0).unwrap();
+    let slot = slot_holds_query(Uuid::nil(), &[Uuid::nil()], at).to_string(PostgresQueryBuilder);
+    let stream = stream_holds_query(&[Uuid::nil()], at).to_string(PostgresQueryBuilder);
+    assert!(slot.contains("\"tool\""), "{slot}");
+    assert!(stream.contains("\"tool\""), "{stream}");
+}
 
 #[test]
 fn test_a_computed_value_is_not_classified_as_a_sync() {

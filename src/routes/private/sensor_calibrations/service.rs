@@ -668,10 +668,28 @@ struct DerivedWorkRow {
     parameter_code: String,
 }
 
-#[derive(FromQueryResult)]
-struct InputRow {
-    val: f64,
-    measurement_type: Option<String>,
+/// A live reading at a derived input's slot, valued as a formula reads it: its sample's mean when
+/// the sample holds any, else its calibrated value, else its raw value.
+#[derive(Debug, Clone, FromQueryResult)]
+pub struct InputCandidate {
+    pub measurement_type: Option<String>,
+    pub replicate_index: i16,
+    pub stream_id: Uuid,
+    pub value: f64,
+    pub from_mean: bool,
+}
+
+/// The reading a derived formula reads at a slot: continuous before spot, then the lowest
+/// replicate, then the lowest stream. The compute and the provenance record both choose here.
+#[must_use]
+pub fn chosen_input(candidates: &[InputCandidate]) -> Option<&InputCandidate> {
+    candidates.iter().min_by_key(|c| {
+        (
+            c.measurement_type.as_deref() == Some("spot"),
+            c.replicate_index,
+            c.stream_id,
+        )
+    })
 }
 
 struct DerivedWork {
@@ -954,13 +972,19 @@ fn input_value_query(
     let r = Alias::new("r");
     let smp = Alias::new("smp");
     SeaQuery::select()
+        .column((r.clone(), readings::Column::MeasurementType))
+        .column((r.clone(), readings::Column::ReplicateIndex))
+        .column((r.clone(), readings::Column::StreamId))
         .expr_as(
             Expr::cust(
                 "COALESCE(CASE WHEN smp.n > 0 THEN smp.mean END, r.calibrated_value, r.raw_value)",
             ),
-            Alias::new("val"),
+            Alias::new("value"),
         )
-        .column((r.clone(), readings::Column::MeasurementType))
+        .expr_as(
+            Expr::cust("COALESCE(smp.n > 0 AND smp.mean IS NOT NULL, false)"),
+            Alias::new("from_mean"),
+        )
         .from_as(readings::Entity, r.clone())
         .join_as(
             JoinType::LeftJoin,
@@ -971,15 +995,8 @@ fn input_value_query(
         .and_where(Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
         .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).eq(parameter_id))
         .and_where(Expr::col((r.clone(), readings::Column::Time)).eq(time))
-        .and_where(Expr::col((r.clone(), readings::Column::WithdrawnAt)).is_null())
+        .and_where(Expr::col((r, readings::Column::WithdrawnAt)).is_null())
         .and_where(Expr::cust("r.is_flagged IS NOT TRUE"))
-        .order_by_expr(
-            Expr::cust("(r.measurement_type IS NOT DISTINCT FROM 'spot')"),
-            Order::Asc,
-        )
-        .order_by((r.clone(), readings::Column::ReplicateIndex), Order::Asc)
-        .order_by((r, readings::Column::StreamId), Order::Asc)
-        .limit(1)
         .take()
 }
 
@@ -1008,14 +1025,15 @@ async fn resolve_variables_for_derived(
     let mut properties = Vec::new();
     for (var_name, source_param_id, site_property) in mapping_rows {
         if let Some(source_param_id) = source_param_id {
-            let value_row = InputRow::find_by_statement(build(input_value_query(
+            let candidates = InputCandidate::find_by_statement(build(input_value_query(
                 item.derived_site_id,
                 source_param_id,
                 time,
             )))
-            .one(db)
+            .all(db)
             .await?;
-            if let Some(input) = &value_row
+            let value_row = chosen_input(&candidates);
+            if let Some(input) = value_row
                 && input.measurement_type.as_deref() == Some("spot")
             {
                 tracing::debug!(
@@ -1025,7 +1043,7 @@ async fn resolve_variables_for_derived(
                     "Derived input resolved from a grab (spot) reading"
                 );
             }
-            parameters.push((var_name, value_row.map(|input| input.val)));
+            parameters.push((var_name, value_row.map(|input| input.value)));
         } else if let Some(property) = site_property {
             properties.push((var_name, property));
         }

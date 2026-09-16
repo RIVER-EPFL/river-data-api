@@ -218,6 +218,7 @@ async fn holds_touching_the_instant_are_listed() {
     assert_eq!(holds.len(), 1, "{body}");
     assert_eq!(holds[0]["kind"], "stale_output");
     assert_eq!(holds[0]["status"], "pending");
+    assert_eq!(holds[0]["tool"], "chain_b");
 }
 
 #[tokio::test]
@@ -279,6 +280,64 @@ async fn the_continuous_cadence_resolves_a_derived_reading() {
     );
     let records = body["records"].as_array().expect("records");
     assert_eq!(records.len(), 1, "{body}");
+}
+
+/// Scenario: a derived value over DO at an instant holding both a logger reading and a grab pair.
+///
+/// Expected behaviour: the record names the input the formula read, the continuous reading, not
+/// the grab pair's mean.
+#[tokio::test]
+#[serial]
+async fn a_derived_input_is_the_reading_the_compute_chose() {
+    let (db, app, token) = setup().await;
+    use crate::common::GLOBAL_PARAM_TURB_ID;
+    save_grab(&app, &token).await;
+
+    let logger = "00000000-0000-4000-c000-0000000009f1";
+    let output = "00000000-0000-4000-c000-0000000009f2";
+    let definition = "00000000-0000-4000-c000-0000000009f3";
+    crate::common::seed_data_stream(&db, logger, "test", "do_logger").await;
+    crate::common::seed_data_stream(&db, output, "test", "derived_output").await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO calculation_formulas (id, code, name, units, formula, output_parameter_id) \
+             VALUES ('{definition}', 'DoTwice', 'DO twice', '', 'do_val * 2', '{GLOBAL_PARAM_TURB_ID}')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO derived_parameter_sources (derived_definition_id, parameter_id, variable_name) \
+             VALUES ('{definition}', '{GLOBAL_PARAM_DO_ID}', 'do_val')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO readings \
+                 (stream_id, time, replicate_index, site_id, parameter_id, raw_value, measurement_type) \
+             VALUES ('{logger}', '{T1}', 0, '{SITE1_ID}', '{GLOBAL_PARAM_DO_ID}', 7.0, 'continuous'), \
+                    ('{output}', '{T1}', 0, '{SITE1_ID}', '{GLOBAL_PARAM_TURB_ID}', 14.0, 'derived')"
+        ),
+    )
+    .await;
+
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!(
+            "/api/readings/provenance?site_id={SITE1_ID}&parameter_id={GLOBAL_PARAM_TURB_ID}&time={T1}"
+        ),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let input = &body["records"][0]["inputs"][0];
+    assert_eq!(input["variable_name"], json!("do_val"), "{body}");
+    assert_eq!(input["value"].as_f64(), Some(7.0), "{body}");
+    assert_eq!(input["served_as"], json!("reading"), "{body}");
 }
 
 /// Scenario: the four write paths an operator can reach land a reading each, and a row is

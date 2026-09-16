@@ -373,3 +373,51 @@ mod non_finite_results {
         assert_eq!(derived_outcome(-1.5), DerivedOutcome::Store(-1.5));
     }
 }
+
+fn candidate(
+    measurement_type: Option<&str>,
+    replicate_index: i16,
+    stream: u128,
+    value: f64,
+) -> InputCandidate {
+    InputCandidate {
+        measurement_type: measurement_type.map(str::to_string),
+        replicate_index,
+        stream_id: Uuid::from_u128(stream),
+        value,
+        from_mean: false,
+    }
+}
+
+#[test]
+fn test_chosen_input_prefers_continuous_over_spot() {
+    let candidates = [
+        candidate(Some("spot"), 0, 1, 4.0),
+        candidate(Some("continuous"), 0, 2, 7.0),
+    ];
+    assert_eq!(chosen_input(&candidates).map(|c| c.value), Some(7.0));
+}
+
+#[test]
+fn test_chosen_input_reads_null_measurement_type_as_continuous() {
+    let candidates = [
+        candidate(Some("spot"), 0, 1, 4.0),
+        candidate(None, 0, 2, 7.0),
+    ];
+    assert_eq!(chosen_input(&candidates).map(|c| c.value), Some(7.0));
+}
+
+#[test]
+fn test_chosen_input_takes_lowest_replicate_then_lowest_stream() {
+    let candidates = [
+        candidate(Some("spot"), 1, 1, 5.0),
+        candidate(Some("spot"), 0, 3, 6.0),
+        candidate(Some("spot"), 0, 2, 4.0),
+    ];
+    assert_eq!(chosen_input(&candidates).map(|c| c.value), Some(4.0));
+}
+
+#[test]
+fn test_chosen_input_empty_slot() {
+    assert!(chosen_input(&[]).is_none());
+}

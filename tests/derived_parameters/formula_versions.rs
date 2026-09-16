@@ -243,6 +243,39 @@ async fn a_formula_value_resolves_the_calculation_that_produced_it() {
     assert_eq!(calc["version_no"], 1);
     assert_eq!(calc["active_version_no"], 1);
     assert!(calc["content_hash"].is_string());
+    assert!(
+        calc.get("tool_script_id").is_none(),
+        "a standalone formula belongs to no calculation: {body}"
+    );
+
+    // A formula a calculation owns names that calculation, so the record opens its page.
+    let script = db
+        .query_one_raw(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM tool_scripts ORDER BY created_at LIMIT 1",
+        ))
+        .await
+        .expect("script query")
+        .expect("a seeded tool script")
+        .try_get::<Uuid>("", "id")
+        .expect("script id");
+    db.execute_unprepared(&format!(
+        "UPDATE calculation_formulas SET tool_script_id = '{script}' WHERE output_parameter_id = '{parameter}'"
+    ))
+    .await
+    .expect("own the formula");
+    let (status, body) = crate::common::get_json_with_token(&app, &uri, &token).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["records"][0]["calculation"]["tool_script_id"],
+        script.to_string(),
+        "{body}"
+    );
+    db.execute_unprepared(&format!(
+        "UPDATE calculation_formulas SET tool_script_id = NULL WHERE output_parameter_id = '{parameter}'"
+    ))
+    .await
+    .expect("release the formula");
 
     // A value stored before versioning names none, and the record says so rather than naming
     // today's formula.
