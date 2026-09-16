@@ -1,9 +1,7 @@
 //! The period statistics table the portals rendered under every time series.
 //!
 //! Time Points, N, NA's, Median, Mean, SD, Min and Max per parameter over the displayed range,
-//! computed in SQL over the values the API serves. Both divisors travel, because a period sd
-//! belongs to no slot's declaration and an unlabelled one is what let the browser and the portal
-//! disagree.
+//! computed in SQL over the values the API serves. The SD is the sample sd, R's `sd()`.
 //!
 //! Run: cargo test --test sites period_statistics -- --test-threads=1
 
@@ -70,11 +68,10 @@ async fn statistics(app: &axum::Router, token: &str, extra: &str) -> serde_json:
     body
 }
 
-/// Expected behaviour: the portal's eight rows, over the continuous series, with both divisors
-/// named rather than one unlabelled number.
+/// Expected behaviour: the portal's eight rows, over the continuous series, with the sample sd.
 #[tokio::test]
 #[serial]
-async fn a_continuous_period_reports_the_portal_s_rows_with_both_divisors() {
+async fn a_continuous_period_reports_the_portal_s_rows_with_the_sample_sd() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -96,11 +93,7 @@ async fn a_continuous_period_reports_the_portal_s_rows_with_both_divisors() {
         (146.0f64 / 3.0 / 2.0).sqrt(),
         "the n-1 standard deviation",
     );
-    close(
-        row["stdev_population"].as_f64(),
-        (146.0f64 / 3.0 / 3.0).sqrt(),
-        "the n standard deviation",
-    );
+    assert!(row.get("stdev_population").is_none(), "{row}");
     assert!(row["units"].is_string(), "the rows name their unit: {row}");
 }
 
@@ -164,11 +157,11 @@ async fn an_unknown_cadence_is_refused() {
     );
 }
 
-/// Expected behaviour: an exported standard deviation names the divisor that produced it, in the
-/// column beside it. Q30 puts the estimator next to every published sd; an export is a publication.
+/// Expected behaviour: an export carries the sample sd and the other statistics, and no divisor
+/// column, because there is one divisor.
 #[tokio::test]
 #[serial]
-async fn an_exported_sd_names_its_divisor() {
+async fn an_export_carries_the_statistics_without_a_divisor_column() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -203,19 +196,12 @@ async fn an_exported_sd_names_its_divisor() {
 
     let header = csv.lines().next().expect("a header row");
     assert!(
-        header.contains("_sd_estimator"),
-        "the divisor travels beside the sd: {header}"
+        header.contains("_sd"),
+        "the sd travels with the mean: {header}"
     );
+    assert!(!header.contains("_sd_estimator"), "{header}");
     assert!(
         header.contains("_median"),
         "the median travels with the other statistics: {header}"
-    );
-    let row = csv
-        .lines()
-        .find(|l| l.contains("2025-04-01"))
-        .expect("the group's row");
-    assert!(
-        row.contains("sample"),
-        "the fallback divisor is named as itself: {row}"
     );
 }

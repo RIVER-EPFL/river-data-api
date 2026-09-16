@@ -390,31 +390,6 @@ impl crudcrate::CRUDOperations for SyncServiceOperations {
 
 /// The rows this file's raw queries return. Derived rather than hand-decoded so a column added to
 /// a query and not to its reader is a compile error rather than a field silently left behind.
-#[derive(FromQueryResult)]
-pub(super) struct ProbeCounts {
-    pub(super) old_readings: i64,
-    pub(super) missing: i64,
-}
-
-#[derive(FromQueryResult)]
-pub(super) struct ReconciliationSlotRow {
-    pub(super) site_parameter_id: Uuid,
-    pub(super) stream_id: Uuid,
-    pub(super) source_system: String,
-    pub(super) source_key: String,
-    pub(super) site_id: Uuid,
-    pub(super) site_name: String,
-    pub(super) parameter_id: Uuid,
-    pub(super) parameter_name: String,
-}
-
-#[derive(FromQueryResult)]
-pub(super) struct StreamExtent {
-    pub(super) readings: i64,
-    pub(super) first: Option<chrono::DateTime<chrono::Utc>>,
-    pub(super) last: Option<chrono::DateTime<chrono::Utc>>,
-}
-
 /// Confine a hold action to the caller's projects, resolved through the stream's paired site,
 /// as the readings flag handlers do. An unpaired stream's hold (deferred) belongs to no project,
 /// so it is actionable only by a caller without project restriction.
@@ -485,7 +460,7 @@ pub const DEFAULT_ABS_TOL: f64 = 1e-4;
 /// The standard deviation gets a looser bound than the mean: against real portal data the stored
 /// sd routinely disagrees with a recompute from its own replicate cells at the 1e-5 relative
 /// level (FLOAT storage, historical R rounding chains), and a hold per micro-mismatch would bury
-/// the real findings. A genuinely wrong sd (population-vs-sample, stale after an edit) sits at
+/// the real findings. A genuinely wrong sd (n divisor against n-1, stale after an edit) sits at
 /// percent level and still trips this.
 pub const SD_REL_TOL: f64 = 1e-3;
 
@@ -508,7 +483,7 @@ pub fn tolerance_bound(e: f64, c: f64, rel_tol: f64, abs_tol: f64) -> f64 {
 }
 
 /// SQL for the same bound between two value expressions, with the relative tolerance bound as
-/// `rel_bind`. The one producer of the tolerance in SQL form; the reconciliation verifier uses it.
+/// `rel_bind`. The one producer of the tolerance in SQL form.
 #[must_use]
 pub fn bound_sql(a: &str, b: &str, rel_bind: &str, abs_tol: f64) -> String {
     format!("GREATEST({rel_bind} * GREATEST(abs({a}), abs({b})), {abs_tol}, {QUANTUM_FLOOR})")
@@ -519,28 +494,8 @@ pub fn bound_sql(a: &str, b: &str, rel_bind: &str, abs_tol: f64) -> String {
 pub struct GroupStats {
     pub n: usize,
     pub mean: Option<f64>,
-    /// The standard deviation under the slot's declared divisor, sample (n-1) by default. None
-    /// below n=2 under either.
+    /// The sample standard deviation (n-1). None below n=2.
     pub sd: Option<f64>,
-}
-
-impl GroupStats {
-    /// The same group under the population divisor: `s * sqrt((n-1)/n)`.
-    ///
-    /// The audit compares against whichever divisor the slot declares, so a slot that has declared
-    /// `population` stops holding these groups instead of holding every one of them forever.
-    #[must_use]
-    pub fn under(self, estimator: &str) -> Self {
-        if estimator != "population" || self.n < 2 {
-            return self;
-        }
-        #[allow(clippy::cast_precision_loss)]
-        let factor = (((self.n - 1) as f64) / self.n as f64).sqrt();
-        Self {
-            sd: self.sd.map(|sd| sd * factor),
-            ..self
-        }
-    }
 }
 
 #[must_use]
@@ -644,8 +599,6 @@ pub struct GroupMismatch {
     pub computed_mean: Option<f64>,
     pub computed_sd: Option<f64>,
     pub n: usize,
-    /// The divisor `computed_sd` was computed under, 'sample' or 'population'.
-    pub sd_estimator: String,
     /// The stored values the statistics were computed over, each at its replicate index.
     pub values: Vec<ReplicateValue>,
 }
@@ -1010,7 +963,6 @@ pub async fn upsert_stats_hold<C: ConnectionTrait>(
         "mean": mismatch.computed_mean,
         "sd": mismatch.computed_sd,
         "n": mismatch.n,
-        "sd_estimator": mismatch.sd_estimator,
         "values": mismatch.values,
     });
     let mut delta = serde_json::json!({
@@ -1081,17 +1033,17 @@ pub fn classify(expected: &serde_json::Value, computed: &serde_json::Value) -> &
     let expected_sd = f64_at(expected, "sd");
     let computed_mean = f64_at(computed, "mean");
     let computed_sd = f64_at(computed, "sd");
-    // A population-divisor sd relates to the sample one by sqrt((n-1)/n). The signature claims
+    // An n-divisor sd relates to the sample one by sqrt((n-1)/n). The signature claims
     // the sd is the ONLY disagreement, so it requires the means to agree: a wrong mean with a
-    // coincidentally population-shaped sd is not explained by the divisor.
+    // coincidentally n-divisor-shaped sd is not explained by the divisor.
     if let (Some(esd), Some(csd), Some(n)) = (expected_sd, computed_sd, computed_n)
         && n >= 2
         && stats_agree(expected_mean, computed_mean, DEFAULT_REL_TOL)
     {
         #[allow(clippy::cast_precision_loss)]
-        let population = csd * (((n - 1) as f64) / n as f64).sqrt();
-        if stats_agree_with(Some(esd), Some(population), SD_REL_TOL, SD_ABS_TOL) {
-            return "population_sd";
+        let n_divisor = csd * (((n - 1) as f64) / n as f64).sqrt();
+        if stats_agree_with(Some(esd), Some(n_divisor), SD_REL_TOL, SD_ABS_TOL) {
+            return "source_sd_matches_n_divisor";
         }
     }
     // A stale cell frozen over the first k replicates before later ones were entered.
@@ -1192,13 +1144,14 @@ fn bound_expr(a: Expr, b: Expr, rel_tol: f64, abs_tol: f64) -> Expr {
     ])
 }
 
-/// The population-divisor signature, over the alias `h` (`replicate_audit_holds`).
+/// The source-sd-matches-n-divisor signature, over the alias `h` (`replicate_audit_holds`).
 ///
-/// It reproduces exactly the arm [`classify`] returns `population_sd` from: the replicate counts
-/// agree (so `n_mismatch` cannot preempt it), the means agree, and the source's sd is our sd under
-/// the other divisor, `s * sqrt((n-1)/n)`. The prefix search behind `stale_subset` has no built
-/// spelling, but it is tested after this arm, so a row matching here is `population_sd` in both.
-pub fn population_sd_expr() -> Condition {
+/// It reproduces exactly the arm [`classify`] returns `source_sd_matches_n_divisor` from: the
+/// replicate counts agree (so `n_mismatch` cannot preempt it), the means agree, and the source's sd
+/// is our sd under the other divisor, `s * sqrt((n-1)/n)`. The prefix search behind `stale_subset`
+/// has no built spelling, but it is tested after this arm, so a row matching here is
+/// `source_sd_matches_n_divisor` in both.
+pub fn source_sd_matches_n_divisor_expr() -> Condition {
     use sea_orm::sea_query::extension::postgres::PgExpr as _;
     let expected_n =
         Expr::col((Alias::new("h"), hold_model::Column::Expected)).cast_json_field("n");
@@ -1207,7 +1160,7 @@ pub fn population_sd_expr() -> Condition {
     let expected_mean = statistic(hold_model::Column::Expected, "mean");
     let computed_mean = statistic(hold_model::Column::Computed, "mean");
     let expected_sd = statistic(hold_model::Column::Expected, "sd");
-    let population_sd = statistic(hold_model::Column::Computed, "sd").mul(sqrt(
+    let n_divisor_sd = statistic(hold_model::Column::Computed, "sd").mul(sqrt(
         statistic(hold_model::Column::Computed, "n")
             .sub(Expr::val(1))
             .div(statistic(hold_model::Column::Computed, "n")),
@@ -1234,9 +1187,9 @@ pub fn population_sd_expr() -> Condition {
         .add(json_present(hold_model::Column::Expected, "sd"))
         .add(json_present(hold_model::Column::Computed, "sd"))
         .add(
-            abs(expected_sd.clone().sub(population_sd.clone())).lte(bound_expr(
+            abs(expected_sd.clone().sub(n_divisor_sd.clone())).lte(bound_expr(
                 expected_sd,
-                population_sd,
+                n_divisor_sd,
                 SD_REL_TOL,
                 SD_ABS_TOL,
             )),
@@ -1269,46 +1222,48 @@ fn coalesce_zero(e: Expr) -> Expr {
     Func::coalesce([e, Expr::val(0)]).into()
 }
 
-/// The population-divisor signature, in SQL, over the alias `h` (`replicate_audit_holds`).
+/// The source-sd-matches-n-divisor signature, in SQL, over the alias `h` (`replicate_audit_holds`).
 ///
-/// It reproduces exactly the arm [`classify`] returns `population_sd` from: the replicate counts
-/// agree (so `n_mismatch` cannot preempt it), the means agree, and the source's sd is our sd under
-/// the other divisor, `s * sqrt((n-1)/n)`. The prefix search behind `stale_subset` has no SQL
-/// spelling, but it is tested after this arm, so a row matching here is `population_sd` in both.
+/// It reproduces exactly the arm [`classify`] returns `source_sd_matches_n_divisor` from: the
+/// replicate counts agree (so `n_mismatch` cannot preempt it), the means agree, and the source's sd
+/// is our sd under the other divisor, `s * sqrt((n-1)/n)`. The prefix search behind `stale_subset`
+/// has no SQL spelling, but it is tested after this arm, so a row matching here is
+/// `source_sd_matches_n_divisor` in both.
 /// `the_sql_signature_and_classify_agree` pins that.
 ///
 /// Built from [`bound_sql`] and the same tolerance constants the in-process comparison uses, so
 /// the two spellings cannot drift. One producer: the list filter, the resolution gate, the bulk
 /// skip and the declaration counts all read this, so what the UI counts and what the gate blocks
 /// can never disagree.
-pub static POPULATION_SD_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let expected_mean = "(h.expected->>'mean')::float8";
-    let computed_mean = "(h.computed->>'mean')::float8";
-    let expected_sd = "(h.expected->>'sd')::float8";
-    let population_sd = "((h.computed->>'sd')::float8 \
+pub static SOURCE_SD_MATCHES_N_DIVISOR_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        let expected_mean = "(h.expected->>'mean')::float8";
+        let computed_mean = "(h.computed->>'mean')::float8";
+        let expected_sd = "(h.expected->>'sd')::float8";
+        let n_divisor_sd = "((h.computed->>'sd')::float8 \
                          * sqrt(((h.computed->>'n')::float8 - 1) / (h.computed->>'n')::float8))";
-    let mean_bound = bound_sql(
-        expected_mean,
-        computed_mean,
-        &DEFAULT_REL_TOL.to_string(),
-        DEFAULT_ABS_TOL,
-    );
-    let sd_bound = bound_sql(
-        expected_sd,
-        population_sd,
-        &SD_REL_TOL.to_string(),
-        SD_ABS_TOL,
-    );
-    format!(
-        "((h.expected->>'n') IS NULL \
+        let mean_bound = bound_sql(
+            expected_mean,
+            computed_mean,
+            &DEFAULT_REL_TOL.to_string(),
+            DEFAULT_ABS_TOL,
+        );
+        let sd_bound = bound_sql(
+            expected_sd,
+            n_divisor_sd,
+            &SD_REL_TOL.to_string(),
+            SD_ABS_TOL,
+        );
+        format!(
+            "((h.expected->>'n') IS NULL \
            OR (h.expected->>'n')::int = (h.computed->>'n')::int) \
          AND (h.computed->>'n')::int >= 2 \
          AND (h.expected->>'mean') IS NOT NULL AND (h.computed->>'mean') IS NOT NULL \
          AND abs({expected_mean} - {computed_mean}) <= {mean_bound} \
          AND (h.expected->>'sd') IS NOT NULL AND (h.computed->>'sd') IS NOT NULL \
-         AND abs({expected_sd} - {population_sd}) <= {sd_bound}"
-    )
-});
+         AND abs({expected_sd} - {n_divisor_sd}) <= {sd_bound}"
+        )
+    });
 
 // --- The review queue's statements ---
 
@@ -1327,12 +1282,6 @@ fn hold_col(column: hold_model::Column) -> Expr {
 /// A column of the hold's stream, under the alias `ds`.
 fn stream_col(column: data_streams::models::Column) -> Expr {
     Expr::col((Alias::new("ds"), column))
-}
-
-/// `h.<doc>-><name>` as text, for a value the hold records that is not a statistic.
-fn json_text(column: hold_model::Column, name: &str) -> Expr {
-    use sea_orm::sea_query::extension::postgres::PgExpr as _;
-    Expr::col((Alias::new("h"), column)).cast_json_field(name)
 }
 
 /// `COUNT(*) FILTER (WHERE condition)`, as a count over a CASE that is NULL where the condition
@@ -1387,29 +1336,6 @@ fn holds_in_scope(scope: &AccessScope) -> Option<Condition> {
     Some(Condition::any().add(paired).add(own_site))
 }
 
-/// Whether the slot behind the hold's stream declares an sd estimator.
-fn estimator_declared_expr() -> Expr {
-    Expr::exists(
-        SeaQuery::select()
-            .expr(Expr::val(1))
-            .from_as(site_parameters::Entity, Alias::new("sp_declared"))
-            .and_where(
-                Expr::col((Alias::new("sp_declared"), site_parameters::Column::Id)).equals((
-                    Alias::new("ds"),
-                    data_streams::models::Column::SiteParameterId,
-                )),
-            )
-            .and_where(
-                Expr::col((
-                    Alias::new("sp_declared"),
-                    site_parameters::Column::SdEstimator,
-                ))
-                .is_not_null(),
-            )
-            .to_owned(),
-    )
-}
-
 /// The filters the queue's three statements share: the caller's project confinement, the identity
 /// and source filters, the three relative-delta ceilings and the two classification arms.
 ///
@@ -1453,16 +1379,18 @@ pub fn hold_filters(scope: &AccessScope, query: &ListHoldsQuery) -> AppResult<Co
     let replicate_stats =
         || hold_col(hold_model::Column::Kind).eq(HoldKind::ReplicateStats.as_str());
     match query.classification.as_deref() {
-        Some("population_sd") => {
-            filters = filters.add(replicate_stats()).add(population_sd_expr());
+        Some("source_sd_matches_n_divisor") => {
+            filters = filters
+                .add(replicate_stats())
+                .add(source_sd_matches_n_divisor_expr());
         }
-        Some("not_population_sd") => {
+        Some("not_source_sd_matches_n_divisor") => {
             // COALESCE, not a bare NOT: a hold missing a statistic leaves the signature NULL, and
-            // a NULL is not the population signature, so it belongs to the complement. This is
+            // a NULL is not the n-divisor signature, so it belongs to the complement. This is
             // what makes the two filters partition the replicate-stats holds exactly.
             filters = filters.add(replicate_stats()).add(
                 Expr::from(Func::coalesce([
-                    Expr::from(population_sd_expr()),
+                    Expr::from(source_sd_matches_n_divisor_expr()),
                     Expr::val(false),
                 ]))
                 .not(),
@@ -1470,24 +1398,70 @@ pub fn hold_filters(scope: &AccessScope, query: &ListHoldsQuery) -> AppResult<Co
         }
         Some(other) => {
             return Err(AppError::BadRequest(format!(
-                "classification '{other}' has no filter; only 'population_sd' and \
-                 'not_population_sd' are filterable"
+                "classification '{other}' has no filter; only 'source_sd_matches_n_divisor' and \
+                 'not_source_sd_matches_n_divisor' are filterable"
             )));
         }
         None => {}
     }
-    match query.estimator_declared {
-        Some(true) => filters = filters.add(estimator_declared_expr()),
-        Some(false) => filters = filters.add(estimator_declared_expr().not()),
-        None => {}
+    if let Some(kinds) = query.kind.as_deref() {
+        let names = HoldKind::parse_list(kinds)?
+            .into_iter()
+            .map(HoldKind::as_str);
+        filters = filters.add(hold_col(hold_model::Column::Kind).is_in(names));
+    }
+    if let Some(tool) = query.tool.clone() {
+        filters = filters.add(hold_col(hold_model::Column::Tool).eq(tool));
+    }
+    if let Some(site_id) = query.site_id {
+        filters = filters.add(hold_at_slot(
+            hold_model::Column::SiteId,
+            site_parameters::Column::SiteId,
+            site_id,
+        ));
+    }
+    if let Some(parameter_id) = query.parameter_id {
+        filters = filters.add(hold_at_slot(
+            hold_model::Column::ParameterId,
+            site_parameters::Column::ParameterId,
+            parameter_id,
+        ));
+    }
+    if let Some(from) = query.from {
+        filters = filters.add(hold_col(hold_model::Column::GroupTime).gte(from));
+    }
+    if let Some(to) = query.to {
+        filters = filters.add(hold_col(hold_model::Column::GroupTime).lt(to));
     }
     Ok(filters)
 }
 
-/// The status view the page asks for: one status, the `resolved` set, or the pending queue.
+/// The hold names `id` in `own`, or its stream is paired into a slot whose `paired` is `id`.
+fn hold_at_slot(own: hold_model::Column, paired: site_parameters::Column, id: Uuid) -> Condition {
+    let through_pairing = Expr::exists(
+        SeaQuery::select()
+            .expr(Expr::val(1))
+            .from_as(site_parameters::Entity, Alias::new("sp_slot"))
+            .and_where(
+                Expr::col((Alias::new("sp_slot"), site_parameters::Column::Id)).equals((
+                    Alias::new("ds"),
+                    data_streams::models::Column::SiteParameterId,
+                )),
+            )
+            .and_where(Expr::col((Alias::new("sp_slot"), paired)).eq(id))
+            .to_owned(),
+    );
+    Condition::any()
+        .add(hold_col(own).eq(id))
+        .add(through_pairing)
+}
+
+/// The status view the page asks for: one status, the `resolved` set, every status, or the
+/// pending queue.
 pub fn hold_status_condition(status: Option<&str>) -> AppResult<Condition> {
     let column = hold_col(hold_model::Column::Status);
     match status {
+        Some("any") => Ok(Condition::all()),
         Some("resolved") => {
             Ok(Condition::all().add(column.is_in(HoldStatus::RESOLVED.iter().map(|s| s.as_str()))))
         }
@@ -1560,21 +1534,6 @@ pub fn hold_kind_counts_statement(filters: &Condition) -> SelectStatement {
     q.take()
 }
 
-/// The divisor the hold's sd was computed under: recorded on the hold, else the slot's
-/// declaration, else the sample divisor. A hold of another kind carries no estimator at all.
-fn estimator_of_hold(sp: &Alias) -> Expr {
-    sea_orm::sea_query::CaseStatement::new()
-        .case(
-            hold_col(hold_model::Column::Kind).eq(HoldKind::ReplicateStats.as_str()),
-            Func::coalesce([
-                json_text(hold_model::Column::Computed, "sd_estimator"),
-                Expr::col((sp.clone(), site_parameters::Column::SdEstimator)),
-                Expr::val("sample"),
-            ]),
-        )
-        .into()
-}
-
 /// One page of the queue, with the slot labels a reviewer reads a hold by. A stream-less finding
 /// carries its own site and parameter, so each label falls back to the pair the hold names.
 pub fn hold_list_statement(
@@ -1589,6 +1548,7 @@ pub fn hold_list_statement(
     let parameter = Alias::new("p");
     let event_site = Alias::new("es");
     let event_parameter = Alias::new("ep");
+    let event_slot = Alias::new("esp");
     let mut q = holds_with_stream();
     q.join_as(
         JoinType::LeftJoin,
@@ -1626,6 +1586,20 @@ pub fn hold_list_statement(
         event_parameter.clone(),
         Expr::col((event_parameter.clone(), parameters::Column::Id))
             .equals((Alias::new("h"), hold_model::Column::ParameterId)),
+    )
+    .join_as(
+        JoinType::LeftJoin,
+        site_parameters::Entity,
+        event_slot.clone(),
+        Condition::all()
+            .add(
+                Expr::col((event_slot.clone(), site_parameters::Column::SiteId))
+                    .equals((Alias::new("h"), hold_model::Column::SiteId)),
+            )
+            .add(
+                Expr::col((event_slot.clone(), site_parameters::Column::ParameterId))
+                    .equals((Alias::new("h"), hold_model::Column::ParameterId)),
+            ),
     );
     for column in [
         hold_model::Column::Id,
@@ -1647,6 +1621,13 @@ pub fn hold_list_statement(
             Expr::col((event_site.clone(), sites::Column::Id)),
         ]),
         Alias::new("site_id"),
+    )
+    .expr_as(
+        Func::coalesce([
+            stream_col(data_streams::models::Column::SiteParameterId),
+            Expr::col((event_slot, site_parameters::Column::Id)),
+        ]),
+        Alias::new("site_parameter_id"),
     )
     .expr_as(
         Func::coalesce([
@@ -1688,8 +1669,7 @@ pub fn hold_list_statement(
     q.expr_as(
         Expr::val("").cast_as(Alias::new("text")),
         Alias::new("classification"),
-    )
-    .expr_as(estimator_of_hold(&sp), Alias::new("sd_estimator"));
+    );
     for column in [
         hold_model::Column::Resolution,
         hold_model::Column::CreatedAt,
@@ -1740,29 +1720,11 @@ pub(super) struct HoldCountsRow {
 }
 
 #[derive(FromQueryResult)]
-pub(super) struct EstimatorGateRow {
-    pub(super) expected_sd: Option<f64>,
-    pub(super) computed_sd: Option<f64>,
-    pub(super) site_name: Option<String>,
-    pub(super) parameter_name: Option<String>,
-}
-
-#[derive(FromQueryResult)]
 pub(super) struct FlagHoldRow {
     pub(super) stream_id: Uuid,
     pub(super) group_time: sea_orm::prelude::DateTimeWithTimeZone,
     pub(super) resolution: Option<serde_json::Value>,
     pub(super) computed: serde_json::Value,
-}
-
-#[derive(FromQueryResult)]
-pub(super) struct EstimatorHoldRow {
-    pub(super) group_time: sea_orm::prelude::DateTimeWithTimeZone,
-    pub(super) site_parameter_id: Uuid,
-    pub(super) site_id: Uuid,
-    pub(super) parameter_id: Uuid,
-    pub(super) previous: Option<String>,
-    pub(super) resolution: Option<serde_json::Value>,
 }
 
 #[derive(FromQueryResult)]
@@ -1772,9 +1734,6 @@ pub(super) struct ReopenHoldRow {
     pub(super) status: String,
     pub(super) paired: bool,
     pub(super) resolution: Option<serde_json::Value>,
-    pub(super) site_parameter_id: Option<Uuid>,
-    pub(super) site_id: Option<Uuid>,
-    pub(super) parameter_id: Option<Uuid>,
 }
 
 /// SQL fragment producing the accept-ours resolution object (actor and time stamped on the
@@ -1853,24 +1812,6 @@ pub(super) async fn delete_audit_annotations<C: ConnectionTrait>(
     Ok(())
 }
 
-/// Declare a slot's sd estimator, or clear it back to undeclared when a reopened hold restores
-/// what was there before the declaration.
-pub(super) async fn set_slot_estimator<C: ConnectionTrait>(
-    conn: &C,
-    site_parameter_id: Uuid,
-    estimator: Option<String>,
-) -> AppResult<()> {
-    site_parameters::models::Entity::update_many()
-        .col_expr(
-            site_parameters::models::Column::SdEstimator,
-            Expr::value(estimator),
-        )
-        .filter(site_parameters::models::Column::Id.eq(site_parameter_id))
-        .exec(conn)
-        .await?;
-    Ok(())
-}
-
 /// The numbers a hold disagrees over, phrased for an annotation: what the source stored against
 /// what the replicates produce.
 pub(super) fn disagreement_phrase(
@@ -1907,67 +1848,11 @@ pub(super) async fn hold_numbers<C: ConnectionTrait>(
         )
 }
 
-/// Refuse to let a population-divisor disagreement be accepted on a slot that has not declared
-/// which divisor it publishes.
-///
-/// The classification is evidence about the source, not a decision: the sources used both formulas
-/// over the years, so "their sd is ours under the other divisor" says the convention is unstated
-/// here, not which one is right. Accepting would file that under "our number stands" and lose the
-/// question. `flag` is not gated (a bad replicate is a separate judgement), nor is any hold on a
-/// slot that has declared (a remaining disagreement there is a genuine finding).
-pub(super) async fn refuse_undeclared_estimator(
-    db: &sea_orm::DatabaseConnection,
-    hold_id: Uuid,
-) -> AppResult<()> {
-    let population_sd = &*POPULATION_SD_SQL;
-    let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT (h.expected->>'sd')::float8 AS expected_sd,
-                        (h.computed->>'sd')::float8 AS computed_sd,
-                        st.name AS site_name, p.name AS parameter_name
-                 FROM replicate_audit_holds h
-                 JOIN data_streams ds ON ds.id = h.stream_id
-                 JOIN site_parameters sp ON sp.id = ds.site_parameter_id
-                 JOIN sites st ON st.id = sp.site_id
-                 JOIN parameters p ON p.id = sp.parameter_id
-                 WHERE h.id = $1 AND h.kind = '{REPLICATE_STATS}'
-                   AND sp.sd_estimator IS NULL AND ({population_sd})",
-                REPLICATE_STATS = HoldKind::ReplicateStats.as_str()
-            ),
-            [hold_id.into()],
-        ))
-        .await?;
-    let Some(row) = row else { return Ok(()) };
-    let EstimatorGateRow {
-        expected_sd,
-        computed_sd,
-        site_name,
-        parameter_name,
-    } = EstimatorGateRow::from_query_result(&row, "")?;
-    let slot = format!(
-        "{} / {}",
-        site_name.as_deref().unwrap_or("this site"),
-        parameter_name.as_deref().unwrap_or("this parameter"),
-    );
-    Err(AppError::Conflict(format!(
-        "This disagreement cannot be accepted yet. The source's sd ({}) is this group's sd under \
-         the population formula (divisor n); ours ({}) uses the sample formula (divisor n-1). \
-         {slot} has not declared which one it publishes, so accepting would leave that unrecorded. \
-         Resolve with mode 'estimator' naming 'sample' or 'population', scoped to the parameter or \
-         to this instant, or flag the replicates instead.",
-        expected_sd.map_or_else(|| "none".to_string(), |v| format!("{v:.4}")),
-        computed_sd.map_or_else(|| "none".to_string(), |v| format!("{v:.4}")),
-    )))
-}
-
 /// Accept the statistics recomputed from the stored replicates: the hold goes terminal, the
 /// decision is recorded on it, and the annotation that draws it on the chart is minted. Both the
 /// acknowledge route and `resolve {mode: "ours"}` are this and nothing else; only the response
 /// they build differs.
 pub(super) async fn accept_ours(state: &AppState, id: Uuid, by: &str) -> AppResult<()> {
-    refuse_undeclared_estimator(&state.db, id).await?;
     // The resolution expression names the row as `h`, so the statement aliases the table.
     let (sql, values) = SeaQuery::update()
         .table(
@@ -2162,7 +2047,6 @@ pub(super) async fn rule_on_visit(
     state.response_cache.invalidate_all();
     Ok(Json(ResolveHoldResponse {
         status: status.to_string(),
-        job_id: None,
         samples_affected: Some(i64::try_from(withdrawn).unwrap_or(i64::MAX)),
     }))
 }
@@ -2267,7 +2151,6 @@ pub(super) async fn rule_on_entry(
     .await?;
     Ok(Json(ResolveHoldResponse {
         status: status.to_string(),
-        job_id: None,
         samples_affected: Some(i64::try_from(decided).unwrap_or(i64::MAX)),
     }))
 }
@@ -2435,24 +2318,14 @@ pub struct PlanEntry {
     /// decision the plan has to settle rather than report.
     #[serde(default)]
     pub instrument: Option<PlanInstrumentRef>,
-    /// The divisor this slot will publish its replicate standard deviation with, chosen in the
-    /// review. Applied to the `site_parameters` row when the plan is applied; left unset, the slot
-    /// stays undeclared and its audit disagreements are held for a decision instead.
-    #[serde(default)]
-    pub sd_estimator: Option<String>,
     /// The decimal places the source declared for this stream, written onto the slot on apply
     /// where the slot declares none. An operator's declaration on the slot is never overwritten.
     #[serde(default)]
     pub decimal_places: Option<i16>,
-    /// The evidence for that choice: open replicate-statistics holds on this stream, and how many
-    /// of them match the population signature. Written at plan creation so the review shows what
-    /// the incoming data reports rather than only that a question exists.
+    /// Open replicate-statistics holds on this stream, written at plan creation.
     #[serde(default)]
     #[schema(required)]
     pub sd_holds: i64,
-    #[serde(default)]
-    #[schema(required)]
-    pub sd_population_holds: i64,
     /// A person has looked at this entry and agreed with it. Set explicitly, never inferred from
     /// an edit: an operator who toggles a parameter group to skip and back has decided nothing.
     /// Only [`ReviewState::NeedsChecking`] entries wait on it; a fully matched entry with no
@@ -2495,7 +2368,7 @@ pub struct ExistingParamRef {
 /// so a warning always reads as something even where the structure is not used.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanWarning {
-    /// `units_mismatch` | `empty_name` | `near_duplicate` | `sd_estimator_undeclared`.
+    /// `units_mismatch` | `empty_name` | `near_duplicate`.
     pub kind: String,
     pub message: String,
     #[serde(default)]
@@ -2550,32 +2423,6 @@ impl PlanWarning {
             kind: "empty_name".to_string(),
             message: "site or parameter name is empty".to_string(),
             parameter: None,
-            existing: None,
-            source_units: None,
-        }
-    }
-
-    /// This source ships its own precomputed standard deviation and nothing has declared which
-    /// divisor it uses. The pairing is where that can first be asked, so it is asked here, with
-    /// the open holds matching the population signature as the evidence; leaving it unset is
-    /// allowed and the audit gate is the backstop.
-    pub fn sd_estimator_undeclared(parameter: &str, population_holds: i64) -> Self {
-        let message = if population_holds == 0 {
-            format!(
-                "'{parameter}' ships its own standard deviation and no divisor is declared for \
-                 it. Declare which one this source uses."
-            )
-        } else {
-            format!(
-                "{population_holds} incoming standard deviation{} for '{parameter}' match the \
-                 population divisor (n), not ours. Declare which one this source uses.",
-                if population_holds == 1 { "" } else { "s" }
-            )
-        };
-        Self {
-            kind: "sd_estimator_undeclared".to_string(),
-            message,
-            parameter: Some(parameter.to_string()),
             existing: None,
             source_units: None,
         }
@@ -3021,10 +2868,9 @@ pub fn stream_instrument_key(stream: &data_streams::Model) -> String {
 /// The instrument a source parameter resolves to, for the feeds that name no curve column.
 ///
 /// The source's own instrument under the key an apply mints ([`stream_instrument_key`]) when it has
-/// one, and otherwise that same key proposed for creation, pre-agreed. Every stream is paired with
-/// an instrument, so the review's default is the suggestion rather than a question: an operator who
-/// wants another instrument attaches it, and one who wants none has nothing to pair. `parameter`
-/// names the proposal, it does not key it.
+/// one, and otherwise that same key proposed for creation, unconfirmed: the plan suggests and a
+/// person confirms, one row at a time or all at once. `parameter` names the proposal, it does not
+/// key it.
 pub fn resolve_parameter_instrument(
     source_key: String,
     parameter: &str,
@@ -3060,9 +2906,7 @@ pub fn resolve_parameter_instrument(
         resolved_by: "parameter".to_string(),
         create: true,
         defaulted: false,
-        // A name an instrument already carries is a decision, not a proposal: the readings would
-        // join a row that already holds data, so the operator says which they meant.
-        confirmed: conflict.is_none(),
+        confirmed: false,
         stamps_readings: false,
         curves: vec![],
         proposed_name: Some(name),
@@ -3386,22 +3230,18 @@ pub async fn create_plan(
     let named_instruments: Vec<Uuid> = streams.iter().filter_map(|s| s.sensor_id).collect();
     let instruments = load_instrument_catalog(db, source_system, &named_instruments).await?;
 
-    // Divisor evidence per stream: its open replicate-statistics holds and how many carry the
-    // population signature. The same signature SQL the audit list and gate use, so the numbers
-    // the review quotes cannot disagree with the queue.
+    // Open replicate-statistics holds per stream, quoted by the review.
     let stream_ids: Vec<Uuid> = streams.iter().map(|s| s.id).collect();
-    let sd_evidence: std::collections::HashMap<Uuid, (i64, i64)> = db
+    let sd_evidence: std::collections::HashMap<Uuid, i64> = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "SELECT h.stream_id, count(*) AS holds, \
-                        count(*) FILTER (WHERE {}) AS population \
+                "SELECT h.stream_id, count(*) AS holds \
                  FROM replicate_audit_holds h \
                  WHERE h.kind = '{REPLICATE_STATS}' \
                    AND h.status IN {open} \
                    AND h.stream_id = ANY($1) \
                  GROUP BY h.stream_id",
-                *POPULATION_SD_SQL,
                 REPLICATE_STATS = HoldKind::ReplicateStats.as_str(),
                 open = *OPEN
             ),
@@ -3411,23 +3251,7 @@ pub async fn create_plan(
         .iter()
         .filter_map(|r| {
             let r = HoldCountRow::from_query_result(r, "").ok()?;
-            Some((r.stream_id, (r.holds, r.population)))
-        })
-        .collect();
-
-    // Slots that already declare a divisor. A declaration is owned by the slot, so an entry landing
-    // on one adopts what it says rather than asking again.
-    let declared_slots: std::collections::HashMap<(Uuid, Uuid), String> = db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT site_id, parameter_id, sd_estimator FROM site_parameters \
-             WHERE sd_estimator IS NOT NULL",
-        ))
-        .await?
-        .iter()
-        .filter_map(|r| {
-            let r = DeclaredSlotRow::from_query_result(r, "").ok()?;
-            Some(((r.site_id, r.parameter_id), r.sd_estimator))
+            Some((r.stream_id, r.holds))
         })
         .collect();
 
@@ -3453,14 +3277,7 @@ pub async fn create_plan(
             h.parameter.clone()
         };
 
-        // The divisor is declared, never inferred: a family the review has not answered stays
-        // undeclared, whatever its holds say, and the audit gate holds its disagreements until
-        // someone does. The holds are carried as evidence for that answer, not as one.
-        let (sd_holds, sd_population_holds) =
-            sd_evidence.get(&stream.id).copied().unwrap_or((0, 0));
-        let reports_sd = replicates
-            .as_ref()
-            .is_some_and(|r| r.portal_sd_column.is_some());
+        let sd_holds = sd_evidence.get(&stream.id).copied().unwrap_or(0);
 
         let mut entry = PlanEntry {
             stream_id: stream.id,
@@ -3504,14 +3321,14 @@ pub async fn create_plan(
                 &instruments,
             ),
             replicates,
-            sd_estimator: None,
             decimal_places: crate::routes::private::data_streams::service::declared_decimal_places(
                 &stream.metadata,
             ),
             sd_holds,
-            sd_population_holds,
             acknowledged: false,
-            is_device: crate::routes::private::sensors::service::is_device_feed(&stream.metadata),
+            is_device: crate::routes::private::sensors::service::is_per_site_instrument(
+                &stream.metadata,
+            ),
             device_serial: crate::routes::private::sensors::service::extract_vaisala_device_serial(
                 &stream.metadata,
             ),
@@ -3533,15 +3350,6 @@ pub async fn create_plan(
                 &entry.parameter.name,
                 &instruments,
             ));
-        }
-        if reports_sd
-            && let (Some(site_id), Some(param_id)) = (entry.site.id, entry.parameter.id)
-            && let Some(declared) = declared_slots.get(&(site_id, param_id))
-        {
-            entry.sd_estimator = Some(declared.clone());
-            entry
-                .warnings
-                .retain(|w| w.kind != "sd_estimator_undeclared");
         }
         entries.push(entry);
     }
@@ -3691,6 +3499,49 @@ pub struct PlanCurveIntent {
     pub instrument_source_key: String,
 }
 
+/// Readings naming one curve on one stream: how many, and the span they cover.
+pub struct CurveUse {
+    pub curve_id: Uuid,
+    pub stream_id: Uuid,
+    pub n: i64,
+    pub first: DateTime<Utc>,
+    pub last: DateTime<Utc>,
+}
+
+/// What a curve corrects, in data terms: the parameters and stations of the plan's streams whose
+/// readings name it, and the period those readings cover. A stream outside the plan counts toward
+/// the readings and the period but names no station.
+#[derive(Debug, Default)]
+pub struct CurveReach {
+    pub reading_count: i64,
+    pub parameters: Vec<String>,
+    pub sites: Vec<String>,
+    pub first: Option<DateTime<Utc>>,
+    pub last: Option<DateTime<Utc>>,
+}
+
+pub fn curve_reach(uses: &[CurveUse], entries: &[PlanEntry]) -> HashMap<Uuid, CurveReach> {
+    let by_stream: HashMap<Uuid, &PlanEntry> = entries.iter().map(|e| (e.stream_id, e)).collect();
+    let mut reach: HashMap<Uuid, CurveReach> = HashMap::new();
+    for u in uses {
+        let r = reach.entry(u.curve_id).or_default();
+        r.reading_count += u.n;
+        r.first = Some(r.first.map_or(u.first, |f| Ord::min(f, u.first)));
+        r.last = Some(r.last.map_or(u.last, |l| Ord::max(l, u.last)));
+        if let Some(entry) = by_stream.get(&u.stream_id) {
+            r.parameters.push(entry.parameter.name.clone());
+            r.sites.push(entry.site.name.clone());
+        }
+    }
+    for r in reach.values_mut() {
+        r.parameters.sort();
+        r.parameters.dedup();
+        r.sites.sort();
+        r.sites.dedup();
+    }
+    reach
+}
+
 /// The curve assignments a plan carries.
 pub fn plan_curve_intents(plan: &pairing_plans::Model) -> AppResult<Vec<PlanCurveIntent>> {
     Ok(plan.curve_assignments.0.clone())
@@ -3764,7 +3615,7 @@ pub(super) struct ApplyCounters {
     pub(super) curves_assigned: u32,
 }
 
-/// The streams whose curve references resolve to an instrument nobody has agreed to create.
+/// The streams whose instrument is a creation nobody has agreed to.
 pub fn unconfirmed_instruments(entries: &[PlanEntry]) -> Vec<&str> {
     entries
         .iter()
@@ -3778,17 +3629,15 @@ pub fn unconfirmed_instruments(entries: &[PlanEntry]) -> Vec<&str> {
         .collect()
 }
 
-/// An instrument nobody agreed to is not created silently. Refusing rather than pairing anyway is
-/// the point: a stream that will carry curve references and names no instrument has those readings
-/// refused by `/readings/batch` and dropped by `/ingest`, so pairing it in that state builds the
-/// failure in.
+/// An instrument nobody agreed to is not created silently: once readings name it, it is provenance,
+/// so a suggestion is confirmed before the apply mints it.
 pub fn refuse_unconfirmed_instruments(entries: &[PlanEntry]) -> AppResult<()> {
     let unconfirmed = unconfirmed_instruments(entries);
     if unconfirmed.is_empty() {
         return Ok(());
     }
     Err(AppError::BadRequest(format!(
-        "{} stream(s) need an instrument for their standard curves before they can pair: {}",
+        "{} stream(s) have an instrument nobody has confirmed: {}",
         unconfirmed.len(),
         unconfirmed
             .iter()
@@ -4276,8 +4125,8 @@ pub(super) async fn free_slot_name<C: ConnectionTrait>(
     unreachable!()
 }
 
-/// The slot an entry pairs into, created when the site has none. The entry's review choices (sd
-/// estimator, decimal places) reach an existing slot too, each under its own rule.
+/// The slot an entry pairs into, created when the site has none. The entry's declared decimal
+/// places reach an existing slot too.
 pub(super) async fn resolve_or_create_site_param<C: ConnectionTrait>(
     txn: &C,
     site_id: Uuid,
@@ -4288,10 +4137,6 @@ pub(super) async fn resolve_or_create_site_param<C: ConnectionTrait>(
 ) -> AppResult<Uuid> {
     let units = entry.parameter.units.as_str();
     let decimal_places = entry.decimal_places;
-    // Refused rather than defaulted: the review chose this, and an unrecognised value is a bug in
-    // the caller, not a licence to pick a divisor.
-    let sd_estimator =
-        crate::routes::private::readings::service::parse_opt(entry.sd_estimator.as_deref())?;
     let key = (site_id, parameter_id);
     if let Some(&id) = caches.site_params.get(&key) {
         return Ok(id);
@@ -4307,16 +4152,6 @@ pub(super) async fn resolve_or_create_site_param<C: ConnectionTrait>(
         .await?;
 
     let id = if let Some(existing) = existing {
-        // The review's choice reaches a slot that already exists too: pairing into an established
-        // slot is exactly when its convention gets settled. An entry that chose nothing leaves
-        // whatever the slot already declares.
-        if let Some(declared) = sd_estimator
-            && existing.sd_estimator.as_deref() != Some(declared)
-        {
-            let mut active: site_parameters::ActiveModel = existing.clone().into();
-            active.sd_estimator = Set(Some(declared.to_string()));
-            active.update(txn).await?;
-        }
         crate::routes::private::data_streams::service::declare_slot_decimal_places(
             txn,
             existing.id,
@@ -4347,7 +4182,6 @@ pub(super) async fn resolve_or_create_site_param<C: ConnectionTrait>(
             parameter_id: Set(parameter_id),
             name: Set(param_name_val),
             sensor_type: Set(String::new()),
-            sd_estimator: Set(sd_estimator.map(str::to_string)),
             display_units: Set(units_val.clone()),
             units_name: Set(units_val),
             units_min: Set(None),
@@ -5343,21 +5177,6 @@ pub fn reclassify_entry(entry: &mut PlanEntry, catalog: &EntityCatalog) {
             &entry.parameter.units,
         ));
     }
-    // A family whose source reports an sd and has no declaration yet. `catalog` has no slot rows,
-    // so this reads the plan's own declaration: an entry that has already been patched with one,
-    // or adopted its slot's, is settled.
-    if entry.sd_estimator.is_none()
-        && entry
-            .replicates
-            .as_ref()
-            .is_some_and(|r| r.portal_sd_column.is_some())
-    {
-        entry.warnings.push(PlanWarning::sd_estimator_undeclared(
-            &entry.parameter.name,
-            entry.sd_population_holds,
-        ));
-    }
-
     entry.confidence = if proj_id.is_some() && site_id.is_some() && param_id.is_some() {
         "exact"
     } else {
@@ -5641,14 +5460,6 @@ pub fn apply_bulk_action(entries: &mut [PlanEntry], filter: &BulkWhere, action: 
 pub(super) struct HoldCountRow {
     pub(super) stream_id: Uuid,
     pub(super) holds: i64,
-    pub(super) population: i64,
-}
-
-#[derive(FromQueryResult)]
-pub(super) struct DeclaredSlotRow {
-    pub(super) site_id: Uuid,
-    pub(super) parameter_id: Uuid,
-    pub(super) sd_estimator: String,
 }
 
 #[derive(FromQueryResult)]

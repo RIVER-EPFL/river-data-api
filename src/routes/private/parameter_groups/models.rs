@@ -11,8 +11,7 @@
 //! declare one (Q120): it is `site_parameters.decimal_places` when the caller names a site, else the
 //! platform default of 2. Rounding is presentation and full resolution is what is stored, so a slot
 //! that wants more or fewer places declares them, and the number a form shows is the number the
-//! public API rounds with. `site_parameters` also supplies `sd_estimator`, and only when the caller
-//! names a site: the divisor is declared per slot and is never inferred.
+//! public API rounds with.
 
 use sea_orm::FromQueryResult;
 use serde::{Deserialize, Serialize};
@@ -164,9 +163,6 @@ pub mod member_model {
 pub struct MemberStatistics {
     pub mean_label: String,
     pub sd_label: String,
-    /// The divisor the slot declares, NULL where it declares none. Never inferred.
-    #[schema(required)]
-    pub sd_estimator: Option<String>,
     /// The places the slot declares, NULL where it declares none. Never inferred: the formatter
     /// that renders the number owns the fallback (Q128).
     #[schema(required)]
@@ -178,20 +174,18 @@ pub fn member_statistics(
     code: &str,
     replicates: Option<&serde_json::Value>,
     decimal_places: Option<i32>,
-    sd_estimator: Option<String>,
 ) -> Option<MemberStatistics> {
     replicates?;
     Some(MemberStatistics {
         mean_label: format!("{code} mean"),
         sd_label: format!("{code} sd"),
-        sd_estimator,
         decimal_places,
     })
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct DefinitionQuery {
-    /// The site the group is rendered for; it is what declares the sd estimator.
+    /// The site the group is rendered for; it is what declares the decimal places.
     pub site_id: Option<Uuid>,
 }
 
@@ -209,11 +203,10 @@ pub struct MemberRow {
     pub source_calculation: Option<serde_json::Value>,
 }
 
-/// What one slot declares for a member: the divisor and the places, both nullable.
+/// What one slot declares for a member: the places, nullable.
 #[derive(FromQueryResult)]
 pub struct SlotDeclaration {
     pub parameter_id: Uuid,
-    pub sd_estimator: Option<String>,
     pub decimal_places: Option<i16>,
 }
 

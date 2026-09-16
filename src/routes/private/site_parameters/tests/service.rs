@@ -12,7 +12,6 @@ fn slot() -> SiteParameterModel {
         instrument_sensor_id: None,
         name: "Slot name".to_string(),
         sensor_type: "sonde".to_string(),
-        sd_estimator: None,
         display_units: None,
         units_name: None,
         units_min: None,

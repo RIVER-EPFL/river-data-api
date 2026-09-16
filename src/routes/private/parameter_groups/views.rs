@@ -76,12 +76,8 @@ pub async fn group_definition(
         // fallback like every other value in the app (Q128).
         let slot = declared.get(&member.parameter_id);
         let decimal_places = slot.and_then(|d| d.decimal_places).map(i32::from);
-        let statistics = member_statistics(
-            &member.code,
-            member.replicates.as_ref(),
-            decimal_places,
-            slot.and_then(|d| d.sd_estimator.clone()),
-        );
+        let statistics =
+            member_statistics(&member.code, member.replicates.as_ref(), decimal_places);
         members.push(DefinitionMember {
             parameter_id: member.parameter_id,
             code: member.code,

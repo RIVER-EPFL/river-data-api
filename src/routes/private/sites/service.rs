@@ -494,17 +494,6 @@ pub(super) fn readings_table(
                         .collect(),
                 ),
             );
-            // The divisor beside the number it produced: an sd whose formula is not named is one
-            // two readers can compare and disagree about, which is the whole of I6.
-            table.column(
-                format!("{}_sd_estimator", p.code),
-                Cells::Text(
-                    stats
-                        .iter()
-                        .map(|s| s.as_ref().map(|s| s.sd_estimator.clone()))
-                        .collect(),
-                ),
-            );
             table.column(
                 format!("{}_median", p.code),
                 Cells::Float(
@@ -578,13 +567,9 @@ pub(super) async fn fetch_sample_stats(
                     n: s.n,
                     mean: s.mean,
                     stdev: s.stdev,
-                    stdev_sample: s.stdev_sample,
-                    stdev_population: s.stdev_population,
                     median: s.median,
                     min: s.min_value,
                     max: s.max_value,
-                    sd_estimator: s.sd_estimator,
-                    sd_estimator_source: s.sd_estimator_source,
                     replicates: Vec::new(),
                 },
             )

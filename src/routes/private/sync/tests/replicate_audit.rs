@@ -33,7 +33,7 @@ fn sd_tolerates_portal_float_noise_but_not_percent_level_drift() {
         SD_REL_TOL,
         SD_ABS_TOL
     ));
-    // Population-vs-sample sd (sqrt(2/3) off) is a real finding and still holds.
+    // An n-divisor sd against the sample sd (sqrt(2/3) off) is a real finding and still holds.
     assert!(!stats_agree_with(
         Some(68.22),
         Some(83.55),
@@ -82,15 +82,15 @@ fn classify_n_mismatch_first() {
 }
 
 #[test]
-fn classify_population_sd_signature() {
-    // Real cnet GLT row: stored sd 4.99 is the population divisor of the recomputed 6.1101.
+fn classify_source_sd_matches_n_divisor_signature() {
+    // Real cnet GLT row: stored sd 4.99 is the n-divisor sd of the recomputed 6.1101.
     assert_eq!(
         classify_case(
             serde_json::json!({"mean": 80.33, "sd": 4.99, "n": 3}),
             serde_json::json!({"mean": 80.3333, "sd": 6.1101, "n": 3,
                                "values": [75.0, 79.0, 87.0]}),
         ),
-        "population_sd"
+        "source_sd_matches_n_divisor"
     );
 }
 
@@ -143,7 +143,7 @@ fn classify_unexplained() {
 }
 
 #[test]
-fn a_population_shaped_sd_with_a_disagreeing_mean_is_not_population_sd() {
+fn an_n_divisor_shaped_sd_with_a_disagreeing_mean_is_not_source_sd_matches_n_divisor() {
     assert_eq!(
         classify_case(
             serde_json::json!({"mean": 60.0, "sd": 4.99, "n": 3}),

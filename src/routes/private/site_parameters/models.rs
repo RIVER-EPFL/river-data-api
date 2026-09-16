@@ -1,5 +1,4 @@
 use crudcrate::EntityToModels;
-use sea_orm::FromQueryResult;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -55,14 +54,6 @@ pub struct Model {
     /// tab.
     #[crudcrate(filterable, sortable, on_create = false)]
     pub needs_review: bool,
-    /// How this slot's replicate standard deviation is defined: 'sample' (divisor n-1) or
-    /// 'population' (divisor n). NULL is UNDECLARED, not a synonym for 'sample': the sources use
-    /// both conventions and which one a slot publishes is a decision, so an undeclared slot is
-    /// reported and its population-signature audit holds cannot be waved through.
-    /// Excluded from update: a declaration change must recompute the slot's stored samples, so it
-    /// goes through `POST /site_parameters/{id}/declare_sd_estimator`, which enqueues the retag.
-    #[crudcrate(filterable, exclude(update))]
-    pub sd_estimator: Option<String>,
     /// How this site fills the slot: 'manual' (a person types the value) or 'tool' (a
     /// calculation computes it here). The declaration is per site, so one site may measure a
     /// parameter by hand while another computes it; which calculation produces it is the
@@ -203,84 +194,3 @@ pub struct ApplyGroupResponse {
 /// One member of a group as the apply flow reads it: the catalog parameter, its code, and the role
 /// the group gives it.
 pub type GroupMember = (Uuid, String, String);
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct DeclareSdEstimatorRequest {
-    /// 'sample' (divisor n-1), 'population' (divisor n), or null to clear the declaration.
-    /// Clearing leaves the slot undeclared: new statistics fall back to sample recorded as
-    /// 'default', and stored samples keep the estimator they were computed with.
-    pub estimator: Option<String>,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct DeclareSdEstimatorResponse {
-    pub site_parameter_id: Uuid,
-    #[schema(required)]
-    pub estimator: Option<String>,
-    #[schema(required)]
-    pub previous: Option<String>,
-    /// Samples the retag will recompute; 0 when clearing or nothing disagrees.
-    pub samples_affected: i64,
-    /// The tracked `sd_estimator_retag` job, present when a recompute was enqueued.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub job_id: Option<Uuid>,
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RetagSdEstimatorRequest {
-    /// 'sample' (divisor n-1) or 'population' (divisor n). Every slot in scope must already
-    /// declare it: the retag applies a declaration to the stored samples, it does not make one.
-    pub estimator: String,
-    #[serde(default)]
-    pub site_parameter_ids: Vec<Uuid>,
-    /// Streams reach their slot through their pairing; an unpaired stream reaches none.
-    #[serde(default)]
-    pub stream_ids: Vec<Uuid>,
-    /// Inclusive bounds on `samples.collected_at`.
-    #[serde(default)]
-    pub start: Option<chrono::DateTime<chrono::Utc>>,
-    #[serde(default)]
-    pub end: Option<chrono::DateTime<chrono::Utc>>,
-    /// Also retag samples whose estimator a person chose for that one instant
-    /// (`sd_estimator_source = 'sample'`). Off by default, as the declaration's own retag is.
-    #[serde(default)]
-    pub override_instants: bool,
-    /// Count what the retag would touch and enqueue nothing. The declaration check is skipped,
-    /// so a slot can be previewed under the divisor it is about to declare.
-    #[serde(default)]
-    pub dry_run: bool,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct RetagSdEstimatorResponse {
-    pub estimator: String,
-    /// Samples the retag will recompute.
-    pub samples_affected: i64,
-    /// Samples in scope carrying an instant-chosen estimator that differs from the target:
-    /// counted inside `samples_affected` with `override_instants`, skipped without.
-    pub instant_decisions: i64,
-    /// The tracked `sd_estimator_retag` job, present when something needed recomputing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub job_id: Option<Uuid>,
-}
-
-/// How many samples a declaration change would recompute, by whether the instant declared for
-/// itself.
-#[derive(FromQueryResult)]
-pub struct RetagCounts {
-    pub slot_rows: i64,
-    pub instant_rows: i64,
-}
-
-/// One slot named in a retag refusal: the site, the parameter and whatever it declares, which is
-/// the thing the caller has to change.
-#[derive(FromQueryResult)]
-pub struct UndeclaredRow {
-    pub site_name: String,
-    pub parameter_name: String,
-    pub sd_estimator: Option<String>,
-}

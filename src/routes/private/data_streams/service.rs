@@ -7,8 +7,8 @@ use sea_orm::sea_query::{
     Alias, Condition, Expr, JoinType, PostgresQueryBuilder, Query as SeaQuery, SelectStatement,
 };
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, ExprTrait, FromQueryResult,
-    Order, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait, UpdateMany,
+    ColumnTrait, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, Order, QueryFilter,
+    QueryOrder, QuerySelect, Set, Statement, TransactionTrait, UpdateMany,
 };
 use uuid::Uuid;
 
@@ -85,6 +85,19 @@ pub fn declared_decimal_places(metadata: &serde_json::Value) -> Option<i16> {
         .get(DECIMAL_PLACES_KEY)
         .and_then(serde_json::Value::as_i64)
         .and_then(|n| i16::try_from(n).ok())
+}
+
+/// The key a stream's declared instrument granularity is stored under in `data_streams.metadata`.
+pub const INSTRUMENT_GRANULARITY_KEY: &str = "instrument_granularity";
+
+/// The instrument granularity the stream's connector declared at registration, if any.
+#[must_use]
+pub fn declared_instrument_granularity(
+    metadata: &serde_json::Value,
+) -> Option<river_data_core::models::InstrumentGranularity> {
+    metadata
+        .get(INSTRUMENT_GRANULARITY_KEY)
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
 }
 
 /// Write a declaration onto a slot that has none. A slot's own declaration is an operator's and
@@ -489,48 +502,6 @@ pub fn with_assignments(model: super::models::Model) -> super::DataStream {
     let mut stream = super::DataStream::from(model);
     stream.replicates = replicates;
     stream
-}
-
-/// The divisor the pairing will serve for this stream, resolved as the write path resolves it:
-/// the stream's registered spec, then the slot's declaration once it is paired, else the
-/// undeclared fallback. An unpaired stream has no slot to read, which is the usual case here.
-pub(super) async fn preview_estimator(
-    db: &DatabaseConnection,
-    stream: &models::Model,
-) -> AppResult<crate::routes::private::readings::service::Resolved> {
-    let spec = super::service::ReplicateSpec::from_metadata(&stream.metadata)
-        .and_then(|spec| spec.declared.sd_estimator);
-    let spec = crate::routes::private::readings::service::parse_opt(spec.as_deref())?;
-    if let Some(estimator) = spec {
-        return Ok(crate::routes::private::readings::service::Resolved {
-            estimator,
-            source: crate::routes::private::readings::service::Source::Stream,
-        });
-    }
-    let Some(site_parameter_id) = stream.site_parameter_id else {
-        return Ok(crate::routes::private::readings::service::Resolved::undeclared());
-    };
-    let slot = site_parameters::Entity::find_by_id(site_parameter_id)
-        .one(db)
-        .await?;
-    let Some(slot) = slot else {
-        return Ok(crate::routes::private::readings::service::Resolved::undeclared());
-    };
-    Ok(
-        match crate::routes::private::readings::service::slot_declaration(
-            db,
-            slot.site_id,
-            slot.parameter_id,
-        )
-        .await?
-        {
-            Some(estimator) => crate::routes::private::readings::service::Resolved {
-                estimator,
-                source: crate::routes::private::readings::service::Source::Slot,
-            },
-            None => crate::routes::private::readings::service::Resolved::undeclared(),
-        },
-    )
 }
 
 /// The stored shapes the hand mappings above read. Derived, so a column added to a query and not

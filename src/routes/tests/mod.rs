@@ -190,7 +190,7 @@ fn test_a_wrapped_attribute_is_read_whole() {
 pub struct Wrapped {
 #[serde(skip_serializing_if = \"Option::is_none\")]
 #[schema(
-    value_type = Option<SdEstimator>,
+    value_type = Option<MeasurementType>,
     nullable = false
 )]
 pub described: Option<String>,

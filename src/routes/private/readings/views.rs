@@ -71,7 +71,7 @@ use crate::routes::service::ACTION_BODY_LIMIT;
 use crate::routes::service::DATA_BODY_LIMIT;
 use crate::routes::service::IMPORT_BODY_LIMIT;
 
-/// Preview a replicate group's statistics after flagging, restoring or switching the sd divisor.
+/// Preview a replicate group's statistics after flagging or restoring replicates.
 /// Nothing is written. Requires `read_data`.
 #[utoipa::path(
     post,
@@ -79,7 +79,7 @@ use crate::routes::service::IMPORT_BODY_LIMIT;
     request_body = SamplePreviewRequest,
     responses(
         (status = 200, body = SamplePreviewResponse),
-        (status = 400, description = "Neither key form, an unknown estimator, or an index the group does not hold"),
+        (status = 400, description = "Neither key form, or an index the group does not hold"),
         (status = 404, description = "No spot reading at that instant, or no such hold on it"),
     ),
     tag = "readings"
@@ -89,7 +89,6 @@ pub async fn sample_preview(
     ProjectScope(scope): ProjectScope,
     Json(q): Json<SamplePreviewRequest>,
 ) -> AppResult<Json<SamplePreviewResponse>> {
-    let estimator = crate::routes::private::readings::service::parse_opt(q.estimator.as_deref())?;
     let time = sea_orm::prelude::DateTimeWithTimeZone::from(q.time);
     let find = preview_rows().filter(readings::Column::Time.eq(time));
     let rows = match (q.stream_id, q.site_id, q.parameter_id) {
@@ -144,42 +143,11 @@ pub async fn sample_preview(
         )));
     }
 
-    // The divisor the group is served under now: the instant's own choice, else the slot's
-    // declaration, else the undeclared fallback.
-    let current_estimator = match slot {
-        Some((site_id, parameter_id)) => {
-            match crate::routes::private::readings::service::instant_declaration(
-                &state.db,
-                site_id,
-                parameter_id,
-                q.time,
-            )
-            .await?
-            {
-                Some(e) => e,
-                None => {
-                    crate::routes::private::readings::service::resolve(
-                        &state.db,
-                        site_id,
-                        parameter_id,
-                        None,
-                        None,
-                    )
-                    .await?
-                    .estimator
-                }
-            }
-        }
-        None => crate::routes::private::readings::service::SAMPLE,
-    };
-
     let change = Change {
         exclude: &q.exclude_replicate_indexes,
         include: &q.include_replicate_indexes,
-        estimator,
     };
-    let (current, proposed, delta, rows) =
-        preview_statistics(&replicates, current_estimator, &change);
+    let (current, proposed, delta, rows) = preview_statistics(&replicates, &change);
 
     let hold = match q.hold_id {
         None => None,
@@ -1723,7 +1691,6 @@ pub async fn ingest_readings(
             inserted: 0,
             skipped: 0,
             skipped_reasons: Vec::new(),
-            held: 0,
             changed: 0,
             proposed: 0,
             withdrawn: 0,
@@ -1745,12 +1712,6 @@ pub async fn ingest_readings(
 
     let (site_id, parameter_id) = resolve_stream_slot(db, stream.site_parameter_id).await?;
     let paired = site_id.is_some();
-
-    // What the source says about its own sd divisor, if anything. Absent is the common answer and
-    // is carried through as absent: the slot then decides, and absent that the samples this pass
-    // materialises are recorded undeclared.
-    let stream_sd_estimator = data_streams::models::ReplicateSpec::from_metadata(&stream.metadata)
-        .and_then(|spec| spec.declared.sd_estimator.clone());
 
     // Withdrawal is confined to spot rows by a database CHECK; the continuous aggregates exclude
     // spot, which is what keeps a retraction structurally unreachable by a rollup. A window on a
@@ -2158,25 +2119,6 @@ pub async fn ingest_readings(
         })
         .collect();
 
-    // The replicate audit runs inside the write transaction below, over the rows it stored. The
-    // slot's declaration is resolved once here: every audited group on this stream sits on the
-    // same slot.
-    let audit_estimator = match (
-        payload.audit.as_deref().filter(|a| !a.is_empty()),
-        stream_sd_estimator.clone(),
-        site_id,
-        parameter_id,
-    ) {
-        (None, ..) => None,
-        (Some(_), Some(declared), _, _) => Some(declared),
-        (Some(_), None, Some(site_id), Some(parameter_id)) => {
-            crate::routes::private::readings::service::slot_declaration(db, site_id, parameter_id)
-                .await?
-                .map(str::to_string)
-        }
-        _ => None,
-    };
-
     let total = models.len();
 
     // Spot readings on a paired stream can form samples: replicate groups sharing an instant get
@@ -2311,12 +2253,8 @@ pub async fn ingest_readings(
                                 sea_orm::prelude::DateTimeWithTimeZone::from(hi),
                             ))
                     };
-                    crate::routes::private::readings::service::materialise_samples_with_estimator(
-                        txn,
-                        window(),
-                        stream_sd_estimator.as_deref(),
-                    )
-                    .await?;
+                    crate::routes::private::readings::service::materialise_samples(txn, window())
+                        .await?;
                     // Each source row maps onto one collection event (D7). A sync service replaying
                     // a portal row writes a portal_sync event; any other writer is a person.
                     crate::routes::private::collection_events::service::attach_collection_events(
@@ -2346,7 +2284,6 @@ pub async fn ingest_readings(
                         txn,
                         payload.stream_id,
                         audits,
-                        audit_estimator.as_deref(),
                         paired,
                     )
                     .await?;
@@ -2745,11 +2682,6 @@ pub async fn insert_grab_samples(
         )?;
     }
 
-    // Refused at the edge rather than falling back to a divisor: a stored estimator is a
-    // specification, so an unrecognised one is a request to reject, not a value to guess.
-    let requested_estimator =
-        crate::routes::private::readings::service::parse_opt(payload.sd_estimator.as_deref())?;
-
     // Validate site exists
     let site = sites::Entity::find_by_id(payload.site_id)
         .one(&state.db)
@@ -2818,9 +2750,6 @@ pub async fn insert_grab_samples(
         &crate::common::actor::label(&auth),
     )
     .await?;
-
-    let fixed_estimators =
-        tool_run_fixed_estimators(&state.db, payload.tool_run_id, &payload.readings).await?;
 
     // What the operator picked, held to the same rule as a slot's declaration and a deployment:
     // a bookkeeping row records that nothing was declared, and a retired instrument is not in the
@@ -3478,8 +3407,6 @@ pub async fn insert_grab_samples(
                 txn,
                 &groups,
                 payload.site_id,
-                requested_estimator,
-                &fixed_estimators,
             )
             .await?;
 

@@ -124,9 +124,8 @@ the stream, then the instrument's declared frequency.
 
 - **Continuous** is logger data, one value per instant.
 - **Spot** is a grab sample: several replicates at one instant, whose mean, standard deviation
-  and count are maintained by a database trigger over the unflagged replicates. Which divisor
-  the standard deviation uses is a declared property of the slot, never inferred; an undeclared
-  slot is reportable and blocks accepting an audit disagreement.
+  and count are maintained by a database trigger over the unflagged replicates. The standard
+  deviation is the sample sd (n-1).
 - **Derived** is a formula over other parameters, recomputed when its inputs move.
 
 Continuous aggregates exclude spot readings, so grabs are served from the replicate statistics

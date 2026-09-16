@@ -10,8 +10,7 @@ use axum::{
 use chrono::Utc;
 use sea_orm::ExprTrait;
 use sea_orm::sea_query::{
-    Alias, Expr, Func, JoinType, LockType, PostgresQueryBuilder, Query as SeaQuery,
-    SelectStatement, SimpleExpr, SubQueryStatement,
+    Alias, Expr, JoinType, LockType, PostgresQueryBuilder, Query as SeaQuery, SelectStatement,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
@@ -30,7 +29,6 @@ use river_data_core::commands as core_commands;
 use crate::routes::private::annotations::models as annotations;
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::readings::models as readings;
-use crate::routes::private::readings::samples::models as samples;
 use crate::routes::private::site_parameters::models as site_parameters;
 use river_data_core::models::{
     CommandStatus, CommandUpdateRequest, EnrollRequest, EnrollResponse, HeartbeatRequest,
@@ -42,10 +40,8 @@ use crate::common::middleware::{AuthContext, ProjectScope};
 use crate::common::paging::Window;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::sensors;
-use crate::routes::private::sync::flows as reconcile;
 use crate::routes::private::sync::hold_model;
 
-use super::flows;
 use super::models::*;
 use super::service::*;
 
@@ -669,55 +665,6 @@ pub async fn revoke_service(
     Ok(Json(RevokedResponse { revoked: true }))
 }
 
-/// A sample whose estimator was chosen for its own instant is not one a slot declaration moved,
-/// so a restore leaves it alone.
-fn not_chosen_per_instant() -> Expr {
-    Expr::col((samples::Entity, samples::Column::SdEstimatorSource)).ne("sample")
-}
-
-/// Put the samples a slot declaration moved back on the estimator that preceded it: the slot's
-/// own, or the default when the slot declares none.
-fn restore_estimator(previous: Option<String>) -> sea_orm::sea_query::UpdateStatement {
-    let mut update = SeaQuery::update();
-    update
-        .table(samples::Entity)
-        .value(
-            samples::Column::SdEstimator,
-            Expr::cust_with_values("COALESCE($1, 'sample')", [previous.clone()]),
-        )
-        .value(
-            samples::Column::SdEstimatorSource,
-            Expr::cust_with_values(
-                "CASE WHEN $1::text IS NULL THEN 'default' ELSE 'slot' END",
-                [previous],
-            ),
-        )
-        .from(site_parameters::Entity);
-    update
-}
-
-/// One slot's sample groups.
-fn slot_samples(site_id: Uuid, parameter_id: Uuid) -> Condition {
-    Condition::all()
-        .add(Expr::col(samples::Column::SiteId).eq(site_id))
-        .add(Expr::col(samples::Column::ParameterId).eq(parameter_id))
-}
-
-/// Recompute the statistics of the sample groups `rows` selects. The trigger function is called
-/// for its effect, so the statement is a SELECT that discards its result.
-fn refresh_group(rows: Condition) -> Statement {
-    built(
-        SeaQuery::select()
-            .expr(
-                Func::cust(Alias::new("refresh_sample_aggregate"))
-                    .arg(Expr::col(samples::Column::Id)),
-            )
-            .from(samples::Entity)
-            .cond_where(rows)
-            .take(),
-    )
-}
-
 /// The three table aliases every hold statement here reads through, so a column reference names
 /// the same table in each of them.
 const HOLD: &str = "h";
@@ -773,259 +720,6 @@ fn built<Q: sea_orm::sea_query::QueryStatementWriter>(query: Q) -> Statement {
     Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values)
 }
 
-/// What the old avg stream holds, and how much of it the family stream has not covered yet.
-fn family_probe(old_id: Uuid, new_id: Uuid) -> Statement {
-    let at_index_zero = |alias: &Alias, stream: Uuid| {
-        Condition::all()
-            .add(Expr::col((alias.clone(), readings::Column::StreamId)).eq(stream))
-            .add(Expr::col((alias.clone(), readings::Column::ReplicateIndex)).eq(0))
-    };
-    let o = Alias::new("o");
-    let n = Alias::new("n");
-    let count = |cond: Condition, alias: &Alias| {
-        SimpleExpr::SubQuery(
-            None,
-            Box::new(SubQueryStatement::SelectStatement(
-                SeaQuery::select()
-                    .expr(Expr::cust("COUNT(*)::bigint"))
-                    .from_as(readings::Entity, alias.clone())
-                    .cond_where(cond)
-                    .take(),
-            )),
-        )
-    };
-    built(
-        SeaQuery::select()
-            .expr_as(
-                count(at_index_zero(&o, old_id), &o),
-                Alias::new("old_readings"),
-            )
-            .expr_as(
-                count(
-                    at_index_zero(&o, old_id).add(
-                        Expr::exists(
-                            SeaQuery::select()
-                                .expr(Expr::value(1))
-                                .from_as(readings::Entity, n.clone())
-                                .and_where(
-                                    Expr::col((n.clone(), readings::Column::StreamId)).eq(new_id),
-                                )
-                                .and_where(
-                                    Expr::col((n, readings::Column::Time))
-                                        .equals((o.clone(), readings::Column::Time)),
-                                )
-                                .take(),
-                        )
-                        .not(),
-                    ),
-                    &o,
-                ),
-                Alias::new("missing"),
-            )
-            .take(),
-    )
-}
-
-/// The replicate families of a source and their migration state.
-#[utoipa::path(
-    get,
-    path = "/api/sync/replicate_reconciliation/candidates",
-    params(("source_system" = String, Query, description = "e.g. cnet")),
-    responses((status = 200, body = CandidatesResponse)),
-    tag = "sync"
-)]
-pub async fn reconciliation_candidates(
-    State(state): State<AppState>,
-    Query(query): Query<CandidatesQuery>,
-) -> AppResult<Json<CandidatesResponse>> {
-    let pairs = reconcile::family_pairs(&state.db, &query.source_system).await?;
-    let mut families = Vec::with_capacity(pairs.len());
-    for pair in &pairs {
-        let row = state
-            .db
-            .query_one_raw(family_probe(pair.old_id, pair.new_id))
-            .await?
-            .ok_or_else(|| AppError::Internal("candidate probe returned no row".to_string()))?;
-        let ProbeCounts {
-            old_readings,
-            missing,
-        } = ProbeCounts::from_query_result(&row, "")?;
-        families.push(FamilyCandidate {
-            family_stream_id: pair.new_id,
-            family_source_key: pair.new_key.clone(),
-            old_stream_id: pair.old_id,
-            old_source_key: pair.old_key.clone(),
-            site_parameter_id: pair.old_site_parameter_id,
-            migrated: pair.new_paired,
-            old_readings,
-            missing_instants: missing,
-            ready: !pair.new_paired && pair.old_site_parameter_id.is_some() && missing == 0,
-        });
-    }
-    Ok(Json(CandidatesResponse {
-        total_old_streams: families.len(),
-        families,
-    }))
-}
-
-/// Start the migrate + verify job. Non-destructive: pairs family streams to their slots and
-/// materialises samples; a family failing verification rolls back untouched.
-#[utoipa::path(
-    post,
-    path = "/api/sync/replicate_reconciliation",
-    request_body = StartReconciliationRequest,
-    responses(
-        (status = 200, body = StartReconciliationResponse),
-        (status = 409, description = "A reconciliation for this source is already running"),
-    ),
-    tag = "sync"
-)]
-pub async fn start_reconciliation(
-    State(state): State<AppState>,
-    Json(payload): Json<StartReconciliationRequest>,
-) -> AppResult<Json<StartReconciliationResponse>> {
-    flows::enqueue_reconciliation(&state, "replicate_reconciliation", &payload).await
-}
-
-/// Start the delete job: re-verifies each migrated family and removes the obsolete avg streams
-/// and their readings. The destructive step of the migration; run only after reviewing the
-/// migrate job's verification report.
-#[utoipa::path(
-    post,
-    path = "/api/sync/replicate_reconciliation/delete",
-    request_body = StartReconciliationRequest,
-    responses(
-        (status = 200, body = StartReconciliationResponse),
-        (status = 409, description = "A delete for this source is already running"),
-    ),
-    tag = "sync"
-)]
-pub async fn start_reconciliation_delete(
-    State(state): State<AppState>,
-    Json(payload): Json<StartReconciliationRequest>,
-) -> AppResult<Json<StartReconciliationResponse>> {
-    flows::enqueue_reconciliation(&state, "replicate_reconciliation_delete", &payload).await
-}
-
-/// The (site, parameter) slots where two streams carry the same instant. Serving returns one row
-/// per instant, so a duplicated slot is invisible on the chart; this is the list the operator
-/// reconciles from. Two streams sharing a slot without ever sharing an instant (a sensor feed
-/// beside a grab feed) is the normal case and is not listed.
-#[utoipa::path(
-    get,
-    path = "/api/sync/replicate_reconciliation/duplicate_slots",
-    responses((status = 200, body = DuplicateSlotsResponse)),
-    tag = "sync"
-)]
-pub async fn duplicate_slots(
-    State(state): State<AppState>,
-) -> AppResult<Json<DuplicateSlotsResponse>> {
-    // Duplication is a property of the pairing: a reading's site and parameter come from its
-    // stream's slot, so two streams can only collide at an instant by sharing one.
-    let rows = state
-        .db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT sp.id AS site_parameter_id, sp.site_id, sp.parameter_id, \
-                    s.name AS site_name, p.name AS parameter_name, \
-                    ds.id AS stream_id, ds.source_system, ds.source_key \
-             FROM data_streams ds \
-             JOIN site_parameters sp ON sp.id = ds.site_parameter_id \
-             JOIN sites s ON s.id = sp.site_id \
-             JOIN parameters p ON p.id = sp.parameter_id \
-             WHERE sp.id IN ( \
-                 SELECT site_parameter_id FROM data_streams \
-                 WHERE site_parameter_id IS NOT NULL \
-                 GROUP BY site_parameter_id HAVING COUNT(*) > 1 \
-             ) \
-             ORDER BY s.name, p.name, ds.source_key"
-                .to_string(),
-        ))
-        .await?;
-
-    let mut slots: Vec<DuplicateSlot> = Vec::new();
-    for r in rows {
-        let slot = ReconciliationSlotRow::from_query_result(&r, "")?;
-        let (site_parameter_id, stream_id) = (slot.site_parameter_id, slot.stream_id);
-        let stats = state
-            .db
-            .query_one_raw(built(
-                SeaQuery::select()
-                    .expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("readings"))
-                    .expr_as(
-                        Func::min(Expr::col(readings::Column::Time)),
-                        Alias::new("first"),
-                    )
-                    .expr_as(
-                        Func::max(Expr::col(readings::Column::Time)),
-                        Alias::new("last"),
-                    )
-                    .from(readings::Entity)
-                    .and_where(Expr::col(readings::Column::StreamId).eq(stream_id))
-                    .take(),
-            ))
-            .await?
-            .ok_or_else(|| AppError::Internal("stream probe returned no row".to_string()))?;
-        let extent = StreamExtent::from_query_result(&stats, "")?;
-        let stream = DuplicateSlotStream {
-            stream_id,
-            source_system: slot.source_system,
-            source_key: slot.source_key,
-            readings: extent.readings,
-            first_reading: extent.first,
-            last_reading: extent.last,
-        };
-        match slots
-            .iter_mut()
-            .find(|s| s.site_parameter_id == site_parameter_id)
-        {
-            Some(slot) => slot.streams.push(stream),
-            None => slots.push(DuplicateSlot {
-                site_id: slot.site_id,
-                site_name: slot.site_name,
-                parameter_id: slot.parameter_id,
-                parameter_name: slot.parameter_name,
-                site_parameter_id,
-                streams: vec![stream],
-                duplicated_instants: 0,
-            }),
-        }
-    }
-
-    for slot in &mut slots {
-        let row = state
-            .db
-            .query_one_raw(built(
-                SeaQuery::select()
-                    .expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("c"))
-                    .from_subquery(
-                        SeaQuery::select()
-                            .column(readings::Column::Time)
-                            .from(readings::Entity)
-                            .and_where(Expr::col(readings::Column::SiteId).eq(slot.site_id))
-                            .and_where(
-                                Expr::col(readings::Column::ParameterId).eq(slot.parameter_id),
-                            )
-                            .and_where(Expr::col(readings::Column::WithdrawnAt).is_null())
-                            .add_group_by([Expr::col(readings::Column::Time)])
-                            .and_having(Expr::cust("COUNT(DISTINCT stream_id) > 1"))
-                            .take(),
-                        Alias::new("t"),
-                    )
-                    .take(),
-            ))
-            .await?;
-        slot.duplicated_instants = row
-            .map(|r| r.try_get::<i64>("", "c"))
-            .transpose()?
-            .unwrap_or(0);
-    }
-
-    // A shared slot is only a duplicate once an instant actually carries both feeds.
-    slots.retain(|s| s.duplicated_instants > 0);
-    Ok(Json(DuplicateSlotsResponse { slots }))
-}
-
 /// List replicate audit holds, newest first. The UI's Audits view reads this.
 #[utoipa::path(
     get,
@@ -1033,12 +727,18 @@ pub async fn duplicate_slots(
     params(
         ("stream_id" = Option<Uuid>, Query, description = "Filter to one stream"),
         ("stream_ids" = Option<String>, Query, description = "Comma-separated stream UUIDs"),
-        ("status" = Option<String>, Query, description = "pending | deferred | acknowledged | remediated | superseded | resolved; omit for pending"),
+        ("status" = Option<String>, Query, description = "pending | deferred | acknowledged | remediated | superseded | resolved | any; omit for pending"),
         ("source_system" = Option<String>, Query, description = "Filter to one source system"),
         ("max_relative_delta" = Option<f64>, Query, description = "Only holds at or below this relative_delta"),
         ("max_mean_relative_delta" = Option<f64>, Query, description = "Only holds at or below this mean_relative_delta"),
         ("max_sd_relative_delta" = Option<f64>, Query, description = "Only holds at or below this sd_relative_delta"),
         ("sort" = Option<String>, Query, description = "relative_delta_desc | relative_delta_asc | created_at_desc"),
+        ("kind" = Option<String>, Query, description = "Comma-separated hold kinds"),
+        ("tool" = Option<String>, Query, description = "Filter to holds raised against one calculation"),
+        ("site_id" = Option<Uuid>, Query, description = "Holds at one site, through the pairing or the finding"),
+        ("parameter_id" = Option<Uuid>, Query, description = "Holds on one parameter, through the pairing or the finding"),
+        ("from" = Option<DateTime<Utc>>, Query, description = "Holds whose instant is at or after this"),
+        ("to" = Option<DateTime<Utc>>, Query, description = "Holds whose instant is before this"),
         ("page" = Option<u64>, Query, description = "1-based page"),
         ("page_size" = Option<u64>, Query, description = "Default 50, max 500"),
     ),
@@ -1159,7 +859,6 @@ pub async fn acknowledge_hold(
     accept_ours(&state, id, &crate::common::actor::label(&auth)).await?;
     Ok(Json(AcknowledgeResponse {
         acknowledged: 1,
-        skipped_undeclared_estimator: 0,
         skipped_no_stream: 0,
     }))
 }
@@ -1195,7 +894,6 @@ pub async fn resolve_hold(
             accept_ours(&state, id, &by).await?;
             Ok(Json(ResolveHoldResponse {
                 status: "acknowledged".to_string(),
-                job_id: None,
                 samples_affected: None,
             }))
         }
@@ -1417,11 +1115,9 @@ pub async fn resolve_hold(
             .await;
             Ok(Json(ResolveHoldResponse {
                 status: "remediated".to_string(),
-                job_id: None,
                 samples_affected: None,
             }))
         }
-        "estimator" => declare_estimator(&state, id, &payload, &by).await,
         // The two rule on whatever the hold is about: a measurement an intern entered, or the
         // field day they opened (Q21, Q177). The hold's own kind says which.
         "verify" | "reject" => {
@@ -1440,192 +1136,6 @@ pub async fn resolve_hold(
             "unknown resolve mode '{other}'"
         ))),
     }
-}
-
-/// Declare which standard-deviation divisor a slot, or one collection group, publishes.
-///
-/// This is the resolution the gate points at. It changes a specification, not a statistic: the
-/// samples trigger still computes every number from the stored replicates, and all this decides is
-/// which of the two divisors it uses. `slot` scope declares it for the parameter at this site and
-/// enqueues the retag that brings its existing samples into line; `instant` scope sets it for this
-/// one group and leaves the parameter undeclared, so the slot's other holds stay gated.
-///
-/// Reversible: the previous value is recorded on the resolution, and reopen restores it.
-async fn declare_estimator(
-    state: &AppState,
-    id: Uuid,
-    payload: &ResolveHoldRequest,
-    by: &str,
-) -> AppResult<Json<ResolveHoldResponse>> {
-    let estimator = crate::routes::private::readings::service::parse(
-        payload.estimator.as_deref().ok_or_else(|| {
-            AppError::BadRequest(
-                "an estimator resolution must name 'sample' or 'population'".to_string(),
-            )
-        })?,
-    )?;
-    let scope = payload.scope.as_deref().unwrap_or("slot");
-    if !matches!(scope, "slot" | "instant") {
-        return Err(AppError::BadRequest(format!(
-            "unknown estimator scope '{scope}'; expected 'slot' or 'instant'"
-        )));
-    }
-
-    let (site_parameter_id, affected) =
-        crate::common::bulk_write::guarded(&state.db, async |txn| {
-            let hold = txn
-                .query_one_raw(built(
-                    hold_on_its_slot()
-                        .column((HOLD, hold_model::Column::GroupTime))
-                        .column((HOLD, hold_model::Column::Resolution))
-                        .expr_as(
-                            Expr::col((SLOT, site_parameters::Column::Id)),
-                            Alias::new("site_parameter_id"),
-                        )
-                        .column((SLOT, site_parameters::Column::SiteId))
-                        .column((SLOT, site_parameters::Column::ParameterId))
-                        .expr_as(
-                            Expr::col((SLOT, site_parameters::Column::SdEstimator)),
-                            Alias::new("previous"),
-                        )
-                        .and_where(Expr::col((HOLD, hold_model::Column::Id)).eq(id))
-                        .and_where(
-                            Expr::col((HOLD, hold_model::Column::Status))
-                                .eq(HoldStatus::Pending.as_str()),
-                        )
-                        .lock_with_tables(LockType::Update, [Alias::new(HOLD)])
-                        .take(),
-                ))
-                .await?
-                .ok_or_else(|| {
-                    AppError::NotFound(format!(
-                        "no pending replicate audit hold {id} on a paired slot; an estimator is \
-                         declared for a slot, so an unpaired stream's hold has none to declare"
-                    ))
-                })?;
-            let EstimatorHoldRow {
-                group_time,
-                site_parameter_id,
-                site_id,
-                parameter_id,
-                previous,
-                resolution: prev_resolution,
-            } = EstimatorHoldRow::from_query_result(&hold, "")?;
-
-            let affected = if scope == "slot" {
-                set_slot_estimator(txn, site_parameter_id, Some(estimator.to_string())).await?;
-                // Counted here, inside the same transaction the declaration lands in, so the
-                // number reported is the one the retag will act on.
-                txn.query_one_raw(built(
-                    SeaQuery::select()
-                        .expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("n"))
-                        .from(samples::Entity)
-                        .cond_where(slot_samples(site_id, parameter_id))
-                        .and_where(Expr::cust_with_values(
-                            "sd_estimator IS DISTINCT FROM $1",
-                            [estimator.to_string()],
-                        ))
-                        .and_where(Expr::col(samples::Column::SdEstimatorSource).ne("sample"))
-                        .take(),
-                ))
-                .await?
-                .map_or(Ok(0_i64), |row| row.try_get::<i64>("", "n"))?
-            } else {
-                // One group: set it and refresh that row alone. `sample` as the source is what
-                // keeps a later slot-level retag from overwriting this decision.
-                let rows = samples::Entity::update_many()
-                    .col_expr(samples::Column::SdEstimator, Expr::value(estimator))
-                    .col_expr(samples::Column::SdEstimatorSource, Expr::value("sample"))
-                    .filter(samples::Column::SiteId.eq(site_id))
-                    .filter(samples::Column::ParameterId.eq(parameter_id))
-                    .filter(samples::Column::CollectedAt.eq(group_time))
-                    .exec(txn)
-                    .await?
-                    .rows_affected;
-                txn.execute_raw(refresh_group(
-                    slot_samples(site_id, parameter_id)
-                        .add(Expr::col(samples::Column::CollectedAt).eq(group_time)),
-                ))
-                .await?;
-                i64::try_from(rows).unwrap_or(0)
-            };
-
-            let resolution = merged_resolution(
-                prev_resolution,
-                serde_json::json!({
-                    "action": "declare_estimator",
-                    "estimator": estimator,
-                    "scope": scope,
-                    "previous_estimator": previous,
-                }),
-                by,
-            );
-            let updated = decide_hold(
-                txn,
-                id,
-                &[HoldStatus::Pending],
-                HoldStatus::Remediated,
-                resolution,
-                Some(by),
-            )
-            .await?;
-            if updated != 1 {
-                return Err(AppError::Conflict(format!(
-                    "replicate audit hold {id} was resolved by another request; no estimator was \
-                     declared"
-                )));
-            }
-            Ok((site_parameter_id, affected))
-        })
-        .await?;
-
-    // The slot's existing samples are brought into line by the tracked job, so a long history is
-    // visible and rerunnable rather than held open in this request.
-    let job_id = if scope == "slot" && affected > 0 {
-        crate::routes::private::reprocessing_jobs::service::enqueue(
-            &state.db,
-            "sd_estimator_retag",
-            None,
-            None,
-            &serde_json::json!({
-                "estimator": estimator,
-                "site_parameter_ids": [site_parameter_id],
-            }),
-            None,
-        )
-        .await?
-    } else {
-        None
-    };
-
-    let (expected, computed) = hold_numbers(&state.db, id).await;
-    let where_ = if scope == "slot" {
-        "this parameter"
-    } else {
-        "this collection group only"
-    };
-    let divisor = if estimator == "population" {
-        "population (divisor n)"
-    } else {
-        "sample (divisor n-1)"
-    };
-    mint_audit_annotation(
-        &state.db,
-        id,
-        &format!(
-            "Audit resolved by declaration: {where_} publishes its standard deviation with the \
-             {divisor} formula ({}). Declared by {by}.",
-            disagreement_phrase(&expected, &computed)
-        ),
-        by,
-    )
-    .await;
-    state.response_cache.invalidate_all();
-    Ok(Json(ResolveHoldResponse {
-        status: "remediated".to_string(),
-        job_id,
-        samples_affected: Some(affected),
-    }))
 }
 
 /// Revert a decision: a remediation's flags are removed (only the readings that resolution
@@ -1660,9 +1170,6 @@ pub async fn reopen_hold(
                         Expr::col((STREAM, data_streams::Column::SiteParameterId)).is_not_null(),
                         Alias::new("paired"),
                     )
-                    .column((STREAM, data_streams::Column::SiteParameterId))
-                    .column((SLOT, site_parameters::Column::SiteId))
-                    .column((SLOT, site_parameters::Column::ParameterId))
                     .and_where(Expr::col((HOLD, hold_model::Column::Id)).eq(id))
                     .and_where(
                         Expr::col((HOLD, hold_model::Column::Status))
@@ -1679,9 +1186,6 @@ pub async fn reopen_hold(
             status,
             paired,
             resolution: prev,
-            site_parameter_id,
-            site_id,
-            parameter_id,
         } = ReopenHoldRow::from_query_result(&hold, "")?;
 
         let flagged = prev.as_ref().and_then(|r| {
@@ -1697,26 +1201,6 @@ pub async fn reopen_hold(
                         })
                         .unwrap_or_default(),
                     r.get("reason")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                )
-            })
-        });
-
-        // An estimator declaration is reverted to exactly what it replaced, which is usually
-        // "undeclared" and must go back to NULL rather than to a divisor nobody chose.
-        let declared = prev.as_ref().and_then(|r| {
-            (r.get("action")? == "declare_estimator").then(|| {
-                (
-                    r.get("scope")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("slot")
-                        .to_string(),
-                    r.get("previous_estimator")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string),
-                    r.get("estimator")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
@@ -1755,86 +1239,6 @@ pub async fn reopen_hold(
             )
             .await?;
         }
-        if status == HoldStatus::Remediated.as_str()
-            && let Some((decl_scope, previous, _)) = &declared
-        {
-            if decl_scope == "slot" {
-                if let Some(sp_id) = site_parameter_id {
-                    set_slot_estimator(txn, sp_id, previous.clone()).await?;
-                    // The samples this declaration moved go back with it. A row whose estimator
-                    // was chosen for its own instant is not one of them.
-                    let slot_rows = Condition::all()
-                        .add(Expr::cust("site_parameters.site_id = samples.site_id"))
-                        .add(Expr::cust(
-                            "site_parameters.parameter_id = samples.parameter_id",
-                        ))
-                        .add(
-                            Expr::col((site_parameters::Entity, site_parameters::Column::Id))
-                                .eq(sp_id),
-                        )
-                        .add(not_chosen_per_instant());
-                    txn.execute_raw(built(
-                        restore_estimator(previous.clone())
-                            .cond_where(slot_rows.clone())
-                            .take(),
-                    ))
-                    .await?;
-                    txn.execute_raw(built(
-                        SeaQuery::select()
-                            .expr(
-                                Func::cust(Alias::new("refresh_sample_aggregate"))
-                                    .arg(Expr::col((samples::Entity, samples::Column::Id))),
-                            )
-                            .from(samples::Entity)
-                            .join(
-                                JoinType::InnerJoin,
-                                site_parameters::Entity,
-                                Condition::all()
-                                    .add(Expr::cust("site_parameters.site_id = samples.site_id"))
-                                    .add(Expr::cust(
-                                        "site_parameters.parameter_id = samples.parameter_id",
-                                    )),
-                            )
-                            .and_where(
-                                Expr::col((site_parameters::Entity, site_parameters::Column::Id))
-                                    .eq(sp_id),
-                            )
-                            .and_where(not_chosen_per_instant())
-                            .take(),
-                    ))
-                    .await?;
-                }
-            } else if let (Some(site_id), Some(parameter_id)) = (site_id, parameter_id) {
-                // The instant goes back to whatever its slot says, which is the state it would
-                // have been created in.
-                let instant = slot_samples(site_id, parameter_id)
-                    .add(Expr::col(samples::Column::CollectedAt).eq(group_time));
-                txn.execute_raw(built(
-                    SeaQuery::update()
-                        .table(samples::Entity)
-                        .value(
-                            samples::Column::SdEstimator,
-                            Expr::cust("COALESCE(site_parameters.sd_estimator, 'sample')"),
-                        )
-                        .value(
-                            samples::Column::SdEstimatorSource,
-                            Expr::cust(
-                                "CASE WHEN site_parameters.sd_estimator IS NULL THEN 'default' \
-                                 ELSE 'slot' END",
-                            ),
-                        )
-                        .from(site_parameters::Entity)
-                        .and_where(Expr::cust("site_parameters.site_id = samples.site_id"))
-                        .and_where(Expr::cust(
-                            "site_parameters.parameter_id = samples.parameter_id",
-                        ))
-                        .cond_where(instant.clone())
-                        .take(),
-                ))
-                .await?;
-                txn.execute_raw(refresh_group(instant)).await?;
-            }
-        }
         let restored =
             decide_hold(txn, id, &HoldStatus::REOPENABLE, reopened, resolution, None).await?;
         if restored != 1 {
@@ -1850,7 +1254,6 @@ pub async fn reopen_hold(
     state.response_cache.invalidate_all();
     Ok(Json(ResolveHoldResponse {
         status: reopened,
-        job_id: None,
         samples_affected: None,
     }))
 }
@@ -1915,49 +1318,6 @@ pub async fn acknowledge_holds_bulk(
     if let Some(ceiling) = payload.max_sd_relative_delta {
         bounds = bounds.add(super::service::relative_delta_of("sd").lte(ceiling));
     }
-    // The same gate the single acknowledge applies, so a threshold sweep cannot drive around it:
-    // at n = 10 the divisor offset is only ~5%, well inside a plausible ceiling.
-    let undeclared_gate = || {
-        Condition::all()
-            .add(super::service::population_sd_expr())
-            .add(
-                Expr::col((h.clone(), hold_model::Column::Kind))
-                    .eq(HoldKind::ReplicateStats.as_str()),
-            )
-            .add(Expr::cust(
-                "EXISTS (SELECT 1 FROM site_parameters sp \
-                 WHERE sp.id = ds.site_parameter_id AND sp.sd_estimator IS NULL)",
-            ))
-    };
-    let ds = Alias::new("ds");
-    let joined = |on_pending: Condition| {
-        let mut q = SeaQuery::select();
-        q.expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("n"))
-            .from_as(hold_model::Entity, h.clone())
-            .join_as(
-                JoinType::InnerJoin,
-                crate::routes::private::data_streams::models::Entity,
-                ds.clone(),
-                Expr::col((
-                    ds.clone(),
-                    crate::routes::private::data_streams::models::Column::Id,
-                ))
-                .equals((h.clone(), hold_model::Column::StreamId)),
-            )
-            .cond_where(on_pending);
-        q.take()
-    };
-    let skipped = state
-        .db
-        .query_one_raw(built(joined(
-            Condition::all()
-                .add(hold_col(hold_model::Column::Status).eq(HoldStatus::Pending.as_str()))
-                .add(undeclared_gate())
-                .add(bounds.clone()),
-        )))
-        .await?
-        .map_or(Ok(0_i64), |row| row.try_get::<i64>("", "n"))?;
-
     // Holds carrying no stream are out of the acknowledging statement's reach: it joins
     // `data_streams`, and every filter this route takes is a replicate-statistics threshold. Count
     // them so a sweep states what it passed over instead of returning a total that reads as the
@@ -1979,6 +1339,7 @@ pub async fn acknowledge_holds_bulk(
         stream_less.count(&state.db).await?
     };
 
+    let ds = Alias::new("ds");
     let acknowledge = SeaQuery::update()
         .table(
             sea_orm::sea_query::IntoTableRef::into_table_ref(hold_model::Entity).alias(h.clone()),
@@ -2009,7 +1370,6 @@ pub async fn acknowledge_holds_bulk(
                     .equals((h.clone(), hold_model::Column::StreamId)),
                 )
                 .add(hold_col(hold_model::Column::Status).eq(HoldStatus::Pending.as_str()))
-                .add(undeclared_gate().not())
                 .add(bounds),
         )
         .to_owned();
@@ -2074,7 +1434,6 @@ pub async fn acknowledge_holds_bulk(
     }
     Ok(Json(AcknowledgeResponse {
         acknowledged,
-        skipped_undeclared_estimator: u64::try_from(skipped).unwrap_or(0),
         skipped_no_stream,
     }))
 }
@@ -2088,11 +1447,9 @@ pub async fn acknowledge_holds_bulk(
 /// - `read_routes`: list/get operations, fine for any read_metadata caller.
 /// - `write_routes`: operator actions such as issuing sync commands and pairing workflows.
 ///   Same gate as other entity mutations (Keycloak admin or write_metadata token).
-/// - `manage_routes`: the replicate audit review surface and non-destructive reconciliation.
+/// - `manage_routes`: the replicate audit review surface.
 ///   Manager-level humans and above (or a write_metadata token); interns and plain members never
 ///   see the audit backlog.
-/// - `destructive_routes`: the reconciliation delete job, which removes streams and readings, so
-///   it takes the same gate as stream deletion on CRUD (Keycloak admin or write_metadata token).
 /// - `admin_routes`: credential listing, creation and revoke, these mint full-permission
 ///   sync session tokens, so they're Keycloak-admin only (no API token can pass). The listing
 ///   is admin-gated alongside them, matching `sync_service_credentials` CRUD, so a leaked token
@@ -2142,32 +1499,9 @@ pub fn manage_routes() -> Router<AppState> {
             "/change_proposals/decide",
             post(crate::routes::private::readings::views::decide_proposals),
         )
-        .route(
-            "/replicate_reconciliation/duplicate_slots",
-            get(duplicate_slots),
-        )
-        .route(
-            "/replicate_reconciliation/candidates",
-            get(reconciliation_candidates),
-        )
-        .route("/replicate_reconciliation", post(start_reconciliation))
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_manage_sensors))
-}
-
-/// Destructive reconciliation: the delete job removes obsolete streams and their readings, so it
-/// sits behind the same gate as stream deletion on CRUD (Keycloak Administrator or a
-/// write_metadata token), not the manager review layer the non-destructive endpoints use.
-pub fn destructive_routes() -> Router<AppState> {
-    Router::new()
-        .route(
-            "/replicate_reconciliation/delete",
-            post(start_reconciliation_delete),
-        )
-        .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
-        .layer(middleware::from_fn(deny_scoped_token))
-        .layer(middleware::from_fn(require_admin_or_token_write_metadata))
 }
 
 pub fn admin_routes() -> Router<AppState> {
@@ -2399,15 +1733,6 @@ pub async fn update_pairing_plan(
             }
             if let Some(ref label) = update.parameter_label {
                 entry.parameter.label = Some(label.trim().to_string()).filter(|l| !l.is_empty());
-            }
-            if let Some(ref declared) = update.sd_estimator {
-                // An empty string clears the choice, which is how the review says "leave it
-                // undeclared" rather than being unable to take a decision back.
-                entry.sd_estimator = if declared.trim().is_empty() {
-                    None
-                } else {
-                    Some(crate::routes::private::readings::service::parse(declared)?.to_string())
-                };
             }
             if let Some(acknowledged) = update.acknowledged {
                 entry.acknowledged = acknowledged;
@@ -2921,25 +2246,35 @@ pub async fn plan_instruments(
             (s.id, name)
         })
         .collect();
-    let mut usage: std::collections::HashMap<Uuid, i64> = std::collections::HashMap::new();
+    let mut uses = Vec::new();
     for row in state
         .db
         .query_all_raw(built(
             SeaQuery::select()
-                .expr_as(
-                    Expr::col(readings::Column::StandardCurveId),
-                    Alias::new("id"),
-                )
+                .column(readings::Column::StandardCurveId)
+                .column(readings::Column::StreamId)
                 .expr_as(Expr::cust("COUNT(*)"), Alias::new("n"))
+                .expr_as(Expr::col(readings::Column::Time).min(), Alias::new("first"))
+                .expr_as(Expr::col(readings::Column::Time).max(), Alias::new("last"))
                 .from(readings::Entity)
                 .and_where(Expr::col(readings::Column::StandardCurveId).is_not_null())
-                .add_group_by([Expr::col(readings::Column::StandardCurveId)])
+                .add_group_by([
+                    Expr::col(readings::Column::StandardCurveId),
+                    Expr::col(readings::Column::StreamId),
+                ])
                 .take(),
         ))
         .await?
     {
-        usage.insert(row.try_get::<Uuid>("", "id")?, row.try_get::<i64>("", "n")?);
+        uses.push(crate::routes::private::sync::service::CurveUse {
+            curve_id: row.try_get("", "standard_curve_id")?,
+            stream_id: row.try_get("", "stream_id")?,
+            n: row.try_get("", "n")?,
+            first: row.try_get("", "first")?,
+            last: row.try_get("", "last")?,
+        });
     }
+    let mut reach = crate::routes::private::sync::service::curve_reach(&uses, &entries);
     let intents = crate::routes::private::sync::service::plan_curve_intents(&plan)?;
     let proposed_names: std::collections::HashMap<&str, &str> = entries
         .iter()
@@ -2958,12 +2293,17 @@ pub async fn plan_instruments(
             .into_iter()
             .map(|c| {
                 let pending = intents.iter().find(|i| i.curve_id == c.id);
+                let reach = reach.remove(&c.id).unwrap_or_default();
                 PlanCurveAssignment {
                     instrument_name: instrument_names
                         .get(&c.sensor_id)
                         .cloned()
                         .unwrap_or_else(|| c.sensor_id.to_string()),
-                    reading_count: usage.get(&c.id).copied().unwrap_or(0),
+                    reading_count: reach.reading_count,
+                    corrected_parameters: reach.parameters,
+                    corrected_sites: reach.sites,
+                    first_corrected: reach.first,
+                    last_corrected: reach.last,
                     pending_source_key: pending.map(|i| i.instrument_source_key.clone()),
                     pending_instrument_name: pending.and_then(|i| {
                         proposed_names

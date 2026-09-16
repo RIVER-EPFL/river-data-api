@@ -9,11 +9,10 @@ fn spec() -> serde_json::Value {
 
 #[test]
 fn test_a_replicated_member_shows_a_mean_and_an_sd() {
-    let stats = member_statistics("doc", Some(&spec()), Some(2), Some("sample".into()))
+    let stats = member_statistics("doc", Some(&spec()), Some(2))
         .expect("a replicated member carries statistics");
     assert_eq!(stats.mean_label, "doc mean");
     assert_eq!(stats.sd_label, "doc sd");
-    assert_eq!(stats.sd_estimator.as_deref(), Some("sample"));
     assert_eq!(stats.decimal_places, Some(2));
 }
 
@@ -22,7 +21,7 @@ fn test_a_replicated_member_shows_a_mean_and_an_sd() {
 #[test]
 fn test_an_undeclared_slot_carries_no_places() {
     assert_eq!(
-        member_statistics("doc", Some(&spec()), None, Some("sample".into()))
+        member_statistics("doc", Some(&spec()), None)
             .expect("a replicated member carries statistics")
             .decimal_places,
         None
@@ -31,16 +30,7 @@ fn test_an_undeclared_slot_carries_no_places() {
 
 #[test]
 fn test_a_member_entered_once_shows_none() {
-    assert_eq!(
-        member_statistics("ph", None, Some(2), Some("sample".into())),
-        None
-    );
-}
-
-#[test]
-fn test_an_undeclared_estimator_stays_undeclared() {
-    let stats = member_statistics("doc", Some(&spec()), None, None).expect("statistics");
-    assert_eq!(stats.sd_estimator, None);
+    assert_eq!(member_statistics("ph", None, Some(2)), None);
 }
 
 // The statistics are the member's own columns, not members of the group, so the order the grid

@@ -19,8 +19,8 @@ use crate::common::{GLOBAL_PARAM_DO_ID, SITE1_ID};
 
 /// Two independent floating point paths (R and Postgres) reduce the same three f64 values, so a
 /// few ulps of disagreement are expected and exact equality is the wrong assertion. At these
-/// magnitudes an ulp is around 1e-14, while the convention error this test exists to catch, a
-/// population (n) standard deviation where a sample (n-1) one is meant, is a factor of
+/// magnitudes an ulp is around 1e-14, while the convention error this test exists to catch, an
+/// n-divisor standard deviation where the sample (n-1) one is meant, is a factor of
 /// sqrt(2/3) ~= 0.816 on three replicates: for the values below that is a gap of about 10, i.e.
 /// ten orders of magnitude larger than this bound.
 const TOL: f64 = 1e-9;
@@ -200,11 +200,11 @@ async fn stored_sample_statistics_equal_the_tools_own_summaries() {
     assert!(close(agg.min_value.unwrap(), lo));
     assert!(close(agg.max_value.unwrap(), hi));
 
-    // The population form of the same spread, which the tolerance must be able to tell apart.
-    let population_sd = tool_sd * (2.0_f64 / 3.0).sqrt();
+    // The n-divisor form of the same spread, which the tolerance must be able to tell apart.
+    let n_divisor_sd = tool_sd * (2.0_f64 / 3.0).sqrt();
     assert!(
-        !close(stdev, population_sd),
-        "an n-vs-n-1 mismatch would read as {population_sd} against {stdev}, \
+        !close(stdev, n_divisor_sd),
+        "an n-vs-n-1 mismatch would read as {n_divisor_sd} against {stdev}, \
          which a tolerance of {TOL} separates"
     );
 

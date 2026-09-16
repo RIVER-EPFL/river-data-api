@@ -217,7 +217,6 @@ fn every_writer_is_classified_and_derivation_writers_append_nothing() {
         Writer::BackfillAttribution,
         Writer::PairingBackfill,
         Writer::MeasurementRetag,
-        Writer::SdEstimatorRetag,
     ] {
         assert_eq!(w.decision(), None, "{w:?} derives, it does not decide");
     }

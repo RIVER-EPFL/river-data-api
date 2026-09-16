@@ -43,8 +43,9 @@ fn relative_delta() -> String {
     )
 }
 
-/// The population-divisor signature as `POPULATION_SD_SQL` spelled it, tolerances inlined.
-fn population_sd() -> String {
+/// The source-sd-matches-n-divisor signature as `SOURCE_SD_MATCHES_N_DIVISOR_SQL` spells it,
+/// tolerances inlined.
+fn source_sd_matches_n_divisor() -> String {
     "((h.expected->>'n') IS NULL \
        OR (h.expected->>'n')::int = (h.computed->>'n')::int) \
      AND (h.computed->>'n')::int >= 2 \
@@ -65,9 +66,9 @@ fn population_sd() -> String {
         .to_string()
 }
 
-/// Hold shapes the queue carries: a plain disagreement, the population signature, a count
+/// Hold shapes the queue carries: a plain disagreement, the n-divisor signature, a count
 /// mismatch, one missing a statistic, one whose mean is zero (the scale floor), a finding no
-/// stream produced, and one whose computed document carries no `n` at all, which the population
+/// stream produced, and one whose computed document carries no `n` at all, which the n-divisor
 /// signature divides by (I95).
 const SHAPES: &[(&str, &str, &str)] = &[
     (
@@ -158,8 +159,10 @@ async fn the_built_expressions_answer_what_the_text_answered() {
         assert_eq!(disagreements, 0, "{label} disagrees with its text spelling");
     }
 
-    let built = render(sea_orm::sea_query::Expr::from(svc::population_sd_expr()));
-    let text = population_sd();
+    let built = render(sea_orm::sea_query::Expr::from(
+        svc::source_sd_matches_n_divisor_expr(),
+    ));
+    let text = source_sd_matches_n_divisor();
     let disagreements = crate::common::e2e::count(
         &db,
         &format!(
@@ -170,7 +173,7 @@ async fn the_built_expressions_answer_what_the_text_answered() {
     .await;
     assert_eq!(
         disagreements, 0,
-        "the population signature disagrees with its text spelling"
+        "the n-divisor signature disagrees with its text spelling"
     );
 
     crate::common::cleanup_test_db(&db).await;

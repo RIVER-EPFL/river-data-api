@@ -15,6 +15,7 @@ mod m20260915_000001_drop_member_role;
 mod m20260915_000002_supersede_synced_visit_findings;
 mod m20260915_000003_visit_verification;
 mod m20260915_000004_drop_calculation_group;
+mod m20260916_000001_sample_sd_only;
 
 pub struct Migrator;
 
@@ -50,6 +51,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260915_000002_supersede_synced_visit_findings::Migration),
             Box::new(m20260915_000003_visit_verification::Migration),
             Box::new(m20260915_000004_drop_calculation_group::Migration),
+            Box::new(m20260916_000001_sample_sd_only::Migration),
         ]
     }
 }

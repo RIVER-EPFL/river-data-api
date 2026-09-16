@@ -74,6 +74,7 @@ use crate::routes::private::readings::models::Selection;
 use crate::routes::private::readings::samples;
 use crate::routes::private::reprocessing_jobs::models::job as jobs_model;
 use crate::routes::private::sensor_calibrations;
+use crate::routes::private::sensor_calibrations::service::{InputCandidate, chosen_input};
 use crate::routes::private::sensor_deployments as deployments;
 use crate::routes::private::sensors;
 use crate::routes::private::site_parameters;
@@ -262,10 +263,6 @@ pub fn resolve_measurement_type(
         .unwrap_or_else(|| MeasurementType::Continuous.as_str().to_string())
 }
 
-pub const SAMPLE: &str = "sample";
-
-pub const POPULATION: &str = "population";
-
 /// `readings r JOIN data_streams ds`, the shape every row predicate written against `r` is
 /// resolved over: the stream join is what makes a source-system clause selectable alongside a
 /// reading's own columns.
@@ -355,154 +352,6 @@ pub(super) fn curated_or_curved(supplies_curve: bool) -> Condition {
     kept
 }
 
-/// Where a sample's estimator came from, most specific first. Stored on the row beside the value
-/// it chose, so "computed under no declaration" stays distinguishable from "declared sample".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Source {
-    /// A person chose it for this one collection group (an audit resolution scoped to the instant).
-    Sample,
-    /// A tool's manifest fixed it, or its operator chose it for this run.
-    Tool,
-    /// The stream's registered replicate spec declares it.
-    Stream,
-    /// The slot declares it: `site_parameters.sd_estimator`.
-    Slot,
-    /// Nothing declared one. The fallback applied and this row is undeclared.
-    Default,
-}
-
-impl Source {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Sample => "sample",
-            Self::Tool => "tool",
-            Self::Stream => "stream",
-            Self::Slot => "slot",
-            Self::Default => "default",
-        }
-    }
-}
-
-/// A resolved estimator: the value a sample is computed with, and what chose it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Resolved {
-    pub estimator: &'static str,
-    pub source: Source,
-}
-
-impl Resolved {
-    /// The undeclared fallback: a sample sd, recorded as chosen by nothing.
-    #[must_use]
-    pub const fn undeclared() -> Self {
-        Self {
-            estimator: SAMPLE,
-            source: Source::Default,
-        }
-    }
-
-    #[must_use]
-    pub const fn is_declared(&self) -> bool {
-        !matches!(self.source, Source::Default)
-    }
-}
-
-/// Reject anything outside the two divisors. A stored estimator is a specification, so an unknown
-/// value is refused at the edge rather than falling back to one of them.
-pub fn parse(value: &str) -> AppResult<&'static str> {
-    match value {
-        SAMPLE => Ok(SAMPLE),
-        POPULATION => Ok(POPULATION),
-        other => Err(AppError::BadRequest(format!(
-            "unknown sd estimator '{other}'; expected 'sample' or 'population'"
-        ))),
-    }
-}
-
-/// The same check for an optional field.
-pub fn parse_opt(value: Option<&str>) -> AppResult<Option<&'static str>> {
-    value.map(parse).transpose()
-}
-
-/// The slot's declaration, or None when the slot has not declared one.
-pub async fn slot_declaration<C: ConnectionTrait>(
-    conn: &C,
-    site_id: Uuid,
-    parameter_id: Uuid,
-) -> AppResult<Option<&'static str>> {
-    let row = site_parameters::Entity::find()
-        .filter(site_parameters::Column::SiteId.eq(site_id))
-        .filter(site_parameters::Column::ParameterId.eq(parameter_id))
-        .filter(site_parameters::Column::SdEstimator.is_not_null())
-        .one(conn)
-        .await?;
-    let Some(row) = row else { return Ok(None) };
-    let stored = row.sd_estimator;
-    // A value outside the two is not reachable through the CHECK constraint; treat it as
-    // undeclared rather than failing a read.
-    Ok(stored.as_deref().and_then(|v| match v {
-        SAMPLE => Some(SAMPLE),
-        POPULATION => Some(POPULATION),
-        _ => None,
-    }))
-}
-
-/// The estimator a stored collection group already carries because a person chose it there: an
-/// audit resolution scoped to the instant (`sd_estimator_source = 'sample'`). It belongs to the
-/// group, not the slot, so it is read by instant and outranks every slot-level declaration.
-pub async fn instant_declaration<C: ConnectionTrait>(
-    conn: &C,
-    site_id: Uuid,
-    parameter_id: Uuid,
-    collected_at: chrono::DateTime<chrono::Utc>,
-) -> AppResult<Option<&'static str>> {
-    let stored = samples::Entity::find()
-        .select_only()
-        .column(samples::Column::SdEstimator)
-        .filter(samples::Column::SiteId.eq(site_id))
-        .filter(samples::Column::ParameterId.eq(parameter_id))
-        .filter(samples::Column::CollectedAt.eq(collected_at))
-        .filter(samples::Column::SdEstimatorSource.eq(SAMPLE))
-        .into_tuple::<String>()
-        .one(conn)
-        .await?;
-    Ok(stored.as_deref().and_then(|v| match v {
-        SAMPLE => Some(SAMPLE),
-        POPULATION => Some(POPULATION),
-        _ => None,
-    }))
-}
-
-/// Resolve one slot's estimator, most specific wins: an explicit request value, then the stream's
-/// spec, then the slot's declaration, then the undeclared fallback.
-///
-/// `explicit` carries its own [`Source`] because the two callers that supply one mean different
-/// things by it (a tool run versus an operator's decision about one instant).
-pub async fn resolve<C: ConnectionTrait>(
-    conn: &C,
-    site_id: Uuid,
-    parameter_id: Uuid,
-    explicit: Option<(&'static str, Source)>,
-    stream_spec: Option<&'static str>,
-) -> AppResult<Resolved> {
-    if let Some((estimator, source)) = explicit {
-        return Ok(Resolved { estimator, source });
-    }
-    if let Some(estimator) = stream_spec {
-        return Ok(Resolved {
-            estimator,
-            source: Source::Stream,
-        });
-    }
-    if let Some(estimator) = slot_declaration(conn, site_id, parameter_id).await? {
-        return Ok(Resolved {
-            estimator,
-            source: Source::Slot,
-        });
-    }
-    Ok(Resolved::undeclared())
-}
-
 /// Grabs are spot measurements: a bottle, not a logger cadence.
 pub const SPOT: &str = river_data_core::models::MeasurementType::Spot.as_str();
 
@@ -583,67 +432,12 @@ pub(super) fn group_select(rows: Condition) -> sea_orm::sea_query::SelectStateme
 /// A group whose sample already exists takes the late replicate whatever the unstamped count is:
 /// the rule is about how many readings share the instant, not how many arrived in this write.
 pub async fn materialise_samples<C: ConnectionTrait>(conn: &C, rows: Condition) -> AppResult<()> {
-    materialise_samples_with_estimator(conn, rows, None).await
-}
-
-/// [`materialise_samples`] for a caller that knows the stream's declared sd estimator.
-///
-/// The estimator is resolved per group rather than per call: one predicate can span several slots,
-/// and each carries its own declaration. `stream_spec` is the stream's own declaration, which wins
-/// over the slot's; absent it, the slot decides, and absent that the group is recorded undeclared.
-pub async fn materialise_samples_with_estimator<C: ConnectionTrait>(
-    conn: &C,
-    rows: Condition,
-    stream_spec: Option<&str>,
-) -> AppResult<()> {
     let g = Alias::new("g");
-    let sp = Alias::new("sp");
-
-    // The estimator each new row is computed with, and what chose it, decided in the insert so a
-    // group can never exist without both recorded. A stream declaration outranks the slot's; with
-    // neither, the row is stamped `default`, which is the undeclared state the report lists and
-    // the audit gate reads.
-    let declared_by_stream = parse_opt(stream_spec)?;
-    let (estimator, source) = match declared_by_stream {
-        Some(declared) => (Expr::val(declared), Expr::val("stream")),
-        None => (
-            sea_orm::sea_query::Func::coalesce([
-                Expr::col((sp.clone(), site_parameters::Column::SdEstimator)),
-                Expr::val(SAMPLE),
-            ])
-            .into(),
-            sea_orm::sea_query::CaseStatement::new()
-                .case(
-                    Expr::col((sp.clone(), site_parameters::Column::SdEstimator)).is_null(),
-                    "default",
-                )
-                .finally("slot")
-                .into(),
-        ),
-    };
     let groups = Query::select()
         .column((g.clone(), samples::Column::SiteId))
         .column((g.clone(), samples::Column::ParameterId))
         .column((g.clone(), readings::Column::Time))
-        .expr(estimator)
-        .expr(source)
         .from_subquery(group_select(rows.clone()), g.clone())
-        .join_as(
-            JoinType::LeftJoin,
-            site_parameters::Entity,
-            sp.clone(),
-            Expr::from(
-                Condition::all()
-                    .add(
-                        Expr::col((sp.clone(), site_parameters::Column::SiteId))
-                            .equals((g.clone(), samples::Column::SiteId)),
-                    )
-                    .add(
-                        Expr::col((sp, site_parameters::Column::ParameterId))
-                            .equals((g.clone(), samples::Column::ParameterId)),
-                    ),
-            ),
-        )
         .to_owned();
     let mut insert = Query::insert();
     insert
@@ -652,8 +446,6 @@ pub async fn materialise_samples_with_estimator<C: ConnectionTrait>(
             samples::Column::SiteId,
             samples::Column::ParameterId,
             samples::Column::CollectedAt,
-            samples::Column::SdEstimator,
-            samples::Column::SdEstimatorSource,
         ])
         .select_from(groups)
         .map_err(|e| AppError::Internal(format!("materialising samples: {e}")))?
@@ -757,16 +549,14 @@ pub struct Replicate {
 pub struct Change<'a> {
     pub exclude: &'a [i16],
     pub include: &'a [i16],
-    pub estimator: Option<&'static str>,
 }
 
-pub(super) fn stats_over(values: &[f64], estimator: &'static str) -> PreviewStats {
-    let s = audit::group_stats(values).under(estimator);
+pub(super) fn stats_over(values: &[f64]) -> PreviewStats {
+    let s = audit::group_stats(values);
     PreviewStats {
         n: s.n,
         mean: s.mean,
         sd: s.sd,
-        sd_estimator: estimator,
     }
 }
 
@@ -776,7 +566,6 @@ pub(super) fn stats_over(values: &[f64], estimator: &'static str) -> PreviewStat
 #[must_use]
 pub fn preview_statistics(
     replicates: &[Replicate],
-    current_estimator: &'static str,
     change: &Change<'_>,
 ) -> (
     PreviewStats,
@@ -784,7 +573,6 @@ pub fn preview_statistics(
     PreviewDelta,
     Vec<PreviewReplicate>,
 ) {
-    let proposed_estimator = change.estimator.unwrap_or(current_estimator);
     let mut rows = Vec::with_capacity(replicates.len());
     let mut now = Vec::new();
     let mut after = Vec::new();
@@ -808,8 +596,8 @@ pub fn preview_statistics(
             included_after,
         });
     }
-    let current = stats_over(&now, current_estimator);
-    let proposed = stats_over(&after, proposed_estimator);
+    let current = stats_over(&now);
+    let proposed = stats_over(&after);
     let delta = PreviewDelta {
         n: i64::try_from(proposed.n).unwrap_or(0) - i64::try_from(current.n).unwrap_or(0),
         mean: proposed.mean.zip(current.mean).map(|(p, c)| p - c),
@@ -1158,7 +946,6 @@ pub enum Writer {
     JanitorRecompose,
     DerivedGapFill,
     MeasurementRetag,
-    SdEstimatorRetag,
     CurveRetirement,
     DerivedRecompute,
 }
@@ -1191,8 +978,7 @@ impl Writer {
             Self::CalibrationResolver
             | Self::BackfillAttribution
             | Self::PairingBackfill
-            | Self::MeasurementRetag
-            | Self::SdEstimatorRetag => None,
+            | Self::MeasurementRetag => None,
         }
     }
 }
@@ -4957,7 +4743,7 @@ pub async fn assemble_records(
                 created_by: e.created_by.clone(),
             });
         // The story of a measurement lives on the reading, so a group with no statistics row
-        // still has one; the sample adds the estimator its stored sd was computed with.
+        // still has one; the sample adds its statistics.
         let sample = group
             .iter()
             .find_map(|r| r.sample_id)
@@ -4973,13 +4759,9 @@ pub async fn assemble_records(
                 notes: group.iter().find_map(|r| r.notes.clone()),
                 provenance: blob,
                 run_source,
-                sd_estimator: sample.map(|s| s.sd_estimator.clone()),
-                sd_estimator_source: sample.map(|s| s.sd_estimator_source.clone()),
                 n: sample.map(|s| s.n),
                 mean: sample.and_then(|s| s.mean),
                 stdev: sample.and_then(|s| s.stdev),
-                stdev_sample: sample.and_then(|s| s.stdev_sample),
-                stdev_population: sample.and_then(|s| s.stdev_population),
                 median: sample.and_then(|s| s.median),
                 min: sample.and_then(|s| s.min_value),
                 max: sample.and_then(|s| s.max_value),
@@ -5196,6 +4978,7 @@ fn stream_holds_query(
             holds::Column::Kind,
             holds::Column::Status,
             holds::Column::CreatedAt,
+            holds::Column::Tool,
         ])
         .from(holds::Entity)
         .cond_where(
@@ -5227,6 +5010,7 @@ fn slot_holds_query(
             holds::Column::Kind,
             holds::Column::Status,
             holds::Column::CreatedAt,
+            holds::Column::Tool,
         ])
         .from(holds::Entity)
         .cond_where(
@@ -5494,7 +5278,7 @@ pub(super) async fn fetch_calculations(
     if parameter_ids.is_empty() {
         return Ok((HashMap::new(), HashMap::new()));
     }
-    let definitions: Vec<(Uuid, String, String, Option<Uuid>)> =
+    let definitions: Vec<(Uuid, String, String, Option<Uuid>, Option<Uuid>)> =
         calculation_formulas::Entity::find()
             .filter(calculation_formulas::Column::OutputParameterId.is_in(parameter_ids))
             .select_only()
@@ -5502,6 +5286,7 @@ pub(super) async fn fetch_calculations(
             .column(calculation_formulas::Column::Code)
             .column(calculation_formulas::Column::Name)
             .column(calculation_formulas::Column::OutputParameterId)
+            .column(calculation_formulas::Column::ToolScriptId)
             .into_tuple()
             .all(db)
             .await?;
@@ -5525,13 +5310,14 @@ pub(super) async fn fetch_calculations(
         }
     }
     let mut by_parameter: HashMap<Uuid, CalculationInfo> = HashMap::new();
-    for (id, code, name, output_parameter_id) in definitions {
+    for (id, code, name, output_parameter_id, tool_script_id) in definitions {
         let row = DefinitionRow {
             active_version_no: active_version.get(&id).copied(),
             id,
             code,
             name,
             output_parameter_id,
+            tool_script_id,
         };
         let Some(output) = row.output_parameter_id else {
             continue;
@@ -5540,6 +5326,7 @@ pub(super) async fn fetch_calculations(
             output,
             CalculationInfo {
                 definition_id: row.id,
+                tool_script_id: row.tool_script_id,
                 code: row.code,
                 name: row.name,
                 version_id: None,
@@ -5611,8 +5398,7 @@ pub(super) struct FormulaLinks {
 #[derive(Debug, Default)]
 pub(super) struct ServedSlot {
     pub(super) by_index: BTreeMap<i16, f64>,
-    pub(super) mean: Option<f64>,
-    pub(super) scalar: Option<f64>,
+    pub(super) live: Vec<InputCandidate>,
 }
 
 /// Served values keyed by `(site_id, parameter_id)`, plus the site rows' numeric columns.
@@ -5624,10 +5410,14 @@ pub(super) struct ServedValues {
 
 impl ServedValues {
     pub(super) fn scalar(&self, site_id: Uuid, parameter_id: Uuid) -> (Option<f64>, &'static str) {
-        match self.slots.get(&(site_id, parameter_id)) {
-            Some(slot) if slot.mean.is_some() => (slot.mean, "mean"),
-            Some(slot) if slot.scalar.is_some() => (slot.scalar, "reading"),
-            _ => (None, "missing"),
+        match self
+            .slots
+            .get(&(site_id, parameter_id))
+            .and_then(|slot| chosen_input(&slot.live))
+        {
+            Some(input) if input.from_mean => (Some(input.value), "mean"),
+            Some(input) => (Some(input.value), "reading"),
+            None => (None, "missing"),
         }
     }
 
@@ -5860,10 +5650,21 @@ pub(super) async fn fetch_served_values(
         .column((r.clone(), readings::Column::ParameterId))
         .column((r.clone(), readings::Column::ReplicateIndex))
         .expr_as(effective_value(Some("r")), Alias::new("value"))
-        .column((sample.clone(), samples::Column::Mean))
         .expr_as(
             Expr::cust("r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL"),
             Alias::new("live"),
+        )
+        .column((r.clone(), readings::Column::MeasurementType))
+        .column((r.clone(), readings::Column::StreamId))
+        .expr_as(
+            Expr::cust(
+                "COALESCE(CASE WHEN s.n > 0 THEN s.mean END, r.calibrated_value, r.raw_value)",
+            ),
+            Alias::new("input_value"),
+        )
+        .expr_as(
+            Expr::cust("COALESCE(s.n > 0 AND s.mean IS NOT NULL, false)"),
+            Alias::new("from_mean"),
         )
         .from_as(readings::Entity, r.clone())
         .join_as(
@@ -5897,9 +5698,14 @@ pub(super) async fn fetch_served_values(
             .entry((row.site_id, row.parameter_id))
             .or_default();
         slot.by_index.insert(row.replicate_index, row.value);
-        slot.mean = slot.mean.or(row.mean);
-        if row.live && slot.scalar.is_none() {
-            slot.scalar = Some(row.value);
+        if row.live {
+            slot.live.push(InputCandidate {
+                measurement_type: row.measurement_type,
+                replicate_index: row.replicate_index,
+                stream_id: row.stream_id,
+                value: row.input_value,
+                from_mean: row.from_mean,
+            });
         }
     }
 
@@ -7235,7 +7041,6 @@ pub(super) fn ingest_outcome(
         inserted,
         skipped,
         skipped_reasons,
-        held: 0,
         changed: 0,
         proposed: 0,
         withdrawn: 0,
@@ -7288,7 +7093,6 @@ pub(super) async fn run_replicate_audit(
     txn: &sea_orm::DatabaseTransaction,
     stream_id: Uuid,
     audits: &[crate::routes::private::sync::models::GroupAudit],
-    estimator: Option<&str>,
     paired: bool,
 ) -> AppResult<()> {
     use crate::routes::private::sync::service as audit;
@@ -7342,11 +7146,7 @@ pub(super) async fn run_replicate_audit(
             .get(&a.time)
             .map_or(&[] as &[audit::ReplicateValue], Vec::as_slice);
         let numbers: Vec<f64> = values.iter().map(|v| v.value).collect();
-        // Compared under the divisor the slot publishes. An undeclared slot compares as sample,
-        // which is what makes its population-shaped groups disagree and surface for a decision
-        // rather than being quietly reconciled under a convention nobody chose.
-        let estimator = estimator.unwrap_or("sample");
-        let stats = audit::group_stats(&numbers).under(estimator);
+        let stats = audit::group_stats(&numbers);
         let agree = audit::agrees(a, &stats);
         let mismatch = audit::GroupMismatch {
             time: a.time,
@@ -7356,7 +7156,6 @@ pub(super) async fn run_replicate_audit(
             computed_mean: stats.mean,
             computed_sd: stats.sd,
             n: stats.n,
-            sd_estimator: estimator.to_string(),
             values: values.to_vec(),
         };
         let hold_status = audit::status_for(paired);
@@ -7718,7 +7517,6 @@ pub(super) async fn find_or_create_sample(
     site_id: Uuid,
     parameter_id: Uuid,
     time: chrono::DateTime<chrono::Utc>,
-    estimator: Resolved,
 ) -> Result<(Uuid, bool), AppError> {
     let candidate = samples::ActiveModel {
         id: Set(Uuid::new_v4()),
@@ -7728,15 +7526,11 @@ pub(super) async fn find_or_create_sample(
         created_at: Set(Some(chrono::Utc::now())),
         mean: Set(None),
         stdev: sea_orm::ActiveValue::NotSet,
-        stdev_sample: Set(None),
-        stdev_population: Set(None),
         median: Set(None),
         n: Set(0),
         min_value: Set(None),
         max_value: Set(None),
         updated_at: Set(None),
-        sd_estimator: Set(estimator.estimator.to_string()),
-        sd_estimator_source: Set(estimator.source.as_str().to_string()),
     };
     let inserted = match samples::Entity::insert(candidate)
         .on_conflict(
@@ -7780,8 +7574,6 @@ pub(super) async fn materialise_grab_samples(
     txn: &sea_orm::DatabaseTransaction,
     groups: &[(Uuid, chrono::DateTime<chrono::Utc>)],
     site_id: Uuid,
-    requested_estimator: Option<&'static str>,
-    fixed_estimators: &HashMap<Uuid, &'static str>,
 ) -> Result<Vec<Uuid>, AppError> {
     let mut created: Vec<Uuid> = Vec::new();
     for (parameter_id, time) in groups {
@@ -7792,25 +7584,8 @@ pub(super) async fn materialise_grab_samples(
         if !forms_sample(usize::try_from(stored).unwrap_or(0)) {
             continue;
         }
-        // Each group resolves its own estimator: one request can span several parameters, and the
-        // declaration is per slot. A manifest that fixes one for this output outranks the
-        // request's, which is the operator's choice for a `selectable` output; both are stamped
-        // `tool`, and neither is invented here.
-        let explicit = fixed_estimators
-            .get(parameter_id)
-            .copied()
-            .or(requested_estimator);
-        let estimator = resolve(
-            txn,
-            site_id,
-            *parameter_id,
-            explicit.map(|e| (e, Source::Tool)),
-            None,
-        )
-        .await?;
         // Re-posting the same grab must reuse its sample, not accumulate empty duplicates.
-        let (sample_id, is_new) =
-            find_or_create_sample(txn, site_id, *parameter_id, *time, estimator).await?;
+        let (sample_id, is_new) = find_or_create_sample(txn, site_id, *parameter_id, *time).await?;
         if is_new {
             created.push(sample_id);
         }
@@ -7849,14 +7624,6 @@ pub(super) fn output_carries_value(output: &serde_json::Value, value: f64) -> bo
 /// standard curve produced corrected outputs, so any reading carrying `standard_curve_id` is
 /// refused (ADR 0003: a stored curve id means raw in, curve out — stamping one here would apply
 /// the correction twice).
-/// The estimator each output of a run's tool fixes, keyed by the parameter its readings land on.
-///
-/// A manifest that names `sample` or `population` is stating what that output means, so the server
-/// applies it rather than trusting a client to repeat it. `selectable` is the operator's choice and
-/// arrives on the request instead; an output that declares neither takes the slot's declaration.
-///
-/// The manifest read is the run's own pinned version, not the tool's active one: a save records
-/// what the run that produced it meant.
 /// The manifest of the tool version a run was executed under. A save reads what the run meant,
 /// never the tool's current active manifest. `None` when there is no run, no matching version, or
 /// a stored manifest that no longer parses (a tool-authoring problem, not this write's).
@@ -7890,46 +7657,6 @@ pub(super) async fn run_pinned_manifest(
         return Ok(None);
     };
     Ok(crate::routes::private::tools::models::parse_manifest(&manifest).ok())
-}
-
-pub(super) async fn tool_run_fixed_estimators(
-    db: &DatabaseConnection,
-    tool_run_id: Option<Uuid>,
-    readings: &[GrabSampleReading],
-) -> Result<HashMap<Uuid, &'static str>, AppError> {
-    let Some(run_id) = tool_run_id else {
-        return Ok(HashMap::new());
-    };
-    let Some(manifest) = run_pinned_manifest(db, run_id).await? else {
-        return Ok(HashMap::new());
-    };
-    let by_key: HashMap<&str, &'static str> = manifest
-        .outputs
-        .iter()
-        .filter_map(|o| Some((o.key.as_str(), o.fixed_sd_estimator()?)))
-        .map(|(k, e)| {
-            (
-                k,
-                if e == "population" {
-                    POPULATION
-                } else {
-                    SAMPLE
-                },
-            )
-        })
-        .collect();
-    if by_key.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let mut by_parameter: HashMap<Uuid, &'static str> = HashMap::new();
-    for r in readings {
-        if let Some(output) = r.output.as_deref()
-            && let Some(estimator) = by_key.get(output)
-        {
-            by_parameter.insert(r.parameter_id, estimator);
-        }
-    }
-    Ok(by_parameter)
 }
 
 /// What a tool-run save may store for a named input of the run, and at which index.
@@ -9065,6 +8792,7 @@ pub(super) async fn import_tool_csv(
                 .iter()
                 .filter_map(|(key, parameter_id)| {
                     result
+                        .calculation
                         .results
                         .get(key)
                         .and_then(serde_json::Value::as_f64)
@@ -9128,7 +8856,6 @@ pub(super) async fn import_tool_csv(
                 check_id: None,
                 // The tool's manifest is read by the save path itself; nothing here overrides
                 // the slot's declaration.
-                sd_estimator: None,
                 readings,
             };
             match insert_grab_samples(
@@ -9722,10 +9449,6 @@ mod attribution_tests;
 #[cfg(test)]
 #[path = "tests/measurement.rs"]
 mod measurement;
-
-#[cfg(test)]
-#[path = "tests/sd_estimator.rs"]
-mod sd_estimator;
 
 #[cfg(test)]
 #[path = "tests/sample_groups.rs"]

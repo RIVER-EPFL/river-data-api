@@ -228,20 +228,17 @@ async fn a_replicate_the_run_did_not_consume_is_refused() {
     assert!(refused.contains("tool_run_id"), "{refused}");
 }
 
-/// 10, 12, 14 with no curve: mean 12, sample sd 2, population sd 1.632993161855452.
-const POPULATION_SD: f64 = 1.632_993_161_855_452;
+/// 10, 12, 14 with no curve: mean 12, sample sd 2.
+const SAMPLE_SD: f64 = 2.0;
 
-/// Scenario: an audit decision settled one instant's divisor as the population one while the slot
-/// itself stayed undeclared, and the operator re-runs the tool over the same replicates.
+/// Scenario: the operator saves a tool run and re-runs the tool over the same replicates.
 ///
-/// Expected behaviour: the sd the tool displays is the sd the database serves. The display path
-/// resolves through the same ladder as the write path, so a decision recorded on the instant
-/// outranks the slot for the displayed number too.
+/// Expected behaviour: the sd the tool displays is the sd the database serves, the sample sd.
 #[tokio::test]
 #[serial]
-async fn a_per_instant_declaration_moves_the_sd_the_tool_displays() {
+async fn the_sd_the_tool_displays_is_the_sd_the_database_serves() {
     if !crate::common::profile::Service::ToolsRunner
-        .require("a_per_instant_declaration_moves_the_sd_the_tool_displays")
+        .require("the_sd_the_tool_displays_is_the_sd_the_database_serves")
         .await
     {
         return;
@@ -264,8 +261,8 @@ async fn a_per_instant_declaration_moves_the_sd_the_tool_displays() {
     assert_eq!(status, 200, "calculate ({status}): {run}");
     let run_id = run["run_id"].as_str().expect("run_id").to_string();
     assert!(
-        (run["results"]["DOC_sd_ppb"].as_f64().unwrap() - 2.0).abs() < 1e-9,
-        "an undeclared slot shows the sample sd: {run}"
+        (run["results"]["DOC_sd_ppb"].as_f64().unwrap() - SAMPLE_SD).abs() < 1e-9,
+        "the tool shows the sample sd: {run}"
     );
 
     let readings: Vec<serde_json::Value> = [10.0, 12.0, 14.0]
@@ -285,27 +282,6 @@ async fn a_per_instant_declaration_moves_the_sd_the_tool_displays() {
     .await;
     assert_eq!(status, 200, "save ({status}): {saved}");
 
-    // The state a `resolve {mode: "estimator", scope: "instant"}` leaves: the group carries the
-    // divisor a person chose for it, the slot still declares nothing. Written directly because
-    // that resolution needs an audit hold, which a grab stream does not raise.
-    crate::common::exec(
-        &db,
-        &format!(
-            "UPDATE samples SET sd_estimator = 'population', sd_estimator_source = 'sample' \
-             WHERE site_id = '{site}' AND parameter_id = '{DOC_PARAM}' AND collected_at = '{AT}'"
-        ),
-    )
-    .await;
-    // The sd is recomputed by the same function the retag job calls, from the group's own column.
-    crate::common::exec(
-        &db,
-        &format!(
-            "SELECT refresh_sample_aggregate(id) FROM samples \
-             WHERE site_id = '{site}' AND parameter_id = '{DOC_PARAM}' AND collected_at = '{AT}'"
-        ),
-    )
-    .await;
-
     let served: f64 = db
         .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -316,13 +292,13 @@ async fn a_per_instant_declaration_moves_the_sd_the_tool_displays() {
         ))
         .await
         .unwrap()
-        .expect("the sample survives the declaration")
+        .expect("the save formed a sample")
         .try_get::<Option<f64>>("", "stdev")
         .unwrap()
         .expect("a recomputed stdev");
     assert!(
-        (served - POPULATION_SD).abs() < 1e-9,
-        "the database serves the declared divisor: {served}"
+        (served - SAMPLE_SD).abs() < 1e-9,
+        "the database serves the sample sd: {served}"
     );
 
     let (status, rerun) = crate::common::post_json_parse_with_token(

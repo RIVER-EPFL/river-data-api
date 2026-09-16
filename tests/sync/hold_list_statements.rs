@@ -68,6 +68,7 @@ fn text_list(base: &str, status: &str, order_by: &str, limit: u64, offset: u64) 
     format!(
         "SELECT h.id, h.stream_id, h.kind, ds.source_system, ds.source_key, ds.source_name,
                 COALESCE(s.id, es.id) AS site_id,
+                COALESCE(ds.site_parameter_id, esp.id) AS site_parameter_id,
                 COALESCE(s.name, es.name) AS site_name,
                 COALESCE(p.name, ep.name) AS parameter_name,
                 COALESCE(p.code, ep.code) AS parameter_code,
@@ -76,9 +77,6 @@ fn text_list(base: &str, status: &str, order_by: &str, limit: u64, offset: u64) 
                 h.group_time,
                 h.expected, h.computed, h.delta, h.status,
                 ''::text AS classification,
-                CASE WHEN h.kind = 'replicate_stats'
-                     THEN COALESCE(h.computed->>'sd_estimator', sp.sd_estimator, 'sample')
-                END AS sd_estimator,
                 h.resolution,
                 h.created_at, h.acknowledged_by, h.acknowledged_at,
                 {relative} AS relative_delta,
@@ -91,6 +89,7 @@ fn text_list(base: &str, status: &str, order_by: &str, limit: u64, offset: u64) 
          LEFT JOIN parameters p ON p.id = sp.parameter_id
          LEFT JOIN sites es ON es.id = h.site_id
          LEFT JOIN parameters ep ON ep.id = h.parameter_id
+         LEFT JOIN site_parameters esp ON esp.site_id = h.site_id AND esp.parameter_id = h.parameter_id
          WHERE {base} AND {status}
          ORDER BY {order_by}
          LIMIT {limit} OFFSET {offset}"
@@ -130,11 +129,11 @@ fn shapes() -> Vec<Hold> {
             json!({"n": 3, "mean": 150.4, "sd": 2.5}),
             json!({"mean": -0.4, "sd": -0.5}),
         ),
-        // The population divisor, which the classification filters partition on.
+        // The n divisor, which the classification filters partition on.
         stats(
             "pending",
             json!({"n": 4, "mean": 10.0, "sd": 1.732_050_807_568_877_2}),
-            json!({"n": 4, "mean": 10.0, "sd": 2.0, "sd_estimator": "population"}),
+            json!({"n": 4, "mean": 10.0, "sd": 2.0}),
             json!({"sd": -0.267_949_192_431_122_8}),
         ),
         // A disagreement the mean carries alone, which orders differently from one the sd carries.
@@ -231,14 +230,6 @@ async fn seed(db: &DatabaseConnection) {
              VALUES ('{PAIRED_STREAM}', 'listsrc', 'paired', 'Paired stream', '{sp}', NOW()), \
                     ('{UNPAIRED_STREAM}', 'othersrc', 'unpaired', 'Unpaired stream', NULL, NOW())",
             sp = crate::common::PARAM_S1_TEMP_ID
-        ),
-    )
-    .await;
-    exec(
-        db,
-        &format!(
-            "UPDATE site_parameters SET sd_estimator = 'sample' WHERE id = '{}'",
-            crate::common::PARAM_S1_TEMP_ID
         ),
     )
     .await;
@@ -374,39 +365,59 @@ fn cases() -> Vec<Case> {
             "h.created_at DESC",
         ),
         case(
-            "the population signature",
-            json!({"classification": "population_sd"}),
+            "the n-divisor signature",
+            json!({"classification": "source_sd_matches_n_divisor"}),
             &format!(
                 "h.kind = 'replicate_stats' AND ({})",
-                *river_db::routes::private::sync::service::POPULATION_SD_SQL
+                *river_db::routes::private::sync::service::SOURCE_SD_MATCHES_N_DIVISOR_SQL
             ),
             &pending,
             "h.created_at DESC",
         ),
         case(
             "what it does not explain",
-            json!({"classification": "not_population_sd"}),
+            json!({"classification": "not_source_sd_matches_n_divisor"}),
             &format!(
                 "h.kind = 'replicate_stats' AND NOT COALESCE(({}), false)",
-                *river_db::routes::private::sync::service::POPULATION_SD_SQL
+                *river_db::routes::private::sync::service::SOURCE_SD_MATCHES_N_DIVISOR_SQL
             ),
             &pending,
             "h.created_at DESC",
         ),
         case(
-            "an undeclared slot",
-            json!({"estimator_declared": false}),
-            "NOT EXISTS (SELECT 1 FROM site_parameters sp \
-             WHERE sp.id = ds.site_parameter_id AND sp.sd_estimator IS NOT NULL)",
-            &pending,
+            "every status",
+            json!({"status": "any"}),
+            "TRUE",
+            "TRUE",
             "h.created_at DESC",
         ),
         case(
-            "a declared slot",
-            json!({"estimator_declared": true}),
-            "EXISTS (SELECT 1 FROM site_parameters sp \
-             WHERE sp.id = ds.site_parameter_id AND sp.sd_estimator IS NOT NULL)",
-            &pending,
+            "one site, through the pairing or the finding",
+            json!({"site_id": crate::common::SITE2_ID, "status": "any"}),
+            &format!(
+                "(h.site_id = '{s}' OR EXISTS (SELECT 1 FROM site_parameters sp \
+                   WHERE sp.id = ds.site_parameter_id AND sp.site_id = '{s}'))",
+                s = crate::common::SITE2_ID
+            ),
+            "TRUE",
+            "h.created_at DESC",
+        ),
+        case(
+            "one parameter",
+            json!({"parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID, "status": "any"}),
+            &format!(
+                "(h.parameter_id = '{p}' OR EXISTS (SELECT 1 FROM site_parameters sp \
+                   WHERE sp.id = ds.site_parameter_id AND sp.parameter_id = '{p}'))",
+                p = crate::common::GLOBAL_PARAM_TEMP_ID
+            ),
+            "TRUE",
+            "h.created_at DESC",
+        ),
+        case(
+            "a period",
+            json!({"from": "2025-06-01T02:00:00Z", "to": "2025-06-01T05:00:00Z", "status": "any"}),
+            "h.group_time >= '2025-06-01T02:00:00Z' AND h.group_time < '2025-06-01T05:00:00Z'",
+            "TRUE",
             "h.created_at DESC",
         ),
         Case {

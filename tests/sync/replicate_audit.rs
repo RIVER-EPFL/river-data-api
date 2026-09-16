@@ -204,7 +204,7 @@ async fn matching_audit_passes() {
     )
     .await;
     assert_eq!(body["inserted"], 3);
-    assert_eq!(body["held"], 0);
+    assert!(body.get("held").is_none(), "no hold count on the wire: {body}");
     assert_eq!(
         count(&fx.db, "SELECT COUNT(*) FROM replicate_audit_holds").await,
         0,
@@ -229,7 +229,6 @@ async fn mismatch_admits_group_and_records_pending_hold() {
     )
     .await;
     assert_eq!(body["inserted"], 6, "both groups are admitted: {body}");
-    assert_eq!(body["held"], 0);
     assert_eq!(readings_at(&fx, T1).await, 3);
 
     let holds = list_holds(&fx, "").await;
@@ -366,7 +365,6 @@ async fn moved_expectation_reaudits_a_group_already_stored() {
     )
     .await;
     assert_eq!(second["inserted"], 0, "no replicate changed");
-    assert_eq!(second["held"], 0, "the group is admitted either way");
     assert_eq!(readings_at(&fx, T1).await, 3);
 
     let holds = list_holds(&fx, "&status=pending").await;
@@ -406,7 +404,6 @@ async fn matching_resend_supersedes_stale_hold() {
         json!([{"time": T1, "expected_mean": 20.0, "expected_sd": 10.0}]),
     )
     .await;
-    assert_eq!(body["held"], 0);
     assert_eq!(hold_status(&fx.db, &hold_id).await, "superseded");
     assert_eq!(readings_at(&fx, T1).await, 3);
 }
@@ -881,12 +878,15 @@ async fn resolve_flag_recomputes_sample_and_reopen_reverts() {
 #[serial]
 async fn classification_reads_the_disagreement_signature() {
     let fx = setup("audit-classify").await;
-    // Population sd of (10, 20, 30) is 8.165; the sample sd is 10.
+    // The n-divisor sd of (10, 20, 30) is 8.165; the sample sd is 10.
     let audit = json!([{"time": T1, "expected_mean": 20.0,
                         "expected_sd": 8.164_965_809_277_26, "expected_n": 3}]);
     ingest_audited(&fx, group(T1, &[10.0, 20.0, 30.0]), audit).await;
     let holds = list_holds(&fx, "").await;
-    assert_eq!(holds["holds"][0]["classification"], "population_sd");
+    assert_eq!(
+        holds["holds"][0]["classification"],
+        "source_sd_matches_n_divisor"
+    );
 }
 
 /// An index that exists in the group but is not among the values the hold recorded cannot be
@@ -1157,57 +1157,6 @@ async fn audit_review_requires_manager_capability() {
     );
 }
 
-/// The reconciliation delete removes streams and readings, so it takes the stream-deletion gate
-/// (administrator or write_metadata token), not the manager review layer: a manager who can
-/// resolve holds and start the non-destructive migration cannot start the delete.
-#[tokio::test]
-#[serial]
-async fn the_destructive_reconciliation_delete_refuses_a_manager() {
-    if !crate::common::keycloak::keycloak_reachable().await {
-        eprintln!("SKIP: keycloak unreachable (start the dev stack, or set TEST_KEYCLOAK_URL)");
-        return;
-    }
-    let db = crate::common::setup_test_db().await;
-    crate::common::cleanup_test_db(&db).await;
-    crate::common::seed_test_data(&db).await;
-    let app = crate::common::keycloak::build_test_app_with_keycloak(db.clone()).await;
-
-    let sub = crate::common::keycloak::keycloak_user_id("manager1").await;
-    crate::common::keycloak::grant_project(&db, &sub, crate::common::PROJECT_ID).await;
-    let manager = crate::common::keycloak::get_keycloak_jwt("manager1", "manager1").await;
-
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/sync/replicate_reconciliation/delete",
-        &json!({"source_system": "cnet"}),
-        &manager,
-    )
-    .await;
-    assert_eq!(status, 403, "delete gate ({status}): {body}");
-
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/sync/replicate_reconciliation",
-        &json!({"source_system": "cnet"}),
-        &manager,
-    )
-    .await;
-    assert_ne!(
-        status, 403,
-        "the non-destructive migration stays manager-level ({status}): {body}"
-    );
-
-    let admin = crate::common::keycloak::get_keycloak_jwt("admin", "admin").await;
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/sync/replicate_reconciliation/delete",
-        &json!({"source_system": "cnet"}),
-        &admin,
-    )
-    .await;
-    assert_ne!(status, 403, "an administrator passes ({status}): {body}");
-}
-
 /// A manager granted only another project neither sees nor acts on a hold whose stream is paired
 /// into this one, and an unpaired (deferred) hold is out of every restricted caller's reach.
 #[tokio::test]
@@ -1332,10 +1281,10 @@ async fn hold_review_is_confined_to_the_callers_projects() {
     assert_eq!(status, 200, "resolve in scope ({status}): {body}");
 }
 
-/// Scenario: the population-divisor signature has two spellings, `classify()` in Rust and
-/// `POPULATION_SD_SQL` in the list filter, gate and bulk skip.
+/// Scenario: the source-sd-matches-n-divisor signature has two spellings, `classify()` in Rust and
+/// `SOURCE_SD_MATCHES_N_DIVISOR_SQL` in the list filter.
 ///
-/// Expected behaviour: they agree on every case, so what the UI counts and what the gate blocks
+/// Expected behaviour: they agree on every case, so what the UI counts and what the filter lists
 /// can never disagree. Driven through the list endpoint's `classification` filter, which is the
 /// SQL spelling, against the classification each hold reports, which is the Rust one.
 #[tokio::test]
@@ -1343,8 +1292,8 @@ async fn hold_review_is_confined_to_the_callers_projects() {
 async fn the_sql_signature_and_classify_agree() {
     let fx = setup("sqlsig").await;
 
-    // Population-shaped: mean agrees, the source's sd is ours under the divisor n.
-    // 10, 12, 14 -> sample sd 2, population sd 1.632993161855452.
+    // N-divisor-shaped: mean agrees, the source's sd is ours under the divisor n.
+    // 10, 12, 14 -> sample sd 2, n-divisor sd 1.632993161855452.
     ingest_audited(
         &fx,
         group(T1, &[10.0, 12.0, 14.0]),
@@ -1366,12 +1315,16 @@ async fn the_sql_signature_and_classify_agree() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|h| h["classification"] == "population_sd")
+        .filter(|h| h["classification"] == "source_sd_matches_n_divisor")
         .map(|h| h["group_time"].as_str().unwrap())
         .collect();
     assert_eq!(by_classify.len(), 1, "classify() finds exactly one: {all}");
 
-    let filtered = list_holds(&fx, "&page_size=100&classification=population_sd").await;
+    let filtered = list_holds(
+        &fx,
+        "&page_size=100&classification=source_sd_matches_n_divisor",
+    )
+    .await;
     let by_sql: Vec<&str> = filtered["holds"]
         .as_array()
         .unwrap()
@@ -1385,7 +1338,11 @@ async fn the_sql_signature_and_classify_agree() {
     );
 
     // The complement is the other half of the same partition: what the divisor does not explain.
-    let rest = list_holds(&fx, "&page_size=100&classification=not_population_sd").await;
+    let rest = list_holds(
+        &fx,
+        "&page_size=100&classification=not_source_sd_matches_n_divisor",
+    )
+    .await;
     let rest_times: Vec<&str> = rest["holds"]
         .as_array()
         .unwrap()
@@ -1407,24 +1364,14 @@ async fn the_sql_signature_and_classify_agree() {
     );
 }
 
-/// Scenario: a bulk accept on a slot whose estimator IS declared.
+/// Scenario: a bulk accept over two instants.
 ///
-/// Expected behaviour: the gate does not apply, and every accepted instant gets its own audit
-/// annotation so a sweep is as visible on the charts as a single decision.
+/// Expected behaviour: every accepted instant gets its own audit annotation so a sweep is as
+/// visible on the charts as a single decision.
 #[tokio::test]
 #[serial]
 async fn a_bulk_accept_annotates_every_instant_it_decides() {
     let fx = setup("bulkann").await;
-    fx.db
-        .execute_raw(Statement::from_string(
-            DatabaseBackend::Postgres,
-            format!(
-                "UPDATE site_parameters SET sd_estimator = 'sample' WHERE id = '{}'",
-                crate::common::PARAM_S1_TEMP_ID
-            ),
-        ))
-        .await
-        .unwrap();
 
     for t in [T1, T2] {
         ingest_audited(
@@ -1497,39 +1444,4 @@ async fn preview_against_a_hold_says_whether_the_expectation_is_met() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["hold"]["meets_after"], false, "{body}");
     assert_eq!(body["hold"]["mean_agrees"], false, "{body}");
-}
-
-/// Scenario: a slot declared `population`, and a later cycle raises a hold there for a count
-/// mismatch. Expected behaviour: the hold carries the divisor its computed sd was made with, so
-/// the review queue can label it, rather than every hold reading as the sample formula.
-#[tokio::test]
-#[serial]
-async fn a_hold_records_the_divisor_its_sd_was_computed_under() {
-    let fx = setup("audit-divisor").await;
-    let (status, declared) = crate::common::post_json_parse_with_token(
-        &fx.app,
-        &format!(
-            "/api/site_parameters/{}/declare_sd_estimator",
-            crate::common::PARAM_S1_TEMP_ID
-        ),
-        &json!({ "estimator": "population" }),
-        &fx.token,
-    )
-    .await;
-    assert_eq!(status, 200, "{declared}");
-
-    // 10, 20, 30: population sd 8.165; the source counted four cells.
-    let audit = json!([{"time": T1, "expected_mean": 20.0,
-                        "expected_sd": 8.164_965_809_277_26, "expected_n": 4}]);
-    ingest_audited(&fx, group(T1, &[10.0, 20.0, 30.0]), audit).await;
-
-    let holds = list_holds(&fx, "").await;
-    let hold = &holds["holds"][0];
-    assert_eq!(hold["classification"], "n_mismatch", "{hold}");
-    assert_eq!(hold["sd_estimator"], "population", "{hold}");
-    assert_eq!(hold["computed"]["sd_estimator"], "population", "{hold}");
-    assert!(
-        (hold["computed"]["sd"].as_f64().unwrap() - 8.164_965_809_277_26).abs() < 1e-9,
-        "the stored sd is the population number: {hold}"
-    );
 }

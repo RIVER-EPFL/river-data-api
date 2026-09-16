@@ -20,8 +20,7 @@ use super::models::{
     UnpairStreamResponse,
 };
 use super::service::{
-    PreviewRow, StoredStreamStats, latest_raw_value_query, preview_estimator, preview_query,
-    stream_stats_query,
+    PreviewRow, StoredStreamStats, latest_raw_value_query, preview_query, stream_stats_query,
 };
 use crate::common::AppState;
 use crate::common::bulk_write;
@@ -122,8 +121,6 @@ pub async fn stream_preview(
         }
     }
 
-    let estimator = preview_estimator(&state.db, &stream).await?;
-
     // Statistics over the replicates that would be served: flagged and withdrawn rows are excluded
     // from `samples`, so excluding them here is what makes the preview match the outcome.
     for instant in &mut instants {
@@ -133,7 +130,7 @@ pub async fn stream_preview(
             .filter(|r| !r.is_flagged && !r.withdrawn)
             .filter_map(|r| r.value)
             .collect();
-        let stats = sync_service::group_stats(&values).under(estimator.estimator);
+        let stats = sync_service::group_stats(&values);
         instant.n = stats.n;
         instant.mean = stats.mean;
         instant.sd = stats.sd;
@@ -142,8 +139,6 @@ pub async fn stream_preview(
     Ok(Json(StreamPreviewResponse {
         stream_id: id,
         source_key: stream.source_key,
-        sd_estimator: estimator.estimator,
-        sd_estimator_source: estimator.source.as_str(),
         instants,
     }))
 }
@@ -372,6 +367,13 @@ pub async fn register_stream(
             payload.metadata = serde_json::json!({});
         }
         payload.metadata[super::service::DECIMAL_PLACES_KEY] = serde_json::json!(places);
+    }
+    if let Some(granularity) = payload.instrument_granularity {
+        if !payload.metadata.is_object() {
+            payload.metadata = serde_json::json!({});
+        }
+        payload.metadata[super::service::INSTRUMENT_GRANULARITY_KEY] =
+            serde_json::json!(granularity);
     }
     // Moving an already-attached feed to a different instrument changes the attribution of
     // everything it has ever written, so it is refused here and left to the explicit swap and

@@ -13,12 +13,6 @@
             "format": "int64",
             "minimum": 0,
             "type": "integer"
-          },
-          "skipped_undeclared_estimator": {
-            "description": "Holds this call deliberately left pending: their disagreement is the population-divisor\nsignature on a slot that has not declared an estimator, so accepting them would record a\ndecision about which formula this slot publishes without anyone having made one.",
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
           }
         },
         "required": [
@@ -2971,6 +2965,11 @@
           "name": {
             "type": "string"
           },
+          "tool_script_id": {
+            "description": "The calculation the formula belongs to, absent for a standalone derived parameter.",
+            "format": "uuid",
+            "type": "string"
+          },
           "version_id": {
             "description": "The version the stored value names, absent when the value predates versioning.",
             "format": "uuid",
@@ -3349,25 +3348,6 @@
         ],
         "type": "object"
       },
-      "CandidatesResponse": {
-        "properties": {
-          "families": {
-            "items": {
-              "$ref": "#/components/schemas/FamilyCandidate"
-            },
-            "type": "array"
-          },
-          "total_old_streams": {
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "families",
-          "total_old_streams"
-        ],
-        "type": "object"
-      },
       "CaseResult": {
         "properties": {
           "error": {
@@ -3509,32 +3489,15 @@
             "format": "uuid",
             "type": "string"
           },
-          "sd_estimator": {
-            "description": "'sample' | 'population', and what chose it ('default' is the fallback having applied).",
-            "type": "string"
-          },
-          "sd_estimator_source": {
-            "type": "string"
-          },
           "stdev": {
-            "description": "The sd under the divisor the slot declares. `sd_estimator` names which that is; the other\ntravels beside it so a reviewer can read both without declaring anything first.",
-            "format": "double",
-            "type": "number"
-          },
-          "stdev_population": {
-            "format": "double",
-            "type": "number"
-          },
-          "stdev_sample": {
+            "description": "The sample standard deviation (n-1).",
             "format": "double",
             "type": "number"
           }
         },
         "required": [
           "sample_id",
-          "n",
-          "sd_estimator",
-          "sd_estimator_source"
+          "n"
         ],
         "type": "object"
       },
@@ -4037,7 +4000,7 @@
             "type": "number"
           },
           "n": {
-            "description": "The group's statistics, the numbers the chart plotted and drew its bar from. Without these\nthe record shows the replicates and a sentence about the divisor, and never what was served.",
+            "description": "The group's statistics, the numbers the chart plotted and drew its bar from. Without these\nthe record shows the replicates and never what was served.",
             "format": "int32",
             "type": "integer"
           },
@@ -4061,22 +4024,7 @@
             "format": "uuid",
             "type": "string"
           },
-          "sd_estimator": {
-            "description": "Which divisor this group's served standard deviation uses ('sample' = n-1, 'population' =\nn) and what chose it. `sd_estimator_source` 'default' means nothing declared one, so the\nnumber is served under a convention nobody stated. Absent on a single measurement, which\nhas no standard deviation.",
-            "type": "string"
-          },
-          "sd_estimator_source": {
-            "type": "string"
-          },
           "stdev": {
-            "format": "double",
-            "type": "number"
-          },
-          "stdev_population": {
-            "format": "double",
-            "type": "number"
-          },
-          "stdev_sample": {
             "format": "double",
             "type": "number"
           }
@@ -5476,56 +5424,6 @@
         ],
         "type": "object"
       },
-      "DeclareSdEstimatorRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "estimator": {
-            "description": "'sample' (divisor n-1), 'population' (divisor n), or null to clear the declaration.\nClearing leaves the slot undeclared: new statistics fall back to sample recorded as\n'default', and stored samples keep the estimator they were computed with.",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
-      "DeclareSdEstimatorResponse": {
-        "properties": {
-          "estimator": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "job_id": {
-            "description": "The tracked `sd_estimator_retag` job, present when a recompute was enqueued.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "previous": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "samples_affected": {
-            "description": "Samples the retag will recompute; 0 when clearing or nothing disagrees.",
-            "format": "int64",
-            "type": "integer"
-          },
-          "site_parameter_id": {
-            "format": "uuid",
-            "type": "string"
-          }
-        },
-        "required": [
-          "site_parameter_id",
-          "estimator",
-          "previous",
-          "samples_affected"
-        ],
-        "type": "object"
-      },
       "DefinitionMember": {
         "properties": {
           "code": {
@@ -6241,104 +6139,6 @@
         ],
         "type": "object"
       },
-      "DuplicateSlot": {
-        "properties": {
-          "duplicated_instants": {
-            "description": "Instants at this slot carrying readings from more than one stream.",
-            "format": "int64",
-            "type": "integer"
-          },
-          "parameter_id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "parameter_name": {
-            "type": "string"
-          },
-          "site_id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "site_name": {
-            "type": "string"
-          },
-          "site_parameter_id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "streams": {
-            "items": {
-              "$ref": "#/components/schemas/DuplicateSlotStream"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "site_id",
-          "site_name",
-          "parameter_id",
-          "parameter_name",
-          "site_parameter_id",
-          "streams",
-          "duplicated_instants"
-        ],
-        "type": "object"
-      },
-      "DuplicateSlotStream": {
-        "properties": {
-          "first_reading": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "last_reading": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "readings": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "source_key": {
-            "type": "string"
-          },
-          "source_system": {
-            "type": "string"
-          },
-          "stream_id": {
-            "format": "uuid",
-            "type": "string"
-          }
-        },
-        "required": [
-          "stream_id",
-          "source_system",
-          "source_key",
-          "readings",
-          "first_reading",
-          "last_reading"
-        ],
-        "type": "object"
-      },
-      "DuplicateSlotsResponse": {
-        "properties": {
-          "slots": {
-            "items": {
-              "$ref": "#/components/schemas/DuplicateSlot"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "slots"
-        ],
-        "type": "object"
-      },
       "DynamicFlag": {
         "description": "A detection the parse tree cannot complete: `any` is what a caller branches on, the\nexpressions are what it shows when it does.",
         "properties": {
@@ -6616,6 +6416,11 @@
           },
           "tool": {
             "description": "The blob's tool name, when one exists.",
+            "type": "string"
+          },
+          "tool_run_id": {
+            "description": "The run behind the value, when a tool computed it. The trace endpoint replays it, which is\nwhat lets a cell show the formula rather than only the name of what ran.",
+            "format": "uuid",
             "type": "string"
           },
           "written_by": {
@@ -6911,6 +6716,10 @@
           "units": {
             "description": "The unit the column's numbers are in, from the site's slot when it declares one and the\ncatalog default otherwise. A grid of bare numbers cannot be read without it.",
             "type": "string"
+          },
+          "written_by": {
+            "description": "The calculation that writes this parameter, when one does. The column's values are computed\noutputs, so the grid reads them and sends a correction back through the calculation (Q8)\nrather than offering a keystroke.",
+            "type": "string"
           }
         },
         "required": [
@@ -6979,58 +6788,6 @@
           "system",
           "station",
           "attribution"
-        ],
-        "type": "object"
-      },
-      "FamilyCandidate": {
-        "properties": {
-          "family_source_key": {
-            "type": "string"
-          },
-          "family_stream_id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "migrated": {
-            "type": "boolean"
-          },
-          "missing_instants": {
-            "description": "Old-stream instants the family stream has no readings for. Zero = ready for cutover.",
-            "format": "int64",
-            "type": "integer"
-          },
-          "old_readings": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "old_source_key": {
-            "type": "string"
-          },
-          "old_stream_id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "ready": {
-            "type": "boolean"
-          },
-          "site_parameter_id": {
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "family_stream_id",
-          "family_source_key",
-          "old_stream_id",
-          "old_source_key",
-          "site_parameter_id",
-          "migrated",
-          "old_readings",
-          "missing_instants",
-          "ready"
         ],
         "type": "object"
       },
@@ -7530,13 +7287,6 @@
             },
             "type": "array"
           },
-          "sd_estimator": {
-            "description": "Which divisor the samples this request creates compute their standard deviation with:\n`sample` (n-1) or `population` (n). Present when a tool's manifest fixes it or its operator\nchose one; omitted, the slot's declaration decides, and absent that the group is recorded\nundeclared. It never changes a group that already exists: the estimator a stored sample was\ncomputed with is changed through the audit resolution or the retag job, where the decision\nis recorded.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "site_id": {
             "format": "uuid",
             "type": "string"
@@ -7835,10 +7585,6 @@
               "null"
             ]
           },
-          "sd_estimator": {
-            "$ref": "#/components/schemas/SdEstimator",
-            "description": "The divisor `sd` was computed under. Absent on a hold that predates the record."
-          },
           "values": {
             "items": {
               "$ref": "#/components/schemas/HoldValue"
@@ -7983,6 +7729,13 @@
           },
           "status": {
             "type": "string"
+          },
+          "tool": {
+            "description": "The calculation a chain finding is against, so its chip opens that calculation.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -8009,7 +7762,7 @@
             ]
           },
           "classification": {
-            "description": "Signature of the disagreement: `n_mismatch` | `population_sd` | `stale_subset` |\n`unexplained`. Computed from the stored expectation and recompute, never persisted.",
+            "description": "Signature of the disagreement: `n_mismatch` | `source_sd_matches_n_divisor` |\n`stale_subset` | `unexplained`. Computed from the stored expectation and recompute, never\npersisted.",
             "type": "string"
           },
           "computed": {
@@ -8066,17 +7819,6 @@
             "description": "The decision record: latest action plus prior actions under `history`.",
             "type": "object"
           },
-          "sd_estimator": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/SdEstimator",
-                "description": "The divisor `computed.sd` was computed under, 'sample' or 'population'. Recorded on the\nhold; a hold that predates the record reads the slot's declaration, else 'sample'."
-              }
-            ]
-          },
           "sd_relative_delta": {
             "description": "`|Δsd|` over the same mean-magnitude denominator as `mean_relative_delta`.",
             "format": "double",
@@ -8091,6 +7833,14 @@
             ]
           },
           "site_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "site_parameter_id": {
+            "description": "The slot the hold is about, which a point record is opened on.",
+            "format": "uuid",
             "type": [
               "string",
               "null"
@@ -8142,6 +7892,7 @@
           "source_key",
           "source_name",
           "site_id",
+          "site_parameter_id",
           "site_name",
           "parameter_name",
           "parameter_code",
@@ -8153,7 +7904,6 @@
           "delta",
           "status",
           "classification",
-          "sd_estimator",
           "resolution",
           "created_at",
           "acknowledged_by",
@@ -9006,11 +8756,6 @@
             "minimum": 0,
             "type": "integer"
           },
-          "held": {
-            "description": "Always 0: the replicate audit admits every group and records disagreements for review.\nRetained because the sync protocol (`river-data-core`) reports a held count per cycle.",
-            "minimum": 0,
-            "type": "integer"
-          },
           "inserted": {
             "minimum": 0,
             "type": "integer"
@@ -9304,6 +9049,14 @@
           "options"
         ],
         "type": "object"
+      },
+      "InstrumentGranularity": {
+        "description": "How many instruments a source's channels stand for, declared by the connector.",
+        "enum": [
+          "per_parameter",
+          "per_site_parameter"
+        ],
+        "type": "string"
       },
       "InstrumentNameConflict": {
         "description": "The instrument a proposed name collides with, enough of it to choose by.",
@@ -10068,7 +9821,7 @@
         "description": "An output that may be saved names the catalog parameter it is saved to twice over.\n\n`parameter_id` is authoritative when present, `suggested_parameter_code` is the fallback, and\nresolution is id first then code. Both halves exist because a manifest has to survive leaving\nthe database it was authored in: the seeded tools are inserted into a fresh database where no\nparameter UUID exists yet, and dev and production give the same analyte different UUIDs, so a\ncode-only output has to keep working exactly as it did.",
         "properties": {
           "aggregate": {
-            "description": "`mean` or `sd`: the engine computes this output over the curve-applied values of the\n`replicates` param `aggregate_of` names, so the preview a technician sees is the number\nthe database will later serve, divisor included. The script never computes it; a script\nvalue under the same key is discarded.",
+            "description": "`mean` or `sd`: the engine computes this output over the curve-applied values of the\n`replicates` param `aggregate_of` names, so the preview a technician sees is the number\nthe database will later serve. The script never computes it; a script\nvalue under the same key is discarded.",
             "type": "string"
           },
           "aggregate_of": {
@@ -10092,13 +9845,6 @@
           },
           "per_replicate": {
             "type": "boolean"
-          },
-          "sd_estimator": {
-            "description": "Which divisor the samples saved from this output compute their standard deviation with:\n`sample` (n-1), `population` (n), or `selectable` to let the operator choose per run.\nAbsent takes the slot's declaration, which is the usual case: the estimator is a property\nof the parameter, and only a tool that genuinely reports both conventions has cause to\noverride it. Never reaches the R runner: it governs how the saved replicates are\naggregated, not the calculation.",
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "suggested_parameter_code": {
             "type": [
@@ -10462,13 +10208,6 @@
           "mean_label": {
             "type": "string"
           },
-          "sd_estimator": {
-            "description": "The divisor the slot declares, NULL where it declares none. Never inferred.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "sd_label": {
             "type": "string"
           }
@@ -10476,7 +10215,6 @@
         "required": [
           "mean_label",
           "sd_label",
-          "sd_estimator",
           "decimal_places"
         ],
         "type": "object"
@@ -13424,7 +13162,7 @@
         "type": "object"
       },
       "ParameterStatistics": {
-        "description": "The portal's eight rows for one parameter, with both standard deviations rather than one.",
+        "description": "The portal's eight rows for one parameter.",
         "properties": {
           "code": {
             "type": "string"
@@ -13466,12 +13204,8 @@
             "format": "uuid",
             "type": "string"
           },
-          "stdev_population": {
-            "format": "double",
-            "type": "number"
-          },
           "stdev_sample": {
-            "description": "Both divisors, named. Which one a slot declares governs its replicate groups, not a period\nsummary, so neither is presented as the answer here.",
+            "description": "The sample standard deviation (n-1), R's `sd()`.",
             "format": "double",
             "type": "number"
           },
@@ -13748,6 +13482,28 @@
       "PlanCurveAssignment": {
         "description": "One standard curve the source has replicated, and the instrument it is currently fitted on.\nRe-homing is a curve-level decision, so the curves are listed in their own right rather than\nonly inside the instrument that happens to own them.",
         "properties": {
+          "corrected_parameters": {
+            "description": "The parameters of the plan's streams whose readings this curve corrects.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "corrected_sites": {
+            "description": "The stations of the plan's streams whose readings this curve corrects.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "first_corrected": {
+            "description": "The earliest reading this curve corrects.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "format": "uuid",
             "type": "string"
@@ -13758,6 +13514,14 @@
           "intercept": {
             "format": "double",
             "type": "number"
+          },
+          "last_corrected": {
+            "description": "The latest reading this curve corrects.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "name": {
             "type": [
@@ -13815,6 +13579,10 @@
           "sensor_id",
           "instrument_name",
           "reading_count",
+          "corrected_parameters",
+          "corrected_sites",
+          "first_corrected",
+          "last_corrected",
           "pending_source_key",
           "pending_instrument_name"
         ],
@@ -14051,19 +13819,8 @@
               }
             ]
           },
-          "sd_estimator": {
-            "description": "The divisor this slot will publish its replicate standard deviation with, chosen in the\nreview. Applied to the `site_parameters` row when the plan is applied; left unset, the slot\nstays undeclared and its audit disagreements are held for a decision instead.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "sd_holds": {
-            "description": "The evidence for that choice: open replicate-statistics holds on this stream, and how many\nof them match the population signature. Written at plan creation so the review shows what\nthe incoming data reports rather than only that a question exists.",
-            "format": "int64",
-            "type": "integer"
-          },
-          "sd_population_holds": {
+            "description": "Open replicate-statistics holds on this stream, written at plan creation.",
             "format": "int64",
             "type": "integer"
           },
@@ -14101,7 +13858,6 @@
           "confidence",
           "warnings",
           "sd_holds",
-          "sd_population_holds",
           "acknowledged",
           "is_device"
         ],
@@ -14185,13 +13941,6 @@
             ]
           },
           "project_name": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "sd_estimator": {
-            "description": "Declare which divisor this slot publishes its replicate standard deviation with,\n`sample` or `population`. Applied to the `site_parameters` row when the plan is applied.\nNever inferred: absent leaves the slot undeclared and the audit gate asks later.",
             "type": [
               "string",
               "null"
@@ -15078,7 +14827,7 @@
             ]
           },
           "kind": {
-            "description": "`units_mismatch` | `empty_name` | `near_duplicate` | `sd_estimator_undeclared`.",
+            "description": "`units_mismatch` | `empty_name` | `near_duplicate`.",
             "type": "string"
           },
           "message": {
@@ -15344,17 +15093,12 @@
               "number",
               "null"
             ]
-          },
-          "sd_estimator": {
-            "$ref": "#/components/schemas/SdEstimator",
-            "description": "'sample' (divisor n-1) or 'population' (divisor n)."
           }
         },
         "required": [
           "n",
           "mean",
-          "sd",
-          "sd_estimator"
+          "sd"
         ],
         "type": "object"
       },
@@ -17148,6 +16892,17 @@
               "null"
             ]
           },
+          "instrument_granularity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/InstrumentGranularity",
+                "description": "The instrument this channel suggests at pairing. None leaves it to the API's inference."
+              }
+            ]
+          },
           "measurement_type": {
             "description": "Stream-level classification declared at discovery. None never clears an operator-set value.",
             "type": [
@@ -18035,15 +17790,8 @@
       "ResolveHoldRequest": {
         "additionalProperties": false,
         "properties": {
-          "estimator": {
-            "description": "`estimator` mode: the divisor to declare, `sample` (n-1) or `population` (n). Either is a\nreal answer; declaring `sample` states that ours is the number this slot publishes even\nthough the source computed the other one.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "mode": {
-            "description": "`ours` (accept the recomputed statistics; identical to acknowledge) | `flag` (flag the\nnamed replicates so the sample statistics recompute over the rest) | `estimator` (declare\nwhich standard-deviation divisor this slot, or this one instant, publishes) | `verify` /\n`reject` (rule on an intern's entry: accept it as it stands, or withdraw it).",
+            "description": "`ours` (accept the recomputed statistics; identical to acknowledge) | `flag` (flag the\nnamed replicates so the sample statistics recompute over the rest) | `verify` / `reject`\n(rule on an intern's entry: accept it as it stands, or withdraw it).",
             "type": "string"
           },
           "reason": {
@@ -18063,13 +17811,6 @@
               "array",
               "null"
             ]
-          },
-          "scope": {
-            "description": "`estimator` mode: `slot` declares it for the parameter at this site and recomputes its\nexisting samples; `instant` sets it for this one collection group and leaves the parameter\nundeclared. Defaults to `slot`.",
-            "type": [
-              "string",
-              "null"
-            ]
           }
         },
         "required": [
@@ -18079,13 +17820,8 @@
       },
       "ResolveHoldResponse": {
         "properties": {
-          "job_id": {
-            "description": "`estimator` mode: the tracked `sd_estimator_retag` recomputing the slot's samples.",
-            "format": "uuid",
-            "type": "string"
-          },
           "samples_affected": {
-            "description": "`estimator` mode: samples this declaration changed, counted before the job for `slot`\nscope and exactly one for `instant`.",
+            "description": "`verify` / `reject`: the readings the ruling decided.",
             "format": "int64",
             "type": "integer"
           },
@@ -18269,85 +18005,6 @@
           "sensors_updated",
           "data_frequency",
           "job_id"
-        ],
-        "type": "object"
-      },
-      "RetagSdEstimatorRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "dry_run": {
-            "description": "Count what the retag would touch and enqueue nothing. The declaration check is skipped,\nso a slot can be previewed under the divisor it is about to declare.",
-            "type": "boolean"
-          },
-          "end": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "estimator": {
-            "description": "'sample' (divisor n-1) or 'population' (divisor n). Every slot in scope must already\ndeclare it: the retag applies a declaration to the stored samples, it does not make one.",
-            "type": "string"
-          },
-          "override_instants": {
-            "description": "Also retag samples whose estimator a person chose for that one instant\n(`sd_estimator_source = 'sample'`). Off by default, as the declaration's own retag is.",
-            "type": "boolean"
-          },
-          "site_parameter_ids": {
-            "items": {
-              "format": "uuid",
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "start": {
-            "description": "Inclusive bounds on `samples.collected_at`.",
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "stream_ids": {
-            "description": "Streams reach their slot through their pairing; an unpaired stream reaches none.",
-            "items": {
-              "format": "uuid",
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "estimator"
-        ],
-        "type": "object"
-      },
-      "RetagSdEstimatorResponse": {
-        "properties": {
-          "estimator": {
-            "type": "string"
-          },
-          "instant_decisions": {
-            "description": "Samples in scope carrying an instant-chosen estimator that differs from the target:\ncounted inside `samples_affected` with `override_instants`, skipped without.",
-            "format": "int64",
-            "type": "integer"
-          },
-          "job_id": {
-            "description": "The tracked `sd_estimator_retag` job, present when something needed recomputing.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "samples_affected": {
-            "description": "Samples the retag will recompute.",
-            "format": "int64",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "estimator",
-          "samples_affected",
-          "instant_decisions"
         ],
         "type": "object"
       },
@@ -18717,6 +18374,82 @@
         ],
         "type": "object"
       },
+      "RunTrace": {
+        "description": "A stored run replayed under the version it pinned, so a value computed months ago still shows\nthe formula behind it and the numbers that formula read.",
+        "properties": {
+          "collected_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "constants": {
+            "additionalProperties": {
+              "format": "double",
+              "type": "number"
+            },
+            "description": "The constant values the run resolved, by name.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "event_inputs": {
+            "description": "The visit's stored values the run read, as `{param, parameter_code, parameter_id, value}`.",
+            "items": {},
+            "type": "array"
+          },
+          "label": {
+            "description": "The pinned version's label, which is what a reader recognises the calculation by.",
+            "type": "string"
+          },
+          "run_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "site_id": {
+            "description": "The visit the run read its values at, when it named one. A binding that is neither a step\nnor a constant was read here, which is the answer to \"where did this number come from\".",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "site_inputs": {
+            "description": "The station properties the run read, as `{property, param, value}`.",
+            "items": {},
+            "type": "array"
+          },
+          "tool": {
+            "description": "The calculation's name, as the run recorded it.",
+            "type": "string"
+          },
+          "trace": {
+            "items": {
+              "$ref": "#/components/schemas/TraceStep"
+            },
+            "type": "array"
+          },
+          "version_no": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "run_id",
+          "tool",
+          "label",
+          "version_no",
+          "site_id",
+          "collected_at",
+          "event_inputs",
+          "site_inputs",
+          "constants",
+          "trace"
+        ],
+        "type": "object"
+      },
       "RunnableJob": {
         "description": "One kind a person may run off-cadence, as the page lists it: what it needs, and the cadence it\nalso runs on where it has one.",
         "properties": {
@@ -18825,31 +18558,11 @@
             "format": "uuid",
             "type": "string"
           },
-          "sd_estimator": {
-            "type": "string"
-          },
-          "sd_estimator_source": {
-            "type": "string"
-          },
           "site_id": {
             "format": "uuid",
             "type": "string"
           },
           "stdev": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "stdev_population": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "stdev_sample": {
             "format": "double",
             "type": [
               "number",
@@ -18873,27 +18586,16 @@
           "mean",
           "stdev",
           "n",
-          "stdev_sample",
-          "stdev_population",
           "median",
           "min_value",
           "max_value",
-          "updated_at",
-          "sd_estimator",
-          "sd_estimator_source"
+          "updated_at"
         ],
         "type": "object"
       },
       "SamplePreviewRequest": {
         "additionalProperties": false,
         "properties": {
-          "estimator": {
-            "description": "The divisor to compute the proposed sd under; absent keeps the group's current one.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "exclude_replicate_indexes": {
             "description": "Replicates to leave out, as a flag would.",
             "items": {
@@ -19032,31 +18734,11 @@
             "format": "uuid",
             "type": "string"
           },
-          "sd_estimator": {
-            "type": "string"
-          },
-          "sd_estimator_source": {
-            "type": "string"
-          },
           "site_id": {
             "format": "uuid",
             "type": "string"
           },
           "stdev": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "stdev_population": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "stdev_sample": {
             "format": "double",
             "type": [
               "number",
@@ -19080,14 +18762,10 @@
           "mean",
           "stdev",
           "n",
-          "stdev_sample",
-          "stdev_population",
           "median",
           "min_value",
           "max_value",
-          "updated_at",
-          "sd_estimator",
-          "sd_estimator_source"
+          "updated_at"
         ],
         "type": "object"
       },
@@ -19124,23 +18802,8 @@
             "format": "uuid",
             "type": "string"
           },
-          "sd_estimator": {
-            "description": "'sample' | 'population', and what chose it ('default' is the fallback having applied).",
-            "type": "string"
-          },
-          "sd_estimator_source": {
-            "type": "string"
-          },
           "stdev": {
-            "description": "The sd under the divisor the slot declares; `sd_estimator` names which. Both divisors are\nserved beside it, so the one not declared stays readable.",
-            "format": "double",
-            "type": "number"
-          },
-          "stdev_population": {
-            "format": "double",
-            "type": "number"
-          },
-          "stdev_sample": {
+            "description": "The sample standard deviation (n-1).",
             "format": "double",
             "type": "number"
           }
@@ -19148,8 +18811,6 @@
         "required": [
           "sample_id",
           "n",
-          "sd_estimator",
-          "sd_estimator_source",
           "replicates"
         ],
         "type": "object"
@@ -19663,14 +19324,6 @@
           "namespaces"
         ],
         "type": "object"
-      },
-      "SdEstimator": {
-        "description": "The two values an estimator field carries, for the document.\n\nThe estimator itself travels as a string, because it is a column value the whole ingest path\ncompares against [`SAMPLE`] and [`POPULATION`]. This names the pair so a schema field declares\nwhat it may hold rather than \"a string\", and a generated client reads the two.",
-        "enum": [
-          "sample",
-          "population"
-        ],
-        "type": "string"
       },
       "SearchResponse": {
         "properties": {
@@ -22066,12 +21719,6 @@
               "null"
             ]
           },
-          "sd_estimator": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "sensor_type": {
             "type": [
               "string",
@@ -22201,13 +21848,6 @@
               "null"
             ]
           },
-          "sd_estimator": {
-            "description": "How this slot's replicate standard deviation is defined: 'sample' (divisor n-1) or\n'population' (divisor n). NULL is UNDECLARED, not a synonym for 'sample': the sources use\nboth conventions and which one a slot publishes is a decision, so an undeclared slot is\nreported and its population-signature audit holds cannot be waved through.\nExcluded from update: a declaration change must recompute the slot's stored samples, so it\ngoes through `POST /site_parameters/{id}/declare_sd_estimator`, which enqueues the retag.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "sensor_type": {
             "type": "string"
           },
@@ -22265,7 +21905,6 @@
           "is_active",
           "is_public",
           "needs_review",
-          "sd_estimator",
           "entry_mode",
           "instrument_sensor_id",
           "variable_mappings",
@@ -22367,13 +22006,6 @@
               "null"
             ]
           },
-          "sd_estimator": {
-            "description": "How this slot's replicate standard deviation is defined: 'sample' (divisor n-1) or\n'population' (divisor n). NULL is UNDECLARED, not a synonym for 'sample': the sources use\nboth conventions and which one a slot publishes is a decision, so an undeclared slot is\nreported and its population-signature audit holds cannot be waved through.\nExcluded from update: a declaration change must recompute the slot's stored samples, so it\ngoes through `POST /site_parameters/{id}/declare_sd_estimator`, which enqueues the retag.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "sensor_type": {
             "type": "string"
           },
@@ -22431,7 +22063,6 @@
           "is_active",
           "is_public",
           "needs_review",
-          "sd_estimator",
           "entry_mode",
           "instrument_sensor_id",
           "variable_mappings",
@@ -22858,28 +22489,41 @@
       },
       "StageEventsRequest": {
         "additionalProperties": false,
-        "description": "A trip: one visit per site named, all at one instant.",
+        "description": "A field day: the visits it covers, each at its own site and instant.",
         "properties": {
-          "collected_at": {
-            "format": "date-time",
-            "type": "string"
-          },
           "notes": {
             "type": [
               "string",
               "null"
             ]
           },
-          "site_ids": {
+          "visits": {
             "items": {
-              "format": "uuid",
-              "type": "string"
+              "$ref": "#/components/schemas/StageVisitRow"
             },
             "type": "array"
           }
         },
         "required": [
-          "site_ids",
+          "visits"
+        ],
+        "type": "object"
+      },
+      "StageVisitRow": {
+        "additionalProperties": false,
+        "description": "One visit of a field day: a site and the instant it was sampled.",
+        "properties": {
+          "collected_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "site_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "site_id",
           "collected_at"
         ],
         "type": "object"
@@ -23350,40 +22994,6 @@
         ],
         "type": "object"
       },
-      "StartReconciliationRequest": {
-        "properties": {
-          "dry_run": {
-            "type": "boolean"
-          },
-          "source_system": {
-            "type": "string"
-          },
-          "tolerance": {
-            "description": "Relative verification tolerance; defaults to the sync audit's.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "source_system"
-        ],
-        "type": "object"
-      },
-      "StartReconciliationResponse": {
-        "properties": {
-          "job_id": {
-            "format": "uuid",
-            "type": "string"
-          }
-        },
-        "required": [
-          "job_id"
-        ],
-        "type": "object"
-      },
       "StationCandidate": {
         "description": "One station offered to a picker: what the list holds, plus how far it is from the site being\nconfigured where that site has coordinates.",
         "properties": {
@@ -23678,14 +23288,6 @@
             },
             "type": "array"
           },
-          "sd_estimator": {
-            "$ref": "#/components/schemas/SdEstimator",
-            "description": "The divisor the standard deviations below were computed under, resolved the way the write\npath resolves it: the stream's spec, then the slot's declaration, else the fallback."
-          },
-          "sd_estimator_source": {
-            "description": "What chose it: 'stream', 'slot', or 'default' for the undeclared fallback.",
-            "type": "string"
-          },
           "source_key": {
             "type": "string"
           },
@@ -23697,8 +23299,6 @@
         "required": [
           "stream_id",
           "source_key",
-          "sd_estimator",
-          "sd_estimator_source",
           "instants"
         ],
         "type": "object"
@@ -25079,6 +24679,119 @@
         ],
         "type": "object"
       },
+      "ToolCalculation": {
+        "description": "A calculation's result as the runner returned it, stored nowhere.",
+        "properties": {
+          "cleared": {
+            "description": "Outputs the script computed as NA. The portal blanked such a column rather than leaving\nthe previous number standing, so these name the stored values a save must clear.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "constants": {
+            "additionalProperties": {
+              "format": "double",
+              "type": "number"
+            },
+            "description": "The constant values the server resolved and passed to the runner, by name.\nThe constant values the server resolved and passed to the runner, by name.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "curves": {
+            "description": "The curves the server resolved, as the runner received them.",
+            "items": {
+              "$ref": "#/components/schemas/CurveSnapshot"
+            },
+            "type": "array"
+          },
+          "event_inputs": {
+            "description": "Same-event parameter values resolved at `(site_id, collected_at)`, as\n`{param, parameter_code, parameter_id, value}`.",
+            "items": {
+              "additionalProperties": {},
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "inputs_ignored": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "inputs_used": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "refused": {
+            "description": "Outputs whose formula produced a number that is not finite. The calculation divided by\nzero, so the output is refused: it is in neither `results` nor `cleared`, the value already\nstored at the visit stands, and `skipped` carries the reason (Q172).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "results": {
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "site_inputs": {
+            "description": "Station properties resolved from the site named by `site_id`, as `{property, param, value}`.",
+            "items": {
+              "additionalProperties": {},
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "skipped": {
+            "description": "Formulas that did not run and why, as `{output, reason}`. An unresolved input costs its\nown output and no other, so the rest of the calculation is in `results`.",
+            "items": {
+              "additionalProperties": {},
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "tool": {
+            "type": "string"
+          },
+          "tool_version": {
+            "$ref": "#/components/schemas/ToolVersionRef",
+            "description": "The exact script version and runtime that produced these numbers; goes into the\nprovenance blob on save."
+          },
+          "trace": {
+            "description": "Each formula as it was evaluated, with the values it read per cell. Absent for a script\nrun, which returns only what the script returns.",
+            "items": {
+              "$ref": "#/components/schemas/TraceStep"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "tool",
+          "results",
+          "inputs_used",
+          "inputs_ignored",
+          "constants",
+          "curves",
+          "tool_version"
+        ],
+        "type": "object"
+      },
       "ToolDescriptor": {
         "description": "One tool as `GET /tools` lists it: the manifest plus the identity of the version serving it.",
         "properties": {
@@ -25196,122 +24909,25 @@
         "description": "One manifest output as `GET /tools` serves it: the declaration as authored, plus the parameter\nit resolves to now. `parameter` is null when the output names none, or names one this database\ndoes not hold."
       },
       "ToolResult": {
-        "properties": {
-          "cleared": {
-            "description": "Outputs the script computed as NA. The portal blanked such a column rather than leaving\nthe previous number standing, so these name the stored values a save must clear.",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ToolCalculation"
           },
-          "constants": {
-            "additionalProperties": {
-              "format": "double",
-              "type": "number"
+          {
+            "properties": {
+              "run_id": {
+                "description": "The stored `tool_runs` row for this calculation. A grab save names it as `tool_run_id`\nand the server builds the provenance blob from that row, never from the client.",
+                "format": "uuid",
+                "type": "string"
+              }
             },
-            "description": "The constant values the server resolved and passed to the runner, by name.\nThe constant values the server resolved and passed to the runner, by name.",
-            "propertyNames": {
-              "type": "string"
-            },
+            "required": [
+              "run_id"
+            ],
             "type": "object"
-          },
-          "curves": {
-            "description": "The curves the server resolved, as the runner received them.",
-            "items": {
-              "$ref": "#/components/schemas/CurveSnapshot"
-            },
-            "type": "array"
-          },
-          "event_inputs": {
-            "description": "Same-event parameter values resolved at `(site_id, collected_at)`, as\n`{param, parameter_code, parameter_id, value}`.",
-            "items": {
-              "additionalProperties": {},
-              "propertyNames": {
-                "type": "string"
-              },
-              "type": "object"
-            },
-            "type": "array"
-          },
-          "inputs_ignored": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "inputs_used": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "refused": {
-            "description": "Outputs whose formula produced a number that is not finite. The calculation divided by\nzero, so the output is refused: it is in neither `results` nor `cleared`, the value already\nstored at the visit stands, and `skipped` carries the reason (Q172).",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "results": {
-            "additionalProperties": {},
-            "propertyNames": {
-              "type": "string"
-            },
-            "type": "object"
-          },
-          "run_id": {
-            "description": "The stored `tool_runs` row for this calculation. A grab save names it as `tool_run_id`\nand the server builds the provenance blob from that row, never from the client.",
-            "format": "uuid",
-            "type": "string"
-          },
-          "site_inputs": {
-            "description": "Station properties resolved from the site named by `site_id`, as `{property, param, value}`.",
-            "items": {
-              "additionalProperties": {},
-              "propertyNames": {
-                "type": "string"
-              },
-              "type": "object"
-            },
-            "type": "array"
-          },
-          "skipped": {
-            "description": "Formulas that did not run and why, as `{output, reason}`. An unresolved input costs its\nown output and no other, so the rest of the calculation is in `results`.",
-            "items": {
-              "additionalProperties": {},
-              "propertyNames": {
-                "type": "string"
-              },
-              "type": "object"
-            },
-            "type": "array"
-          },
-          "tool": {
-            "type": "string"
-          },
-          "tool_version": {
-            "$ref": "#/components/schemas/ToolVersionRef",
-            "description": "The exact script version and runtime that produced these numbers; goes into the\nprovenance blob on save."
-          },
-          "trace": {
-            "description": "Each formula as it was evaluated, with the values it read per cell. Absent for a script\nrun, which returns only what the script returns.",
-            "items": {
-              "$ref": "#/components/schemas/TraceStep"
-            },
-            "type": "array"
           }
-        },
-        "required": [
-          "tool",
-          "results",
-          "inputs_used",
-          "inputs_ignored",
-          "constants",
-          "curves",
-          "tool_version",
-          "run_id"
         ],
-        "type": "object"
+        "description": "A calculation and the `tool_runs` row it was stored as."
       },
       "ToolRunList": {
         "properties": {
@@ -25789,6 +25405,13 @@
           "label": {
             "type": "string"
           },
+          "output_parameter_code": {
+            "description": "The catalog parameter this formula writes, when it writes one. A reader arrives at a trace\nholding a parameter, so this is what says which step produced the value in front of them.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "per_replicate": {
             "type": "boolean"
           },
@@ -25803,6 +25426,7 @@
           "code",
           "label",
           "units",
+          "output_parameter_code",
           "formula",
           "intermediate",
           "per_replicate",
@@ -25914,96 +25538,6 @@
           "max",
           "default",
           "help"
-        ],
-        "type": "object"
-      },
-      "UndeclaredEstimatorSlot": {
-        "properties": {
-          "open_holds": {
-            "description": "Open holds at this slot, and how many carry the population-divisor signature. That second\nnumber is the evidence for the decision; this report states it and rules on nothing.",
-            "format": "int64",
-            "type": "integer"
-          },
-          "parameter_code": {
-            "type": "string"
-          },
-          "parameter_id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "parameter_name": {
-            "type": "string"
-          },
-          "population_signature_holds": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "site_id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "site_name": {
-            "type": "string"
-          },
-          "site_parameter_id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "source_reports_sd": {
-            "description": "Whether any stream feeding the slot ships a precomputed sd column. A slot whose source\nstates an sd is one whose convention is answerable from the evidence; one that does not is\na choice about what this lab publishes.",
-            "type": "boolean"
-          },
-          "streams": {
-            "description": "Every stream feeding the slot, as `source_system/source_key`."
-          },
-          "undeclared_samples": {
-            "description": "Samples at this slot computed under no declaration, ie. `sd_estimator_source = 'default'`.",
-            "format": "int64",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "site_id",
-          "parameter_id",
-          "site_name",
-          "parameter_name",
-          "parameter_code",
-          "site_parameter_id",
-          "undeclared_samples",
-          "source_reports_sd",
-          "streams",
-          "open_holds",
-          "population_signature_holds"
-        ],
-        "type": "object"
-      },
-      "UndeclaredEstimatorsResponse": {
-        "properties": {
-          "slots": {
-            "items": {
-              "$ref": "#/components/schemas/UndeclaredEstimatorSlot"
-            },
-            "type": "array"
-          },
-          "total_population_signature_holds": {
-            "description": "Open holds across these slots that the population divisor would explain. Every one of them\nis blocked from plain acknowledgement until its slot declares an estimator.",
-            "format": "int64",
-            "type": "integer"
-          },
-          "total_slots": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "total_undeclared_samples": {
-            "format": "int64",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "total_slots",
-          "total_undeclared_samples",
-          "total_population_signature_holds",
-          "slots"
         ],
         "type": "object"
       },
@@ -26429,19 +25963,17 @@
             },
             "type": "array"
           },
-          "sd_estimator": {
-            "description": "Which divisor produced `stdev`, and what chose it.",
-            "type": "string"
-          },
-          "sd_estimator_source": {
-            "type": "string"
-          },
           "stdev": {
             "format": "double",
             "type": "number"
           },
           "tool": {
             "description": "The blob's tool name, when one exists.",
+            "type": "string"
+          },
+          "tool_run_id": {
+            "description": "The run behind the value, when a tool computed it. The trace endpoint replays it, which is\nwhat lets a cell show the formula rather than only the name of what ran.",
+            "format": "uuid",
             "type": "string"
           },
           "value": {
@@ -27271,39 +26803,6 @@
         ]
       }
     },
-    "/api/actions/retag_sd_estimator": {
-      "post": {
-        "operationId": "retag_sd_estimator",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RetagSdEstimatorRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RetagSdEstimatorResponse"
-                }
-              }
-            },
-            "description": ""
-          },
-          "400": {
-            "description": "Unknown estimator, no slot or stream named, a window that ends before it starts, or a slot in scope that does not declare the estimator"
-          }
-        },
-        "tags": [
-          "actions"
-        ]
-      }
-    },
     "/api/actions/rollback_deployment": {
       "post": {
         "operationId": "rollback_deployment",
@@ -27411,28 +26910,6 @@
         "summary": "Swap one sensor for another in a (site, parameter) slot: end the outgoing sensor's deployment and\nstart the incoming sensor's at the same instant, in one transaction. Requires `write_metadata`.",
         "tags": [
           "sensors"
-        ]
-      }
-    },
-    "/api/actions/undeclared_sd_estimators": {
-      "get": {
-        "description": "The sources stored both divisors over the years, row by row within one stream, so the\nconvention cannot be inferred and is declared per slot instead. Until a slot declares one, its\nsamples are computed with the sample divisor and stamped `default`, which is what this lists.\nNo write path can notice this shape on its own: every ingest is individually valid, and the gap\nis in what nobody stated.\n\nRead-only. Which divisor a slot publishes is a question about this lab's practice and the\nsource's, so nothing here decides one.",
-        "operationId": "undeclared_sd_estimators",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UndeclaredEstimatorsResponse"
-                }
-              }
-            },
-            "description": "Slots with no declared sd estimator"
-          }
-        },
-        "summary": "Slots serving replicate statistics under no declared sd estimator.",
-        "tags": [
-          "actions"
         ]
       }
     },
@@ -30288,16 +29765,16 @@
                 }
               }
             },
-            "description": "The staged visits, one per site in the order named"
+            "description": "The staged visits, one per row in the order given"
           },
           "400": {
-            "description": "No site named"
+            "description": "No visit given, or a row repeats another's site and instant"
           },
           "404": {
             "description": "Unknown site"
           }
         },
-        "summary": "Stage a trip: one visit per site named, all at `collected_at`, in one transaction. A site\nnamed twice is staged once; an unknown site refuses the whole trip, so no partial trip lands.\nEach visit is find-or-create exactly as `/collection_events/stage`. Requires `write_data`.",
+        "summary": "Stage a field day: one visit per row, each at its own site and instant, in one transaction.\nA row repeating another's site and instant refuses the day, as does an unknown site, so no\npartial day lands. Each visit is find-or-create exactly as `/collection_events/stage`.\nRequires `write_data`.",
         "tags": [
           "collection_events"
         ]
@@ -36844,7 +36321,7 @@
             }
           },
           {
-            "description": "The site the group is rendered for; it is what declares the sd estimator.",
+            "description": "The site the group is rendered for; it is what declares the decimal places.",
             "in": "query",
             "name": "site_id",
             "required": false,
@@ -39008,13 +38485,13 @@
             "description": ""
           },
           "400": {
-            "description": "Neither key form, an unknown estimator, or an index the group does not hold"
+            "description": "Neither key form, or an index the group does not hold"
           },
           "404": {
             "description": "No spot reading at that instant, or no such hold on it"
           }
         },
-        "summary": "Preview a replicate group's statistics after flagging, restoring or switching the sd divisor.\nNothing is written. Requires `read_data`.",
+        "summary": "Preview a replicate group's statistics after flagging or restoring replicates.\nNothing is written. Requires `read_data`.",
         "tags": [
           "readings"
         ]
@@ -39686,7 +39163,7 @@
     },
     "/api/samples": {
       "get": {
-        "description": "Retrieves all samples.\n\nThis resource manages sample items\n\nAdditional sortable columns: \n- collected_at\n- created_at\n- mean\n- n.\n\nAdditional filterable columns: \n- site_id\n- parameter_id\n- collected_at\n- sd_estimator\n- sd_estimator_source.",
+        "description": "Retrieves all samples.\n\nThis resource manages sample items\n\nAdditional sortable columns: \n- collected_at\n- created_at\n- mean\n- n.\n\nAdditional filterable columns: \n- site_id\n- parameter_id\n- collected_at.",
         "operationId": "get_all_samples",
         "parameters": [
           {
@@ -42614,7 +42091,7 @@
     },
     "/api/site_parameters": {
       "get": {
-        "description": "Retrieves all site_parameters.\n\nThis resource manages site_parameter items\n\nAdditional sortable columns: \n- name\n- needs_review\n- created_at\n- discovered_at.\n\nAdditional filterable columns: \n- site_id\n- parameter_id\n- name\n- sensor_type\n- is_active\n- is_public\n- needs_review\n- sd_estimator\n- entry_mode\n- instrument_sensor_id\n- discovered_at.",
+        "description": "Retrieves all site_parameters.\n\nThis resource manages site_parameter items\n\nAdditional sortable columns: \n- name\n- needs_review\n- created_at\n- discovered_at.\n\nAdditional filterable columns: \n- site_id\n- parameter_id\n- name\n- sensor_type\n- is_active\n- is_public\n- needs_review\n- entry_mode\n- instrument_sensor_id\n- discovered_at.",
         "operationId": "get_all_site_parameters",
         "parameters": [
           {
@@ -43098,53 +42575,6 @@
           }
         },
         "summary": "Update one site_parameter"
-      }
-    },
-    "/api/site_parameters/{id}/declare_sd_estimator": {
-      "post": {
-        "operationId": "declare_sd_estimator",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DeclareSdEstimatorRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DeclareSdEstimatorResponse"
-                }
-              }
-            },
-            "description": ""
-          },
-          "400": {
-            "description": "Estimator is not 'sample', 'population' or null"
-          },
-          "404": {
-            "description": "No site parameter with this id"
-          }
-        },
-        "tags": [
-          "site_parameters"
-        ]
       }
     },
     "/api/sites": {
@@ -47174,7 +46604,7 @@
             }
           },
           {
-            "description": "pending | deferred | acknowledged | remediated | superseded | resolved; omit for pending",
+            "description": "pending | deferred | acknowledged | remediated | superseded | resolved | any; omit for pending",
             "in": "query",
             "name": "status",
             "required": false,
@@ -47227,6 +46657,64 @@
             "name": "sort",
             "required": false,
             "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated hold kinds",
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter to holds raised against one calculation",
+            "in": "query",
+            "name": "tool",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Holds at one site, through the pairing or the finding",
+            "in": "query",
+            "name": "site_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Holds on one parameter, through the pairing or the finding",
+            "in": "query",
+            "name": "parameter_id",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Holds whose instant is at or after this",
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Holds whose instant is before this",
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "schema": {
+              "format": "date-time",
               "type": "string"
             }
           },
@@ -47415,127 +46903,6 @@
           }
         },
         "summary": "Resolve one pending hold. Statistics are never written directly: `ours` accepts the\nrecomputed numbers, `flag` marks the named replicates so the trigger recomputes the sample\nover the rest. Both record the decision on the hold.",
-        "tags": [
-          "sync"
-        ]
-      }
-    },
-    "/api/sync/replicate_reconciliation": {
-      "post": {
-        "operationId": "start_reconciliation",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/StartReconciliationRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StartReconciliationResponse"
-                }
-              }
-            },
-            "description": ""
-          },
-          "409": {
-            "description": "A reconciliation for this source is already running"
-          }
-        },
-        "summary": "Start the migrate + verify job. Non-destructive: pairs family streams to their slots and\nmaterialises samples; a family failing verification rolls back untouched.",
-        "tags": [
-          "sync"
-        ]
-      }
-    },
-    "/api/sync/replicate_reconciliation/candidates": {
-      "get": {
-        "operationId": "reconciliation_candidates",
-        "parameters": [
-          {
-            "description": "e.g. cnet",
-            "in": "query",
-            "name": "source_system",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CandidatesResponse"
-                }
-              }
-            },
-            "description": ""
-          }
-        },
-        "summary": "The replicate families of a source and their migration state.",
-        "tags": [
-          "sync"
-        ]
-      }
-    },
-    "/api/sync/replicate_reconciliation/delete": {
-      "post": {
-        "operationId": "start_reconciliation_delete",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/StartReconciliationRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StartReconciliationResponse"
-                }
-              }
-            },
-            "description": ""
-          },
-          "409": {
-            "description": "A delete for this source is already running"
-          }
-        },
-        "summary": "Start the delete job: re-verifies each migrated family and removes the obsolete avg streams\nand their readings. The destructive step of the migration; run only after reviewing the\nmigrate job's verification report.",
-        "tags": [
-          "sync"
-        ]
-      }
-    },
-    "/api/sync/replicate_reconciliation/duplicate_slots": {
-      "get": {
-        "operationId": "duplicate_slots",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DuplicateSlotsResponse"
-                }
-              }
-            },
-            "description": ""
-          }
-        },
-        "summary": "The (site, parameter) slots where two streams carry the same instant. Serving returns one row\nper instant, so a duplicated slot is invisible on the chart; this is the list the operator\nreconciles from. Two streams sharing a slot without ever sharing an instant (a sensor feed\nbeside a grab feed) is the normal case and is not listed.",
         "tags": [
           "sync"
         ]
@@ -50375,6 +49742,45 @@
         ]
       }
     },
+    "/api/tool_runs/{id}/trace": {
+      "get": {
+        "operationId": "trace_run",
+        "parameters": [
+          {
+            "description": "Tool run id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunTrace"
+                }
+              }
+            },
+            "description": "Each formula as the run evaluated it"
+          },
+          "404": {
+            "description": "No such run"
+          },
+          "409": {
+            "description": "A script run, or a version that is no longer stored"
+          }
+        },
+        "summary": "Replay a stored run under the version it pinned, so a computed value shows its formula, its\nintermediates and the values each of them read. Requires `read_data`.",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
     "/api/tool_scripts": {
       "get": {
         "operationId": "list_scripts",
@@ -50646,7 +50052,7 @@
             "description": "The set is saved and one version activated"
           },
           "400": {
-            "description": "A formula the set refuses, or a calculation that is not formula-engined"
+            "description": "A formula the set refuses, a code another calculation holds, or a calculation that is not formula-engined"
           },
           "404": {
             "description": "No such calculation"
@@ -51011,6 +50417,61 @@
           }
         },
         "summary": "Run an analytical tool calculation. The body schema is the tool's manifest (call `GET /tools`);\nunknown fields are refused by name. Requires `read_data`.",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
+    "/api/tools/{tool_name}/preview": {
+      "post": {
+        "operationId": "preview_tool",
+        "parameters": [
+          {
+            "description": "Tool name (e.g. 'doc', 'dic', 'pco2')",
+            "in": "path",
+            "name": "tool_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "Per-tool request body (see GET /tools for schemas)",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolCalculation"
+                }
+              }
+            },
+            "description": "The calculation, stored nowhere"
+          },
+          "400": {
+            "description": "Invalid input for this tool, or a script error"
+          },
+          "404": {
+            "description": "Unknown tool name"
+          },
+          "409": {
+            "description": "The calculation is switched off"
+          },
+          "503": {
+            "description": "The tool runner is not configured or unreachable"
+          }
+        },
+        "summary": "Run a tool calculation without storing it, for a form computing as values are typed. The\nresponse has no `run_id`, so a save cannot name it; `calculate` stores the run a save names.\nRequires `read_data`.",
         "tags": [
           "tools"
         ]

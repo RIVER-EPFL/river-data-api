@@ -3,8 +3,8 @@
 //! A grid of bare numbers with no unit, no n and no dispersion cannot distinguish a triplicate
 //! from a single reading, and the point record showed the replicates behind a value without ever
 //! showing the value's own statistics. Every surface that serves a spot instant serves the whole
-//! group: n, mean, both standard deviations, median, range, the divisor the slot declares, and the
-//! parameter's identity and unit.
+//! group: n, mean, the sample standard deviation, median, range, and the parameter's identity and
+//! unit.
 //!
 //! Run: cargo test --test readings spot_instant_shape -- --test-threads=1
 
@@ -16,7 +16,7 @@ use crate::common::{GLOBAL_PARAM_DO_ID, SITE1_ID};
 
 const AT: &str = "2025-05-06T07:00:00Z";
 
-/// 1, 2 and 10: median 2, mean 4.333…, sample sd 4.932…, population sd 4.027….
+/// 1, 2 and 10: median 2, mean 4.333…, sample sd 4.932….
 const REPLICATES: [f64; 3] = [1.0, 2.0, 10.0];
 
 async fn setup() -> (DatabaseConnection, axum::Router, String) {
@@ -83,18 +83,19 @@ async fn the_visits_grid_carries_the_group_s_statistics_and_its_column_a_unit() 
     close(cell["median"].as_f64(), 2.0, "median");
     close(cell["min"].as_f64(), 1.0, "min");
     close(cell["max"].as_f64(), 10.0, "max");
-    assert!(cell["stdev"].as_f64().is_some(), "an sd is served: {cell}");
-    assert_eq!(
-        cell["sd_estimator_source"], "default",
-        "nothing declared a divisor, so the fallback is named as itself: {cell}"
+    close(
+        cell["stdev"].as_f64(),
+        (146.0f64 / 3.0 / 2.0).sqrt(),
+        "the n-1 standard deviation",
     );
+    assert!(cell.get("sd_estimator_source").is_none(), "{cell}");
 }
 
-/// Expected behaviour: expanding a visit gives the range and both divisors, and each replicate's
+/// Expected behaviour: expanding a visit gives the range and the sample sd, and each replicate's
 /// curve references and retraction stamp.
 #[tokio::test]
 #[serial]
-async fn the_visit_detail_carries_both_divisors_and_each_replicate_s_provenance() {
+async fn the_visit_detail_carries_the_sample_sd_and_each_replicate_s_provenance() {
     let (db, app, token) = setup().await;
     save_group(&app, &token).await;
     crate::common::exec(
@@ -136,11 +137,11 @@ async fn the_visit_detail_carries_both_divisors_and_each_replicate_s_provenance(
     close(sample["min"].as_f64(), 1.0, "min");
     close(sample["max"].as_f64(), 2.0, "max");
     close(
-        sample["stdev_sample"].as_f64(),
+        sample["stdev"].as_f64(),
         (0.5f64).sqrt(),
         "the n-1 standard deviation",
     );
-    close(sample["stdev_population"].as_f64(), 0.5, "the n divisor");
+    assert!(sample.get("stdev_population").is_none(), "{sample}");
 
     let retracted = cell["replicates"]
         .as_array()
@@ -185,14 +186,13 @@ async fn the_point_record_carries_the_group_statistics_and_names_the_parameter()
     close(computation["min"].as_f64(), 1.0, "min");
     close(computation["max"].as_f64(), 10.0, "max");
     close(
-        computation["stdev_sample"].as_f64(),
+        computation["stdev"].as_f64(),
         (146.0f64 / 3.0 / 2.0).sqrt(),
         "the n-1 standard deviation",
     );
-    close(
-        computation["stdev_population"].as_f64(),
-        (146.0f64 / 3.0 / 3.0).sqrt(),
-        "the n standard deviation",
+    assert!(
+        computation.get("stdev_population").is_none(),
+        "{computation}"
     );
 }
 
@@ -229,12 +229,10 @@ async fn the_readings_response_serves_the_whole_group_and_the_slot_s_precision()
     let sample = &series["samples"][0];
     assert_eq!(sample["n"], 3, "{sample}");
     close(sample["median"].as_f64(), 2.0, "median");
-    assert_eq!(
-        sample["sd_estimator"], "sample",
-        "the fallback divisor, named: {sample}"
+    close(
+        sample["stdev"].as_f64(),
+        (146.0f64 / 3.0 / 2.0).sqrt(),
+        "the n-1 standard deviation",
     );
-    assert!(
-        sample["stdev_population"].as_f64().is_some(),
-        "the divisor the slot did not declare is still readable: {sample}"
-    );
+    assert!(sample.get("sd_estimator").is_none(), "{sample}");
 }

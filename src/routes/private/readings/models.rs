@@ -215,18 +215,6 @@ pub fn new(
 #[path = "tests/model.rs"]
 pub(super) mod tests;
 
-/// The two values an estimator field carries, for the document.
-///
-/// The estimator itself travels as a string, because it is a column value the whole ingest path
-/// compares against [`SAMPLE`] and [`POPULATION`]. This names the pair so a schema field declares
-/// what it may hold rather than "a string", and a generated client reads the two.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum SdEstimator {
-    Sample,
-    Population,
-}
-
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SamplePreviewRequest {
@@ -244,9 +232,6 @@ pub struct SamplePreviewRequest {
     /// Flagged replicates to bring back, as an unflag would.
     #[serde(default)]
     pub include_replicate_indexes: Vec<i16>,
-    /// The divisor to compute the proposed sd under; absent keeps the group's current one.
-    #[serde(default)]
-    pub estimator: Option<String>,
     /// A replicate audit hold on this group; the response says whether the proposed statistics
     /// meet its recorded expectation under the audit tolerances.
     #[serde(default)]
@@ -260,9 +245,6 @@ pub struct PreviewStats {
     pub mean: Option<f64>,
     #[schema(required)]
     pub sd: Option<f64>,
-    /// 'sample' (divisor n-1) or 'population' (divisor n).
-    #[schema(value_type = SdEstimator)]
-    pub sd_estimator: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, ToSchema)]
@@ -1680,6 +1662,10 @@ pub struct EventRef {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CalculationInfo {
     pub definition_id: Uuid,
+    /// The calculation the formula belongs to, absent for a standalone derived parameter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub tool_script_id: Option<Uuid>,
     pub code: String,
     pub name: String,
     /// The version the stored value names, absent when the value predates versioning.
@@ -1724,18 +1710,8 @@ pub struct ComputationInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub run_source: Option<String>,
-    /// Which divisor this group's served standard deviation uses ('sample' = n-1, 'population' =
-    /// n) and what chose it. `sd_estimator_source` 'default' means nothing declared one, so the
-    /// number is served under a convention nobody stated. Absent on a single measurement, which
-    /// has no standard deviation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub sd_estimator: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub sd_estimator_source: Option<String>,
     /// The group's statistics, the numbers the chart plotted and drew its bar from. Without these
-    /// the record shows the replicates and a sentence about the divisor, and never what was served.
+    /// the record shows the replicates and never what was served.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub n: Option<i32>,
@@ -1745,12 +1721,6 @@ pub struct ComputationInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub stdev: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub stdev_sample: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub stdev_population: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub median: Option<f64>,
@@ -1768,6 +1738,8 @@ pub struct HoldRef {
     pub kind: String,
     pub status: String,
     pub created_at: DateTime<Utc>,
+    /// The calculation a chain finding is against, so its chip opens that calculation.
+    pub tool: Option<String>,
 }
 
 /// One value a formula read at the record's instant. A parameter input carries the slot key
@@ -1884,6 +1856,7 @@ pub(super) struct HoldRow {
     pub(super) kind: String,
     pub(super) status: String,
     pub(super) created_at: DateTime<chrono::FixedOffset>,
+    pub(super) tool: Option<String>,
 }
 
 impl From<&HoldRow> for HoldRef {
@@ -1893,6 +1866,7 @@ impl From<&HoldRow> for HoldRef {
             kind: row.kind.clone(),
             status: row.status.clone(),
             created_at: row.created_at.with_timezone(&Utc),
+            tool: row.tool.clone(),
         }
     }
 }
@@ -1903,6 +1877,7 @@ pub(super) struct DefinitionRow {
     pub(super) code: String,
     pub(super) name: String,
     pub(super) output_parameter_id: Option<Uuid>,
+    pub(super) tool_script_id: Option<Uuid>,
     pub(super) active_version_no: Option<i32>,
 }
 
@@ -1933,8 +1908,11 @@ pub(super) struct ServedRow {
     pub(super) parameter_id: Uuid,
     pub(super) replicate_index: i16,
     pub(super) value: f64,
-    pub(super) mean: Option<f64>,
     pub(super) live: bool,
+    pub(super) measurement_type: Option<String>,
+    pub(super) stream_id: Uuid,
+    pub(super) input_value: f64,
+    pub(super) from_mean: bool,
 }
 
 #[derive(FromQueryResult)]
@@ -2115,10 +2093,6 @@ pub struct IngestResponse {
     /// stays a fixed size however large the batch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped_reasons: Vec<String>,
-    /// Always 0: the replicate audit admits every group and records disagreements for review.
-    /// Retained because the sync protocol (`river-data-core`) reports a held count per cycle.
-    #[serde(default)]
-    pub held: usize,
     /// Windowed diff: stored keys the source has moved since river-data stored them. Nothing is
     /// written for them (Q84); `proposed` says how many are waiting for a person.
     #[serde(default)]
@@ -2223,14 +2197,6 @@ pub struct GrabSampleRequest {
     /// naming a check that does not cover the values is refused.
     #[serde(default)]
     pub check_id: Option<Uuid>,
-    /// Which divisor the samples this request creates compute their standard deviation with:
-    /// `sample` (n-1) or `population` (n). Present when a tool's manifest fixes it or its operator
-    /// chose one; omitted, the slot's declaration decides, and absent that the group is recorded
-    /// undeclared. It never changes a group that already exists: the estimator a stored sample was
-    /// computed with is changed through the audit resolution or the retag job, where the decision
-    /// is recorded.
-    #[serde(default)]
-    pub sd_estimator: Option<String>,
     /// What the client believes each group it replaces already holds. A replace retracts the
     /// stored replicates it does not carry, so a save built from a stale read would retract a
     /// repeat somebody else added in the meantime. Naming the indexes refuses that with a 409

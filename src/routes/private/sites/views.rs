@@ -1733,7 +1733,6 @@ pub async fn get_site_statistics(
         ),
         agg("AVG(v.value)", "mean"),
         agg("STDDEV_SAMP(v.value)", "stdev_sample"),
-        agg("STDDEV_POP(v.value)", "stdev_population"),
         agg("MIN(v.value)", "min_value"),
         agg("MAX(v.value)", "max_value"),
     ] {
@@ -1794,7 +1793,6 @@ pub async fn get_site_statistics(
             median: r.median,
             mean: r.mean,
             stdev_sample: r.stdev_sample,
-            stdev_population: r.stdev_population,
             min: r.min_value,
             max: r.max_value,
         });

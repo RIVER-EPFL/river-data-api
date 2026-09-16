@@ -425,9 +425,8 @@ pub mod rules {
     }
 }
 
-/// What each of the group's parameters declares at one site: the sd estimator, which is never
-/// inferred, and the decimal places a form renders at. A slot with no row, or a row declaring
-/// neither, carries NULL for both.
+/// What each of the group's parameters declares at one site: the decimal places a form renders at.
+/// A slot with no row, or a row declaring none, carries NULL.
 pub(super) async fn site_declarations(
     db: &sea_orm::DatabaseConnection,
     group_id: Uuid,
@@ -436,7 +435,7 @@ pub(super) async fn site_declarations(
     let rows = db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT sp.parameter_id, sp.sd_estimator, sp.decimal_places \
+            "SELECT sp.parameter_id, sp.decimal_places \
                FROM site_parameters sp \
                JOIN parameter_group_members m ON m.parameter_id = sp.parameter_id \
               WHERE m.group_id = $1 AND sp.site_id = $2",

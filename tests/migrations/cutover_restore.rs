@@ -61,9 +61,8 @@ INSERT INTO tool_runs (id, tool_name, tool_version, inputs, constants, curves, o
             'interactive'
        FROM sites s WHERE s.name = 'Martigny';
 
-INSERT INTO samples (id, site_id, parameter_id, collected_at, sd_estimator, sd_estimator_source)
-     SELECT '11111111-1111-1111-1111-111111111111', s.id, p.id, '2024-06-01T09:00:00Z',
-            'population', 'slot'
+INSERT INTO samples (id, site_id, parameter_id, collected_at)
+     SELECT '11111111-1111-1111-1111-111111111111', s.id, p.id, '2024-06-01T09:00:00Z'
        FROM sites s, parameters p WHERE s.name = 'Martigny' AND p.code = 'doc';
 
 INSERT INTO readings (stream_id, time, replicate_index, site_id, parameter_id, raw_value,

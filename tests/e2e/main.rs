@@ -28,7 +28,6 @@ mod reactive_recompute;
 mod replicate_sync_flow;
 mod replicates_as_readings;
 mod scoped_recompute;
-mod sd_estimator_declaration;
 mod seasonal_check_gate;
 mod sensor_ui_lifecycle;
 mod status_search_export_comparison;

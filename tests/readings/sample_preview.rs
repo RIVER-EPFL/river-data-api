@@ -1,6 +1,5 @@
 //! `POST /readings/sample_preview` says what a replicate group's statistics become without the
-//! replicates about to be flagged, with the ones about to be restored, or under the other sd
-//! divisor, and writes nothing.
+//! replicates about to be flagged or with the ones about to be restored, and writes nothing.
 //!
 //! Run: cargo test --test readings sample_preview -- --test-threads=1
 
@@ -8,7 +7,7 @@ use serde_json::json;
 use serial_test::serial;
 
 use crate::common::e2e::count;
-use crate::common::{GLOBAL_PARAM_TEMP_ID, PARAM_S1_TEMP_ID, SITE1_ID};
+use crate::common::{GLOBAL_PARAM_TEMP_ID, SITE1_ID};
 
 const T: &str = "2025-06-01T10:00:00Z";
 
@@ -72,7 +71,6 @@ async fn excluding_the_highest_replicate_previews_the_mean_of_the_other_two() {
     assert!(near(&body["proposed"]["mean"], 15.0), "{body}");
     assert!(near(&body["delta"]["mean"], -5.0), "{body}");
     assert_eq!(body["delta"]["n"], -1);
-    assert_eq!(body["proposed"]["sd_estimator"], "sample");
     assert_eq!(body["replicates"][2]["included_after"], false);
 
     assert_eq!(
@@ -92,51 +90,27 @@ async fn excluding_the_highest_replicate_previews_the_mean_of_the_other_two() {
     );
 }
 
+/// Scenario: a client still asks for the sd under another divisor.
+///
+/// Expected behaviour: the request is refused rather than answered with the sample sd, because the
+/// preview has one divisor and a field it does not read must not look honoured.
 #[tokio::test]
 #[serial]
-async fn the_other_divisor_previews_the_sd_under_it_and_names_both() {
+async fn a_divisor_in_the_request_is_refused() {
     let (_db, app, token) = setup().await;
-
-    let (status, body) = preview(
+    let (status, body) = crate::common::post_json_with_token(
         &app,
-        &token,
-        json!({
+        "/api/readings/sample_preview",
+        &json!({
             "site_id": SITE1_ID,
             "parameter_id": GLOBAL_PARAM_TEMP_ID,
             "time": T,
             "estimator": "population",
         }),
-    )
-    .await;
-    assert_eq!(status, 200, "preview ({status}): {body}");
-    assert_eq!(body["current"]["sd_estimator"], "sample");
-    assert!(near(&body["current"]["sd"], 10.0), "{body}");
-    assert_eq!(body["proposed"]["sd_estimator"], "population");
-    // 10 * sqrt(2/3)
-    assert!(
-        near(&body["proposed"]["sd"], 8.164_965_809_277_26),
-        "{body}"
-    );
-    assert!(near(&body["delta"]["mean"], 0.0), "{body}");
-
-    // The declaration is what the current side reads.
-    let (status, declared) = crate::common::post_json_parse_with_token(
-        &app,
-        &format!("/api/site_parameters/{PARAM_S1_TEMP_ID}/declare_sd_estimator"),
-        &json!({ "estimator": "population" }),
         &token,
     )
     .await;
-    assert_eq!(status, 200, "{declared}");
-    let (status, body) = preview(
-        &app,
-        &token,
-        json!({ "site_id": SITE1_ID, "parameter_id": GLOBAL_PARAM_TEMP_ID, "time": T }),
-    )
-    .await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["current"]["sd_estimator"], "population");
-    assert_eq!(body["proposed"]["sd_estimator"], "population");
+    assert!((400..500).contains(&status), "refused ({status}): {body}");
 }
 
 #[tokio::test]

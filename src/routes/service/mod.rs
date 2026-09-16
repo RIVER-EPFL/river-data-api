@@ -506,8 +506,16 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             post(tools::views::calculate_tool),
         )
         .route(
+            "/tools/{tool_name}/preview",
+            post(tools::views::preview_tool),
+        )
+        .route(
             "/tool_runs/{id}/reload",
             get(crate::routes::private::readings::views::reload_run),
+        )
+        .route(
+            "/tool_runs/{id}/trace",
+            get(crate::routes::private::tools::views::trace_run),
         )
         .route(
             "/sites/{id}/visits",
@@ -539,10 +547,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .route(
             "/actions/calibration_candidates",
             get(calibration_views::calibration_candidates),
-        )
-        .route(
-            "/actions/undeclared_sd_estimators",
-            get(site_parameter_views::undeclared_sd_estimators),
         )
         .route(
             "/parameter_groups/{id}/definition",
@@ -622,14 +626,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/sites/{site_id}/parameter_groups",
             post(crate::routes::private::site_parameters::views::apply_group),
         )
-        .route(
-            "/site_parameters/{id}/declare_sd_estimator",
-            post(crate::routes::private::site_parameters::views::declare_sd_estimator),
-        )
-        .route(
-            "/actions/retag_sd_estimator",
-            post(crate::routes::private::site_parameters::views::retag_sd_estimator),
-        )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_manage_sensors))
@@ -669,10 +665,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
 
     let sync_admin_manage = Router::new()
         .nest("/sync", sync_views::manage_routes())
-        .with_state(state.clone());
-
-    let sync_admin_destructive = Router::new()
-        .nest("/sync", sync_views::destructive_routes())
         .with_state(state.clone());
 
     let sync_admin_admin = Router::new()
@@ -753,7 +745,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .merge(sync_admin_read)
         .merge(sync_admin_write)
         .merge(sync_admin_manage)
-        .merge(sync_admin_destructive)
         .merge(sync_admin_admin);
 
     if let Some(routes) = user_routes {

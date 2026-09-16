@@ -99,7 +99,6 @@ fn resolve_site_parameters(site_id: Uuid, config: &PublicProjectConfig) -> Vec<R
             code: ep.code.clone(),
             name: ep.name.clone(),
             units: ep.units.clone(),
-            sd_estimator: ep.sd_estimator.clone(),
             decimal_places: ep.decimal_places,
         })
         .collect();
@@ -130,7 +129,6 @@ struct ResolvedParam {
     code: String,
     name: String,
     units: String,
-    sd_estimator: Option<String>,
     decimal_places: Option<i16>,
 }
 
@@ -416,12 +414,11 @@ pub struct ReadingsQuery {
     /// Include a per-point measurement_type array (continuous/spot/derived) on each parameter.
     #[serde(default)]
     pub include_measurement_type: Option<bool>,
-    /// Publish the replicate statistics behind each served value: `n`, `mean`, `sd`, `min` and
-    /// `max` per point under `sample_stats` (JSON) or as `{code}_n`, `{code}_mean`, `{code}_sd`,
-    /// `{code}_min`, `{code}_max` and `{code}_sd_estimator` columns (CSV, NDJSON). A spot value
-    /// is the mean over its unflagged replicates and reports their count; a continuous or derived
-    /// value is one measurement and reports `n = 1` with no statistics. The sd is published only
-    /// with its estimator, so a parameter whose slot has not declared one publishes `n` and no sd.
+    /// Publish the replicate statistics behind each served value: `n`, `mean`, `sd_sample`, `min`
+    /// and `max` per point under `sample_stats` (JSON) or as `{code}_n`, `{code}_mean`,
+    /// `{code}_sd_sample`, `{code}_min` and `{code}_max` columns (CSV, NDJSON). A spot value is the
+    /// mean over its unflagged replicates and reports their count; a continuous or derived value is
+    /// one measurement and reports `n = 1` with no statistics.
     #[serde(default)]
     pub include_sample_stats: Option<bool>,
     /// json (default), csv, or ndjson.
@@ -471,16 +468,12 @@ pub struct ParameterData {
 /// the statistics are null.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SampleStatsData {
-    /// The divisor every `sd` here was computed with: `sample` (n - 1) or `population` (n). Null
-    /// when the slot has not declared one, in which case no `sd` is published.
-    #[schema(required)]
-    pub sd_estimator: Option<String>,
     /// Replicates behind each value. Null where no value is served.
     pub n: Vec<Option<i64>>,
     /// The replicate mean, equal to the served value for a spot instant.
     pub mean: Vec<Option<f64>>,
-    /// The replicate standard deviation under `sd_estimator`.
-    pub sd: Vec<Option<f64>>,
+    /// The replicate sample standard deviation (n - 1).
+    pub sd_sample: Vec<Option<f64>>,
     pub min: Vec<Option<f64>>,
     pub max: Vec<Option<f64>>,
 }
@@ -507,13 +500,12 @@ fn readings_table(times: &[String], params: &[ParameterData]) -> Table {
             };
             table.column(format!("{}_n", p.code), Cells::Int(stats.n.clone()));
             table.column(format!("{}_mean", p.code), Cells::Float(stats.mean.clone()));
-            table.column(format!("{}_sd", p.code), Cells::Float(stats.sd.clone()));
+            table.column(
+                format!("{}_sd_sample", p.code),
+                Cells::Float(stats.sd_sample.clone()),
+            );
             table.column(format!("{}_min", p.code), Cells::Float(stats.min.clone()));
             table.column(format!("{}_max", p.code), Cells::Float(stats.max.clone()));
-            table.column(
-                format!("{}_sd_estimator", p.code),
-                Cells::Text(vec![stats.sd_estimator.clone(); times.len()]),
-            );
         }
     }
     table
@@ -532,7 +524,6 @@ struct ReadingRow {
     sd: Option<f64>,
     min: Option<f64>,
     max: Option<f64>,
-    sd_estimator: Option<String>,
 }
 
 /// Raw time-series readings for a public project site.
@@ -1114,7 +1105,6 @@ pub(crate) fn readings_query(
                 .expr_as(Expr::cust("NULL::DOUBLE PRECISION"), Alias::new("sd"))
                 .expr_as(Expr::cust("NULL::DOUBLE PRECISION"), Alias::new("min"))
                 .expr_as(Expr::cust("NULL::DOUBLE PRECISION"), Alias::new("max"))
-                .expr_as(Expr::cust("NULL::TEXT"), Alias::new("sd_estimator"))
                 .from_as(readings::Entity, r.clone())
                 .cond_where(slot().add(served::served_continuous()).add(extra))
                 .take(),
@@ -1143,7 +1133,6 @@ pub(crate) fn readings_query(
                 Expr::col((smp.clone(), samples::Column::MaxValue)),
                 Alias::new("max"),
             )
-            .column((smp.clone(), samples::Column::SdEstimator))
             .from_as(readings::Entity, r.clone())
             .join_as(
                 JoinType::LeftJoin,
@@ -1169,7 +1158,6 @@ pub(crate) fn readings_query(
                     (sp.clone(), Alias::new("sd")),
                     (sp.clone(), Alias::new("min")),
                     (sp.clone(), Alias::new("max")),
-                    (sp.clone(), Alias::new("sd_estimator")),
                 ])
                 .from_subquery(group.take(), sp.clone())
                 .take(),
@@ -1292,7 +1280,6 @@ async fn fetch_readings(
         let units = matched.map_or("", |rp| rp.units.as_str());
 
         let decimal_places = matched.and_then(|rp| rp.decimal_places);
-        let declared_estimator = matched.and_then(|rp| rp.sd_estimator.as_deref());
 
         let mut values = vec![None; num_times];
         let mut measurement_types = if include_measurement_type {
@@ -1302,10 +1289,9 @@ async fn fetch_readings(
         };
         let mut stats = if include_sample_stats {
             Some(SampleStatsData {
-                sd_estimator: declared_estimator.map(str::to_string),
                 n: vec![None; num_times],
                 mean: vec![None; num_times],
-                sd: vec![None; num_times],
+                sd_sample: vec![None; num_times],
                 min: vec![None; num_times],
                 max: vec![None; num_times],
             })
@@ -1331,15 +1317,7 @@ async fn fetch_readings(
                         st.mean[idx] = row.mean.map(|v| expressed(v, decimal_places));
                         st.min[idx] = row.min.map(|v| expressed(v, decimal_places));
                         st.max[idx] = row.max.map(|v| expressed(v, decimal_places));
-                        // The sd travels only under the divisor the slot declares. A sample
-                        // computed under another divisor (an instant-level override) is not what
-                        // the parameter's estimator says, so it is withheld rather than mislabelled.
-                        st.sd[idx] = match (declared_estimator, row.sd_estimator.as_deref()) {
-                            (Some(declared), Some(used)) if declared == used => {
-                                row.sd.map(|v| expressed(v, decimal_places))
-                            }
-                            _ => None,
-                        };
+                        st.sd_sample[idx] = row.sd.map(|v| expressed(v, decimal_places));
                     }
                 }
             }

@@ -333,7 +333,6 @@ pub async fn mint_tool_slot<C: ConnectionTrait>(
         is_active: Set(Some(true)),
         is_public: Set(Some(false)),
         needs_review: Set(true),
-        sd_estimator: Set(None),
         entry_mode: Set("tool".to_string()),
         variable_mappings: Set(None),
         created_at: Set(Some(chrono::Utc::now())),

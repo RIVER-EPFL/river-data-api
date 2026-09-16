@@ -431,17 +431,10 @@ pub struct SampleStatOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub mean: Option<f64>,
-    /// The sd under the divisor the slot declares; `sd_estimator` names which. Both divisors are
-    /// served beside it, so the one not declared stays readable.
+    /// The sample standard deviation (n-1).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub stdev: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub stdev_sample: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub stdev_population: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub median: Option<f64>,
@@ -451,9 +444,6 @@ pub struct SampleStatOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub max: Option<f64>,
-    /// 'sample' | 'population', and what chose it ('default' is the fallback having applied).
-    pub sd_estimator: String,
-    pub sd_estimator_source: String,
     pub replicates: Vec<ReplicateOut>,
 }
 
@@ -788,12 +778,11 @@ pub(super) struct StatisticsRow {
     pub(super) median: Option<f64>,
     pub(super) mean: Option<f64>,
     pub(super) stdev_sample: Option<f64>,
-    pub(super) stdev_population: Option<f64>,
     pub(super) min_value: Option<f64>,
     pub(super) max_value: Option<f64>,
 }
 
-/// The portal's eight rows for one parameter, with both standard deviations rather than one.
+/// The portal's eight rows for one parameter.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ParameterStatistics {
     pub parameter_id: Uuid,
@@ -817,14 +806,10 @@ pub struct ParameterStatistics {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub mean: Option<f64>,
-    /// Both divisors, named. Which one a slot declares governs its replicate groups, not a period
-    /// summary, so neither is presented as the answer here.
+    /// The sample standard deviation (n-1), R's `sd()`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub stdev_sample: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub stdev_population: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub min: Option<f64>,

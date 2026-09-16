@@ -240,12 +240,6 @@ pub struct PreviewInstant {
 pub struct StreamPreviewResponse {
     pub stream_id: Uuid,
     pub source_key: String,
-    /// The divisor the standard deviations below were computed under, resolved the way the write
-    /// path resolves it: the stream's spec, then the slot's declaration, else the fallback.
-    #[schema(value_type = crate::routes::private::readings::models::SdEstimator)]
-    pub sd_estimator: &'static str,
-    /// What chose it: 'stream', 'slot', or 'default' for the undeclared fallback.
-    pub sd_estimator_source: &'static str,
     pub instants: Vec<PreviewInstant>,
 }
 
