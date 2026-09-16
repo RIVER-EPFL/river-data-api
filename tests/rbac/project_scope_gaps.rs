@@ -1252,7 +1252,7 @@ async fn collection_event_writes_refuse_a_site_outside_the_callers_grants() {
             ),
             (
                 "/api/collection_events/stage_many".to_string(),
-                json!({ "site_ids": [site], "collected_at": days_ago(4) }),
+                json!({ "visits": [{ "site_id": site, "collected_at": days_ago(4) }] }),
             ),
             (
                 format!("/api/collection_events/{visit}/recompute"),

@@ -81,12 +81,19 @@ pub struct StageEventRequest {
     pub notes: Option<String>,
 }
 
-/// A trip: one visit per site named, all at one instant.
+/// One visit of a field day: a site and the instant it was sampled.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StageVisitRow {
+    pub site_id: Uuid,
+    pub collected_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A field day: the visits it covers, each at its own site and instant.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StageEventsRequest {
-    pub site_ids: Vec<Uuid>,
-    pub collected_at: chrono::DateTime<chrono::Utc>,
+    pub visits: Vec<StageVisitRow>,
     #[serde(default)]
     pub notes: Option<String>,
 }
@@ -231,13 +238,6 @@ pub struct VisitCell {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub max: Option<f64>,
-    /// Which divisor produced `stdev`, and what chose it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub sd_estimator: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub sd_estimator_source: Option<String>,
     /// Kind of the oldest open finding on this cell, when one exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
@@ -257,6 +257,11 @@ pub struct VisitCell {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub tool: Option<String>,
+    /// The run behind the value, when a tool computed it. The trace endpoint replays it, which is
+    /// what lets a cell show the formula rather than only the name of what ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub tool_run_id: Option<Uuid>,
 }
 
 /// One replicate of a listing's cell: enough to draw the expanded column and to seed the edit
@@ -291,6 +296,12 @@ pub struct ExpectedParameter {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub decimal_places: Option<i16>,
+    /// The calculation that writes this parameter, when one does. The column's values are computed
+    /// outputs, so the grid reads them and sends a correction back through the calculation (Q8)
+    /// rather than offering a keystroke.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub written_by: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -412,6 +423,11 @@ pub struct EventCell {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub tool: Option<String>,
+    /// The run behind the value, when a tool computed it. The trace endpoint replays it, which is
+    /// what lets a cell show the formula rather than only the name of what ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub tool_run_id: Option<Uuid>,
     /// The value serving arm reports: sample mean, else the lowest unflagged live replicate.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
@@ -446,17 +462,10 @@ pub struct CellSample {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub mean: Option<f64>,
-    /// The sd under the divisor the slot declares. `sd_estimator` names which that is; the other
-    /// travels beside it so a reviewer can read both without declaring anything first.
+    /// The sample standard deviation (n-1).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub stdev: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub stdev_sample: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub stdev_population: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub median: Option<f64>,
@@ -467,9 +476,6 @@ pub struct CellSample {
     #[schema(nullable = false)]
     pub max: Option<f64>,
     pub n: i32,
-    /// 'sample' | 'population', and what chose it ('default' is the fallback having applied).
-    pub sd_estimator: String,
-    pub sd_estimator_source: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

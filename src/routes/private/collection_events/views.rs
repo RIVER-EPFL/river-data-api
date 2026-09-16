@@ -21,9 +21,8 @@ use uuid::Uuid;
 use super::models::{
     CellFinding, CellReplicate, CellSample, EnqueuedJobResponse, Entity, EventAuditRequest,
     EventCell, EventDetailResponse, EventRecomputeRequest, ExpectedParameter, StageEventRequest,
-    StageEventsRequest, StagedEvent, VisitCell, VisitListQuery, VisitListRow, VisitReplicate,
-    VisitRow,
-    VisitsQuery, VisitsResponse,
+    StageEventsRequest, StageVisitRow, StagedEvent, VisitCell, VisitListQuery, VisitListRow,
+    VisitReplicate, VisitRow, VisitsQuery, VisitsResponse,
 };
 use super::service::{
     self, limit_clause, paging, range_clause, visit_count_columns, visit_list_order,
@@ -159,16 +158,32 @@ pub async fn stage_collection_event(
     Ok(Json(staged))
 }
 
-/// Stage a trip: one visit per site named, all at `collected_at`, in one transaction. A site
-/// named twice is staged once; an unknown site refuses the whole trip, so no partial trip lands.
-/// Each visit is find-or-create exactly as `/collection_events/stage`. Requires `write_data`.
+/// The rows of a field day that repeat an earlier row's site and instant, each as
+/// `(first, repeat)` by position.
+pub(super) fn repeated_visits(rows: &[StageVisitRow]) -> Vec<(usize, usize)> {
+    let mut repeats = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        if let Some(first) = rows[..i]
+            .iter()
+            .position(|r| r.site_id == row.site_id && r.collected_at == row.collected_at)
+        {
+            repeats.push((first, i));
+        }
+    }
+    repeats
+}
+
+/// Stage a field day: one visit per row, each at its own site and instant, in one transaction.
+/// A row repeating another's site and instant refuses the day, as does an unknown site, so no
+/// partial day lands. Each visit is find-or-create exactly as `/collection_events/stage`.
+/// Requires `write_data`.
 #[utoipa::path(
     post,
     path = "/api/collection_events/stage_many",
     request_body = StageEventsRequest,
     responses(
-        (status = 200, description = "The staged visits, one per site in the order named", body = Vec<StagedEvent>),
-        (status = 400, description = "No site named"),
+        (status = 200, description = "The staged visits, one per row in the order given", body = Vec<StagedEvent>),
+        (status = 400, description = "No visit given, or a row repeats another's site and instant"),
         (status = 404, description = "Unknown site"),
     ),
     tag = "collection_events"
@@ -181,16 +196,27 @@ pub async fn stage_collection_events(
 ) -> AppResult<Json<Vec<StagedEvent>>> {
     use sea_orm::TransactionTrait;
 
-    let mut site_ids: Vec<Uuid> = Vec::with_capacity(req.site_ids.len());
-    for id in req.site_ids {
-        if !site_ids.contains(&id) {
-            site_ids.push(id);
-        }
-    }
-    if site_ids.is_empty() {
+    if req.visits.is_empty() {
         return Err(AppError::BadRequest(
-            "A trip names at least one site".to_string(),
+            "A field day names at least one visit".to_string(),
         ));
+    }
+    let repeats = repeated_visits(&req.visits);
+    if !repeats.is_empty() {
+        let named: Vec<String> = repeats
+            .iter()
+            .map(|(first, repeat)| format!("row {} repeats row {}", repeat + 1, first + 1))
+            .collect();
+        return Err(AppError::BadRequest(format!(
+            "A site is visited once at an instant: {}",
+            named.join(", ")
+        )));
+    }
+    let mut site_ids: Vec<Uuid> = Vec::with_capacity(req.visits.len());
+    for row in &req.visits {
+        if !site_ids.contains(&row.site_id) {
+            site_ids.push(row.site_id);
+        }
     }
     let missing = service::missing_sites(&state.db, &site_ids).await?;
     if !missing.is_empty() {
@@ -204,13 +230,13 @@ pub async fn stage_collection_events(
     let actor = crate::common::actor::label(&auth);
     let pending = visit_lands_pending(&auth);
     let txn = state.db.begin().await?;
-    let mut staged = Vec::with_capacity(site_ids.len());
-    for site_id in site_ids {
+    let mut staged = Vec::with_capacity(req.visits.len());
+    for row in &req.visits {
         staged.push(
             stage_and_queue(
                 &txn,
-                site_id,
-                req.collected_at,
+                row.site_id,
+                row.collected_at,
                 &actor,
                 req.notes.as_deref(),
                 pending,
@@ -524,7 +550,21 @@ pub async fn list_site_visits(
             name: r.name,
             units: r.units,
             decimal_places: r.decimal_places,
+            written_by: None,
         });
+    }
+    let columns: Vec<Uuid> = expected_parameters.iter().map(|p| p.parameter_id).collect();
+    let impacts =
+        crate::routes::private::tools::service::calculations_fed_by(&state.db, &columns).await?;
+    for column in &mut expected_parameters {
+        column.written_by = impacts
+            .iter()
+            .find(|i| {
+                i.outputs
+                    .iter()
+                    .any(|o| o.parameter_id == column.parameter_id)
+            })
+            .map(|i| i.tool.clone());
     }
 
     let mut page_binds = binds;
@@ -624,8 +664,6 @@ pub async fn list_site_visits(
             agg("MAX(s.median)", "median"),
             agg("MAX(s.min_value)", "min_value"),
             agg("MAX(s.max_value)", "max_value"),
-            agg("MAX(s.sd_estimator)", "sd_estimator"),
-            agg("MAX(s.sd_estimator_source)", "sd_estimator_source"),
             // The replicates themselves, as parallel arrays in one index order: a composite array
             // would decode by hand, and the four are read back together or not at all.
             agg(
@@ -654,6 +692,7 @@ pub async fn list_site_visits(
             ),
             agg("BOOL_OR(r.provenance IS NOT NULL)", "has_provenance"),
             agg("MAX(r.provenance ->> 'tool')", "tool"),
+            agg("(MAX(r.provenance ->> 'run_id'))::uuid", "tool_run_id"),
         ] {
             cell_query.expr_as(expr, name);
         }
@@ -742,13 +781,12 @@ pub async fn list_site_visits(
                 median: c.median,
                 min: c.min_value,
                 max: c.max_value,
-                sd_estimator: c.sd_estimator,
-                sd_estimator_source: c.sd_estimator_source,
                 finding: None,
                 finding_count: None,
                 replicates,
                 has_provenance: c.has_provenance.unwrap_or(false),
                 tool: c.tool,
+                tool_run_id: c.tool_run_id,
             });
         }
         for visit in &mut visits {
@@ -778,13 +816,12 @@ pub async fn list_site_visits(
                         median: None,
                         min: None,
                         max: None,
-                        sd_estimator: None,
-                        sd_estimator_source: None,
                         finding: Some(kind.clone()),
                         finding_count: (*n > 1).then_some(*n),
                         replicates: Vec::new(),
                         has_provenance: false,
                         tool: None,
+                        tool_run_id: None,
                     });
                 }
             }
@@ -976,8 +1013,6 @@ struct CellRow {
     median: Option<f64>,
     min_value: Option<f64>,
     max_value: Option<f64>,
-    sd_estimator: Option<String>,
-    sd_estimator_source: Option<String>,
     replicate_indexes: Vec<i16>,
     replicate_values: Vec<f64>,
     replicate_flagged: Vec<bool>,
@@ -986,6 +1021,7 @@ struct CellRow {
     replicate_streams: Vec<Uuid>,
     has_provenance: Option<bool>,
     tool: Option<String>,
+    tool_run_id: Option<Uuid>,
 }
 
 /// The five parallel arrays one `ARRAY_AGG` group returns, read back as replicates. They come out
@@ -1026,13 +1062,9 @@ struct DetailRow {
     sample_mean: Option<f64>,
     sample_stdev: Option<f64>,
     sample_n: Option<i32>,
-    stdev_sample: Option<f64>,
-    stdev_population: Option<f64>,
     sample_median: Option<f64>,
     sample_min: Option<f64>,
     sample_max: Option<f64>,
-    sd_estimator: Option<String>,
-    sd_estimator_source: Option<String>,
     flag_reason: Option<String>,
     withdrawn_at: Option<DateTime<Utc>>,
     calibration_id: Option<Uuid>,
@@ -1044,6 +1076,7 @@ struct DetailRow {
     has_provenance: Option<bool>,
     provenance_kind: Option<String>,
     tool: Option<String>,
+    tool_run_id: Option<Uuid>,
 }
 
 /// One open finding on a visit's parameter.
@@ -1124,8 +1157,6 @@ pub async fn get_event_detail(
             Expr::col((s_.clone(), samples::Column::N)),
             Alias::new("sample_n"),
         )
-        .column((s_.clone(), samples::Column::StdevSample))
-        .column((s_.clone(), samples::Column::StdevPopulation))
         .expr_as(
             Expr::col((s_.clone(), samples::Column::Median)),
             Alias::new("sample_median"),
@@ -1138,8 +1169,6 @@ pub async fn get_event_detail(
             Expr::col((s_.clone(), samples::Column::MaxValue)),
             Alias::new("sample_max"),
         )
-        .column((s_.clone(), samples::Column::SdEstimator))
-        .column((s_.clone(), samples::Column::SdEstimatorSource))
         .column((r.clone(), readings::Column::FlagReason))
         .column((r.clone(), readings::Column::WithdrawnAt))
         .column((r.clone(), readings::Column::CalibrationId))
@@ -1160,6 +1189,10 @@ pub async fn get_event_detail(
         )
         .column((r.clone(), readings::Column::ProvenanceKind))
         .expr_as(Expr::cust("r.provenance ->> 'tool'"), Alias::new("tool"))
+        .expr_as(
+            Expr::cust("(r.provenance ->> 'run_id')::uuid"),
+            Alias::new("tool_run_id"),
+        )
         .from_as(readings::Entity, r.clone())
         .join_as(
             JoinType::InnerJoin,
@@ -1267,14 +1300,10 @@ pub async fn get_event_detail(
                     sample_id,
                     mean: r.sample_mean,
                     stdev: r.sample_stdev,
-                    stdev_sample: r.stdev_sample,
-                    stdev_population: r.stdev_population,
                     median: r.sample_median,
                     min: r.sample_min,
                     max: r.sample_max,
                     n: r.sample_n.unwrap_or(0),
-                    sd_estimator: r.sd_estimator.unwrap_or_default(),
-                    sd_estimator_source: r.sd_estimator_source.unwrap_or_default(),
                 });
                 cells.push(EventCell {
                     parameter_id: r.parameter_id,
@@ -1285,6 +1314,7 @@ pub async fn get_event_detail(
                     has_provenance: r.has_provenance.unwrap_or(false),
                     provenance_kind: r.provenance_kind,
                     tool: r.tool,
+                    tool_run_id: r.tool_run_id,
                     source_system: r.source_system,
                     source_key: r.source_key,
                     parameter_code: r.code,
@@ -1328,6 +1358,7 @@ pub async fn get_event_detail(
             has_provenance: false,
             provenance_kind: None,
             tool: None,
+            tool_run_id: None,
             source_system: None,
             source_key: None,
             served_value: None,

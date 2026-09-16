@@ -68,3 +68,46 @@ mod visit_state {
         ));
     }
 }
+
+/// Several sites on one day is a field day; one site twice at one instant is a slip in the form.
+mod repeated_visits {
+    use super::super::repeated_visits;
+    use crate::routes::private::collection_events::models::StageVisitRow;
+    use uuid::Uuid;
+
+    fn row(site: Uuid, at: &str) -> StageVisitRow {
+        StageVisitRow {
+            site_id: site,
+            collected_at: at.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_repeated_visits_several_sites_one_day_is_none() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let rows = [
+            row(a, "2026-06-03T09:10:00Z"),
+            row(b, "2026-06-03T09:10:00Z"),
+            row(a, "2026-06-03T14:00:00Z"),
+        ];
+        assert!(repeated_visits(&rows).is_empty());
+    }
+
+    #[test]
+    fn test_repeated_visits_names_each_repeat_against_its_first_row() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let rows = [
+            row(a, "2026-06-03T09:10:00Z"),
+            row(b, "2026-06-03T10:05:00Z"),
+            row(a, "2026-06-03T09:10:00Z"),
+            row(a, "2026-06-03T11:10:00+02:00"),
+        ];
+        // 11:10 at +02:00 is 09:10 UTC, the same instant as row 0
+        assert_eq!(repeated_visits(&rows), vec![(0, 2), (0, 3)]);
+    }
+
+    #[test]
+    fn test_repeated_visits_empty_is_none() {
+        assert!(repeated_visits(&[]).is_empty());
+    }
+}

@@ -17,6 +17,21 @@ async fn setup() -> (DatabaseConnection, axum::Router, String) {
     (f.db, f.app, f.token)
 }
 
+/// The site parameter the doc tool's replicates land on. A tool save writes onto the slots the
+/// site carries and mints none (Q98), so the story declares its slot before it imports.
+async fn configure_doc_slot(db: &DatabaseConnection) {
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active) \
+             VALUES (gen_random_uuid(), '{site}', '00000000-0000-4000-b000-0000000000d0', 'DOC', \
+                     'lab', true)",
+            site = crate::common::SITE1_ID,
+        ),
+    )
+    .await;
+}
+
 /// Poll until the import worker has landed `want` readings at SITE1.
 async fn poll_readings(db: &DatabaseConnection, time: &str, want: i64) -> i64 {
     let sql = format!(
@@ -185,15 +200,16 @@ async fn an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance() {
         return;
     }
     let (db, app, token) = setup().await;
-    // The catalog parameter doc's DOC_avg_ppb output resolves to; deliberately not assigned to
-    // the site, so the import also exercises first-save auto-provisioning.
+    // The catalog parameter the doc tool's replicates are readings of, under the code its manifest
+    // names, on a slot the site carries: a tool save mints none (Q98).
     crate::common::exec(
         &db,
         "INSERT INTO parameters (id, code, name, category) \
-         VALUES ('00000000-0000-4000-b000-0000000000d0', 'DOC', 'DOC', 'measurement')",
+         VALUES ('00000000-0000-4000-b000-0000000000d0', 'DOC_ppb', 'DOC', 'measurement')",
     )
     .await;
     let doc_param = "00000000-0000-4000-b000-0000000000d0";
+    configure_doc_slot(&db).await;
 
     let csv = "DateTime,DOC_rep_1,DOC_rep_2,DOC_rep_3,DOC_notes\n\
                2025-06-01 10:00:00,120,125,118,\n\
@@ -249,8 +265,8 @@ async fn an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance() {
     assert_eq!(runs, 2);
 
     // Each row's replicates went through the grab write path as readings of the DOC parameter:
-    // each carrying the server-built blob, source csv_import, on the auto-provisioned slot, every
-    // replicate attached to a collection event, the mean derived by the database.
+    // each carrying the server-built blob, source csv_import, every replicate attached to a
+    // collection event, the mean derived by the database.
     for (time, expected) in [
         ("2025-06-01T10:00:00Z", (120.0 + 125.0 + 118.0) / 3.0),
         ("2025-06-02T10:00:00Z", 130.0),
@@ -285,19 +301,20 @@ async fn an_import_of_raw_inputs_runs_the_tool_and_carries_its_provenance() {
         assert_eq!(row.try_get::<i64>("", "attached").unwrap(), 3);
     }
 
-    let provisioned = db
+    // The import wrote onto the slot the site declares and minted none beside it (Q98).
+    let slots = db
         .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             format!(
-                "SELECT needs_review FROM site_parameters \
+                "SELECT count(*)::bigint AS n FROM site_parameters \
                  WHERE site_id = '{}' AND parameter_id = '{doc_param}'",
                 crate::common::SITE1_ID
             ),
         ))
         .await
         .unwrap()
-        .expect("the import provisioned the slot");
-    assert!(provisioned.try_get::<bool>("", "needs_review").unwrap());
+        .unwrap();
+    assert_eq!(slots.try_get::<i64>("", "n").unwrap(), 1);
 }
 
 #[tokio::test]
@@ -310,13 +327,16 @@ async fn an_import_naming_a_curve_saves_the_replicates_it_corrected_with_it() {
         return;
     }
     let (db, app, token) = setup().await;
+    // The catalog parameter the doc tool's replicates are readings of, under the code its manifest
+    // names, on a slot the site carries: a tool save mints none (Q98).
     crate::common::exec(
         &db,
         "INSERT INTO parameters (id, code, name, category) \
-         VALUES ('00000000-0000-4000-b000-0000000000d0', 'DOC', 'DOC', 'measurement')",
+         VALUES ('00000000-0000-4000-b000-0000000000d0', 'DOC_ppb', 'DOC', 'measurement')",
     )
     .await;
     let doc_param = "00000000-0000-4000-b000-0000000000d0";
+    configure_doc_slot(&db).await;
     let analyser =
         crate::common::sensor_lifecycle::create_sensor_without_curve(&db, "TOC analyser").await;
     let mut curves = Vec::new();

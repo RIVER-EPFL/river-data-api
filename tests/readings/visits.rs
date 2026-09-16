@@ -188,7 +188,6 @@ async fn the_detail_grid_shows_replicates_and_sample_stats() {
     assert_eq!(record["origin"]["classification"], "manual");
     assert_eq!(record["readings"].as_array().unwrap().len(), 2);
     assert_eq!(record["readings"][1]["replicate_index"], 1);
-    assert_eq!(record["computation"]["sd_estimator"], "sample");
     let temp_cell = cells
         .iter()
         .find(|c| c["parameter_id"] == GLOBAL_PARAM_TEMP_ID)
@@ -958,4 +957,138 @@ async fn a_single_measurement_counts_as_one() {
         temperature["n"], 0,
         "the count is what the mean would stand on: {temperature}"
     );
+}
+
+/// Scenario: a site whose grid carries a plain measurement beside a parameter a calculation writes.
+///
+/// Expected behaviour: the column of the computed parameter names the calculation that writes it,
+/// and the measured one names none. The grid decides from this whether a cell takes a keystroke,
+/// so a listing that does not carry it offers an edit on a computed value.
+#[tokio::test]
+#[serial]
+async fn a_computed_column_names_the_calculation_that_writes_it() {
+    let (db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+
+    let group = "00000000-0000-4000-c000-000000000121";
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO parameter_groups (id, code, label, ordinal) \
+             VALUES ('{group}', 'visit_roles', 'Visit roles', 1)"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO parameter_group_members (id, group_id, parameter_id, ordinal) \
+             VALUES (gen_random_uuid(), '{group}', '{GLOBAL_PARAM_DO_ID}', 1)"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "INSERT INTO tool_scripts (name, label, engine, created_by) \
+         VALUES ('visit_roles', 'Visit roles', 'formula', 'test')",
+    )
+    .await;
+    let script_id = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM tool_scripts WHERE name = 'visit_roles'".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("the calculation")
+        .try_get::<Uuid>("", "id")
+        .expect("id")
+        .to_string();
+    let (status, text) = crate::common::save_formula_set(
+        &app,
+        &token,
+        &script_id,
+        json!([{ "code": "visit_roles_out", "units": "ratio", "formula": "Dissolved_O2 * 2", "ordinal": 1 }]),
+    )
+    .await;
+    assert!((200..300).contains(&status), "save ({status}): {text}");
+
+    // The output is a column of this site's grid once the site declares it.
+    let output_id = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM parameters WHERE code = 'visit_roles_out'".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("the save minted the output")
+        .try_get::<Uuid>("", "id")
+        .expect("id");
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, entry_mode) \
+             VALUES (gen_random_uuid(), '{SITE1_ID}', '{output_id}', 'visit_roles_out', '', 'tool')"
+        ),
+    )
+    .await;
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let column = |parameter_id: &str| {
+        body["expected_parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["parameter_id"] == parameter_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no column for {parameter_id}: {body}"))
+    };
+    assert_eq!(
+        column(&output_id.to_string())["written_by"], "visit_roles",
+        "the computed column names its calculation: {body}"
+    );
+    assert!(
+        column(GLOBAL_PARAM_DO_ID)["written_by"].is_null(),
+        "a measured column names none: {body}"
+    );
+}
+
+/// Scenario: a listed cell whose reading was written by a calculation run, so its provenance names
+/// the run.
+///
+/// Expected behaviour: the listing serves and names the run on the cell.
+#[tokio::test]
+#[serial]
+async fn a_calculated_cell_names_its_run_in_the_listing() {
+    let (db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+    let run_id = Uuid::new_v4();
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE readings SET provenance = jsonb_build_object('tool', 'doc', 'run_id', $1::text) \
+         WHERE site_id = $2 AND parameter_id = $3 AND time = $4::timestamptz",
+        [
+            run_id.to_string().into(),
+            Uuid::parse_str(SITE1_ID).unwrap().into(),
+            Uuid::parse_str(GLOBAL_PARAM_TEMP_ID).unwrap().into(),
+            T1.into(),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let temp = body["visits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|v| cell(v, GLOBAL_PARAM_TEMP_ID))
+        .expect("the temperature cell is listed");
+    assert_eq!(temp["tool_run_id"], run_id.to_string(), "{temp}");
 }
