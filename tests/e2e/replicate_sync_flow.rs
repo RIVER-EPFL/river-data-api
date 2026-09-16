@@ -1,8 +1,7 @@
 //! The whole replicate-sync story from a fresh database, driven through HTTP: a portal's standard
 //! curve and replicate family are registered, replicate batches ingest with curve correction and
-//! a matching statistics audit, the reconciliation job migrates the legacy avg stream's slot onto
-//! the family behind two verifications, an audit mismatch is admitted and reviewed, and the
-//! delete job finally retires the avg stream without moving a served value.
+//! a matching statistics audit, pairing the family serves its groups as samples, and an audit
+//! mismatch is admitted and reviewed.
 //!
 //! Run: cargo test --test e2e replicate_sync_flow -- --test-threads=1
 
@@ -17,7 +16,7 @@ const T3: &str = "2025-06-01T10:00:00Z";
 const T4: &str = "2025-06-01T11:00:00Z";
 
 /// Replicate raw counts per instant; the curve (slope 2, intercept 1) turns them into the
-/// corrected values whose mean the legacy avg stream served.
+/// corrected values whose mean and sd the portal stored.
 const GROUPS: [(&str, [f64; 3], f64, f64); 3] = [
     (T1, [10.0, 20.0, 30.0], 41.0, 20.0),
     (T2, [40.0, 50.0, 60.0], 101.0, 20.0),
@@ -147,39 +146,6 @@ async fn replicate_sync_full_flow() {
         "the spec is persisted under metadata.replicates"
     );
 
-    let (status, old_stream) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/streams/register",
-        &json!({"source_system": "cnet", "source_key": "DGT:DOC_avg_ppb",
-                "measurement_type": "spot"}),
-        &sync_token,
-    )
-    .await;
-    assert_eq!(status, 200, "register avg stream ({status}): {old_stream}");
-    let old_stream = e2e::id_of(&old_stream);
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        &format!("/api/streams/{old_stream}/pair"),
-        &json!({"site_parameter_id": sp}),
-        &token,
-    )
-    .await;
-    assert_eq!(status, 200, "pair avg stream ({status}): {body}");
-
-    let avg_readings: Vec<serde_json::Value> = GROUPS
-        .iter()
-        .map(|(time, _raws, mean, _sd)| json!({"time": time, "raw_value": mean}))
-        .collect();
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/ingest",
-        &json!({"stream_id": old_stream, "readings": avg_readings}),
-        &sync_token,
-    )
-    .await;
-    assert_eq!(status, 200, "avg ingest ({status}): {body}");
-    assert_eq!(body["inserted"], 3);
-
     let mut readings = Vec::new();
     let mut audit = Vec::new();
     for (time, raws, mean, sd) in &GROUPS {
@@ -195,7 +161,6 @@ async fn replicate_sync_full_flow() {
     .await;
     assert_eq!(status, 200, "family ingest ({status}): {body}");
     assert_eq!(body["inserted"], 9);
-    assert_eq!(body["held"], 0, "the portal's statistics agree: {body}");
     assert_eq!(body["paired"], false);
 
     assert_eq!(
@@ -212,31 +177,14 @@ async fn replicate_sync_full_flow() {
         "unpaired: no samples yet"
     );
 
-    let (status, candidates) = crate::common::get_json_with_token(
+    let (status, body) = crate::common::post_json_with_token(
         &app,
-        "/api/sync/replicate_reconciliation/candidates?source_system=cnet",
+        &format!("/api/streams/{family_stream}/pair"),
+        &json!({"site_parameter_id": sp}),
         &token,
     )
     .await;
-    assert_eq!(status, 200, "candidates: {candidates}");
-    assert_eq!(candidates["families"][0]["ready"], true, "{candidates}");
-    assert_eq!(candidates["families"][0]["missing_instants"], 0);
-    assert_eq!(candidates["families"][0]["migrated"], false);
-
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/sync/replicate_reconciliation",
-        &json!({"source_system": "cnet"}),
-        &token,
-    )
-    .await;
-    assert_eq!(status, 200, "start reconciliation ({status}): {body}");
-    let job_id = body["job_id"].as_str().unwrap().to_string();
-    assert_eq!(
-        e2e::poll_job(&app, &token, &job_id, 30).await,
-        "completed",
-        "migrate job"
-    );
+    assert_eq!(status, 200, "pair family stream ({status}): {body}");
 
     assert_eq!(
         e2e::count(
@@ -248,7 +196,7 @@ async fn replicate_sync_full_flow() {
         )
         .await,
         1,
-        "the family took the avg stream's slot"
+        "the family is paired to the slot"
     );
     for (time, _raws, mean, sd) in &GROUPS {
         let row = db
@@ -287,7 +235,7 @@ async fn replicate_sync_full_flow() {
     for ((_, _, mean, _), got) in GROUPS.iter().zip(&served) {
         assert!(
             (got - mean).abs() < 1e-9,
-            "the migrated slot serves the old avg values 1:1: {served:?}"
+            "the paired slot serves the portal's means 1:1: {served:?}"
         );
     }
 
@@ -307,7 +255,6 @@ async fn replicate_sync_full_flow() {
         body["inserted"], 3,
         "the disagreeing group is admitted for review: {body}"
     );
-    assert_eq!(body["held"], 0);
     assert_eq!(
         e2e::count(
             &db,
@@ -401,48 +348,15 @@ async fn replicate_sync_full_flow() {
         "the recomputed mean (25+49+73)/3 is what is served, not the portal's 50: {t4_mean}"
     );
 
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/sync/replicate_reconciliation/delete",
-        &json!({"source_system": "cnet"}),
-        &token,
-    )
-    .await;
-    assert_eq!(status, 200, "start delete ({status}): {body}");
-    let job_id = body["job_id"].as_str().unwrap().to_string();
-    assert_eq!(
-        e2e::poll_job(&app, &token, &job_id, 30).await,
-        "completed",
-        "delete job"
-    );
-
-    assert_eq!(
-        e2e::count(
-            &db,
-            &format!("SELECT COUNT(*) FROM data_streams WHERE id = '{old_stream}'"),
-        )
-        .await,
-        0,
-        "the legacy avg stream is retired"
-    );
-    assert_eq!(
-        e2e::count(
-            &db,
-            &format!("SELECT COUNT(*) FROM readings WHERE stream_id = '{old_stream}'"),
-        )
-        .await,
-        0
-    );
-
     let (status, series) = crate::common::get_json_with_token(&app, &series_uri, &token).await;
-    assert_eq!(status, 200, "series after delete: {series}");
+    assert_eq!(status, 200, "series after review: {series}");
     let served = sorted(e2e::values_for(&series, &param));
     let expected = sorted(vec![41.0, 101.0, 17.0, 49.0]);
     assert_eq!(served.len(), 4, "one point per collection event: {series}");
     for (got, want) in served.iter().zip(&expected) {
         assert!(
             (got - want).abs() < 1e-9,
-            "served values unchanged by the deletion: {served:?} vs {expected:?}"
+            "the reviewed group is served beside the rest: {served:?} vs {expected:?}"
         );
     }
     let sample_stats = series["parameters"][0]["samples"].as_array().unwrap();

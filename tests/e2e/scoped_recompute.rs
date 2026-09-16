@@ -171,16 +171,19 @@ async fn a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findin
     }
     save_a(other_site.clone(), 20.0, VISITS[0], true).await;
     set_enabled(&app, &admin, "scope_b", true).await;
-    let (status, audit) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/actions/event_audit",
-        &json!({}),
-        &river,
-    )
-    .await;
-    assert_eq!(status, 200, "{audit}");
-    let job_id = audit["job_id"].as_str().expect("job id").to_string();
-    assert_eq!(e2e::poll_job(&app, &admin, &job_id, 60).await, "completed");
+    // A member granted one project names the site an audit covers.
+    for site in [&site_id, &other_site] {
+        let (status, audit) = crate::common::post_json_parse_with_token(
+            &app,
+            "/api/actions/event_audit",
+            &json!({ "site_id": site }),
+            &river,
+        )
+        .await;
+        assert_eq!(status, 200, "{audit}");
+        let job_id = audit["job_id"].as_str().expect("job id").to_string();
+        assert_eq!(e2e::poll_job(&app, &admin, &job_id, 60).await, "completed");
+    }
     let stale = pending_findings(site_id.clone()).await;
     assert_eq!(stale.len(), 2, "both visits report B stale: {stale:?}");
     assert_eq!(pending_findings(other_site.clone()).await.len(), 1);
@@ -281,7 +284,7 @@ async fn a_site_scoped_recompute_repairs_every_stale_visit_and_closes_the_findin
     let (status, audit) = crate::common::post_json_parse_with_token(
         &app,
         "/api/actions/event_audit",
-        &json!({}),
+        &json!({ "site_id": site_id }),
         &river,
     )
     .await;

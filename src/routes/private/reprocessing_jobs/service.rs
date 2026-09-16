@@ -112,7 +112,6 @@ pub const RERUNNABLE: &[&str] = &[
     "refresh_aggregates",
     "derived_recompute",
     "measurement_retag",
-    "sd_estimator_retag",
     "event_recompute",
     "event_audit",
     "reprocess_all",
@@ -288,31 +287,16 @@ pub fn manual_run_for(trigger_type: &str) -> ManualRun {
             spec("start", Instant, false, "Window start"),
             spec("end", Instant, false, "Window end"),
         ]),
-        "replicate_reconciliation" | "replicate_reconciliation_delete" | "sync_full_reassert" => {
-            declared(vec![
-                spec("source_system", Text, true, "Source system"),
-                spec("tolerance", Number, false, "Relative tolerance"),
-                spec("dry_run", Bool, false, "Report only"),
-            ])
-        }
+        "sync_full_reassert" => declared(vec![
+            spec("source_system", Text, true, "Source system"),
+            spec("tolerance", Number, false, "Relative tolerance"),
+            spec("dry_run", Bool, false, "Report only"),
+        ]),
         "measurement_retag" => declared(vec![
             spec("target", Text, true, "Measurement type"),
             spec("sensor_ids", UuidList, false, "Instruments"),
             spec("stream_ids", UuidList, false, "Streams"),
             spec("source_system", Text, false, "Source system"),
-        ]),
-        "sd_estimator_retag" => declared(vec![
-            spec("estimator", Text, true, "Estimator"),
-            spec("site_parameter_ids", UuidList, false, "Slots"),
-            spec("stream_ids", UuidList, false, "Streams"),
-            spec("start", Instant, false, "Window start"),
-            spec("end", Instant, false, "Window end"),
-            spec(
-                "override_instants",
-                Bool,
-                false,
-                "Override declared instants",
-            ),
         ]),
 
         // Its inputs are not a person's: staged rows the run deletes, or persisted timestamps.
@@ -347,8 +331,6 @@ pub const CANCELLABLE: &[&str] = &[
     "derived_recompute",
     "csv_import",
     "janitor_service",
-    "replicate_reconciliation",
-    "replicate_reconciliation_delete",
     "event_audit",
     "event_recompute",
     "meteoswiss_sync",
@@ -675,9 +657,6 @@ pub fn build_registry() -> JobRegistry {
     registry.register(Arc::new(
         crate::routes::private::readings::flows::MeasurementRetag,
     ));
-    registry.register(Arc::new(
-        crate::routes::private::site_parameters::flows::SdEstimatorRetag,
-    ));
     registry.register(Arc::new(crate::routes::private::readings::flows::CsvImport));
     registry.register(Arc::new(
         crate::routes::private::alarms::flows::AlarmBackfill,
@@ -699,12 +678,6 @@ pub fn build_registry() -> JobRegistry {
     ));
     registry.register(Arc::new(
         crate::routes::private::data_streams::flows::PlanRevert,
-    ));
-    registry.register(Arc::new(
-        crate::routes::private::sync::flows::ReplicateReconciliation,
-    ));
-    registry.register(Arc::new(
-        crate::routes::private::sync::flows::ReplicateReconciliationDelete,
     ));
     registry.register(Arc::new(
         crate::routes::private::tools::models::EventRecompute,

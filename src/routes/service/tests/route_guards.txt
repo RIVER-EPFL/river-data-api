@@ -16,11 +16,9 @@
 /actions/reconcile_alarms => deny_scoped_token+require_write_data
 /actions/reprocess => deny_scoped_token+require_manage_sensors
 /actions/reprocess_all => deny_scoped_token+require_write_data
-/actions/retag_sd_estimator => deny_scoped_token+require_manage_sensors
 /actions/rollback_deployment => deny_scoped_token+require_manage_sensors
 /actions/sensor_calibrations/{id}/recalculate => deny_scoped_token+require_manage_sensors
 /actions/swap => deny_scoped_token+require_manage_sensors
-/actions/undeclared_sd_estimators => require_read_metadata
 /alarms/active => require_read_data
 /alarms/events => require_read_data
 /alarms/summary => require_read_data
@@ -101,10 +99,6 @@
 /replicate_audit_holds/{id}/acknowledge => deny_scoped_token+require_manage_sensors
 /replicate_audit_holds/{id}/reopen => deny_scoped_token+require_manage_sensors
 /replicate_audit_holds/{id}/resolve => deny_scoped_token+require_manage_sensors
-/replicate_reconciliation => deny_scoped_token+require_manage_sensors
-/replicate_reconciliation/candidates => deny_scoped_token+require_manage_sensors
-/replicate_reconciliation/delete => deny_scoped_token+require_admin_or_token_write_metadata
-/replicate_reconciliation/duplicate_slots => deny_scoped_token+require_manage_sensors
 /reprocessing_jobs/{id}/cancel => deny_scoped_token+require_manage_sensors
 /reprocessing_jobs/{id}/logs => require_read_data
 /reprocessing_jobs/{id}/rerun => deny_scoped_token+require_manage_sensors
@@ -126,7 +120,6 @@
 /sensors/{sensor_id}/adopt_suggestions => require_read_metadata
 /services/{id}/commands => deny_scoped_token+require_admin_or_token_write_metadata
 /services/{id}/revoke => deny_scoped_token+require_admin_or_token_write_metadata
-/site_parameters/{id}/declare_sd_estimator => deny_scoped_token+require_manage_sensors
 /sites/{id}/visits => require_read_data
 /sites/{site_id}/parameter_groups => deny_scoped_token+require_manage_sensors
 /standard_curves/register => deny_scoped_token+require_admin_or_token_write_metadata
@@ -145,6 +138,7 @@
 /tokens/{id}/rotate => require_admin
 /tokens/{id}/usage => require_admin
 /tool_runs/{id}/reload => require_read_data
+/tool_runs/{id}/trace => require_read_data
 /tool_scripts => require_admin
 /tool_scripts/draft_run => require_admin
 /tool_scripts/inspect => require_admin
@@ -159,6 +153,7 @@
 /tool_scripts/{id}/versions/{version_id}/validate => require_admin
 /tools => require_read_data
 /tools/{tool_name}/calculate => require_read_data
+/tools/{tool_name}/preview => require_read_data
 /unpaired-summary => require_read_metadata
 /users => require_admin
 /users/search => require_admin

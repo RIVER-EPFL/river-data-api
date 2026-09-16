@@ -1,14 +1,12 @@
 use std::path::{Path, PathBuf};
 
-/// Nothing deletes a reading except these statements, each a recorded decision: the
-/// destructive replicate reconciliation (retired streams, admin-gated) and grab `replace`
+/// Nothing deletes a reading except these statements, each a recorded decision: grab `replace`
 /// mode (uncurated spot rows at the instant being re-entered). A new delete of readings
 /// anywhere else fails this test until it is argued into the list. Tests are not scanned,
 /// neither the inline modules nor the sibling `tests/` directories they live in; only live
 /// code counts.
 const ALLOWED: &[(&str, usize)] = &[
     ("src/routes/private/readings/views.rs", 1),
-    ("src/routes/private/sync/flows.rs", 1),
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {

@@ -724,12 +724,14 @@ fn table() -> Table {
             ("GET", "/api/calculations/health"),
             ("GET", "/api/derived_parameters/{id}/dependents"),
             ("POST", "/api/tools/{tool_name}/calculate"),
+            ("POST", "/api/tools/{tool_name}/preview"),
             ("POST", "/api/readings/seasonal_check"),
             ("GET", "/api/readings/provenance"),
             ("GET", "/api/readings/ledger"),
             ("GET", "/api/readings/decisions"),
             ("POST", "/api/readings/edits/inspect"),
             ("GET", "/api/tool_runs/{id}/reload"),
+            ("GET", "/api/tool_runs/{id}/trace"),
             ("GET", "/api/sites/{id}/visits"),
             ("GET", "/api/visits"),
             ("GET", "/api/collection_events/{id}/detail"),
@@ -744,7 +746,6 @@ fn table() -> Table {
         &[
             ("GET", "/api/search"),
             ("GET", "/api/version"),
-            ("GET", "/api/actions/undeclared_sd_estimators"),
             ("GET", "/api/parameter_groups/{id}/definition"),
             ("GET", "/api/change_audit"),
             ("GET", "/api/schedules"),
@@ -780,8 +781,6 @@ fn table() -> Table {
             ("POST", "/api/reprocessing_jobs/{id}/cancel"),
             ("PATCH", "/api/schedules/{job_name}"),
             ("POST", "/api/schedules/{job_name}/run_now"),
-            ("POST", "/api/site_parameters/{id}/declare_sd_estimator"),
-            ("POST", "/api/actions/retag_sd_estimator"),
             ("POST", "/api/sensor_calibrations/{id}/retire"),
             ("POST", "/api/sensor_calibrations/{id}/unretire"),
             ("POST", "/api/standard_curves/{id}/retire"),
@@ -838,18 +837,8 @@ fn table() -> Table {
             ("POST", "/api/sync/replicate_audit_holds/{id}/resolve"),
             ("POST", "/api/sync/replicate_audit_holds/{id}/reopen"),
             ("POST", "/api/sync/replicate_audit_holds/acknowledge_bulk"),
-            ("GET", "/api/sync/replicate_reconciliation/duplicate_slots"),
-            ("GET", "/api/sync/replicate_reconciliation/candidates"),
-            ("POST", "/api/sync/replicate_reconciliation"),
             ("POST", "/api/sync/change_proposals/decide"),
         ],
-    );
-
-    t.group(
-        Capability::Admin,
-        TokenAccess::Bit(TokenBit::WriteMetadata),
-        Scope::DenyScopedToken,
-        &[("POST", "/api/sync/replicate_reconciliation/delete")],
     );
 
     t.group(
@@ -1072,7 +1061,7 @@ fn check(route: &Route, caller: Caller, actual: u16, crashes: &mut Vec<String>) 
             // The tool run answers 503 when the R runner is unreachable, which is the deliberate
             // answer under a profile that excludes the runner rather than a crash.
             let runner_excluded = actual == 503
-                && route.declared == "/api/tools/{tool_name}/calculate"
+                && route.declared.starts_with("/api/tools/{tool_name}/")
                 && !crate::common::profile::selected()
                     .covers(crate::common::profile::Service::ToolsRunner);
             if actual >= 500 && !runner_excluded {

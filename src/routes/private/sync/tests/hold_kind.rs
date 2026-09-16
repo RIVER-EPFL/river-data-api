@@ -75,3 +75,21 @@ fn test_reopenable_is_a_subset_of_resolved() {
         );
     }
 }
+
+#[test]
+fn test_parse_kinds_reads_a_comma_separated_list() {
+    assert_eq!(
+        HoldKind::parse_list("unverified_visit, unverified_entry").unwrap(),
+        vec![HoldKind::UnverifiedVisit, HoldKind::UnverifiedEntry]
+    );
+}
+
+#[test]
+fn test_parse_kinds_refuses_a_kind_it_does_not_know() {
+    assert!(HoldKind::parse_list("unverified_visit,verification").is_err());
+}
+
+#[test]
+fn test_parse_kinds_refuses_an_empty_list() {
+    assert!(HoldKind::parse_list(" , ").is_err());
+}

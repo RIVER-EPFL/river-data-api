@@ -9,7 +9,6 @@ use uuid::Uuid;
 
 use crate::common::paging::Window;
 use crate::error::{AppError, AppResult};
-use crate::routes::private::readings::models::SdEstimator;
 
 /// One replicate group's expectation, as the portal stored it. Declared in `river-data-core`.
 pub use river_data_core::models::GroupAudit;
@@ -189,76 +188,6 @@ pub struct RevokedResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct CandidatesQuery {
-    pub source_system: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct FamilyCandidate {
-    pub family_stream_id: Uuid,
-    pub family_source_key: String,
-    pub old_stream_id: Uuid,
-    pub old_source_key: String,
-    #[schema(required)]
-    pub site_parameter_id: Option<Uuid>,
-    pub migrated: bool,
-    pub old_readings: i64,
-    /// Old-stream instants the family stream has no readings for. Zero = ready for cutover.
-    pub missing_instants: i64,
-    pub ready: bool,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct CandidatesResponse {
-    pub families: Vec<FamilyCandidate>,
-    pub total_old_streams: usize,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct StartReconciliationRequest {
-    pub source_system: String,
-    #[serde(default)]
-    pub dry_run: bool,
-    /// Relative verification tolerance; defaults to the sync audit's.
-    #[serde(default)]
-    pub tolerance: Option<f64>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct StartReconciliationResponse {
-    pub job_id: Uuid,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DuplicateSlotStream {
-    pub stream_id: Uuid,
-    pub source_system: String,
-    pub source_key: String,
-    pub readings: i64,
-    #[schema(required)]
-    pub first_reading: Option<chrono::DateTime<chrono::Utc>>,
-    #[schema(required)]
-    pub last_reading: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DuplicateSlot {
-    pub site_id: Uuid,
-    pub site_name: String,
-    pub parameter_id: Uuid,
-    pub parameter_name: String,
-    pub site_parameter_id: Uuid,
-    pub streams: Vec<DuplicateSlotStream>,
-    /// Instants at this slot carrying readings from more than one stream.
-    pub duplicated_instants: i64,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct DuplicateSlotsResponse {
-    pub slots: Vec<DuplicateSlot>,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
 pub struct ListHoldsQuery {
     /// One hold, for a link that names it.
     #[serde(default)]
@@ -270,7 +199,7 @@ pub struct ListHoldsQuery {
     pub stream_ids: Option<String>,
     #[serde(default)]
     pub source_system: Option<String>,
-    /// One status, or the view `resolved` (every decided or cleared hold); defaults to
+    /// One status, the view `resolved` (every decided or cleared hold), or `any`; defaults to
     /// `pending`, the review queue.
     #[serde(default)]
     pub status: Option<String>,
@@ -288,17 +217,31 @@ pub struct ListHoldsQuery {
     /// scale is what lets an operator triage the whole backlog largest-first across pages.
     #[serde(default)]
     pub sort: Option<String>,
-    /// Restrict to one disagreement signature: `population_sd`, or `not_population_sd` for the
-    /// disagreements it does not explain. Only these two are filterable, because
-    /// [`POPULATION_SD_SQL`] is the one signature with a SQL spelling and its complement is
-    /// exactly as spellable, so both filter and page honestly rather than dropping rows out of an
-    /// already-counted page.
+    /// Restrict to one disagreement signature: `source_sd_matches_n_divisor`, or
+    /// `not_source_sd_matches_n_divisor` for the disagreements it does not explain. Only these two
+    /// are filterable, because [`SOURCE_SD_MATCHES_N_DIVISOR_SQL`] is the one signature with a SQL
+    /// spelling and its complement is exactly as spellable, so both filter and page honestly rather
+    /// than dropping rows out of an already-counted page.
     #[serde(default)]
     pub classification: Option<String>,
-    /// Restrict to holds whose slot has, or has not, declared an sd estimator. `false` is the
-    /// set the gate blocks from plain acknowledgement.
+    /// Comma-separated hold kinds, e.g. `unverified_visit,unverified_entry`.
     #[serde(default)]
-    pub estimator_declared: Option<bool>,
+    pub kind: Option<String>,
+    /// Holds raised against one calculation.
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// Holds at one site, through the stream's pairing or the site a finding names.
+    #[serde(default)]
+    pub site_id: Option<Uuid>,
+    /// Holds on one parameter, reached the same way as `site_id`.
+    #[serde(default)]
+    pub parameter_id: Option<Uuid>,
+    /// Holds whose instant is at or after this.
+    #[serde(default)]
+    pub from: Option<DateTime<Utc>>,
+    /// Holds whose instant is before this.
+    #[serde(default)]
+    pub to: Option<DateTime<Utc>>,
     #[serde(default)]
     pub page: Option<u64>,
     #[serde(default)]
@@ -349,11 +292,38 @@ impl HoldKind {
         }
     }
 
+    /// A comma-separated list of kind names, as a list filter takes them.
+    pub fn parse_list(list: &str) -> AppResult<Vec<Self>> {
+        let kinds = list
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                serde_json::from_value(serde_json::Value::String(name.to_string()))
+                    .map_err(|_| AppError::BadRequest(format!("unknown hold kind '{name}'")))
+            })
+            .collect::<AppResult<Vec<Self>>>()?;
+        if kinds.is_empty() {
+            return Err(AppError::BadRequest("kind names no hold kind".to_string()));
+        }
+        Ok(kinds)
+    }
+
     /// The kinds the event audit and the chain raise, which every reader of calculation findings
     /// filters on together. A kind added here reaches those readers; one named in their SQL by
     /// hand does not.
     pub const EVENT_AUDIT: [Self; 3] =
         [Self::MissingOutput, Self::StaleOutput, Self::SkippedOutput];
+
+    /// The kinds a manager owes an action on, which is what `holds_open` announces.
+    pub const OWED: [Self; 6] = [
+        Self::UnverifiedEntry,
+        Self::UnverifiedVisit,
+        Self::MissingOutput,
+        Self::StaleOutput,
+        Self::BrakeFired,
+        Self::SourceIdentityChanged,
+    ];
 
     /// A `kind IN (...)` list for a set of kinds, quoted for SQL.
     #[must_use]
@@ -476,10 +446,6 @@ pub struct HoldComputed {
     #[schema(required)]
     pub sd: Option<f64>,
     pub n: i64,
-    /// The divisor `sd` was computed under. Absent on a hold that predates the record.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<SdEstimator>, nullable = false)]
-    pub sd_estimator: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub values: Option<Vec<HoldValue>>,
@@ -517,6 +483,9 @@ pub struct HoldRow {
     /// stream is unpaired.
     #[schema(required)]
     pub site_id: Option<Uuid>,
+    /// The slot the hold is about, which a point record is opened on.
+    #[schema(required)]
+    pub site_parameter_id: Option<Uuid>,
     #[schema(required)]
     pub site_name: Option<String>,
     #[schema(required)]
@@ -535,13 +504,10 @@ pub struct HoldRow {
     #[schema(value_type = HoldDelta)]
     pub delta: serde_json::Value,
     pub status: String,
-    /// Signature of the disagreement: `n_mismatch` | `population_sd` | `stale_subset` |
-    /// `unexplained`. Computed from the stored expectation and recompute, never persisted.
+    /// Signature of the disagreement: `n_mismatch` | `source_sd_matches_n_divisor` |
+    /// `stale_subset` | `unexplained`. Computed from the stored expectation and recompute, never
+    /// persisted.
     pub classification: String,
-    /// The divisor `computed.sd` was computed under, 'sample' or 'population'. Recorded on the
-    /// hold; a hold that predates the record reads the slot's declaration, else 'sample'.
-    #[schema(required, value_type = Option<SdEstimator>)]
-    pub sd_estimator: Option<String>,
     /// The decision record: latest action plus prior actions under `history`.
     #[schema(value_type = Object)]
     #[schema(required)]
@@ -576,11 +542,6 @@ pub struct ListHoldsResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AcknowledgeResponse {
     pub acknowledged: u64,
-    /// Holds this call deliberately left pending: their disagreement is the population-divisor
-    /// signature on a slot that has not declared an estimator, so accepting them would record a
-    /// decision about which formula this slot publishes without anyone having made one.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub skipped_undeclared_estimator: u64,
     /// Pending holds this call could not reach: a hold with no stream is keyed on its slot rather
     /// than a stream, and the sweep's statement and every filter it takes are about streams. The
     /// count is what keeps `acknowledged` from reading as the whole queue.
@@ -592,9 +553,8 @@ pub struct AcknowledgeResponse {
 #[serde(deny_unknown_fields)]
 pub struct ResolveHoldRequest {
     /// `ours` (accept the recomputed statistics; identical to acknowledge) | `flag` (flag the
-    /// named replicates so the sample statistics recompute over the rest) | `estimator` (declare
-    /// which standard-deviation divisor this slot, or this one instant, publishes) | `verify` /
-    /// `reject` (rule on an intern's entry: accept it as it stands, or withdraw it).
+    /// named replicates so the sample statistics recompute over the rest) | `verify` / `reject`
+    /// (rule on an intern's entry: accept it as it stands, or withdraw it).
     pub mode: String,
     /// The replicate indexes to flag; required for `flag`. Each must be among the values the
     /// hold recorded and unflagged, and at least one unflagged replicate must remain after.
@@ -603,28 +563,13 @@ pub struct ResolveHoldRequest {
     /// Recorded as the readings' flag_reason; defaults to a reference to this hold.
     #[serde(default)]
     pub reason: Option<String>,
-    /// `estimator` mode: the divisor to declare, `sample` (n-1) or `population` (n). Either is a
-    /// real answer; declaring `sample` states that ours is the number this slot publishes even
-    /// though the source computed the other one.
-    #[serde(default)]
-    pub estimator: Option<String>,
-    /// `estimator` mode: `slot` declares it for the parameter at this site and recomputes its
-    /// existing samples; `instant` sets it for this one collection group and leaves the parameter
-    /// undeclared. Defaults to `slot`.
-    #[serde(default)]
-    pub scope: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResolveHoldResponse {
     /// The status the hold moved to: `acknowledged` | `remediated`.
     pub status: String,
-    /// `estimator` mode: the tracked `sd_estimator_retag` recomputing the slot's samples.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub job_id: Option<Uuid>,
-    /// `estimator` mode: samples this declaration changed, counted before the job for `slot`
-    /// scope and exactly one for `instant`.
+    /// `verify` / `reject`: the readings the ruling decided.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub samples_affected: Option<i64>,
@@ -844,11 +789,6 @@ pub struct PlanEntryUpdate {
     /// this is its inverse, since an absent `instrument_id` means "unchanged", not "none".
     #[serde(default)]
     pub instrument_clear: Option<bool>,
-    /// Declare which divisor this slot publishes its replicate standard deviation with,
-    /// `sample` or `population`. Applied to the `site_parameters` row when the plan is applied.
-    /// Never inferred: absent leaves the slot undeclared and the audit gate asks later.
-    #[serde(default)]
-    pub sd_estimator: Option<String>,
     /// Record that a person looked at this entry and agreed with it, or take that back. Separate
     /// from `action`, so changing what an entry does is not the same as deciding it.
     #[serde(default)]
@@ -949,6 +889,16 @@ pub struct PlanCurveAssignment {
     /// Readings this curve has already corrected. A curve with history is one whose instrument a
     /// re-home changes the meaning of, so the number is shown beside the choice.
     pub reading_count: i64,
+    /// The parameters of the plan's streams whose readings this curve corrects.
+    pub corrected_parameters: Vec<String>,
+    /// The stations of the plan's streams whose readings this curve corrects.
+    pub corrected_sites: Vec<String>,
+    /// The earliest reading this curve corrects.
+    #[schema(required)]
+    pub first_corrected: Option<DateTime<Utc>>,
+    /// The latest reading this curve corrects.
+    #[schema(required)]
+    pub last_corrected: Option<DateTime<Utc>>,
     /// The instrument this plan will move the curve onto when applied, by `source_key`, and the
     /// name the plan proposes for it. Absent when no assignment is pending.
     #[schema(required)]
