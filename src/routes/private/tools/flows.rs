@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use super::models::{
     ActiveTool, AuditCounts, Engine, EventAudit, EventContext, EventRecompute, MissingConstant,
-    RecomputeOutcome, RecomputeScope, RunOutcome, RunTrace, ToolCalculation, ToolResult, parse_manifest,
-    run,
+    RecomputeOutcome, RecomputeScope, RunOutcome, RunTrace, ToolCalculation, ToolResult,
+    parse_manifest, run,
 };
 use super::service::{
     ParameterCatalog, ResolvedRun, build, evaluate_with_trace, execute_resolved, formula_bindings,
@@ -144,7 +144,7 @@ pub(super) async fn store_run(
         id: Set(run_id),
         tool_name: Set(tool.name.clone()),
         tool_version: Set(
-            serde_json::to_value(&calculation.tool_version).unwrap_or(serde_json::Value::Null),
+            serde_json::to_value(&calculation.tool_version).unwrap_or(serde_json::Value::Null)
         ),
         inputs: Set(inputs),
         constants: Set(calculation.constants.clone()),
@@ -637,10 +637,14 @@ pub async fn recompute_event(
 
         let readings: Vec<GrabSampleReading> = owned_outputs
             .iter()
-            .flat_map(|(key, parameter_id)| match result.calculation.results.get(key) {
-                Some(value) => readings_for_output(key, *parameter_id, value, event.collected_at),
-                None => Vec::new(),
-            })
+            .flat_map(
+                |(key, parameter_id)| match result.calculation.results.get(key) {
+                    Some(value) => {
+                        readings_for_output(key, *parameter_id, value, event.collected_at)
+                    }
+                    None => Vec::new(),
+                },
+            )
             .collect();
         if readings.is_empty() {
             let reason = "run produced no savable output".to_string();

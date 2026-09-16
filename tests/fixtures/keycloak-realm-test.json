@@ -7,7 +7,6 @@
   "duplicateEmailsAllowed": false,
   "resetPasswordAllowed": false,
   "verifyEmail": false,
-  "_comment_bruteForce": "Off deliberately: every role-bearing e2e test logs its user in, so a full run plus a concurrent one trips the lockout and the suite then fails on credentials rather than on code (T18).",
   "bruteForceProtected": false,
   "accessTokenLifespan": 3600,
   "ssoSessionIdleTimeout": 1800,

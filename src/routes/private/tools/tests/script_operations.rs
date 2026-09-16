@@ -82,8 +82,8 @@ fn fresh(code: &str) -> (Option<uuid::Uuid>, String) {
 #[test]
 fn test_a_set_save_updates_what_it_names_and_deletes_what_it_leaves_out() {
     let stored = [row(1, "a"), row(2, "b"), row(3, "c")];
-    let writes = plan_formula_set(&stored, &[kept(2, "b"), fresh("d"), kept(1, "a")])
-        .expect("planned");
+    let writes =
+        plan_formula_set(&stored, &[kept(2, "b"), fresh("d"), kept(1, "a")]).expect("planned");
     assert_eq!(
         writes,
         vec![
@@ -170,7 +170,10 @@ fn test_a_set_save_refuses_the_same_formula_twice() {
 #[test]
 fn test_codes_held_elsewhere_names_each_taken_code_and_its_calculation() {
     let held = [
-        ("co2sheet_lab_temp_k".to_string(), "co2_ch4_sheet".to_string()),
+        (
+            "co2sheet_lab_temp_k".to_string(),
+            "co2_ch4_sheet".to_string(),
+        ),
         ("ch4sheet_ppm".to_string(), "co2_ch4_sheet".to_string()),
     ];
     assert_eq!(

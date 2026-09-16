@@ -144,7 +144,10 @@ async fn an_edited_formula_leaves_the_stored_run_replaying_as_it_ran() {
     let script_id = seed_calculation(&db, "00000000-0000-4000-c000-000000000122").await;
     save_set(&app, &token, &script_id, 0.5).await;
     let result = calculate(&app, &token).await;
-    let run_id = result["run_id"].as_str().expect("the run was stored").to_string();
+    let run_id = result["run_id"]
+        .as_str()
+        .expect("the run was stored")
+        .to_string();
 
     save_set(&app, &token, &script_id, 3.0).await;
     let after = calculate(&app, &token).await;

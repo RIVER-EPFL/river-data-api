@@ -1047,7 +1047,8 @@ async fn a_computed_column_names_the_calculation_that_writes_it() {
             .unwrap_or_else(|| panic!("no column for {parameter_id}: {body}"))
     };
     assert_eq!(
-        column(&output_id.to_string())["written_by"], "visit_roles",
+        column(&output_id.to_string())["written_by"],
+        "visit_roles",
         "the computed column names its calculation: {body}"
     );
     assert!(

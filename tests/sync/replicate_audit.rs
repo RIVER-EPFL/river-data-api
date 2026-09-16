@@ -204,7 +204,10 @@ async fn matching_audit_passes() {
     )
     .await;
     assert_eq!(body["inserted"], 3);
-    assert!(body.get("held").is_none(), "no hold count on the wire: {body}");
+    assert!(
+        body.get("held").is_none(),
+        "no hold count on the wire: {body}"
+    );
     assert_eq!(
         count(&fx.db, "SELECT COUNT(*) FROM replicate_audit_holds").await,
         0,

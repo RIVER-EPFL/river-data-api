@@ -440,7 +440,10 @@ async fn an_attached_instrument_returns_to_the_plan_s_own_proposal() {
         serde_json::json!("parameter")
     );
     assert_eq!(proposed["instrument"]["create"], serde_json::json!(true));
-    assert_eq!(proposed["instrument"]["confirmed"], serde_json::json!(false));
+    assert_eq!(
+        proposed["instrument"]["confirmed"],
+        serde_json::json!(false)
+    );
     assert_eq!(
         proposed["instrument"]["proposed_name"],
         serde_json::json!("doc"),
@@ -957,7 +960,10 @@ async fn an_untouched_plan_is_refused_until_its_suggestions_are_accepted() {
 
     let (status, refused) =
         crate::common::post_plan_action_with_token(&app, &plan_id, "apply", &token).await;
-    assert_eq!(status, 400, "an unconfirmed suggestion holds the apply: {refused}");
+    assert_eq!(
+        status, 400,
+        "an unconfirmed suggestion holds the apply: {refused}"
+    );
     assert!(
         refused.contains("untouched-doc") && refused.contains("untouched-tss"),
         "the refusal names each feed still asking: {refused}"
@@ -974,7 +980,10 @@ async fn an_untouched_plan_is_refused_until_its_suggestions_are_accepted() {
         &token,
     )
     .await;
-    assert!((200..300).contains(&status), "accept all ({status}): {body}");
+    assert!(
+        (200..300).contains(&status),
+        "accept all ({status}): {body}"
+    );
 
     let before = scalar_i64(&db, "SELECT count(*)::bigint AS v FROM sensors").await;
     apply_and_wait(&app, &db, &token, &plan_id).await;

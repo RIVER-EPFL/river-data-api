@@ -3462,9 +3462,12 @@ pub fn plan_formula_set(
     let mut claimed: Vec<usize> = Vec::new();
     let mut adopted: Vec<(Uuid, usize)> = Vec::new();
     for (stored_id, code) in stored.iter().filter(|(id, _)| !named.contains(id)) {
-        let taken = payload.iter().enumerate().position(|(i, (id, payload_code))| {
-            id.is_none() && payload_code == code && !claimed.contains(&i)
-        });
+        let taken = payload
+            .iter()
+            .enumerate()
+            .position(|(i, (id, payload_code))| {
+                id.is_none() && payload_code == code && !claimed.contains(&i)
+            });
         if let Some(i) = taken {
             claimed.push(i);
             adopted.push((*stored_id, i));
@@ -3478,14 +3481,16 @@ pub fn plan_formula_set(
         })
         .map(|(id, _)| FormulaWrite::Delete(*id))
         .collect();
-    writes.extend(payload.iter().enumerate().map(|(i, (id, _))| match id {
-        Some(id) => FormulaWrite::Update(*id, i),
-        None => adopted
-            .iter()
-            .find(|(_, position)| *position == i)
-            .map_or(FormulaWrite::Create(i), |(adopted_id, _)| {
-                FormulaWrite::Update(*adopted_id, i)
-            }),
+    writes.extend(payload.iter().enumerate().map(|(i, (id, _))| {
+        match id {
+            Some(id) => FormulaWrite::Update(*id, i),
+            None => adopted
+                .iter()
+                .find(|(_, position)| *position == i)
+                .map_or(FormulaWrite::Create(i), |(adopted_id, _)| {
+                    FormulaWrite::Update(*adopted_id, i)
+                }),
+        }
     }));
     Ok(writes)
 }

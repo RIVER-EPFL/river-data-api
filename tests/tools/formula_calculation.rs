@@ -285,12 +285,15 @@ async fn the_chain_reads_a_calculation_only_once_a_save_pins_a_version() {
     let fed = river_db::routes::private::tools::service::calculations_fed_by(&db, &[temperature])
         .await
         .expect("the graph reads");
-    let reading_it = fed.iter().find(|c| c.tool == CALCULATION).unwrap_or_else(|| {
-        panic!(
-            "the saved calculation reads the temperature: {:?}",
-            fed.iter().map(|c| &c.tool).collect::<Vec<_>>()
-        )
-    });
+    let reading_it = fed
+        .iter()
+        .find(|c| c.tool == CALCULATION)
+        .unwrap_or_else(|| {
+            panic!(
+                "the saved calculation reads the temperature: {:?}",
+                fed.iter().map(|c| &c.tool).collect::<Vec<_>>()
+            )
+        });
     assert_eq!(
         reading_it
             .outputs
@@ -490,7 +493,10 @@ async fn a_preview_computes_without_storing_a_run() {
         .as_f64()
         .unwrap_or_else(|| panic!("no result: {text}"));
     assert!((value - 4.0).abs() < 1e-12, "8 / 2: {text}");
-    assert!(preview.get("run_id").is_none(), "a preview names no run: {text}");
+    assert!(
+        preview.get("run_id").is_none(),
+        "a preview names no run: {text}"
+    );
     assert!(
         preview["trace"].as_array().is_some_and(|t| !t.is_empty()),
         "the full calculation, trace included: {text}"
@@ -506,9 +512,19 @@ async fn a_preview_computes_without_storing_a_run() {
     .await;
     assert_eq!(status, 200, "calculate ({status}): {text}");
     let stored: serde_json::Value = serde_json::from_str(&text).expect("JSON");
-    assert_eq!(stored["results"], preview["results"], "the same calculation");
-    assert!(stored["run_id"].is_string(), "calculate still names its run: {text}");
-    assert_eq!(count(&db, runs).await, before + 1, "calculate stores one run");
+    assert_eq!(
+        stored["results"], preview["results"],
+        "the same calculation"
+    );
+    assert!(
+        stored["run_id"].is_string(),
+        "calculate still names its run: {text}"
+    );
+    assert_eq!(
+        count(&db, runs).await,
+        before + 1,
+        "calculate stores one run"
+    );
 }
 
 /// Scenario: the two-stage shape four of the portal's calculators have, a formula evaluating once
@@ -1028,7 +1044,10 @@ async fn a_set_save_writes_the_whole_set_and_activates_a_version() {
         &admin,
     )
     .await;
-    assert!((200..300).contains(&status), "second calculation: {created}");
+    assert!(
+        (200..300).contains(&status),
+        "second calculation: {created}"
+    );
     let other_id = created["id"].as_str().expect("id");
     let (status, text) = crate::common::post_json_with_token(
         &app,

@@ -5,9 +5,7 @@ use std::path::{Path, PathBuf};
 /// anywhere else fails this test until it is argued into the list. Tests are not scanned,
 /// neither the inline modules nor the sibling `tests/` directories they live in; only live
 /// code counts.
-const ALLOWED: &[(&str, usize)] = &[
-    ("src/routes/private/readings/views.rs", 1),
-];
+const ALLOWED: &[(&str, usize)] = &[("src/routes/private/readings/views.rs", 1)];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read src") {
