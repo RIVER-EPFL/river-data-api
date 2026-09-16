@@ -26,7 +26,7 @@ pub struct Slot {
 /// hear about values changing under them and not about a stream going unpaired says so per kind,
 /// and a channel nobody subscribed to still records everything it would have said, in the ledger
 /// and on the alerts panel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Channel {
     pub kind: &'static str,
     /// What the channel is called where somebody chooses it.
@@ -36,119 +36,148 @@ pub struct Channel {
     /// Whether a subscriber with no row for this channel is in its audience. The two alarm kinds
     /// are, which is the audience every subscriber already had; everything else is asked for.
     pub on_by_default: bool,
+    /// The lowest level that may subscribe to the channel and be sent it: somebody below it could
+    /// not act on what it announces.
+    pub audience: Role,
 }
 
 /// Every kind the triggers emit, as the channel it is subscribed through. A kind absent from here
 /// would reach every enabled recipient with no way to decline, which is what the tests below hold
 /// the triggers to.
-pub const CHANNELS: [Channel; 18] = [
+pub const CHANNELS: [Channel; 19] = [
     Channel {
         kind: "alarm_opened",
         label: "Alarm opened",
         description: "A reading crossing a warning or alarm threshold.",
         on_by_default: true,
+        audience: Role::Intern,
     },
     Channel {
         kind: "alarm_resolved",
         label: "Alarm resolved",
         description: "A slot that was breaching returning to range.",
         on_by_default: true,
+        audience: Role::Intern,
     },
     Channel {
         kind: "battery_forecast",
         label: "Instrument forecasts",
         description: "A battery whose voltage trend reaches the cutoff before the next field visit.",
         on_by_default: false,
+        audience: Role::Intern,
     },
     Channel {
         kind: "stale_data",
         label: "Site gone quiet",
         description: "A site that has stopped sending data.",
         on_by_default: false,
+        audience: Role::Intern,
     },
     Channel {
         kind: "sync_stale",
         label: "Sync service silent",
         description: "A sync service whose heartbeat has stopped.",
         on_by_default: false,
+        audience: Role::Intern,
     },
     Channel {
         kind: "sync_failure",
         label: "Sync failures",
         description: "A sync cycle that ended in an error.",
         on_by_default: false,
+        audience: Role::Intern,
     },
     Channel {
         kind: "streams_unpaired",
         label: "Unpaired streams",
         description: "A source sending readings into a stream that is paired to no slot.",
         on_by_default: false,
+        audience: Role::Intern,
     },
     Channel {
         kind: "holds_open",
-        label: "Review queue",
-        description: "Audit holds waiting for somebody to decide them.",
+        label: "Waiting for a manager",
+        description: "Field days to verify, calculation outputs to recompute, fired brakes and \
+                      device identity changes.",
         on_by_default: false,
+        audience: Role::Manager,
+    },
+    Channel {
+        kind: "import_tags",
+        label: "Import discrepancies",
+        description: "Discrepancy tags a sync import recorded, such as replicate statistics that do not match.",
+        on_by_default: false,
+        audience: Role::Administrator,
     },
     Channel {
         kind: "steps_skipped",
         label: "Skipped calculation steps",
         description: "A calculation step that did not run at a visit, leaving its outputs absent.",
         on_by_default: false,
+        audience: Role::Intern,
     },
     Channel {
         kind: "job_failed",
         label: "Failed jobs",
         description: "A background job that has spent its retries.",
         on_by_default: false,
+        audience: Role::Intern,
     },
     Channel {
         kind: "changes_pending",
         label: "Source changes",
         description: "Values a source changed after river-data stored them, and what arrived.",
         on_by_default: false,
+        audience: Role::Intern,
     },
     Channel {
         kind: "curve_drift",
         label: "Recomposed values",
         description: "Stored values the janitor recomposed from the curves their readings name.",
         on_by_default: false,
+        audience: Role::Intern,
     },
     Channel {
         kind: "derived_computed",
         label: "Derived values computed",
         description: "Derived values computed where none was stored.",
         on_by_default: false,
+        audience: Role::Intern,
     },
     Channel {
         kind: "access_revoked",
         label: "Access revoked",
         description: "Push subscriptions removed because the person lost their grant.",
         on_by_default: false,
+        audience: Role::Intern,
     },
     Channel {
         kind: "aggregates_refreshed",
         label: "Rollups refreshed",
         description: "Continuous aggregate refreshes, which is upkeep rather than a change.",
         on_by_default: false,
+        audience: Role::Intern,
     },
     Channel {
         kind: "jobs_pruned",
         label: "Job rows pruned",
         description: "Tracked job rows aged out of the timeline by retention.",
         on_by_default: false,
+        audience: Role::Intern,
     },
     Channel {
         kind: "sync_events_swept",
         label: "Stale sync events closed",
         description: "Sync events left running past the staleness threshold and marked failed.",
         on_by_default: false,
+        audience: Role::Intern,
     },
     Channel {
         kind: "ledger_pruned",
         label: "Sync ledger pruned",
         description: "Sync events and ingest receipts deleted by their retention horizons.",
         on_by_default: false,
+        audience: Role::Intern,
     },
 ];
 
@@ -162,6 +191,13 @@ pub fn channel(kind: &str) -> Option<&'static Channel> {
 #[must_use]
 pub fn on_by_default(kind: &str) -> bool {
     channel(kind).is_some_and(|c| c.on_by_default)
+}
+
+/// Whether somebody at `role` is in the audience a kind is addressed to. A kind no channel answers
+/// for is the test send, addressed to whoever asked.
+#[must_use]
+pub fn admits(kind: &str, role: &Role) -> bool {
+    channel(kind).is_none_or(|c| role.level() >= c.audience.level())
 }
 
 /// Every kind the triggers emit, which is the channel table read as names.

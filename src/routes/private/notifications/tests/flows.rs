@@ -142,3 +142,43 @@ mod judged_against_tests {
         );
     }
 }
+
+/// Scenario: open holds of every kind, some a person owes an action on and some not.
+/// Expected behaviour: one line per place the work is done, and no line for a kind nobody owes.
+#[test]
+fn test_owed_holds_message_names_where_each_is_worked() {
+    use crate::routes::private::sync::models::HoldKind;
+    let counts = [
+        (HoldKind::ReplicateStats, 157),
+        (HoldKind::SourceModified, 4),
+        (HoldKind::SkippedOutput, 2),
+        (HoldKind::UnverifiedVisit, 1),
+        (HoldKind::UnverifiedEntry, 3),
+        (HoldKind::StaleOutput, 5),
+        (HoldKind::BrakeFired, 1),
+    ];
+    let (subject, body) = owed_holds_message(&counts).unwrap();
+    // 1 + 3 + 5 + 1
+    assert_eq!(subject, "RIVER Data: 10 item(s) waiting for a manager");
+    assert!(
+        body.contains("4 field day entries to verify on Visits"),
+        "{body}"
+    );
+    assert!(
+        body.contains("5 calculation outputs to recompute on the Toolbox"),
+        "{body}"
+    );
+    assert!(
+        body.contains("1 fired brake or device identity change on Streams"),
+        "{body}"
+    );
+    assert!(!body.contains("157"), "{body}");
+    assert!(!body.contains("Audits"), "{body}");
+}
+
+#[test]
+fn test_owed_holds_message_is_none_when_nothing_is_owed() {
+    use crate::routes::private::sync::models::HoldKind;
+    assert!(owed_holds_message(&[]).is_none());
+    assert!(owed_holds_message(&[(HoldKind::ReplicateStats, 157)]).is_none());
+}

@@ -28,6 +28,7 @@ fn test_every_emitted_kind_has_a_channel() {
         "curve_drift",
         "derived_computed",
         "steps_skipped",
+        "import_tags",
     ] {
         assert!(!on_by_default(kind), "'{kind}' is asked for, not assumed");
     }
@@ -67,4 +68,29 @@ fn test_channel_names_are_the_kinds_and_are_unique() {
         assert_eq!(channel(c.kind), Some(&c));
         assert!(!c.label.is_empty() && !c.description.is_empty());
     }
+}
+
+/// Q210: the review queue reaches managers, import discrepancies admins, every other channel any
+/// member.
+#[test]
+fn test_channel_audiences() {
+    for c in CHANNELS {
+        let expected = match c.kind {
+            "holds_open" => Role::Manager,
+            "import_tags" => Role::Administrator,
+            _ => Role::Intern,
+        };
+        assert_eq!(c.audience, expected, "'{}'", c.kind);
+    }
+}
+
+#[test]
+fn test_admits_holds_open_from_manager_up() {
+    assert!(!admits("holds_open", &Role::Intern));
+    assert!(!admits("holds_open", &Role::River));
+    assert!(admits("holds_open", &Role::Manager));
+    assert!(admits("holds_open", &Role::Administrator));
+    assert!(admits("alarm_opened", &Role::Intern));
+    assert!(!admits("alarm_opened", &Role::Unknown(String::new())));
+    assert!(admits(UNADDRESSED_KIND, &Role::Intern));
 }

@@ -253,10 +253,10 @@ async fn sync_digest_covers_partial_cycles() {
     );
 }
 
-/// Scenario: a sync registers a station nobody has paired, and a portal edit lands on a curated
-/// reading. Both wait for a person on a screen nobody has a reason to open.
-/// Expected behaviour: each raises its own notification, once, and the unpaired one stops once the
-/// stream is paired.
+/// Scenario: a sync registers a station nobody has paired and a statistics disagreement, and later an
+/// intern's field day waits for a manager.
+/// Expected behaviour: the stream and the field day each raise one notification, the disagreement
+/// none, and the unpaired one stops once the stream is paired.
 #[tokio::test]
 #[serial]
 async fn unpaired_streams_and_open_holds_are_announced() {
@@ -279,17 +279,17 @@ async fn unpaired_streams_and_open_holds_are_announced() {
         &format!(
             "INSERT INTO replicate_audit_holds \
                  (stream_id, site_id, parameter_id, group_time, kind, expected, computed, delta, status) \
-             VALUES ('{stream}', NULL, NULL, NOW(), 'source_modified', '{{}}'::jsonb, \
+             VALUES ('{stream}', NULL, NULL, NOW(), 'replicate_stats', '{{}}'::jsonb, \
                      '{{}}'::jsonb, '{{}}'::jsonb, 'deferred')"
         ),
     )
     .await;
 
+    // A statistics disagreement alone is a tag nobody owes an action on.
     let sent = Arc::new(Mutex::new(Vec::new()));
     let channels: Vec<Box<dyn NotificationChannel>> =
         vec![Box::new(MockChannel { sent: sent.clone() })];
     flows::run(&state, &channels).await;
-
     {
         let msgs = sent.lock().unwrap();
         let unpaired = kinds(&msgs, "streams_unpaired");
@@ -299,10 +299,33 @@ async fn unpaired_streams_and_open_holds_are_announced() {
             "body: {}",
             unpaired[0].body
         );
-        let holds = kinds(&msgs, "holds_open");
-        assert_eq!(holds.len(), 1, "the review queue is announced");
         assert!(
-            holds[0].body.contains("1 source_modified"),
+            kinds(&msgs, "holds_open").is_empty(),
+            "replicate_stats is not waiting for a manager"
+        );
+    }
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO replicate_audit_holds \
+                 (stream_id, site_id, parameter_id, group_time, kind, expected, computed, delta, status) \
+             VALUES (NULL, '{site}', NULL, NOW(), 'unverified_visit', '{{}}'::jsonb, \
+                     '{{}}'::jsonb, '{{}}'::jsonb, 'pending')",
+            site = crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    sent.lock().unwrap().clear();
+    flows::run(&state, &channels).await;
+    {
+        let msgs = sent.lock().unwrap();
+        let holds = kinds(&msgs, "holds_open");
+        assert_eq!(holds.len(), 1, "the pending field day is announced");
+        assert!(
+            holds[0]
+                .body
+                .contains("1 field day entry to verify on Visits"),
             "the digest says what is waiting: {}",
             holds[0].body
         );
@@ -746,4 +769,72 @@ async fn history_that_stopped_before_the_pairing_announces_nothing() {
         .filter(|m| m.body.contains("flowing again"))
         .collect();
     assert_eq!(recovered.len(), 1, "one recovery notice");
+}
+
+/// Scenario: a sync import records a discrepancy tag, and a decided hold of another kind stands
+/// beside it (Q210).
+///
+/// Expected behaviour: the tag is announced once by source and kind, the other kind is not counted,
+/// and a tick with no new tag sends nothing.
+#[tokio::test]
+#[serial]
+async fn import_tags_are_announced_once_by_source() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    let stream = turb_stream(&db).await;
+    for kind in ["replicate_stats", "source_modified"] {
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO replicate_audit_holds \
+                     (stream_id, group_time, kind, expected, computed, delta, status) \
+                 VALUES ('{stream}', NOW(), '{kind}', '{{}}'::jsonb, '{{}}'::jsonb, \
+                         '{{}}'::jsonb, 'pending')"
+            ),
+        )
+        .await;
+    }
+    let source: String = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!("SELECT source_system FROM data_streams WHERE id = '{stream}'"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "source_system")
+        .unwrap();
+
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let channels: Vec<Box<dyn NotificationChannel>> =
+        vec![Box::new(MockChannel { sent: sent.clone() })];
+    flows::run(&state, &channels).await;
+
+    {
+        let msgs = sent.lock().unwrap();
+        let tags = kinds(&msgs, "import_tags");
+        assert_eq!(tags.len(), 1, "the tag is announced: {msgs:?}");
+        assert!(
+            tags[0]
+                .body
+                .contains(&format!("1 replicate_stats from {source}")),
+            "by kind and source, and only the tag kind: {}",
+            tags[0].body
+        );
+        assert!(
+            !tags[0].body.contains("source_modified"),
+            "{}",
+            tags[0].body
+        );
+    }
+
+    sent.lock().unwrap().clear();
+    flows::run(&state, &channels).await;
+    assert!(
+        kinds(&sent.lock().unwrap(), "import_tags").is_empty(),
+        "the same tags are not announced twice"
+    );
 }

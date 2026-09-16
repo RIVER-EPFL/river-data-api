@@ -150,3 +150,49 @@ async fn channels_default_alarms_on_and_the_rest_off() {
         "a system-wide sync alert answers to the channel-wide row"
     );
 }
+
+/// Scenario: a river member and a manager both hold a stored `holds_open` row, and an intern's
+/// role cannot be resolved.
+/// Expected behaviour: the review queue reaches the manager alone.
+#[tokio::test]
+#[serial]
+async fn holds_open_reaches_only_managers_and_up() {
+    use river_db::common::authz::Role;
+    use river_db::routes::private::notifications::models::RoleResolution;
+    use river_db::routes::private::notifications::service::within_audience;
+
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+
+    for sub in ["sub-river", "sub-manager", "sub-unresolved"] {
+        push_sub(&db, sub, &format!("https://push.example.com/{sub}")).await;
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO notification_subscriptions (keycloak_sub, channel, enabled) \
+                 VALUES ('{sub}', 'holds_open', TRUE)"
+            ),
+        )
+        .await;
+    }
+    state
+        .authorizer
+        .prime("sub-river", RoleResolution::Active(Role::River))
+        .await;
+    state
+        .authorizer
+        .prime("sub-manager", RoleResolution::Active(Role::Manager))
+        .await;
+
+    let reached = slot_subscriptions(&db, &None, "holds_open").await.unwrap();
+    assert_eq!(reached.len(), 3, "all three hold a stored row");
+    let (admitted, mut refused) = within_audience(&state, "holds_open", reached).await;
+    refused.sort();
+    assert_eq!(
+        endpoints(&admitted),
+        vec!["https://push.example.com/sub-manager"]
+    );
+    assert_eq!(refused, vec!["sub-river", "sub-unresolved"]);
+}

@@ -7,7 +7,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use moka::future::Cache;
-use sea_orm::sea_query::{Expr, ExprTrait, OnConflict};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, OnConflict, Order, Query};
 use sea_orm::{
     ActiveValue, ActiveValue::NotSet, ActiveValue::Set, ColumnTrait, ConnectionTrait,
     DatabaseConnection, DbErr, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter,
@@ -27,7 +27,10 @@ use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::alarms::models::alarm_event;
 use crate::routes::private::api_tokens::service as users;
+use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::readings::decision_model;
+use crate::routes::private::sync::hold_model;
+use crate::routes::private::sync::models::HoldKind;
 
 pub(super) const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 
@@ -518,6 +521,29 @@ pub struct Subscription {
     pub auth: String,
 }
 
+/// Splits the subscriptions a kind reached into those whose holder's live role is in the channel's
+/// audience, and the holders it refused. A role that cannot be resolved is refused: the audience is
+/// not confirmed. A channel open to every level resolves nobody.
+pub async fn within_audience(
+    state: &AppState,
+    kind: &str,
+    subscriptions: Vec<Subscription>,
+) -> (Vec<Subscription>, Vec<String>) {
+    if channel(kind).is_none_or(|c| c.audience.level() <= Role::Intern.level()) {
+        return (subscriptions, Vec::new());
+    }
+    let mut admitted = Vec::with_capacity(subscriptions.len());
+    let mut refused = Vec::new();
+    for sub in subscriptions {
+        let resolution = state.authorizer.resolve(state, &sub.keycloak_sub).await;
+        match resolution.as_ref().and_then(RoleResolution::role) {
+            Some(role) if admits(kind, role) => admitted.push(sub),
+            _ => refused.push(sub.keycloak_sub),
+        }
+    }
+    (admitted, refused)
+}
+
 pub(super) fn deep_link_url(base: Option<&str>, slot: &Option<Slot>) -> Option<String> {
     let base = base?.trim_end_matches('/');
     match slot {
@@ -699,6 +725,20 @@ impl NotificationChannel for WebPushChannel {
                 return Vec::new();
             }
         };
+
+        let (subscriptions, refused) = within_audience(state, msg.kind, subscriptions).await;
+        for recipient in &refused {
+            log_delivery(
+                db,
+                None,
+                msg.kind,
+                self.name(),
+                recipient,
+                "skipped",
+                Some("below the channel's audience"),
+            )
+            .await;
+        }
 
         let project = msg.slot.as_ref().and_then(|s| s.project_id);
 
@@ -1012,6 +1052,12 @@ pub(super) fn require_sub(auth: &AuthContext) -> AppResult<String> {
     auth.keycloak_sub().map(str::to_string).ok_or_else(|| {
         AppError::Forbidden("notification preferences require a Keycloak login".to_string())
     })
+}
+
+/// The caller's level for choosing channels; a caller with no realm role is below every audience.
+pub(super) fn caller_role(auth: &AuthContext) -> Role {
+    auth.highest_role()
+        .unwrap_or_else(|| Role::Unknown(String::new()))
 }
 
 // --- The roster ---
@@ -1462,6 +1508,92 @@ pub(super) async fn decisions_since(
         .count(db)
         .await?;
     Ok(i64::try_from(n).unwrap_or(i64::MAX))
+}
+
+/// The hold kinds a sync import records as a tag on the data rather than as work for a person.
+const IMPORT_TAG_KINDS: [HoldKind; 2] = [HoldKind::ReplicateStats, HoldKind::CurveClaimStripped];
+
+/// Discrepancy tags recorded since `since`, counted by the source system of the stream that
+/// raised them (`None` for a tag no stream produced) and by kind.
+pub(super) async fn import_tags_since(
+    db: &DatabaseConnection,
+    since: DateTime<Utc>,
+) -> Result<Vec<(Option<String>, String, i64)>, DbErr> {
+    let source = Expr::col((data_streams::Entity, data_streams::Column::SourceSystem));
+    let kind = Expr::col((hold_model::Entity, hold_model::Column::Kind));
+    let query = Query::select()
+        .expr_as(source.clone(), Alias::new("source_system"))
+        .expr_as(kind.clone(), Alias::new("kind"))
+        .expr_as(
+            Expr::col((hold_model::Entity, hold_model::Column::Id)).count(),
+            Alias::new("n"),
+        )
+        .from(hold_model::Entity)
+        .left_join(
+            data_streams::Entity,
+            Expr::col((data_streams::Entity, data_streams::Column::Id))
+                .equals((hold_model::Entity, hold_model::Column::StreamId)),
+        )
+        .and_where(kind.clone().is_in(IMPORT_TAG_KINDS.map(HoldKind::as_str)))
+        .and_where(
+            Expr::col((hold_model::Entity, hold_model::Column::CreatedAt))
+                .gt(sea_orm::prelude::DateTimeWithTimeZone::from(since)),
+        )
+        .add_group_by([source, kind])
+        .order_by(
+            (data_streams::Entity, data_streams::Column::SourceSystem),
+            Order::Asc,
+        )
+        .order_by((hold_model::Entity, hold_model::Column::Kind), Order::Asc)
+        .to_owned();
+    let rows = db.query_all_raw(PG.build(&query)).await?;
+    rows.iter()
+        .map(|r| {
+            let TagCount {
+                source_system,
+                kind,
+                n,
+            } = TagCount::from_query_result(r, "")?;
+            Ok((source_system, kind, n))
+        })
+        .collect()
+}
+
+#[derive(FromQueryResult)]
+struct TagCount {
+    source_system: Option<String>,
+    kind: String,
+    n: i64,
+}
+
+/// The digest of discrepancy tags a sync import recorded, or `None` when there were none. It
+/// informs rather than asks: a tag is a mark on the data, not a decision owed.
+#[must_use]
+pub fn render_import_tags(counts: &[(Option<String>, String, i64)]) -> Option<OutgoingMessage> {
+    let total: i64 = counts.iter().map(|(_, _, n)| n).sum();
+    if total == 0 {
+        return None;
+    }
+    let listed = counts
+        .iter()
+        .map(|(source, kind, n)| {
+            format!(
+                "{n} {kind} from {}",
+                source.as_deref().unwrap_or("no stream")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(OutgoingMessage {
+        kind: "import_tags",
+        subject: format!("RIVER Data: {total} discrepancy tag(s) recorded at import"),
+        body: format!(
+            "🏷️ Synced data did not match itself where it was imported: {listed}. The values are \
+             stored as the source sent them, tagged for reading under Data Streams, Audits."
+        ),
+        // Tags span every stream a sync touched, so the digest carries no single scope.
+        slot: None,
+    })
 }
 
 #[cfg(test)]

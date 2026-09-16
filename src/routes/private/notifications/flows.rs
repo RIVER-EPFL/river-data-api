@@ -23,6 +23,7 @@ use crate::routes::private::readings::service as readings_service;
 use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport, Schedule};
 use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::sites::models as sites;
+use crate::routes::private::sync::models::HoldKind;
 use crate::routes::private::sync::models::services as sync_services;
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
@@ -212,6 +213,9 @@ pub async fn run(state: &AppState, channels: &[Box<dyn NotificationChannel>]) {
     }
     if let Err(e) = holds_open(state, channels).await {
         tracing::warn!(error = %e, "open-holds trigger failed");
+    }
+    if let Err(e) = import_tags(state, channels).await {
+        tracing::warn!(error = %e, "import-tag trigger failed");
     }
     if let Err(e) = jobs_failed(state, channels).await {
         tracing::warn!(error = %e, "failed-job trigger failed");
@@ -809,9 +813,8 @@ async fn streams_unpaired(
     Ok(())
 }
 
-/// Open review-queue holds. A held source edit or a statistics disagreement waits for a person, and
-/// the audits panel is only found by people who already know it exists, so the backlog is announced
-/// on the same cadence a silent sync service is.
+/// Holds a manager owes an action on, announced on the cadence a silent sync service is: a pending
+/// field day or a stale output is only found by somebody who goes looking.
 async fn holds_open(
     state: &AppState,
     channels: &[Box<dyn NotificationChannel>],
@@ -822,38 +825,106 @@ async fn holds_open(
             PG,
             format!(
                 "SELECT kind, COUNT(*)::bigint AS n FROM replicate_audit_holds \
-                 WHERE status IN {open} GROUP BY kind ORDER BY kind",
-                open = *crate::routes::private::sync::service::OPEN
+                 WHERE status IN {open} AND kind IN {owed} GROUP BY kind ORDER BY kind",
+                open = *crate::routes::private::sync::service::OPEN,
+                owed = HoldKind::sql_list(&HoldKind::OWED)
             ),
         ))
         .await?;
-    if rows.is_empty() {
+    let mut counts = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let HoldCount { kind, n } = HoldCount::from_query_result(r, "")?;
+        if let Ok(kind) = serde_json::from_value(serde_json::Value::String(kind)) {
+            counts.push((kind, n));
+        }
+    }
+    let Some((subject, body)) = owed_holds_message(&counts) else {
         // Nothing is waiting, so a later backlog is a fresh transition rather than a repeat.
         state_clear(db, "holds_open", "all").await?;
         return Ok(());
-    }
-
-    let mut total = 0i64;
-    let mut parts = Vec::new();
-    for r in &rows {
-        let HoldCount { kind, n } = HoldCount::from_query_result(r, "")?;
-        total += n;
-        parts.push(format!("{n} {kind}"));
-    }
+    };
     if !claim_renotify(db, "holds_open", "all", HOLDS_RENOTIFY_HOURS).await? {
         return Ok(());
     }
     let msg = OutgoingMessage {
         kind: "holds_open",
-        subject: format!("RIVER Data: {total} hold(s) awaiting review"),
-        body: format!(
-            "📋 {total} hold(s) are open in the review queue ({}). Review them under Data \
-             Streams, Audits.",
-            parts.join(", ")
-        ),
-        // The queue spans slots and unpaired streams alike, so it carries no single scope.
+        subject,
+        body,
+        // The work spans sites and streams alike, so it carries no single scope.
         slot: None,
     };
+    let _ = deliver(state, channels, &msg, None).await;
+    Ok(())
+}
+
+/// The subject and body announcing what a manager owes, one line per place the work is done, or
+/// `None` when no counted kind is one a manager owes.
+fn owed_holds_message(counts: &[(HoldKind, i64)]) -> Option<(String, String)> {
+    const PLACES: [(&[HoldKind], &str, &str, &str); 3] = [
+        (
+            &[HoldKind::UnverifiedEntry, HoldKind::UnverifiedVisit],
+            "field day entry to verify",
+            "field day entries to verify",
+            "Visits",
+        ),
+        (
+            &[HoldKind::MissingOutput, HoldKind::StaleOutput],
+            "calculation output to recompute",
+            "calculation outputs to recompute",
+            "the Toolbox",
+        ),
+        (
+            &[HoldKind::BrakeFired, HoldKind::SourceIdentityChanged],
+            "fired brake or device identity change",
+            "fired brakes or device identity changes",
+            "Streams",
+        ),
+    ];
+    let mut total = 0;
+    let mut lines = Vec::new();
+    for (kinds, one, many, place) in PLACES {
+        let n: i64 = counts
+            .iter()
+            .filter(|(k, _)| kinds.contains(k))
+            .map(|(_, n)| n)
+            .sum();
+        if n == 0 {
+            continue;
+        }
+        total += n;
+        let what = if n == 1 { one } else { many };
+        lines.push(format!("{n} {what} on {place}"));
+    }
+    if total == 0 {
+        return None;
+    }
+    Some((
+        format!("RIVER Data: {total} item(s) waiting for a manager"),
+        format!("📋 {}.", lines.join("; ")),
+    ))
+}
+
+/// The longest a discrepancy tag goes unannounced when no digest has been sent before.
+const IMPORT_TAGS_WINDOW_HOURS: i64 = 24;
+
+/// Discrepancy tags a sync import recorded since the last digest (Q210). A tag asks nothing of
+/// anybody, so an unchanged backlog is never repeated: only what arrived since the watermark is.
+async fn import_tags(
+    state: &AppState,
+    channels: &[Box<dyn NotificationChannel>],
+) -> Result<(), DbErr> {
+    let db = &state.db;
+    let since = state_get(db, "import_tags", "all")
+        .await?
+        .map(|(_, at)| at)
+        .unwrap_or_else(|| Utc::now() - Duration::hours(IMPORT_TAGS_WINDOW_HOURS));
+    let counts = import_tags_since(db, since).await?;
+    let Some(msg) = render_import_tags(&counts) else {
+        return Ok(());
+    };
+    if !claim_cas(db, "import_tags", "all", since).await? {
+        return Ok(());
+    }
     let _ = deliver(state, channels, &msg, None).await;
     Ok(())
 }

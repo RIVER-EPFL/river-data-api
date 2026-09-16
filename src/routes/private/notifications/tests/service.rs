@@ -40,3 +40,44 @@ fn test_render_resolved_without_dashboard_has_no_link() {
     assert!(msg.body.contains("Verbier / Dissolved_O2 is back in range"));
     assert!(!msg.body.contains("View:"));
 }
+
+#[test]
+fn test_render_import_tags_groups_by_source_and_kind() {
+    let counts = vec![
+        (Some("cnet".to_string()), "replicate_stats".to_string(), 12),
+        (
+            Some("metalp".to_string()),
+            "curve_claim_stripped".to_string(),
+            1,
+        ),
+        (None, "replicate_stats".to_string(), 2),
+    ];
+    let msg = render_import_tags(&counts).expect("tags were recorded");
+    assert_eq!(msg.kind, "import_tags");
+    // 12 + 1 + 2
+    assert_eq!(
+        msg.subject,
+        "RIVER Data: 15 discrepancy tag(s) recorded at import"
+    );
+    assert!(
+        msg.body.contains("12 replicate_stats from cnet"),
+        "{}",
+        msg.body
+    );
+    assert!(
+        msg.body.contains("1 curve_claim_stripped from metalp"),
+        "{}",
+        msg.body
+    );
+    assert!(
+        msg.body.contains("2 replicate_stats from no stream"),
+        "{}",
+        msg.body
+    );
+    assert!(msg.slot.is_none());
+}
+
+#[test]
+fn test_render_import_tags_empty_sends_nothing() {
+    assert!(render_import_tags(&[]).is_none());
+}

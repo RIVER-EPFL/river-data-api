@@ -195,6 +195,7 @@ pub async fn list_channels(
     Extension(auth): Extension<AuthContext>,
 ) -> AppResult<Json<Vec<ChannelView>>> {
     let sub = require_sub(&auth)?;
+    let role = caller_role(&auth);
     let counts = state
         .db
         .query_all_raw(Statement::from_string(
@@ -232,6 +233,7 @@ pub async fn list_channels(
     Ok(Json(
         CHANNELS
             .iter()
+            .filter(|c| admits(c.kind, &role))
             .map(|c| {
                 let counts = by_kind.get(c.kind);
                 ChannelView {
@@ -262,6 +264,7 @@ pub async fn set_my_subscriptions(
     Json(req): Json<SetSubscriptionsRequest>,
 ) -> AppResult<Json<MyNotifications>> {
     let sub = require_sub(&auth)?;
+    let role = caller_role(&auth);
 
     let scope = auth.access_scope();
     let accessible: Option<HashSet<Uuid>> = match &scope {
@@ -273,6 +276,12 @@ pub async fn set_my_subscriptions(
         if channel(&s.channel).is_none() {
             return Err(AppError::BadRequest(format!(
                 "unknown notification channel: {}",
+                s.channel
+            )));
+        }
+        if !admits(&s.channel, &role) {
+            return Err(AppError::Forbidden(format!(
+                "notification channel {} is not open to your role",
                 s.channel
             )));
         }
