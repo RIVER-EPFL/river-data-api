@@ -335,28 +335,18 @@ pub async fn seed_token_write_data_only(db: &DatabaseConnection) -> String {
 /// auth path where a sync service post-enrollment has unrestricted scope.
 /// Returns (raw_token, service_id).
 pub async fn seed_sync_session_token(db: &DatabaseConnection) -> (String, Uuid) {
-    seed_sync_session_token_declaring(db, None).await
-}
-
-/// The same, for a service enrolled on a credential that declares the source system it speaks for.
-/// What it registers is written under that declaration, whatever its request claims.
-pub async fn seed_sync_session_token_declaring(
-    db: &DatabaseConnection,
-    source_system: Option<&str>,
-) -> (String, Uuid) {
     use chrono::Duration;
     let service_id = Uuid::new_v4();
     let raw_token = format!("sync-session-{}", Uuid::new_v4());
     let token_hash = hash_token(&raw_token);
     let expires_at = (Utc::now() + Duration::hours(1)).to_rfc3339();
-    let declared = source_system.map_or("NULL".to_string(), |s| format!("'{s}'"));
 
     exec(
         db,
         &format!(
             "INSERT INTO sync_services \
-             (id, service_type, source_system, instance_id, status, created_at, updated_at) \
-             VALUES ('{service_id}', 'test', {declared}, 'test-instance', 'registered', now(), now())"
+             (id, service_type, instance_id, status, created_at, updated_at) \
+             VALUES ('{service_id}', 'test', 'test-instance', 'registered', now(), now())"
         ),
     )
     .await;

@@ -125,10 +125,6 @@ pub struct IssueCommandRequest {
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct CreateCredentialRequest {
     pub service_type: String,
-    /// The source system a service on this credential speaks for, e.g. "metalp". Its registrations
-    /// are written under it, so it is declared here rather than sent with each call.
-    #[serde(default)]
-    pub source_system: Option<String>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -1024,12 +1020,6 @@ pub mod credentials {
         pub client_secret_hash: String,
         #[crudcrate(filterable)]
         pub service_type: String,
-        /// The source system a service enrolled on this credential speaks for, e.g. "metalp". It is
-        /// the provenance its registrations are written under; `service_type` is the kind of service,
-        /// which for the three portals is one value. NULL on a credential minted before it was
-        /// declared.
-        #[crudcrate(filterable)]
-        pub source_system: Option<String>,
         #[crudcrate(filterable)]
         pub service_id: Option<Uuid>,
         #[crudcrate(filterable)]
@@ -1156,10 +1146,6 @@ pub mod services {
         pub id: Uuid,
         #[crudcrate(filterable)]
         pub service_type: String,
-        /// Copied from the credential at enrolment: the source system this service's registrations are
-        /// written under. Not a CRUD field, it belongs to the credential.
-        #[crudcrate(filterable, exclude(create, update))]
-        pub source_system: Option<String>,
         #[crudcrate(filterable)]
         pub instance_id: String,
         #[crudcrate(filterable)]

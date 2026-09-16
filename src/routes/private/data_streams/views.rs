@@ -324,11 +324,9 @@ pub async fn stream_receipts(
 pub async fn register_stream(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
-    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(RegisterStreamRequest(mut payload)): Json<RegisterStreamRequest>,
 ) -> AppResult<Json<DataStream>> {
-    payload.source_system =
-        crate::common::provenance::source_system(&auth, &payload.source_system)?;
+    payload.source_system = crate::common::provenance::source_system(&payload.source_system)?;
     crate::routes::private::readings::service::validate_measurement_type(
         payload.measurement_type.as_deref(),
     )?;

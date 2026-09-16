@@ -7,7 +7,6 @@ fn credential(secret: &str, revoked: bool) -> credentials::Model {
         client_id: "rvd-sync-1".to_string(),
         client_secret_hash: hash_token(secret),
         service_type: "vaisala".to_string(),
-        source_system: Some("vaisala".to_string()),
         service_id: None,
         revoked,
         created_at: Utc::now().into(),

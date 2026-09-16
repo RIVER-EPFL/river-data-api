@@ -24,10 +24,9 @@ use crate::error::{AppError, AppResult};
 )]
 pub async fn register_notes(
     State(state): State<AppState>,
-    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(payload): Json<RegisterNotesRequest>,
 ) -> AppResult<Json<RegisterNotesResponse>> {
-    let source_system = crate::common::provenance::source_system(&auth, &payload.source_system)?;
+    let source_system = crate::common::provenance::source_system(&payload.source_system)?;
     let db = &state.db;
 
     let names: Vec<String> = payload.notes.iter().map(|n| n.site_name.clone()).collect();

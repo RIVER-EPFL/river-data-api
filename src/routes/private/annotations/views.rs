@@ -30,10 +30,9 @@ use crate::error::{AppError, AppResult};
 )]
 pub async fn register_annotations(
     State(state): State<AppState>,
-    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(payload): Json<RegisterAnnotationsRequest>,
 ) -> AppResult<Json<RegisterAnnotationsResponse>> {
-    let source_system = crate::common::provenance::source_system(&auth, &payload.source_system)?;
+    let source_system = crate::common::provenance::source_system(&payload.source_system)?;
     let db = &state.db;
 
     let stream_ids: Vec<Uuid> = payload.annotations.iter().map(|a| a.stream_id).collect();

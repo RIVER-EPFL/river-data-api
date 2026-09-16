@@ -49,13 +49,10 @@ use crate::routes::private::{collection_events, readings};
 use super::models::services::{SyncService, SyncServiceList};
 use super::models::*;
 
-/// An authenticated sync service: who it is, and what it writes provenance under.
+/// An authenticated sync service.
 #[derive(Debug, Clone)]
 pub struct SyncSession {
     pub service_id: Uuid,
-    /// The source system the service enrolled for, from its credential. `None` on a service whose
-    /// credential declares none.
-    pub source_system: Option<String>,
 }
 
 /// Resolve a raw bearer token to a live sync session. Returns `None` for an unknown, malformed
@@ -67,11 +64,8 @@ pub async fn lookup_sync_session(db: &DatabaseConnection, raw_token: &str) -> Op
     }
 
     let token_hash = hash_token(raw_token);
-    // The service comes back with the token: the source system it speaks for is read on every
-    // authenticated request, so it is one round trip rather than a second lookup below.
-    let (token, service) = tokens::Entity::find()
+    let token = tokens::Entity::find()
         .filter(tokens::Column::TokenHash.eq(&token_hash))
-        .find_also_related(services::Entity)
         .one(db)
         .await
         .inspect_err(|e| tracing::warn!(error = %e, "DB error looking up sync token"))
@@ -85,7 +79,6 @@ pub async fn lookup_sync_session(db: &DatabaseConnection, raw_token: &str) -> Op
 
     Some(SyncSession {
         service_id: token.service_id,
-        source_system: service.and_then(|s| s.source_system),
     })
 }
 
@@ -98,7 +91,6 @@ pub fn bearer(value: Option<&str>) -> Option<&str> {
 #[derive(Debug, Clone)]
 pub struct SyncServiceContext {
     pub service_id: Uuid,
-    pub source_system: Option<String>,
 }
 
 impl FromRequestParts<AppState> for SyncServiceContext {
@@ -123,7 +115,6 @@ impl FromRequestParts<AppState> for SyncServiceContext {
 
         Ok(Self {
             service_id: session.service_id,
-            source_system: session.source_system,
         })
     }
 }

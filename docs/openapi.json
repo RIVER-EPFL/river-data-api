@@ -4268,13 +4268,6 @@
         "properties": {
           "service_type": {
             "type": "string"
-          },
-          "source_system": {
-            "description": "The source system a service on this credential speaks for, e.g. \"metalp\". Its registrations\nare written under it, so it is declared here rather than sent with each call.",
-            "type": [
-              "string",
-              "null"
-            ]
           }
         },
         "required": [
@@ -24138,12 +24131,6 @@
           },
           "service_type": {
             "type": "string"
-          },
-          "source_system": {
-            "type": [
-              "string",
-              "null"
-            ]
           }
         },
         "required": [
@@ -24178,20 +24165,12 @@
           },
           "service_type": {
             "type": "string"
-          },
-          "source_system": {
-            "description": "The source system a service enrolled on this credential speaks for, e.g. \"metalp\". It is\nthe provenance its registrations are written under; `service_type` is the kind of service,\nwhich for the three portals is one value. NULL on a credential minted before it was\ndeclared.",
-            "type": [
-              "string",
-              "null"
-            ]
           }
         },
         "required": [
           "id",
           "client_id",
           "service_type",
-          "source_system",
           "service_id",
           "revoked",
           "created_at"
@@ -24223,20 +24202,12 @@
           },
           "service_type": {
             "type": "string"
-          },
-          "source_system": {
-            "description": "The source system a service enrolled on this credential speaks for, e.g. \"metalp\". It is\nthe provenance its registrations are written under; `service_type` is the kind of service,\nwhich for the three portals is one value. NULL on a credential minted before it was\ndeclared.",
-            "type": [
-              "string",
-              "null"
-            ]
           }
         },
         "required": [
           "id",
           "client_id",
           "service_type",
-          "source_system",
           "service_id",
           "revoked",
           "created_at"
@@ -24265,12 +24236,6 @@
             ]
           },
           "service_type": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "source_system": {
             "type": [
               "string",
               "null"
@@ -24329,13 +24294,6 @@
           "service_type": {
             "type": "string"
           },
-          "source_system": {
-            "description": "Copied from the credential at enrolment: the source system this service's registrations are\nwritten under. Not a CRUD field, it belongs to the credential.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "status": {
             "type": "string"
           },
@@ -24355,7 +24313,6 @@
         "required": [
           "id",
           "service_type",
-          "source_system",
           "instance_id",
           "status",
           "paused",
@@ -24420,13 +24377,6 @@
           "service_type": {
             "type": "string"
           },
-          "source_system": {
-            "description": "Copied from the credential at enrolment: the source system this service's registrations are\nwritten under. Not a CRUD field, it belongs to the credential.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "status": {
             "type": "string"
           },
@@ -24446,7 +24396,6 @@
         "required": [
           "id",
           "service_type",
-          "source_system",
           "instance_id",
           "status",
           "paused",
@@ -47993,7 +47942,7 @@
     },
     "/api/sync_service_credentials": {
       "get": {
-        "description": "Retrieves all sync_service_credentials.\n\nThis resource manages sync_service_credential items\n\nAdditional sortable columns: \n- created_at.\n\nAdditional filterable columns: \n- client_id\n- service_type\n- source_system\n- service_id\n- revoked.",
+        "description": "Retrieves all sync_service_credentials.\n\nThis resource manages sync_service_credential items\n\nAdditional sortable columns: \n- created_at.\n\nAdditional filterable columns: \n- client_id\n- service_type\n- service_id\n- revoked.",
         "operationId": "get_all_sync_service_credentials",
         "parameters": [
           {
@@ -48481,7 +48430,7 @@
     },
     "/api/sync_services": {
       "get": {
-        "description": "Retrieves all sync_services.\n\nThis resource manages sync_service items\n\nAdditional sortable columns: \n- last_heartbeat\n- created_at\n- updated_at.\n\nAdditional filterable columns: \n- service_type\n- source_system\n- instance_id\n- status\n- paused\n- full_reassert_enabled.",
+        "description": "Retrieves all sync_services.\n\nThis resource manages sync_service items\n\nAdditional sortable columns: \n- last_heartbeat\n- created_at\n- updated_at.\n\nAdditional filterable columns: \n- service_type\n- instance_id\n- status\n- paused\n- full_reassert_enabled.",
         "operationId": "get_all_sync_services",
         "parameters": [
           {

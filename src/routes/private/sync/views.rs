@@ -442,9 +442,6 @@ pub async fn enroll(
         active.status = Set(starting);
         active.current_operation = Set(None);
         active.last_error = Set(None);
-        // The credential declares the source system, so a re-declaration reaches the service on
-        // its next enrollment rather than waiting for it to be re-created.
-        active.source_system = Set(cred.source_system.clone());
         active.updated_at = Set(Utc::now().into());
         active.update(&state.db).await?;
         (existing.id, existing.paused, existing.sync_interval_secs)
@@ -452,7 +449,6 @@ pub async fn enroll(
         let service = services::ActiveModel {
             id: Set(Uuid::new_v4()),
             service_type: Set(cred.service_type.clone()),
-            source_system: Set(cred.source_system.clone()),
             instance_id: Set(req.instance_id.clone()),
             status: Set(starting),
             paused: Set(false),
@@ -582,10 +578,6 @@ pub async fn create_credential(
         client_id: Set(client_id.clone()),
         client_secret_hash: Set(secret_hash),
         service_type: Set(req.service_type),
-        source_system: Set(req
-            .source_system
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())),
         service_id: Set(None),
         revoked: Set(false),
         created_at: Set(Utc::now().into()),

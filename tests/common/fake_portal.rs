@@ -397,7 +397,6 @@ pub async fn enrolled_service(
         State(state.clone()),
         Json(CreateCredentialRequest {
             service_type: SOURCE_SYSTEM.to_string(),
-            source_system: Some(SOURCE_SYSTEM.to_string()),
         }),
     )
     .await

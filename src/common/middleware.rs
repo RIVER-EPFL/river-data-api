@@ -42,15 +42,8 @@ pub enum AuthContext {
     },
     /// Authenticated via an enrolled sync service's session token.
     ///
-    /// It writes like a full-permission unscoped token, and unlike a token it says which source
-    /// system it speaks for: what a service writes provenance under is a property of the identity
-    /// it enrolled with, never a field in its requests.
-    SyncService {
-        service_id: Uuid,
-        /// Declared on the credential the service enrolled with (M167). `None` on a credential
-        /// minted before it was declared.
-        source_system: Option<String>,
-    },
+    /// It writes like a full-permission unscoped token.
+    SyncService { service_id: Uuid },
     /// Authenticated via API token (external scripts, curl).
     ApiToken {
         token_id: Uuid,
@@ -136,18 +129,13 @@ impl AuthContext {
     }
 
     /// One name for this caller, as every trail records it: the email, else the Keycloak subject,
-    /// else the source system a sync service speaks for, else the token or service it authenticated
-    /// with.
+    /// else the token or service it authenticated with.
     #[must_use]
     pub fn label(&self) -> String {
         match self {
             AuthContext::Keycloak { email: Some(e), .. } => e.clone(),
             AuthContext::Keycloak { sub, .. } => sub.clone(),
-            AuthContext::SyncService {
-                source_system: Some(system),
-                ..
-            } => format!("sync:{system}"),
-            AuthContext::SyncService { service_id: id, .. } => format!("token:{id}"),
+            AuthContext::SyncService { service_id: id } => format!("token:{id}"),
             AuthContext::ApiToken { token_id, .. } => format!("token:{token_id}"),
         }
     }
@@ -161,16 +149,6 @@ impl AuthContext {
         match self {
             AuthContext::SyncService { .. } => Origin::Sync,
             AuthContext::Keycloak { .. } | AuthContext::ApiToken { .. } => Origin::Manual,
-        }
-    }
-
-    /// The source system this caller writes provenance under, for the register routes. `None` for
-    /// a person or a token: only an enrolled service speaks for a source.
-    #[must_use]
-    pub fn source_system(&self) -> Option<&str> {
-        match self {
-            AuthContext::SyncService { source_system, .. } => source_system.as_deref(),
-            AuthContext::Keycloak { .. } | AuthContext::ApiToken { .. } => None,
         }
     }
 
@@ -329,7 +307,6 @@ pub async fn service_auth_middleware(
         {
             let auth = AuthContext::SyncService {
                 service_id: session.service_id,
-                source_system: session.source_system,
             };
             let actor = auth.label();
             request.extensions_mut().insert(auth);

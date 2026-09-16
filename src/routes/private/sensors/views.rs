@@ -1530,10 +1530,9 @@ pub async fn get_sensor_deployment_bands(
 )]
 pub async fn propose_instruments(
     State(state): State<AppState>,
-    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(payload): Json<ProposeInstrumentsRequest>,
 ) -> AppResult<Json<ProposeInstrumentsResponse>> {
-    let source_system = crate::common::provenance::source_system(&auth, &payload.source_system)?;
+    let source_system = crate::common::provenance::source_system(&payload.source_system)?;
     let mut stored = 0usize;
     let mut already_admitted = 0usize;
     for instrument in &payload.instruments {

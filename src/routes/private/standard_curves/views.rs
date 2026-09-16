@@ -120,10 +120,9 @@ pub(crate) async fn resolve_lab_instrument(
 )]
 pub async fn register_standard_curve(
     State(state): State<AppState>,
-    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(payload): Json<RegisterStandardCurveRequest>,
 ) -> AppResult<Json<RegisterStandardCurveResponse>> {
-    let source_system = crate::common::provenance::source_system(&auth, &payload.source_system)?;
+    let source_system = crate::common::provenance::source_system(&payload.source_system)?;
     if payload.curve.slope == 0.0 {
         return Err(AppError::BadRequest(
             "Slope cannot be zero: all readings would produce a constant value".to_string(),

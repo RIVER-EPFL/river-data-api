@@ -63,7 +63,6 @@ mod visit_state {
         assert!(!super::super::visit_lands_pending(
             &AuthContext::SyncService {
                 service_id: uuid::Uuid::new_v4(),
-                source_system: Some("cnet".to_string()),
             }
         ));
     }
