@@ -213,8 +213,9 @@ pub mod version {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+/// A calculation's result as the runner returned it, stored nowhere.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct ToolResult {
+pub struct ToolCalculation {
     pub tool: String,
     #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
     pub results: serde_json::Value,
@@ -252,13 +253,20 @@ pub struct ToolResult {
     /// The exact script version and runtime that produced these numbers; goes into the
     /// provenance blob on save.
     pub tool_version: ToolVersionRef,
-    /// The stored `tool_runs` row for this calculation. A grab save names it as `tool_run_id`
-    /// and the server builds the provenance blob from that row, never from the client.
-    pub run_id: Uuid,
     /// Each formula as it was evaluated, with the values it read per cell. Absent for a script
     /// run, which returns only what the script returns.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub trace: Vec<TraceStep>,
+}
+
+/// A calculation and the `tool_runs` row it was stored as.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ToolResult {
+    #[serde(flatten)]
+    pub calculation: ToolCalculation,
+    /// The stored `tool_runs` row for this calculation. A grab save names it as `tool_run_id`
+    /// and the server builds the provenance blob from that row, never from the client.
+    pub run_id: Uuid,
 }
 
 /// The closed `kind` vocabulary. `enum:` carries its variants after the colon.
@@ -834,33 +842,13 @@ pub struct ManifestOutput {
     pub parameter_id: Option<Uuid>,
     #[serde(default)]
     pub suggested_parameter_code: Option<String>,
-    /// Which divisor the samples saved from this output compute their standard deviation with:
-    /// `sample` (n-1), `population` (n), or `selectable` to let the operator choose per run.
-    /// Absent takes the slot's declaration, which is the usual case: the estimator is a property
-    /// of the parameter, and only a tool that genuinely reports both conventions has cause to
-    /// override it. Never reaches the R runner: it governs how the saved replicates are
-    /// aggregated, not the calculation.
-    #[serde(default)]
-    pub sd_estimator: Option<String>,
     /// `mean` or `sd`: the engine computes this output over the curve-applied values of the
     /// `replicates` param `aggregate_of` names, so the preview a technician sees is the number
-    /// the database will later serve, divisor included. The script never computes it; a script
+    /// the database will later serve. The script never computes it; a script
     /// value under the same key is discarded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub aggregate: Option<String>,
-}
-
-impl ManifestOutput {
-    /// The estimator this output fixes, or None when it defers to the slot (absent or
-    /// `selectable`, which is the operator's choice rather than the manifest's).
-    #[must_use]
-    pub fn fixed_sd_estimator(&self) -> Option<&str> {
-        match self.sd_estimator.as_deref() {
-            Some(e @ ("sample" | "population")) => Some(e),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1020,14 +1008,6 @@ pub(super) struct ManifestRaw {
 
 /// The vocabulary checks on one output. Read wherever a manifest is read, authoring included.
 pub(super) fn check_output(o: &ManifestOutput) -> Result<(), String> {
-    if let Some(declared) = o.sd_estimator.as_deref()
-        && !matches!(declared, "sample" | "population" | "selectable")
-    {
-        return Err(format!(
-            "output '{}': sd_estimator '{declared}' is not 'sample', 'population' or 'selectable'",
-            o.key
-        ));
-    }
     if let Some(agg) = o.aggregate.as_deref() {
         if !matches!(agg, "mean" | "sd") {
             return Err(format!(
@@ -1687,6 +1667,32 @@ pub struct Evaluated {
     pub bindings: Vec<(String, f64)>,
 }
 
+/// A stored run replayed under the version it pinned, so a value computed months ago still shows
+/// the formula behind it and the numbers that formula read.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RunTrace {
+    pub run_id: Uuid,
+    /// The calculation's name, as the run recorded it.
+    pub tool: String,
+    /// The pinned version's label, which is what a reader recognises the calculation by.
+    pub label: String,
+    pub version_no: i32,
+    /// The visit the run read its values at, when it named one. A binding that is neither a step
+    /// nor a constant was read here, which is the answer to "where did this number come from".
+    #[schema(required)]
+    pub site_id: Option<Uuid>,
+    #[schema(required)]
+    pub collected_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The visit's stored values the run read, as `{param, parameter_code, parameter_id, value}`.
+    pub event_inputs: Vec<serde_json::Value>,
+    /// The station properties the run read, as `{property, param, value}`.
+    pub site_inputs: Vec<serde_json::Value>,
+    /// The constant values the run resolved, by name.
+    #[schema(value_type = std::collections::HashMap<String, f64>)]
+    pub constants: serde_json::Value,
+    pub trace: Vec<TraceStep>,
+}
+
 /// One formula of a run as it was evaluated: the text, and per cell the value it produced and
 /// the variables it read. A scalar formula has one cell; a per-replicate one has one per index.
 #[derive(Clone, Debug, PartialEq, Serialize, ToSchema)]
@@ -1695,6 +1701,10 @@ pub struct TraceStep {
     pub label: String,
     #[schema(required)]
     pub units: Option<String>,
+    /// The catalog parameter this formula writes, when it writes one. A reader arrives at a trace
+    /// holding a parameter, so this is what says which step produced the value in front of them.
+    #[schema(required)]
+    pub output_parameter_code: Option<String>,
     pub formula: String,
     pub intermediate: bool,
     pub per_replicate: bool,

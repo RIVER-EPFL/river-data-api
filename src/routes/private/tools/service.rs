@@ -24,11 +24,11 @@ use super::models::version::{ToolScriptVersion, ToolScriptVersionList};
 use super::models::{
     ActiveTool, CalculationHealth, CalculationImpact, CaseResult, CatalogFindings, ClosureQuery,
     Curve, CurveSnapshot, Engine, Evaluated, ImpactParameter, LintFinding, Manifest, ManifestCurve,
-    ManifestEventInput, ManifestOutput, ManifestParam, ManifestSiteInput, MissingConstant,
-    ParamWhen, ParseCheck, ParseError, PinnedFormula, Produced, ResolvedBy, ResolvedCurve,
-    ResolvedParameter, RunOutcome, RunnerRuntime, ScannedName, ScriptInspection, ScriptScan,
-    SlotCoverage, StoredVersionContent, Subject, ToolScriptOperations, TraceCell, TraceStep,
-    ValidateResponse, kind_accepts, parse_manifest,
+    ManifestEventInput, ManifestOutput, ManifestSiteInput, MissingConstant, ParamWhen, ParseCheck,
+    ParseError, PinnedFormula, Produced, ResolvedBy, ResolvedCurve, ResolvedParameter, RunOutcome,
+    RunnerRuntime, ScannedName, ScriptInspection, ScriptScan, SlotCoverage, StoredVersionContent,
+    Subject, ToolScriptOperations, TraceCell, TraceStep, ValidateResponse, kind_accepts,
+    parse_manifest,
 };
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
@@ -1257,36 +1257,12 @@ pub async fn execute_resolved(
     let mut refused: Vec<String> = Vec::new();
     let mut trace: Vec<TraceStep> = Vec::new();
     let raw = if tool.engine == Engine::Formula {
-        let numbers: std::collections::HashMap<String, f64> = effective_inputs
-            .iter()
-            .filter_map(|(k, v)| v.as_f64().map(|n| (k.clone(), n)))
-            .collect();
-        let constant_values: std::collections::HashMap<String, f64> = constants
-            .iter()
-            .filter_map(|(k, v)| v.as_f64().map(|n| (k.clone(), n)))
-            .collect();
+        let (numbers, replicate_values) = formula_bindings(&effective_inputs);
+        let constant_values = numbers_by_name(&constants);
         let curve_values: std::collections::HashMap<String, Curve> = curves
             .iter()
-            .filter_map(|(name, curve)| {
-                let slope = curve.get("slope")?.as_f64()?;
-                let intercept = curve.get("intercept")?.as_f64()?;
-                Some((name.clone(), Curve { slope, intercept }))
-            })
+            .filter_map(|(name, curve)| Some((name.clone(), read_curve(curve)?)))
             .collect();
-        // A replicate-shaped input arrives as an array, one entry per index with `null` for a
-        // repeat not measured. It is what a per-replicate formula runs over, so it is carried
-        // separately rather than dropped by the scalar filter above.
-        let replicate_values: std::collections::HashMap<String, Vec<Option<f64>>> =
-            effective_inputs
-                .iter()
-                .filter_map(|(k, v)| {
-                    let items = v.as_array()?;
-                    Some((
-                        k.clone(),
-                        items.iter().map(serde_json::Value::as_f64).collect(),
-                    ))
-                })
-                .collect();
         let (produced, steps) = evaluate_with_trace(
             &tool.formulas,
             &numbers,
@@ -1328,16 +1304,7 @@ pub async fn execute_resolved(
     };
     let cleared = partition_cleared(&mut results);
 
-    apply_manifest_aggregates(
-        &state.db,
-        manifest,
-        &effective_inputs,
-        &curve_snapshots,
-        site_id,
-        collected_at,
-        &mut results,
-    )
-    .await?;
+    apply_manifest_aggregates(manifest, &effective_inputs, &curve_snapshots, &mut results);
 
     let declared_used: Vec<String> = results
         .remove("inputs_used")
@@ -1441,17 +1408,13 @@ pub(super) fn partition_cleared(
 
 /// Compute the manifest's `aggregate` outputs over the curve-applied replicate values, replacing
 /// anything the script emitted under the same keys. The preview must be the number the database
-/// will serve after the save: same curve, same divisor. The divisor is the output's fixed
-/// declaration, else what [`displayed_sd_estimator`] resolves for the instant being calculated.
-pub(super) async fn apply_manifest_aggregates(
-    db: &DatabaseConnection,
+/// will serve after the save: same curve, and the sample sd the samples trigger computes.
+pub(super) fn apply_manifest_aggregates(
     manifest: &Manifest,
     inputs: &serde_json::Map<String, serde_json::Value>,
     curve_snapshots: &[CurveSnapshot],
-    site_id: Option<Uuid>,
-    collected_at: Option<chrono::DateTime<chrono::Utc>>,
     results: &mut serde_json::Map<String, serde_json::Value>,
-) -> AppResult<()> {
+) {
     for output in &manifest.outputs {
         let (Some(kind), Some(source)) =
             (output.aggregate.as_deref(), output.aggregate_of.as_deref())
@@ -1486,15 +1449,7 @@ pub(super) async fn apply_manifest_aggregates(
 
         let computed = match kind {
             "mean" => replicate_audit::group_stats(&values).mean,
-            "sd" => {
-                let estimator = match output.fixed_sd_estimator() {
-                    Some(fixed) => fixed,
-                    None => displayed_sd_estimator(db, site_id, collected_at, param)
-                        .await?
-                        .unwrap_or(crate::routes::private::readings::service::SAMPLE),
-                };
-                replicate_audit::group_stats(&values).under(estimator).sd
-            }
+            "sd" => replicate_audit::group_stats(&values).sd,
             _ => None,
         };
         match computed {
@@ -1506,44 +1461,6 @@ pub(super) async fn apply_manifest_aggregates(
             }
         }
     }
-    Ok(())
-}
-
-/// The divisor the database will serve for the group this run is calculating, reachable only when
-/// the run carries a site and the param names a catalog code.
-///
-/// Same ladder as the write path (`crate::routes::private::readings::service::resolve`), preceded by the one declaration that
-/// belongs to the instant rather than the slot: an audit resolution scoped to a collection group
-/// records its choice on that `samples` row, and the trigger computes the served sd from it. A
-/// display resolved from the slot alone would show a different standard deviation for the same
-/// values.
-pub(super) async fn displayed_sd_estimator(
-    db: &DatabaseConnection,
-    site_id: Option<Uuid>,
-    collected_at: Option<chrono::DateTime<chrono::Utc>>,
-    param: &ManifestParam,
-) -> AppResult<Option<&'static str>> {
-    let (Some(site), Some(code)) = (site_id, param.parameter_code.as_deref()) else {
-        return Ok(None);
-    };
-    let Some(parameter_id) = catalog_parameter_id(db, code).await? else {
-        return Ok(None);
-    };
-    if let Some(at) = collected_at
-        && let Some(estimator) = crate::routes::private::readings::service::instant_declaration(
-            db,
-            site,
-            parameter_id,
-            at,
-        )
-        .await?
-    {
-        return Ok(Some(estimator));
-    }
-    let resolved =
-        crate::routes::private::readings::service::resolve(db, site, parameter_id, None, None)
-            .await?;
-    Ok(resolved.is_declared().then_some(resolved.estimator))
 }
 
 /// The catalog parameter a manifest param names, matched the way every other code lookup does.
@@ -2448,6 +2365,59 @@ pub fn evaluate_over_replicates(
     evaluate_with_trace(formulas, inputs, replicates, constants, curves).map(|(p, _)| p)
 }
 
+/// The numbers a name-keyed object binds, dropping whatever is not one.
+pub(super) fn numbers_by_name(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> HashMap<String, f64> {
+    map.iter()
+        .filter_map(|(name, value)| value.as_f64().map(|n| (name.clone(), n)))
+        .collect()
+}
+
+/// A curve as the engine takes it, from the `{slope, intercept}` shape both a resolved slot and a
+/// stored run's snapshot carry.
+pub(super) fn read_curve(value: &serde_json::Value) -> Option<Curve> {
+    Some(Curve {
+        slope: value.get("slope")?.as_f64()?,
+        intercept: value.get("intercept")?.as_f64()?,
+    })
+}
+
+/// The curves a run passed to the engine, read back out of the snapshots it stored.
+pub(super) fn stored_curves(stored: &serde_json::Value) -> HashMap<String, Curve> {
+    stored
+        .as_array()
+        .map(|snapshots| {
+            snapshots
+                .iter()
+                .filter_map(|snapshot| {
+                    let name = snapshot.get("name")?.as_str()?.to_string();
+                    Some((name, read_curve(snapshot.get("curve")?)?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The scalar and per-replicate bindings a formula set runs over, split out of one input object.
+/// An array is a replicate family, one entry per index with `null` for a repeat not measured, and
+/// is carried separately rather than dropped by the scalar read.
+pub(super) fn formula_bindings(
+    inputs: &serde_json::Map<String, serde_json::Value>,
+) -> (HashMap<String, f64>, HashMap<String, Vec<Option<f64>>>) {
+    let replicates = inputs
+        .iter()
+        .filter_map(|(name, value)| {
+            let items = value.as_array()?;
+            Some((
+                name.clone(),
+                items.iter().map(serde_json::Value::as_f64).collect(),
+            ))
+        })
+        .collect();
+    (numbers_by_name(inputs), replicates)
+}
+
 /// [`evaluate_over_replicates`], also returning each formula as it was evaluated: its text and,
 /// per cell, the value and the variables it read. A scalar formula is one cell with no index; a
 /// per-replicate one is a cell per index.
@@ -2509,6 +2479,7 @@ pub fn evaluate_with_trace(
             code: formula.code.clone(),
             label: formula.label.clone(),
             units: formula.units.clone(),
+            output_parameter_code: formula.output_parameter_code.clone(),
             formula: formula.formula.clone(),
             intermediate: formula.intermediate,
             per_replicate: formula.per_replicate.is_some(),
@@ -3519,6 +3490,65 @@ pub fn plan_formula_set(
     Ok(writes)
 }
 
+/// Refuse a set whose new codes other calculations already hold, naming each code and its holder.
+/// `held` is (code, the calculation holding it) for every such code.
+///
+/// # Errors
+/// One sentence per code held elsewhere.
+pub fn codes_held_elsewhere(held: &[(String, String)]) -> Result<(), String> {
+    if held.is_empty() {
+        return Ok(());
+    }
+    let named: Vec<String> = held
+        .iter()
+        .map(|(code, holder)| format!("{code} is a formula of {holder}"))
+        .collect();
+    Err(format!(
+        "{}; a formula code is unique across calculations",
+        named.join("; ")
+    ))
+}
+
+/// Every code of `codes` a formula outside calculation `id` holds, with the calculation holding
+/// it, or "a standalone derived parameter" for a formula belonging to none.
+pub async fn formula_codes_held_elsewhere<C: ConnectionTrait>(
+    conn: &C,
+    id: Uuid,
+    codes: &[String],
+) -> AppResult<Vec<(String, String)>> {
+    use crate::routes::private::derived_parameters::models::definition as formula_entity;
+    if codes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let taken = formula_entity::Entity::find()
+        .filter(formula_entity::Column::Code.is_in(codes.iter().cloned()))
+        .filter(
+            sea_orm::Condition::any()
+                .add(formula_entity::Column::ToolScriptId.ne(id))
+                .add(formula_entity::Column::ToolScriptId.is_null()),
+        )
+        .order_by_asc(formula_entity::Column::Code)
+        .all(conn)
+        .await?;
+    let holders: HashMap<Uuid, String> = script::Entity::find()
+        .filter(script::Column::Id.is_in(taken.iter().filter_map(|f| f.tool_script_id)))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|s| (s.id, s.name))
+        .collect();
+    Ok(taken
+        .into_iter()
+        .map(|f| {
+            let holder = f
+                .tool_script_id
+                .and_then(|script_id| holders.get(&script_id).cloned())
+                .unwrap_or_else(|| "a standalone derived parameter".to_string());
+            (f.code, holder)
+        })
+        .collect())
+}
+
 /// The dedupe key an edit to one calculation audits under, so a burst of formula edits coalesces
 /// into one audit the way a burst of constant edits does.
 #[must_use]
@@ -4471,6 +4501,10 @@ mod closure_tests;
 #[cfg(test)]
 #[path = "tests/cnet_formula_sets.rs"]
 mod cnet_formula_sets_tests;
+
+#[cfg(test)]
+#[path = "tests/lab_spreadsheet_sets.rs"]
+mod lab_spreadsheet_sets_tests;
 
 #[cfg(test)]
 #[path = "tests/engine.rs"]

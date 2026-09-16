@@ -61,7 +61,7 @@ fn a_switched_off_calculation_is_not_run_by_name() {
     }
 }
 
-use super::{FormulaWrite, plan_formula_set};
+use super::{FormulaWrite, codes_held_elsewhere, plan_formula_set};
 
 fn id(n: u128) -> uuid::Uuid {
     uuid::Uuid::from_u128(n)
@@ -165,4 +165,25 @@ fn test_a_set_save_refuses_the_same_formula_twice() {
     let err = plan_formula_set(&[row(1, "a"), row(2, "b")], &[kept(1, "a"), kept(1, "a")])
         .expect_err("refused");
     assert!(err.contains("twice"), "{err}");
+}
+
+#[test]
+fn test_codes_held_elsewhere_names_each_taken_code_and_its_calculation() {
+    let held = [
+        ("co2sheet_lab_temp_k".to_string(), "co2_ch4_sheet".to_string()),
+        ("ch4sheet_ppm".to_string(), "co2_ch4_sheet".to_string()),
+    ];
+    assert_eq!(
+        codes_held_elsewhere(&held),
+        Err(
+            "co2sheet_lab_temp_k is a formula of co2_ch4_sheet; ch4sheet_ppm is a formula of \
+             co2_ch4_sheet; a formula code is unique across calculations"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn test_codes_held_elsewhere_passes_a_set_no_other_calculation_holds() {
+    assert_eq!(codes_held_elsewhere(&[]), Ok(()));
 }

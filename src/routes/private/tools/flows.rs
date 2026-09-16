@@ -12,13 +12,14 @@ use uuid::Uuid;
 
 use super::models::{
     ActiveTool, AuditCounts, Engine, EventAudit, EventContext, EventRecompute, MissingConstant,
-    RecomputeOutcome, RecomputeScope, RunOutcome, ToolResult, parse_manifest, run,
+    RecomputeOutcome, RecomputeScope, RunOutcome, RunTrace, ToolCalculation, ToolResult, parse_manifest,
+    run,
 };
 use super::service::{
-    ParameterCatalog, ResolvedRun, build, execute_resolved, list_active_tools,
-    load_parameter_catalog, parse_pinned, resolve_event_inputs, resolve_replicate_inputs,
-    resolve_run, resolve_site_inputs, run_active_tool, run_fingerprint, runner_runtime,
-    served_spot_value_expr,
+    ParameterCatalog, ResolvedRun, build, evaluate_with_trace, execute_resolved, formula_bindings,
+    list_active_tools, load_parameter_catalog, numbers_by_name, parse_pinned, resolve_event_inputs,
+    resolve_replicate_inputs, resolve_run, resolve_site_inputs, run_active_tool, run_fingerprint,
+    runner_runtime, served_spot_value_expr, stored_curves,
 };
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
@@ -66,6 +67,40 @@ pub async fn execute_and_store_resolved(
     store_run(state, tool, outcome, actor, source).await
 }
 
+/// Run a tool and return what it computed, storing nothing: no `tool_runs` row and no `run_id`,
+/// so a preview is never something a save can name (Q212).
+pub async fn preview_run(
+    state: &AppState,
+    tool: &ActiveTool,
+    body: &[u8],
+) -> AppResult<ToolCalculation> {
+    let outcome = run_active_tool(state, tool, body).await?;
+    let runtime = runner_runtime(state).await;
+    Ok(calculation_of(tool, runtime.as_ref(), outcome))
+}
+
+fn calculation_of(
+    tool: &ActiveTool,
+    runtime: Option<&super::models::RunnerRuntime>,
+    outcome: RunOutcome,
+) -> ToolCalculation {
+    ToolCalculation {
+        tool: tool.name.clone(),
+        results: serde_json::Value::Object(outcome.results),
+        cleared: outcome.cleared,
+        skipped: outcome.skipped,
+        refused: outcome.refused,
+        inputs_used: outcome.inputs_used,
+        inputs_ignored: outcome.inputs_ignored,
+        constants: serde_json::Value::Object(outcome.constants),
+        curves: outcome.curves,
+        site_inputs: outcome.site_inputs,
+        event_inputs: outcome.event_inputs,
+        tool_version: tool.version_ref(runtime),
+        trace: outcome.trace,
+    }
+}
+
 pub(super) async fn store_run(
     state: &AppState,
     tool: &ActiveTool,
@@ -74,30 +109,31 @@ pub(super) async fn store_run(
     source: &str,
 ) -> AppResult<ToolResult> {
     let runtime = runner_runtime(state).await;
-    let tool_version = tool.version_ref(runtime.as_ref());
-    let results = serde_json::Value::Object(outcome.results);
-    let constants = serde_json::Value::Object(outcome.constants);
+    let site_id = outcome.site_id;
+    let collected_at = outcome.collected_at;
+    let inputs = serde_json::Value::Object(outcome.inputs.clone());
+    let calculation = calculation_of(tool, runtime.as_ref(), outcome);
     // The run records what the script produced, cleared outputs included: an explicit null is
     // what says the value was computed and is not a number, as against never computed at all.
     let stored_outputs = {
-        let mut map = results.as_object().cloned().unwrap_or_default();
-        for key in &outcome.cleared {
+        let mut map = calculation.results.as_object().cloned().unwrap_or_default();
+        for key in &calculation.cleared {
             map.insert(key.clone(), serde_json::Value::Null);
         }
         serde_json::Value::Object(map)
     };
 
-    let context = if outcome.site_id.is_some()
-        || !outcome.site_inputs.is_empty()
-        || !outcome.event_inputs.is_empty()
-        || !outcome.skipped.is_empty()
+    let context = if site_id.is_some()
+        || !calculation.site_inputs.is_empty()
+        || !calculation.event_inputs.is_empty()
+        || !calculation.skipped.is_empty()
     {
         serde_json::json!({
-            "site_id": outcome.site_id,
-            "collected_at": outcome.collected_at,
-            "site_inputs": outcome.site_inputs,
-            "event_inputs": outcome.event_inputs,
-            "skipped": outcome.skipped,
+            "site_id": site_id,
+            "collected_at": collected_at,
+            "site_inputs": calculation.site_inputs,
+            "event_inputs": calculation.event_inputs,
+            "skipped": calculation.skipped,
         })
     } else {
         serde_json::Value::Null
@@ -107,10 +143,12 @@ pub(super) async fn store_run(
     run::ActiveModel {
         id: Set(run_id),
         tool_name: Set(tool.name.clone()),
-        tool_version: Set(serde_json::to_value(&tool_version).unwrap_or(serde_json::Value::Null)),
-        inputs: Set(serde_json::Value::Object(outcome.inputs)),
-        constants: Set(constants.clone()),
-        curves: Set(serde_json::to_value(&outcome.curves).unwrap_or(serde_json::Value::Null)),
+        tool_version: Set(
+            serde_json::to_value(&calculation.tool_version).unwrap_or(serde_json::Value::Null),
+        ),
+        inputs: Set(inputs),
+        constants: Set(calculation.constants.clone()),
+        curves: Set(serde_json::to_value(&calculation.curves).unwrap_or(serde_json::Value::Null)),
         outputs: Set(stored_outputs),
         created_by: Set(actor.to_string()),
         context: Set((!context.is_null()).then_some(context)),
@@ -121,20 +159,8 @@ pub(super) async fn store_run(
     .await?;
 
     Ok(ToolResult {
-        tool: tool.name.clone(),
-        results,
-        cleared: outcome.cleared,
-        skipped: outcome.skipped,
-        refused: outcome.refused,
-        inputs_used: outcome.inputs_used,
-        inputs_ignored: outcome.inputs_ignored,
-        constants,
-        curves: outcome.curves,
-        site_inputs: outcome.site_inputs,
-        event_inputs: outcome.event_inputs,
-        tool_version,
+        calculation,
         run_id,
-        trace: outcome.trace,
     })
 }
 
@@ -557,10 +583,10 @@ pub async fn recompute_event(
         // (Q172): the value stored at this visit stands and stays served, so the finding is the
         // only thing that says the calculation divided by zero.
         for (key, parameter_id) in &owned_outputs {
-            if !result.refused.iter().any(|r| r == key) {
+            if !result.calculation.refused.iter().any(|r| r == key) {
                 continue;
             }
-            let reason = skipped_reason(&result.skipped, key)
+            let reason = skipped_reason(&result.calculation.skipped, key)
                 .unwrap_or_else(|| "the result is not a finite number".to_string());
             raise_skip(&state.db, &event, &tool.name, key, *parameter_id, &reason).await?;
             outcome.findings_raised += 1;
@@ -573,7 +599,7 @@ pub async fn recompute_event(
         // value is withdrawn rather than left standing beside a run that did not produce it. A
         // person's ruling on the row is not overridden: those keep their value and their hold.
         for (key, parameter_id) in &owned_outputs {
-            if !result.cleared.iter().any(|c| c == key) {
+            if !result.calculation.cleared.iter().any(|c| c == key) {
                 continue;
             }
             let withdrawn = crate::common::bulk_write::guarded(&state.db, async |txn| {
@@ -611,7 +637,7 @@ pub async fn recompute_event(
 
         let readings: Vec<GrabSampleReading> = owned_outputs
             .iter()
-            .flat_map(|(key, parameter_id)| match result.results.get(key) {
+            .flat_map(|(key, parameter_id)| match result.calculation.results.get(key) {
                 Some(value) => readings_for_output(key, *parameter_id, value, event.collected_at),
                 None => Vec::new(),
             })
@@ -622,7 +648,7 @@ pub async fn recompute_event(
             // would replace it with a vaguer one.
             let unexplained: Vec<(String, Uuid)> = saved_outputs
                 .iter()
-                .filter(|(key, _)| !result.refused.iter().any(|r| r == key))
+                .filter(|(key, _)| !result.calculation.refused.iter().any(|r| r == key))
                 .cloned()
                 .collect();
             outcome.findings_raised +=
@@ -644,7 +670,7 @@ pub async fn recompute_event(
         // The site declared the inputs, so it gets the column the run publishes (Q193). The slot
         // is minted needing review, so a manager confirms it from the site's Parameters tab.
         for (key, parameter_id) in &owned_outputs {
-            if declared.contains(parameter_id) || result.results.get(key).is_none() {
+            if declared.contains(parameter_id) || result.calculation.results.get(key).is_none() {
                 continue;
             }
             if crate::routes::private::site_parameters::service::mint_tool_slot(
@@ -679,7 +705,6 @@ pub async fn recompute_event(
             check_id: None,
             // The tool's manifest is read by the save path itself; nothing here overrides
             // the slot's declaration.
-            sd_estimator: None,
             readings,
         };
         let saved = insert_grab_samples(
@@ -701,7 +726,7 @@ pub async fn recompute_event(
         }
         // A set whose other outputs saved takes none of the whole-tool skip arms, so the outputs
         // the engine refused are filed here, one per slot, under the reason it gave.
-        for skip in &result.skipped {
+        for skip in &result.calculation.skipped {
             let Some((output, reason)) = skipped_entry(skip) else {
                 continue;
             };
@@ -962,6 +987,69 @@ pub(super) async fn pinned_tool(
         // formulas that version holds rather than the definitions as they stand today.
         formulas,
     }))
+}
+
+/// One stored run replayed under the version it pinned: each formula with the values it read and
+/// the number it produced.
+///
+/// The version body is the formula set and its identity is a content hash, so re-evaluating the
+/// run's own inputs, constants and curves under it reproduces what the run returned rather than
+/// what the calculation would produce today.
+pub async fn replay_trace(db: &DatabaseConnection, run: &run::Model) -> AppResult<RunTrace> {
+    let blob = serde_json::json!({ "tool_version": run.tool_version });
+    let tool = pinned_tool(db, &run.tool_name, &blob)
+        .await?
+        .ok_or_else(|| {
+            AppError::Conflict(format!(
+                "The version this {} run pinned is no longer stored, so it cannot be replayed",
+                run.tool_name
+            ))
+        })?;
+    if tool.engine != Engine::Formula {
+        return Err(AppError::Conflict(format!(
+            "'{}' runs on the {} engine, which records no formulas to replay",
+            run.tool_name,
+            tool.engine.as_str()
+        )));
+    }
+    let inputs = run.inputs.as_object().cloned().unwrap_or_default();
+    let constants = run.constants.as_object().cloned().unwrap_or_default();
+    let (numbers, replicates) = formula_bindings(&inputs);
+    let (_, trace) = evaluate_with_trace(
+        &tool.formulas,
+        &numbers,
+        &replicates,
+        &numbers_by_name(&constants),
+        &stored_curves(&run.curves),
+    )
+    .map_err(|message| AppError::Conflict(format!("{}: {message}", run.tool_name)))?;
+    let context = run.context.clone().unwrap_or(serde_json::Value::Null);
+    let from_context = |field: &str| {
+        context
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    Ok(RunTrace {
+        run_id: run.id,
+        tool: run.tool_name.clone(),
+        label: tool.label,
+        version_no: tool.version_no,
+        site_id: context
+            .get("site_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| s.parse().ok()),
+        collected_at: context
+            .get("collected_at")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&chrono::Utc)),
+        event_inputs: from_context("event_inputs"),
+        site_inputs: from_context("site_inputs"),
+        constants: serde_json::Value::Object(constants),
+        trace,
+    })
 }
 
 /// A pinned tool version as the chain reads it back. The manifest and the formula body are parsed

@@ -22,6 +22,7 @@ mod partial_skip;
 mod pending_inputs_inherit;
 mod replicate_family_inputs;
 mod run_contract;
+mod run_trace;
 mod runner_absent;
 mod scripts_authoring;
 mod scripts_lifecycle;

@@ -1,0 +1,1515 @@
+{
+  "source": "calculation-spreadsheets/ (constants.xlsx, DIC.xlsx, CO2_CH4.xlsx), the lab's own documentation of the two sets, one formula per spreadsheet column",
+  "constants": {
+    "gas_const_r_atm": 0.0820574,
+    "h_co2_29815k": 0.034733,
+    "c_const": 2400,
+    "vol_sa": 0.03,
+    "vol_water": 0.03,
+    "lab_press_avg_atm": 0.957237,
+    "lab_temp_avg_degC": 22.5,
+    "h_ch4_29815k": 0.00213,
+    "ch4_in_sa": 2e-06,
+    "gas_const_r_mol": 8.31446,
+    "vial_volume": 12.168,
+    "h3po4_added": 0.3
+  },
+  "calculations": [
+    {
+      "name": "dic_sheet",
+      "label": "DIC and d13C-DIC, from the lab spreadsheet",
+      "formulas": [
+        {
+          "code": "dic_sheet_lab_temp_k",
+          "label": "Lab temp in K",
+          "units": "K",
+          "formula": "lab_temp_avg_degC + 273.15",
+          "description": "E7: Lab temp in K",
+          "ordinal": 1,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": null,
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_lab_press_pa",
+          "label": "Lab pressure in Pa",
+          "units": "Pa",
+          "formula": "lab_press_avg_atm * 101325",
+          "description": "D6: Lab pressure in Pa",
+          "ordinal": 2,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": null,
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_frac_gas_aq",
+          "label": "Fractionation between gas and aq. phase",
+          "units": "permill",
+          "formula": "(-373 / dic_sheet_lab_temp_k) + 0.19",
+          "description": "D10: Fractionation between gas and aq. phase",
+          "ordinal": 3,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": null,
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_v_sample_ml",
+          "label": "V sample",
+          "units": "mL",
+          "formula": "dic_wgt_vial_acid_sample - dic_wgt_vial_acid",
+          "description": "G19: V sample",
+          "ordinal": 4,
+          "output_parameter_code": null,
+          "sources": [
+            [
+              "dic_wgt_vial_acid_sample",
+              "dic_wgt_vial_acid_sample"
+            ],
+            [
+              "dic_wgt_vial_acid",
+              "dic_wgt_vial_acid"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_wgt_vial_acid_sample",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_v_sample_m3",
+          "label": "V sample",
+          "units": "m3",
+          "formula": "dic_sheet_v_sample_ml / 1000 / 1000",
+          "description": "H19: V sample",
+          "ordinal": 5,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_v_sample_ml",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_v_hs_ml",
+          "label": "V HS at atm press (incl overpr)",
+          "units": "mL",
+          "formula": "vial_volume - (dic_sheet_v_sample_ml + h3po4_added) + dic_v_overpressure",
+          "description": "I19: V HS at atm press (incl overpr)",
+          "ordinal": 6,
+          "output_parameter_code": null,
+          "sources": [
+            [
+              "dic_v_overpressure",
+              "dic_v_overpressure"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_v_overpressure",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_v_hs_m3",
+          "label": "V HS at atm press (incl overpr)",
+          "units": "m3",
+          "formula": "dic_sheet_v_hs_ml / 1000 / 1000",
+          "description": "J19: V HS at atm press (incl overpr)",
+          "ordinal": 7,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_v_hs_ml",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_mol_sample_gas_hs",
+          "label": "mol of sample gas in HS",
+          "units": "mol",
+          "formula": "(dic_sheet_lab_press_pa * dic_sheet_v_hs_m3) / (8.314 * dic_sheet_lab_temp_k)",
+          "description": "K19: mol of sample gas in HS",
+          "ordinal": 8,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_v_hs_m3",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_v_sa_m3",
+          "label": "volume SA added",
+          "units": "m3",
+          "formula": "dic_volume_sa_added / 1000 / 1000",
+          "description": "M19: volume SA added",
+          "ordinal": 9,
+          "output_parameter_code": null,
+          "sources": [
+            [
+              "dic_volume_sa_added",
+              "dic_volume_sa_added"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_volume_sa_added",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_mol_total_gas_added",
+          "label": "mol total gas added",
+          "units": "mol",
+          "formula": "(dic_sheet_lab_press_pa * dic_sheet_v_sa_m3) / (8.314 * dic_sheet_lab_temp_k)",
+          "description": "N19: mol total gas added",
+          "ordinal": 10,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_v_sa_m3",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_frac_sample_in_mix",
+          "label": "fraction of sample in the gas mix",
+          "units": "-",
+          "formula": "dic_sheet_mol_sample_gas_hs / (dic_sheet_mol_total_gas_added + dic_sheet_mol_sample_gas_hs)",
+          "description": "O19: fraction of sample in the gas mix",
+          "ordinal": 11,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_mol_sample_gas_hs",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_pct_original_in_mix",
+          "label": "% of original content in mix",
+          "units": "%",
+          "formula": "dic_sheet_frac_sample_in_mix * 100",
+          "description": "P19: % of original content in mix",
+          "ordinal": 12,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_frac_sample_in_mix",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_gas_mix_transferred_m3",
+          "label": "Gas mix transfered in GS",
+          "units": "m3",
+          "formula": "dic_volume_sa_added / 1000 / 1000",
+          "description": "R19: Gas mix transfered in GS",
+          "ordinal": 13,
+          "output_parameter_code": null,
+          "sources": [
+            [
+              "dic_volume_sa_added",
+              "dic_volume_sa_added"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_volume_sa_added",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_mol_gas_mix_transferred",
+          "label": "total mol of gas mix transferred to GS",
+          "units": "mol",
+          "formula": "(dic_sheet_lab_press_pa * dic_sheet_gas_mix_transferred_m3) / (8.314 * dic_sheet_lab_temp_k)",
+          "description": "S19: total mol of gas mix transferred to GS",
+          "ordinal": 14,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_gas_mix_transferred_m3",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_mol_sample_transferred",
+          "label": "mol of sample transferred into GS",
+          "units": "mol",
+          "formula": "dic_sheet_mol_gas_mix_transferred * dic_sheet_frac_sample_in_mix",
+          "description": "T19: mol of sample transferred into GS",
+          "ordinal": 15,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_mol_gas_mix_transferred",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_co2_undil_hs_ppm",
+          "label": "CO2 undil in HS",
+          "units": "ppm",
+          "formula": "dic_co2_dry_picarro / dic_sheet_frac_sample_in_mix * 1",
+          "description": "V19: CO2 undil in HS",
+          "ordinal": 16,
+          "output_parameter_code": null,
+          "sources": [
+            [
+              "dic_co2_dry_picarro",
+              "dic_co2_dry_picarro"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_co2_dry_picarro",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_co2_undil_hs_atm",
+          "label": "CO2 undil in HS",
+          "units": "atm",
+          "formula": "dic_sheet_co2_undil_hs_ppm / 1000 / 1000",
+          "description": "W19: CO2 undil in HS",
+          "ordinal": 17,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_co2_undil_hs_ppm",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_co2_undil_hs_pa",
+          "label": "CO2 undil in HS",
+          "units": "Pa",
+          "formula": "dic_sheet_co2_undil_hs_atm * 101325",
+          "description": "X19: CO2 undil in HS",
+          "ordinal": 18,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_co2_undil_hs_atm",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_co2_mol_hs",
+          "label": "CO2 in HS",
+          "units": "mol",
+          "formula": "(dic_sheet_co2_undil_hs_pa * dic_sheet_v_hs_m3) / (8.314 * dic_sheet_lab_temp_k)",
+          "description": "Y19: CO2 in HS",
+          "ordinal": 19,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_co2_undil_hs_pa",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_co2_conc_hs",
+          "label": "CO2 in HS",
+          "units": "mol m-3",
+          "formula": "dic_sheet_co2_mol_hs / dic_sheet_v_hs_m3",
+          "description": "Z19: CO2 in HS",
+          "ordinal": 20,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_co2_mol_hs",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_co2_umol_l_hs",
+          "label": "CO2 in HS",
+          "units": "umol L-1",
+          "formula": "dic_sheet_co2_conc_hs * 1000",
+          "description": "AA19: CO2 in HS",
+          "ordinal": 21,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_co2_conc_hs",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_hco2_teq",
+          "label": "HCO2_Teq",
+          "units": "mol L-1 atm-1",
+          "formula": "h_co2_29815k * exp(2392.86 * (1 / dic_sheet_lab_temp_k - 1 / 298.15))",
+          "description": "AB19: HCO2_Teq",
+          "ordinal": 22,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": null,
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_co2_aq_mol_l",
+          "label": "CO2 aq.",
+          "units": "mol/L",
+          "formula": "dic_sheet_hco2_teq * dic_sheet_co2_undil_hs_atm",
+          "description": "AC19: CO2 aq.",
+          "ordinal": 23,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_co2_undil_hs_atm",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_co2_aq_mol_m3",
+          "label": "CO2 aq.",
+          "units": "mol/m3",
+          "formula": "dic_sheet_co2_aq_mol_l * 1000",
+          "description": "AD19: CO2 aq.",
+          "ordinal": 24,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_co2_aq_mol_l",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_co2_aq_mol",
+          "label": "CO2 aq.",
+          "units": "mol",
+          "formula": "dic_sheet_co2_aq_mol_m3 * dic_sheet_v_sample_m3",
+          "description": "AE19: CO2 aq.",
+          "ordinal": 25,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_co2_aq_mol_m3",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_co2_tot_mol",
+          "label": "CO2 tot",
+          "units": "mol",
+          "formula": "dic_sheet_co2_aq_mol + dic_sheet_co2_mol_hs",
+          "description": "AF19: CO2 tot",
+          "ordinal": 26,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_co2_aq_mol",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_co2_sample_mol_m3",
+          "label": "CO2 sample",
+          "units": "mol m-3",
+          "formula": "dic_sheet_co2_tot_mol / dic_sheet_v_sample_m3",
+          "description": "AG19: CO2 sample",
+          "ordinal": 27,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_co2_tot_mol",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_co2_sample_umol_l",
+          "label": "CO2 sample",
+          "units": "umol L-1",
+          "formula": "dic_sheet_co2_sample_mol_m3 * 1000",
+          "description": "AH19: CO2 sample",
+          "ordinal": 28,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_co2_sample_mol_m3",
+          "intermediate": true
+        },
+        {
+          "code": "DIC_sheet",
+          "label": "DIC",
+          "units": "mmol L-1",
+          "formula": "dic_sheet_co2_sample_umol_l / 1000",
+          "description": "AI19: DIC",
+          "ordinal": 29,
+          "output_parameter_code": "DIC_sheet",
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_co2_sample_umol_l",
+          "intermediate": false
+        },
+        {
+          "code": "dic_sheet_co2_sample_nmol_l",
+          "label": "CO2 sample",
+          "units": "nmol L-1",
+          "formula": "dic_sheet_co2_sample_umol_l * 1000",
+          "description": "AJ19: CO2 sample",
+          "ordinal": 30,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_co2_sample_umol_l",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_d13c_aq",
+          "label": "d13C-aq.",
+          "units": "permill",
+          "formula": "dic_delta_13co2 + dic_sheet_frac_gas_aq",
+          "description": "AL19: d13C-aq.",
+          "ordinal": 31,
+          "output_parameter_code": null,
+          "sources": [
+            [
+              "dic_delta_13co2",
+              "dic_delta_13co2"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_delta_13co2",
+          "intermediate": true
+        },
+        {
+          "code": "dic_sheet_kd",
+          "label": "CO2 HS/CO2aq.",
+          "units": "-",
+          "formula": "dic_sheet_co2_aq_mol_m3 / dic_sheet_co2_conc_hs",
+          "description": "AM19: CO2 HS/CO2aq.",
+          "ordinal": 32,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_sheet_co2_aq_mol_m3",
+          "intermediate": true
+        },
+        {
+          "code": "d13C_DIC_sheet",
+          "label": "final d13C-DIC",
+          "units": "permill",
+          "formula": "(dic_delta_13co2 * dic_sheet_co2_conc_hs * dic_sheet_v_hs_m3 + dic_sheet_d13c_aq * dic_sheet_co2_aq_mol_m3 * dic_sheet_v_sample_m3) / (dic_sheet_co2_conc_hs * dic_sheet_v_hs_m3 + dic_sheet_v_sample_m3 * dic_sheet_co2_aq_mol_m3)",
+          "description": "AN19: final d13C-DIC",
+          "ordinal": 33,
+          "output_parameter_code": "d13C_DIC_sheet",
+          "sources": [
+            [
+              "dic_delta_13co2",
+              "dic_delta_13co2"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "dic_delta_13co2",
+          "intermediate": false
+        }
+      ],
+      "cases": [
+        {
+          "name": "BPD 2016-10-27 (Raw data row 3)",
+          "inputs": {},
+          "replicates": {
+            "dic_wgt_vial_acid": [
+              13.12
+            ],
+            "dic_wgt_vial_acid_sample": [
+              15.16
+            ],
+            "dic_v_overpressure": [
+              3
+            ],
+            "dic_volume_sa_added": [
+              46
+            ],
+            "dic_co2_dry_picarro": [
+              817.3
+            ],
+            "dic_delta_13co2": [
+              -4.188
+            ]
+          },
+          "curves": {},
+          "expected": {
+            "DIC_sheet": [
+              1.1108705054852523
+            ],
+            "d13C_DIC_sheet": [
+              -4.3224009746364604
+            ]
+          },
+          "steps": {
+            "dic_sheet_v_sample_ml": 2.040000000000001,
+            "dic_sheet_v_hs_ml": 12.828,
+            "dic_sheet_mol_sample_gas_hs": 0.0005061825019501389,
+            "dic_sheet_frac_sample_in_mix": 0.2180594274835112,
+            "dic_sheet_co2_undil_hs_ppm": 3748.060835671968,
+            "dic_sheet_hco2_teq": 0.037171972431778416,
+            "dic_sheet_co2_tot_mol": 2.2661758311899163e-06,
+            "dic_sheet_d13c_aq": -5.25962692372738,
+            "dic_sheet_kd": 0.9017515499784974
+          }
+        },
+        {
+          "name": "VEL 2020-05-19 (Raw data row 4)",
+          "inputs": {},
+          "replicates": {
+            "dic_wgt_vial_acid": [
+              13.5
+            ],
+            "dic_wgt_vial_acid_sample": [
+              16.45
+            ],
+            "dic_v_overpressure": [
+              4
+            ],
+            "dic_volume_sa_added": [
+              46
+            ],
+            "dic_co2_dry_picarro": [
+              563.5
+            ],
+            "dic_delta_13co2": [
+              -6.539
+            ]
+          },
+          "curves": {},
+          "expected": {
+            "DIC_sheet": [
+              0.5594608314511884
+            ],
+            "d13C_DIC_sheet": [
+              -6.721993714419716
+            ]
+          },
+          "steps": {
+            "dic_sheet_v_sample_ml": 2.9499999999999993,
+            "dic_sheet_v_hs_ml": 12.918,
+            "dic_sheet_mol_sample_gas_hs": 0.0005097338291387507,
+            "dic_sheet_frac_sample_in_mix": 0.21925387827149592,
+            "dic_sheet_co2_undil_hs_ppm": 2570.0799659390004,
+            "dic_sheet_hco2_teq": 0.037171972431778416,
+            "dic_sheet_co2_tot_mol": 1.6504094527810058e-06,
+            "dic_sheet_d13c_aq": -7.610626923727381,
+            "dic_sheet_kd": 0.9017515499784976
+          }
+        }
+      ],
+      "tolerance": 2.1e-08
+    },
+    {
+      "name": "co2_ch4_sheet",
+      "label": "CO2 and CH4, from the lab spreadsheet",
+      "formulas": [
+        {
+          "code": "co2sheet_lab_temp_k",
+          "label": "Lab temp in K",
+          "units": "K",
+          "formula": "lab_temp_avg_degC + 273.15",
+          "description": "D8: Lab temp in K",
+          "ordinal": 1,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": null,
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_lab_press_atm",
+          "label": "Lab pressure from the lab's altitude",
+          "units": "atm",
+          "formula": "(1.01325 * (288.15 / (288.15 - 0.0065 * (396 - 0))) ^ (9.80665 * 0.0289644 / (8.31432 * (-0.0065)))) * 0.987",
+          "description": "C7: Lab pressure from the lab's altitude",
+          "ordinal": 2,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": null,
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_h_ch4_teq",
+          "label": "HCH4_Teq",
+          "units": "M/atm",
+          "formula": "h_ch4_29815k * exp(1750 * (1 / co2sheet_lab_temp_k - 1 / 298.15))",
+          "description": "G2: HCH4_Teq",
+          "ordinal": 3,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": null,
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_t_field_k",
+          "label": "T field",
+          "units": "K",
+          "formula": "co2_wtw_t + 273.15",
+          "description": "F13: T field",
+          "ordinal": 4,
+          "output_parameter_code": null,
+          "sources": [
+            [
+              "co2_wtw_t",
+              "co2_wtw_t"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2_wtw_t",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_p_field_atm",
+          "label": "P field",
+          "units": "atm",
+          "formula": "100 * co2_bp_hpa / 101325",
+          "description": "G13: P field",
+          "ordinal": 5,
+          "output_parameter_code": null,
+          "sources": [
+            [
+              "co2_bp_hpa",
+              "co2_bp_hpa"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2_bp_hpa",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_dry_ppm",
+          "label": "CH4 dry",
+          "units": "ppm",
+          "formula": "((co2_h2o * 1.2347 - 0.0016) * co2_ch4_ppm / 100) + co2_ch4_ppm",
+          "description": "M13: CH4 dry",
+          "ordinal": 6,
+          "output_parameter_code": "co2sheet_ch4_dry_ppm",
+          "sources": [
+            [
+              "co2_h2o",
+              "co2_h2o"
+            ],
+            [
+              "co2_ch4_ppm",
+              "co2_ch4_ppm"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2_h2o",
+          "intermediate": false
+        },
+        {
+          "code": "co2sheet_kh_inc",
+          "label": "KH,cp at incubation T",
+          "units": "M/atm",
+          "formula": "0.034 * exp(c_const * (1 / co2sheet_lab_temp_k - 1 / 298.15))",
+          "description": "O13: KH,cp at incubation T",
+          "ordinal": 7,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": null,
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_kh_stream",
+          "label": "KH,cp in stream T",
+          "units": "M/atm",
+          "formula": "0.034 * exp(c_const * (1 / co2sheet_t_field_k - 1 / 298.15))",
+          "description": "P13: KH,cp in stream T",
+          "ordinal": 8,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_t_field_k",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_px_lab_atm",
+          "label": "Px lab",
+          "units": "atm",
+          "formula": "co2sheet_lab_press_atm * (co2_co2_ppm / (10^6))",
+          "description": "Q13: Px lab",
+          "ordinal": 9,
+          "output_parameter_code": null,
+          "sources": [
+            [
+              "co2_co2_ppm",
+              "co2_co2_ppm"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2_co2_ppm",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ng",
+          "label": "ng",
+          "units": "mol",
+          "formula": "(co2sheet_px_lab_atm * vol_sa) / (0.082056 * co2sheet_lab_temp_k)",
+          "description": "R13: ng",
+          "ordinal": 10,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_px_lab_atm",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_naq",
+          "label": "naq",
+          "units": "mol",
+          "formula": "co2sheet_px_lab_atm * co2sheet_kh_inc * vol_water",
+          "description": "S13: naq",
+          "ordinal": 11,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_px_lab_atm",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ntot",
+          "label": "ntot",
+          "units": "mol",
+          "formula": "co2sheet_ng + co2sheet_naq",
+          "description": "T13: ntot",
+          "ordinal": 12,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ng",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_caq_inc",
+          "label": "Caq at inc conditions",
+          "units": "M",
+          "formula": "co2sheet_ntot / vol_water",
+          "description": "U13: Caq at inc conditions",
+          "ordinal": 13,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ntot",
+          "intermediate": true
+        },
+        {
+          "code": "CO2_HS_Um_sheet",
+          "label": "[CO2aq]",
+          "units": "uM",
+          "formula": "co2sheet_caq_inc * 1000000",
+          "description": "V13: [CO2aq]",
+          "ordinal": 14,
+          "output_parameter_code": "CO2_HS_Um_sheet",
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_caq_inc",
+          "intermediate": false
+        },
+        {
+          "code": "pCO2_HS_uatm_sheet",
+          "label": "pCO2",
+          "units": "uatm",
+          "formula": "(co2sheet_caq_inc / co2sheet_kh_stream) * 1000000",
+          "description": "W13: pCO2",
+          "ordinal": 15,
+          "output_parameter_code": "pCO2_HS_uatm_sheet",
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_caq_inc",
+          "intermediate": false
+        },
+        {
+          "code": "pCO2_HS_P1_sheet",
+          "label": "pCO2_HS_P1",
+          "units": "uatm",
+          "formula": "((co2sheet_caq_inc * co2sheet_p_field_atm) / co2sheet_kh_stream) * 1000000",
+          "description": "X13: pCO2_HS_P1",
+          "ordinal": 16,
+          "output_parameter_code": "pCO2_HS_P1_sheet",
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_caq_inc",
+          "intermediate": false
+        },
+        {
+          "code": "pCO2_HS_P2_sheet",
+          "label": "pCO2_HS_P2",
+          "units": "uatm",
+          "formula": "(co2sheet_caq_inc / (co2sheet_kh_stream * co2sheet_p_field_atm)) * 1000000",
+          "description": "Y13: pCO2_HS_P2",
+          "ordinal": 17,
+          "output_parameter_code": "pCO2_HS_P2_sheet",
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_caq_inc",
+          "intermediate": false
+        },
+        {
+          "code": "co2sheet_mol_sa_in_hs",
+          "label": "mol of SA in HS",
+          "units": "mol",
+          "formula": "((co2_bp_hpa * 100) * (vol_sa / 1000)) / (8.314 * co2sheet_t_field_k)",
+          "description": "Z13: mol of SA in HS",
+          "ordinal": 18,
+          "output_parameter_code": null,
+          "sources": [
+            [
+              "co2_bp_hpa",
+              "co2_bp_hpa"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2_bp_hpa",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_in_sa_mol",
+          "label": "CH4 in SA",
+          "units": "mol",
+          "formula": "co2sheet_mol_sa_in_hs / 100 * ch4_in_sa",
+          "description": "AA13: CH4 in SA",
+          "ordinal": 19,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_mol_sa_in_hs",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_atm",
+          "label": "CH4 in HS",
+          "units": "atm",
+          "formula": "co2sheet_ch4_dry_ppm / 1000 / 1000",
+          "description": "AB13: CH4 in HS",
+          "ordinal": 20,
+          "output_parameter_code": null,
+          "sources": [
+            [
+              "co2sheet_ch4_dry_ppm",
+              "co2sheet_ch4_dry_ppm"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_dry_ppm",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_pa",
+          "label": "CH4 in HS",
+          "units": "Pa",
+          "formula": "co2sheet_ch4_atm * co2sheet_lab_press_atm * 101325",
+          "description": "AC13: CH4 in HS",
+          "ordinal": 21,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_atm",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_mol_m3",
+          "label": "CH4 in HS",
+          "units": "mol m-3",
+          "formula": "co2sheet_ch4_pa / (co2sheet_lab_temp_k * 8.314)",
+          "description": "AD13: CH4 in HS",
+          "ordinal": 22,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_pa",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_mass_picarro",
+          "label": "Mass Picarro",
+          "units": "mol",
+          "formula": "co2sheet_ch4_mol_m3 * (vol_sa / 1000)",
+          "description": "AE13: Mass Picarro",
+          "ordinal": 23,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_mol_m3",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_mass_eff",
+          "label": "Effective CH4 mass in HS (w/o SA)",
+          "units": "mol",
+          "formula": "co2sheet_ch4_mass_picarro - co2sheet_ch4_in_sa_mol",
+          "description": "AF13: Effective CH4 mass in HS (w/o SA)",
+          "ordinal": 24,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_mass_picarro",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_conc_eff",
+          "label": "Effective CH4 conc in HS (w/o SA)",
+          "units": "mol m-3",
+          "formula": "co2sheet_ch4_mass_eff / (vol_sa / 1000)",
+          "description": "AG13: Effective CH4 conc in HS (w/o SA)",
+          "ordinal": 25,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_mass_eff",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_hs_pa",
+          "label": "CH4 in HS",
+          "units": "Pa",
+          "formula": "co2sheet_ch4_conc_eff * co2sheet_t_field_k * 8.314",
+          "description": "AH13: CH4 in HS",
+          "ordinal": 26,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_conc_eff",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_hs_atm",
+          "label": "CH4 in HS",
+          "units": "atm",
+          "formula": "co2sheet_ch4_hs_pa / (co2_bp_hpa * 100)",
+          "description": "AI13: CH4 in HS",
+          "ordinal": 27,
+          "output_parameter_code": null,
+          "sources": [
+            [
+              "co2_bp_hpa",
+              "co2_bp_hpa"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_hs_pa",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_aq_mol_l",
+          "label": "CH4aq.",
+          "units": "mol/L",
+          "formula": "co2sheet_ch4_hs_atm * co2sheet_h_ch4_teq",
+          "description": "AJ13: CH4aq.",
+          "ordinal": 28,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_hs_atm",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_aq_mol_m3",
+          "label": "CH4aq.",
+          "units": "mol/m3",
+          "formula": "co2sheet_ch4_aq_mol_l * 1000",
+          "description": "AK13: CH4aq.",
+          "ordinal": 29,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_aq_mol_l",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_aq_mol",
+          "label": "CH4aq.",
+          "units": "mol",
+          "formula": "co2sheet_ch4_aq_mol_m3 * (vol_sa / 1000)",
+          "description": "AL13: CH4aq.",
+          "ordinal": 30,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_aq_mol_m3",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_tot_mol",
+          "label": "CH4 tot in sample",
+          "units": "mol",
+          "formula": "co2sheet_ch4_aq_mol + co2sheet_ch4_mass_eff",
+          "description": "AM13: CH4 tot in sample",
+          "ordinal": 31,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_aq_mol",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_tot_mol_m3",
+          "label": "CH4 tot in sample",
+          "units": "mol m-3",
+          "formula": "co2sheet_ch4_tot_mol / (vol_sa / 1000)",
+          "description": "AN13: CH4 tot in sample",
+          "ordinal": 32,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_tot_mol",
+          "intermediate": true
+        },
+        {
+          "code": "ch4_calc_umol_L_sheet",
+          "label": "CH4",
+          "units": "umol L-1",
+          "formula": "co2sheet_ch4_tot_mol_m3 * 1000",
+          "description": "AO13: CH4",
+          "ordinal": 33,
+          "output_parameter_code": "ch4_calc_umol_L_sheet",
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_tot_mol_m3",
+          "intermediate": false
+        },
+        {
+          "code": "co2sheet_ch4_nmol_l",
+          "label": "CH4",
+          "units": "nmol L-1",
+          "formula": "ch4_calc_umol_L_sheet * 1000",
+          "description": "AP13: CH4",
+          "ordinal": 34,
+          "output_parameter_code": null,
+          "sources": [
+            [
+              "ch4_calc_umol_L_sheet",
+              "ch4_calc_umol_L_sheet"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "ch4_calc_umol_L_sheet",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_mol_l",
+          "label": "CH4",
+          "units": "mol/L",
+          "formula": "ch4_calc_umol_L_sheet / 1000000",
+          "description": "AQ13: CH4",
+          "ordinal": 35,
+          "output_parameter_code": null,
+          "sources": [
+            [
+              "ch4_calc_umol_L_sheet",
+              "ch4_calc_umol_L_sheet"
+            ]
+          ],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "ch4_calc_umol_L_sheet",
+          "intermediate": true
+        },
+        {
+          "code": "co2sheet_ch4_g_l",
+          "label": "CH4",
+          "units": "g/L",
+          "formula": "co2sheet_ch4_mol_l * 16.04",
+          "description": "AR13: CH4",
+          "ordinal": 36,
+          "output_parameter_code": null,
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_mol_l",
+          "intermediate": true
+        },
+        {
+          "code": "ch4_calc_mg_L_sheet",
+          "label": "CH4",
+          "units": "mg/L",
+          "formula": "co2sheet_ch4_g_l * 1000",
+          "description": "AS13: CH4",
+          "ordinal": 37,
+          "output_parameter_code": "ch4_calc_mg_L_sheet",
+          "sources": [],
+          "site_sources": [],
+          "curve_slot": null,
+          "per_replicate": "co2sheet_ch4_g_l",
+          "intermediate": false
+        }
+      ],
+      "cases": [
+        {
+          "name": "RIC 2019-01-11 (row 13)",
+          "inputs": {},
+          "replicates": {
+            "co2_wtw_t": [
+              2.3
+            ],
+            "co2_bp_hpa": [
+              898
+            ],
+            "co2_h2o": [
+              1.415
+            ],
+            "co2_co2_ppm": [
+              527.356
+            ],
+            "co2_ch4_ppm": [
+              0.136
+            ]
+          },
+          "curves": {},
+          "expected": {
+            "co2sheet_ch4_dry_ppm": [
+              0.13837388068
+            ],
+            "CO2_HS_Um_sheet": [
+              39.04836779555188
+            ],
+            "pCO2_HS_uatm_sheet": [
+              591.5937752828349
+            ],
+            "pCO2_HS_P1_sheet": [
+              524.3041798213528
+            ],
+            "pCO2_HS_P2_sheet": [
+              667.519368380103
+            ],
+            "ch4_calc_umol_L_sheet": [
+              0.0049233195235913844
+            ],
+            "ch4_calc_mg_L_sheet": [
+              7.897004515840581e-05
+            ]
+          },
+          "steps": {
+            "co2sheet_lab_press_atm": 0.9540080701956016,
+            "co2sheet_h_ch4_teq": 0.00223838447541586,
+            "co2sheet_t_field_k": 275.45,
+            "co2sheet_p_field_atm": 0.8862570935109795,
+            "co2sheet_kh_inc": 0.03639486994839212,
+            "co2sheet_kh_stream": 0.06600537298906375,
+            "co2sheet_px_lab_atm": 0.0005031018798660717,
+            "co2sheet_ntot": 1.1714510338665565e-06,
+            "co2sheet_ch4_mass_eff": 1.3972366002644773e-10,
+            "co2sheet_ch4_aq_mol_l": 2.658641893764596e-10
+          }
+        }
+      ],
+      "tolerance": 1e-12
+    }
+  ],
+  "portal_rows": [
+    {
+      "case": "METALP RIC 2019-01-29, replicate A",
+      "portal": {
+        "CO2_HS_Um": 46.0206,
+        "pCO2_HS_uatm": 675.438,
+        "pCO2_HS_P1_uatm": 588.612,
+        "pCO2_HS_P2_uatm": 775.07,
+        "ch4_dry_ppm": 0.21914,
+        "CH4_umol_L": 9.11515
+      },
+      "ported": {
+        "calculation": "pco2",
+        "inputs": {
+          "WTW_Temp_degC_1": 1.3,
+          "Field_BP": 883,
+          "Field_BP_altitude": 883,
+          "lab_co2_lab_temp": 21.7,
+          "lab_co2_lab_press": 950.59
+        },
+        "replicates": {
+          "lab_co2_co2ppm": [
+            624.6
+          ],
+          "lab_co2_h2o": [
+            0.8
+          ],
+          "lab_co2_ch4": [
+            0.217
+          ]
+        },
+        "codes": {
+          "CO2_HS_Um": "CO2_HS_Um_avg",
+          "pCO2_HS_uatm": "pCO2_HS_uatm_avg",
+          "pCO2_HS_P1_uatm": "pCO2_HS_P1_uatm_avg",
+          "pCO2_HS_P2_uatm": "pCO2_HS_P2_uatm_avg",
+          "ch4_dry_ppm": "lab_co2_ch4_dry",
+          "CH4_umol_L": "CH4_umol_L_avg"
+        }
+      },
+      "sheet": {
+        "calculation": "co2_ch4_sheet",
+        "inputs": {},
+        "replicates": {
+          "co2_wtw_t": [
+            1.3
+          ],
+          "co2_bp_hpa": [
+            883
+          ],
+          "co2_h2o": [
+            0.8
+          ],
+          "co2_co2_ppm": [
+            624.6
+          ],
+          "co2_ch4_ppm": [
+            0.217
+          ]
+        },
+        "codes": {
+          "CO2_HS_Um": "CO2_HS_Um_sheet",
+          "pCO2_HS_uatm": "pCO2_HS_uatm_sheet",
+          "pCO2_HS_P1_uatm": "pCO2_HS_P1_sheet",
+          "pCO2_HS_P2_uatm": "pCO2_HS_P2_sheet",
+          "ch4_dry_ppm": "co2sheet_ch4_dry_ppm",
+          "CH4_umol_L": "ch4_calc_umol_L_sheet"
+        }
+      },
+      "ratios": {
+        "CO2_HS_Um": {
+          "ported": 0.999999777,
+          "sheet": 1.004959817
+        },
+        "pCO2_HS_uatm": {
+          "ported": 0.999999476,
+          "sheet": 1.004959515
+        },
+        "pCO2_HS_P1_uatm": {
+          "ported": 1.000000557,
+          "sheet": 1.004960601
+        },
+        "pCO2_HS_P2_uatm": {
+          "ported": 1.000000562,
+          "sheet": 1.004960606
+        },
+        "ch4_dry_ppm": {
+          "ported": 0.99999985,
+          "sheet": 0.99999985
+        },
+        "CH4_umol_L": {
+          "ported": 1.0203371,
+          "sheet": 0.000910317
+        }
+      }
+    },
+    {
+      "case": "METALP AND 2019-02-14, replicate A",
+      "portal": {
+        "CO2_HS_Um": 40.2076,
+        "pCO2_HS_uatm": 569.715,
+        "pCO2_HS_P1_uatm": 512.786,
+        "pCO2_HS_P2_uatm": 632.965,
+        "ch4_dry_ppm": 0.168352,
+        "CH4_umol_L": 7.21809
+      },
+      "ported": {
+        "calculation": "pco2",
+        "inputs": {
+          "WTW_Temp_degC_1": 0.2,
+          "Field_BP": 912,
+          "Field_BP_altitude": 912,
+          "lab_co2_lab_temp": 23,
+          "lab_co2_lab_press": 987.5
+        },
+        "replicates": {
+          "lab_co2_co2ppm": [
+            535.448
+          ],
+          "lab_co2_h2o": [
+            1.149
+          ],
+          "lab_co2_ch4": [
+            0.166
+          ]
+        },
+        "codes": {
+          "CO2_HS_Um": "CO2_HS_Um_avg",
+          "pCO2_HS_uatm": "pCO2_HS_uatm_avg",
+          "pCO2_HS_P1_uatm": "pCO2_HS_P1_uatm_avg",
+          "pCO2_HS_P2_uatm": "pCO2_HS_P2_uatm_avg",
+          "ch4_dry_ppm": "lab_co2_ch4_dry",
+          "CH4_umol_L": "CH4_umol_L_avg"
+        }
+      },
+      "sheet": {
+        "calculation": "co2_ch4_sheet",
+        "inputs": {},
+        "replicates": {
+          "co2_wtw_t": [
+            0.2
+          ],
+          "co2_bp_hpa": [
+            912
+          ],
+          "co2_h2o": [
+            1.149
+          ],
+          "co2_co2_ppm": [
+            535.448
+          ],
+          "co2_ch4_ppm": [
+            0.166
+          ]
+        },
+        "codes": {
+          "CO2_HS_Um": "CO2_HS_Um_sheet",
+          "pCO2_HS_uatm": "pCO2_HS_uatm_sheet",
+          "pCO2_HS_P1_uatm": "pCO2_HS_P1_sheet",
+          "pCO2_HS_P2_uatm": "pCO2_HS_P2_sheet",
+          "ch4_dry_ppm": "co2sheet_ch4_dry_ppm",
+          "CH4_umol_L": "ch4_calc_umol_L_sheet"
+        }
+      },
+      "ratios": {
+        "CO2_HS_Um": {
+          "ported": 0.999999161,
+          "sheet": 0.986070903
+        },
+        "pCO2_HS_uatm": {
+          "ported": 1.000000714,
+          "sheet": 0.986072433
+        },
+        "pCO2_HS_P1_uatm": {
+          "ported": 1.00000007,
+          "sheet": 0.986071799
+        },
+        "pCO2_HS_P2_uatm": {
+          "ported": 1.000000097,
+          "sheet": 0.986071825
+        },
+        "ch4_dry_ppm": {
+          "ported": 1.000002,
+          "sheet": 1.000002
+        },
+        "CH4_umol_L": {
+          "ported": 0.982195331,
+          "sheet": 0.000850996
+        }
+      }
+    },
+    {
+      "case": "METALP VEL 2020-05-19, replicate A",
+      "portal": {
+        "DIC": 0.559435,
+        "d13C_DIC": -6.722
+      },
+      "ported": {
+        "calculation": "dic",
+        "inputs": {},
+        "replicates": {
+          "lab_dic_acid_wght": [
+            13.5
+          ],
+          "lab_dic_acid_sample_wght": [
+            16.45
+          ],
+          "lab_dic_vol_overpressure": [
+            4
+          ],
+          "lab_dic_SA_added": [
+            46
+          ],
+          "lab_dic_co2_dry": [
+            563.5
+          ],
+          "lab_dic_delta_13co2": [
+            -6.539
+          ]
+        },
+        "codes": {
+          "DIC": "DIC_avg",
+          "d13C_DIC": "d13C_DIC_avg"
+        }
+      },
+      "sheet": {
+        "calculation": "dic_sheet",
+        "inputs": {},
+        "replicates": {
+          "dic_wgt_vial_acid": [
+            13.5
+          ],
+          "dic_wgt_vial_acid_sample": [
+            16.45
+          ],
+          "dic_v_overpressure": [
+            4
+          ],
+          "dic_volume_sa_added": [
+            46
+          ],
+          "dic_co2_dry_picarro": [
+            563.5
+          ],
+          "dic_delta_13co2": [
+            -6.539
+          ]
+        },
+        "codes": {
+          "DIC": "DIC_sheet",
+          "d13C_DIC": "d13C_DIC_sheet"
+        }
+      },
+      "ratios": {
+        "DIC": {
+          "ported": 1.000000294,
+          "sheet": 1.000046174
+        },
+        "d13C_DIC": {
+          "ported": 1.000000314,
+          "sheet": 0.999999065
+        }
+      }
+    }
+  ]
+}

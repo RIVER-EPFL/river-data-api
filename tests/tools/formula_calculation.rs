@@ -234,6 +234,74 @@ async fn a_formula_row_written_through_crud_mints_no_version() {
     );
 }
 
+/// Scenario: the calculation's formula is written through CRUD, then the same set is saved.
+///
+/// Expected behaviour: the chain reads a calculation only once a save has pinned a version. Until
+/// then the calculation is invisible to `calculations_fed_by`, so a write at a visit enqueues no
+/// recompute and the output stays empty.
+#[tokio::test]
+#[serial]
+async fn the_chain_reads_a_calculation_only_once_a_save_pins_a_version() {
+    let group_id = "00000000-0000-4000-c000-000000000113";
+    let (db, app, token) = setup().await;
+    seed_calculation(&db, group_id).await;
+    let script_id = calculation_id(&db).await;
+    let temperature: uuid::Uuid = crate::common::GLOBAL_PARAM_TEMP_ID.parse().expect("uuid");
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": "temp_ratio_out",
+            "name": "temp_ratio_out",
+            "units": "ratio",
+            "formula": "DO_Temperature / Dissolved_O2",
+            "tool_script_id": script_id,
+            "ordinal": 1,
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create ({status}): {text}");
+    let fed = river_db::routes::private::tools::service::calculations_fed_by(&db, &[temperature])
+        .await
+        .expect("the graph reads");
+    assert!(
+        !fed.iter().any(|c| c.tool == CALCULATION),
+        "an unpinned calculation feeds nothing: {:?}",
+        fed.iter().map(|c| &c.tool).collect::<Vec<_>>()
+    );
+
+    let (status, text) = add_formula(
+        &app,
+        &token,
+        &script_id,
+        "temp_ratio_out",
+        "DO_Temperature / Dissolved_O2",
+        1,
+    )
+    .await;
+    assert!((200..300).contains(&status), "save ({status}): {text}");
+    let fed = river_db::routes::private::tools::service::calculations_fed_by(&db, &[temperature])
+        .await
+        .expect("the graph reads");
+    let reading_it = fed.iter().find(|c| c.tool == CALCULATION).unwrap_or_else(|| {
+        panic!(
+            "the saved calculation reads the temperature: {:?}",
+            fed.iter().map(|c| &c.tool).collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(
+        reading_it
+            .outputs
+            .iter()
+            .map(|o| o.parameter_code.as_str())
+            .collect::<Vec<_>>(),
+        ["temp_ratio_out"],
+        "and writes the output the save minted"
+    );
+}
+
 /// Scenario: a three-formula calculation saved in one go, by a service token rather than a person.
 ///
 /// Expected behaviour: one version and one activation, not one per row. The version's
@@ -383,6 +451,64 @@ async fn the_calculation_runs_its_formulas_without_the_runner() {
         .as_f64()
         .unwrap_or_else(|| panic!("no result: {text}"));
     assert!((value - 4.0).abs() < 1e-12, "8 / 2: {text}");
+}
+
+/// Scenario: a form previews a calculation as values are typed (Q212).
+///
+/// Expected behaviour: the preview returns the calculation `calculate` returns, stores no run and
+/// carries no `run_id`, so there is nothing a save can name.
+#[tokio::test]
+#[serial]
+async fn a_preview_computes_without_storing_a_run() {
+    let group_id = "00000000-0000-4000-c000-000000000113";
+    let (db, app, token) = setup().await;
+    seed_calculation(&db, group_id).await;
+    let script_id = calculation_id(&db).await;
+    let (status, text) = add_formula(
+        &app,
+        &token,
+        &script_id,
+        "temp_ratio_out",
+        "DO_Temperature / Dissolved_O2",
+        1,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create ({status}): {text}");
+    let runs = "SELECT count(*) AS count FROM tool_runs";
+    let before = count(&db, runs).await;
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/tools/{CALCULATION}/preview"),
+        &json!({ "DO_Temperature": 8.0, "Dissolved_O2": 2.0 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "preview ({status}): {text}");
+    let preview: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let value = preview["results"]["temp_ratio_out"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no result: {text}"));
+    assert!((value - 4.0).abs() < 1e-12, "8 / 2: {text}");
+    assert!(preview.get("run_id").is_none(), "a preview names no run: {text}");
+    assert!(
+        preview["trace"].as_array().is_some_and(|t| !t.is_empty()),
+        "the full calculation, trace included: {text}"
+    );
+    assert_eq!(count(&db, runs).await, before, "a preview stores no run");
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/tools/{CALCULATION}/calculate"),
+        &json!({ "DO_Temperature": 8.0, "Dissolved_O2": 2.0 }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "calculate ({status}): {text}");
+    let stored: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(stored["results"], preview["results"], "the same calculation");
+    assert!(stored["run_id"].is_string(), "calculate still names its run: {text}");
+    assert_eq!(count(&db, runs).await, before + 1, "calculate stores one run");
 }
 
 /// Scenario: the two-stage shape four of the portal's calculators have, a formula evaluating once
@@ -892,6 +1018,33 @@ async fn a_set_save_writes_the_whole_set_and_activates_a_version() {
     assert!(
         body.contains("DO_Temperature / 2"),
         "the active version is the saved set: {body}"
+    );
+
+    // A code is unique across calculations, so a second calculation reusing one is told which.
+    let (status, created) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/tool_scripts",
+        &json!({ "name": "set_other", "label": "Set other", "engine": "formula" }),
+        &admin,
+    )
+    .await;
+    assert!((200..300).contains(&status), "second calculation: {created}");
+    let other_id = created["id"].as_str().expect("id");
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/tool_scripts/{other_id}/formulas"),
+        &json!({
+            "formulas": [
+                { "code": "set_a", "units": "ratio", "formula": "DO_Temperature * 3", "ordinal": 1 }
+            ]
+        }),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 400, "a taken code is refused: {text}");
+    assert!(
+        text.contains(&format!("set_a is a formula of {CALCULATION}")),
+        "the refusal names the code and the calculation holding it: {text}"
     );
 }
 

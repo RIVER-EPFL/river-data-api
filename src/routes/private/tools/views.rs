@@ -14,7 +14,7 @@ use sea_orm::{
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use super::flows::execute_and_store_run;
+use super::flows::{execute_and_store_run, preview_run, replay_trace};
 use super::models::activation as activation_entity;
 use super::models::script as script_entity;
 use super::models::script::{ToolScript, ToolScriptList};
@@ -25,16 +25,17 @@ use super::models::{
     CreateVersionResponse, DraftRunFailure, DraftRunFailureKind, DraftRunRequest, DraftRunResponse,
     DraftRunResults, Engine, FormulaDraftRunRequest, FormulaDraftRunResponse,
     FormulaDraftRunResults, InspectScriptRequest, InspectScriptResponse, LintFinding,
-    MissingConstant, SaveFormulaSetRequest, SaveFormulaSetResponse, SavedFormula, ToolDescriptor,
-    ToolResult, UpdateScriptRequest, ValidateResponse, VersionUsage, parse_manifest,
-    reconcile_manifest,
+    MissingConstant, RunTrace, SaveFormulaSetRequest, SaveFormulaSetResponse, SavedFormula,
+    ToolCalculation, ToolDescriptor, ToolResult, UpdateScriptRequest, ValidateResponse, VersionUsage, parse_manifest,
+    reconcile_manifest, run as tool_run,
 };
 use super::service::{
     FormulaWrite, LIST_LIMIT, audit_after_activation, calculation_health, calculation_slots,
     calculations_fed_by_subject, canonical_hash, check_engine, check_manifest_against_catalog,
-    check_manifest_codes_resolve, closure_subject, coverage_for, find_active_tool, lint_script,
-    list_active_tools, load_parameter_catalog, load_script, load_version, manifest_finding,
-    manifest_json, mint_formula_version, normalise_name, plan_formula_set, render, replicated_for,
+    check_manifest_codes_resolve, closure_subject, codes_held_elsewhere, coverage_for,
+    find_active_tool, formula_codes_held_elsewhere, lint_script, list_active_tools,
+    load_parameter_catalog, load_script, load_version, manifest_finding, manifest_json,
+    mint_formula_version, normalise_name, plan_formula_set, render, replicated_for,
     run_stored_cases, run_tool_body, runner_runtime, stored_version_content,
 };
 use crate::common::AppState;
@@ -103,6 +104,56 @@ pub async fn calculate_tool(
     )
     .await?;
     Ok(Json(result))
+}
+
+/// Run a tool calculation without storing it, for a form computing as values are typed. The
+/// response has no `run_id`, so a save cannot name it; `calculate` stores the run a save names.
+/// Requires `read_data`.
+#[utoipa::path(
+    post,
+    path = "/api/tools/{tool_name}/preview",
+    params(("tool_name" = String, Path, description = "Tool name (e.g. 'doc', 'dic', 'pco2')")),
+    request_body(content = Object, description = "Per-tool request body (see GET /tools for schemas)"),
+    responses(
+        (status = 200, description = "The calculation, stored nowhere", body = ToolCalculation),
+        (status = 404, description = "Unknown tool name"),
+        (status = 409, description = "The calculation is switched off"),
+        (status = 400, description = "Invalid input for this tool, or a script error"),
+        (status = 503, description = "The tool runner is not configured or unreachable"),
+    ),
+    tag = "tools"
+)]
+pub async fn preview_tool(
+    State(state): State<AppState>,
+    Path(tool_name): Path<String>,
+    body: axum::body::Bytes,
+) -> AppResult<Json<ToolCalculation>> {
+    let tool = find_active_tool(&state.db, &tool_name).await?;
+    Ok(Json(preview_run(&state, &tool, &body).await?))
+}
+
+/// Replay a stored run under the version it pinned, so a computed value shows its formula, its
+/// intermediates and the values each of them read. Requires `read_data`.
+#[utoipa::path(
+    get,
+    path = "/api/tool_runs/{id}/trace",
+    params(("id" = Uuid, Path, description = "Tool run id")),
+    responses(
+        (status = 200, description = "Each formula as the run evaluated it", body = RunTrace),
+        (status = 404, description = "No such run"),
+        (status = 409, description = "A script run, or a version that is no longer stored"),
+    ),
+    tag = "tools"
+)]
+pub async fn trace_run(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<RunTrace>> {
+    let run = tool_run::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Tool run {id} not found")))?;
+    Ok(Json(replay_trace(&state.db, &run).await?))
 }
 
 /// The calculations a set of parameters feeds, and where each calculation's data lives.
@@ -873,7 +924,7 @@ fn update_model(f: &SavedFormula) -> CalculationFormulaUpdate {
     request_body = SaveFormulaSetRequest,
     responses(
         (status = 200, description = "The set is saved and one version activated", body = SaveFormulaSetResponse),
-        (status = 400, description = "A formula the set refuses, or a calculation that is not formula-engined"),
+        (status = 400, description = "A formula the set refuses, a code another calculation holds, or a calculation that is not formula-engined"),
         (status = 404, description = "No such calculation"),
     ),
     tag = "tool_scripts")]
@@ -917,6 +968,9 @@ pub async fn save_formula_set(
         .map(|f| (f.id, f.code.clone()))
         .collect();
     let writes = plan_formula_set(&stored, &named).map_err(AppError::BadRequest)?;
+    let codes: Vec<String> = named.iter().map(|(_, code)| code.clone()).collect();
+    let held = formula_codes_held_elsewhere(&txn, id, &codes).await?;
+    codes_held_elsewhere(&held).map_err(AppError::BadRequest)?;
 
     let mut created = 0usize;
     let mut updated = 0usize;
