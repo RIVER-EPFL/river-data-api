@@ -341,7 +341,7 @@ async fn a_device_instrument_is_named_after_the_slot_it_serves() {
 /// `/streams/register`, which mints nothing (M172).
 ///
 /// Expected behaviour: the plan is where the instrument is decided. The entry carries the
-/// proposal the apply will mint, pre-agreed the way Q76's Option A asks, rather than an
+/// proposal the apply will mint, waiting for a person to confirm it (Q195), rather than an
 /// instrument registration had already chosen. Every other test in this suite seeds by hand, so
 /// this is the only one that exercises what the production path actually leaves behind.
 #[tokio::test]
@@ -393,8 +393,8 @@ async fn a_registered_feed_reaches_the_plan_as_a_proposal() {
     let entry = entry_for(&plan, stream);
     assert_eq!(
         entry["instrument"]["confirmed"],
-        serde_json::json!(true),
-        "the entry arrives decided rather than unanswered: {entry}"
+        serde_json::json!(false),
+        "the plan suggests; nobody has confirmed it yet: {entry}"
     );
     // Proposed, not resolved: nothing has minted one, so the entry names what the apply will
     // create, keyed on the source's parameter.
@@ -432,7 +432,7 @@ async fn an_attached_instrument_returns_to_the_plan_s_own_proposal() {
     assert_eq!(
         instruments["unassigned"].as_array().map(Vec::len),
         Some(0),
-        "a parameter with no instrument is proposed pre-agreed, not asked: {instruments}"
+        "a parameter with no instrument is proposed, not left unassigned: {instruments}"
     );
     let proposed = entry_for(&plan, stream);
     assert_eq!(
@@ -440,7 +440,7 @@ async fn an_attached_instrument_returns_to_the_plan_s_own_proposal() {
         serde_json::json!("parameter")
     );
     assert_eq!(proposed["instrument"]["create"], serde_json::json!(true));
-    assert_eq!(proposed["instrument"]["confirmed"], serde_json::json!(true));
+    assert_eq!(proposed["instrument"]["confirmed"], serde_json::json!(false));
     assert_eq!(
         proposed["instrument"]["proposed_name"],
         serde_json::json!("doc"),
@@ -689,6 +689,27 @@ async fn a_curve_assigned_to_a_proposed_instrument_moves_when_the_plan_is_applie
         serde_json::json!("doc curvehome"),
         "{listed}"
     );
+    let used = instruments["curves"]
+        .as_array()
+        .expect("curves")
+        .iter()
+        .find(|c| c["id"] == serde_json::json!(used_curve))
+        .cloned()
+        .expect("the used curve is listed");
+    assert_eq!(
+        (
+            &used["corrected_parameters"],
+            &used["corrected_sites"],
+            &used["reading_count"]
+        ),
+        (
+            &serde_json::json!(["doc"]),
+            &serde_json::json!(["Upstream Station"]),
+            &serde_json::json!(1)
+        ),
+        "the review says which readings the curve corrects: {used}"
+    );
+    assert!(used["first_corrected"].is_string(), "{used}");
 
     apply_and_wait(&app, &db, &token, &plan_id).await;
 
@@ -895,4 +916,68 @@ async fn a_proposal_colliding_with_an_existing_instrument_is_reported_and_left_u
         serde_json::json!(existing),
         "the tab carries the collision too, so the choice is where the decision is made: {group}"
     );
+}
+
+/// Scenario: a first plan over two lab feeds, every row ticked and no instrument touched.
+///
+/// Expected behaviour: the plan suggests and a person confirms (Q195). The apply is refused
+/// naming the feeds whose suggestion nobody accepted, and one PATCH confirming every asking row,
+/// which is what the review's bulk accept sends, lets it through and mints both.
+#[tokio::test]
+#[serial]
+async fn an_untouched_plan_is_refused_until_its_suggestions_are_accepted() {
+    let (app, token, db) = setup().await;
+    let doc = Uuid::new_v4();
+    let tss = Uuid::new_v4();
+    seed_lab_stream(&db, doc, "untouched-doc", "Upstream Station").await;
+    seed_lab_stream(&db, tss, "untouched-tss", "Downstream Station").await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE data_streams SET metadata = jsonb_set(metadata, '{{hierarchy,parameter}}', '\"tss\"') \
+             WHERE id = '{tss}'"
+        ),
+    )
+    .await;
+
+    let plan = create_plan(&app, &token).await;
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+    let ticks: Vec<serde_json::Value> = [doc, tss]
+        .iter()
+        .map(|id| serde_json::json!({ "stream_id": id, "acknowledged": true }))
+        .collect();
+    let (status, body) = crate::common::patch_plan_with_token(
+        &app,
+        &plan_id,
+        &serde_json::json!({ "updates": ticks }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "tick ({status}): {body}");
+
+    let (status, refused) =
+        crate::common::post_plan_action_with_token(&app, &plan_id, "apply", &token).await;
+    assert_eq!(status, 400, "an unconfirmed suggestion holds the apply: {refused}");
+    assert!(
+        refused.contains("untouched-doc") && refused.contains("untouched-tss"),
+        "the refusal names each feed still asking: {refused}"
+    );
+
+    let accept: Vec<serde_json::Value> = [doc, tss]
+        .iter()
+        .map(|id| serde_json::json!({ "stream_id": id, "instrument_confirmed": true }))
+        .collect();
+    let (status, body) = crate::common::patch_plan_with_token(
+        &app,
+        &plan_id,
+        &serde_json::json!({ "updates": accept }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "accept all ({status}): {body}");
+
+    let before = scalar_i64(&db, "SELECT count(*)::bigint AS v FROM sensors").await;
+    apply_and_wait(&app, &db, &token, &plan_id).await;
+    let after = scalar_i64(&db, "SELECT count(*)::bigint AS v FROM sensors").await;
+    assert_eq!(after - before, 2, "each accepted suggestion is minted once");
 }

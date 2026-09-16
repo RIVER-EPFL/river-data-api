@@ -107,6 +107,7 @@ fn a_stream_registration_arrives_whole_and_may_omit_metadata() {
             sd_estimator: Some("population".to_string()),
         }),
         decimal_places: Some(2),
+        instrument_granularity: None,
     };
     let RegisterStreamRequest(got) = through(&sent);
     assert_eq!(got.metadata, sent.metadata);

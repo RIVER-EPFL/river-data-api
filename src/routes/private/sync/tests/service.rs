@@ -171,15 +171,16 @@ fn test_resolve_parameter_instrument_takes_the_source_s_own() {
     assert!(resolved.confirmed);
 }
 
-/// Expected behaviour: a parameter with no instrument is proposed, already agreed. The review
-/// changes it by attaching another; leaving it alone creates the suggestion.
+/// Expected behaviour: a parameter with no instrument is proposed, not agreed. The plan suggests
+/// and a person confirms, so an untouched plan creates nothing nobody looked at.
 #[test]
-fn test_resolve_parameter_instrument_proposes_one_already_agreed() {
+fn test_resolve_parameter_instrument_proposes_one_nobody_has_confirmed() {
     let proposed =
         resolve_parameter_instrument("cnet:NO2_mgL".to_string(), "NO2_mgL", &catalog(&[]));
     assert_eq!(proposed.id, None);
     assert_eq!(proposed.source_key, "cnet:NO2_mgL");
-    assert!(proposed.create && proposed.confirmed);
+    assert!(proposed.create);
+    assert!(!proposed.confirmed, "a suggestion waits for a person");
     assert_eq!(
         proposed.proposed_name.as_deref(),
         Some("NO2_mgL"),

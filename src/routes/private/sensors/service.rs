@@ -903,7 +903,7 @@ pub async fn resolve_or_mint_stream_instrument<C: ConnectionTrait>(
     if let Some(sensor_id) = stream.sensor_id {
         return Ok(sensor_id);
     }
-    if is_device_feed(&stream.metadata) {
+    if is_per_site_instrument(&stream.metadata) {
         return Ok(import_sensor_for_stream(db, stream, name_hint)
             .await?
             .sensor_id);
@@ -997,11 +997,19 @@ pub async fn ensure_channel_instrument<C: ConnectionTrait>(
         .await
 }
 
-/// A device feed is one whose stream metadata carries a `device` block. Broader than testing for a
-/// serial: viewLinc may report a channel with no `logger_serial`, and that is still a device.
+/// Whether a stream's instrument is its own channel, one per site and parameter, rather than the
+/// source's instrument for the parameter. The connector declares it at registration; a stream
+/// registered without a declaration is one when its metadata carries a `device` block.
 #[must_use]
-pub fn is_device_feed(stream_metadata: &serde_json::Value) -> bool {
-    stream_metadata.get("device").is_some_and(|d| !d.is_null())
+pub fn is_per_site_instrument(stream_metadata: &serde_json::Value) -> bool {
+    use river_data_core::models::InstrumentGranularity;
+    match crate::routes::private::data_streams::service::declared_instrument_granularity(
+        stream_metadata,
+    ) {
+        Some(InstrumentGranularity::PerSiteParameter) => true,
+        Some(InstrumentGranularity::PerParameter) => false,
+        None => stream_metadata.get("device").is_some_and(|d| !d.is_null()),
+    }
 }
 
 /// The name a non-device instrument takes when it is minted.

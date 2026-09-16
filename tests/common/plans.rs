@@ -53,12 +53,15 @@ pub fn find_entry<'a>(plan: &'a serde_json::Value, stream_id: &str) -> &'a serde
         .unwrap_or_else(|| panic!("entry for stream {stream_id} missing: {plan}"))
 }
 
-/// Tick every entry of a plan, which is what the review does before an apply is allowed.
+/// Tick every entry of a plan and accept its instrument suggestions, which is what the review does
+/// before an apply is allowed.
 ///
-/// Q133 gated the apply on `needs_checking == 0`, so a plan drafted over unknown sites or
-/// parameters is refused until a person has agreed to each row. A test whose subject is what the
-/// apply then does says so here rather than carrying the gate's refusal into its own assertions;
-/// the gate itself is exercised by `apply_is_refused_while_a_row_still_needs_checking`.
+/// Q133 gated the apply on `needs_checking == 0`, and Q195 on every suggested instrument being
+/// confirmed, so an untouched plan is refused. A test whose subject is what the apply then does
+/// says so here rather than carrying the gates' refusals into its own assertions; the gates
+/// themselves are exercised by `apply_is_refused_while_a_row_still_needs_checking` and
+/// `an_untouched_plan_is_refused_until_its_suggestions_are_accepted`. A suggestion colliding with
+/// an existing instrument's name is left alone, as the review's bulk accept leaves it.
 pub async fn acknowledge_plan(app: &Router, token: &str, plan_id: &str) {
     let (status, plan) =
         super::get_json_with_token(app, &format!("/api/sync/pairing-plans/{plan_id}"), token).await;
@@ -68,8 +71,14 @@ pub async fn acknowledge_plan(app: &Router, token: &str, plan_id: &str) {
         .map(|entries| {
             entries
                 .iter()
-                .filter(|e| e["acknowledged"] != json!(true))
-                .map(|e| json!({ "stream_id": e["stream_id"], "acknowledged": true }))
+                .filter(|e| e["acknowledged"] != json!(true) || is_suggestion(e))
+                .map(|e| {
+                    let mut update = json!({ "stream_id": e["stream_id"], "acknowledged": true });
+                    if is_suggestion(e) {
+                        update["instrument_confirmed"] = json!(true);
+                    }
+                    update
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -84,6 +93,14 @@ pub async fn acknowledge_plan(app: &Router, token: &str, plan_id: &str) {
     )
     .await;
     assert_eq!(status, 200, "ticking the plan's rows: {text}");
+}
+
+/// An instrument the plan proposes that nobody has confirmed and no existing name collides with.
+fn is_suggestion(entry: &serde_json::Value) -> bool {
+    let instrument = &entry["instrument"];
+    instrument["create"] == json!(true)
+        && instrument["confirmed"] != json!(true)
+        && instrument["name_conflict"].is_null()
 }
 
 /// Agree to every instrument the plan would create, which is what an operator does before an apply.

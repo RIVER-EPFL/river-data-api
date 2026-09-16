@@ -1,4 +1,6 @@
-use super::{InstrumentKind, source_instrument_name};
+use serde_json::json;
+
+use super::{InstrumentKind, is_per_site_instrument, source_instrument_name};
 
 #[test]
 fn test_source_instrument_name_source_parameter_carries_no_site() {
@@ -216,4 +218,28 @@ fn test_device_frequency_follows_the_stream_declaration() {
     assert_eq!(device_frequency(Some("derived")), "high");
     // An undeclared stream is a logger, which is what every device feed was until one declared.
     assert_eq!(device_frequency(None), "high");
+}
+
+#[test]
+fn test_is_per_site_instrument_declared_per_site_parameter_without_device() {
+    assert!(is_per_site_instrument(&json!({
+        "instrument_granularity": "per_site_parameter"
+    })));
+}
+
+#[test]
+fn test_is_per_site_instrument_declared_per_parameter_with_device() {
+    assert!(!is_per_site_instrument(&json!({
+        "instrument_granularity": "per_parameter",
+        "device": { "logger_serial": "L123" }
+    })));
+}
+
+#[test]
+fn test_is_per_site_instrument_undeclared_falls_back_to_device_block() {
+    assert!(is_per_site_instrument(
+        &json!({ "device": { "logger_serial": "L123" } })
+    ));
+    assert!(!is_per_site_instrument(&json!({ "device": null })));
+    assert!(!is_per_site_instrument(&json!({})));
 }

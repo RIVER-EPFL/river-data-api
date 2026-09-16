@@ -1,4 +1,5 @@
 use super::instrument_key;
+use crate::routes::private::sync::service::{CurveUse, curve_reach};
 use serde_json::json;
 
 fn entry(
@@ -86,4 +87,66 @@ fn test_a_hold_reaches_its_slot_through_one_join_and_locks_only_the_hold() {
         unpaired.contains(r#"LEFT JOIN "site_parameters""#),
         "a left join admits a hold whose stream is unpaired: {unpaired}"
     );
+}
+
+fn curve_use(
+    curve_id: uuid::Uuid,
+    stream_id: uuid::Uuid,
+    n: i64,
+    first: &str,
+    last: &str,
+) -> CurveUse {
+    CurveUse {
+        curve_id,
+        stream_id,
+        n,
+        first: first.parse().unwrap(),
+        last: last.parse().unwrap(),
+    }
+}
+
+#[test]
+fn test_curve_reach_names_the_parameters_stations_and_period_it_corrects() {
+    let curve = uuid::Uuid::new_v4();
+    let mut fp1 = entry("DOC", None);
+    fp1.site.name = "FP1".into();
+    let mut fp2 = entry("DOC", None);
+    fp2.site.name = "FP2".into();
+    let unplanned = uuid::Uuid::new_v4();
+    let uses = [
+        curve_use(
+            curve,
+            fp1.stream_id,
+            4,
+            "2023-04-12T08:00:00Z",
+            "2023-09-01T08:00:00Z",
+        ),
+        curve_use(
+            curve,
+            fp2.stream_id,
+            2,
+            "2023-05-01T08:00:00Z",
+            "2024-01-20T08:00:00Z",
+        ),
+        curve_use(
+            curve,
+            unplanned,
+            1,
+            "2022-12-01T08:00:00Z",
+            "2022-12-01T08:00:00Z",
+        ),
+    ];
+    let reach = curve_reach(&uses, &[fp1, fp2]);
+    let r = &reach[&curve];
+    // 4 + 2 + 1
+    assert_eq!(r.reading_count, 7);
+    assert_eq!(r.parameters, vec!["DOC".to_string()]);
+    assert_eq!(r.sites, vec!["FP1".to_string(), "FP2".to_string()]);
+    assert_eq!(r.first.unwrap().to_rfc3339(), "2022-12-01T08:00:00+00:00");
+    assert_eq!(r.last.unwrap().to_rfc3339(), "2024-01-20T08:00:00+00:00");
+}
+
+#[test]
+fn test_curve_reach_is_empty_for_a_curve_no_reading_names() {
+    assert!(curve_reach(&[], &[entry("DOC", None)]).is_empty());
 }

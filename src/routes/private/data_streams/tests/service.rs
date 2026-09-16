@@ -203,3 +203,30 @@ fn the_cursor_advance_never_moves_the_cursor_back() {
     assert!(sql.contains(r#""last_data_time""#), "{sql}");
     assert!(sql.contains(r#""id" ="#), "{sql}");
 }
+
+#[test]
+fn test_declared_instrument_granularity_reads_both_shapes() {
+    use river_data_core::models::InstrumentGranularity;
+    assert_eq!(
+        declared_instrument_granularity(&serde_json::json!({
+            INSTRUMENT_GRANULARITY_KEY: "per_parameter"
+        })),
+        Some(InstrumentGranularity::PerParameter)
+    );
+    assert_eq!(
+        declared_instrument_granularity(&serde_json::json!({
+            INSTRUMENT_GRANULARITY_KEY: "per_site_parameter"
+        })),
+        Some(InstrumentGranularity::PerSiteParameter)
+    );
+    assert_eq!(
+        declared_instrument_granularity(&serde_json::json!({})),
+        None
+    );
+    assert_eq!(
+        declared_instrument_granularity(
+            &serde_json::json!({ INSTRUMENT_GRANULARITY_KEY: "per_station" })
+        ),
+        None
+    );
+}

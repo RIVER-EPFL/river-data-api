@@ -230,6 +230,7 @@ impl SourceBackend for FakePortal {
                 sensor_id: None,
                 replicates: None,
                 decimal_places: Some(2),
+                instrument_granularity: None,
             });
             let mut metadata = Self::metadata(station, FAMILY_MEAN_COLUMN, "DOC");
             metadata["replicate_family"] = json!({
@@ -257,6 +258,7 @@ impl SourceBackend for FakePortal {
                     sd_estimator: None,
                 }),
                 decimal_places: Some(2),
+                instrument_granularity: None,
             });
         }
         Ok(out)

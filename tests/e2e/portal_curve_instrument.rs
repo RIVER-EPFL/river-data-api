@@ -223,8 +223,7 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
     );
 
     // Registration mints nothing (M172), so a stream with no curve column is proposed one under
-    // the source's own parameter key, pre-agreed: the review defaults to the suggestion rather
-    // than asking a question nobody has evidence to answer differently.
+    // the source's own parameter key, unconfirmed like every suggestion (Q195).
     let plain_instrument = &entry_for(&plan, &plain)["instrument"];
     assert_eq!(
         plain_instrument["resolved_by"], "parameter",
@@ -232,8 +231,8 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
     );
     assert_eq!(plain_instrument["create"], true, "{plain_instrument}");
     assert_eq!(
-        plain_instrument["confirmed"], true,
-        "nothing else carries that name, so the suggestion stands: {plain_instrument}",
+        plain_instrument["confirmed"], false,
+        "a suggestion waits for a person even when nothing else carries the name: {plain_instrument}",
     );
     assert_eq!(
         plain_instrument["stamps_readings"], false,
