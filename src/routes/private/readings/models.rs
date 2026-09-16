@@ -1739,6 +1739,7 @@ pub struct HoldRef {
     pub status: String,
     pub created_at: DateTime<Utc>,
     /// The calculation a chain finding is against, so its chip opens that calculation.
+    #[schema(required)]
     pub tool: Option<String>,
 }
 

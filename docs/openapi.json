@@ -7742,7 +7742,8 @@
           "id",
           "kind",
           "status",
-          "created_at"
+          "created_at",
+          "tool"
         ],
         "type": "object"
       },
