@@ -3480,6 +3480,7 @@ pub async fn create_plan(
         summary: Set(summary),
         entries: Set(PlanEntries(entries)),
         curve_assignments: Set(PlanCurveIntents::default()),
+        curve_attachments: Set(PlanCurveAttachments::default()),
         accepted_objects: Set(PlanAcceptedObjects::default()),
         instrument_proposals: Set(PlanInstrumentProposals(proposals)),
         version: Set(0),
@@ -3518,6 +3519,10 @@ pub struct ApplyResult {
     #[serde(default)]
     #[schema(required)]
     pub curves_assigned: u32,
+    /// Held curves this apply created under the instruments the review attached them to.
+    #[serde(default)]
+    #[schema(required)]
+    pub curves_created: u32,
     /// Parameter groups the source's registry named that the database did not hold, and the
     /// memberships placed in them.
     #[serde(default)]
@@ -3580,6 +3585,34 @@ pub struct PlanAcceptedObject {
     #[schema(required)]
     pub accepted_by: Option<String>,
     pub accepted_at: chrono::DateTime<chrono::FixedOffset>,
+}
+
+/// The held curves the review attached, as the column holds them.
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+    sea_orm::FromJsonQueryResult,
+)]
+#[serde(transparent)]
+pub struct PlanCurveAttachments(pub Vec<PlanCurveAttachment>);
+
+/// A held curve the review attached to one of the plan's instruments: one the plan creates, by
+/// `instrument_source_key`, or one that already exists, by `instrument_id`. The apply creates the
+/// curve under it (Q195).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PlanCurveAttachment {
+    pub proposal_id: Uuid,
+    #[serde(default)]
+    #[schema(required)]
+    pub instrument_source_key: Option<String>,
+    #[serde(default)]
+    #[schema(required)]
+    pub instrument_id: Option<Uuid>,
 }
 
 /// A standard curve the review assigned to an instrument the plan creates, keyed by the
@@ -3684,6 +3717,188 @@ pub(super) async fn assign_plan_curves<C: ConnectionTrait>(
     Ok(moved)
 }
 
+/// The curves a source holds for a pairing plan, in the order the review lists them.
+pub async fn held_curves<C: ConnectionTrait>(
+    conn: &C,
+    source_system: &str,
+) -> AppResult<Vec<standard_curves::models::proposal::Model>> {
+    use standard_curves::models::proposal;
+    Ok(proposal::Entity::find()
+        .filter(proposal::Column::SourceSystem.eq(source_system))
+        .order_by_asc(proposal::Column::Label)
+        .order_by_asc(proposal::Column::SourceKey)
+        .all(conn)
+        .await?)
+}
+
+/// How a held curve is named to the operator: its name where the source gave one, else its label
+/// and key.
+fn held_curve_title(curve: &standard_curves::models::proposal::Model) -> String {
+    curve
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("{} ({})", curve.label, curve.source_key))
+}
+
+/// Refuse a plan while any curve its source holds is attached to none of its instruments. The
+/// curve cannot be stored without one, and leaving it behind would leave the readings that name it
+/// uncorrected with nothing saying why (Q195).
+pub async fn refuse_unattached_curves<C: ConnectionTrait>(
+    conn: &C,
+    source_system: &str,
+    attachments: &[PlanCurveAttachment],
+) -> AppResult<()> {
+    let unattached: Vec<String> = held_curves(conn, source_system)
+        .await?
+        .iter()
+        .filter(|c| !attachments.iter().any(|a| a.proposal_id == c.id))
+        .map(held_curve_title)
+        .collect();
+    if unattached.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(format!(
+        "{} standard curve{} from {source_system} {} attached to no instrument: {}. Attach each \
+         to one of the plan's instruments before applying.",
+        unattached.len(),
+        if unattached.len() == 1 { "" } else { "s" },
+        if unattached.len() == 1 { "is" } else { "are" },
+        unattached.join(", ")
+    )))
+}
+
+/// Fold the review's held-curve attachments into the plan's list. A held curve of this source may
+/// be attached to an instrument some paired entry proposes creating, or to one that exists; naming
+/// neither clears it. Anything else is a 400 now rather than a failed apply later.
+pub(super) async fn apply_held_curve_updates(
+    db: &sea_orm::DatabaseConnection,
+    source_system: &str,
+    entries: &[PlanEntry],
+    attachments: &mut Vec<PlanCurveAttachment>,
+    updates: &[PlanHeldCurveUpdate],
+) -> AppResult<()> {
+    use standard_curves::models::proposal;
+    for update in updates {
+        attachments.retain(|a| a.proposal_id != update.proposal_id);
+        let source_key = update
+            .instrument_source_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty());
+        if source_key.is_none() && update.instrument_id.is_none() {
+            continue;
+        }
+        if source_key.is_some() && update.instrument_id.is_some() {
+            return Err(AppError::BadRequest(
+                "attach a held curve to one instrument: a source key the plan creates, or an \
+                 existing instrument id, not both"
+                    .to_string(),
+            ));
+        }
+        let held = proposal::Entity::find_by_id(update.proposal_id)
+            .one(db)
+            .await?
+            .filter(|c| c.source_system == source_system);
+        if held.is_none() {
+            return Err(AppError::BadRequest(format!(
+                "{source_system} holds no curve {}",
+                update.proposal_id
+            )));
+        }
+        if let Some(key) = source_key {
+            let proposed = entries.iter().any(|e| {
+                e.action == "pair"
+                    && e.instrument
+                        .as_ref()
+                        .is_some_and(|i| i.create && i.source_key == key)
+            });
+            if !proposed {
+                return Err(AppError::BadRequest(format!(
+                    "this plan does not create an instrument with source key '{key}'"
+                )));
+            }
+        }
+        if let Some(id) = update.instrument_id
+            && sensors::models::Entity::find_by_id(id)
+                .one(db)
+                .await?
+                .is_none()
+        {
+            return Err(AppError::BadRequest(format!(
+                "instrument {id} does not exist"
+            )));
+        }
+        attachments.push(PlanCurveAttachment {
+            proposal_id: update.proposal_id,
+            instrument_source_key: source_key.map(str::to_string),
+            instrument_id: update.instrument_id,
+        });
+    }
+    Ok(())
+}
+
+/// Create each attached held curve under its instrument, and stop holding it. Runs inside the
+/// apply transaction, after `mint_plan_instruments`, so an instrument this plan creates exists by
+/// its `source_key`. An attachment the apply cannot honour fails the apply rather than being
+/// dropped.
+pub(super) async fn create_attached_curves<C: ConnectionTrait>(
+    txn: &C,
+    source_system: &str,
+    attachments: &[PlanCurveAttachment],
+    minted: &HashMap<String, Uuid>,
+) -> AppResult<u32> {
+    use standard_curves::models::proposal;
+    let mut created = 0u32;
+    for attachment in attachments {
+        let Some(held) = proposal::Entity::find_by_id(attachment.proposal_id)
+            .one(txn)
+            .await?
+            .filter(|c| c.source_system == source_system)
+        else {
+            return Err(AppError::BadRequest(format!(
+                "curve {} is no longer held; clear its attachment before applying",
+                attachment.proposal_id
+            )));
+        };
+        let sensor_id = match (&attachment.instrument_source_key, attachment.instrument_id) {
+            (Some(key), _) => minted.get(key).copied().ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "curve {} is attached to instrument '{key}', which this plan no longer \
+                     creates; attach it again before applying",
+                    held_curve_title(&held)
+                ))
+            })?,
+            (None, Some(id)) => id,
+            (None, None) => continue,
+        };
+        standard_curves::models::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            sensor_id: Set(sensor_id),
+            name: Set(held.name.clone()),
+            fitted_on: Set(Some(
+                held.fitted_on.unwrap_or_else(|| Utc::now().date_naive()),
+            )),
+            slope: Set(held.slope),
+            intercept: Set(held.intercept),
+            r_squared: Set(held.r_squared),
+            notes: Set(held.notes.clone()),
+            created_at: Set(Utc::now()),
+            created_by: Set(Some(format!("sync:{source_system}"))),
+            source_system: Set(Some(source_system.to_string())),
+            source_key: Set(Some(held.source_key.clone())),
+            copied_from_id: Set(None),
+            retired_at: Set(None),
+            retired_by: Set(None),
+            retired_reason: Set(None),
+        }
+        .insert(txn)
+        .await?;
+        proposal::Entity::delete_by_id(held.id).exec(txn).await?;
+        created += 1;
+    }
+    Ok(created)
+}
+
 pub(super) struct EntityCaches {
     pub(super) projects: HashMap<String, Uuid>,
     pub(super) groups: HashMap<String, Uuid>,
@@ -3704,6 +3919,7 @@ pub(super) struct ApplyCounters {
     pub(super) streams_skipped: u32,
     pub(super) instruments_created: u32,
     pub(super) curves_assigned: u32,
+    pub(super) curves_created: u32,
 }
 
 /// The streams whose instrument is a creation nobody has agreed to.
@@ -3789,6 +4005,7 @@ pub async fn apply_plan(
 
     refuse_unconfirmed_instruments(&entries)?;
     refuse_unchecked_entries(&entries)?;
+    refuse_unattached_curves(db, &plan.source_system, &plan.curve_attachments.0).await?;
     if let Some(reason) =
         crate::routes::private::data_streams::service::pairing_refusal(&plan.source_system)
     {
@@ -3840,6 +4057,7 @@ pub async fn apply_plan(
         streams_skipped: 0,
         instruments_created: 0,
         curves_assigned: 0,
+        curves_created: 0,
     };
 
     let minted = mint_plan_instruments(&txn, &plan.source_system, &entries).await?;
@@ -3858,6 +4076,13 @@ pub async fn apply_plan(
     counters.instruments_created +=
         admit_instrument_proposals(&txn, &plan.source_system, &plan.instrument_proposals.0).await?;
     counters.curves_assigned = assign_plan_curves(&txn, &curve_intents, &minted).await?;
+    counters.curves_created = create_attached_curves(
+        &txn,
+        &plan.source_system,
+        &plan.curve_attachments.0,
+        &minted,
+    )
+    .await?;
 
     // How far the apply has got, on the pool connection rather than inside `txn`, so the operator
     // sees an import of a couple of thousand entries move instead of a spinner.
@@ -4019,6 +4244,7 @@ pub async fn apply_plan(
         streams_skipped: counters.streams_skipped,
         instruments_created: counters.instruments_created,
         curves_assigned: counters.curves_assigned,
+        curves_created: counters.curves_created,
         groups_created: counters.groups_created,
         group_members_created: counters.group_members_created,
         readings_backfilled,
@@ -4708,6 +4934,7 @@ pub(super) async fn finalize_plan<C: ConnectionTrait>(
         streams_skipped: counters.streams_skipped,
         instruments_created: counters.instruments_created,
         curves_assigned: counters.curves_assigned,
+        curves_created: counters.curves_created,
         groups_created: counters.groups_created,
         group_members_created: counters.group_members_created,
         readings_backfilled,

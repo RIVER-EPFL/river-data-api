@@ -1,10 +1,9 @@
 //! What an instrument row is, on the row.
 //!
-//! Three of the four minting paths produce something that is not a device: the instrument a source
-//! carries for one parameter across every station, the per-slot entry channel behind a hand-typed
-//! value, and the pseudo-instrument a portal curve label mints. `(source_system, source_key)` stays
-//! the identity; `kind` is what a picker and the inventory read to tell a spectrophotometer from a
-//! bookkeeping row.
+//! Two of the three minting paths produce something that is not a device: the instrument a source
+//! carries for one parameter across every station, and the per-slot entry channel behind a
+//! hand-typed value. `(source_system, source_key)` stays the identity; `kind` is what a picker and
+//! the inventory read to tell a spectrophotometer from a bookkeeping row.
 //!
 //! Run: cargo test --test sensors instrument_kinds -- --test-threads=1
 
@@ -156,24 +155,6 @@ async fn each_minting_path_stamps_what_it_made() {
         .try_get::<String>("", "id")
         .expect("sensor id");
     assert_eq!(kind_of(&db, &entry).await, "entry_channel");
-
-    // A portal curve label: not an instrument at all, one row per analyte.
-    let (status, curve) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/standard_curves/register",
-        &json!({
-            "source_system": "cnet",
-            "source_key": "standard_curves:9",
-            "instrument_label": "DOC corr",
-            "slope": 2.0,
-            "intercept": 1.0,
-        }),
-        &token,
-    )
-    .await;
-    assert!((200..300).contains(&status), "curve ({status}): {curve}");
-    let lab = curve["sensor_id"].as_str().expect("curve instrument");
-    assert_eq!(kind_of(&db, lab).await, "lab");
 }
 
 /// Expected behaviour: an instrument created by hand is a device until something says otherwise,

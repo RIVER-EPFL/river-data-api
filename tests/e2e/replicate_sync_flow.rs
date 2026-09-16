@@ -64,25 +64,20 @@ async fn replicate_sync_full_flow() {
     let param = e2e::create_parameter(&app, &token, "doclab", "DOC", "ppb").await;
     let sp = e2e::assign_site_parameter_minimal(&app, &token, &site, &param).await;
 
-    let register_curve = |slope: f64| {
-        json!({
-            "source_system": "cnet",
-            "source_key": "standard_curves:17",
-            "instrument_label": "DOC corr",
-            "slope": slope,
-            "intercept": 1.0,
-        })
-    };
-    let (status, curve_resp) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/standard_curves/register",
-        &register_curve(2.0),
-        &sync_token,
+    // The curve and the lab instrument it was fitted on, as the pairing plan that attached them
+    // leaves them: a sync holds a curve it cannot place, and declaring a feed's instrument is the
+    // operator's decision, so the family below is registered by the operator's token.
+    let (curve, lab_sensor) = crate::common::store_source_curve(
+        &db,
+        "cnet",
+        "DOC corr",
+        "standard_curves:17",
+        "DOC corr 2025-01-01",
+        2.0,
+        1.0,
     )
     .await;
-    assert_eq!(status, 200, "register curve ({status}): {curve_resp}");
-    let curve = curve_resp["id"].as_str().unwrap().to_string();
-    let lab_sensor = curve_resp["sensor_id"].as_str().unwrap().to_string();
+    let (curve, lab_sensor) = (curve.to_string(), lab_sensor.to_string());
 
     let family_registration = |replicates: serde_json::Value, mt: Option<&str>| {
         let mut body = json!({
@@ -108,7 +103,7 @@ async fn replicate_sync_full_flow() {
         &app,
         "/api/streams/register",
         &family_registration(full_spec.clone(), None),
-        &sync_token,
+        &token,
     )
     .await;
     assert_eq!(
@@ -119,7 +114,7 @@ async fn replicate_sync_full_flow() {
         &app,
         "/api/streams/register",
         &family_registration(json!({"source_columns": ["DOC_1_ppb"]}), Some("spot")),
-        &sync_token,
+        &token,
     )
     .await;
     assert_eq!(status, 400, "a single-member spec is refused: {body}");
@@ -128,7 +123,7 @@ async fn replicate_sync_full_flow() {
         &app,
         "/api/streams/register",
         &family_registration(full_spec, Some("spot")),
-        &sync_token,
+        &token,
     )
     .await;
     assert_eq!(status, 200, "register family ({status}): {family_stream}");

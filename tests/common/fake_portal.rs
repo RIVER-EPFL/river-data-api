@@ -255,7 +255,6 @@ impl SourceBackend for FakePortal {
                     calc: Some("mean".to_string()),
                     // Undeclared, as the portals leave it: the slot declaration and the audit
                     // gate own that decision.
-                    sd_estimator: None,
                 }),
                 decimal_places: Some(2),
                 instrument_granularity: None,

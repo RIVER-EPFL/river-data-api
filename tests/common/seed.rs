@@ -1,5 +1,5 @@
 use chrono::{Duration, Utc};
-use sea_orm::DatabaseConnection;
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use uuid::Uuid;
 
 use super::db::exec;
@@ -560,4 +560,57 @@ pub async fn seed_unpaired_stream_with_hierarchy(
         )
         .await;
     }
+}
+
+/// A source curve as an applied pairing plan leaves it: the lab instrument it was attached to,
+/// carrying the source's provenance (`{source_system}:{instrument}`, named `{instrument}
+/// ({source_system})`), and the curve stored on it under the source's key. Registration maps a
+/// portal curve onto a stored row and holds one it cannot find, so a test about what a stored curve
+/// does starts here. Returns `(curve_id, sensor_id)`.
+pub async fn store_source_curve(
+    db: &DatabaseConnection,
+    source_system: &str,
+    instrument: &str,
+    source_key: &str,
+    name: &str,
+    slope: f64,
+    intercept: f64,
+) -> (Uuid, Uuid) {
+    let instrument_key = format!("{source_system}:{instrument}");
+    exec(
+        db,
+        &format!(
+            "INSERT INTO sensors (id, name, is_active, is_lab_instrument, kind, source_system, source_key) \
+             VALUES (gen_random_uuid(), '{instrument} ({source_system})', true, true, 'lab', \
+                     '{source_system}', '{instrument_key}') \
+             ON CONFLICT (source_system, source_key) \
+                 WHERE source_system IS NOT NULL AND source_key IS NOT NULL DO NOTHING"
+        ),
+    )
+    .await;
+    let sensor_id = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT id FROM sensors WHERE source_system = '{source_system}' \
+                 AND source_key = '{instrument_key}'"
+            ),
+        ))
+        .await
+        .expect("find the instrument")
+        .expect("the instrument exists")
+        .try_get::<Uuid>("", "id")
+        .expect("id");
+    let curve_id = Uuid::new_v4();
+    exec(
+        db,
+        &format!(
+            "INSERT INTO standard_curves (id, sensor_id, name, fitted_on, slope, intercept, created_at, \
+                                          source_system, source_key) \
+             VALUES ('{curve_id}', '{sensor_id}', '{name}', '2025-01-01', {slope}, {intercept}, now(), \
+                     '{source_system}', '{source_key}')"
+        ),
+    )
+    .await;
+    (curve_id, sensor_id)
 }

@@ -18,6 +18,7 @@ mod m20260915_000004_drop_calculation_group;
 mod m20260916_000001_sample_sd_only;
 mod m20260916_000002_drop_sync_source_system;
 mod m20260917_000001_site_project_source_links;
+mod m20260917_000002_standard_curve_proposals;
 
 pub struct Migrator;
 
@@ -56,6 +57,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260916_000001_sample_sd_only::Migration),
             Box::new(m20260916_000002_drop_sync_source_system::Migration),
             Box::new(m20260917_000001_site_project_source_links::Migration),
+            Box::new(m20260917_000002_standard_curve_proposals::Migration),
         ]
     }
 }

@@ -104,7 +104,6 @@ fn a_stream_registration_arrives_whole_and_may_omit_metadata() {
             portal_sd_column: Some("DOC_sd_ppb".to_string()),
             curve_ref_column: Some("doc_std_curve_id".to_string()),
             calc: Some("calcMean".to_string()),
-            sd_estimator: Some("population".to_string()),
         }),
         decimal_places: Some(2),
         instrument_granularity: None,
@@ -155,7 +154,6 @@ fn a_replicate_declaration_carries_no_assignments() {
             portal_sd_column: None,
             curve_ref_column: None,
             calc: None,
-            sd_estimator: None,
         },
         assignments: vec![ColumnAssignment {
             column: "DOC_A".to_string(),

@@ -302,6 +302,7 @@ pub const CLEANUP_TRUNCATED_TABLES: &[&str] = &[
     "sync_services",
     "sync_service_credentials",
     "instrument_proposals",
+    "standard_curve_proposals",
     "pairing_plans",
     "data_streams",
     "meteoswiss_fetch_state",

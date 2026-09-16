@@ -15,13 +15,13 @@ use sea_orm::sea_query::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter,
-    QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    QuerySelect, Set, Statement, TransactionTrait,
 };
 use uuid::Uuid;
 
 use super::models::LAST_USED_METHOD;
 use super::models::{
-    Column, Entity, LastUsedCurveQuery, LastUsedCurveResponse, Model, RegisterStandardCurveRequest,
+    Column, Entity, LastUsedCurveQuery, LastUsedCurveResponse, RegisterStandardCurveRequest,
     RegisterStandardCurveResponse, RetireCurveRequest, RetireCurveResponse,
 };
 use super::service::{readings_using, retired_at};
@@ -33,8 +33,6 @@ use crate::routes::private::parameters;
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::service::SPOT;
 use crate::routes::private::sensors;
-use crate::routes::private::sensors::models::InstrumentKind;
-use crate::routes::private::sensors::service::upsert_source_instrument;
 
 /// Whether any reading was corrected with this curve, or any annotation records a source-side
 /// correction made with it; a used curve's coefficients are frozen.
@@ -52,58 +50,6 @@ pub(crate) async fn curve_is_used<C: ConnectionTrait>(conn: &C, id: Uuid) -> App
         .one(conn)
         .await?
         .is_some())
-}
-
-/// Find or create the lab instrument a source's curves attach to, one per
-/// (source_system, instrument_label). `(source_system, source_key)` is the identity, so
-/// re-registration resolves the same instrument instead of minting one per cycle.
-///
-/// The serial lookup is the fallback for an instrument minted before provenance existed whose
-/// curve registration never landed, so the migration's curve-join backfill could not reach it;
-/// resolving it that way stamps the provenance it was missing.
-pub(crate) async fn resolve_lab_instrument(
-    state: &AppState,
-    source_system: &str,
-    instrument_label: &str,
-) -> AppResult<Uuid> {
-    let source_key = format!("{source_system}:{instrument_label}");
-    if let Some(existing) = sensors::Entity::find()
-        .filter(sensors::Column::SourceSystem.eq(source_system))
-        .filter(sensors::Column::SourceKey.eq(source_key.clone()))
-        .one(&state.db)
-        .await?
-    {
-        return Ok(existing.id);
-    }
-    // Rows that predate the provenance columns carry the key in `serial_number`. Only an unclaimed
-    // row may be adopted, so one source can never take over another's instrument, and the oldest
-    // wins so the choice is deterministic now that a serial is no longer unique.
-    if let Some(existing) = sensors::Entity::find()
-        .filter(sensors::Column::SerialNumber.eq(source_key.clone()))
-        .filter(sensors::Column::SourceSystem.is_null())
-        .order_by_asc(sensors::Column::CreatedAt)
-        .one(&state.db)
-        .await?
-    {
-        let id = existing.id;
-        let mut active: sensors::ActiveModel = existing.into();
-        active.source_system = Set(Some(source_system.to_string()));
-        active.source_key = Set(Some(source_key));
-        active.update(&state.db).await?;
-        return Ok(id);
-    }
-    // `serial_number` is left unset: it holds the lab's own serial for an instrument, never a
-    // fabricated copy of the provenance key, which `source_key` already carries.
-    upsert_source_instrument(
-        &state.db,
-        source_system,
-        &source_key,
-        &format!("{instrument_label} ({source_system})"),
-        InstrumentKind::Lab,
-        "low",
-        None,
-    )
-    .await
 }
 
 /// Upsert a standard curve by provenance. Requires `write_metadata` (sync session tokens carry
@@ -134,103 +80,143 @@ pub async fn register_standard_curve(
         ));
     }
 
-    let sensor_id =
-        resolve_lab_instrument(&state, &source_system, &payload.curve.instrument_label).await?;
-
-    let existing = Entity::find()
+    let Some(current) = Entity::find()
         .filter(Column::SourceSystem.eq(source_system.clone()))
         .filter(Column::SourceKey.eq(payload.curve.source_key.clone()))
         .one(&state.db)
-        .await?;
-
-    let coefficients_match = |c: &Model| {
-        c.slope == payload.curve.slope
-            && c.intercept == payload.curve.intercept
-            && c.sensor_id == sensor_id
+        .await?
+    else {
+        hold_curve(&state.db, &source_system, &payload.curve).await?;
+        return Ok(Json(RegisterStandardCurveResponse {
+            id: None,
+            sensor_id: None,
+            superseded: false,
+            proposed: true,
+        }));
     };
 
-    if let Some(current) = existing {
-        if coefficients_match(&current) {
-            return Ok(Json(RegisterStandardCurveResponse {
-                id: current.id,
-                sensor_id,
-                superseded: false,
-            }));
-        }
-        if !curve_is_used(&state.db, current.id).await? {
-            let mut active: super::ActiveModel = current.into();
-            active.sensor_id = Set(sensor_id);
-            active.slope = Set(payload.curve.slope);
-            active.intercept = Set(payload.curve.intercept);
-            active.r_squared = Set(payload.curve.r_squared);
-            if let Some(name) = payload.curve.name.clone() {
-                active.name = Set(Some(name));
-            }
-            if let Some(fitted_on) = payload.curve.fitted_on {
-                active.fitted_on = Set(Some(fitted_on));
-            }
-            let updated = active.update(&state.db).await?;
-            return Ok(Json(RegisterStandardCurveResponse {
-                id: updated.id,
-                sensor_id,
-                superseded: false,
-            }));
-        }
-        // Used curve edited upstream: mint a successor, move the provenance to it and retire the
-        // row it replaces, in one transaction. The old row keeps the readings it produced and the
-        // system it came from; only its `source_key` is cleared, which is what the partial unique
-        // index needs to admit the successor, and the clearing must come first, because while the
-        // old row still holds the key the successor insert conflicts, does nothing, and resolves
-        // back to the old row. Retiring it is what takes it out of the picker: without that, the
-        // lab is offered both rows on one instrument, the same name and fit date on each, and
-        // nothing saying which one the portal now holds.
-        let old_id = current.id;
-        let txn = state.db.begin().await?;
-        Entity::update_many()
-            .col_expr(Column::SourceKey, Expr::value(None::<String>))
-            .filter(Column::Id.eq(old_id))
-            .exec(&txn)
-            .await?;
-        let minted = insert_curve(&txn, &payload, &source_system, sensor_id)
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!("minting successor for edited curve {old_id}: {e}"))
-            })?;
-        Entity::update_many()
-            .col_expr(Column::RetiredAt, Expr::current_timestamp())
-            .col_expr(Column::RetiredBy, Expr::value(Some(source_system.clone())))
-            .col_expr(
-                Column::RetiredReason,
-                Expr::value(Some(format!(
-                    "Superseded by {minted}: {} re-registered {} with different coefficients",
-                    payload.source_system, payload.curve.source_key
-                ))),
-            )
-            .filter(Column::Id.eq(old_id))
-            .filter(Column::RetiredAt.is_null())
-            .exec(&txn)
-            .await?;
-        txn.commit().await?;
-        tracing::warn!(
-            source_system = %payload.source_system,
-            source_key = %payload.curve.source_key,
-            %old_id,
-            new_id = %minted,
-            "Portal edited a standard curve already applied to readings; minted a successor"
-        );
+    // A stored curve's instrument is the one a plan attached it to, so the source's label no
+    // longer has a say in it.
+    let sensor_id = current.sensor_id;
+    if current.slope == payload.curve.slope && current.intercept == payload.curve.intercept {
         return Ok(Json(RegisterStandardCurveResponse {
-            id: minted,
-            sensor_id,
-            superseded: true,
+            id: Some(current.id),
+            sensor_id: Some(sensor_id),
+            superseded: false,
+            proposed: false,
         }));
     }
-
-    let id = insert_curve(&state.db, &payload, &source_system, sensor_id).await?;
+    if !curve_is_used(&state.db, current.id).await? {
+        let mut active: super::ActiveModel = current.into();
+        active.slope = Set(payload.curve.slope);
+        active.intercept = Set(payload.curve.intercept);
+        active.r_squared = Set(payload.curve.r_squared);
+        if let Some(name) = payload.curve.name.clone() {
+            active.name = Set(Some(name));
+        }
+        if let Some(fitted_on) = payload.curve.fitted_on {
+            active.fitted_on = Set(Some(fitted_on));
+        }
+        let updated = active.update(&state.db).await?;
+        return Ok(Json(RegisterStandardCurveResponse {
+            id: Some(updated.id),
+            sensor_id: Some(sensor_id),
+            superseded: false,
+            proposed: false,
+        }));
+    }
+    // Used curve edited upstream: mint a successor, move the provenance to it and retire the
+    // row it replaces, in one transaction. The old row keeps the readings it produced and the
+    // system it came from; only its `source_key` is cleared, which is what the partial unique
+    // index needs to admit the successor, and the clearing must come first, because while the
+    // old row still holds the key the successor insert conflicts, does nothing, and resolves
+    // back to the old row. Retiring it is what takes it out of the picker: without that, the
+    // lab is offered both rows on one instrument, the same name and fit date on each, and
+    // nothing saying which one the portal now holds.
+    let old_id = current.id;
+    let txn = state.db.begin().await?;
+    Entity::update_many()
+        .col_expr(Column::SourceKey, Expr::value(None::<String>))
+        .filter(Column::Id.eq(old_id))
+        .exec(&txn)
+        .await?;
+    let minted = insert_curve(&txn, &payload, &source_system, sensor_id)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!("minting successor for edited curve {old_id}: {e}"))
+        })?;
+    Entity::update_many()
+        .col_expr(Column::RetiredAt, Expr::current_timestamp())
+        .col_expr(Column::RetiredBy, Expr::value(Some(source_system.clone())))
+        .col_expr(
+            Column::RetiredReason,
+            Expr::value(Some(format!(
+                "Superseded by {minted}: {} re-registered {} with different coefficients",
+                payload.source_system, payload.curve.source_key
+            ))),
+        )
+        .filter(Column::Id.eq(old_id))
+        .filter(Column::RetiredAt.is_null())
+        .exec(&txn)
+        .await?;
+    txn.commit().await?;
+    tracing::warn!(
+        source_system = %payload.source_system,
+        source_key = %payload.curve.source_key,
+        %old_id,
+        new_id = %minted,
+        "Portal edited a standard curve already applied to readings; minted a successor"
+    );
     Ok(Json(RegisterStandardCurveResponse {
-        id,
-        sensor_id,
-        superseded: false,
+        id: Some(minted),
+        sensor_id: Some(sensor_id),
+        superseded: true,
+        proposed: false,
     }))
+}
+
+/// Hold a curve no stored row carries yet, keeping the latest coefficients the source sent.
+async fn hold_curve<C: ConnectionTrait>(
+    conn: &C,
+    source_system: &str,
+    curve: &river_data_core::models::StandardCurveUpsert,
+) -> AppResult<()> {
+    use super::models::proposal;
+    use sea_orm::sea_query::OnConflict;
+
+    let now = chrono::Utc::now();
+    let row = proposal::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        source_system: Set(source_system.to_string()),
+        source_key: Set(curve.source_key.clone()),
+        label: Set(curve.instrument_label.clone()),
+        name: Set(curve.name.clone()),
+        slope: Set(curve.slope),
+        intercept: Set(curve.intercept),
+        r_squared: Set(curve.r_squared),
+        fitted_on: Set(curve.fitted_on),
+        notes: Set(curve.notes.clone()),
+        first_seen_at: Set(now),
+        last_seen_at: Set(now),
+    };
+    proposal::Entity::insert(row)
+        .on_conflict(
+            OnConflict::columns([proposal::Column::SourceSystem, proposal::Column::SourceKey])
+                .update_columns([
+                    proposal::Column::Label,
+                    proposal::Column::Name,
+                    proposal::Column::Slope,
+                    proposal::Column::Intercept,
+                    proposal::Column::RSquared,
+                    proposal::Column::FittedOn,
+                    proposal::Column::Notes,
+                    proposal::Column::LastSeenAt,
+                ])
+                .to_owned(),
+        )
+        .exec_without_returning(conn)
+        .await?;
+    Ok(())
 }
 
 async fn insert_curve<C: ConnectionTrait>(

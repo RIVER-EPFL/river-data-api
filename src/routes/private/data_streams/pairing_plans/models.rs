@@ -3,8 +3,8 @@ use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::routes::private::sync::service::{
-    ApplyResult, PlanAcceptedObjects, PlanCurveIntents, PlanEntries, PlanInstrumentProposals,
-    PlanSummary,
+    ApplyResult, PlanAcceptedObjects, PlanCurveAttachments, PlanCurveIntents, PlanEntries,
+    PlanInstrumentProposals, PlanSummary,
 };
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize, EntityToModels)]
@@ -33,6 +33,11 @@ pub struct Model {
     #[sea_orm(column_type = "JsonBinary")]
     #[crudcrate(exclude(create, update), on_create = PlanCurveIntents::default())]
     pub curve_assignments: PlanCurveIntents,
+    /// Held curves the review attached to one of this plan's instruments, `[{proposal_id,
+    /// instrument_source_key | instrument_id}]`, created by the apply under that instrument.
+    #[sea_orm(column_type = "JsonBinary")]
+    #[crudcrate(exclude(create, update), on_create = PlanCurveAttachments::default())]
+    pub curve_attachments: PlanCurveAttachments,
     /// The objects the review has accepted, `[{key, accepted_by, accepted_at}]`. One decision
     /// behind however many rows name it, so it is recorded here and not read back off the rows.
     #[sea_orm(column_type = "JsonBinary")]

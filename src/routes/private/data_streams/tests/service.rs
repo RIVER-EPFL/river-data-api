@@ -27,7 +27,6 @@ fn declaration(columns: &[&str]) -> river_data_core::models::ReplicateSpec {
         portal_sd_column: Some("DOC_sd_ppb".to_string()),
         curve_ref_column: Some("doc_std_curve_id".to_string()),
         calc: Some("calcDOCavg".to_string()),
-        sd_estimator: None,
     }
 }
 

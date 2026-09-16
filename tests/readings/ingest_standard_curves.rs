@@ -27,25 +27,11 @@ async fn setup() -> Fixture {
 }
 
 /// Register a portal curve; returns (curve_id, lab_sensor_id).
+/// A portal curve as a plan stored it, on the instrument named for its label.
 async fn register_curve(fx: &Fixture, source_key: &str, label: &str) -> (String, String) {
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &fx.app,
-        "/api/standard_curves/register",
-        &json!({
-            "source_system": "cnet",
-            "source_key": source_key,
-            "instrument_label": label,
-            "slope": 2.0,
-            "intercept": 1.0,
-        }),
-        &fx.token,
-    )
-    .await;
-    assert_eq!(status, 200, "register curve ({status}): {body}");
-    (
-        body["id"].as_str().unwrap().to_string(),
-        body["sensor_id"].as_str().unwrap().to_string(),
-    )
+    let (curve_id, sensor_id) =
+        crate::common::store_source_curve(&fx.db, "cnet", label, source_key, label, 2.0, 1.0).await;
+    (curve_id.to_string(), sensor_id.to_string())
 }
 
 async fn register_paired_spot_stream(fx: &Fixture, key: &str, sensor_id: &str) -> String {

@@ -90,6 +90,7 @@ async fn a_portal_source_reaches_a_served_value_and_changes_only_when_decided() 
     let plan = crate::common::plans::create_plan(&app, &token, SOURCE_SYSTEM).await;
     let plan_id = plan["id"].as_str().expect("plan id").to_string();
     crate::common::plans::confirm_plan_instruments(&app, &token, &plan_id).await;
+    crate::common::plans::attach_held_curves(&app, &token, &plan_id).await;
     let counts = run_plan_action(&app, &token, &plan_id, "apply").await;
     assert!(
         counts["streams_paired"].as_i64().unwrap_or_default() >= 4,
@@ -258,6 +259,7 @@ async fn a_visit_added_inside_a_reconciled_window_lands_and_a_new_station_reache
     let plan = crate::common::plans::create_plan(&app, &token, SOURCE_SYSTEM).await;
     let plan_id = plan["id"].as_str().expect("plan id").to_string();
     crate::common::plans::confirm_plan_instruments(&app, &token, &plan_id).await;
+    crate::common::plans::attach_held_curves(&app, &token, &plan_id).await;
     run_plan_action(&app, &token, &plan_id, "apply").await;
 
     // A visit entered between two the store already holds: inside the window every pass

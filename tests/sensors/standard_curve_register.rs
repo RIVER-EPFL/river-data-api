@@ -1,7 +1,8 @@
-//! `POST /standard_curves/register`: provenance-keyed idempotent upsert of portal standard
-//! curves. Re-registration resolves the same row and the same lab instrument; changed
-//! coefficients update an unused curve in place; a curve any reading references is frozen, so an
-//! upstream edit mints a successor that takes over the provenance while history keeps the old row.
+//! `POST /standard_curves/register` on a curve a pairing plan has stored: re-registration resolves
+//! the same row on the instrument the plan put it on and mints nothing; changed coefficients update
+//! an unused curve in place; a curve any reading references is frozen, so an upstream edit mints a
+//! successor that takes over the provenance while history keeps the old row. A curve no stored row
+//! carries is held for a plan (`tests/sync/curve_proposals.rs`).
 //!
 //! Run: cargo test --test sensors standard_curve_register -- --test-threads=1
 
@@ -16,13 +17,28 @@ struct Fixture {
     token: String,
 }
 
-async fn setup() -> Fixture {
+/// A seeded app holding `cnet`'s curve 17 at slope 2 and intercept 1, as a plan stored it.
+async fn setup() -> (Fixture, Uuid, Uuid) {
     let f = crate::common::seeded_app().await;
-    Fixture {
-        db: f.db,
-        app: f.app,
-        token: f.token,
-    }
+    let (curve_id, sensor_id) = crate::common::store_source_curve(
+        &f.db,
+        "cnet",
+        "DOC corr",
+        "standard_curves:17",
+        "DOC corr 2025-01-01",
+        2.0,
+        1.0,
+    )
+    .await;
+    (
+        Fixture {
+            db: f.db,
+            app: f.app,
+            token: f.token,
+        },
+        curve_id,
+        sensor_id,
+    )
 }
 
 async fn register(fx: &Fixture, slope: f64, intercept: f64) -> serde_json::Value {
@@ -84,50 +100,36 @@ async fn reference_curve_from_a_reading(db: &DatabaseConnection, curve_id: &str)
 
 #[tokio::test]
 #[serial]
-async fn register_upserts_by_provenance() {
-    let fx = setup().await;
+async fn register_resolves_the_stored_curve_by_provenance() {
+    let (fx, curve_id, sensor_id) = setup().await;
+    let instruments = count(&fx.db, "SELECT COUNT(*) FROM sensors").await;
 
     let first = register(&fx, 2.0, 1.0).await;
-    assert_eq!(first["superseded"], false);
-    let curve_id = first["id"].as_str().unwrap().to_string();
-    let sensor_id = first["sensor_id"].as_str().unwrap().to_string();
-
+    assert_eq!(first["id"], json!(curve_id), "{first}");
     assert_eq!(
-        count(
-            &fx.db,
-            &format!(
-                "SELECT COUNT(*) FROM sensors WHERE id = '{sensor_id}' \
-                 AND source_system = 'cnet' AND source_key = 'cnet:DOC corr' \
-                 AND serial_number IS NULL AND is_lab_instrument"
-            ),
-        )
-        .await,
-        1,
-        "one lab instrument minted per (source_system, instrument_label), identified by its \
-         provenance pair; serial_number holds a real instrument serial or nothing"
+        first["sensor_id"],
+        json!(sensor_id),
+        "on the instrument the plan chose: {first}"
     );
+    assert_eq!(first["superseded"], false);
+    assert_eq!(first["proposed"], false);
 
     let second = register(&fx, 2.0, 1.0).await;
     assert_eq!(second["id"], first["id"], "same coefficients, same curve");
     assert_eq!(second["sensor_id"], first["sensor_id"]);
-    assert_eq!(second["superseded"], false);
 
     assert_eq!(
         count(&fx.db, "SELECT COUNT(*) FROM standard_curves").await,
         1,
-        "re-registration mints nothing"
+        "re-registration mints no curve"
     );
     assert_eq!(
-        count(
-            &fx.db,
-            "SELECT COUNT(*) FROM sensors WHERE is_lab_instrument"
-        )
-        .await,
-        1,
-        "re-registration resolves the existing instrument"
+        count(&fx.db, "SELECT COUNT(*) FROM sensors").await,
+        instruments,
+        "and no instrument"
     );
     assert!(
-        (stored_slope(&fx.db, &curve_id).await - 2.0).abs() < 1e-12,
+        (stored_slope(&fx.db, &curve_id.to_string()).await - 2.0).abs() < 1e-12,
         "the stored coefficients are the registered ones"
     );
 }
@@ -135,7 +137,7 @@ async fn register_upserts_by_provenance() {
 #[tokio::test]
 #[serial]
 async fn changed_coefficients_update_unused_curve() {
-    let fx = setup().await;
+    let (fx, _, _) = setup().await;
 
     let first = register(&fx, 2.0, 1.0).await;
     let curve_id = first["id"].as_str().unwrap().to_string();
@@ -159,7 +161,7 @@ async fn changed_coefficients_update_unused_curve() {
 #[tokio::test]
 #[serial]
 async fn used_curve_edit_mints_successor() {
-    let fx = setup().await;
+    let (fx, _, _) = setup().await;
 
     let first = register(&fx, 2.0, 1.0).await;
     let old_id = first["id"].as_str().unwrap().to_string();
@@ -270,7 +272,7 @@ async fn reference_curve_from_an_annotation(fx: &Fixture, curve_id: &str) {
 #[tokio::test]
 #[serial]
 async fn a_curve_referenced_only_by_an_annotation_is_used() {
-    let fx = setup().await;
+    let (fx, _, _) = setup().await;
     let first = register(&fx, 2.0, 1.0).await;
     let old_id = first["id"].as_str().unwrap().to_string();
     reference_curve_from_an_annotation(&fx, &old_id).await;
@@ -284,46 +286,13 @@ async fn a_curve_referenced_only_by_an_annotation_is_used() {
     );
 }
 
-async fn stored_fitted_on(db: &DatabaseConnection, curve_id: &str) -> Option<String> {
-    db.query_one_raw(Statement::from_string(
-        DatabaseBackend::Postgres,
-        format!("SELECT fitted_on::text AS v FROM standard_curves WHERE id = '{curve_id}'"),
-    ))
-    .await
-    .unwrap()
-    .unwrap()
-    .try_get::<Option<String>>("", "v")
-    .unwrap()
-}
-
 /// Expected behaviour: a curve is identified in the lab by the date it was fitted, so the source's
-/// own date is stored rather than folded into free text, and a source that reports none leaves the
-/// row on its creation date rather than on nothing.
+/// own date is kept on the curve held for a plan rather than folded into free text. The apply
+/// stores it, and a curve reported with none on its creation date (`tests/sync/curve_proposals.rs`).
 #[tokio::test]
 #[serial]
 async fn fitted_on_travels_from_the_source() {
-    let fx = setup().await;
-
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &fx.app,
-        "/api/standard_curves/register",
-        &json!({
-            "source_system": "cnet",
-            "source_key": "standard_curves:17",
-            "instrument_label": "DOC corr",
-            "slope": 2.0,
-            "intercept": 1.0,
-            "fitted_on": "2021-01-28",
-        }),
-        &fx.token,
-    )
-    .await;
-    assert_eq!(status, 200, "register ({status}): {body}");
-    let dated = body["id"].as_str().unwrap().to_string();
-    assert_eq!(
-        stored_fitted_on(&fx.db, &dated).await.as_deref(),
-        Some("2021-01-28")
-    );
+    let (fx, _, _) = setup().await;
 
     let (status, body) = crate::common::post_json_parse_with_token(
         &fx.app,
@@ -334,14 +303,20 @@ async fn fitted_on_travels_from_the_source() {
             "instrument_label": "DOC corr",
             "slope": 2.0,
             "intercept": 1.0,
+            "fitted_on": "2021-01-28",
         }),
         &fx.token,
     )
     .await;
     assert_eq!(status, 200, "register ({status}): {body}");
-    let undated = body["id"].as_str().unwrap().to_string();
-    assert!(
-        stored_fitted_on(&fx.db, &undated).await.is_some(),
-        "a source reporting no date leaves the curve on its creation date, never on NULL"
+    assert_eq!(body["proposed"], true, "{body}");
+    assert_eq!(
+        count(
+            &fx.db,
+            "SELECT COUNT(*) FROM standard_curve_proposals \
+             WHERE source_key = 'standard_curves:18' AND fitted_on = '2021-01-28'",
+        )
+        .await,
+        1
     );
 }

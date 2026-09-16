@@ -124,11 +124,51 @@ impl<'de> Deserialize<'de> for RegisterStandardCurveRequest {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RegisterStandardCurveResponse {
-    pub id: Uuid,
-    pub sensor_id: Uuid,
+    /// The stored curve, or null while it is held for a pairing plan.
+    #[schema(required)]
+    pub id: Option<Uuid>,
+    /// The instrument the curve was fitted on, or null while it is held for a pairing plan.
+    #[schema(required)]
+    pub sensor_id: Option<Uuid>,
     /// True when the stored coefficients differed and the curve was already applied to readings,
     /// so a new row was minted under this provenance. History keeps the old row.
     pub superseded: bool,
+    /// True when no stored curve carries this provenance, so the curve is held until a pairing
+    /// plan attaches it to one of its instruments.
+    pub proposed: bool,
+}
+
+/// A source's standard curve held until a pairing plan attaches it to one of its instruments.
+///
+/// The portal names no instrument for a curve, only its parameter cell (`label`), and a curve
+/// cannot be stored without one, so nothing is created on the way past (Q195).
+pub mod proposal {
+    use sea_orm::entity::prelude::*;
+    use serde::Serialize;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize)]
+    #[sea_orm(table_name = "standard_curve_proposals")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: Uuid,
+        pub source_system: String,
+        pub source_key: String,
+        /// The source's own label for the curve, which is where an attachment is suggested from.
+        pub label: String,
+        pub name: Option<String>,
+        pub slope: f64,
+        pub intercept: f64,
+        pub r_squared: Option<f64>,
+        pub fitted_on: Option<chrono::NaiveDate>,
+        pub notes: Option<String>,
+        pub first_seen_at: chrono::DateTime<chrono::Utc>,
+        pub last_seen_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]

@@ -12,6 +12,7 @@ const T1: &str = "2025-06-10T08:00:00Z";
 struct Fixture {
     app: axum::Router,
     token: String,
+    db: sea_orm::DatabaseConnection,
 }
 
 async fn setup() -> Fixture {
@@ -20,7 +21,7 @@ async fn setup() -> Fixture {
     crate::common::seed_test_data(&db).await;
     let token = crate::common::seed_token_full(&db).await;
     let app = crate::common::build_test_app(db.clone());
-    Fixture { app, token }
+    Fixture { app, token, db }
 }
 
 #[tokio::test]
@@ -28,23 +29,17 @@ async fn setup() -> Fixture {
 async fn overview_lists_instruments_curves_and_their_readings() {
     let fx = setup().await;
 
-    let (status, curve) = crate::common::post_json_parse_with_token(
-        &fx.app,
-        "/api/standard_curves/register",
-        &json!({
-            "source_system": "cnet",
-            "source_key": "standard_curves:3",
-            "instrument_label": "DOC corr",
-            "slope": 2.0,
-            "intercept": 1.0,
-            "name": "DOC corr 2021-01-28",
-        }),
-        &fx.token,
+    let (curve_id, sensor_id) = crate::common::store_source_curve(
+        &fx.db,
+        "cnet",
+        "DOC corr",
+        "standard_curves:3",
+        "DOC corr 2021-01-28",
+        2.0,
+        1.0,
     )
     .await;
-    assert_eq!(status, 200, "register curve ({status}): {curve}");
-    let curve_id = curve["id"].as_str().unwrap().to_string();
-    let sensor_id = curve["sensor_id"].as_str().unwrap().to_string();
+    let (curve_id, sensor_id) = (curve_id.to_string(), sensor_id.to_string());
 
     let (status, stream) = crate::common::post_json_parse_with_token(
         &fx.app,
@@ -141,23 +136,11 @@ async fn sensor_curve_usage_reports_per_curve_counts() {
         ("standard_curves:7", "used"),
         ("standard_curves:8", "unused"),
     ] {
-        let (status, curve) = crate::common::post_json_parse_with_token(
-            &fx.app,
-            "/api/standard_curves/register",
-            &json!({
-                "source_system": "cnet",
-                "source_key": key,
-                "instrument_label": "DOC corr",
-                "slope": 2.0,
-                "intercept": 1.0,
-                "name": name,
-            }),
-            &fx.token,
-        )
-        .await;
-        assert_eq!(status, 200, "register curve ({status}): {curve}");
-        sensor_id = curve["sensor_id"].as_str().unwrap().to_string();
-        curve_ids.push(curve["id"].as_str().unwrap().to_string());
+        let (curve_id, sensor) =
+            crate::common::store_source_curve(&fx.db, "cnet", "DOC corr", key, name, 2.0, 1.0)
+                .await;
+        sensor_id = sensor.to_string();
+        curve_ids.push(curve_id.to_string());
     }
 
     let (status, stream) = crate::common::post_json_parse_with_token(
@@ -239,25 +222,19 @@ async fn the_lab_grouping_reads_the_kind_and_not_the_flag() {
         ("mu spectrophotometer", "lab"),
         ("beta probe", "device"),
     ] {
-        let (status, curve) = crate::common::post_json_parse_with_token(
-            &app,
-            "/api/standard_curves/register",
-            &json!({
-                "source_system": "cnet",
-                "source_key": format!("kinds:{kind}"),
-                "instrument_label": name,
-                "slope": 1.0,
-                "intercept": 0.0,
-                "name": format!("{name} curve"),
-                "fitted_on": "2025-01-01",
-            }),
-            &token,
+        crate::common::store_source_curve(
+            &db,
+            "cnet",
+            name,
+            &format!("kinds:{kind}"),
+            &format!("{name} curve"),
+            1.0,
+            0.0,
         )
         .await;
-        assert_eq!(status, 200, "{curve}");
-        // The register mints every curve label as `lab`; restating the kind here is what puts one
+        // The helper stores every instrument as `lab`; restating the kind here is what puts one
         // row of each on the list, which is the shape the ordering has to survive. The instrument
-        // the register minted is keyed by its label, not by the curve's own source key.
+        // is keyed by its label, not by the curve's own source key.
         crate::common::exec(
             &db,
             &format!(

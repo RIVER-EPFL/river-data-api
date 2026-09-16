@@ -5,11 +5,11 @@
 //! by a `*_std_curve_id` column. The wizard has to settle which instrument each curve column
 //! belongs to before those streams pair.
 //!
-//! Expected behaviour: a curve column whose stem matches one of the source's own curve labels
-//! resolves to that instrument without being asked; one that matches nothing proposes a
-//! placeholder and blocks apply until an operator agrees to it; a stream with no curve column
-//! carries the default registration minted for it and the plan creates nothing further for it.
-//! With the instrument in place, a reading naming the curve is stored instead of dropped.
+//! Expected behaviour: the curves are held, not stored, because the portal names no instrument for
+//! them (Q195); each curve column proposes an instrument an operator confirms; a held curve is
+//! attached to one of the plan's instruments and the apply creates it there; a stream with no
+//! curve column is proposed the source's instrument for its parameter. With the instrument and the
+//! curve in place, a reading naming the curve is stored instead of dropped.
 //!
 //! Run: cargo test --test e2e portal_curve_instrument -- --test-threads=1
 
@@ -34,13 +34,8 @@ fn entry_for<'a>(plan: &'a serde_json::Value, stream_id: &str) -> &'a serde_json
         .unwrap_or_else(|| panic!("entry for stream {stream_id} missing: {plan}"))
 }
 
-/// The curve's id and the lab instrument the registration found or created for its label.
-async fn register_curve_with_instrument(
-    app: &Router,
-    jwt: &str,
-    source_key: &str,
-    label: &str,
-) -> (String, String) {
+/// Register a portal curve, which the API holds for a plan.
+async fn register_curve(app: &Router, jwt: &str, source_key: &str, label: &str) {
     let (status, body) = crate::common::post_json_parse_with_token(
         app,
         "/api/standard_curves/register",
@@ -56,32 +51,10 @@ async fn register_curve_with_instrument(
     )
     .await;
     assert_eq!(status, 200, "register curve {label} ({status}): {body}");
-    (
-        body["id"].as_str().expect("curve id").to_string(),
-        body["sensor_id"].as_str().expect("sensor id").to_string(),
-    )
-}
-
-async fn register_curve(app: &Router, jwt: &str, source_key: &str, label: &str) -> String {
-    let (status, body) = crate::common::post_json_parse_with_token(
-        app,
-        "/api/standard_curves/register",
-        &json!({
-            "source_system": SOURCE,
-            "source_key": source_key,
-            "instrument_label": label,
-            "slope": 2.0,
-            "intercept": 1.0,
-            "name": format!("{label} 2025-01-01"),
-        }),
-        jwt,
-    )
-    .await;
-    assert_eq!(status, 200, "register curve {label} ({status}): {body}");
-    body["id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("curve id: {body}"))
-        .to_string()
+    assert_eq!(
+        body["proposed"], true,
+        "held until a plan attaches it: {body}"
+    );
 }
 
 /// A replicate family the portal corrects through `curve_column`, or a plain single-column stream
@@ -167,19 +140,19 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
     let app = kc::build_test_app_with_keycloak(db.clone()).await;
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
-    let curve_id = register_curve(&app, &admin, "standard_curves:1", "DOC corr").await;
+    register_curve(&app, &admin, "standard_curves:1", "DOC corr").await;
     // The harness seeds one instrument of its own, so the question is what the registration added.
-    let sensors_after_curve = count(
-        &db,
-        &format!(
-            "SELECT COUNT(*) FROM sensors WHERE id <> '{}'",
-            crate::common::FIXTURE_SENSOR_ID
-        ),
-    )
-    .await;
     assert_eq!(
-        sensors_after_curve, 1,
-        "registering a curve creates exactly its lab instrument",
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) FROM sensors WHERE id <> '{}'",
+                crate::common::FIXTURE_SENSOR_ID
+            ),
+        )
+        .await,
+        0,
+        "registering a curve creates no instrument",
     );
 
     let doc = register_stream(&app, &admin, "doc", "DOC", Some("doc_std_curve_id")).await;
@@ -189,38 +162,22 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
     let plan = create_plan(&app, &admin).await;
     let plan_id = e2e::id_of(&plan);
 
-    let doc_instrument = &entry_for(&plan, &doc)["instrument"];
-    assert_eq!(
-        doc_instrument["resolved_by"], "curve_label",
-        "doc_std_curve_id matches the source's own 'DOC corr' label: {doc_instrument}",
-    );
-    assert_eq!(
-        doc_instrument["create"], false,
-        "a matched instrument is not created again: {doc_instrument}",
-    );
-    assert_eq!(
-        doc_instrument["stamps_readings"], true,
-        "the family's own calculation names the curve, so each reading stores it: {doc_instrument}",
-    );
-    assert_eq!(
-        doc_instrument["curves"]
-            .as_array()
-            .map(|c| c.len())
-            .unwrap_or_default(),
-        1,
-        "the instrument's curves travel with the entry: {doc_instrument}",
-    );
-
-    let xyz_instrument = &entry_for(&plan, &xyz)["instrument"];
-    assert_eq!(
-        xyz_instrument["resolved_by"], "placeholder",
-        "nothing matches xyz_std_curve_id: {xyz_instrument}",
-    );
-    assert_eq!(xyz_instrument["create"], true, "{xyz_instrument}");
-    assert_eq!(
-        xyz_instrument["confirmed"], false,
-        "a proposal is not an agreement: {xyz_instrument}",
-    );
+    for (stream, column) in [(&doc, "doc_std_curve_id"), (&xyz, "xyz_std_curve_id")] {
+        let instrument = &entry_for(&plan, stream)["instrument"];
+        assert_eq!(
+            instrument["resolved_by"], "placeholder",
+            "no instrument exists for {column} to match: {instrument}",
+        );
+        assert_eq!(instrument["create"], true, "{instrument}");
+        assert_eq!(
+            instrument["confirmed"], false,
+            "a proposal is not an agreement: {instrument}",
+        );
+        assert_eq!(
+            instrument["stamps_readings"], true,
+            "the family's own calculation names the curve, so each reading stores it: {instrument}",
+        );
+    }
 
     // Registration mints nothing (M172), so a stream with no curve column is proposed one under
     // the source's own parameter key, unconfirmed like every suggestion (Q195).
@@ -239,7 +196,7 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
         "no curve column, so no curve is stored per reading: {plain_instrument}",
     );
     assert_eq!(
-        plan["summary"]["instruments_to_create"], 2,
+        plan["summary"]["instruments_to_create"], 3,
         "counted by identity, not by stream: {}",
         plan["summary"],
     );
@@ -256,32 +213,64 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
         "the refusal names the stream that needs a decision: {refused}",
     );
 
-    let (status, patched) = crate::common::patch_plan_with_token(
+    for (stream, name) in [
+        (&doc, "DOC lab (curvesrc portal)"),
+        (&xyz, "XYZ lab (curvesrc portal)"),
+    ] {
+        let (status, patched) = crate::common::patch_plan_with_token(
+            &app,
+            &plan_id.to_string(),
+            &json!({ "updates": [{
+                "stream_id": stream,
+                "instrument_name": name,
+                "instrument_confirmed": true,
+            }] }),
+            &admin,
+        )
+        .await;
+        assert_eq!(status, 200, "confirm the proposal ({status}): {patched}");
+    }
+
+    // The held curve blocks the apply until it is attached to the instrument its column names.
+    let (status, view) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sync/pairing-plans/{plan_id}/instruments"),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "instruments view ({status}): {view}");
+    let held = view["held_curves"].as_array().expect("held curves");
+    assert_eq!(held.len(), 1, "{view}");
+    let (_, plan) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &admin,
+    )
+    .await;
+    let (status, attached) = crate::common::patch_plan_with_token(
         &app,
         &plan_id.to_string(),
-        &json!({ "updates": [{
-            "stream_id": xyz,
-            "instrument_name": "XYZ lab (curvesrc portal)",
-            "instrument_confirmed": true,
+        &json!({ "held_curves": [{
+            "proposal_id": held[0]["id"],
+            "instrument_source_key": entry_for(&plan, &doc)["instrument"]["source_key"],
         }] }),
         &admin,
     )
     .await;
-    assert_eq!(status, 200, "confirm the proposal ({status}): {patched}");
+    assert_eq!(status, 200, "attach the held curve ({status}): {attached}");
 
     let before_apply = count(&db, "SELECT COUNT(*) FROM sensors").await;
     let counts = apply_plan(&app, &admin, &plan_id).await;
     assert_eq!(
-        counts["instruments_created"], 2,
-        "one for the confirmed curve column and one for the parameter, not one per stream: \
-         {counts}",
+        counts["instruments_created"], 3,
+        "one per confirmed curve column and one for the parameter, not one per stream: {counts}",
     );
     assert_eq!(counts["streams_paired"], 3, "{counts}");
 
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM sensors").await,
-        before_apply + 2,
-        "the apply creates the two the plan named, and nothing else",
+        before_apply + 3,
+        "the apply creates the three the plan named, and nothing else",
     );
     assert_eq!(
         count(
@@ -295,18 +284,15 @@ async fn curve_columns_resolve_to_instruments_before_their_streams_pair() {
         "a stream with no curve column reaches its slot with an instrument all the same: no \
          measurement without one",
     );
-    assert_eq!(
-        count(
-            &db,
-            &format!(
-                "SELECT COUNT(*) FROM data_streams WHERE id IN ('{doc}', '{xyz}') \
-                 AND sensor_id IS NOT NULL"
-            )
-        )
-        .await,
-        2,
-        "both curve streams carry the instrument their curves belong to",
-    );
+    let curve_id = e2e::scalar(
+        &db,
+        &format!(
+            "SELECT c.id::text FROM standard_curves c JOIN data_streams ds ON ds.sensor_id = c.sensor_id \
+             WHERE ds.id = '{doc}' AND c.source_system = '{SOURCE}' \
+               AND c.source_key = 'standard_curves:1'"
+        ),
+    )
+    .await;
 
     let (status, ingested) = crate::common::post_json_parse_with_token(
         &app,
@@ -413,8 +399,17 @@ async fn an_instrument_is_attached_to_streams_whose_source_names_no_curve() {
     let app = kc::build_test_app_with_keycloak(db.clone()).await;
     let admin = kc::get_keycloak_jwt("admin", "admin").await;
 
-    let (_, instrument_id) =
-        register_curve_with_instrument(&app, &admin, "standard_curves:1", "Chla fluorometer").await;
+    let (_, instrument_id) = crate::common::store_source_curve(
+        &db,
+        SOURCE,
+        "Chla fluorometer",
+        "standard_curves:1",
+        "Chla fluorometer 2025-01-01",
+        2.0,
+        1.0,
+    )
+    .await;
+    let instrument_id = instrument_id.to_string();
     let acid = register_stream(&app, &admin, "chla_acid", "chla_acid", None).await;
     let noacid = register_stream(&app, &admin, "chla_noacid", "chla_noacid", None).await;
     let bix = register_stream(&app, &admin, "bix", "BIX", None).await;

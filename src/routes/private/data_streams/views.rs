@@ -324,6 +324,7 @@ pub async fn stream_receipts(
 pub async fn register_stream(
     State(state): State<AppState>,
     ProjectScope(scope): ProjectScope,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Json(RegisterStreamRequest(mut payload)): Json<RegisterStreamRequest>,
 ) -> AppResult<Json<DataStream>> {
     payload.source_system = crate::common::provenance::source_system(&payload.source_system)?;
@@ -353,6 +354,19 @@ pub async fn register_stream(
         .embed(&mut payload.metadata)?;
     }
     if let Some(sensor_id) = payload.sensor_id {
+        // Which instrument produced a feed is the pairing plan's decision (Q195), so a service
+        // speaking for a source cannot settle it on the way past. An operator registering a stream
+        // by hand is that decision being made.
+        if matches!(
+            auth,
+            crate::common::middleware::AuthContext::SyncService { .. }
+        ) {
+            return Err(AppError::Forbidden(format!(
+                "{} cannot declare an instrument on a stream; the pairing plan decides which \
+                 instrument a feed reports",
+                auth.label()
+            )));
+        }
         validate_declared_sensor(&state.db, &scope, sensor_id, &payload.metadata).await?;
     }
     if let Some(places) = payload.decimal_places {

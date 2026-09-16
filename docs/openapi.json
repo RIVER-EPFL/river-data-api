@@ -2051,6 +2051,12 @@
             "minimum": 0,
             "type": "integer"
           },
+          "curves_created": {
+            "description": "Held curves this apply created under the instruments the review attached them to.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
           "group_members_created": {
             "format": "int32",
             "minimum": 0,
@@ -2112,6 +2118,7 @@
           "streams_skipped",
           "instruments_created",
           "curves_assigned",
+          "curves_created",
           "groups_created",
           "group_members_created",
           "readings_backfilled"
@@ -2498,23 +2505,36 @@
       "BulkAction": {
         "additionalProperties": false,
         "properties": {
+          "acknowledged": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "action": {
             "description": "`pair` or `skip`.",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "where": {
             "$ref": "#/components/schemas/BulkWhere"
           }
         },
-        "required": [
-          "action"
-        ],
         "type": "object"
       },
       "BulkWhere": {
         "additionalProperties": false,
         "description": "Which entries a plan-wide bulk action covers. Every field is a further narrowing, so an empty\n`BulkWhere` selects the whole plan; a plan-wide action is then one predicate on the wire rather\nthan one update per entry (1891 for CNET, 29,400 for NOMIS).",
         "properties": {
+          "action": {
+            "description": "`pair` or `skip`, what the entry is set to now.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "confidence": {
             "description": "`exact` when the project, site and parameter all resolved, `none` otherwise.",
             "type": [
@@ -11762,6 +11782,10 @@
             "$ref": "#/components/schemas/PlanCurveIntents",
             "description": "Curves the review assigned to instruments this plan creates, `[{curve_id,\ninstrument_source_key}]`, moved in the apply transaction that mints them."
           },
+          "curve_attachments": {
+            "$ref": "#/components/schemas/PlanCurveAttachments",
+            "description": "Held curves the review attached to one of this plan's instruments, `[{proposal_id,\ninstrument_source_key | instrument_id}]`, created by the apply under that instrument."
+          },
           "entries": {
             "$ref": "#/components/schemas/PlanEntries"
           },
@@ -11796,6 +11820,7 @@
           "summary",
           "entries",
           "curve_assignments",
+          "curve_attachments",
           "accepted_objects",
           "instrument_proposals",
           "version",
@@ -11873,6 +11898,10 @@
             "$ref": "#/components/schemas/PlanCurveIntents",
             "description": "Curves the review assigned to instruments this plan creates, `[{curve_id,\ninstrument_source_key}]`, moved in the apply transaction that mints them."
           },
+          "curve_attachments": {
+            "$ref": "#/components/schemas/PlanCurveAttachments",
+            "description": "Held curves the review attached to one of this plan's instruments, `[{proposal_id,\ninstrument_source_key | instrument_id}]`, created by the apply under that instrument."
+          },
           "entries": {
             "$ref": "#/components/schemas/PlanEntries"
           },
@@ -11907,6 +11936,7 @@
           "summary",
           "entries",
           "curve_assignments",
+          "curve_attachments",
           "accepted_objects",
           "instrument_proposals",
           "version",
@@ -11953,6 +11983,10 @@
             "$ref": "#/components/schemas/PlanCurveIntents",
             "description": "Curves the review assigned to instruments this plan creates, `[{curve_id,\ninstrument_source_key}]`, moved in the apply transaction that mints them."
           },
+          "curve_attachments": {
+            "$ref": "#/components/schemas/PlanCurveAttachments",
+            "description": "Held curves the review attached to one of this plan's instruments, `[{proposal_id,\ninstrument_source_key | instrument_id}]`, created by the apply under that instrument."
+          },
           "entries": {
             "$ref": "#/components/schemas/PlanEntries"
           },
@@ -11987,6 +12021,7 @@
           "summary",
           "entries",
           "curve_assignments",
+          "curve_attachments",
           "accepted_objects",
           "instrument_proposals",
           "version",
@@ -13582,6 +13617,41 @@
         ],
         "type": "object"
       },
+      "PlanCurveAttachment": {
+        "description": "A held curve the review attached to one of the plan's instruments: one the plan creates, by\n`instrument_source_key`, or one that already exists, by `instrument_id`. The apply creates the\ncurve under it (Q195).",
+        "properties": {
+          "instrument_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instrument_source_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "proposal_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "proposal_id",
+          "instrument_source_key",
+          "instrument_id"
+        ],
+        "type": "object"
+      },
+      "PlanCurveAttachments": {
+        "description": "The held curves the review attached, as the column holds them.",
+        "items": {
+          "$ref": "#/components/schemas/PlanCurveAttachment"
+        },
+        "type": "array"
+      },
       "PlanCurveIntent": {
         "description": "A standard curve the review assigned to an instrument the plan creates, keyed by the\ninstrument's `source_key` because the row does not exist until the apply mints it.",
         "properties": {
@@ -13737,6 +13807,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "source_name": {
+            "description": "The name the source sends, which the apply links to the resolved row.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -14032,6 +14109,132 @@
         ],
         "type": "object"
       },
+      "PlanHeldCurve": {
+        "description": "A source's curve held until this plan attaches it to one of its instruments (Q195).",
+        "properties": {
+          "attached": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanHeldCurveTarget",
+                "description": "Where the apply will create it, or null while nothing is attached, which blocks the apply."
+              }
+            ]
+          },
+          "fitted_on": {
+            "format": "date",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "intercept": {
+            "format": "double",
+            "type": "number"
+          },
+          "label": {
+            "description": "The source's own label, the curve's parameter cell. It names no instrument.",
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "r_squared": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "slope": {
+            "format": "double",
+            "type": "number"
+          },
+          "source_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "source_key",
+          "label",
+          "name",
+          "slope",
+          "intercept",
+          "r_squared",
+          "fitted_on",
+          "attached"
+        ],
+        "type": "object"
+      },
+      "PlanHeldCurveTarget": {
+        "description": "The instrument a held curve is attached to.",
+        "properties": {
+          "create": {
+            "description": "True when the instrument is one this plan creates.",
+            "type": "boolean"
+          },
+          "instrument_id": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instrument_name": {
+            "type": "string"
+          },
+          "instrument_source_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "instrument_source_key",
+          "instrument_id",
+          "instrument_name",
+          "create"
+        ],
+        "type": "object"
+      },
+      "PlanHeldCurveUpdate": {
+        "properties": {
+          "instrument_id": {
+            "description": "An instrument that already exists. Naming neither clears the attachment.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instrument_source_key": {
+            "description": "The `source_key` of an instrument the plan proposes creating.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "proposal_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "proposal_id"
+        ],
+        "type": "object"
+      },
       "PlanInstrumentGroup": {
         "description": "One instrument decision in a pairing plan: the instrument, what it covers, and the curves it\nowns. Only instruments the plan actually binds are listed; the rest of the inventory is\nreachable through the picker, so this stays a list of decisions rather than a catalog.",
         "properties": {
@@ -14316,6 +14519,12 @@
             },
             "type": "array"
           },
+          "held_curves": {
+            "items": {
+              "$ref": "#/components/schemas/PlanHeldCurve"
+            },
+            "type": "array"
+          },
           "unassigned": {
             "items": {
               "$ref": "#/components/schemas/PlanUnassignedParameter"
@@ -14327,7 +14536,8 @@
           "groups",
           "unassigned",
           "devices",
-          "curves"
+          "curves",
+          "held_curves"
         ],
         "type": "object"
       },
@@ -14665,6 +14875,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "source_name": {
+            "description": "The name the source sends, which the apply links to the resolved row.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -16869,12 +17086,24 @@
       "RegisterStandardCurveResponse": {
         "properties": {
           "id": {
+            "description": "The stored curve, or null while it is held for a pairing plan.",
             "format": "uuid",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "proposed": {
+            "description": "True when no stored curve carries this provenance, so the curve is held until a pairing\nplan attaches it to one of its instruments.",
+            "type": "boolean"
           },
           "sensor_id": {
+            "description": "The instrument the curve was fitted on, or null while it is held for a pairing plan.",
             "format": "uuid",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "superseded": {
             "description": "True when the stored coefficients differed and the curve was already applied to readings,\nso a new row was minted under this provenance. History keeps the old row.",
@@ -16884,7 +17113,8 @@
         "required": [
           "id",
           "sensor_id",
-          "superseded"
+          "superseded",
+          "proposed"
         ],
         "type": "object"
       },
@@ -17333,13 +17563,6 @@
             ]
           },
           "portal_sd_column": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "sd_estimator": {
-            "description": "The sd divisor the source's own sd column uses ('sample' | 'population'),\nwhen the source declares one. Never inferred; None leaves the slot's\ndeclaration (or the audit gate) to decide.",
             "type": [
               "string",
               "null"
@@ -22957,7 +23180,7 @@
             ]
           },
           "instrument_label": {
-            "description": "The portal curve's parameter label; the API finds-or-creates one lab\ninstrument per (source_system, instrument_label).",
+            "description": "The portal curve's parameter label. The portal names no instrument for a\ncurve, so this is where a pairing plan suggests the attachment from; the\nAPI holds the curve until a plan attaches it to one of its instruments.",
             "type": "string"
           },
           "intercept": {
@@ -25627,7 +25850,7 @@
               },
               {
                 "$ref": "#/components/schemas/BulkAction",
-                "description": "A plan-wide decision, applied before the per-entry updates so an operator can pair what\nmatched, or skip what did not, in one act rather than one line per entry."
+                "description": "One decision over every entry a predicate selects, applied before the per-entry updates."
               }
             ]
           },
@@ -25642,6 +25865,13 @@
             "description": "The version the client read. The write is refused if the plan has moved on since.",
             "format": "int32",
             "type": "integer"
+          },
+          "held_curves": {
+            "description": "Held curves to attach to one of this plan's instruments, created under it when the plan is\napplied.",
+            "items": {
+              "$ref": "#/components/schemas/PlanHeldCurveUpdate"
+            },
+            "type": "array"
           },
           "instruments": {
             "description": "Register rows the review has decided to admit or leave behind, by the source's own key.",

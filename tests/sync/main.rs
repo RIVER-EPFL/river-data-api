@@ -13,6 +13,7 @@ mod control_plane;
 mod control_plane_client;
 mod credential_listing_gate;
 mod credentials;
+mod curve_proposals;
 mod fake_portal_cycle;
 mod hold_delta_expressions;
 mod hold_kinds;

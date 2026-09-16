@@ -1768,6 +1768,15 @@ pub async fn update_pairing_plan(
 
     let mut intents = crate::routes::private::sync::service::plan_curve_intents(&plan)?;
     apply_curve_updates(&state.db, &entries, &mut intents, &req.curves).await?;
+    let mut attachments = plan.curve_attachments.0.clone();
+    crate::routes::private::sync::service::apply_held_curve_updates(
+        &state.db,
+        &plan.source_system,
+        &entries,
+        &mut attachments,
+        &req.held_curves,
+    )
+    .await?;
 
     let mut accepted = plan.accepted_objects.0.clone();
     apply_object_updates(
@@ -1799,14 +1808,17 @@ pub async fn update_pairing_plan(
         .execute_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "UPDATE pairing_plans SET entries = $1, curve_assignments = $2, summary = $3, \
-             accepted_objects = $4, instrument_proposals = $5, version = version + 1 \
-             WHERE id = $6 AND version = $7",
+             accepted_objects = $4, instrument_proposals = $5, curve_attachments = $6, \
+             version = version + 1 WHERE id = $7 AND version = $8",
             [
                 serde_json::to_value(&entries).unwrap_or_default().into(),
                 serde_json::to_value(&intents).unwrap_or_default().into(),
                 summary.into(),
                 serde_json::to_value(&accepted).unwrap_or_default().into(),
                 serde_json::to_value(&proposals).unwrap_or_default().into(),
+                serde_json::to_value(&attachments)
+                    .unwrap_or_default()
+                    .into(),
                 id.into(),
                 req.expected_version.into(),
             ],
@@ -1865,6 +1877,12 @@ pub async fn apply_pairing_plan(
     let entries: Vec<crate::routes::private::sync::service::PlanEntry> = plan.entries.0;
     crate::routes::private::sync::service::refuse_unconfirmed_instruments(&entries)?;
     crate::routes::private::sync::service::refuse_unchecked_entries(&entries)?;
+    crate::routes::private::sync::service::refuse_unattached_curves(
+        &state.db,
+        &plan.source_system,
+        &plan.curve_attachments.0,
+    )
+    .await?;
 
     let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
         &state.db,
@@ -2328,6 +2346,15 @@ pub async fn plan_instruments(
             .then_with(|| a.name.cmp(&b.name))
     });
 
+    let held_curves = held_curve_rows(
+        &state.db,
+        &plan.source_system,
+        &plan.curve_attachments.0,
+        &proposed_names,
+        &instrument_names,
+    )
+    .await?;
+
     // The devices the plan's feeds name, one row per channel: a channel is an instrument, so the
     // key is the feed's own `source_key`. Grouping by serial would merge a multi-channel logger's
     // parameters into one row and then fail to resolve it, since a source-registered instrument
@@ -2406,7 +2433,75 @@ pub async fn plan_instruments(
         unassigned: unassigned.into_values().collect(),
         devices: device_acc.into_values().collect(),
         curves,
+        held_curves,
     }))
+}
+
+/// The curves the source holds for a plan, each with the instrument the review attached it to.
+async fn held_curve_rows(
+    db: &sea_orm::DatabaseConnection,
+    source_system: &str,
+    attachments: &[crate::routes::private::sync::service::PlanCurveAttachment],
+    proposed_names: &std::collections::HashMap<&str, &str>,
+    source_instrument_names: &std::collections::HashMap<Uuid, String>,
+) -> AppResult<Vec<PlanHeldCurve>> {
+    let existing: Vec<Uuid> = attachments.iter().filter_map(|a| a.instrument_id).collect();
+    let mut names = source_instrument_names.clone();
+    if !existing.is_empty() {
+        for sensor in sensors::Entity::find()
+            .filter(sensors::Column::Id.is_in(existing))
+            .all(db)
+            .await?
+        {
+            let name = sensor
+                .name
+                .clone()
+                .or_else(|| sensor.serial_number.clone())
+                .unwrap_or_else(|| sensor.id.to_string());
+            names.insert(sensor.id, name);
+        }
+    }
+    Ok(
+        crate::routes::private::sync::service::held_curves(db, source_system)
+            .await?
+            .into_iter()
+            .map(|c| {
+                let attached = attachments.iter().find(|a| a.proposal_id == c.id).map(|a| {
+                    let (instrument_name, create) =
+                        match (&a.instrument_source_key, a.instrument_id) {
+                            (Some(key), _) => (
+                                proposed_names
+                                    .get(key.as_str())
+                                    .map_or_else(|| key.clone(), |n| (*n).to_string()),
+                                true,
+                            ),
+                            (None, Some(id)) => (
+                                names.get(&id).cloned().unwrap_or_else(|| id.to_string()),
+                                false,
+                            ),
+                            (None, None) => (String::new(), false),
+                        };
+                    PlanHeldCurveTarget {
+                        instrument_source_key: a.instrument_source_key.clone(),
+                        instrument_id: a.instrument_id,
+                        instrument_name,
+                        create,
+                    }
+                });
+                PlanHeldCurve {
+                    id: c.id,
+                    source_key: c.source_key,
+                    label: c.label,
+                    name: c.name,
+                    slope: c.slope,
+                    intercept: c.intercept,
+                    r_squared: c.r_squared,
+                    fitted_on: c.fitted_on,
+                    attached,
+                }
+            })
+            .collect(),
+    )
 }
 
 /// The credential-authenticated entry point, the only route worth brute-forcing.

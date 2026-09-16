@@ -254,8 +254,23 @@ async fn summary_counts_annotated_points_and_csv_exports() {
     );
 }
 
-/// A registered standard curve to reference from an annotation. Returns its id.
+/// A stored standard curve to reference from an annotation. Returns its id.
 async fn register_curve(fx: &Fixture, source_key: &str, slope: f64) -> String {
+    let (curve_id, _) = crate::common::store_source_curve(
+        &fx.db,
+        "cnet",
+        "DOC corr",
+        source_key,
+        "DOC corr 2025-01-01",
+        slope,
+        1.0,
+    )
+    .await;
+    curve_id.to_string()
+}
+
+/// The source re-registering a stored curve with new coefficients. Returns the id it resolves to.
+async fn reregister_curve(fx: &Fixture, source_key: &str, slope: f64) -> String {
     let (status, body) = crate::common::post_json_parse_with_token(
         &fx.app,
         "/api/standard_curves/register",
@@ -264,7 +279,7 @@ async fn register_curve(fx: &Fixture, source_key: &str, slope: f64) -> String {
         &fx.token,
     )
     .await;
-    assert_eq!(status, 200, "register curve ({status}): {body}");
+    assert_eq!(status, 200, "re-register curve ({status}): {body}");
     body["id"].as_str().unwrap().to_string()
 }
 
@@ -330,7 +345,7 @@ async fn a_curve_annotation_is_frozen_once_it_names_its_curve() {
     let same = register_with_curve(&fx, &stream, key, "curve 'A' (raw * 2 + 1)", &curve).await;
     assert_eq!(same["status"], "unchanged", "{same}");
 
-    let successor = register_curve(&fx, "standard_curves:5", 3.0).await;
+    let successor = reregister_curve(&fx, "standard_curves:5", 3.0).await;
     assert_ne!(
         successor, curve,
         "the referenced curve is used, so the edit mints a successor"

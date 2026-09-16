@@ -697,6 +697,10 @@ pub struct UpdatePairingPlanRequest {
     /// plan is applied, in the transaction that mints the instrument.
     #[serde(default)]
     pub curves: Vec<PlanCurveUpdate>,
+    /// Held curves to attach to one of this plan's instruments, created under it when the plan is
+    /// applied.
+    #[serde(default)]
+    pub held_curves: Vec<PlanHeldCurveUpdate>,
     /// Objects the review has accepted or taken back, `{kind}:{name}` as the card names them.
     #[serde(default)]
     pub objects: Vec<PlanObjectUpdate>,
@@ -742,6 +746,17 @@ pub struct PlanCurveUpdate {
     /// leaving the curve on the instrument it has.
     #[serde(default)]
     pub instrument_source_key: Option<String>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct PlanHeldCurveUpdate {
+    pub proposal_id: Uuid,
+    /// The `source_key` of an instrument the plan proposes creating.
+    #[serde(default)]
+    pub instrument_source_key: Option<String>,
+    /// An instrument that already exists. Naming neither clears the attachment.
+    #[serde(default)]
+    pub instrument_id: Option<Uuid>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -932,12 +947,45 @@ pub struct PlanDeviceGroup {
     pub anchor_stream_id: Uuid,
 }
 
+/// A source's curve held until this plan attaches it to one of its instruments (Q195).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PlanHeldCurve {
+    pub id: Uuid,
+    pub source_key: String,
+    /// The source's own label, the curve's parameter cell. It names no instrument.
+    pub label: String,
+    #[schema(required)]
+    pub name: Option<String>,
+    pub slope: f64,
+    pub intercept: f64,
+    #[schema(required)]
+    pub r_squared: Option<f64>,
+    #[schema(required)]
+    pub fitted_on: Option<chrono::NaiveDate>,
+    /// Where the apply will create it, or null while nothing is attached, which blocks the apply.
+    #[schema(required)]
+    pub attached: Option<PlanHeldCurveTarget>,
+}
+
+/// The instrument a held curve is attached to.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PlanHeldCurveTarget {
+    #[schema(required)]
+    pub instrument_source_key: Option<String>,
+    #[schema(required)]
+    pub instrument_id: Option<Uuid>,
+    pub instrument_name: String,
+    /// True when the instrument is one this plan creates.
+    pub create: bool,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PlanInstrumentsResponse {
     pub groups: Vec<PlanInstrumentGroup>,
     pub unassigned: Vec<PlanUnassignedParameter>,
     pub devices: Vec<PlanDeviceGroup>,
     pub curves: Vec<PlanCurveAssignment>,
+    pub held_curves: Vec<PlanHeldCurve>,
 }
 
 /// Commands the API queues for a sync service to collect on its next heartbeat.

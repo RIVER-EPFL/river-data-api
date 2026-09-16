@@ -142,6 +142,52 @@ pub async fn confirm_plan_instruments(app: &Router, token: &str, plan_id: &str) 
     assert_eq!(status, 200, "confirming the plan's instruments: {text}");
 }
 
+/// Attach every curve the plan's source holds to the instrument the plan proposes for its curve
+/// column, which is the review's answer for a source carrying one curve column. Fails when the
+/// plan proposes no such instrument, since the apply would refuse the plan anyway.
+pub async fn attach_held_curves(app: &Router, token: &str, plan_id: &str) {
+    let (status, view) = super::get_json_with_token(
+        app,
+        &format!("/api/sync/pairing-plans/{plan_id}/instruments"),
+        token,
+    )
+    .await;
+    assert_eq!(status, 200, "reading the plan's held curves: {view}");
+    let held: Vec<serde_json::Value> = view["held_curves"]
+        .as_array()
+        .map(|curves| curves.iter().map(|c| c["id"].clone()).collect())
+        .unwrap_or_default();
+    if held.is_empty() {
+        return;
+    }
+    let (status, plan) =
+        super::get_json_with_token(app, &format!("/api/sync/pairing-plans/{plan_id}"), token).await;
+    assert_eq!(status, 200, "reading the plan's instruments: {plan}");
+    let instrument_key = plan["entries"]
+        .as_array()
+        .and_then(|entries| {
+            entries.iter().find(|e| {
+                e["action"] == json!("pair")
+                    && e["instrument"]["create"] == json!(true)
+                    && e["instrument"]["curve_column"].is_string()
+            })
+        })
+        .map(|e| e["instrument"]["source_key"].clone())
+        .unwrap_or_else(|| panic!("the plan proposes no instrument for a curve column: {plan}"));
+    let attachments: Vec<serde_json::Value> = held
+        .iter()
+        .map(|id| json!({ "proposal_id": id, "instrument_source_key": instrument_key }))
+        .collect();
+    let (status, text) = super::patch_json_with_token(
+        app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &json!({ "expected_version": plan["version"], "held_curves": attachments }),
+        token,
+    )
+    .await;
+    assert_eq!(status, 200, "attaching the held curves: {text}");
+}
+
 /// Post `apply`/`revert` on a plan, wait for its job to reach `completed`, and return the job's
 /// `detail.counts`. The pairing, the backfill and the plan's status transition all happen in that
 /// job, so a fact read from the database is only true once this has returned.

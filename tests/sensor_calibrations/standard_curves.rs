@@ -810,21 +810,16 @@ async fn attribution_is_stored_on_create_and_the_fit_quality_freezes_with_the_co
 async fn a_copied_curve_names_its_origin_and_leaves_the_portal_identity_on_the_original() {
     let fx = setup().await;
 
-    let (status, registered) = post_json_parse_with_token(
-        &fx.app,
-        "/api/standard_curves/register",
-        &json!({
-            "source_system": "cnet",
-            "source_key": "standard_curves:41",
-            "instrument_label": "DOC corr",
-            "slope": 2.0,
-            "intercept": 1.0,
-        }),
-        &fx.token,
+    let (original, _) = crate::common::store_source_curve(
+        &fx.db,
+        "cnet",
+        "DOC corr",
+        "standard_curves:41",
+        "DOC corr 2025-01-01",
+        2.0,
+        1.0,
     )
     .await;
-    assert_eq!(status, 200, "register the portal curve: {registered}");
-    let original: Uuid = registered["id"].as_str().unwrap().parse().unwrap();
 
     // The copy the split writes: the original's coefficients on the receiving instrument, naming
     // where it came from and claiming none of the source's identity.
