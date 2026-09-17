@@ -153,6 +153,28 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     );
     assert_eq!(e["parameter"]["create"], false);
 
+    // rename what the plan creates: the project everywhere, one site, and the new parameter
+    let (status, body) = crate::common::patch_plan_with_token(
+        &app,
+        &plan_id.to_string(),
+        &serde_json::json!({"updates": [
+            {"stream_id": cond1, "project_name": "Glacier streams", "site_name": "Glacier 1 downstream"},
+            {"stream_id": temp1, "project_name": "Glacier streams", "site_name": "Glacier 1 downstream", "parameter_name": "Water temperature"},
+            {"stream_id": cond2, "project_name": "Glacier streams"},
+            {"stream_id": temp2, "project_name": "Glacier streams", "parameter_name": "Water temperature"}
+        ]}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "rename in plan ({status}): {body}");
+    let plan: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let e = find_entry(&plan, &temp1);
+    assert_eq!(e["project"]["name"], "Glacier streams");
+    assert_eq!(e["project"]["create"], true);
+    assert_eq!(e["site"]["name"], "Glacier 1 downstream");
+    assert_eq!(e["parameter"]["name"], "Water temperature");
+    assert_eq!(e["parameter"]["create"], true);
+
     // apply (runs as a plan_apply job)
     let counts = run_plan_action(&app, &token, &plan_id, "apply").await;
     assert_eq!(counts["streams_paired"], 4);
@@ -164,6 +186,42 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     );
     assert_eq!(counts["site_parameters_created"], 4);
     assert_eq!(counts["readings_backfilled"], 12);
+    for (sql, what) in [
+        (
+            "SELECT count(*) AS c FROM projects WHERE name = 'Glacier streams'",
+            "the renamed project",
+        ),
+        (
+            "SELECT count(*) AS c FROM sites WHERE name = 'Glacier 1 downstream'",
+            "the renamed site",
+        ),
+        (
+            "SELECT count(*) AS c FROM parameters WHERE name = 'Water temperature'",
+            "the renamed parameter",
+        ),
+    ] {
+        assert_eq!(count(&db, sql).await, 1, "apply created {what}");
+    }
+    for (sql, what) in [
+        (
+            "SELECT count(*) AS c FROM projects WHERE name = 'METALP'",
+            "the source's project name",
+        ),
+        (
+            "SELECT count(*) AS c FROM sites WHERE name = 'GL1_DN'",
+            "the source's site name",
+        ),
+        (
+            "SELECT count(*) AS c FROM parameters WHERE name = 'Temperature'",
+            "the source's parameter name",
+        ),
+    ] {
+        assert_eq!(
+            count(&db, sql).await,
+            0,
+            "apply created nothing under {what}"
+        );
+    }
 
     assert_eq!(
         count(&db, &format!(
@@ -228,7 +286,7 @@ async fn create_inspect_update_apply_revert_full_lifecycle() {
     assert!(
         count(
             &db,
-            "SELECT count(*) AS c FROM sites WHERE LOWER(name) IN ('gl1_dn','gl2_up')"
+            "SELECT count(*) AS c FROM sites WHERE LOWER(name) IN ('glacier 1 downstream','gl2_up')"
         )
         .await
             >= 2,

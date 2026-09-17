@@ -1082,3 +1082,96 @@ async fn an_untouched_plan_is_refused_until_its_suggestions_are_accepted() {
     let after = scalar_i64(&db, "SELECT count(*)::bigint AS v FROM sensors").await;
     assert_eq!(after - before, 2, "each accepted suggestion is minted once");
 }
+
+/// Scenario: the source's `toc` column is measured by the same analyser as `doc`, so the reviewer
+/// names toc's instrument `DOC`, after the one the plan proposes for doc.
+/// Expected behaviour: the plan lists one instrument covering both parameters, and the apply
+/// creates one instrument that both streams name.
+#[tokio::test]
+#[serial]
+async fn naming_an_instrument_after_another_proposal_joins_the_two() {
+    let (app, token, db) = setup().await;
+    let doc = Uuid::new_v4();
+    let toc = Uuid::new_v4();
+    for (stream, key, parameter) in [(doc, "FP1:doc", "doc"), (toc, "FP1:toc", "toc")] {
+        crate::common::seed_unpaired_stream_with_hierarchy(
+            &db,
+            &stream.to_string(),
+            SOURCE,
+            key,
+            "Test River Project",
+            "Station One",
+            parameter,
+            "ppb",
+            None,
+            0,
+        )
+        .await;
+        crate::common::exec(
+            &db,
+            &format!("UPDATE data_streams SET sensor_id = NULL WHERE id = '{stream}'"),
+        )
+        .await;
+    }
+
+    let plan = create_plan(&app, &token).await;
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+    let doc_instrument = entry_for(&plan, doc)["instrument"].clone();
+    assert_ne!(
+        doc_instrument["source_key"],
+        entry_for(&plan, toc)["instrument"]["source_key"],
+        "each parameter starts with a proposal of its own: {plan}"
+    );
+
+    let (status, body) = patch_entry(
+        &app,
+        &token,
+        &plan_id,
+        serde_json::json!({ "stream_id": toc, "instrument_name": doc_instrument["name"].as_str().unwrap().to_uppercase() }),
+    )
+    .await;
+    assert_eq!(status, 200, "name toc's instrument ({status}): {body}");
+    let joined: serde_json::Value = serde_json::from_str(&body).expect("the plan comes back");
+    assert_eq!(
+        entry_for(&joined, toc)["instrument"]["source_key"],
+        doc_instrument["source_key"],
+        "toc is on doc's instrument: {joined}"
+    );
+
+    let listed = plan_instruments(&app, &token, &plan_id).await;
+    let rows: Vec<&serde_json::Value> = listed["groups"]
+        .as_array()
+        .expect("groups")
+        .iter()
+        .filter(|g| {
+            g["parameters"]
+                .as_array()
+                .is_some_and(|p| p.iter().any(|x| x == "doc" || x == "toc"))
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "one row covers both: {listed}");
+    assert_eq!(rows[0]["parameters"], serde_json::json!(["doc", "toc"]));
+
+    let (status, body) = patch_entry(
+        &app,
+        &token,
+        &plan_id,
+        serde_json::json!({ "stream_id": doc, "instrument_confirmed": true }),
+    )
+    .await;
+    assert_eq!(status, 200, "confirm ({status}): {body}");
+    apply_and_wait(&app, &db, &token, &plan_id).await;
+
+    let instruments = scalar_i64(
+        &db,
+        &format!(
+            "SELECT count(DISTINCT sensor_id)::bigint AS v FROM data_streams \
+              WHERE id IN ('{doc}', '{toc}') AND sensor_id IS NOT NULL"
+        ),
+    )
+    .await;
+    assert_eq!(
+        instruments, 1,
+        "both streams name the one instrument the apply created"
+    );
+}

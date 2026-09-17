@@ -688,8 +688,7 @@ pub struct PairingPlanSummary {
 pub struct UpdatePairingPlanRequest {
     /// The version the client read. The write is refused if the plan has moved on since.
     pub expected_version: i32,
-    /// A plan-wide decision, applied before the per-entry updates so an operator can pair what
-    /// matched, or skip what did not, in one act rather than one line per entry.
+    /// One decision over every entry a predicate selects, applied before the per-entry updates.
     #[serde(default)]
     pub bulk: Option<BulkAction>,
     #[serde(default)]
@@ -730,7 +729,10 @@ pub struct BulkAction {
     #[serde(default)]
     pub r#where: crate::routes::private::sync::service::BulkWhere,
     /// `pair` or `skip`.
-    pub action: String,
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub acknowledged: Option<bool>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]

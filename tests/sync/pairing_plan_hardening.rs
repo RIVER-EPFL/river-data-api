@@ -976,7 +976,8 @@ async fn non_draft_plan_refusals_are_conflicts() {
 }
 
 /// A plan-wide decision is one predicate on the wire: skip everything the catalog did not
-/// recognise, without a line per entry, and pair back exactly that set with the opposite action.
+/// recognise, without a line per entry, pair back exactly that set with the opposite action, and
+/// mark the rows a predicate selects as reviewed.
 #[tokio::test]
 #[serial]
 async fn a_bulk_decision_moves_every_entry_its_predicate_selects() {
@@ -1059,6 +1060,39 @@ async fn a_bulk_decision_moves_every_entry_its_predicate_selects() {
         entry_for(&plan, unknown)["action"],
         serde_json::json!("pair")
     );
+
+    let (status, body) = crate::common::patch_plan_with_token(
+        &app,
+        &plan_id.to_string(),
+        &serde_json::json!({ "bulk": {
+            "where": { "action": "pair", "confidence": "none" },
+            "acknowledged": true
+        } }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "a predicate marks its rows reviewed: {body}");
+    let plan: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        entry_for(&plan, unknown)["acknowledged"],
+        serde_json::json!(true)
+    );
+    for stream in [known_a, known_b] {
+        assert_eq!(
+            entry_for(&plan, stream)["acknowledged"],
+            serde_json::json!(false),
+            "a matched entry is outside the filter"
+        );
+    }
+
+    let (status, body) = crate::common::patch_plan_with_token(
+        &app,
+        &plan_id.to_string(),
+        &serde_json::json!({ "bulk": { "where": {} } }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 400, "a bulk action that sets nothing: {body}");
 
     let (status, body) = crate::common::patch_plan_with_token(
         &app,

@@ -5588,6 +5588,9 @@ pub struct BulkWhere {
     pub site_name: Option<String>,
     #[serde(default)]
     pub parameter_name: Option<String>,
+    /// `pair` or `skip`, what the entry is set to now.
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
 /// The positions in `entries` the predicate picks.
@@ -5611,30 +5614,46 @@ pub fn select_entries(entries: &[PlanEntry], filter: &BulkWhere) -> Vec<usize> {
                     .parameter_name
                     .as_deref()
                     .is_none_or(|n| e.parameter.name.eq_ignore_ascii_case(n))
+                && filter.action.as_deref().is_none_or(|a| e.action == a)
         })
         .map(|(i, _)| i)
         .collect()
 }
 
-/// Apply a bulk action to the selected entries. An entry with no site or no parameter name is
-/// never set to `pair`: there is no slot to pair it to, which is the rule the per-entry updates
-/// already enforce.
-pub fn apply_bulk_action(entries: &mut [PlanEntry], filter: &BulkWhere, action: &str) -> usize {
+/// Apply a bulk action to the selected entries, returning how many moved. An entry with no site
+/// or no parameter name is never set to `pair`: there is no slot to pair it to, which is the rule
+/// the per-entry updates already enforce.
+pub fn apply_bulk_action(
+    entries: &mut [PlanEntry],
+    filter: &BulkWhere,
+    action: Option<&str>,
+    acknowledged: Option<bool>,
+) -> usize {
     let selected = select_entries(entries, filter);
     let mut changed = 0;
     for i in selected {
         let entry = &mut entries[i];
-        let target = if action == "pair"
-            && (entry.site.name.trim().is_empty() || entry.parameter.name.trim().is_empty())
-        {
-            "skip"
-        } else {
-            action
-        };
-        if entry.action != target {
-            entry.action = target.to_string();
-            changed += 1;
+        let mut moved = false;
+        if let Some(action) = action {
+            let target = if action == "pair"
+                && (entry.site.name.trim().is_empty() || entry.parameter.name.trim().is_empty())
+            {
+                "skip"
+            } else {
+                action
+            };
+            if entry.action != target {
+                entry.action = target.to_string();
+                moved = true;
+            }
         }
+        if let Some(acknowledged) = acknowledged
+            && entry.acknowledged != acknowledged
+        {
+            entry.acknowledged = acknowledged;
+            moved = true;
+        }
+        changed += usize::from(moved);
     }
     changed
 }
@@ -5829,6 +5848,70 @@ pub(super) fn instrument_key(entry: &crate::routes::private::sync::service::Plan
             format!("instrument:{}", instrument.source_key)
         }
         _ => instrument_scope(entry),
+    }
+}
+
+/// Join the instrument an entry was just named to another this plan creates under that name, so
+/// two parameters named after one instrument are one row in the review and one instrument on
+/// apply. The joined row takes the other instrument's identity and review. A parameter still
+/// waiting on its own suggested instrument of that name joins too, unreviewed.
+pub(super) fn join_named_proposal(entries: &mut [PlanEntry], stream_id: Uuid, source_system: &str) {
+    let Some(named) = entries.iter().find(|e| e.stream_id == stream_id) else {
+        return;
+    };
+    let Some(proposal) = named
+        .instrument
+        .as_ref()
+        .filter(|i| !named.is_device && i.create && i.id.is_none())
+    else {
+        return;
+    };
+    let own_key = instrument_key(named);
+    let name = proposal.name.trim().to_lowercase();
+    let template = proposal.clone();
+
+    let other = entries
+        .iter()
+        .filter(|e| !e.is_device && instrument_key(e) != own_key)
+        .filter_map(|e| e.instrument.as_ref())
+        .find(|i| i.create && i.id.is_none() && i.name.trim().to_lowercase() == name)
+        .map(|i| (i.source_key.clone(), i.confirmed));
+    let (source_key, confirmed) = match other {
+        Some(joined) => joined,
+        None => {
+            let waiting: Vec<usize> = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    !e.is_device
+                        && e.instrument.is_none()
+                        && e.parameter.name.trim().to_lowercase() == name
+                })
+                .map(|(i, _)| i)
+                .collect();
+            let Some(&first) = waiting.first() else {
+                return;
+            };
+            // The key that parameter's own suggestion would have been created under.
+            let key = format!("{source_system}:{}", entries[first].parameter.name);
+            for i in waiting {
+                entries[i].instrument = Some(PlanInstrumentRef {
+                    curve_column: None,
+                    source_key: key.clone(),
+                    confirmed: false,
+                    curves: Vec::new(),
+                    name_conflict: None,
+                    ..template.clone()
+                });
+            }
+            (key, false)
+        }
+    };
+    for entry in entries.iter_mut().filter(|e| instrument_key(e) == own_key) {
+        if let Some(instrument) = entry.instrument.as_mut() {
+            instrument.source_key.clone_from(&source_key);
+            instrument.confirmed = confirmed;
+        }
     }
 }
 
@@ -6103,6 +6186,9 @@ pub(super) async fn apply_instrument_updates(
             if let Some(confirmed) = update.instrument_confirmed {
                 instrument.confirmed = confirmed;
             }
+        }
+        if update.instrument_name.is_some() && repointed.is_none() {
+            join_named_proposal(entries, update.stream_id, source_system);
         }
     }
     Ok(())

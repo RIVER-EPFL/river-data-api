@@ -1,8 +1,9 @@
 use super::{
     BulkWhere, EntityCatalog, InstrumentCatalog, InstrumentNameConflict, PlanCalculationRef,
-    PlanEntry, PlanGroupRef, apply_bulk_action, apply_group_updates, family_parameter_suggestion,
-    group_code, linked_entity, minted_param_needs_review, plan_calculation, proposal_conflict,
-    resolve_parameter_instrument, select_entries, stream_instrument_key,
+    PlanEntry, PlanGroupRef, PlanInstrumentRef, apply_bulk_action, apply_group_updates,
+    family_parameter_suggestion, group_code, instrument_key, join_named_proposal, linked_entity,
+    minted_param_needs_review, plan_calculation, proposal_conflict, resolve_parameter_instrument,
+    select_entries, stream_instrument_key,
 };
 use crate::routes::private::sync::models::PlanEntryUpdate;
 use std::collections::{HashMap, HashSet};
@@ -313,6 +314,45 @@ fn test_select_entries_picks_exactly_each_predicate_s_set() {
 }
 
 #[test]
+fn test_select_entries_picks_by_what_the_entry_is_set_to() {
+    let mut entries = vec![
+        plan_entry("FP1", "Depth", "exact", 0),
+        plan_entry("FP2", "Depth", "none", 0),
+    ];
+    entries[1].action = "skip".to_string();
+
+    let set_to = |a: &str| BulkWhere {
+        action: Some(a.into()),
+        ..Default::default()
+    };
+    assert_eq!(select_entries(&entries, &set_to("pair")), vec![0]);
+    assert_eq!(select_entries(&entries, &set_to("skip")), vec![1]);
+}
+
+#[test]
+fn test_apply_bulk_action_marks_reviewed_and_counts_each_entry_once() {
+    let mut entries = vec![
+        plan_entry("FP1", "Depth", "none", 0),
+        plan_entry("FP1", "CDOM", "none", 0),
+    ];
+    entries[1].acknowledged = true;
+    entries[1].action = "skip".to_string();
+
+    let changed = apply_bulk_action(
+        &mut entries,
+        &BulkWhere::default(),
+        Some("pair"),
+        Some(true),
+    );
+    assert_eq!(changed, 2);
+    assert!(entries.iter().all(|e| e.acknowledged && e.action == "pair"));
+
+    let changed = apply_bulk_action(&mut entries, &BulkWhere::default(), None, Some(false));
+    assert_eq!(changed, 2, "and unmarking is its inverse");
+    assert!(entries.iter().all(|e| !e.acknowledged));
+}
+
+#[test]
 fn test_apply_bulk_action_never_pairs_an_entry_with_no_slot() {
     let mut entries = vec![
         plan_entry("", "Depth", "none", 0),
@@ -323,13 +363,13 @@ fn test_apply_bulk_action_never_pairs_an_entry_with_no_slot() {
         entry.action = "skip".to_string();
     }
 
-    let changed = apply_bulk_action(&mut entries, &BulkWhere::default(), "pair");
+    let changed = apply_bulk_action(&mut entries, &BulkWhere::default(), Some("pair"), None);
     assert_eq!(changed, 1, "only the entry that names a slot moves");
     assert_eq!(entries[0].action, "skip");
     assert_eq!(entries[1].action, "skip");
     assert_eq!(entries[2].action, "pair");
 
-    let changed = apply_bulk_action(&mut entries, &BulkWhere::default(), "skip");
+    let changed = apply_bulk_action(&mut entries, &BulkWhere::default(), Some("skip"), None);
     assert_eq!(changed, 1, "and skipping is its inverse");
     assert!(entries.iter().all(|e| e.action == "skip"));
 }
@@ -533,6 +573,36 @@ fn test_a_blank_group_description_clears_it() {
     );
 }
 
+/// A project or site renamed in the review pairs onto the catalog entry it now names, matched
+/// without regard to case, and is proposed for creation under any other name.
+#[test]
+fn test_reclassify_entry_resolves_a_renamed_project_and_site_against_the_catalog() {
+    let project = Uuid::new_v4();
+    let site = Uuid::new_v4();
+    let catalog = EntityCatalog {
+        projects: vec![(project, "METALP".to_string())],
+        sites: vec![(site, "Martigny".to_string())],
+        ..EntityCatalog::default()
+    };
+    let mut entry = plan_entry("FP1", "Depth", "none", 0);
+
+    entry.project.name = "metalp".to_string();
+    entry.site.name = "martigny".to_string();
+    super::reclassify_entry(&mut entry, &catalog);
+    assert_eq!(entry.project.id, Some(project));
+    assert!(!entry.project.create);
+    assert_eq!(entry.site.id, Some(site));
+    assert!(!entry.site.create);
+
+    entry.project.name = "Glacier streams".to_string();
+    entry.site.name = "Glacier 1 downstream".to_string();
+    super::reclassify_entry(&mut entry, &catalog);
+    assert_eq!(entry.project.id, None);
+    assert!(entry.project.create);
+    assert_eq!(entry.site.id, None);
+    assert!(entry.site.create);
+}
+
 /// The review's acceptance of the object is the review the flag asks for, so an accepted mint
 /// lands clear and one nobody accepted stays flagged.
 #[test]
@@ -658,4 +728,84 @@ fn test_linked_entity_ignores_an_entry_renamed_in_the_plan() {
 fn test_linked_entity_unlinked_name_resolves_nothing() {
     let links = HashMap::new();
     assert_eq!(linked_entity(Some("S01"), "S01", &links, &[]), None);
+}
+
+fn proposal(source_key: &str, name: &str, confirmed: bool) -> PlanInstrumentRef {
+    serde_json::from_value(serde_json::json!({
+        "curve_column": null, "id": null, "name": name, "source_key": source_key,
+        "resolved_by": "placeholder", "create": true, "confirmed": confirmed,
+        "stamps_readings": false, "curves": [], "proposed_name": name,
+    }))
+    .expect("a proposal")
+}
+
+fn with_instrument(parameter: &str, instrument: Option<PlanInstrumentRef>) -> PlanEntry {
+    let mut entry = plan_entry("FP1", parameter, "none", 0);
+    entry.instrument = instrument;
+    entry
+}
+
+#[test]
+fn test_join_named_proposal_merges_into_the_instrument_of_that_name() {
+    let mut entries = vec![
+        with_instrument("A", Some(proposal("cnet:A", "A", true))),
+        with_instrument("A_T", Some(proposal("cnet:A_T", "a", false))),
+        with_instrument("A_T", Some(proposal("cnet:A_T", "a", false))),
+    ];
+    let named = entries[1].stream_id;
+    join_named_proposal(&mut entries, named, "cnet");
+
+    assert!(
+        entries
+            .iter()
+            .all(|e| instrument_key(e) == "instrument:cnet:A"),
+        "every A_T stream is on A, matched regardless of case"
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.instrument.as_ref().is_some_and(|i| i.confirmed)),
+        "and the row keeps A's review"
+    );
+}
+
+#[test]
+fn test_join_named_proposal_brings_in_a_parameter_waiting_on_that_suggestion() {
+    let mut entries = vec![
+        with_instrument("A", None),
+        with_instrument("A_T", Some(proposal("cnet:A_T", "A", true))),
+    ];
+    let named = entries[1].stream_id;
+    join_named_proposal(&mut entries, named, "cnet");
+
+    assert_eq!(instrument_key(&entries[0]), "instrument:cnet:A");
+    assert_eq!(instrument_key(&entries[1]), "instrument:cnet:A");
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.instrument.as_ref().is_some_and(|i| !i.confirmed)),
+        "a suggestion nobody accepted is not reviewed by joining it"
+    );
+}
+
+#[test]
+fn test_join_named_proposal_leaves_a_name_of_its_own_and_an_existing_instrument_alone() {
+    let mut existing = proposal("cnet:B", "B", true);
+    existing.create = false;
+    existing.id = Some(Uuid::new_v4());
+    let mut entries = vec![
+        with_instrument("B", Some(existing)),
+        with_instrument("A_T", Some(proposal("cnet:A_T", "B", false))),
+        with_instrument("C", Some(proposal("cnet:C", "Fresh", false))),
+    ];
+    let (to_existing, fresh) = (entries[1].stream_id, entries[2].stream_id);
+    join_named_proposal(&mut entries, to_existing, "cnet");
+    join_named_proposal(&mut entries, fresh, "cnet");
+
+    assert_eq!(
+        instrument_key(&entries[1]),
+        "instrument:cnet:A_T",
+        "an inventory row is attached by id, not by name"
+    );
+    assert_eq!(instrument_key(&entries[2]), "instrument:cnet:C");
 }

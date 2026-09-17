@@ -1695,16 +1695,24 @@ pub async fn update_pairing_plan(
             .await?;
 
     if let Some(bulk) = &req.bulk {
-        if bulk.action != "pair" && bulk.action != "skip" {
+        if bulk.action.is_none() && bulk.acknowledged.is_none() {
+            return Err(AppError::BadRequest(
+                "Bulk action must set 'action' or 'acknowledged'".to_string(),
+            ));
+        }
+        if let Some(action) = bulk.action.as_deref()
+            && action != "pair"
+            && action != "skip"
+        {
             return Err(AppError::BadRequest(format!(
-                "Bulk action must be 'pair' or 'skip', got '{}'",
-                bulk.action
+                "Bulk action must be 'pair' or 'skip', got '{action}'"
             )));
         }
         crate::routes::private::sync::service::apply_bulk_action(
             &mut entries,
             &bulk.r#where,
-            &bulk.action,
+            bulk.action.as_deref(),
+            bulk.acknowledged,
         );
     }
 
