@@ -55,31 +55,49 @@ pub struct SyncSession {
     pub service_id: Uuid,
 }
 
-/// Resolve a raw bearer token to a live sync session. Returns `None` for an unknown, malformed
-/// or expired token; the caller decides whether that is a 401 or a fall-through to another
-/// auth method.
-pub async fn lookup_sync_session(db: &DatabaseConnection, raw_token: &str) -> Option<SyncSession> {
+/// Resolve a raw bearer token to a live sync session. `Ok(None)` is an unknown, malformed or
+/// expired token; the caller decides whether that is a 401 or a fall-through to another auth
+/// method. `Err` is a lookup that could not be made, which says nothing about the token.
+pub async fn lookup_sync_session(
+    db: &DatabaseConnection,
+    raw_token: &str,
+) -> Result<Option<SyncSession>, sea_orm::DbErr> {
     if raw_token.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let token_hash = hash_token(raw_token);
-    let token = tokens::Entity::find()
+    let Some(token) = tokens::Entity::find()
         .filter(tokens::Column::TokenHash.eq(&token_hash))
         .one(db)
         .await
-        .inspect_err(|e| tracing::warn!(error = %e, "DB error looking up sync token"))
-        .ok()
-        .flatten()?;
+        .inspect_err(|e| tracing::warn!(error = %e, "DB error looking up sync token"))?
+    else {
+        return Ok(None);
+    };
 
     if token.expires_at.with_timezone(&chrono::Utc) < chrono::Utc::now() {
         tracing::debug!(service_id = %token.service_id, "Sync token expired");
-        return None;
+        return Ok(None);
     }
 
-    Some(SyncSession {
+    Ok(Some(SyncSession {
         service_id: token.service_id,
-    })
+    }))
+}
+
+/// The answer to a session lookup: 401 only for a token the database says is not live, 503 when
+/// the database could not be asked, so an outage never reads to the client as revoked credentials.
+pub fn session_or_rejection(
+    lookup: Result<Option<SyncSession>, sea_orm::DbErr>,
+) -> Result<SyncSession, AppError> {
+    match lookup {
+        Ok(Some(session)) => Ok(session),
+        Ok(None) => Err(AppError::Unauthorized("Invalid session token".to_string())),
+        Err(_) => Err(AppError::ServiceUnavailable(
+            "Session lookup unavailable".to_string(),
+        )),
+    }
 }
 
 /// Extract the raw bearer token from an `Authorization` header value.
@@ -109,9 +127,7 @@ impl FromRequestParts<AppState> for SyncServiceContext {
         .filter(|t| !t.is_empty())
         .ok_or_else(|| AppError::Unauthorized("Bearer token required".to_string()))?;
 
-        let session = lookup_sync_session(&state.db, raw_token)
-            .await
-            .ok_or_else(|| AppError::Unauthorized("Invalid session token".to_string()))?;
+        let session = session_or_rejection(lookup_sync_session(&state.db, raw_token).await)?;
 
         Ok(Self {
             service_id: session.service_id,
@@ -2905,6 +2921,68 @@ pub fn resolve_parameter_instrument(
     }
 }
 
+/// The instrument a device feed resolves to: its own channel, keyed on the feed's `source_key`.
+///
+/// The source's row under that key when it has one, and otherwise a proposal named for the slot
+/// the feed serves, `{site} {parameter}`, unconfirmed: the pairing mints it and opens its
+/// deployment, so a person agrees to it first like any other instrument the plan creates.
+pub fn resolve_device_instrument(
+    source_key: &str,
+    slot: &str,
+    catalog: &InstrumentCatalog,
+) -> PlanInstrumentRef {
+    if let Some(id) = catalog.by_source_key.get(source_key).copied() {
+        let (name, key) = catalog.by_id.get(&id).cloned().unwrap_or_default();
+        return PlanInstrumentRef {
+            curve_column: None,
+            id: Some(id),
+            name,
+            source_key: key.unwrap_or_else(|| source_key.to_string()),
+            resolved_by: "source_key".to_string(),
+            create: false,
+            defaulted: catalog.defaulted.contains(&id),
+            confirmed: true,
+            stamps_readings: false,
+            curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
+            proposed_name: None,
+            name_conflict: None,
+        };
+    }
+    PlanInstrumentRef {
+        curve_column: None,
+        id: None,
+        name: slot.to_string(),
+        source_key: source_key.to_string(),
+        resolved_by: "device".to_string(),
+        create: true,
+        defaulted: false,
+        confirmed: false,
+        stamps_readings: false,
+        curves: vec![],
+        proposed_name: Some(slot.to_string()),
+        name_conflict: catalog.named(slot),
+    }
+}
+
+/// The name a device channel is proposed under: the slot it serves, `{site} {parameter}`. An
+/// existing site or parameter reads as the inventory names it, and a new one as the apply will.
+#[must_use]
+pub fn device_slot_name(entry: &PlanEntry, catalog: &EntityCatalog) -> String {
+    let site = entry
+        .site
+        .id
+        .and_then(|id| catalog.sites.iter().find(|(s, _)| *s == id))
+        .map_or(entry.site.name.as_str(), |(_, name)| name.as_str());
+    let parameter = entry
+        .parameter
+        .id
+        .and_then(|id| catalog.params.iter().find(|p| p.id == id))
+        .map(|p| p.name.as_str())
+        .or(entry.parameter.label.as_deref())
+        .unwrap_or(&entry.parameter.name);
+    format!("{site} {parameter}")
+}
+
 pub(super) fn plan_replicates(metadata: &serde_json::Value) -> Option<PlanReplicates> {
     let spec =
         crate::routes::private::data_streams::models::ReplicateSpec::from_metadata(metadata)?;
@@ -3333,8 +3411,8 @@ pub async fn create_plan(
         };
         reclassify_entry(&mut entry, &catalog);
         // A feed naming no curve column can still belong to an instrument this source created in
-        // an earlier plan. A device-shaped feed is never one of those: its instrument is minted
-        // from its own provenance at pairing.
+        // an earlier plan. A device-shaped feed is never one of those: its instrument is its own
+        // channel, proposed once the parameter names below are settled.
         if entry.instrument.is_none() && !entry.is_device {
             entry.instrument = Some(resolve_parameter_instrument(
                 stream_instrument_key(stream),
@@ -3365,6 +3443,18 @@ pub async fn create_plan(
                 entries[idx].parameter.original_names = group.original_names.clone();
             }
         }
+    }
+
+    // Named for the slot after the grouping above, which is what renames a parameter.
+    for entry in entries
+        .iter_mut()
+        .filter(|e| e.is_device && e.instrument.is_none())
+    {
+        entry.instrument = Some(resolve_device_instrument(
+            &entry.source_key,
+            &device_slot_name(entry, &catalog),
+            &instruments,
+        ));
     }
 
     let summary = compute_summary(&entries);
@@ -3744,6 +3834,15 @@ pub async fn apply_plan(
 
     let minted = mint_plan_instruments(&txn, &plan.source_system, &entries).await?;
     counters.instruments_created = minted.len() as u32;
+    counters.instruments_created += entries
+        .iter()
+        .filter(|e| e.action == "pair" && e.is_device)
+        .filter(|e| {
+            e.instrument
+                .as_ref()
+                .is_some_and(|i| i.create && i.id.is_none())
+        })
+        .count() as u32;
     // The source's own register, admitted by the same apply: an instrument exists because a plan an
     // operator validated created it, whether it came from a feed or from the register (Q134).
     counters.instruments_created +=
@@ -3811,6 +3910,11 @@ pub async fn apply_plan(
             .instrument
             .as_ref()
             .and_then(|i| i.id.or_else(|| minted.get(&i.source_key).copied()));
+        let device_name = entry
+            .instrument
+            .as_ref()
+            .filter(|i| entry.is_device && i.create)
+            .map(|i| i.name.as_str());
         pair_entry_stream(
             &txn,
             stream,
@@ -3818,6 +3922,7 @@ pub async fn apply_plan(
             site_parameter_id,
             parameter_id,
             instrument_id,
+            device_name,
         )
         .await?;
         counters.streams_paired += 1;
@@ -4370,7 +4475,12 @@ pub(super) async fn mint_plan_instruments<C: ConnectionTrait>(
     entries: &[PlanEntry],
 ) -> AppResult<HashMap<String, Uuid>> {
     let mut wanted: HashMap<&str, &PlanInstrumentRef> = HashMap::new();
-    for entry in entries.iter().filter(|e| e.action == "pair") {
+    // A device channel is minted by its own pairing, where the stream's provenance and the slot's
+    // deployment are to hand.
+    for entry in entries
+        .iter()
+        .filter(|e| e.action == "pair" && !e.is_device)
+    {
         if let Some(i) = &entry.instrument
             && i.create
             && i.id.is_none()
@@ -4426,6 +4536,7 @@ pub(super) async fn pair_entry_stream<C: ConnectionTrait>(
     site_parameter_id: Uuid,
     parameter_id: Uuid,
     instrument_id: Option<Uuid>,
+    device_name: Option<&str>,
 ) -> AppResult<()> {
     // The plan's instrument wins over the one the stream carries. Since registration mints an
     // instrument for every stream, a review that only filled the gaps would fill none: the entry's
@@ -4453,7 +4564,7 @@ pub(super) async fn pair_entry_stream<C: ConnectionTrait>(
     // resolve, minted here. The apply fails rather than pairing a slot whose readings would name
     // nothing that measured them.
     if needs_sensor {
-        create_sensor_for_stream(txn, &stream, parameter_id, site_id).await?;
+        create_sensor_for_stream(txn, &stream, parameter_id, site_id, device_name).await?;
     } else if device && let Some(sensor_id) = stream.sensor_id.or(from_plan) {
         // A device is stationed at the site whichever route named it, so the slot's deployment is
         // opened here too. Without this the plan's own instrument choice silently costs the
@@ -5765,23 +5876,33 @@ pub(super) async fn apply_instrument_updates(
             .and_then(|i| i.curve_column.as_deref())
         {
             Some(column) => format!("{source_system}:{column}"),
+            None if target.is_device => target.source_key.clone(),
             None => format!("{source_system}:{}", target.parameter.name),
         };
 
-        // A feed the source reports as a device has its instrument already: one minted for the
-        // slot it serves when the stream is paired, with that slot's deployment opened. Minting a
-        // lab instrument for it instead would take both.
-        if update.instrument_name.is_some() && update.instrument_id.is_none() && target.is_device {
-            let named = match &target.device_serial {
-                Some(serial) => format!(" (the source names device serial {serial})"),
-                None => String::new(),
+        // A feed the source reports as a device is its own channel instrument, minted by its
+        // pairing with the slot's deployment. Its proposal can be renamed and confirmed like any
+        // other, but an existing one is the inventory's to rename, and clearing it would leave the
+        // pairing to mint one nobody confirmed.
+        if target.is_device && update.instrument_id.is_none() {
+            let existing = target.instrument.as_ref().is_some_and(|i| !i.create);
+            let refused = if update.instrument_clear == Some(true) {
+                Some("its instrument cannot be cleared; attach an existing one instead")
+            } else if update.instrument_name.is_some() && existing {
+                Some("its instrument is already in the inventory and is renamed on its own page")
+            } else {
+                None
             };
-            return Err(AppError::BadRequest(format!(
-                "stream {} is reported as a device{named}, so its instrument is minted for the \
-                 slot it serves when the stream is paired. Attach an existing instrument to \
-                 override that, or leave it unset.",
-                update.stream_id
-            )));
+            if let Some(reason) = refused {
+                let named = match &target.device_serial {
+                    Some(serial) => format!(" (the source names device serial {serial})"),
+                    None => String::new(),
+                };
+                return Err(AppError::BadRequest(format!(
+                    "stream {} is reported as a device{named}, so {reason}.",
+                    update.stream_id
+                )));
+            }
         }
 
         // A repoint has to name an instrument that exists; otherwise the plan would carry an id

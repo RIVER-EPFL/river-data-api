@@ -160,6 +160,16 @@ impl From<InsertStatement> for Dml {
 }
 
 impl Dml {
+    /// The statement as built, with no `RETURNING`.
+    fn build(self) -> Statement {
+        let (sql, values) = match self {
+            Self::Update(statement) => statement.build(PostgresQueryBuilder),
+            Self::Delete(statement) => statement.build(PostgresQueryBuilder),
+            Self::Insert(statement) => statement.build(PostgresQueryBuilder),
+        };
+        Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values)
+    }
+
     /// The statement with `RETURNING time` on it, as the summary wrapper needs.
     fn returning_time(self) -> SubQueryStatement {
         let time = Alias::new("time");
@@ -198,6 +208,20 @@ pub async fn mutation<C: ConnectionTrait>(
     statement: impl Into<Dml>,
 ) -> AppResult<TouchedRange> {
     run_summary(conn, summary_of(statement.into())).await
+}
+
+/// One hypertable DML statement on a connection already inside a guarded transaction, reporting
+/// only the rows it wrote. TimescaleDB holds every row a hypertable `RETURNING` emits in the
+/// statement's executor memory, so a write that can reach a stream's whole history and needs no
+/// span takes this rather than [`mutation`].
+pub async fn mutation_rows<C: ConnectionTrait>(
+    conn: &C,
+    statement: impl Into<Dml>,
+) -> AppResult<u64> {
+    Ok(conn
+        .execute_raw(statement.into().build())
+        .await?
+        .rows_affected())
 }
 
 /// [`guarded_mutation`] over a statement still spelled as text.

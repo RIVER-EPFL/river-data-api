@@ -60,6 +60,13 @@ impl Job for FailingJob {
     }
 }
 
+fn retry_budget(max_retries: u32) -> jobs::RetryPolicy {
+    jobs::RetryPolicy {
+        max_retries,
+        backoff_base: std::time::Duration::from_secs(60),
+    }
+}
+
 fn events() -> river_db::common::EventSender {
     tokio::sync::broadcast::channel::<AppEvent>(16).0
 }
@@ -170,7 +177,9 @@ async fn reaper_reclaims_a_running_row_with_no_lease() {
     .await;
 
     assert!(
-        jobs::run_one(&db, &ev, &reg, &wid).await.unwrap(),
+        jobs::run_one_with_policy(&db, &ev, &reg, &wid, retry_budget(3))
+            .await
+            .unwrap(),
         "a running row with no lease is unreachable by nothing else, so the reaper must take it"
     );
     assert_eq!(runs.load(Ordering::Relaxed), 1);
@@ -208,13 +217,71 @@ async fn reaper_reclaims_expired_lease() {
     .await;
 
     assert!(
-        jobs::run_one(&db, &ev, &reg, &wid).await.unwrap(),
+        jobs::run_one_with_policy(&db, &ev, &reg, &wid, retry_budget(3))
+            .await
+            .unwrap(),
         "reaper should reclaim and run the expired-lease job"
     );
     assert_eq!(runs.load(Ordering::Relaxed), 1);
     let row = job_row(&db, id).await;
     assert_eq!(row.status, "completed");
     assert!(row.owner_is_null);
+    assert_eq!(row.retry_count, 1, "the orphaned run spent an attempt");
+}
+
+/// Scenario: a job whose run never returns (the database or the pod dies under it) is orphaned
+/// again and again, and has already spent its whole retry budget.
+///
+/// Expected behaviour: the reaper fails the row instead of running it once more.
+#[tokio::test]
+#[serial]
+async fn reaper_fails_an_orphan_that_has_spent_its_retries() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let ev = events();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut reg = JobRegistry::new();
+    reg.register(Arc::new(CompletingJob {
+        name: "test_complete",
+        count: 1,
+        runs: runs.clone(),
+    }));
+    let wid = jobs::worker_id();
+
+    let id = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reprocessing_jobs \
+                (id, trigger_type, status, category, owner, lease_epoch, lease_expires_at, \
+                 retry_count) \
+             VALUES ('{id}', 'test_complete', 'running', 'operator', 'dead-worker', 9, \
+                     now() - interval '5 minutes', 3)"
+        ),
+    )
+    .await;
+
+    assert!(
+        jobs::run_one_with_policy(&db, &ev, &reg, &wid, retry_budget(3))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        runs.load(Ordering::Relaxed),
+        0,
+        "an exhausted orphan is not run"
+    );
+    let row = job_row(&db, id).await;
+    assert_eq!(row.status, "failed");
+    assert_eq!(row.retry_count, 4);
+    assert!(row.owner_is_null);
+    assert!(
+        row.error_message
+            .as_deref()
+            .is_some_and(|m| m.contains("lease expired")),
+        "{:?}",
+        row.error_message
+    );
 }
 
 #[tokio::test]

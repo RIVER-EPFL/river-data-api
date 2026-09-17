@@ -13656,11 +13656,22 @@
         "type": "object"
       },
       "PlanDeviceGroup": {
-        "description": "One device-shaped feed a plan carries, and the slot it serves.\n\nA device is not a decision the plan takes: the feed's own `(source_system, source_key)` is the\nidentity, and pairing mints the instrument for its slot and opens that slot's deployment. One\ninstrument serves one (site, parameter), so a multi-channel logger is one group per channel\nrather than one group carrying them all; the serial it reports is displayed, never matched on.\nIt is listed so an operator can see which instrument each feed will land on, and whether it is\nalready in the inventory.",
+        "description": "One device-shaped feed a plan carries, and the slot it serves.\n\nThe feed's own `(source_system, source_key)` is the identity, and pairing mints the instrument\nfor its slot and opens that slot's deployment. One instrument serves one (site, parameter), so a\nmulti-channel logger is one group per channel rather than one group carrying them all; the\nserial it reports is displayed, never matched on. It is listed so an operator can see which\ninstrument each feed will land on, name a new one, and confirm it before the apply mints it.",
         "properties": {
           "anchor_stream_id": {
             "format": "uuid",
             "type": "string"
+          },
+          "instrument": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanInstrumentGroup",
+                "description": "The instrument the plan binds this channel to: the inventory row, or the proposal the\npairing will mint once a person confirms it. Absent on a plan drafted without one."
+              }
+            ]
           },
           "instrument_id": {
             "description": "The inventory row this serial already resolves to, when it has one.",
@@ -13705,6 +13716,7 @@
           "model",
           "instrument_id",
           "instrument_name",
+          "instrument",
           "parameters",
           "stream_count",
           "anchor_stream_id"

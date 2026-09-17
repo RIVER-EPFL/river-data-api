@@ -27,3 +27,27 @@ fn session_hashing_is_sha256() {
         "4c5dc9b7708905f77f5e5d16316b5dfb425e68cb326dcd55a860e90a7707031e"
     );
 }
+
+#[test]
+fn test_session_or_rejection_database_error_is_unavailable() {
+    let lookup = Err(sea_orm::DbErr::Custom("connection refused".to_string()));
+    assert!(matches!(
+        session_or_rejection(lookup),
+        Err(AppError::ServiceUnavailable(_))
+    ));
+}
+
+#[test]
+fn test_session_or_rejection_unknown_token_is_unauthorized() {
+    assert!(matches!(
+        session_or_rejection(Ok(None)),
+        Err(AppError::Unauthorized(_))
+    ));
+}
+
+#[test]
+fn test_session_or_rejection_live_session_passes() {
+    let service_id = uuid::Uuid::new_v4();
+    let session = session_or_rejection(Ok(Some(SyncSession { service_id }))).unwrap();
+    assert_eq!(session.service_id, service_id);
+}

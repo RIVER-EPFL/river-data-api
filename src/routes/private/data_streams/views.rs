@@ -574,7 +574,7 @@ pub async fn pair_stream(
             // Create/reuse the sensor, then re-read the stream: it has gained a sensor_id. Pairing
             // never completes without an instrument: a slot's readings must name what measured them.
             let sensor_ctx =
-                create_sensor_for_stream(txn, &stream, sp.parameter_id, sp.site_id).await?;
+                create_sensor_for_stream(txn, &stream, sp.parameter_id, sp.site_id, None).await?;
             let deployment_id = sensor_ctx.deployment_id;
 
             // Everything a pairing owes the slot: readings and status events attributed,

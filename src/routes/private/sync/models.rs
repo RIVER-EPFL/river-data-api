@@ -905,12 +905,11 @@ pub struct PlanCurveAssignment {
 
 /// One device-shaped feed a plan carries, and the slot it serves.
 ///
-/// A device is not a decision the plan takes: the feed's own `(source_system, source_key)` is the
-/// identity, and pairing mints the instrument for its slot and opens that slot's deployment. One
-/// instrument serves one (site, parameter), so a multi-channel logger is one group per channel
-/// rather than one group carrying them all; the serial it reports is displayed, never matched on.
-/// It is listed so an operator can see which instrument each feed will land on, and whether it is
-/// already in the inventory.
+/// The feed's own `(source_system, source_key)` is the identity, and pairing mints the instrument
+/// for its slot and opens that slot's deployment. One instrument serves one (site, parameter), so a
+/// multi-channel logger is one group per channel rather than one group carrying them all; the
+/// serial it reports is displayed, never matched on. It is listed so an operator can see which
+/// instrument each feed will land on, name a new one, and confirm it before the apply mints it.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PlanDeviceGroup {
     pub site: String,
@@ -922,6 +921,10 @@ pub struct PlanDeviceGroup {
     pub instrument_id: Option<Uuid>,
     #[schema(required)]
     pub instrument_name: Option<String>,
+    /// The instrument the plan binds this channel to: the inventory row, or the proposal the
+    /// pairing will mint once a person confirms it. Absent on a plan drafted without one.
+    #[schema(required)]
+    pub instrument: Option<PlanInstrumentGroup>,
     pub parameters: Vec<String>,
     pub stream_count: usize,
     pub anchor_stream_id: Uuid,

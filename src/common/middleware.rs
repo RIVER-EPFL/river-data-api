@@ -302,9 +302,13 @@ pub async fn service_auth_middleware(
     {
         // Same resolution the control plane extractor uses, so the expiry rule cannot drift
         // between the two surfaces a session token reaches.
-        if let Some(session) =
-            crate::routes::private::sync::service::lookup_sync_session(&state.db, raw).await
-        {
+        let lookup =
+            crate::routes::private::sync::service::lookup_sync_session(&state.db, raw).await;
+        if lookup.is_err() {
+            return AppError::ServiceUnavailable("Session lookup unavailable".to_string())
+                .into_response();
+        }
+        if let Ok(Some(session)) = lookup {
             let auth = AuthContext::SyncService {
                 service_id: session.service_id,
             };

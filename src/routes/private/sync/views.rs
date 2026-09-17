@@ -2336,6 +2336,30 @@ pub async fn plan_instruments(
                 model: entry.device_model.clone(),
                 instrument_id: None,
                 instrument_name: None,
+                instrument: entry.instrument.as_ref().map(|i| PlanInstrumentGroup {
+                    scope: Some(instrument_key(entry)),
+                    instrument_id: i.id,
+                    name: i.name.clone(),
+                    source_key: i.source_key.clone(),
+                    resolved_by: i.resolved_by.clone(),
+                    create: i.create,
+                    confirmed: i.confirmed,
+                    stamps_readings: i.stamps_readings,
+                    curve_column: i.curve_column.clone(),
+                    stream_count: 1,
+                    parameters: vec![entry.parameter.name.clone()],
+                    site_count: 1,
+                    anchor_stream_id: Some(entry.stream_id),
+                    curves: i.curves.clone(),
+                    proposed_name: i.proposed_name.clone(),
+                    // Read fresh, like the lab rows' catalog: an instrument created since the plan
+                    // was drafted is the collision this reports.
+                    name_conflict: if i.create {
+                        catalog.named(&i.name)
+                    } else {
+                        None
+                    },
+                }),
                 parameters: Vec::new(),
                 stream_count: 0,
                 anchor_stream_id: entry.stream_id,

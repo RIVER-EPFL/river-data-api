@@ -550,3 +550,83 @@ fn test_minted_param_needs_review_follows_the_accepted_objects() {
         "a plan with nothing accepted mints nothing reviewed"
     );
 }
+
+/// Expected behaviour: a device feed's channel is proposed as an instrument named for the slot it
+/// serves, keyed on the feed itself, and waits for a person like any other creation (Q195).
+#[test]
+fn test_resolve_device_instrument_proposes_the_slot_unconfirmed() {
+    let proposed = super::resolve_device_instrument("1270", "Martigny Water Depth", &catalog(&[]));
+    assert_eq!(proposed.id, None);
+    assert_eq!(proposed.source_key, "1270", "the channel is the identity");
+    assert_eq!(proposed.name, "Martigny Water Depth");
+    assert_eq!(
+        proposed.proposed_name.as_deref(),
+        Some("Martigny Water Depth")
+    );
+    assert!(proposed.create);
+    assert!(!proposed.confirmed, "a suggestion waits for a person");
+    assert!(!proposed.stamps_readings);
+}
+
+#[test]
+fn test_resolve_device_instrument_takes_the_channel_s_own() {
+    let id = Uuid::new_v4();
+    let resolved =
+        super::resolve_device_instrument("1270", "Martigny Water Depth", &catalog(&[("1270", id)]));
+    assert_eq!(resolved.id, Some(id));
+    assert!(
+        !resolved.create,
+        "a channel already in the inventory is not created again"
+    );
+    assert!(resolved.confirmed);
+}
+
+/// Expected behaviour: the apply refuses a device channel nobody confirmed, as it does a lab one.
+#[test]
+fn test_unconfirmed_instruments_counts_a_device_channel() {
+    let mut entry = plan_entry("Martigny", "Water Depth", "exact", 0);
+    entry.is_device = true;
+    entry.instrument = Some(super::resolve_device_instrument(
+        &entry.source_key,
+        "Martigny Water Depth",
+        &catalog(&[]),
+    ));
+    let source_key = entry.source_key.clone();
+    let entries = vec![entry];
+    assert_eq!(
+        super::unconfirmed_instruments(&entries),
+        vec![source_key.as_str()]
+    );
+    assert!(super::refuse_unconfirmed_instruments(&entries).is_err());
+}
+
+/// Expected behaviour: a channel serving an existing parameter is proposed under the inventory's
+/// name for it, which is the name the slot already reads as, not the source's label.
+#[test]
+fn test_device_slot_name_reads_an_existing_parameter_as_the_inventory_names_it() {
+    let parameter = Uuid::new_v4();
+    let catalog = EntityCatalog {
+        params: vec![super::CatalogParam {
+            id: parameter,
+            code: "water_temperature".to_string(),
+            name: "Water Temperature".to_string(),
+            aliases: vec![],
+            units: "°C".to_string(),
+            category: "measurement".to_string(),
+            site_parameter_count: 0,
+            reading_count: 0,
+        }],
+        ..EntityCatalog::default()
+    };
+    let mut entry = plan_entry("Martigny", "water temperature", "exact", 0);
+    assert_eq!(
+        super::device_slot_name(&entry, &catalog),
+        "Martigny water temperature",
+        "a parameter the apply creates keeps the plan's name"
+    );
+    entry.parameter.id = Some(parameter);
+    assert_eq!(
+        super::device_slot_name(&entry, &catalog),
+        "Martigny Water Temperature"
+    );
+}

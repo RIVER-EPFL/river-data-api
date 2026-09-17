@@ -166,3 +166,44 @@ async fn failed_run_is_rescheduled_queued_with_backoff() {
         .unwrap();
     assert!(due_later, "the backoff is persisted as next_attempt_at");
 }
+
+/// Scenario: a job fails once and succeeds on its retry.
+/// Expected behaviour: the retry's timeline continues after the first attempt's lines, so both
+/// attempts' opening and closing lines are kept.
+#[tokio::test]
+#[serial]
+async fn retried_run_keeps_every_attempts_timeline() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+
+    let attempts = Arc::new(AtomicU32::new(0));
+    let a = attempts.clone();
+    let job = ClosureJob::new("test_retry", move |_ctx| {
+        let a = a.clone();
+        async move {
+            if a.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err::<i64, _>(DbErr::Custom("first attempt".into()));
+            }
+            Ok(1)
+        }
+    });
+    let job_id = enqueue_and_drain(&db, job, IMMEDIATE).await;
+
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT seq, context->>'attempt' AS attempt FROM reprocessing_job_logs \
+                 WHERE job_id = '{job_id}' ORDER BY seq"
+            ),
+        ))
+        .await
+        .unwrap();
+    let seqs: Vec<i64> = rows.iter().map(|r| r.try_get("", "seq").unwrap()).collect();
+    let openings: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r.try_get::<Option<String>>("", "attempt").unwrap())
+        .collect();
+    assert_eq!(seqs, vec![0, 1, 2, 3], "two lines per attempt");
+    assert_eq!(openings, vec!["1", "2"]);
+}

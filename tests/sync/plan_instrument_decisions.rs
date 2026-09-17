@@ -199,26 +199,6 @@ async fn a_device_feed_is_reported_per_channel_and_never_offered_a_lab_instrumen
         );
     }
 
-    let (status, body) = patch_entry(
-        &app,
-        &token,
-        &plan_id,
-        serde_json::json!({
-            "stream_id": temp,
-            "instrument_name": "Water Temperature instrdec",
-            "instrument_confirmed": true,
-        }),
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "naming a lab instrument for a device feed is refused: {body}"
-    );
-    assert!(
-        body.contains("LOG-1"),
-        "the refusal names the device it resolves to instead: {body}"
-    );
-
     apply_and_wait(&app, &db, &token, &plan_id).await;
 
     let sensors = scalar_i64(
@@ -334,6 +314,118 @@ async fn a_device_instrument_is_named_after_the_slot_it_serves() {
             "Upstream Station Water Temperature".to_string(),
         ],
         "each channel of a multi-channel logger is named by the slot it serves, not by the logger"
+    );
+}
+
+/// Scenario: a plan pairs a logger's channels, none of them in the inventory yet.
+///
+/// Expected behaviour: the plan names the instrument each channel will mint, for the slot it
+/// serves, and holds the apply until a person confirms it (Q195). The name can be changed before
+/// the apply, and the apply mints the channel under the confirmed name with its deployment.
+#[tokio::test]
+#[serial]
+async fn a_device_channel_is_proposed_and_confirmed_before_the_apply_mints_it() {
+    let (app, token, db) = setup().await;
+    let temp = Uuid::new_v4();
+    let oxygen = Uuid::new_v4();
+    seed_device_stream(&db, temp, "dev-temp", "water temperature", "LOG-3", "AQ600").await;
+    seed_device_stream(&db, oxygen, "dev-do", "dissolved oxygen", "LOG-3", "AQ600").await;
+
+    let plan = create_plan(&app, &token).await;
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+    let entry = entry_for(&plan, temp);
+    assert_eq!(
+        entry["instrument"]["source_key"],
+        serde_json::json!("dev-temp"),
+        "the channel is the identity: {entry}"
+    );
+    assert_eq!(
+        entry["instrument"]["create"],
+        serde_json::json!(true),
+        "{entry}"
+    );
+    assert_eq!(
+        entry["instrument"]["confirmed"],
+        serde_json::json!(false),
+        "the plan suggests; nobody has confirmed it yet: {entry}"
+    );
+    assert!(
+        entry["instrument"]["name"]
+            .as_str()
+            .is_some_and(|n| n.starts_with("Upstream Station ")),
+        "the proposal is named for the slot: {entry}"
+    );
+
+    let instruments = plan_instruments(&app, &token, &plan_id).await;
+    let devices = instruments["devices"].as_array().expect("devices");
+    assert!(
+        devices
+            .iter()
+            .all(|d| d["instrument"]["create"] == serde_json::json!(true)
+                && d["instrument"]["confirmed"] == serde_json::json!(false)),
+        "each channel is listed as a proposal still asking: {instruments}"
+    );
+
+    let (status, body) =
+        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
+            .await;
+    assert_eq!(
+        status, 400,
+        "an unconfirmed channel holds the apply: {body}"
+    );
+    assert!(
+        body.contains("dev-temp"),
+        "the refusal names the channel: {body}"
+    );
+
+    let (status, body) = patch_entry(
+        &app,
+        &token,
+        &plan_id,
+        serde_json::json!({
+            "stream_id": temp,
+            "instrument_name": "AQ600 temperature probe",
+            "instrument_confirmed": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "a device proposal can be named: {body}");
+
+    let (status, body) = patch_entry(
+        &app,
+        &token,
+        &plan_id,
+        serde_json::json!({ "stream_id": oxygen, "instrument_clear": true }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "clearing a channel's instrument would leave the pairing to mint one unconfirmed: {body}"
+    );
+
+    apply_and_wait(&app, &db, &token, &plan_id).await;
+
+    let named = scalar_i64(
+        &db,
+        "SELECT count(*) AS v FROM sensors \
+         WHERE source_system = 'instrdec' AND source_key = 'dev-temp' \
+           AND name = 'AQ600 temperature probe'",
+    )
+    .await;
+    assert_eq!(
+        named, 1,
+        "the channel is minted under the name the review gave it"
+    );
+    let deployments = scalar_i64(
+        &db,
+        "SELECT count(*) AS v FROM sensor_deployments d JOIN sensors s ON s.id = d.sensor_id \
+         WHERE s.source_system = 'instrdec' AND s.source_key IN ('dev-temp', 'dev-do') \
+           AND d.deployed_until IS NULL",
+    )
+    .await;
+    assert_eq!(
+        deployments, 2,
+        "each confirmed channel is stationed at its slot"
     );
 }
 

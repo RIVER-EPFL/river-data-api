@@ -794,13 +794,14 @@ impl JobContext {
         job_id: Uuid,
         events: crate::common::EventSender,
         params: serde_json::Value,
+        first_seq: i64,
     ) -> (Self, Arc<AtomicBool>) {
         let cancel = Arc::new(AtomicBool::new(false));
         let ctx = Self {
             db,
             job_id,
             events,
-            seq: Arc::new(AtomicI64::new(0)),
+            seq: Arc::new(AtomicI64::new(first_seq)),
             cancel: cancel.clone(),
             params,
         };
@@ -1500,7 +1501,8 @@ struct Claimed {
 async fn claim_one(
     db: &DatabaseConnection,
     worker_id: &str,
-) -> Result<Option<Claimed>, sea_orm::DbErr> {
+    policy: RetryPolicy,
+) -> Result<Option<Claim>, sea_orm::DbErr> {
     // The select and the update are one transaction because the row lock is what keeps two
     // workers off the same row: `SKIP LOCKED` holds it until this transaction commits, so a
     // second worker's select passes over it rather than waiting for it.
@@ -1525,9 +1527,38 @@ async fn claim_one(
         txn.commit().await?;
         return Ok(None);
     };
+    let orphan = row.status == "running";
+    if orphan && is_retry_budget_spent(row.retry_count, policy.max_retries) {
+        let message = format!(
+            "lease expired {} times without a result",
+            row.retry_count + 1
+        );
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value("failed"))
+            .col_expr(Column::RetryCount, Expr::col(Column::RetryCount).add(1))
+            .col_expr(Column::ErrorMessage, Expr::value(message.clone()))
+            .col_expr(Column::CompletedAt, Expr::current_timestamp())
+            .col_expr(Column::Owner, Expr::value(Option::<String>::None))
+            .col_expr(Column::DedupeKey, Expr::value(Option::<String>::None))
+            .col_expr(
+                Column::LeaseExpiresAt,
+                Expr::value(Option::<sea_orm::prelude::DateTimeWithTimeZone>::None),
+            )
+            .filter(Column::Id.eq(row.id))
+            .exec(&txn)
+            .await?;
+        txn.commit().await?;
+        return Ok(Some(Claim::Exhausted {
+            id: row.id,
+            message,
+        }));
+    }
+    // An orphaned run never returned a result, so it spent an attempt just as a failed one does.
+    let retry_count = row.retry_count + i32::from(orphan);
     let lease_epoch = row.lease_epoch + 1;
     Entity::update_many()
         .col_expr(Column::Status, Expr::value("running"))
+        .col_expr(Column::RetryCount, Expr::value(retry_count))
         .col_expr(Column::Owner, Expr::value(worker_id))
         .col_expr(Column::DedupeKey, Expr::value(Option::<String>::None))
         .col_expr(Column::LeaseEpoch, Expr::value(lease_epoch))
@@ -1536,13 +1567,25 @@ async fn claim_one(
         .exec(&txn)
         .await?;
     txn.commit().await?;
-    Ok(Some(Claimed {
+    Ok(Some(Claim::Run(Claimed {
         id: row.id,
         trigger_type: row.trigger_type,
         lease_epoch,
         params: row.params,
-        retry_count: row.retry_count,
-    }))
+        retry_count,
+    })))
+}
+
+/// What a claim took off the queue: a row to run, or an orphan that had no attempts left and was
+/// failed in its place.
+enum Claim {
+    Run(Claimed),
+    Exhausted { id: Uuid, message: String },
+}
+
+/// Whether a row that has spent `retry_count` attempts may not be given another under `max_retries`.
+fn is_retry_budget_spent(retry_count: i32, max_retries: u32) -> bool {
+    i64::from(retry_count) >= i64::from(max_retries)
 }
 
 /// Renew the lease on a cadence while the job runs, and observe cross-replica cancellation: if
@@ -1678,6 +1721,18 @@ async fn reschedule_or_fail(
     ))
 }
 
+/// The seq a claim's first timeline line takes: one past the lines earlier claims of the row wrote.
+async fn next_log_seq(db: &DatabaseConnection, job_id: Uuid) -> Result<i64, DbErr> {
+    let last: Option<Option<i64>> = super::models::job_log::Entity::find()
+        .select_only()
+        .column_as(super::models::job_log::Column::Seq.max(), "last")
+        .filter(super::models::job_log::Column::JobId.eq(job_id))
+        .into_tuple()
+        .one(db)
+        .await?;
+    Ok(last.flatten().map_or(0, |seq| seq + 1))
+}
+
 /// Run a single claimed job to its terminal (or rescheduled) state. Separated from [`run`] so tests
 /// can drive one cycle deterministically.
 async fn execute(
@@ -1702,11 +1757,13 @@ async fn execute(
         return Ok(());
     };
 
+    let first_seq = next_log_seq(db, claimed.id).await?;
     let (ctx, cancel) = JobContext::for_worker(
         db.clone(),
         claimed.id,
         events.clone(),
         claimed.params.clone(),
+        first_seq,
     );
     // The two lines every run owes its timeline. A job body says what only it knows; that a run
     // started and how it ended is the worker's to say, so a silent job is impossible.
@@ -1848,9 +1905,19 @@ pub async fn run_one_with_policy(
     worker_id: &str,
     policy: RetryPolicy,
 ) -> Result<bool, sea_orm::DbErr> {
-    match claim_one(db, worker_id).await? {
-        Some(claimed) => {
+    match claim_one(db, worker_id, policy).await? {
+        Some(Claim::Run(claimed)) => {
             execute(db, events, registry, worker_id, policy, claimed).await?;
+            Ok(true)
+        }
+        Some(Claim::Exhausted { id, message }) => {
+            tracing::warn!(job_id = %id, "{message}");
+            let _ = events.send(crate::common::AppEvent::JobCompleted {
+                job_id: id,
+                status: "failed".to_string(),
+                readings_updated: None,
+                error_message: Some(message),
+            });
             Ok(true)
         }
         None => Ok(false),

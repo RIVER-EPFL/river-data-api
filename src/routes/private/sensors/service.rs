@@ -940,13 +940,20 @@ pub async fn resolve_or_mint_stream_instrument<C: ConnectionTrait>(
 /// is not stationed at the site, which is the "attributed but not deployed" state
 /// `import_sensor_for_stream` documents. No calibration is created either; the context carries
 /// whichever curve the instrument already has.
+///
+/// `name` is a device channel's name as a pairing plan confirmed it; without one the channel is
+/// named for the slot.
 pub async fn create_sensor_for_stream<C: ConnectionTrait>(
     db: &C,
     stream: &data_streams::Model,
     parameter_id: Uuid,
     site_id: Uuid,
+    name: Option<&str>,
 ) -> AppResult<SensorContext> {
-    let name = slot_instrument_name(db, site_id, parameter_id).await?;
+    let name = match name {
+        Some(name) => Some(name.to_string()),
+        None => slot_instrument_name(db, site_id, parameter_id).await?,
+    };
     let sensor_id = resolve_or_mint_stream_instrument(
         db,
         stream,

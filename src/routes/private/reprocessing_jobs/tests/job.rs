@@ -102,3 +102,13 @@ fn duplicate_registration_panics() {
     r.register(dummy("x", None));
     r.register(dummy("x", None));
 }
+
+#[test]
+fn test_is_retry_budget_spent_at_and_past_the_limit() {
+    assert!(!is_retry_budget_spent(0, 3));
+    assert!(!is_retry_budget_spent(2, 3));
+    assert!(is_retry_budget_spent(3, 3));
+    assert!(is_retry_budget_spent(7, 3));
+    // No retries configured: the first orphaning is final
+    assert!(is_retry_budget_spent(0, 0));
+}

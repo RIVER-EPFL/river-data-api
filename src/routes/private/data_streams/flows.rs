@@ -166,9 +166,8 @@ pub async fn backfill<C: ConnectionTrait>(
     // The backfill reaches chunks the compression policy has already closed.
     bulk_write::lift_decompression_cap(conn).await?;
 
-    let readings = bulk_write::mutation(conn, attribute_readings(scope, deployment_id))
-        .await?
-        .rows;
+    let readings =
+        bulk_write::mutation_rows(conn, attribute_readings(scope, deployment_id)).await?;
 
     // Replicate groups on the newly paired streams (2+ spot readings sharing a slot and timestamp,
     // e.g. migrated NOMIS A/B/C rows) form samples. The row-level triggers populate the statistics.
