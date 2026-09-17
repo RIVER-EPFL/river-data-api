@@ -371,3 +371,105 @@ async fn an_existing_site_is_not_moved_by_a_plan_edit() {
         "the existing site keeps its own elevation"
     );
 }
+
+/// Scenario: a plan renames the station and the project a portal names, and is applied; the portal
+/// later adds a column at the same station and sends a note keyed to the station's own name.
+///
+/// Expected behaviour: the next plan resolves the new column onto the renamed site and project
+/// instead of proposing `S01` and `CNET` again, and the note lands on the renamed site.
+#[tokio::test]
+#[serial]
+async fn renamed_site_and_project_keep_resolving_from_their_source_names() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let first = uuid::Uuid::new_v4().to_string();
+    crate::common::seed_unpaired_stream_with_hierarchy(
+        &db, &first, "cnet", "S01:DOC", "CNET", "S01", "DOC", "ppb", None, 0,
+    )
+    .await;
+    let (status, plan) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/pairing-plans",
+        &serde_json::json!({"source_system": "cnet"}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "create ({status}): {plan}");
+    let plan_id = plan["id"].as_str().unwrap().to_string();
+    let (status, body) = crate::common::patch_plan_with_token(
+        &app,
+        &plan_id,
+        &serde_json::json!({
+            "expected_version": plan["version"],
+            "updates": [{
+                "stream_id": first,
+                "site_name": "Val Ferret upstream",
+                "project_name": "C-NET Valais",
+            }],
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "rename ({status}): {body}");
+    let counts = run_plan_action(&app, &token, &plan_id, "apply").await;
+    assert_eq!(counts["sites_created"], 1);
+    assert_eq!(counts["projects_created"], 1);
+
+    let second = uuid::Uuid::new_v4().to_string();
+    crate::common::seed_unpaired_stream_with_hierarchy(
+        &db, &second, "cnet", "S01:TOC", "CNET", "S01", "TOC", "ppb", None, 0,
+    )
+    .await;
+    let (status, plan) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/sync/pairing-plans",
+        &serde_json::json!({"source_system": "cnet"}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "second plan ({status}): {plan}");
+    let entry = plan["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["stream_id"] == second.as_str())
+        .expect("entry for the new column")
+        .clone();
+    assert_eq!(entry["site"]["name"], "Val Ferret upstream", "{entry}");
+    assert_eq!(entry["site"]["create"], false, "{entry}");
+    assert_eq!(entry["project"]["name"], "C-NET Valais", "{entry}");
+    assert_eq!(entry["project"]["create"], false, "{entry}");
+
+    let counts = run_plan_action(&app, &token, plan["id"].as_str().unwrap(), "apply").await;
+    assert_eq!(counts["sites_created"], 0);
+    assert_eq!(counts["projects_created"], 0);
+    assert_eq!(count(&db, "SELECT count(*) AS c FROM sites").await, 1);
+    assert_eq!(count(&db, "SELECT count(*) AS c FROM projects").await, 1);
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/notes/register",
+        &serde_json::json!({
+            "source_system": "cnet",
+            "notes": [{"source_key": "notes:1", "site_name": "S01", "text": "sensor cleaned"}],
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "notes ({status}): {body}");
+    assert_eq!(body["notes"][0]["status"], "created", "{body}");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT count(*) AS c FROM notes n JOIN sites s ON s.id = n.site_id \
+             WHERE s.name = 'Val Ferret upstream'"
+        )
+        .await,
+        1
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}

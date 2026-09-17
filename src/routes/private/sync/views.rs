@@ -1690,7 +1690,9 @@ pub async fn update_pairing_plan(
 
     let mut entries: Vec<crate::routes::private::sync::service::PlanEntry> = plan.entries.0.clone();
 
-    let catalog = crate::routes::private::sync::service::load_entity_catalog(&state.db).await?;
+    let catalog =
+        crate::routes::private::sync::service::load_entity_catalog(&state.db, &plan.source_system)
+            .await?;
 
     if let Some(bulk) = &req.bulk {
         if bulk.action != "pair" && bulk.action != "skip" {

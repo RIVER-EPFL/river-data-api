@@ -1,7 +1,8 @@
 //! Provenance-keyed upsert of source-authored site notes for sync services. Idempotent per
 //! `(source_system, source_key)`, so a source may send its complete set every cycle.
 //!
-//! The site comes from the source's own station name, resolved against sites that already exist.
+//! The site comes from the source's own station name, resolved through the source's links and then
+//! against the names of sites that already exist.
 //! A note mints nothing: a station river-data has never seen is reported `unresolved` and lands on
 //! a later cycle, once pairing has created the site.
 
@@ -10,7 +11,7 @@ use crudcrate::UpsertStatus;
 use sea_orm::Set;
 
 use super::models::{ActiveModel, Note, NoteOutcome, RegisterNotesRequest, RegisterNotesResponse};
-use super::service::sites_by_name;
+use super::service::sites_by_station;
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
 
@@ -30,7 +31,7 @@ pub async fn register_notes(
     let db = &state.db;
 
     let names: Vec<String> = payload.notes.iter().map(|n| n.site_name.clone()).collect();
-    let site_by_name = sites_by_name(db, &names).await?;
+    let site_by_name = sites_by_station(db, &source_system, &names).await?;
 
     let mut outcomes = Vec::with_capacity(payload.notes.len());
     for item in &payload.notes {

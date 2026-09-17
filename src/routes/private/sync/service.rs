@@ -33,6 +33,7 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::api_tokens::service::hash_token;
 use crate::routes::private::parameter_groups::group_model as parameter_groups;
 use crate::routes::private::parameter_groups::member_model;
+use crate::routes::private::projects::source_links as project_source_links;
 use crate::routes::private::readings::samples::models as samples;
 use crate::routes::private::readings::status_events::models as status_events;
 use crate::routes::private::sensors;
@@ -40,6 +41,7 @@ use crate::routes::private::sensors::models::{InstrumentKind, proposal};
 use crate::routes::private::sensors::service::{
     create_sensor_for_stream, upsert_source_instrument,
 };
+use crate::routes::private::sites::source_links as site_source_links;
 use crate::routes::private::{
     annotations, data_streams, data_streams::pairing_plans, parameters, projects, site_parameters,
     sites, standard_curves,
@@ -3001,6 +3003,9 @@ pub struct PlanEntityRef {
     pub id: Option<Uuid>,
     pub name: String,
     pub create: bool,
+    /// The name the source sends, which the apply links to the resolved row.
+    #[serde(default)]
+    pub source_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -3009,6 +3014,9 @@ pub struct PlanSiteRef {
     pub id: Option<Uuid>,
     pub name: String,
     pub create: bool,
+    /// The name the source sends, which the apply links to the resolved row.
+    #[serde(default)]
+    pub source_name: Option<String>,
     #[schema(required)]
     pub latitude: Option<f64>,
     #[schema(required)]
@@ -3295,7 +3303,7 @@ pub async fn create_plan(
         )));
     }
 
-    let catalog = load_entity_catalog(db).await?;
+    let catalog = load_entity_catalog(db, source_system).await?;
     let named_instruments: Vec<Uuid> = streams.iter().filter_map(|s| s.sensor_id).collect();
     let instruments = load_instrument_catalog(db, source_system, &named_instruments).await?;
 
@@ -3355,11 +3363,13 @@ pub async fn create_plan(
             action,
             project: PlanEntityRef {
                 id: None,
+                source_name: source_name(&h.project),
                 name: h.project,
                 create: false,
             },
             site: PlanSiteRef {
                 id: None,
+                source_name: source_name(&h.site),
                 name: h.site,
                 create: false,
                 latitude: h.latitude,
@@ -4050,8 +4060,15 @@ pub(super) async fn resolve_plan_entry<C: ConnectionTrait>(
         &mut caches.sites,
         &mut counters.sites_created,
         project_id,
+        source_system,
     )
     .await?;
+    if let Some(source_name) = &entry.project.source_name {
+        project_source_links::link(txn, source_system, source_name, project_id).await?;
+    }
+    if let Some(source_name) = &entry.site.source_name {
+        site_source_links::link(txn, source_system, source_name, site_id).await?;
+    }
     let parameter_id = resolve_or_create_param(
         txn,
         &entry.parameter,
@@ -5018,6 +5035,32 @@ where
         .find(|name| name.to_lowercase() != lower && canonical_name(name) == canonical)
 }
 
+/// The source name an entry still carries, or `None` once a reviewer has renamed the entry.
+fn unrenamed_source_name<'a>(source_name: Option<&'a str>, name: &str) -> Option<&'a str> {
+    source_name.filter(|source| source.eq_ignore_ascii_case(name.trim()))
+}
+
+/// A source's name for a site or project, as the links key it.
+fn source_name(name: &str) -> Option<String> {
+    Some(name.trim().to_string()).filter(|n| !n.is_empty())
+}
+
+/// The row an entry's source name is linked to, with that row's current name. An entry a reviewer
+/// has renamed in the plan names its target itself, so the link is only read while the entry still
+/// carries the source's name.
+pub(super) fn linked_entity(
+    source_name: Option<&str>,
+    name: &str,
+    links: &HashMap<String, Uuid>,
+    existing: &[(Uuid, String)],
+) -> Option<(Uuid, String)> {
+    let id = links.get(unrenamed_source_name(source_name, name)?)?;
+    existing
+        .iter()
+        .find(|(existing_id, _)| existing_id == id)
+        .cloned()
+}
+
 pub(super) fn match_entity(name: &str, existing: &[(Uuid, String)]) -> (Option<Uuid>, bool) {
     if name.is_empty() {
         return (None, false);
@@ -5109,9 +5152,15 @@ pub struct EntityCatalog {
     /// Parameter groups that already exist, by code, so a proposal resolves onto one rather than
     /// proposing a second group under a name the database already carries.
     pub groups: Vec<(Uuid, String)>,
+    /// The plan's source names for projects and sites, and the rows they are linked to.
+    pub project_links: HashMap<String, Uuid>,
+    pub site_links: HashMap<String, Uuid>,
 }
 
-pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityCatalog> {
+pub async fn load_entity_catalog(
+    db: &impl ConnectionTrait,
+    source_system: &str,
+) -> AppResult<EntityCatalog> {
     let projects = projects::Entity::find()
         .all(db)
         .await?
@@ -5210,6 +5259,8 @@ pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityC
         sites,
         params,
         groups,
+        project_links: project_source_links::for_source(db, source_system).await?,
+        site_links: site_source_links::for_source(db, source_system).await?,
     })
 }
 
@@ -5217,10 +5268,26 @@ pub async fn load_entity_catalog(db: &impl ConnectionTrait) -> AppResult<EntityC
 /// id + create flags, unit-mismatch warnings, and overall confidence. Warnings are rebuilt from
 /// scratch so ones that no longer apply are cleared. Does not touch action or grouping fields.
 pub fn reclassify_entry(entry: &mut PlanEntry, catalog: &EntityCatalog) {
+    if let Some((_, name)) = linked_entity(
+        entry.project.source_name.as_deref(),
+        &entry.project.name,
+        &catalog.project_links,
+        &catalog.projects,
+    ) {
+        entry.project.name = name;
+    }
     let (proj_id, proj_create) = match_entity(&entry.project.name, &catalog.projects);
     entry.project.id = proj_id;
     entry.project.create = proj_create;
 
+    if let Some((_, name)) = linked_entity(
+        entry.site.source_name.as_deref(),
+        &entry.site.name,
+        &catalog.site_links,
+        &catalog.sites,
+    ) {
+        entry.site.name = name;
+    }
     let (site_id, site_create) = match_entity(&entry.site.name, &catalog.sites);
     entry.site.id = site_id;
     entry.site.create = site_create;
@@ -5301,6 +5368,13 @@ pub(super) async fn resolve_or_create_project<C: ConnectionTrait>(
     if let Some(&id) = cache.get(&key) {
         return Ok(id);
     }
+    if let Some(source_name) =
+        unrenamed_source_name(entity_ref.source_name.as_deref(), &entity_ref.name)
+        && let Some(id) = project_source_links::find(txn, source_system, source_name).await?
+    {
+        cache.insert(key, id);
+        return Ok(id);
+    }
     let existing = projects::Entity::find()
         .filter(Expr::cust_with_values("LOWER(name) = $1", [key.clone()]))
         .one(txn)
@@ -5337,6 +5411,7 @@ pub(super) async fn resolve_or_create_site(
     cache: &mut HashMap<String, Uuid>,
     created_count: &mut u32,
     project_id: Uuid,
+    source_system: &str,
 ) -> AppResult<Uuid> {
     if let Some(id) = site_ref.id {
         // The site was matched at plan-creation time. Still backfill coordinates from the stream
@@ -5356,6 +5431,13 @@ pub(super) async fn resolve_or_create_site(
     }
     let key = site_ref.name.to_lowercase();
     if let Some(&id) = cache.get(&key) {
+        return Ok(id);
+    }
+    if let Some(source_name) =
+        unrenamed_source_name(site_ref.source_name.as_deref(), &site_ref.name)
+        && let Some(id) = site_source_links::find(txn, source_system, source_name).await?
+    {
+        cache.insert(key, id);
         return Ok(id);
     }
     let existing = sites::Entity::find()

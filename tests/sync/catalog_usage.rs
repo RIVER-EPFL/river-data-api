@@ -59,7 +59,9 @@ async fn a_parameter_with_readings_does_not_report_none() {
 
 /// The catalog's reading count for the seeded parameter.
 async fn count_of(db: &DatabaseConnection) -> i64 {
-    let catalog = load_entity_catalog(db).await.expect("catalog loads");
+    let catalog = load_entity_catalog(db, "vaisala")
+        .await
+        .expect("catalog loads");
     catalog
         .params
         .iter()

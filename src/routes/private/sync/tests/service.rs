@@ -1,7 +1,7 @@
 use super::{
     BulkWhere, EntityCatalog, InstrumentCatalog, InstrumentNameConflict, PlanCalculationRef,
     PlanEntry, PlanGroupRef, apply_bulk_action, apply_group_updates, family_parameter_suggestion,
-    group_code, minted_param_needs_review, plan_calculation, proposal_conflict,
+    group_code, linked_entity, minted_param_needs_review, plan_calculation, proposal_conflict,
     resolve_parameter_instrument, select_entries, stream_instrument_key,
 };
 use crate::routes::private::sync::models::PlanEntryUpdate;
@@ -629,4 +629,33 @@ fn test_device_slot_name_reads_an_existing_parameter_as_the_inventory_names_it()
         super::device_slot_name(&entry, &catalog),
         "Martigny Water Temperature"
     );
+}
+
+#[test]
+fn test_linked_entity_resolves_a_source_name_onto_the_renamed_row() {
+    let site = Uuid::new_v4();
+    let links = HashMap::from([("S01".to_string(), site)]);
+    let existing = vec![(site, "Val Ferret upstream".to_string())];
+    assert_eq!(
+        linked_entity(Some("S01"), "s01", &links, &existing),
+        Some((site, "Val Ferret upstream".to_string()))
+    );
+}
+
+#[test]
+fn test_linked_entity_ignores_an_entry_renamed_in_the_plan() {
+    let site = Uuid::new_v4();
+    let links = HashMap::from([("S01".to_string(), site)]);
+    let existing = vec![(site, "Val Ferret upstream".to_string())];
+    assert_eq!(
+        linked_entity(Some("S01"), "Somewhere else", &links, &existing),
+        None
+    );
+    assert_eq!(linked_entity(None, "S01", &links, &existing), None);
+}
+
+#[test]
+fn test_linked_entity_unlinked_name_resolves_nothing() {
+    let links = HashMap::new();
+    assert_eq!(linked_entity(Some("S01"), "S01", &links, &[]), None);
 }

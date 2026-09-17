@@ -330,6 +330,8 @@ pub const CLEANUP_TRUNCATED_TABLES: &[&str] = &[
     "calculation_formulas",
     "user_project_grants",
     "site_parameters",
+    "site_source_links",
+    "project_source_links",
     "parameters",
     "sites",
     "subprojects",
