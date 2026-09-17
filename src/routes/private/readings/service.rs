@@ -24,6 +24,7 @@ use sea_orm::QueryOrder;
 use sea_orm::QuerySelect;
 use sea_orm::Set;
 use sea_orm::Statement;
+use sea_orm::TransactionTrait;
 use sea_orm::Value;
 use sea_orm::entity::prelude::*;
 use sea_orm::sea_query::Alias;
@@ -9783,3 +9784,236 @@ mod import;
 #[cfg(test)]
 #[path = "tests/reconcile.rs"]
 mod reconcile;
+
+/// Adds referenced names to reading responses through CRUD hooks.
+pub struct ReadingOperations;
+
+impl crudcrate::CRUDOperations for ReadingOperations {
+    type Resource = super::models::Reading;
+
+    async fn after_get_one<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        entity: &mut super::models::Reading,
+    ) -> Result<(), crudcrate::ApiError> {
+        label_readings(db, std::slice::from_mut(entity)).await
+    }
+
+    async fn after_get_all<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        entities: &mut Vec<super::models::ReadingList>,
+    ) -> Result<(), crudcrate::ApiError> {
+        label_readings(db, entities.as_mut_slice()).await
+    }
+}
+
+trait ReadingLabelled {
+    fn ids(&self) -> RowIds;
+    fn label(&mut self, labels: &Labels);
+}
+
+struct RowIds {
+    stream: Uuid,
+    site: Option<Uuid>,
+    parameter: Option<Uuid>,
+    sensor: Option<Uuid>,
+    calibration: Option<Uuid>,
+    standard_curve: Option<Uuid>,
+}
+
+macro_rules! reading_labelled {
+    ($t:ty) => {
+        impl ReadingLabelled for $t {
+            fn ids(&self) -> RowIds {
+                RowIds {
+                    stream: self.stream_id,
+                    site: self.site_id,
+                    parameter: self.parameter_id,
+                    sensor: self.sensor_id,
+                    calibration: self.calibration_id,
+                    standard_curve: self.standard_curve_id,
+                }
+            }
+            fn label(&mut self, labels: &Labels) {
+                let ids = self.ids();
+                if let Some((system, key)) = labels.streams.get(&ids.stream) {
+                    self.source_system = Some(system.clone());
+                    self.source_key = Some(key.clone());
+                }
+                self.site_name = ids.site.and_then(|id| labels.sites.get(&id).cloned());
+                if let Some((code, units)) = ids.parameter.and_then(|id| labels.parameters.get(&id))
+                {
+                    self.parameter_code = Some(code.clone());
+                    self.units = Some(units.clone());
+                }
+                self.instrument_name = ids
+                    .sensor
+                    .and_then(|id| labels.sensors.get(&id).cloned());
+                self.calibration = ids
+                    .calibration
+                    .and_then(|id| labels.calibrations.get(&id).cloned());
+                self.curve = ids
+                    .standard_curve
+                    .and_then(|id| labels.curves.get(&id).cloned());
+            }
+        }
+    };
+}
+
+reading_labelled!(super::models::Reading);
+reading_labelled!(super::models::ReadingList);
+
+struct Labels {
+    streams: HashMap<Uuid, (String, String)>,
+    sites: HashMap<Uuid, String>,
+    parameters: HashMap<Uuid, (String, String)>,
+    sensors: HashMap<Uuid, String>,
+    calibrations: HashMap<Uuid, ReadingCalibrationRef>,
+    curves: HashMap<Uuid, ReadingCurveRef>,
+}
+
+async fn label_readings<C: ConnectionTrait, T: ReadingLabelled>(
+    db: &C,
+    rows: &mut [T],
+) -> Result<(), crudcrate::ApiError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let labels = load_labels(db, rows.iter().map(ReadingLabelled::ids)).await?;
+    for row in rows {
+        row.label(&labels);
+    }
+    Ok(())
+}
+
+fn distinct(ids: impl Iterator<Item = Option<Uuid>>) -> Vec<Uuid> {
+    ids.flatten().collect::<HashSet<_>>().into_iter().collect()
+}
+
+async fn load_labels<C: ConnectionTrait>(
+    db: &C,
+    rows: impl Iterator<Item = RowIds>,
+) -> Result<Labels, sea_orm::DbErr> {
+    let rows: Vec<RowIds> = rows.collect();
+    let streams = load_reading_streams(db, &rows).await?;
+    let sites = load_reading_sites(db, &rows).await?;
+    let parameters = load_reading_parameters(db, &rows).await?;
+    let sensors = load_reading_sensors(db, &rows).await?;
+    let calibrations = load_reading_calibrations(db, &rows).await?;
+    let curves = load_reading_curves(db, &rows).await?;
+    Ok(Labels {
+        streams,
+        sites,
+        parameters,
+        sensors,
+        calibrations,
+        curves,
+    })
+}
+
+async fn load_reading_streams<C: ConnectionTrait>(
+    db: &C,
+    rows: &[RowIds],
+) -> Result<HashMap<Uuid, (String, String)>, sea_orm::DbErr> {
+    Ok(data_streams::Entity::find()
+        .filter(data_streams::Column::Id.is_in(distinct(rows.iter().map(|r| Some(r.stream)))))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|s| (s.id, (s.source_system, s.source_key)))
+        .collect())
+}
+
+async fn load_reading_sites<C: ConnectionTrait>(
+    db: &C,
+    rows: &[RowIds],
+) -> Result<HashMap<Uuid, String>, sea_orm::DbErr> {
+    Ok(sites::Entity::find()
+        .filter(sites::Column::Id.is_in(distinct(rows.iter().map(|r| r.site))))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|s| (s.id, s.name))
+        .collect())
+}
+
+async fn load_reading_parameters<C: ConnectionTrait>(
+    db: &C,
+    rows: &[RowIds],
+) -> Result<HashMap<Uuid, (String, String)>, sea_orm::DbErr> {
+    Ok(parameters::Entity::find()
+        .filter(parameters::Column::Id.is_in(distinct(rows.iter().map(|r| r.parameter))))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|p| (p.id, (p.code, p.default_units)))
+        .collect())
+}
+
+async fn load_reading_sensors<C: ConnectionTrait>(
+    db: &C,
+    rows: &[RowIds],
+) -> Result<HashMap<Uuid, String>, sea_orm::DbErr> {
+    Ok(sensors::Entity::find()
+        .filter(sensors::Column::Id.is_in(distinct(rows.iter().map(|r| r.sensor))))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|s| {
+            let name = s
+                .name
+                .or(s.serial_number)
+                .unwrap_or_else(|| s.id.to_string());
+            (s.id, name)
+        })
+        .collect())
+}
+
+async fn load_reading_calibrations<C: ConnectionTrait>(
+    db: &C,
+    rows: &[RowIds],
+) -> Result<HashMap<Uuid, ReadingCalibrationRef>, sea_orm::DbErr> {
+    Ok(sensor_calibrations::Entity::find()
+        .filter(sensor_calibrations::Column::Id.is_in(distinct(rows.iter().map(|r| r.calibration))))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|c| {
+            (
+                c.id,
+                ReadingCalibrationRef {
+                    id: c.id,
+                    name: c.name,
+                    slope: c.slope,
+                    intercept: c.intercept,
+                    valid_from: c.valid_from,
+                    valid_until: c.valid_until,
+                },
+            )
+        })
+        .collect())
+}
+
+async fn load_reading_curves<C: ConnectionTrait>(
+    db: &C,
+    rows: &[RowIds],
+) -> Result<HashMap<Uuid, ReadingCurveRef>, sea_orm::DbErr> {
+    Ok(standard_curves::Entity::find()
+        .filter(standard_curves::Column::Id.is_in(distinct(rows.iter().map(|r| r.standard_curve))))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|c| {
+            (
+                c.id,
+                ReadingCurveRef {
+                    id: c.id,
+                    name: c.name,
+                    slope: c.slope,
+                    intercept: c.intercept,
+                },
+            )
+        })
+        .collect())
+}

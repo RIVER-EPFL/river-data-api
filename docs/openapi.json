@@ -15817,6 +15817,49 @@
         ],
         "type": "object"
       },
+      "ReadingCalibrationRef": {
+        "description": "The calibration a listed reading was corrected with.",
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "intercept": {
+            "format": "double",
+            "type": "number"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "slope": {
+            "format": "double",
+            "type": "number"
+          },
+          "valid_from": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "valid_until": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slope",
+          "intercept",
+          "valid_from",
+          "valid_until"
+        ],
+        "type": "object"
+      },
       "ReadingChangeProposalList": {
         "properties": {
           "decided_at": {
@@ -16070,6 +16113,36 @@
           "site_name",
           "parameter_id",
           "parameter_code"
+        ],
+        "type": "object"
+      },
+      "ReadingCurveRef": {
+        "description": "The standard curve a listed reading names.",
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "intercept": {
+            "format": "double",
+            "type": "number"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "slope": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slope",
+          "intercept"
         ],
         "type": "object"
       },
@@ -16465,6 +16538,16 @@
               "null"
             ]
           },
+          "calibration": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReadingCalibrationRef"
+              }
+            ]
+          },
           "calibration_id": {
             "description": "The time-windowed base calibration the value was corrected with.",
             "format": "uuid",
@@ -16486,6 +16569,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "curve": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReadingCurveRef"
+              }
             ]
           },
           "deployment_id": {
@@ -16512,6 +16605,12 @@
           "ingested_at": {
             "description": "When the stored value arrived (DB default on insert, re-stamped when an overwrite changes\nthe value). NULL on rows that predate tracking.",
             "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instrument_name": {
             "type": [
               "string",
               "null"
@@ -16544,6 +16643,12 @@
           },
           "notes": {
             "description": "The operator's free text about the measurement.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parameter_code": {
             "type": [
               "string",
               "null"
@@ -16595,6 +16700,25 @@
               "null"
             ]
           },
+          "site_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_system": {
+            "description": "The names behind the ids above, filled on read so a list reads without a lookup per row.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "standard_curve_id": {
             "description": "The hand-picked lab curve applied on top of the base calibration, for grab measurements.",
             "format": "uuid",
@@ -16610,6 +16734,12 @@
           "time": {
             "format": "date-time",
             "type": "string"
+          },
+          "units": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "unverified": {
             "description": "An intern's entry that no manager has verified. Curated surfaces leave it out\n(`common/served.rs`); only `reading_decisions` moves it, through its projection trigger.",
@@ -16657,7 +16787,15 @@
           "notes",
           "created_by",
           "unverified",
-          "derived_version_id"
+          "derived_version_id",
+          "source_system",
+          "source_key",
+          "site_name",
+          "parameter_code",
+          "units",
+          "instrument_name",
+          "calibration",
+          "curve"
         ],
         "type": "object"
       },
@@ -37848,7 +37986,7 @@
     },
     "/api/readings": {
       "get": {
-        "description": "Retrieves all readings.\n\nThis resource manages reading items\n\nAdditional sortable columns: \n- time\n- raw_value.\n\nAdditional filterable columns: \n- stream_id\n- time\n- replicate_index\n- site_id\n- parameter_id\n- sensor_id\n- standard_curve_id\n- measurement_type\n- is_flagged\n- sample_id\n- collection_event_id\n- provenance_kind\n- unverified.",
+        "description": "Retrieves all readings.\n\nThis resource manages reading items\n\nAdditional sortable columns: \n- time\n- raw_value\n- ingested_at.\n\nAdditional filterable columns: \n- stream_id\n- time\n- replicate_index\n- site_id\n- parameter_id\n- sensor_id\n- calibration_id\n- standard_curve_id\n- measurement_type\n- is_flagged\n- sample_id\n- collection_event_id\n- provenance_kind\n- unverified.",
         "operationId": "get_all_readings",
         "parameters": [
           {

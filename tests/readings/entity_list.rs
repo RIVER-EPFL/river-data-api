@@ -84,3 +84,26 @@ async fn the_list_pages_by_range() {
         "the range is the page size: {body}"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn the_list_names_what_each_row_carries_by_id() {
+    let (app, token) = setup().await;
+
+    let filter = percent_encode(&format!(
+        r#"{{"site_id":"{SITE1_ID}","parameter_id":"{GLOBAL_PARAM_TEMP_ID}","time":"{T}"}}"#
+    ));
+    let (status, body) = list(&app, &token, &format!("filter={filter}")).await;
+    assert_eq!(status, 200, "{body}");
+    let row = &body.as_array().expect("a list of readings")[0];
+    assert_eq!(row["site_name"], "Upstream Station", "{row}");
+    assert_eq!(row["parameter_code"], "DO_Temperature", "{row}");
+    assert_eq!(row["units"], "°C", "{row}");
+    assert_eq!(row["source_system"], "grab_sample", "{row}");
+    assert!(row["source_key"].is_string(), "{row}");
+    assert!(
+        row["calibration"].is_null(),
+        "an uncorrected value names no calibration: {row}"
+    );
+    assert!(row["curve"].is_null(), "{row}");
+}

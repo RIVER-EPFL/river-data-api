@@ -37,7 +37,8 @@ pub use river_data_core::models::SourceWindow;
     name_singular = "reading",
     name_plural = "readings",
     generate_router,
-    routes(read)
+    routes(read),
+    operations = super::service::ReadingOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
@@ -59,6 +60,7 @@ pub struct Model {
     #[crudcrate(filterable)]
     pub sensor_id: Option<Uuid>,
     /// The time-windowed base calibration the value was corrected with.
+    #[crudcrate(filterable)]
     pub calibration_id: Option<Uuid>,
     /// The hand-picked lab curve applied on top of the base calibration, for grab measurements.
     #[crudcrate(filterable)]
@@ -83,6 +85,7 @@ pub struct Model {
     pub withdrawn_reason: Option<String>,
     /// When the stored value arrived (DB default on insert, re-stamped when an overwrite changes
     /// the value). NULL on rows that predate tracking.
+    #[crudcrate(sortable)]
     pub ingested_at: Option<DateTimeWithTimeZone>,
     /// Where this value came from: `tool_run` | `chain` | `csv_import` | `manual` | `batch` |
     /// `sync` | `derived`. Total, held by a DB trigger for a writer that names none,
@@ -107,6 +110,31 @@ pub struct Model {
     pub unverified: bool,
     /// The formula version a derived value was computed under, on a derived row.
     pub derived_version_id: Option<Uuid>,
+    /// The names behind the ids above, filled on read so a list reads without a lookup per row.
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub source_system: Option<String>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub source_key: Option<String>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub site_name: Option<String>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub parameter_code: Option<String>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub units: Option<String>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub instrument_name: Option<String>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub calibration: Option<ReadingCalibrationRef>,
+    #[sea_orm(ignore)]
+    #[crudcrate(non_db_attr = true, exclude(create, update))]
+    pub curve: Option<ReadingCurveRef>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -2958,4 +2986,27 @@ pub struct CurationDriftResponse {
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct CurationDriftQuery {
     pub limit: Option<u32>,
+}
+
+/// The calibration a listed reading was corrected with.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ReadingCalibrationRef {
+    pub id: Uuid,
+    #[schema(required)]
+    pub name: Option<String>,
+    pub slope: f64,
+    pub intercept: f64,
+    pub valid_from: DateTime<Utc>,
+    #[schema(required)]
+    pub valid_until: Option<DateTime<Utc>>,
+}
+
+/// The standard curve a listed reading names.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ReadingCurveRef {
+    pub id: Uuid,
+    #[schema(required)]
+    pub name: Option<String>,
+    pub slope: f64,
+    pub intercept: f64,
 }
