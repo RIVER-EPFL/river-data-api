@@ -77,21 +77,20 @@ impl CRUDOperations for StandardCurveOperations {
             ));
         }
 
-        // Everything except `notes` is the provenance of a value that has already been published,
-        // `r_squared` and `created_by` included: they record how and by whom the fit that produced
-        // that value was obtained. Only free text may still be added after the fact.
+        // The fit is the provenance of a value that has already been published, `r_squared` and
+        // `created_by` included: they record how and by whom it was obtained. The name and notes
+        // are labels, and a reading references the curve by id, so both stay editable.
         let frozen_field_change = data.slope.is_some()
             || data.intercept.is_some()
             || data.r_squared.is_some()
-            || data.name.is_some()
             || data.fitted_on.is_some()
             || data.sensor_id.is_some()
             || data.created_by.is_some();
         if frozen_field_change && curve_is_used(db, id).await? {
             return Err(ApiError::bad_request(
                 "This standard curve has already been applied to readings, so its coefficients, \
-                 fit quality, name, fit date, instrument and attribution are fixed. Create a new \
-                 curve and re-enter the affected measurements against it. Only its notes stay \
+                 fit quality, fit date, instrument and attribution are fixed. Create a new \
+                 curve and re-enter the affected measurements against it. Its name and notes stay \
                  editable."
                     .to_string(),
             ));

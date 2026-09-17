@@ -433,6 +433,21 @@ async fn editing_an_applied_curve_is_refused_so_a_new_curve_is_minted() {
         "the coefficients the reading was corrected with are unchanged",
     );
 
+    let (status, body) = put_json_with_token(
+        &fx.app,
+        &format!("/api/standard_curves/{original}"),
+        &json!({ "name": "Plate D, March run" }),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "an applied curve can still be renamed: {body}");
+    let stored = reading_at(&fx.db, GRAB_TIME).await;
+    assert_eq!(
+        stored.standard_curve_id,
+        Some(original),
+        "the reading keeps the renamed curve"
+    );
+
     let refit = create_curve(&fx, sensor.id, "Plate D refit", 5.0, 1.0).await;
     assert_ne!(refit, original, "the corrected fit is a new row");
 
