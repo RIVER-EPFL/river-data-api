@@ -1494,3 +1494,94 @@ async fn the_drift_report_lists_the_readings_behind_its_count() {
         "the fold says what the decision asserted"
     );
 }
+
+// --- The order of effect (Q215) ---
+
+async fn seq_of(db: &DatabaseConnection, id: Uuid) -> i64 {
+    db.query_one_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!("SELECT seq FROM reading_decisions WHERE id = '{id}'"),
+    ))
+    .await
+    .unwrap()
+    .expect("the decision")
+    .try_get("", "seq")
+    .unwrap()
+}
+
+/// Two decisions in one transaction share `at`; `seq` still says which came second.
+#[tokio::test]
+#[serial]
+async fn two_decisions_in_one_transaction_are_ordered_by_seq() {
+    let f = setup().await;
+    seed_group(&f, &[10.0]).await;
+    let flag = decision(
+        &f,
+        Kind::Flag,
+        Some(0),
+        json!({ "is_flagged": true, "flag_reason": "a" }),
+    );
+    let unflag = decision(
+        &f,
+        Kind::Unflag,
+        Some(0),
+        json!({ "is_flagged": false, "flag_reason": null }),
+    );
+    let (first, second) = bulk_write::guarded(&f.db, async |txn| {
+        let a = decisions::record(txn, &flag).await?;
+        let b = decisions::record(txn, &unflag).await?;
+        Ok((a, b))
+    })
+    .await
+    .expect("both recorded");
+    assert!(seq_of(&f.db, second).await > seq_of(&f.db, first).await);
+}
+
+/// A second writer on the same key waits for the first to commit before it takes a sequence, so
+/// the later effect carries the later number whatever the two transactions' clocks say.
+#[tokio::test]
+#[serial]
+async fn a_second_writer_on_the_same_key_waits_for_the_first() {
+    let f = setup().await;
+    seed_group(&f, &[10.0]).await;
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let db1 = f.db.clone();
+    let flag = decision(
+        &f,
+        Kind::Flag,
+        Some(0),
+        json!({ "is_flagged": true, "flag_reason": "a" }),
+    );
+    let first = tokio::spawn(async move {
+        bulk_write::guarded(&db1, async |txn| {
+            let id = decisions::record(txn, &flag).await?;
+            held_tx.send(()).ok();
+            release_rx.await.ok();
+            Ok(id)
+        })
+        .await
+        .expect("first recorded")
+    });
+    held_rx.await.expect("the first writer holds its decision");
+    let db2 = f.db.clone();
+    let unflag = decision(
+        &f,
+        Kind::Unflag,
+        Some(0),
+        json!({ "is_flagged": false, "flag_reason": null }),
+    );
+    let mut second = tokio::spawn(async move {
+        bulk_write::guarded(&db2, async |txn| decisions::record(txn, &unflag).await)
+            .await
+            .expect("second recorded")
+    });
+    tokio::select! {
+        _ = &mut second => panic!("the second writer took a sequence while the first held the key"),
+        () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+    }
+    release_tx.send(()).unwrap();
+    let first = first.await.unwrap();
+    let second = second.await.unwrap();
+    assert!(seq_of(&f.db, second).await > seq_of(&f.db, first).await);
+}

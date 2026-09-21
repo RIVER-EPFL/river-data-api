@@ -796,3 +796,114 @@ async fn a_per_replicate_chain_is_walkable_in_both_directions() {
     let s1 = record_of(&app, &token, &s1_id).await;
     assert_eq!(s1["inputs"].as_array().map(Vec::len), Some(3), "{s1}");
 }
+
+/// Scenario: a derived value is computed from a stored reading.
+///
+/// Expected behaviour: the record names what the computation consumed, each input carrying the
+/// key of the reading it was read from and the slot its own point record is opened by (Q215,
+/// M276). What the marks read as when a source moves is `consumed_history.rs`, which walks each
+/// path that can move one.
+#[tokio::test]
+#[serial]
+async fn a_consumed_input_opens_the_reading_it_was_read_from() {
+    let (_db, app, token) = setup().await;
+
+    let code = format!("consumed_{}", uuid::Uuid::new_v4().simple());
+    let (status, def) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": code,
+            "name": "Consumed input fixture",
+            "units": "mg/L",
+            "formula": "Dissolved_O2 * 2",
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create ({status}): {def}");
+    let output = def["output_parameter_id"].as_str().expect("output");
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/site_parameters",
+        &json!({
+            "site_id": SITE1_ID,
+            "parameter_id": output,
+            "name": code,
+            "sensor_type": "derived",
+            "entry_mode": "tool",
+            "display_units": "mg/L",
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "assign ({status}): {body}");
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/readings/batch",
+        &json!({
+            "readings": [{
+                "site_id": SITE1_ID,
+                "parameter_id": GLOBAL_PARAM_DO_ID,
+                "time": T1,
+                "raw_value": 10.0,
+            }]
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "ingest ({status}): {body}");
+
+    let uri =
+        format!("/api/readings/provenance?site_id={SITE1_ID}&parameter_id={output}&time={T1}");
+    let consumed = wait_for_consumed(&app, &token, &uri).await;
+    assert_eq!(
+        consumed.len(),
+        2,
+        "the input and the formula step: {consumed:?}"
+    );
+    let input = entry(&consumed, "Dissolved_O2");
+    assert_eq!(input["state"], json!("unchanged"), "{input}");
+    assert_eq!(input["value"].as_f64(), Some(10.0), "{input}");
+    let member = &input["members"][0];
+    assert_eq!(member["value"].as_f64(), Some(10.0), "{member}");
+    assert_eq!(member["current_value"].as_f64(), Some(10.0), "{member}");
+    assert_eq!(member["state"], json!("unchanged"), "{member}");
+    assert_eq!(
+        member["point"]["site_parameter_id"],
+        json!(PARAM_S1_DO_ID),
+        "the member opens the slot's own point record: {member}"
+    );
+    assert_eq!(
+        member["point"]["measurement_type"],
+        json!("continuous"),
+        "{member}"
+    );
+    assert_eq!(entry(&consumed, &code)["state"], json!("unchanged"));
+}
+
+/// The record's consumed set, polled until the compute that captures it lands.
+async fn wait_for_consumed(app: &axum::Router, token: &str, uri: &str) -> Vec<serde_json::Value> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (status, body) = crate::common::get_json_with_token(app, uri, token).await;
+        let set = body["records"][0]["consumed"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if !set.is_empty() || std::time::Instant::now() >= deadline {
+            assert_eq!(status, 200, "{body}");
+            return set;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+fn entry<'a>(consumed: &'a [serde_json::Value], variable: &str) -> &'a serde_json::Value {
+    consumed
+        .iter()
+        .find(|c| c["variable"] == variable)
+        .unwrap_or_else(|| panic!("{variable} was consumed: {consumed:?}"))
+}

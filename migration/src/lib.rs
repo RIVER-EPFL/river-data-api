@@ -19,6 +19,9 @@ mod m20260916_000001_sample_sd_only;
 mod m20260916_000002_drop_sync_source_system;
 mod m20260917_000001_site_project_source_links;
 mod m20260917_000002_standard_curve_proposals;
+pub mod m20260921_000001_entity_revisions;
+mod m20260921_000002_given_up_parameter;
+mod m20260921_000003_tool_run_visit;
 
 pub struct Migrator;
 
@@ -58,6 +61,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260916_000002_drop_sync_source_system::Migration),
             Box::new(m20260917_000001_site_project_source_links::Migration),
             Box::new(m20260917_000002_standard_curve_proposals::Migration),
+            Box::new(m20260921_000001_entity_revisions::Migration),
+            Box::new(m20260921_000002_given_up_parameter::Migration),
+            Box::new(m20260921_000003_tool_run_visit::Migration),
         ]
     }
 }

@@ -69,8 +69,9 @@ async fn test_list_tools_excludes_removed() {
         .map(|t| t["name"].as_str().unwrap())
         .collect();
     // Counting is not a property of this endpoint: the authoring suites create scripts in the
-    // same database and cleanup does not remove them, so assert the seeded set is served.
-    // Tools enter this list one at a time as they are reworked onto the replicates model.
+    // same database and cleanup does not remove them, so assert the reference set is served.
+    // `doc` is the one R tool the fixtures carry; the portal's other calculators are formula
+    // calculations authored by hand and reach no database from here.
     for expected in ["doc"] {
         assert!(names.contains(&expected), "missing tool {expected}");
     }

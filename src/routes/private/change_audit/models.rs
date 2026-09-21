@@ -38,6 +38,10 @@ pub struct Model {
     pub new_value: Option<serde_json::Value>,
     #[crudcrate(sortable, exclude(update, create))]
     pub changed_at: DateTimeWithTimeZone,
+    /// The order of effect: assigned under a lock on the subject, so the newest row for a subject
+    /// is the row's revision (Q215).
+    #[crudcrate(sortable, exclude(update, create))]
+    pub seq: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

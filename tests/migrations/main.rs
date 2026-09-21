@@ -8,4 +8,5 @@ mod common;
 
 mod blank_database;
 mod cutover_restore;
+mod entity_revisions;
 mod rollup_policies;

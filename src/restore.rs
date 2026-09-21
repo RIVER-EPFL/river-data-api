@@ -70,7 +70,7 @@ const CARRIED: &[Carried] = &[
     Carried {
         table: "tool_runs",
         key: &["id"],
-        references: &[],
+        references: &[("site_id", Reference::Natural("sites"))],
         nested: &[("context", "site_id", Reference::Natural("sites"))],
     },
     Carried {

@@ -257,6 +257,10 @@ pub struct ToolCalculation {
     /// run, which returns only what the script returns.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub trace: Vec<TraceStep>,
+    /// Every input as it was read, with the revision of each row behind it (Q215). Stored on
+    /// the run's context, so a later reader can say whether a source has moved since.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub consumed: Vec<crate::routes::private::readings::models::ConsumedInput>,
 }
 
 /// A calculation and the `tool_runs` row it was stored as.
@@ -1488,6 +1492,8 @@ pub struct RunOutcome {
     pub collected_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Each formula as it was evaluated, in order. Empty for a script run.
     pub trace: Vec<TraceStep>,
+    /// Every input as it was read, with the revision of each row behind it (Q215).
+    pub consumed: Vec<crate::routes::private::readings::models::ConsumedInput>,
 }
 
 /// What the runner reports about itself. It cannot change without the container restarting, so
@@ -1665,6 +1671,9 @@ pub struct Evaluated {
     /// The variables the formula read, by name, in the order the formula names them. Empty when
     /// the formula was skipped.
     pub bindings: Vec<(String, f64)>,
+    /// The families the formula reduced, in the order it names them. Empty for a formula that
+    /// reduces nothing.
+    pub reductions: Vec<TraceReduction>,
 }
 
 /// A stored run replayed under the version it pinned, so a value computed months ago still shows
@@ -1691,6 +1700,19 @@ pub struct RunTrace {
     #[schema(value_type = std::collections::HashMap<String, f64>)]
     pub constants: serde_json::Value,
     pub trace: Vec<TraceStep>,
+    /// The values the run produced, as it stored them: an explicit null is a value computed and
+    /// not a number, as against never computed at all.
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
+    pub results: serde_json::Value,
+    /// Outputs the run did not produce, each with its reason, as the run recorded them.
+    pub skipped: Vec<serde_json::Value>,
+    /// The curves the run applied, as it stored them.
+    #[schema(value_type = Vec<serde_json::Value>)]
+    pub curves: serde_json::Value,
+    /// The manifest of the version the run pinned, so the stored result reads through the same
+    /// tables a fresh run does rather than through a second rendering of its own.
+    #[schema(value_type = Object)]
+    pub manifest: serde_json::Value,
 }
 
 /// One formula of a run as it was evaluated: the text, and per cell the value it produced and
@@ -1726,6 +1748,21 @@ pub struct TraceCell {
     pub skipped: Option<String>,
     #[schema(value_type = std::collections::HashMap<String, f64>)]
     pub bindings: std::collections::BTreeMap<String, f64>,
+    /// One entry per reducer the formula applied. A binding names one number; this names the
+    /// family behind it, so a reader can see which repeats the mean or the sd was taken over.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reductions: Vec<TraceReduction>,
+}
+
+/// One reduction over a replicate family: the call as the formula writes it, the number it bound,
+/// and the indexes whose values were eligible. A gap and a value computed as NA are not members,
+/// so `members` is what the statistic was actually taken over.
+#[derive(Clone, Debug, PartialEq, Serialize, ToSchema)]
+pub struct TraceReduction {
+    pub call: String,
+    #[schema(required)]
+    pub value: Option<f64>,
+    pub members: Vec<usize>,
 }
 
 /// What a calculation produced for one output: one number, or one per replicate index.
@@ -2092,6 +2129,26 @@ pub struct SaveFormulaSetResponse {
     pub deleted: usize,
     /// Whether the migration of the superseded version's values was enqueued.
     pub migrated: bool,
+    /// One entry per formula this save turned from an output into a step. Publication stops and
+    /// nothing is deleted, so the entry says what stays behind and who still reads it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub given_up: Vec<GivenUpOutput>,
+}
+
+/// A catalog parameter a formula published until this save ticked it as a step.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GivenUpOutput {
+    /// The formula's code, which is the catalog row's code too.
+    pub code: String,
+    pub parameter_id: Uuid,
+    /// Readings stored under the parameter. They stay, and ticking the formula back as an output
+    /// publishes them again.
+    pub readings_retained: i64,
+    /// The formulas that read the parameter, by code: each of them now reads a value nothing
+    /// refreshes.
+    pub read_by: Vec<String>,
+    /// The sites holding a slot of the parameter, by name.
+    pub sites: Vec<String>,
 }
 
 /// Run a formula calculation's unsaved formula set at a visit. The formulas replace the stored
@@ -2409,6 +2466,13 @@ pub mod run {
         #[sea_orm(column_type = "JsonBinary", nullable)]
         #[crudcrate(exclude(list))]
         pub context: Option<serde_json::Value>,
+        /// The visit the run was computed at. The same two values `context` carries, written from
+        /// the same resolution, as columns a list can be filtered and ordered by: "the runs at
+        /// this visit" is a query, not a scan of the blobs.
+        #[crudcrate(filterable, sortable)]
+        pub site_id: Option<Uuid>,
+        #[crudcrate(filterable, sortable)]
+        pub collected_at: Option<chrono::DateTime<chrono::Utc>>,
         /// Which path minted the run: `interactive`, `csv_import` or `chain`.
         #[crudcrate(filterable, sortable)]
         pub source: String,

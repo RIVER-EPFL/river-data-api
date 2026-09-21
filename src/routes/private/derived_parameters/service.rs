@@ -81,6 +81,19 @@ async fn is_standalone<C: ConnectionTrait>(db: &C, definition_id: Uuid) -> Resul
     Ok(row.is_some_and(|d| d.tool_script_id.is_none() && !d.intermediate))
 }
 
+/// A reducer takes a replicate family, and a continuous definition reads one value per instant, so
+/// there is nothing for it to reduce. It is refused at the save rather than left to fail on every
+/// reading the derived job computes.
+pub(crate) fn refuse_reducers(formula: &str) -> Result<(), ApiError> {
+    match crate::routes::private::tools::service::reducer_calls(formula).first() {
+        Some(call) => Err(ApiError::bad_request(format!(
+            "'{}' reduces a replicate family, which a continuous calculation does not have",
+            call.call
+        ))),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn validate_formula(formula: &str) -> Result<(), ApiError> {
     formula
         .parse::<meval::Expr>()
@@ -848,20 +861,12 @@ async fn ensure_output_parameter<C: ConnectionTrait>(
     entity: &mut CalculationFormula,
 ) -> Result<Option<Uuid>, ApiError> {
     // An intermediate is a step, not a measurement: nothing stores its value, so no parameter is
-    // minted for it and a formula turned intermediate gives up the link it had.
+    // minted for it and a formula turned intermediate gives up the link it had. The row it gave up
+    // is recorded, so ticking the step back recovers that parameter rather than a second one.
     if entity.intermediate {
-        if entity.output_parameter_id.take().is_some() {
-            super::models::definition::Entity::update_many()
-                .col_expr(
-                    super::models::definition::Column::OutputParameterId,
-                    sea_orm::sea_query::Expr::value(Option::<Uuid>::None),
-                )
-                .filter(super::models::definition::Column::Id.eq(entity.id))
-                .exec(db)
-                .await
-                .map_err(|e| {
-                    ApiError::internal(format!("Failed to unlink output parameter: {e}"), None)
-                })?;
+        if let Some(given_up) = entity.output_parameter_id.take() {
+            set_output_link(db, entity.id, None, Some(given_up)).await?;
+            entity.given_up_parameter_id = Some(given_up);
         }
         return Ok(None);
     }
@@ -870,6 +875,15 @@ async fn ensure_output_parameter<C: ConnectionTrait>(
         // Keep the parameter row in sync
         update_output_parameter(db, existing_id, entity).await?;
         return Ok(Some(existing_id));
+    }
+    // A formula ticked back as an output takes back the parameter it published, by id, so a code
+    // changed while it was a step does not send it to the adoption guard below.
+    if let Some(given_up) = entity.given_up_parameter_id {
+        update_output_parameter(db, given_up, entity).await?;
+        set_output_link(db, entity.id, Some(given_up), None).await?;
+        entity.output_parameter_id = Some(given_up);
+        entity.given_up_parameter_id = None;
+        return Ok(Some(given_up));
     }
 
     // Create or find the output parameter
@@ -909,24 +923,52 @@ async fn ensure_output_parameter<C: ConnectionTrait>(
     };
 
     // Store the link on the definition
+    set_output_link(db, entity.id, Some(param_id), None).await?;
+
+    entity.output_parameter_id = Some(param_id);
+    entity.given_up_parameter_id = None;
+    Ok(Some(param_id))
+}
+
+/// Write both halves of a formula's claim on a catalog parameter: the one it publishes now, and
+/// the one it published and gave up. They are written together so the pair is never half true.
+async fn set_output_link<C: ConnectionTrait>(
+    db: &C,
+    definition_id: Uuid,
+    published: Option<Uuid>,
+    given_up: Option<Uuid>,
+) -> Result<(), ApiError> {
     super::models::definition::Entity::update_many()
         .col_expr(
             super::models::definition::Column::OutputParameterId,
-            sea_orm::sea_query::Expr::value(param_id),
+            sea_orm::sea_query::Expr::value(published),
         )
-        .filter(super::models::definition::Column::Id.eq(entity.id))
+        .col_expr(
+            super::models::definition::Column::GivenUpParameterId,
+            sea_orm::sea_query::Expr::value(given_up),
+        )
+        .filter(super::models::definition::Column::Id.eq(definition_id))
         .exec(db)
         .await
         .map_err(|e| ApiError::internal(format!("Failed to link output parameter: {e}"), None))?;
-
-    entity.output_parameter_id = Some(param_id);
-    Ok(Some(param_id))
+    Ok(())
 }
 
 pub struct CalculationFormulaOperations;
 
 impl CRUDOperations for CalculationFormulaOperations {
     type Resource = CalculationFormula;
+
+    /// The change-audit trigger reads the writer from the transaction, so the label is declared on
+    /// every write this entity makes, before any hook or statement on it.
+    async fn after_begin<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+    ) -> Result<(), ApiError> {
+        crate::common::actor::declare(db)
+            .await
+            .map_err(ApiError::database)
+    }
 
     async fn after_get_one<C: ConnectionTrait + TransactionTrait>(
         &self,
@@ -1004,6 +1046,7 @@ impl CRUDOperations for CalculationFormulaOperations {
         ensure_output_parameter(db, entity).await?;
 
         if is_standalone(db, entity.id).await? {
+            refuse_reducers(&entity.formula)?;
             mint_derived_version(db, entity.id, &entity.formula, None).await?;
         }
 
@@ -1071,6 +1114,7 @@ impl CRUDOperations for CalculationFormulaOperations {
         ensure_output_parameter(db, entity).await?;
 
         if is_standalone(db, entity.id).await? {
+            refuse_reducers(&entity.formula)?;
             mint_derived_version(db, entity.id, &entity.formula, None).await?;
         }
 
@@ -1227,6 +1271,69 @@ impl DerivedPass {
         }
         Ok(holds.len())
     }
+}
+
+/// What a formula leaves behind when it stops publishing a parameter: the readings stored under
+/// it, the formulas that still read it, and the sites that hold a slot of it. Nothing is deleted,
+/// so this is what a person confirming the tick needs to see.
+pub async fn given_up_report<C: ConnectionTrait>(
+    db: &C,
+    code: String,
+    parameter_id: Uuid,
+) -> Result<crate::routes::private::tools::models::GivenUpOutput, ApiError> {
+    let readings_retained = readings_under(db, parameter_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to count readings: {e}"), None))?;
+    let reader_ids: Vec<Uuid> = source::Entity::find()
+        .filter(source::Column::ParameterId.eq(parameter_id))
+        .all(db)
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?
+        .into_iter()
+        .map(|s| s.derived_definition_id)
+        .collect();
+    let mut read_by: Vec<String> = if reader_ids.is_empty() {
+        Vec::new()
+    } else {
+        super::models::definition::Entity::find()
+            .filter(super::models::definition::Column::Id.is_in(reader_ids))
+            .order_by_asc(super::models::definition::Column::Code)
+            .all(db)
+            .await
+            .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?
+            .into_iter()
+            .map(|f| f.code)
+            .collect()
+    };
+    read_by.retain(|reader| *reader != code);
+    let slot_sites: Vec<Uuid> = site_parameters::Entity::find()
+        .filter(site_parameters::Column::ParameterId.eq(parameter_id))
+        .all(db)
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?
+        .into_iter()
+        .map(|slot| slot.site_id)
+        .collect();
+    let sites: Vec<String> = if slot_sites.is_empty() {
+        Vec::new()
+    } else {
+        sites::Entity::find()
+            .filter(sites::Column::Id.is_in(slot_sites))
+            .order_by_asc(sites::Column::Name)
+            .all(db)
+            .await
+            .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?
+            .into_iter()
+            .map(|site| site.name)
+            .collect()
+    };
+    Ok(crate::routes::private::tools::models::GivenUpOutput {
+        code,
+        parameter_id,
+        readings_retained: i64::try_from(readings_retained).unwrap_or(i64::MAX),
+        read_by,
+        sites,
+    })
 }
 
 #[cfg(test)]

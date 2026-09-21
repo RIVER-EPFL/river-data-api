@@ -10,6 +10,7 @@ use sea_orm::{
 use sea_orm_migration::sea_orm::DbErr;
 
 use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::models::{ConsumedInput, ConsumedReading};
 use crate::routes::private::readings::samples::models as samples;
 use serde::Deserialize;
 use serde_json::json;
@@ -27,11 +28,12 @@ use super::models::{
     ManifestEventInput, ManifestOutput, ManifestSiteInput, MissingConstant, ParamWhen, ParseCheck,
     ParseError, PinnedFormula, Produced, ResolvedBy, ResolvedCurve, ResolvedParameter, RunOutcome,
     RunnerRuntime, ScannedName, ScriptInspection, ScriptScan, SlotCoverage, StoredVersionContent,
-    Subject, ToolScriptOperations, TraceCell, TraceStep, ValidateResponse, kind_accepts,
-    parse_manifest,
+    Subject, ToolScriptOperations, TraceCell, TraceReduction, TraceStep, ValidateResponse,
+    kind_accepts, parse_manifest,
 };
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
+use crate::routes::private::change_audit::service::{entity_revision, entity_revisions};
 use crate::routes::private::constants::models as constants;
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::parameter_groups::service::rules;
@@ -335,13 +337,6 @@ pub(super) struct StoredFormula {
     curve_slot: Option<String>,
     per_replicate: Option<String>,
     intermediate: bool,
-}
-
-/// The served spot value at one slot, which an event input resolves to. A NULL `value` is a slot
-/// with nothing served at the instant, not a decode failure.
-#[derive(FromQueryResult)]
-pub(super) struct ServedSpotValue {
-    value: Option<f64>,
 }
 
 /// [`ACTIVE_TOOL_SQL`]'s row. The manifest and the engine stay parses over it: a stored manifest
@@ -660,16 +655,32 @@ pub(super) async fn resolve_constants(
     db: &DatabaseConnection,
     names: &[String],
     missing: MissingConstant,
-) -> AppResult<serde_json::Map<String, serde_json::Value>> {
+) -> AppResult<(
+    serde_json::Map<String, serde_json::Value>,
+    Vec<ConsumedInput>,
+)> {
     let mut out = serde_json::Map::new();
+    let mut consumed = Vec::new();
     if names.is_empty() {
-        return Ok(out);
+        return Ok((out, consumed));
     }
     let rows = constants::Entity::find()
         .filter(constants::Column::Name.is_in(names.to_vec()))
         .all(db)
         .await?;
+    let subjects: Vec<String> = rows.iter().map(|c| format!("constant:{}", c.id)).collect();
+    let revisions = entity_revisions(db, &subjects).await?;
     for constant in rows {
+        let subject = format!("constant:{}", constant.id);
+        consumed.push(ConsumedInput {
+            variable: constant.name.clone(),
+            kind: "constant".to_string(),
+            revision: revisions.get(&subject).copied(),
+            subject: Some(subject),
+            property: None,
+            members: Vec::new(),
+            value: serde_json::json!(constant.value),
+        });
         out.insert(constant.name, serde_json::json!(constant.value));
     }
     if missing == MissingConstant::Refuse {
@@ -684,7 +695,7 @@ pub(super) async fn resolve_constants(
             }
         }
     }
-    Ok(out)
+    Ok((out, consumed))
 }
 
 /// Pop the reserved context fields off a request body. They are calculation context, not tool
@@ -723,6 +734,7 @@ pub async fn resolve_site_inputs(
     manifest: &Manifest,
     site_id: Option<Uuid>,
     body: &mut serde_json::Map<String, serde_json::Value>,
+    consumed: &mut Vec<ConsumedInput>,
 ) -> AppResult<Vec<serde_json::Value>> {
     let pending: Vec<&ManifestSiteInput> = manifest
         .site_inputs
@@ -749,6 +761,8 @@ pub async fn resolve_site_inputs(
         .ok_or_else(|| AppError::BadRequest(format!("Site {site_id} not found")))?;
     let site_name = row.name.clone();
     let site = serde_json::to_value(row).map_err(|e| AppError::Internal(e.to_string()))?;
+    let subject = format!("site:{site_id}");
+    let revision = entity_revision(db, &subject).await?;
 
     let mut resolved = Vec::new();
     for s in pending {
@@ -768,6 +782,15 @@ pub async fn resolve_site_inputs(
                     )));
                 }
                 body.insert(s.target().to_string(), value.clone());
+                consumed.push(ConsumedInput {
+                    variable: s.target().to_string(),
+                    kind: "site".to_string(),
+                    subject: Some(subject.clone()),
+                    property: Some(s.property.clone()),
+                    revision,
+                    members: Vec::new(),
+                    value: value.clone(),
+                });
                 resolved.push(serde_json::json!({
                     "property": s.property,
                     "param": s.target(),
@@ -832,6 +855,90 @@ pub fn served_spot_value_expr(site: Expr, parameter: Expr, instant: Expr) -> Exp
     Func::coalesce([Expr::expr(mean), Expr::expr(lowest_replicate)]).into()
 }
 
+/// One live spot row at a slot instant, with the sample statistic it stands under and the
+/// revision it is at: what an event input or a family reads, and the identity the run records.
+#[derive(FromQueryResult)]
+struct SpotMember {
+    stream_id: Uuid,
+    replicate_index: i16,
+    value: Option<f64>,
+    mean: Option<f64>,
+    revision: Option<i64>,
+}
+
+/// The newest ledger sequence at the row `r` names, or NULL for a row no decision has touched
+/// (the arrival state). A group-scoped decision covers every replicate at its key.
+pub(crate) fn reading_revision_expr() -> Expr {
+    Expr::cust(
+        "(SELECT max(d.seq) FROM reading_decisions d \
+          WHERE d.stream_id = r.stream_id AND d.time = r.time \
+            AND (d.replicate_index IS NULL OR d.replicate_index = r.replicate_index))",
+    )
+}
+
+/// The live, unflagged spot rows of one parameter at one instant, lowest replicate first, each
+/// with the sample mean where the group has one. `served::not_flagged` rather than
+/// `served::not_curated_out`, the exception [`served_spot_value_expr`] documents.
+async fn spot_members(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    instant: chrono::DateTime<chrono::Utc>,
+) -> AppResult<Vec<SpotMember>> {
+    use sea_orm::sea_query::ExprTrait;
+    let r = crate::common::served::r();
+    let smp = Alias::new("smp");
+    let query = Query::select()
+        .column((r.clone(), readings::Column::StreamId))
+        .column((r.clone(), readings::Column::ReplicateIndex))
+        .expr_as(
+            Func::coalesce([
+                Expr::col((r.clone(), readings::Column::CalibratedValue)),
+                Expr::col((r.clone(), readings::Column::RawValue)),
+            ]),
+            Alias::new("value"),
+        )
+        .expr_as(
+            Expr::cust("CASE WHEN smp.n > 0 THEN smp.mean END"),
+            Alias::new("mean"),
+        )
+        .expr_as(reading_revision_expr(), Alias::new("revision"))
+        .from_as(readings::Entity, r.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            samples::Entity,
+            smp.clone(),
+            Expr::col((smp, samples::Column::Id)).equals((r.clone(), readings::Column::SampleId)),
+        )
+        .and_where(Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
+        .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).eq(parameter_id))
+        .and_where(
+            Expr::col((r.clone(), readings::Column::Time))
+                .eq(sea_orm::prelude::DateTimeWithTimeZone::from(instant)),
+        )
+        .cond_where(crate::common::served::spot_rows())
+        .cond_where(crate::common::served::not_flagged())
+        .order_by((r, readings::Column::ReplicateIndex), Order::Asc)
+        .to_owned();
+    let rows = db.query_all_raw(build(&query)).await?;
+    rows.iter()
+        .map(|row| SpotMember::from_query_result(row, "").map_err(AppError::from))
+        .collect()
+}
+
+fn consumed_reading(
+    member: &SpotMember,
+    instant: chrono::DateTime<chrono::Utc>,
+) -> ConsumedReading {
+    ConsumedReading {
+        stream_id: member.stream_id,
+        time: instant,
+        replicate_index: member.replicate_index,
+        revision: member.revision,
+        value: member.value,
+    }
+}
+
 /// Fill the params the manifest's `event_inputs` declare from the collection event's stored
 /// readings, where the request did not carry them. The value is the served spot value: the sample
 /// mean, else the lowest unflagged replicate. Absence is not an error here — the param's own
@@ -843,6 +950,7 @@ pub async fn resolve_event_inputs(
     site_id: Option<Uuid>,
     collected_at: Option<chrono::DateTime<chrono::Utc>>,
     body: &mut serde_json::Map<String, serde_json::Value>,
+    consumed: &mut Vec<ConsumedInput>,
 ) -> AppResult<Vec<serde_json::Value>> {
     let pending: Vec<&ManifestEventInput> = manifest
         .event_inputs
@@ -857,23 +965,27 @@ pub async fn resolve_event_inputs(
         let Some(parameter_id) = catalog_parameter_id(db, &e.parameter_code).await? else {
             continue;
         };
-        let query = Query::select()
-            .expr_as(
-                served_spot_value_expr(
-                    Expr::val(site_id),
-                    Expr::val(parameter_id),
-                    Expr::val(sea_orm::prelude::DateTimeWithTimeZone::from(collected_at)),
+        let members = spot_members(db, site_id, parameter_id, collected_at).await?;
+        // The served spot value: the sample mean, else the lowest unflagged replicate.
+        let (value, kind, behind): (f64, &str, Vec<ConsumedReading>) =
+            match members.iter().find_map(|m| m.mean) {
+                Some(mean) => (
+                    mean,
+                    "mean",
+                    members
+                        .iter()
+                        .map(|m| consumed_reading(m, collected_at))
+                        .collect(),
                 ),
-                Alias::new("value"),
-            )
-            .to_owned();
-        let Some(row) = db.query_one_raw(build(&query)).await? else {
-            continue;
-        };
-        let served = ServedSpotValue::from_query_result(&row, "")?;
-        let Some(value) = served.value else {
-            continue;
-        };
+                None => match members.iter().find(|m| m.value.is_some()) {
+                    Some(first) => (
+                        first.value.unwrap_or_default(),
+                        "reading",
+                        vec![consumed_reading(first, collected_at)],
+                    ),
+                    None => continue,
+                },
+            };
         if let Some(param) = manifest.params.iter().find(|p| p.name == e.param)
             && !kind_accepts(&param.kind, &serde_json::json!(value))
         {
@@ -883,6 +995,15 @@ pub async fn resolve_event_inputs(
             )));
         }
         body.insert(e.param.clone(), serde_json::json!(value));
+        consumed.push(ConsumedInput {
+            variable: e.param.clone(),
+            kind: kind.to_string(),
+            subject: None,
+            property: None,
+            revision: None,
+            members: behind,
+            value: serde_json::json!(value),
+        });
         resolved.push(serde_json::json!({
             "param": e.param,
             "parameter_code": e.parameter_code,
@@ -891,13 +1012,6 @@ pub async fn resolve_event_inputs(
         }));
     }
     Ok(resolved)
-}
-
-/// One stored replicate of a family: its index and the value it serves.
-#[derive(FromQueryResult)]
-struct StoredReplicate {
-    replicate_index: i16,
-    value: Option<f64>,
 }
 
 /// Fill the `replicates` params from the visit's stored replicate family, where the request did
@@ -913,6 +1027,7 @@ pub async fn resolve_replicate_inputs(
     site_id: Option<Uuid>,
     collected_at: Option<chrono::DateTime<chrono::Utc>>,
     body: &mut serde_json::Map<String, serde_json::Value>,
+    consumed: &mut Vec<ConsumedInput>,
 ) -> AppResult<Vec<serde_json::Value>> {
     let (Some(site_id), Some(collected_at)) = (site_id, collected_at) else {
         return Ok(Vec::new());
@@ -934,9 +1049,22 @@ pub async fn resolve_replicate_inputs(
         }
         let values: Vec<serde_json::Value> = family
             .iter()
-            .map(|v| v.map_or(serde_json::Value::Null, |n| serde_json::json!(n)))
+            .map(|v| {
+                v.as_ref()
+                    .and_then(|m| m.value)
+                    .map_or(serde_json::Value::Null, |n| serde_json::json!(n))
+            })
             .collect();
         body.insert(param.name.clone(), serde_json::Value::Array(values.clone()));
+        consumed.push(ConsumedInput {
+            variable: param.name.clone(),
+            kind: "replicates".to_string(),
+            subject: None,
+            property: None,
+            revision: None,
+            members: family.iter().flatten().cloned().collect(),
+            value: serde_json::Value::Array(values.clone()),
+        });
         resolved.push(serde_json::json!({
             "param": param.name,
             "parameter_code": parameter_code,
@@ -956,38 +1084,14 @@ async fn stored_replicates(
     site_id: Uuid,
     parameter_id: Uuid,
     instant: chrono::DateTime<chrono::Utc>,
-) -> AppResult<Vec<Option<f64>>> {
-    use sea_orm::sea_query::ExprTrait;
-    let r = crate::common::served::r();
-    let query = Query::select()
-        .column((r.clone(), readings::Column::ReplicateIndex))
-        .expr_as(
-            Func::coalesce([
-                Expr::col((r.clone(), readings::Column::CalibratedValue)),
-                Expr::col((r.clone(), readings::Column::RawValue)),
-            ]),
-            Alias::new("value"),
-        )
-        .from_as(readings::Entity, r.clone())
-        .and_where(Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
-        .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).eq(parameter_id))
-        .and_where(
-            Expr::col((r.clone(), readings::Column::Time))
-                .eq(sea_orm::prelude::DateTimeWithTimeZone::from(instant)),
-        )
-        .cond_where(crate::common::served::spot_rows())
-        .cond_where(crate::common::served::not_flagged())
-        .order_by((r, readings::Column::ReplicateIndex), Order::Asc)
-        .to_owned();
-    let rows = db.query_all_raw(build(&query)).await?;
-    let mut family: Vec<Option<f64>> = Vec::new();
-    for row in rows {
-        let stored = StoredReplicate::from_query_result(&row, "")?;
-        let index = usize::try_from(stored.replicate_index).unwrap_or(0);
+) -> AppResult<Vec<Option<ConsumedReading>>> {
+    let mut family: Vec<Option<ConsumedReading>> = Vec::new();
+    for member in spot_members(db, site_id, parameter_id, instant).await? {
+        let index = usize::try_from(member.replicate_index).unwrap_or(0);
         if family.len() <= index {
             family.resize(index + 1, None);
         }
-        family[index] = stored.value;
+        family[index] = Some(consumed_reading(&member, instant));
     }
     Ok(family)
 }
@@ -1034,6 +1138,8 @@ pub struct ResolvedRun {
     pub event_inputs: Vec<serde_json::Value>,
     pub site_id: Option<Uuid>,
     pub collected_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Every input as it was read, with the revision of each row behind it (Q215).
+    pub consumed: Vec<ConsumedInput>,
 }
 
 impl ResolvedRun {
@@ -1134,8 +1240,16 @@ pub async fn resolve_run(
     check_body_shape(&tool.name, manifest, &body)?;
     // Resolved context values land before defaults and requiredness: a typed value wins, a
     // resolved one fills the gap, and a manifest default is the last resort.
-    let site_inputs =
-        resolve_site_inputs(&state.db, &tool.name, manifest, site_id, &mut body).await?;
+    let mut consumed = Vec::new();
+    let site_inputs = resolve_site_inputs(
+        &state.db,
+        &tool.name,
+        manifest,
+        site_id,
+        &mut body,
+        &mut consumed,
+    )
+    .await?;
     let mut event_inputs = resolve_event_inputs(
         &state.db,
         &tool.name,
@@ -1143,10 +1257,19 @@ pub async fn resolve_run(
         site_id,
         collected_at,
         &mut body,
+        &mut consumed,
     )
     .await?;
     event_inputs.extend(
-        resolve_replicate_inputs(&state.db, manifest, site_id, collected_at, &mut body).await?,
+        resolve_replicate_inputs(
+            &state.db,
+            manifest,
+            site_id,
+            collected_at,
+            &mut body,
+            &mut consumed,
+        )
+        .await?,
     );
 
     // Defaults land before requiredness so a condition reads the same values the runner will,
@@ -1183,6 +1306,25 @@ pub async fn resolve_run(
                 curves_consumed.push(slot.name.clone());
                 let resolved = resolve_curve(&state.db, slot, &value).await?;
                 let json = serde_json::to_value(&resolved).unwrap_or_default();
+                let subject = resolved
+                    .standard_curve_id
+                    .map(|id| format!("standard_curve:{id}"));
+                let revision = match &subject {
+                    Some(subject) => entity_revision(&state.db, subject).await?,
+                    None => None,
+                };
+                consumed.push(ConsumedInput {
+                    variable: slot.name.clone(),
+                    kind: "curve".to_string(),
+                    subject,
+                    property: None,
+                    revision,
+                    members: Vec::new(),
+                    value: serde_json::json!({
+                        "slope": resolved.slope,
+                        "intercept": resolved.intercept,
+                    }),
+                });
                 curve_snapshots.push(CurveSnapshot {
                     name: slot.name.clone(),
                     curve: resolved,
@@ -1208,12 +1350,30 @@ pub async fn resolve_run(
                         "constant '{name}' is declared by the manifest but not supplied"
                     ))
                 })?;
+                // Supplied by the caller in the catalog's place: a value with no source row.
+                consumed.push(ConsumedInput {
+                    variable: name.clone(),
+                    kind: "constant".to_string(),
+                    subject: None,
+                    property: None,
+                    revision: None,
+                    members: Vec::new(),
+                    value: value.clone(),
+                });
                 out.insert(name.clone(), value.clone());
             }
             out
         }
-        None => resolve_constants(&state.db, &manifest.constants, missing_constant).await?,
+        None => {
+            let (out, read) =
+                resolve_constants(&state.db, &manifest.constants, missing_constant).await?;
+            consumed.extend(read);
+            out
+        }
     };
+    if tool.engine == Engine::Formula {
+        consumed.extend(formula_revisions(&state.db, &tool.formulas).await?);
+    }
     let provided: Vec<String> = body.keys().cloned().collect();
     Ok(ResolvedRun {
         inputs: body,
@@ -1226,7 +1386,53 @@ pub async fn resolve_run(
         event_inputs,
         site_id,
         collected_at,
+        consumed,
     })
+}
+
+/// The revision each formula of a pinned set stands at, own and shared alike, so a step edited
+/// after the version was minted reads as changed on every value that consumed it. A code the
+/// catalog no longer holds is a formula that was dropped since, recorded with no subject.
+async fn formula_revisions(
+    db: &DatabaseConnection,
+    formulas: &[PinnedFormula],
+) -> AppResult<Vec<ConsumedInput>> {
+    use crate::routes::private::derived_parameters::models::definition;
+    if formulas.is_empty() {
+        return Ok(Vec::new());
+    }
+    let codes: Vec<String> = formulas.iter().map(|f| f.code.clone()).collect();
+    let rows: Vec<(Uuid, String)> = definition::Entity::find()
+        .select_only()
+        .column(definition::Column::Id)
+        .column(definition::Column::Code)
+        .filter(definition::Column::Code.is_in(codes))
+        .into_tuple()
+        .all(db)
+        .await?;
+    let by_code: HashMap<String, Uuid> = rows.into_iter().map(|(id, code)| (code, id)).collect();
+    let subjects: Vec<String> = by_code
+        .values()
+        .map(|id| format!("calculation_formula:{id}"))
+        .collect();
+    let revisions = entity_revisions(db, &subjects).await?;
+    Ok(formulas
+        .iter()
+        .map(|f| {
+            let subject = by_code
+                .get(&f.code)
+                .map(|id| format!("calculation_formula:{id}"));
+            ConsumedInput {
+                variable: f.code.clone(),
+                kind: "step".to_string(),
+                revision: subject.as_ref().and_then(|s| revisions.get(s).copied()),
+                subject,
+                property: None,
+                members: Vec::new(),
+                value: serde_json::Value::String(f.formula.clone()),
+            }
+        })
+        .collect())
 }
 
 /// Hand a resolved run to the runner and shape its answer: NA outputs dropped, manifest
@@ -1249,6 +1455,7 @@ pub async fn execute_resolved(
         event_inputs,
         site_id,
         collected_at,
+        consumed,
     } = resolved;
 
     // The engine decides only how the arithmetic is done. Everything after this point, the
@@ -1345,6 +1552,7 @@ pub async fn execute_resolved(
         site_id,
         collected_at,
         trace,
+        consumed,
     })
 }
 
@@ -1711,7 +1919,9 @@ pub(super) async fn call_runner(
 pub const CURVE_VARIABLES: [&str; 2] = ["curve_slope", "curve_intercept"];
 
 /// Identifiers a formula may name that are neither a source nor a constant: meval's own
-/// functions and constants, and the guard functions [`evaluate_formula`] registers.
+/// functions and constants, the guard functions [`evaluate_formula`] registers, and the two
+/// reducers ([`FORMULA_REDUCERS`]), which the engine resolves over a family before the expression
+/// is evaluated.
 pub const FORMULA_BUILTINS: &[&str] = &[
     "sqrt",
     "abs",
@@ -1748,6 +1958,8 @@ pub const FORMULA_BUILTINS: &[&str] = &[
     "coalesce",
     "is_missing",
     "na",
+    "mean",
+    "sd",
 ];
 
 /// The guard functions a missing value may pass through. Each is total over NaN: a variable read
@@ -1977,19 +2189,38 @@ pub fn in_order(formulas: &[PinnedFormula]) -> Result<Vec<&PinnedFormula>, Strin
 /// stored readings.
 ///
 /// A per-replicate output is one of them only for another per-replicate formula, which reads it at
-/// its own index. A scalar consumer reads the family's mean, which the `samples` trigger derives
-/// after the repeats are stored and never a formula (Q95, D21), so for that one the output stays an
-/// event input and the second stage converges on the pass after the repeats land.
+/// its own index, or for a consumer that reduces it: a reducer is taken over the vector this run
+/// just produced. A scalar consumer reading it as one number takes the family's mean, which the
+/// `samples` trigger derives after the repeats are stored and never a formula (Q95, D21), so for
+/// that one the output stays an event input and the second stage converges on the pass after the
+/// repeats land.
 pub(super) fn produced_before(
     ordered: &[&PinnedFormula],
     index: usize,
     consumer_is_per_replicate: bool,
+    reduced_codes: &[String],
 ) -> Vec<String> {
     ordered[..index]
         .iter()
-        .filter(|f| f.per_replicate.is_none() || consumer_is_per_replicate)
+        .filter(|f| {
+            f.per_replicate.is_none()
+                || consumer_is_per_replicate
+                || f.output_parameter_code
+                    .as_ref()
+                    .is_some_and(|code| reduced_codes.contains(&code.to_lowercase()))
+        })
         .filter_map(|f| f.output_parameter_code.as_ref())
         .map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// The catalog codes a formula reads only as a family, so a caller can tell a reduction over the
+/// run's own per-replicate output from a read of the stored mean.
+pub(super) fn reduced_codes(formula: &PinnedFormula) -> Vec<String> {
+    reduced_variables(&formula.formula)
+        .iter()
+        .filter_map(|variable| formula.sources.iter().find(|(name, _)| name == variable))
+        .map(|(_, code)| code.to_lowercase())
         .collect()
 }
 
@@ -2030,19 +2261,31 @@ pub fn manifest_json(
         .filter(|f| f.per_replicate.is_some())
         .flat_map(|f| f.sources.iter().map(|(variable, _)| variable))
         .collect();
+    // A variable a reducer takes is the family too: `sd(x)` is taken over the repeats, never over
+    // the group's served mean.
+    let reduced: Vec<String> = ordered
+        .iter()
+        .flat_map(|f| reduced_variables(&f.formula))
+        .collect();
     let mut params = Vec::new();
     let mut event_inputs = Vec::new();
     let mut site_inputs = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for (index, formula) in ordered.iter().enumerate() {
-        let internal = produced_before(&ordered, index, formula.per_replicate.is_some());
+        let internal = produced_before(
+            &ordered,
+            index,
+            formula.per_replicate.is_some(),
+            &reduced_codes(formula),
+        );
         for (variable, parameter_code) in &formula.sources {
             if internal.contains(&parameter_code.to_lowercase()) || seen.contains(variable) {
                 continue;
             }
             seen.push(variable.clone());
             if driven.contains(variable)
-                || (walked.contains(&variable) && is_replicated(parameter_code))
+                || ((walked.contains(&variable) || reduced.contains(variable))
+                    && is_replicated(parameter_code))
             {
                 // A variable a formula evaluates over is the family, not one number: the body
                 // carries the whole list, and the param names the parameter those readings are
@@ -2138,66 +2381,226 @@ pub fn parse_pinned(body: &str) -> Result<Vec<PinnedFormula>, String> {
     serde_json::from_str(body).map_err(|e| format!("unreadable formula set: {e}"))
 }
 
-/// Evaluate every formula in order, feeding each result forward under the parameter code it is
-/// stored as, so a formula reading an earlier formula's output takes the fresh value.
+/// Evaluate a formula set that names no replicate family: one value per formula, in dependency
+/// order, each fed forward under the parameter code it is stored as.
 ///
-/// `inputs` is keyed by variable name, the form the resolved run holds; `constants` and `curves`
-/// are what the manifest declared, resolved by the caller. The result is one entry per formula,
-/// in evaluation order, keyed by output code, the form a run outcome holds.
-///
-/// A formula whose sources do not all resolve is skipped and the rest still evaluate: the portal
-/// warns and moves to the next calculation rather than losing the row. A formula reading a
-/// skipped formula's output skips in turn. Only an unevaluable expression is fatal, because that
-/// is the definition being wrong rather than the visit being incomplete.
-///
-/// A source the formula reads only through a guard function is bound as NaN rather than skipped,
-/// so the portal's defaults and its comparisons against a missing value take the arm they take
-/// there ([`read_only_through_guards`]).
+/// This is [`evaluate_cells`] read as scalars. A calculation whose formulas walk replicates is
+/// evaluated through [`evaluate_over_replicates`], which keeps every index.
 pub fn evaluate(
     formulas: &[PinnedFormula],
     inputs: &HashMap<String, f64>,
     constants: &HashMap<String, f64>,
     curves: &HashMap<String, Curve>,
 ) -> Result<Vec<Evaluated>, String> {
-    evaluate_set(formulas, inputs, constants, curves, false)
+    let (_, cells) = evaluate_cells(formulas, inputs, &HashMap::new(), constants, curves)?;
+    Ok(cells
+        .into_iter()
+        .map(|mut row| row.swap_remove(0))
+        .collect())
 }
 
-/// One pass over the formula set. `chain_replicates` is the per-index pass of
-/// [`evaluate_over_replicates`]: a per-replicate result is handed to a later per-replicate formula
-/// at the same index, and to nothing else.
-pub(super) fn evaluate_set(
-    formulas: &[PinnedFormula],
-    inputs: &HashMap<String, f64>,
-    constants: &HashMap<String, f64>,
-    curves: &HashMap<String, Curve>,
-    chain_replicates: bool,
-) -> Result<Vec<Evaluated>, String> {
-    let ordered = in_order(formulas)?;
-    let mut produced: HashMap<String, f64> = HashMap::new();
-    let mut at_index: HashMap<String, f64> = HashMap::new();
-    // An intermediate stores nothing, so it is named by its own code rather than by a parameter,
-    // and reaches a later formula as a variable of that name.
-    let mut steps: HashMap<String, f64> = HashMap::new();
-    let mut steps_at_index: HashMap<String, f64> = HashMap::new();
-    let mut results = Vec::with_capacity(ordered.len());
-    for formula in &ordered {
-        let mut variables: HashMap<String, f64> = constants.clone();
-        variables.extend(steps.iter().map(|(k, v)| (k.clone(), *v)));
-        if formula.per_replicate.is_some() && chain_replicates {
-            variables.extend(steps_at_index.iter().map(|(k, v)| (k.clone(), *v)));
+/// The two names that take a family rather than a number. Everything else the language defines is
+/// scalar and total, so these are the only calls resolved before the expression is evaluated.
+pub const FORMULA_REDUCERS: [&str; 2] = ["mean", "sd"];
+
+/// One reducer call as the formula writes it: `sd(y)` naming the family `y`, at that span of the
+/// text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReducerCall {
+    pub call: String,
+    pub function: String,
+    pub variable: String,
+    pub span: std::ops::Range<usize>,
+}
+
+/// The reducer calls a formula makes, in the order they appear.
+///
+/// A reducer takes its family by name, so `mean(x + 1)` is not one: it is left in the expression,
+/// where the evaluator refuses it as a function nothing defines. That is the same answer an
+/// unknown name gets, and it keeps the reduction over a value the author can point at.
+#[must_use]
+pub fn reducer_calls(formula: &str) -> Vec<ReducerCall> {
+    let chars: Vec<(usize, char)> = formula.char_indices().collect();
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let end = formula.len();
+    let at = |i: usize| chars.get(i).map_or(end, |(byte, _)| *byte);
+    let mut calls = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if !ident(chars[i].1) {
+            i += 1;
+            continue;
         }
+        let start = i;
+        while i < chars.len() && ident(chars[i].1) {
+            i += 1;
+        }
+        let name = &formula[at(start)..at(i)];
+        if !FORMULA_REDUCERS.contains(&name) {
+            continue;
+        }
+        let mut j = i;
+        while chars.get(j).is_some_and(|(_, c)| c.is_whitespace()) {
+            j += 1;
+        }
+        if chars.get(j).map(|(_, c)| *c) != Some('(') {
+            continue;
+        }
+        j += 1;
+        while chars.get(j).is_some_and(|(_, c)| c.is_whitespace()) {
+            j += 1;
+        }
+        let argument = j;
+        while chars.get(j).is_some_and(|(_, c)| ident(*c)) {
+            j += 1;
+        }
+        if j == argument {
+            continue;
+        }
+        let variable = formula[at(argument)..at(j)].to_string();
+        while chars.get(j).is_some_and(|(_, c)| c.is_whitespace()) {
+            j += 1;
+        }
+        if chars.get(j).map(|(_, c)| *c) != Some(')') {
+            continue;
+        }
+        j += 1;
+        calls.push(ReducerCall {
+            call: formula[at(start)..at(j)].to_string(),
+            function: name.to_string(),
+            variable,
+            span: at(start)..at(j),
+        });
+        i = j;
+    }
+    calls
+}
+
+/// The variables a formula reads only as a family. One read outside a reducer makes the variable
+/// an ordinary source as well, and it is bound both ways.
+#[must_use]
+pub fn reduced_variables(formula: &str) -> Vec<String> {
+    let calls = reducer_calls(formula);
+    if calls.is_empty() {
+        return Vec::new();
+    }
+    let mut outside = formula.to_string();
+    for call in calls.iter().rev() {
+        outside.replace_range(call.span.clone(), " ");
+    }
+    let elsewhere = free_identifiers(&outside);
+    let mut names: Vec<String> = Vec::new();
+    for call in &calls {
+        if !elsewhere.contains(&call.variable) && !names.contains(&call.variable) {
+            names.push(call.variable.clone());
+        }
+    }
+    names
+}
+
+/// The variable a reducer binds its result to. Catalog codes, constant names and formula codes
+/// are what an author names, and none of them begins with two underscores, so the binding shadows
+/// nothing the formula reads.
+fn reducer_binding(function: &str, variable: &str) -> String {
+    format!("__reduce_{function}_{variable}")
+}
+
+/// What the set has produced when the walk reaches a formula. Scalars and the per-replicate
+/// values at each index feed the next formula; the finished vectors are what a reducer reads.
+struct SetState {
+    /// Scalar outputs, by the lowercased parameter code they are stored as.
+    produced: HashMap<String, f64>,
+    /// Scalar steps, by their own code: a step produces no parameter and is read by name.
+    steps: HashMap<String, f64>,
+    at_index: Vec<HashMap<String, f64>>,
+    steps_at_index: Vec<HashMap<String, f64>>,
+    /// Finished per-replicate outputs, by parameter code, and steps by their own code.
+    vectors: HashMap<String, Vec<Option<f64>>>,
+    step_vectors: HashMap<String, Vec<Option<f64>>>,
+}
+
+/// The value a variable holds at one cell: the family's value at this index where the visit
+/// entered a family, the scalar otherwise. A repeat that was not measured is absent, which skips
+/// the formulas reading it rather than falling back to the group's summary.
+fn entered(
+    variable: &str,
+    index: usize,
+    inputs: &HashMap<String, f64>,
+    replicates: &HashMap<String, Vec<Option<f64>>>,
+) -> Option<f64> {
+    match replicates.get(variable) {
+        Some(values) => values.get(index).copied().flatten(),
+        None => inputs.get(variable).copied(),
+    }
+}
+
+impl SetState {
+    fn new(width: usize) -> Self {
+        Self {
+            produced: HashMap::new(),
+            steps: HashMap::new(),
+            at_index: vec![HashMap::new(); width],
+            steps_at_index: vec![HashMap::new(); width],
+            vectors: HashMap::new(),
+            step_vectors: HashMap::new(),
+        }
+    }
+
+    /// The family a reducer's argument names, most specific first: an output this run computed
+    /// per replicate, a step it computed per replicate, then a family the visit entered.
+    fn family_for<'a>(
+        &'a self,
+        formula: &PinnedFormula,
+        variable: &str,
+        replicates: &'a HashMap<String, Vec<Option<f64>>>,
+    ) -> Option<&'a Vec<Option<f64>>> {
+        let code = formula
+            .sources
+            .iter()
+            .find(|(name, _)| name == variable)
+            .map(|(_, code)| code.to_lowercase());
+        if let Some(code) = code
+            && let Some(values) = self.vectors.get(&code)
+        {
+            return Some(values);
+        }
+        if let Some(values) = self.step_vectors.get(&variable.to_lowercase()) {
+            return Some(values);
+        }
+        replicates.get(variable)
+    }
+
+    /// One evaluation of one formula: a scalar formula's only cell, or a per-replicate formula's
+    /// cell at `index`.
+    fn cell(
+        &self,
+        formula: &PinnedFormula,
+        index: Option<usize>,
+        inputs: &HashMap<String, f64>,
+        replicates: &HashMap<String, Vec<Option<f64>>>,
+        constants: &HashMap<String, f64>,
+        curves: &HashMap<String, Curve>,
+    ) -> Result<Evaluated, String> {
+        let at = index.unwrap_or(0);
+        let mut variables: HashMap<String, f64> = constants.clone();
+        variables.extend(self.steps.iter().map(|(k, v)| (k.clone(), *v)));
+        if let Some(i) = index {
+            variables.extend(self.steps_at_index[i].iter().map(|(k, v)| (k.clone(), *v)));
+        }
+        let reduced = reduced_variables(&formula.formula);
         let mut skipped = None;
         for (variable, parameter_code) in &formula.sources {
+            // A variable read only as a family is bound from the whole vector below, not from one
+            // value of it.
+            if reduced.contains(variable) {
+                continue;
+            }
             let code = parameter_code.to_lowercase();
-            let chained = formula
-                .per_replicate
-                .is_some()
-                .then(|| at_index.get(&code))
-                .flatten();
+            let chained = index.and_then(|i| self.at_index[i].get(&code));
             let value = chained
-                .or_else(|| produced.get(&code))
-                .or_else(|| inputs.get(variable))
-                .copied();
+                .or_else(|| self.produced.get(&code))
+                .copied()
+                .or_else(|| entered(variable, at, inputs, replicates));
             match value {
                 Some(value) => {
                     variables.insert(variable.clone(), value);
@@ -2214,9 +2617,9 @@ pub(super) fn evaluate_set(
         // A site property arrives resolved as an input under the variable's name.
         if skipped.is_none() {
             for (variable, property) in &formula.site_sources {
-                match inputs.get(variable) {
+                match entered(variable, at, inputs, replicates) {
                     Some(value) => {
-                        variables.insert(variable.clone(), *value);
+                        variables.insert(variable.clone(), value);
                     }
                     None if read_only_through_guards(&formula.formula, variable) => {
                         variables.insert(variable.clone(), f64::NAN);
@@ -2239,18 +2642,56 @@ pub(super) fn evaluate_set(
                 None => skipped = Some(format!("curve '{slot}' was not supplied")),
             }
         }
+        // Each reducer is resolved over the finished family and bound as one number, so what the
+        // evaluator sees is an expression of scalars. Insufficient members is a computed NA, which
+        // clears the output unless a guard supplies a fallback (Q229).
+        let mut text = formula.formula.clone();
+        let mut reductions = Vec::new();
+        if skipped.is_none() {
+            for call in reducer_calls(&formula.formula).iter().rev() {
+                let Some(values) = self.family_for(formula, &call.variable, replicates) else {
+                    skipped = Some(format!(
+                        "no replicate family for {} ({})",
+                        call.variable, call.call
+                    ));
+                    break;
+                };
+                let members: Vec<usize> = values
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, value)| value.is_some_and(f64::is_finite))
+                    .map(|(index, _)| index)
+                    .collect();
+                let eligible: Vec<f64> = members.iter().filter_map(|&i| values[i]).collect();
+                let stats = crate::routes::private::sync::service::group_stats(&eligible);
+                let value = if call.function == "mean" {
+                    stats.mean
+                } else {
+                    stats.sd
+                };
+                let name = reducer_binding(&call.function, &call.variable);
+                variables.insert(name.clone(), value.unwrap_or(f64::NAN));
+                text.replace_range(call.span.clone(), &name);
+                reductions.push(TraceReduction {
+                    call: call.call.clone(),
+                    value,
+                    members,
+                });
+            }
+            reductions.reverse();
+        }
         if let Some(reason) = skipped {
-            results.push(Evaluated {
+            return Ok(Evaluated {
                 code: formula.code.clone(),
                 value: None,
                 curve_slot: formula.curve_slot.clone(),
                 skipped: Some(reason),
                 refused: false,
                 bindings: Vec::new(),
+                reductions: Vec::new(),
             });
-            continue;
         }
-        let value = evaluate_formula(&formula.formula, &variables)
+        let value = evaluate_formula(&text, &variables)
             .map_err(|e| format!("formula {}: {e}", formula.code))?;
         let bindings = free_identifiers(&formula.formula)
             .into_iter()
@@ -2262,45 +2703,110 @@ pub(super) fn evaluate_set(
         // divided by zero. The guard is here so the value never reaches serde_json, which maps a
         // non-finite float to null and would make it indistinguishable from an NA.
         if value.is_infinite() {
-            results.push(Evaluated {
+            return Ok(Evaluated {
                 code: formula.code.clone(),
                 value: None,
                 curve_slot: formula.curve_slot.clone(),
                 skipped: Some(format!("computed as {value}, not a finite number")),
                 refused: true,
                 bindings,
+                reductions,
             });
-            continue;
         }
-        // NaN is the portal's NA: computed, and not a number. It clears the stored value rather
-        // than feeding the next formula, which would turn one NA into a whole calculation of them.
-        // A per-replicate value is one repeat, so it travels only to a later per-replicate formula
-        // at this index; a scalar formula reading that parameter takes the stored mean instead.
-        if !value.is_nan() {
-            if formula.intermediate {
-                if formula.per_replicate.is_none() {
-                    steps.insert(formula.code.clone(), value);
-                } else if chain_replicates {
-                    steps_at_index.insert(formula.code.clone(), value);
-                }
-            } else if let Some(code) = &formula.output_parameter_code {
-                if formula.per_replicate.is_none() {
-                    produced.insert(code.to_lowercase(), value);
-                } else if chain_replicates {
-                    at_index.insert(code.to_lowercase(), value);
-                }
-            }
-        }
-        results.push(Evaluated {
+        Ok(Evaluated {
             code: formula.code.clone(),
             value: (!value.is_nan()).then_some(value),
             curve_slot: formula.curve_slot.clone(),
             skipped: None,
             refused: false,
             bindings,
-        });
+            reductions,
+        })
     }
-    Ok(results)
+
+    /// NaN is the portal's NA: computed, and not a number. It clears the stored value rather than
+    /// feeding the next formula, which would turn one NA into a whole calculation of them.
+    fn record_scalar(&mut self, formula: &PinnedFormula, evaluated: &Evaluated) {
+        let Some(value) = evaluated.value else {
+            return;
+        };
+        if formula.intermediate {
+            self.steps.insert(formula.code.clone(), value);
+        } else if let Some(code) = &formula.output_parameter_code {
+            self.produced.insert(code.to_lowercase(), value);
+        }
+    }
+
+    /// A per-replicate value is one repeat, so it travels only to a later per-replicate formula at
+    /// this index; a scalar formula reads the whole vector through a reducer, or the stored mean.
+    fn record_at_index(&mut self, formula: &PinnedFormula, index: usize, evaluated: &Evaluated) {
+        let Some(value) = evaluated.value else {
+            return;
+        };
+        if formula.intermediate {
+            self.steps_at_index[index].insert(formula.code.clone(), value);
+        } else if let Some(code) = &formula.output_parameter_code {
+            self.at_index[index].insert(code.to_lowercase(), value);
+        }
+    }
+
+    fn record_vector(&mut self, formula: &PinnedFormula, cells: &[Evaluated]) {
+        let values: Vec<Option<f64>> = cells.iter().map(|cell| cell.value).collect();
+        if formula.intermediate {
+            self.step_vectors
+                .insert(formula.code.to_lowercase(), values);
+        } else if let Some(code) = &formula.output_parameter_code {
+            self.vectors.insert(code.to_lowercase(), values);
+        }
+    }
+}
+
+/// Every formula of the set as it evaluated, in dependency order: one cell for a scalar formula,
+/// one per index for a per-replicate one.
+///
+/// The walk is formula by formula rather than index by index, so a per-replicate formula is
+/// finished before anything after it runs and a reducer reads a complete vector. `inputs` is
+/// keyed by variable name, the form the resolved run holds; `replicates` holds the families under
+/// the same names; `constants` and `curves` are what the manifest declared, resolved by the
+/// caller.
+///
+/// A formula whose sources do not all resolve is skipped and the rest still evaluate: the portal
+/// warns and moves to the next calculation rather than losing the row. A formula reading a
+/// skipped formula's output skips in turn. Only an unevaluable expression is fatal, because that
+/// is the definition being wrong rather than the visit being incomplete.
+///
+/// A source the formula reads only through a guard function is bound as NaN rather than skipped,
+/// so the portal's defaults and its comparisons against a missing value take the arm they take
+/// there ([`read_only_through_guards`]).
+fn evaluate_cells<'a>(
+    formulas: &'a [PinnedFormula],
+    inputs: &HashMap<String, f64>,
+    replicates: &HashMap<String, Vec<Option<f64>>>,
+    constants: &HashMap<String, f64>,
+    curves: &HashMap<String, Curve>,
+) -> Result<(Vec<&'a PinnedFormula>, Vec<Vec<Evaluated>>), String> {
+    let ordered = in_order(formulas)?;
+    let width = replicate_width(&ordered, replicates);
+    let mut state = SetState::new(width);
+    let mut cells: Vec<Vec<Evaluated>> = Vec::with_capacity(ordered.len());
+    for formula in &ordered {
+        if formula.per_replicate.is_none() {
+            let evaluated = state.cell(formula, None, inputs, replicates, constants, curves)?;
+            state.record_scalar(formula, &evaluated);
+            cells.push(vec![evaluated]);
+            continue;
+        }
+        let mut row = Vec::with_capacity(width);
+        for index in 0..width {
+            let evaluated =
+                state.cell(formula, Some(index), inputs, replicates, constants, curves)?;
+            state.record_at_index(formula, index, &evaluated);
+            row.push(evaluated);
+        }
+        state.record_vector(formula, &row);
+        cells.push(row);
+    }
+    Ok((ordered, cells))
 }
 
 /// The number of replicate indexes a calculation runs over: the longest replicate vector any
@@ -2419,8 +2925,8 @@ pub(super) fn formula_bindings(
 }
 
 /// [`evaluate_over_replicates`], also returning each formula as it was evaluated: its text and,
-/// per cell, the value and the variables it read. A scalar formula is one cell with no index; a
-/// per-replicate one is a cell per index.
+/// per cell, the value, the variables it read and the families it reduced. A scalar formula is
+/// one cell with no index; a per-replicate one is a cell per index.
 pub fn evaluate_with_trace(
     formulas: &[PinnedFormula],
     inputs: &HashMap<String, f64>,
@@ -2428,51 +2934,22 @@ pub fn evaluate_with_trace(
     constants: &HashMap<String, f64>,
     curves: &HashMap<String, Curve>,
 ) -> Result<(Vec<Produced>, Vec<TraceStep>), String> {
-    let ordered = in_order(formulas)?;
-    let width = replicate_width(&ordered, replicates);
-    let mut per_index: Vec<Vec<Evaluated>> = Vec::with_capacity(width);
-    for index in 0..width {
-        let mut at_index = inputs.clone();
-        for (variable, values) in replicates {
-            match values.get(index).copied().flatten() {
-                Some(value) => {
-                    at_index.insert(variable.clone(), value);
-                }
-                // A repeat that was not measured is absent, which skips the formulas reading it
-                // and leaves this index a gap rather than falling back to the group's summary.
-                None => {
-                    at_index.remove(variable);
-                }
-            }
-        }
-        per_index.push(evaluate_set(formulas, &at_index, constants, curves, true)?);
-    }
-
-    let cell = |index: Option<usize>, evaluated: &Evaluated| TraceCell {
-        index,
-        value: evaluated.value,
-        skipped: evaluated.skipped.clone(),
-        bindings: evaluated.bindings.iter().cloned().collect(),
-    };
+    let (ordered, cells) = evaluate_cells(formulas, inputs, replicates, constants, curves)?;
     let mut produced = Vec::with_capacity(ordered.len());
     let mut trace = Vec::with_capacity(ordered.len());
-    for (position, formula) in ordered.iter().enumerate() {
+    for (formula, row) in ordered.iter().zip(cells) {
         let cells = if formula.per_replicate.is_none() {
-            produced.push(Produced::Scalar(per_index[0][position].clone()));
-            vec![cell(None, &per_index[0][position])]
+            produced.push(Produced::Scalar(row[0].clone()));
+            vec![trace_cell(None, &row[0])]
         } else {
             produced.push(Produced::PerReplicate {
                 code: formula.code.clone(),
-                values: per_index
-                    .iter()
-                    .map(|results| results[position].value)
-                    .collect(),
+                values: row.iter().map(|cell| cell.value).collect(),
                 curve_slot: formula.curve_slot.clone(),
             });
-            per_index
-                .iter()
+            row.iter()
                 .enumerate()
-                .map(|(i, results)| cell(Some(i), &results[position]))
+                .map(|(index, cell)| trace_cell(Some(index), cell))
                 .collect()
         };
         trace.push(TraceStep {
@@ -2487,6 +2964,16 @@ pub fn evaluate_with_trace(
         });
     }
     Ok((produced, trace))
+}
+
+fn trace_cell(index: Option<usize>, evaluated: &Evaluated) -> TraceCell {
+    TraceCell {
+        index,
+        value: evaluated.value,
+        skipped: evaluated.skipped.clone(),
+        bindings: evaluated.bindings.iter().cloned().collect(),
+        reductions: evaluated.reductions.clone(),
+    }
 }
 
 /// The global parameters a subject moves.

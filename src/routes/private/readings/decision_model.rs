@@ -63,6 +63,10 @@ pub struct Model {
     /// pruned, so an old decision keeps its record and loses only the link to the run.
     #[crudcrate(filterable, exclude(update, create))]
     pub job_id: Option<Uuid>,
+    /// The order of effect: assigned under a lock on the reading's key, so the newest row at a
+    /// key is the reading's revision (Q215).
+    #[crudcrate(sortable, exclude(update, create))]
+    pub seq: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -944,6 +944,27 @@ pub struct DecisionsQuery {
     pub replicate_index: Option<i16>,
 }
 
+/// What a derived value's replay answers: the arithmetic behind the stored number.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReplayResponse {
+    /// The formula the computation recorded, as it stood then.
+    pub formula: String,
+    /// The version the stored value names, where it names one.
+    #[schema(required)]
+    pub derived_version_id: Option<Uuid>,
+    /// Running that formula over the values the computation consumed.
+    pub replayed: f64,
+    /// What the reading holds now. A replay that disagrees with it means the row moved without
+    /// the ledger, which is the one thing this read is for.
+    #[schema(required)]
+    pub stored: Option<f64>,
+    /// The values the replay bound, by variable name.
+    #[schema(value_type = std::collections::HashMap<String, f64>)]
+    pub variables: serde_json::Value,
+    /// When the captured set was recorded.
+    pub captured_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct LedgerQuery {
     /// The instant (exact reading timestamp).
@@ -1478,6 +1499,11 @@ pub struct ProvenanceRecord {
     /// value at this instant where one exists.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub consumers: Vec<ConsumerRef>,
+    /// What the calculation that made this record actually read, captured at the read (Q215),
+    /// each input beside what its source holds now. Empty on a record nothing computed, and on
+    /// one computed before the capture existed, whose inputs are therefore unknown.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub consumed: Vec<ConsumedRef>,
     pub holds: Vec<HoldRef>,
 }
 
@@ -1803,6 +1829,107 @@ pub struct InputRef {
     pub value: Option<f64>,
 }
 
+/// One reading a calculation read, as the row and the revision it stood at (Q215). `revision` is
+/// the newest `reading_decisions.seq` at the key when the value was read; null is the arrival
+/// state, a row no decision had touched yet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ConsumedReading {
+    pub stream_id: Uuid,
+    pub time: DateTime<Utc>,
+    pub replicate_index: i16,
+    #[schema(required)]
+    pub revision: Option<i64>,
+    #[schema(required)]
+    pub value: Option<f64>,
+}
+
+/// One input a calculation consumed, captured when it was read (Q215): what it was bound to and
+/// the exact revision of every row behind it, so a later reader can say whether the source has
+/// moved since. `kind` is `reading` (one row), `mean` (the sample statistic over `members`),
+/// `replicates` (a family, one member per index, a gap as a member with no value), `site` (a
+/// column of the site row), `constant`, `curve` (a catalog curve, or entered coefficients with no
+/// subject), or `step` (a formula of the pinned set). An entity input names its `change_audit`
+/// subject and the newest `seq` for it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ConsumedInput {
+    pub variable: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub property: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub revision: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<ConsumedReading>,
+    #[schema(value_type = Object)]
+    pub value: serde_json::Value,
+}
+
+/// Where a consumed reading opens: the site page's point record for its slot.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SlotRef {
+    pub site_id: Uuid,
+    pub site_parameter_id: Uuid,
+    pub time: DateTime<Utc>,
+    /// `spot` or `continuous`, the cadence arm the record is read by.
+    pub measurement_type: String,
+}
+
+/// One reading a calculation consumed, beside what its key holds now (Q215).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ConsumedMemberRef {
+    pub stream_id: Uuid,
+    pub time: DateTime<Utc>,
+    pub replicate_index: i16,
+    #[schema(required)]
+    pub revision: Option<i64>,
+    #[schema(required)]
+    pub value: Option<f64>,
+    #[schema(required)]
+    pub current_revision: Option<i64>,
+    #[schema(required)]
+    pub current_value: Option<f64>,
+    /// `changed`, `unchanged` or `unknown`.
+    pub state: String,
+    /// The record this member opens, absent while its stream is unpaired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub point: Option<SlotRef>,
+}
+
+/// One input of the calculation that made this record, as it was consumed and as its source
+/// stands now (Q215). `kind`, `subject` and `property` are the captured binding.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ConsumedRef {
+    pub variable: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub property: Option<String>,
+    #[schema(required)]
+    pub revision: Option<i64>,
+    #[schema(required)]
+    pub current_revision: Option<i64>,
+    #[schema(value_type = serde_json::Value)]
+    pub value: serde_json::Value,
+    /// What the source holds now, where the input reads one row. A statistic over several
+    /// readings is not recomputed here: its members carry their own current values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false, value_type = Option<serde_json::Value>)]
+    pub current_value: Option<serde_json::Value>,
+    /// `changed`, `unchanged` or `unknown`.
+    pub state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub members: Vec<ConsumedMemberRef>,
+}
+
 /// One formula reading the record's parameter, with its output at the instant where one exists.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ConsumerRef {
@@ -1942,6 +2069,8 @@ pub(super) struct ServedRow {
     pub(super) stream_id: Uuid,
     pub(super) input_value: f64,
     pub(super) from_mean: bool,
+    /// The newest ledger sequence at the row's key, or `None` at its arrival state (Q215).
+    pub(super) revision: Option<i64>,
 }
 
 #[derive(FromQueryResult)]

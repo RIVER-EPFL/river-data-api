@@ -52,6 +52,17 @@ async fn copies_made_from<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<u64, A
 impl CRUDOperations for StandardCurveOperations {
     type Resource = StandardCurve;
 
+    /// The change-audit trigger reads the writer from the transaction, so the label is declared on
+    /// every write this entity makes, before any hook or statement on it.
+    async fn after_begin<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+    ) -> Result<(), ApiError> {
+        crate::common::actor::declare(db)
+            .await
+            .map_err(ApiError::database)
+    }
+
     async fn before_create<C: ConnectionTrait + TransactionTrait>(
         &self,
         _db: &C,

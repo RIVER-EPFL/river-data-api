@@ -235,3 +235,274 @@ async fn an_unknown_run_is_not_found() {
     let (status, _) = trace_of(&app, &token, &uuid::Uuid::new_v4().to_string()).await;
     assert_eq!(status, 404);
 }
+
+// --- What a run consumed (Q215) ---
+
+const VISIT: &str = "2025-06-15T10:00:00Z";
+
+/// A set reading two visit parameters and a catalog constant, so the run consumes a reading, a
+/// constant and its own steps.
+async fn save_consuming_set(app: &axum::Router, token: &str, script_id: &str) {
+    let (status, text) = crate::common::save_formula_set(
+        app,
+        token,
+        script_id,
+        json!([
+            { "code": "half_temp", "units": "C", "formula": "DO_Temperature * 0.5", "ordinal": 1, "intermediate": true },
+            { "code": "trace_ratio_out", "units": "ratio", "formula": "half_temp / Dissolved_O2 * gas_const_r_atm", "ordinal": 2 }
+        ]),
+    )
+    .await;
+    assert!((200..300).contains(&status), "save ({status}): {text}");
+}
+
+async fn consumed_of(db: &sea_orm::DatabaseConnection, run_id: &str) -> serde_json::Value {
+    db.query_one_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!("SELECT context->'consumed' AS consumed FROM tool_runs WHERE id = '{run_id}'"),
+    ))
+    .await
+    .expect("query")
+    .expect("the run")
+    .try_get::<serde_json::Value>("", "consumed")
+    .expect("consumed")
+}
+
+fn entry<'a>(consumed: &'a serde_json::Value, variable: &str) -> &'a serde_json::Value {
+    consumed
+        .as_array()
+        .expect("a list")
+        .iter()
+        .find(|c| c["variable"] == variable)
+        .unwrap_or_else(|| panic!("{variable} was consumed: {consumed}"))
+}
+
+/// Scenario: a calculation runs at a visit, reading two stored readings and a constant.
+///
+/// Expected behaviour: the stored run names, per input, the rows it read and the revision each
+/// stood at: a reading nobody has touched at its arrival state, a constant and each step at the
+/// revision the audit trail holds, and after the reading is corrected, the next run at the
+/// corrected revision.
+#[tokio::test]
+#[serial]
+async fn a_stored_run_names_the_revision_of_every_input_it_read() {
+    use river_db::common::bulk_write;
+    use river_db::routes::private::readings::models::{Kind, Origin};
+    use river_db::routes::private::readings::service::{self as decisions, Decision, DecisionKey};
+
+    let (db, app, token) = setup().await;
+    let script_id = seed_calculation(&db, "00000000-0000-4000-c000-000000000122").await;
+    save_consuming_set(&app, &token, &script_id).await;
+    let temp = crate::common::sensor_lifecycle::create_paired_stream(
+        &db,
+        "consumed-temp",
+        crate::common::PARAM_S1_TEMP_ID,
+    )
+    .await;
+    let oxygen = crate::common::sensor_lifecycle::create_paired_stream(
+        &db,
+        "consumed-do",
+        crate::common::PARAM_S1_DO_ID,
+    )
+    .await;
+    for (stream, parameter, value) in [
+        (temp, crate::common::GLOBAL_PARAM_TEMP_ID, 8.0),
+        (oxygen, crate::common::GLOBAL_PARAM_DO_ID, 2.0),
+    ] {
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO readings (stream_id, site_id, parameter_id, time, raw_value, \
+                 replicate_index, measurement_type) \
+                 VALUES ('{stream}', '{}', '{parameter}', '{VISIT}', {value}, 0, 'spot')",
+                crate::common::SITE1_ID
+            ),
+        )
+        .await;
+    }
+    // The cleanup truncates the audit trail and keeps the seeded constants, so the constant has
+    // no revision here until something writes it; on a deployment the migration backfilled one.
+    // The trigger records nothing for an unchanged row, so the edit differs every run.
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE constants SET description = 'gas constant {}' WHERE name = 'gas_const_r_atm'",
+            uuid::Uuid::new_v4()
+        ),
+    )
+    .await;
+    let at_visit = json!({ "site_id": crate::common::SITE1_ID, "collected_at": VISIT });
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/tools/{CALCULATION}/calculate"),
+        &at_visit,
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "calculate ({status}): {text}");
+    let result: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let consumed = consumed_of(&db, result["run_id"].as_str().expect("run id")).await;
+
+    let reading = entry(&consumed, "DO_Temperature");
+    assert_eq!(reading["kind"], "reading", "{consumed}");
+    assert_eq!(reading["members"][0]["stream_id"], json!(temp.to_string()));
+    assert_eq!(reading["members"][0]["value"], json!(8.0));
+    assert!(
+        reading["members"][0]["revision"].is_null(),
+        "a reading nobody has touched is at its arrival state: {consumed}"
+    );
+    let constant = entry(&consumed, "gas_const_r_atm");
+    assert_eq!(constant["kind"], "constant");
+    assert!(
+        constant["subject"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("constant:")),
+        "{consumed}"
+    );
+    assert!(
+        constant["revision"].as_i64().is_some(),
+        "the edit is the constant's revision: {consumed}"
+    );
+    for code in ["half_temp", "trace_ratio_out"] {
+        let step = entry(&consumed, code);
+        assert_eq!(step["kind"], "step");
+        assert!(
+            step["subject"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("calculation_formula:")),
+            "{consumed}"
+        );
+        assert!(step["revision"].as_i64().is_some(), "{consumed}");
+    }
+
+    // The temperature is corrected, and the next run reads the corrected revision.
+    let correction = Decision {
+        key: DecisionKey {
+            stream_id: temp,
+            time: chrono::DateTime::parse_from_rfc3339(VISIT)
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            replicate_index: Some(0),
+        },
+        kind: Kind::ValueCorrection,
+        new: json!({ "raw_value": 9.0 }),
+        actor: "tester".to_string(),
+        reason: Some("typo".to_string()),
+        origin: Origin::Manual,
+        set_id: None,
+    };
+    bulk_write::guarded(&db, async |txn| decisions::record(txn, &correction).await)
+        .await
+        .expect("corrected");
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/tools/{CALCULATION}/calculate"),
+        &at_visit,
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "calculate ({status}): {text}");
+    let result: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let consumed = consumed_of(&db, result["run_id"].as_str().expect("run id")).await;
+    let reading = entry(&consumed, "DO_Temperature");
+    assert_eq!(reading["members"][0]["value"], json!(9.0), "{consumed}");
+    assert!(
+        reading["members"][0]["revision"].as_i64().is_some(),
+        "the correction is the reading's revision: {consumed}"
+    );
+}
+
+/// Scenario: a reader arrives at the calculation page from a value computed at a visit, and the
+/// page has to draw the recorded result rather than a fresh one.
+///
+/// Expected behaviour: the trace carries what the tables are drawn from: the values the run
+/// produced, the outputs it skipped, the curves it applied and the manifest of the version it
+/// pinned. Nothing here re-resolves anything from the store.
+#[tokio::test]
+#[serial]
+async fn a_stored_run_carries_what_the_page_draws_it_from() {
+    let (db, app, token) = setup().await;
+    let script_id = seed_calculation(&db, "00000000-0000-4000-c000-000000000124").await;
+    save_set(&app, &token, &script_id, 0.5).await;
+
+    let result = calculate(&app, &token).await;
+    let run_id = result["run_id"].as_str().expect("the run was stored");
+
+    let (status, text) = trace_of(&app, &token, run_id).await;
+    assert_eq!(status, 200, "trace ({status}): {text}");
+    let replayed: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    // 8.0 * 0.5 / 2.0
+    assert_eq!(
+        replayed["results"]["trace_ratio_out"],
+        json!(2.0),
+        "the stored value, not a recomputation: {text}"
+    );
+    let outputs = replayed["manifest"]["outputs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the pinned manifest's outputs: {text}"));
+    assert!(
+        outputs.iter().any(|o| o["key"] == "trace_ratio_out"),
+        "the manifest names the output the tables draw: {text}"
+    );
+    assert!(
+        replayed["skipped"].is_array() && replayed["curves"].is_array(),
+        "both are lists even when the run had none: {text}"
+    );
+}
+
+/// Scenario: the runs at one visit are listed beside the calculation.
+///
+/// Expected behaviour: a run is found at its visit by column, so the list is one filtered read of
+/// `/tool_runs`. A run stored before the columns existed is found there too, because the
+/// migration backfilled it from the context blob it always carried.
+#[tokio::test]
+#[serial]
+async fn the_runs_at_a_visit_are_found_by_site_and_instant() {
+    let (db, app, token) = setup().await;
+    let script_id = seed_calculation(&db, "00000000-0000-4000-c000-000000000125").await;
+    save_set(&app, &token, &script_id, 0.5).await;
+
+    let collected_at = "2025-01-15T00:00:00Z";
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/tools/{CALCULATION}/calculate"),
+        &json!({
+            "site_id": crate::common::SITE1_ID,
+            "collected_at": collected_at,
+            "DO_Temperature": 8.0,
+            "Dissolved_O2": 2.0,
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "calculate at a visit ({status}): {text}");
+    let at_visit: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let run_id = at_visit["run_id"].as_str().expect("the run was stored");
+
+    // A run whose columns were never written, as every row was before the migration.
+    crate::common::exec(
+        &db,
+        &format!("UPDATE tool_runs SET site_id = NULL, collected_at = NULL WHERE id = '{run_id}'"),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        "UPDATE tool_runs SET site_id = (context ->> 'site_id')::uuid, \
+                              collected_at = (context ->> 'collected_at')::timestamptz \
+          WHERE site_id IS NULL AND context ->> 'site_id' IS NOT NULL",
+    )
+    .await;
+
+    let uri = format!(
+        "/api/tool_runs?site_id={}&collected_at={collected_at}&tool_name={CALCULATION}",
+        crate::common::SITE1_ID
+    );
+    let (status, listed) = crate::common::get_json_with_token(&app, &uri, &token).await;
+    assert_eq!(status, 200, "list ({status}): {listed}");
+    let rows = listed.as_array().expect("a list of runs");
+    assert!(
+        rows.iter().any(|r| r["id"].as_str() == Some(run_id)),
+        "the run at this visit is in the list: {listed}"
+    );
+}

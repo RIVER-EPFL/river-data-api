@@ -1,7 +1,7 @@
 //! The trail of one subject, and the append every writer makes.
 
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, NotSet, QueryFilter, QueryOrder,
     QuerySelect, Set,
 };
 use uuid::Uuid;
@@ -27,6 +27,33 @@ pub async fn entries_for<C: ConnectionTrait>(db: &C, subject: &str) -> AppResult
         .collect())
 }
 
+/// The revision a subject stands at: the newest `seq` recorded for it, or `None` for a subject no
+/// trigger has seen, which after the backfill is a subject that does not exist.
+pub async fn entity_revision<C: ConnectionTrait>(db: &C, subject: &str) -> AppResult<Option<i64>> {
+    let revisions = entity_revisions(db, std::slice::from_ref(&subject.to_string())).await?;
+    Ok(revisions.get(subject).copied())
+}
+
+/// The revision of each of `subjects`, keyed by subject; a subject with no row is absent.
+pub async fn entity_revisions<C: ConnectionTrait>(
+    db: &C,
+    subjects: &[String],
+) -> AppResult<std::collections::HashMap<String, i64>> {
+    if subjects.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<(String, i64)> = models::Entity::find()
+        .select_only()
+        .column(models::Column::Subject)
+        .column_as(models::Column::Seq.max(), "revision")
+        .filter(models::Column::Subject.is_in(subjects.to_vec()))
+        .group_by(models::Column::Subject)
+        .into_tuple()
+        .all(db)
+        .await?;
+    Ok(rows.into_iter().collect())
+}
+
 /// Append one change to the trail, in the caller's transaction. Every writer goes through here, so
 /// a new one cannot leave out a column the readers expect.
 pub async fn record<C: ConnectionTrait>(
@@ -45,6 +72,7 @@ pub async fn record<C: ConnectionTrait>(
         old_value: Set(old_value),
         new_value: Set(new_value),
         changed_at: Set(chrono::Utc::now().into()),
+        seq: NotSet,
     }
     .insert(db)
     .await?;

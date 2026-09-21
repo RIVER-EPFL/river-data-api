@@ -238,6 +238,7 @@ pub fn validate_optional_time_range(
         private::readings::views::get_reading_ledger,
         private::readings::views::sample_preview,
         private::readings::views::list_decisions,
+        private::readings::views::replay_derived,
         private::sensor_calibrations::views::retire_calibration,
         private::sensor_calibrations::views::unretire_calibration,
         private::standard_curves::views::retire_standard_curve,

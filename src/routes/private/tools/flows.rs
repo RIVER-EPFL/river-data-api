@@ -98,6 +98,7 @@ fn calculation_of(
         event_inputs: outcome.event_inputs,
         tool_version: tool.version_ref(runtime),
         trace: outcome.trace,
+        consumed: outcome.consumed,
     }
 }
 
@@ -127,6 +128,7 @@ pub(super) async fn store_run(
         || !calculation.site_inputs.is_empty()
         || !calculation.event_inputs.is_empty()
         || !calculation.skipped.is_empty()
+        || !calculation.consumed.is_empty()
     {
         serde_json::json!({
             "site_id": site_id,
@@ -134,6 +136,7 @@ pub(super) async fn store_run(
             "site_inputs": calculation.site_inputs,
             "event_inputs": calculation.event_inputs,
             "skipped": calculation.skipped,
+            "consumed": calculation.consumed,
         })
     } else {
         serde_json::Value::Null
@@ -152,6 +155,8 @@ pub(super) async fn store_run(
         outputs: Set(stored_outputs),
         created_by: Set(actor.to_string()),
         context: Set((!context.is_null()).then_some(context)),
+        site_id: Set(site_id),
+        collected_at: Set(collected_at),
         source: Set(source.to_string()),
         ..Default::default()
     }
@@ -1053,6 +1058,10 @@ pub async fn replay_trace(db: &DatabaseConnection, run: &run::Model) -> AppResul
         site_inputs: from_context("site_inputs"),
         constants: serde_json::Value::Object(constants),
         trace,
+        results: run.outputs.clone(),
+        skipped: from_context("skipped"),
+        curves: run.curves.clone(),
+        manifest: serde_json::to_value(&tool.manifest).unwrap_or(serde_json::Value::Null),
     })
 }
 
@@ -1094,12 +1103,14 @@ pub(super) async fn inputs_exist(
     let mut body = probe.clone();
     body.remove("site_id");
     body.remove("collected_at");
+    let mut consumed = Vec::new();
     let site = resolve_site_inputs(
         &state.db,
         &tool.name,
         &tool.manifest,
         Some(event.site_id),
         &mut body,
+        &mut consumed,
     )
     .await;
     if site.is_err() {
@@ -1112,6 +1123,7 @@ pub(super) async fn inputs_exist(
         Some(event.site_id),
         Some(event.collected_at),
         &mut body,
+        &mut consumed,
     )
     .await?;
     resolve_replicate_inputs(
@@ -1120,6 +1132,7 @@ pub(super) async fn inputs_exist(
         Some(event.site_id),
         Some(event.collected_at),
         &mut body,
+        &mut consumed,
     )
     .await?;
     for p in &tool.manifest.params {

@@ -44,6 +44,11 @@ pub mod definition {
         pub description: Option<String>,
         #[crudcrate(exclude(create, update))]
         pub output_parameter_id: Option<Uuid>,
+        /// The catalog parameter this formula published before it was ticked as a step. Ticking it
+        /// back adopts this row again, so disabling publication and enabling it keeps one identity
+        /// rather than minting a second parameter or refusing the code.
+        #[crudcrate(exclude(create, update))]
+        pub given_up_parameter_id: Option<Uuid>,
         /// The calculation this formula belongs to (M67). NULL is a standalone derived parameter, the
         /// per-reading continuous kind the derived job and janitor serve.
         #[crudcrate(filterable)]

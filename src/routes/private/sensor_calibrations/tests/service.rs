@@ -386,6 +386,7 @@ fn candidate(
         stream_id: Uuid::from_u128(stream),
         value,
         from_mean: false,
+        revision: None,
     }
 }
 
@@ -420,4 +421,85 @@ fn test_chosen_input_takes_lowest_replicate_then_lowest_stream() {
 #[test]
 fn test_chosen_input_empty_slot() {
     assert!(chosen_input(&[]).is_none());
+}
+
+/// A derived value's replay: the formula the computation recorded, over the numbers it recorded.
+mod replay {
+    use super::super::{captured_set, replay_captured};
+    use crate::routes::private::readings::models::ConsumedInput;
+
+    fn input(variable: &str, kind: &str, value: serde_json::Value) -> ConsumedInput {
+        ConsumedInput {
+            variable: variable.to_string(),
+            kind: kind.to_string(),
+            subject: None,
+            property: None,
+            revision: None,
+            members: Vec::new(),
+            value,
+        }
+    }
+
+    fn step(formula: &str) -> ConsumedInput {
+        input("DOmgL", "step", serde_json::json!(formula))
+    }
+
+    #[test]
+    fn test_the_replay_is_the_recorded_formula_over_the_recorded_values() {
+        let consumed = [
+            step("Dissolved_O2 * 2"),
+            input("Dissolved_O2", "reading", serde_json::json!(10.0)),
+        ];
+        assert_eq!(replay_captured(&consumed), Ok(20.0));
+    }
+
+    #[test]
+    fn test_a_constant_and_a_site_property_bind_like_any_other_value() {
+        let consumed = [
+            step("(Depth - datum) * k"),
+            input("Depth", "reading", serde_json::json!(3.0)),
+            input("datum", "site", serde_json::json!(1.0)),
+            input("k", "constant", serde_json::json!(2.0)),
+        ];
+        assert_eq!(replay_captured(&consumed), Ok(4.0));
+    }
+
+    #[test]
+    fn test_a_value_that_was_not_there_binds_as_na_where_a_guard_reads_it() {
+        let consumed = [
+            step("coalesce(Dissolved_O2, 5)"),
+            input("Dissolved_O2", "reading", serde_json::Value::Null),
+        ];
+        assert_eq!(replay_captured(&consumed), Ok(5.0));
+    }
+
+    #[test]
+    fn test_a_value_that_was_not_there_refuses_the_replay_when_nothing_guards_it() {
+        let consumed = [
+            step("Dissolved_O2 * 2"),
+            input("Dissolved_O2", "reading", serde_json::Value::Null),
+        ];
+        let refusal = replay_captured(&consumed).expect_err("nothing to evaluate over");
+        assert!(refusal.contains("Dissolved_O2"), "{refusal}");
+    }
+
+    /// A set captured before the step entry existed names no formula, so there is nothing to
+    /// replay and the reader is told that rather than shown a number.
+    #[test]
+    fn test_a_set_naming_no_formula_is_refused() {
+        let consumed = [input("Dissolved_O2", "reading", serde_json::json!(10.0))];
+        assert!(captured_set(&consumed).is_err());
+        assert!(replay_captured(&consumed).is_err());
+    }
+
+    #[test]
+    fn test_the_step_is_not_bound_as_a_variable_of_its_own_formula() {
+        let consumed = [
+            step("Dissolved_O2 * 2"),
+            input("Dissolved_O2", "reading", serde_json::json!(10.0)),
+        ];
+        let set = captured_set(&consumed).expect("a captured set");
+        assert_eq!(set.formula, "Dissolved_O2 * 2");
+        assert_eq!(set.variables.len(), 1, "{:?}", set.variables);
+    }
 }

@@ -2659,6 +2659,14 @@
           "formula": {
             "type": "string"
           },
+          "given_up_parameter_id": {
+            "description": "The catalog parameter this formula published before it was ticked as a step. Ticking it\nback adopts this row again, so disabling publication and enabling it keeps one identity\nrather than minting a second parameter or refusing the code.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "format": "uuid",
             "type": "string"
@@ -2715,6 +2723,7 @@
           "formula",
           "description",
           "output_parameter_id",
+          "given_up_parameter_id",
           "tool_script_id",
           "ordinal",
           "curve_slot",
@@ -2760,6 +2769,14 @@
           },
           "formula": {
             "type": "string"
+          },
+          "given_up_parameter_id": {
+            "description": "The catalog parameter this formula published before it was ticked as a step. Ticking it\nback adopts this row again, so disabling publication and enabling it keeps one identity\nrather than minting a second parameter or refusing the code.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "id": {
             "format": "uuid",
@@ -2817,6 +2834,7 @@
           "formula",
           "description",
           "output_parameter_id",
+          "given_up_parameter_id",
           "tool_script_id",
           "ordinal",
           "curve_slot",
@@ -3561,6 +3579,11 @@
           },
           "new_value": {},
           "old_value": {},
+          "seq": {
+            "description": "The order of effect: assigned under a lock on the subject, so the newest row for a subject\nis the row's revision (Q215).",
+            "format": "int64",
+            "type": "integer"
+          },
           "subject": {
             "description": "The thing the change was made to, as the writer keyed it: `schedule:{job_name}`,\n`parameter:{id}`, `site_parameter:{id}`, `parameter_group:{id}`, `push_subscriptions:{sub}`.",
             "type": "string"
@@ -3573,7 +3596,8 @@
           "changed_by",
           "old_value",
           "new_value",
-          "changed_at"
+          "changed_at",
+          "seq"
         ],
         "type": "object"
       },
@@ -3599,6 +3623,11 @@
           },
           "new_value": {},
           "old_value": {},
+          "seq": {
+            "description": "The order of effect: assigned under a lock on the subject, so the newest row for a subject\nis the row's revision (Q215).",
+            "format": "int64",
+            "type": "integer"
+          },
           "subject": {
             "description": "The thing the change was made to, as the writer keyed it: `schedule:{job_name}`,\n`parameter:{id}`, `site_parameter:{id}`, `parameter_group:{id}`, `push_subscriptions:{sub}`.",
             "type": "string"
@@ -3611,7 +3640,8 @@
           "changed_by",
           "old_value",
           "new_value",
-          "changed_at"
+          "changed_at",
+          "seq"
         ],
         "type": "object"
       },
@@ -4236,6 +4266,199 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "ConsumedInput": {
+        "description": "One input a calculation consumed, captured when it was read (Q215): what it was bound to and\nthe exact revision of every row behind it, so a later reader can say whether the source has\nmoved since. `kind` is `reading` (one row), `mean` (the sample statistic over `members`),\n`replicates` (a family, one member per index, a gap as a member with no value), `site` (a\ncolumn of the site row), `constant`, `curve` (a catalog curve, or entered coefficients with no\nsubject), or `step` (a formula of the pinned set). An entity input names its `change_audit`\nsubject and the newest `seq` for it.",
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/ConsumedReading"
+            },
+            "type": "array"
+          },
+          "property": {
+            "type": "string"
+          },
+          "revision": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "value": {
+            "type": "object"
+          },
+          "variable": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "variable",
+          "kind",
+          "value"
+        ],
+        "type": "object"
+      },
+      "ConsumedMemberRef": {
+        "description": "One reading a calculation consumed, beside what its key holds now (Q215).",
+        "properties": {
+          "current_revision": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "current_value": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "point": {
+            "$ref": "#/components/schemas/SlotRef",
+            "description": "The record this member opens, absent while its stream is unpaired."
+          },
+          "replicate_index": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "revision": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "`changed`, `unchanged` or `unknown`.",
+            "type": "string"
+          },
+          "stream_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "value": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "stream_id",
+          "time",
+          "replicate_index",
+          "revision",
+          "value",
+          "current_revision",
+          "current_value",
+          "state"
+        ],
+        "type": "object"
+      },
+      "ConsumedReading": {
+        "description": "One reading a calculation read, as the row and the revision it stood at (Q215). `revision` is\nthe newest `reading_decisions.seq` at the key when the value was read; null is the arrival\nstate, a row no decision had touched yet.",
+        "properties": {
+          "replicate_index": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "revision": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "stream_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "value": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "stream_id",
+          "time",
+          "replicate_index",
+          "revision",
+          "value"
+        ],
+        "type": "object"
+      },
+      "ConsumedRef": {
+        "description": "One input of the calculation that made this record, as it was consumed and as its source\nstands now (Q215). `kind`, `subject` and `property` are the captured binding.",
+        "properties": {
+          "current_revision": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "current_value": {
+            "description": "What the source holds now, where the input reads one row. A statistic over several\nreadings is not recomputed here: its members carry their own current values."
+          },
+          "kind": {
+            "type": "string"
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/ConsumedMemberRef"
+            },
+            "type": "array"
+          },
+          "property": {
+            "type": "string"
+          },
+          "revision": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "`changed`, `unchanged` or `unknown`.",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "value": {},
+          "variable": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "variable",
+          "kind",
+          "revision",
+          "current_revision",
+          "value",
+          "state"
+        ],
         "type": "object"
       },
       "ConsumerRef": {
@@ -7110,6 +7333,46 @@
           "site_inputs",
           "event_inputs",
           "trace"
+        ],
+        "type": "object"
+      },
+      "GivenUpOutput": {
+        "description": "A catalog parameter a formula published until this save ticked it as a step.",
+        "properties": {
+          "code": {
+            "description": "The formula's code, which is the catalog row's code too.",
+            "type": "string"
+          },
+          "parameter_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "read_by": {
+            "description": "The formulas that read the parameter, by code: each of them now reads a value nothing\nrefreshes.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "readings_retained": {
+            "description": "Readings stored under the parameter. They stay, and ticking the formula back as an output\npublishes them again.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "sites": {
+            "description": "The sites holding a slot of the parameter, by name.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "code",
+          "parameter_id",
+          "readings_retained",
+          "read_by",
+          "sites"
         ],
         "type": "object"
       },
@@ -15698,6 +15961,13 @@
           "computation": {
             "$ref": "#/components/schemas/ComputationInfo"
           },
+          "consumed": {
+            "description": "What the calculation that made this record actually read, captured at the read (Q215),\neach input beside what its source holds now. Empty on a record nothing computed, and on\none computed before the capture existed, whose inputs are therefore unknown.",
+            "items": {
+              "$ref": "#/components/schemas/ConsumedRef"
+            },
+            "type": "array"
+          },
           "consumers": {
             "description": "Every enabled formula reading this parameter, one hop down the chain, with its output's\nvalue at this instant where one exists.",
             "items": {
@@ -16201,6 +16471,11 @@
               "null"
             ]
           },
+          "seq": {
+            "description": "The order of effect: assigned under a lock on the reading's key, so the newest row at a\nkey is the reading's revision (Q215).",
+            "format": "int64",
+            "type": "integer"
+          },
           "set_id": {
             "description": "The set-level decision this row materialises, where it belongs to one.",
             "format": "uuid",
@@ -16241,7 +16516,8 @@
           "supersedes",
           "rolled_back_by",
           "set_id",
-          "job_id"
+          "job_id",
+          "seq"
         ],
         "type": "object"
       },
@@ -16300,6 +16576,11 @@
               "null"
             ]
           },
+          "seq": {
+            "description": "The order of effect: assigned under a lock on the reading's key, so the newest row at a\nkey is the reading's revision (Q215).",
+            "format": "int64",
+            "type": "integer"
+          },
           "set_id": {
             "description": "The set-level decision this row materialises, where it belongs to one.",
             "format": "uuid",
@@ -16340,7 +16621,8 @@
           "supersedes",
           "rolled_back_by",
           "set_id",
-          "job_id"
+          "job_id",
+          "seq"
         ],
         "type": "object"
       },
@@ -17366,6 +17648,61 @@
           "body",
           "constants",
           "curves"
+        ],
+        "type": "object"
+      },
+      "ReplayResponse": {
+        "description": "What a derived value's replay answers: the arithmetic behind the stored number.",
+        "properties": {
+          "captured_at": {
+            "description": "When the captured set was recorded.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "derived_version_id": {
+            "description": "The version the stored value names, where it names one.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "formula": {
+            "description": "The formula the computation recorded, as it stood then.",
+            "type": "string"
+          },
+          "replayed": {
+            "description": "Running that formula over the values the computation consumed.",
+            "format": "double",
+            "type": "number"
+          },
+          "stored": {
+            "description": "What the reading holds now. A replay that disagrees with it means the row moved without\nthe ledger, which is the one thing this read is for.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "variables": {
+            "additionalProperties": {
+              "format": "double",
+              "type": "number"
+            },
+            "description": "The values the replay bound, by variable name.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "formula",
+          "derived_version_id",
+          "replayed",
+          "stored",
+          "variables",
+          "captured_at"
         ],
         "type": "object"
       },
@@ -18762,6 +19099,11 @@
             },
             "type": "object"
           },
+          "curves": {
+            "description": "The curves the run applied, as it stored them.",
+            "items": {},
+            "type": "array"
+          },
           "event_inputs": {
             "description": "The visit's stored values the run read, as `{param, parameter_code, parameter_id, value}`.",
             "items": {},
@@ -18770,6 +19112,18 @@
           "label": {
             "description": "The pinned version's label, which is what a reader recognises the calculation by.",
             "type": "string"
+          },
+          "manifest": {
+            "description": "The manifest of the version the run pinned, so the stored result reads through the same\ntables a fresh run does rather than through a second rendering of its own.",
+            "type": "object"
+          },
+          "results": {
+            "additionalProperties": {},
+            "description": "The values the run produced, as it stored them: an explicit null is a value computed and\nnot a number, as against never computed at all.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
           },
           "run_id": {
             "format": "uuid",
@@ -18785,6 +19139,11 @@
           },
           "site_inputs": {
             "description": "The station properties the run read, as `{property, param, value}`.",
+            "items": {},
+            "type": "array"
+          },
+          "skipped": {
+            "description": "Outputs the run did not produce, each with its reason, as the run recorded them.",
             "items": {},
             "type": "array"
           },
@@ -18813,7 +19172,11 @@
           "event_inputs",
           "site_inputs",
           "constants",
-          "trace"
+          "trace",
+          "results",
+          "skipped",
+          "curves",
+          "manifest"
         ],
         "type": "object"
       },
@@ -19214,6 +19577,13 @@
           "deleted": {
             "minimum": 0,
             "type": "integer"
+          },
+          "given_up": {
+            "description": "One entry per formula this save turned from an output into a step. Publication stops and\nnothing is deleted, so the entry says what stays behind and who still reads it.",
+            "items": {
+              "$ref": "#/components/schemas/GivenUpOutput"
+            },
+            "type": "array"
           },
           "migrated": {
             "description": "Whether the migration of the superseded version's values was enqueued.",
@@ -22763,6 +23133,34 @@
         ],
         "type": "object"
       },
+      "SlotRef": {
+        "description": "Where a consumed reading opens: the site page's point record for its slot.",
+        "properties": {
+          "measurement_type": {
+            "description": "`spot` or `continuous`, the cadence arm the record is read by.",
+            "type": "string"
+          },
+          "site_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "site_parameter_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "site_id",
+          "site_parameter_id",
+          "time",
+          "measurement_type"
+        ],
+        "type": "object"
+      },
       "SourceParameterSeries": {
         "properties": {
           "name": {
@@ -25023,6 +25421,13 @@
             },
             "type": "object"
           },
+          "consumed": {
+            "description": "Every input as it was read, with the revision of each row behind it (Q215). Stored on\nthe run's context, so a later reader can say whether a source has moved since.",
+            "items": {
+              "$ref": "#/components/schemas/ConsumedInput"
+            },
+            "type": "array"
+          },
           "curves": {
             "description": "The curves the server resolved, as the runner received them.",
             "items": {
@@ -25254,6 +25659,13 @@
       },
       "ToolRunList": {
         "properties": {
+          "collected_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -25264,6 +25676,14 @@
           "id": {
             "format": "uuid",
             "type": "string"
+          },
+          "site_id": {
+            "description": "The visit the run was computed at. The same two values `context` carries, written from\nthe same resolution, as columns a list can be filtered and ordered by: \"the runs at\nthis visit\" is a query, not a scan of the blobs.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "source": {
             "description": "Which path minted the run: `interactive`, `csv_import` or `chain`.",
@@ -25282,12 +25702,21 @@
           "tool_version",
           "created_by",
           "created_at",
+          "site_id",
+          "collected_at",
           "source"
         ],
         "type": "object"
       },
       "ToolRunResponse": {
         "properties": {
+          "collected_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "constants": {},
           "context": {
             "description": "The resolved calculation context: site, collected_at, and the station and event inputs\nthe server read. Null on a run that named none."
@@ -25306,6 +25735,14 @@
           },
           "inputs": {},
           "outputs": {},
+          "site_id": {
+            "description": "The visit the run was computed at. The same two values `context` carries, written from\nthe same resolution, as columns a list can be filtered and ordered by: \"the runs at\nthis visit\" is a query, not a scan of the blobs.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "source": {
             "description": "Which path minted the run: `interactive`, `csv_import` or `chain`.",
             "type": "string"
@@ -25328,6 +25765,8 @@
           "created_by",
           "created_at",
           "context",
+          "site_id",
+          "collected_at",
           "source"
         ],
         "type": "object"
@@ -25690,6 +26129,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "reductions": {
+            "description": "One entry per reducer the formula applied. A binding names one number; this names the\nfamily behind it, so a reader can see which repeats the mean or the sd was taken over.",
+            "items": {
+              "$ref": "#/components/schemas/TraceReduction"
+            },
+            "type": "array"
+          },
           "skipped": {
             "type": "string"
           },
@@ -25704,6 +26150,34 @@
         "required": [
           "value",
           "bindings"
+        ],
+        "type": "object"
+      },
+      "TraceReduction": {
+        "description": "One reduction over a replicate family: the call as the formula writes it, the number it bound,\nand the indexes whose values were eligible. A gap and a value computed as NA are not members,\nso `members` is what the statistic was actually taken over.",
+        "properties": {
+          "call": {
+            "type": "string"
+          },
+          "members": {
+            "items": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "value": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "call",
+          "value",
+          "members"
         ],
         "type": "object"
       },
@@ -29523,7 +29997,7 @@
     },
     "/api/change_audit_entries": {
       "get": {
-        "description": "Retrieves all change_audit_entries.\n\nThis resource manages change_audit_entry items\n\nAdditional sortable columns: \n- subject\n- change\n- changed_by\n- changed_at.\n\nAdditional filterable columns: \n- subject\n- change\n- changed_by.",
+        "description": "Retrieves all change_audit_entries.\n\nThis resource manages change_audit_entry items\n\nAdditional sortable columns: \n- subject\n- change\n- changed_by\n- changed_at\n- seq.\n\nAdditional filterable columns: \n- subject\n- change\n- changed_by.",
         "operationId": "get_all_change_audit_entries",
         "parameters": [
           {
@@ -37842,7 +38316,7 @@
     },
     "/api/reading_decisions": {
       "get": {
-        "description": "Retrieves all reading_decisions.\n\nThis resource manages reading_decision items\n\nAdditional sortable columns: \n- stream_id\n- time\n- replicate_index\n- kind\n- actor\n- at\n- origin.\n\nAdditional filterable columns: \n- stream_id\n- time\n- replicate_index\n- kind\n- actor\n- origin\n- supersedes\n- rolled_back_by\n- set_id\n- job_id.",
+        "description": "Retrieves all reading_decisions.\n\nThis resource manages reading_decision items\n\nAdditional sortable columns: \n- stream_id\n- time\n- replicate_index\n- kind\n- actor\n- at\n- origin\n- seq.\n\nAdditional filterable columns: \n- stream_id\n- time\n- replicate_index\n- kind\n- actor\n- origin\n- supersedes\n- rolled_back_by\n- set_id\n- job_id.",
         "operationId": "get_all_reading_decisions",
         "parameters": [
           {
@@ -38748,6 +39222,66 @@
           }
         },
         "summary": "The assembled record of one measured instant: where it came from, when it arrived, what\ninstrument and corrections produced the stored value, the visit it belongs to, the tool run\nthat computed it, and any review holds touching it. Requires `read_data`.",
+        "tags": [
+          "readings"
+        ]
+      }
+    },
+    "/api/readings/replay": {
+      "get": {
+        "operationId": "replay_derived",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "stream_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "time",
+            "required": true,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Omit for the group's decisions.",
+            "in": "query",
+            "name": "replicate_index",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplayResponse"
+                }
+              }
+            },
+            "description": "The recorded formula over the recorded values"
+          },
+          "404": {
+            "description": "No reading, or no computation captured at that key"
+          },
+          "409": {
+            "description": "The captured set cannot be evaluated"
+          }
+        },
+        "summary": "A derived value's own arithmetic: the formula the computation recorded, run again over the\nvalues it consumed, beside the number the reading holds. Reads only; writes nothing and touches\nno live value. Requires `read_data`.",
         "tags": [
           "readings"
         ]
@@ -49894,7 +50428,7 @@
     },
     "/api/tool_runs": {
       "get": {
-        "description": "Retrieves all tool_runs.\n\nThis resource manages tool_run items\n\nAdditional sortable columns: \n- tool_name\n- created_by\n- created_at\n- source.\n\nAdditional filterable columns: \n- tool_name\n- created_by\n- source.",
+        "description": "Retrieves all tool_runs.\n\nThis resource manages tool_run items\n\nAdditional sortable columns: \n- tool_name\n- created_by\n- created_at\n- site_id\n- collected_at\n- source.\n\nAdditional filterable columns: \n- tool_name\n- created_by\n- site_id\n- collected_at\n- source.",
         "operationId": "get_all_tool_runs",
         "parameters": [
           {

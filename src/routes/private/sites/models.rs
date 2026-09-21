@@ -9,6 +9,7 @@ use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
+use super::service::SiteOperations;
 use crate::routes::private::meteoswiss::models::ExternalSource;
 
 // --- The sites entity ---
@@ -21,7 +22,8 @@ use crate::routes::private::meteoswiss::models::ExternalSource;
     api_struct = "Site",
     name_singular = "site",
     name_plural = "sites",
-    generate_router
+    generate_router,
+    operations = SiteOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]

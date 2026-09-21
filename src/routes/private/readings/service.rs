@@ -1199,6 +1199,7 @@ pub async fn record<C: ConnectionTrait>(conn: &C, d: &Decision) -> AppResult<Uui
         rolled_back_by: Set(None),
         set_id: Set(d.set_id),
         job_id: Set(None),
+        seq: NotSet,
     }
     .insert(conn)
     .await?;
@@ -1293,6 +1294,7 @@ pub async fn rollback<C: ConnectionTrait>(
         rolled_back_by: Set(None),
         set_id: Set(None),
         job_id: Set(None),
+        seq: NotSet,
     }
     .insert(conn)
     .await?;
@@ -1355,6 +1357,9 @@ pub enum NewValue {
     /// The row's own projected state of the kind's columns, for a decision recorded over rows
     /// born with the state already in place (an insert-time curve claim): `old` is then null.
     Born,
+    /// [`NewValue::Born`] with extra keys merged into `new`: what a computed row's arrival
+    /// consumed (Q215), which is not a column of the row.
+    BornWith(serde_json::Value),
     /// A jsonb expression evaluated once per row against `r` (`readings`), for a decision whose
     /// assertion differs per reading: a curve retirement moves each of its readings onto whichever
     /// curve covers that reading, which is a different answer per row. The expression carries its
@@ -1564,6 +1569,17 @@ pub async fn record_many<C: ConnectionTrait>(
             Expr::cust_with_values("$1::jsonb", [sea_orm::Value::from(value.clone())]),
         ),
         NewValue::Born => (nulled_columns(), touched_columns()),
+        NewValue::BornWith(extra) => (
+            nulled_columns(),
+            Expr::cust_with_values(
+                "(SELECT COALESCE(jsonb_object_agg(k, t.state -> k), '{}'::jsonb) \
+                  FROM unnest($1::text[]) AS k) || $2::jsonb",
+                [
+                    sea_orm::Value::from(cols.clone()),
+                    sea_orm::Value::from(extra.clone()),
+                ],
+            ),
+        ),
         NewValue::Sql(_) => (
             touched_columns(),
             Expr::col((Alias::new("t"), Alias::new("resolved"))),
@@ -3053,6 +3069,53 @@ pub async fn history<C: ConnectionTrait>(
         .all(conn)
         .await?;
     rows.into_iter().map(row_from).collect()
+}
+
+/// A derived value's recorded arithmetic, run again over the values it consumed.
+///
+/// The newest `derived_computed` or `formula_transition` at the key is the computation that made
+/// the value standing there; both carry the whole set in `new.consumed`, formula included, so
+/// nothing here reads a formula, a version or an input from the store. The answer is the stored
+/// number's own arithmetic, which is what a reader compares against the inputs as they stand now.
+pub async fn replay_at<C: ConnectionTrait>(
+    conn: &C,
+    key: &DecisionKey,
+) -> AppResult<crate::routes::private::readings::models::ReplayResponse> {
+    use crate::routes::private::readings::models::{Kind, ReplayResponse};
+    let computation = history(conn, key)
+        .await?
+        .into_iter()
+        .find(|row| matches!(row.kind, Kind::DerivedComputed | Kind::FormulaTransition))
+        .ok_or_else(|| {
+            AppError::NotFound("No computation is recorded at that reading".to_string())
+        })?;
+    let consumed: Vec<crate::routes::private::readings::models::ConsumedInput> =
+        serde_json::from_value(
+            computation
+                .new
+                .get("consumed")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )
+        .map_err(|e| AppError::Conflict(format!("the captured set is unreadable: {e}")))?;
+    let set = crate::routes::private::sensor_calibrations::service::captured_set(&consumed)
+        .map_err(AppError::Conflict)?;
+    let replayed = crate::routes::private::sensor_calibrations::service::replay_captured(&consumed)
+        .map_err(AppError::Conflict)?;
+    let stored = readings::Entity::find()
+        .filter(readings::Column::StreamId.eq(key.stream_id))
+        .filter(readings::Column::Time.eq(key.time))
+        .filter(readings::Column::ReplicateIndex.eq(key.replicate_index.unwrap_or(0)))
+        .one(conn)
+        .await?;
+    Ok(ReplayResponse {
+        formula: set.formula.to_string(),
+        derived_version_id: stored.as_ref().and_then(|r| r.derived_version_id),
+        replayed,
+        stored: stored.map(|r| r.raw_value),
+        variables: serde_json::to_value(&set.variables).unwrap_or(serde_json::Value::Null),
+        captured_at: computation.at,
+    })
 }
 
 /// The default and the ceiling on how much history one read returns. A value with a thousand
@@ -4653,6 +4716,8 @@ pub async fn assemble_records(
     let (calculations, formula_versions) = fetch_calculations(db, rows).await?;
     let links = fetch_formula_links(db, rows).await?;
     let served = fetch_served_values(db, rows, &links, time).await?;
+    let mut consumed_sets =
+        super::consumed::resolve_many(db, &fetch_consumed_sets(db, rows, time).await?).await?;
 
     let mut records = Vec::with_capacity(groups.len());
     for (stream_id, group) in &groups {
@@ -4800,6 +4865,7 @@ pub async fn assemble_records(
             ),
             _ => (Vec::new(), Vec::new()),
         };
+        let consumed = consumed_sets.remove(stream_id).unwrap_or_default();
 
         records.push(ProvenanceRecord {
             origin: OriginInfo {
@@ -4832,6 +4898,7 @@ pub async fn assemble_records(
             calculation,
             inputs,
             consumers,
+            consumed,
             holds,
         });
     }
@@ -4857,6 +4924,86 @@ pub async fn records_for_event(
         .into_iter()
         .map(|r| (r.origin.stream_id, r))
         .collect())
+}
+
+/// What each record's calculation consumed, as it was captured at the read (Q215), keyed by the
+/// stream the record is served by.
+///
+/// A tool run keeps its set on the run row, one per run. A derived value keeps its on the
+/// decision that wrote it, so the newest of those at the key is the set behind the stored number;
+/// a recompute that moved the value appended a `formula_transition` and a first computation a
+/// `derived_computed`, and both are read here by the ledger order the lock makes effect order.
+pub(super) async fn fetch_consumed_sets(
+    db: &sea_orm::DatabaseConnection,
+    rows: &[RawRow],
+    time: DateTime<Utc>,
+) -> AppResult<HashMap<Uuid, Vec<ConsumedInput>>> {
+    let mut out: HashMap<Uuid, Vec<ConsumedInput>> = HashMap::new();
+
+    // The first blob in the group, which is the one the record itself reports.
+    let mut runs: HashMap<Uuid, Uuid> = HashMap::new();
+    for row in rows {
+        if let Some(run) = run_id_of(row.provenance.as_ref()) {
+            runs.entry(row.stream_id).or_insert(run);
+        }
+    }
+    if !runs.is_empty() {
+        let contexts: HashMap<Uuid, Option<serde_json::Value>> = tool_run::Entity::find()
+            .filter(tool_run::Column::Id.is_in(runs.values().copied().collect::<Vec<_>>()))
+            .select_only()
+            .column(tool_run::Column::Id)
+            .column(tool_run::Column::Context)
+            .into_tuple::<(Uuid, Option<serde_json::Value>)>()
+            .all(db)
+            .await?
+            .into_iter()
+            .collect();
+        for (stream_id, run_id) in &runs {
+            let captured = contexts
+                .get(run_id)
+                .and_then(|c| c.as_ref())
+                .and_then(|c| c.get("consumed"))
+                .cloned();
+            if let Some(set) = captured.and_then(consumed_set) {
+                out.insert(*stream_id, set);
+            }
+        }
+    }
+
+    let derived: Vec<Uuid> = rows
+        .iter()
+        .filter(|r| r.measurement_type.as_deref() == Some("derived"))
+        .map(|r| r.stream_id)
+        .collect();
+    if !derived.is_empty() {
+        let ledger = decision_model::Entity::find()
+            .filter(decision_model::Column::StreamId.is_in(derived))
+            .filter(decision_model::Column::Time.eq(time))
+            .filter(decision_model::Column::Kind.is_in([
+                Kind::FormulaTransition.as_str(),
+                Kind::DerivedComputed.as_str(),
+            ]))
+            .order_by_desc(decision_model::Column::Seq)
+            .all(db)
+            .await?;
+        for row in ledger {
+            if out.contains_key(&row.stream_id) {
+                continue;
+            }
+            if let Some(set) = row.new.get("consumed").cloned().and_then(consumed_set) {
+                out.insert(row.stream_id, set);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A stored `consumed` array as the capture wrote it. A shape this build does not understand is
+/// no set at all, which reads as unknown rather than as a partial one.
+fn consumed_set(stored: serde_json::Value) -> Option<Vec<ConsumedInput>> {
+    serde_json::from_value::<Vec<ConsumedInput>>(stored)
+        .ok()
+        .filter(|set| !set.is_empty())
 }
 
 pub fn run_id_of(blob: Option<&serde_json::Value>) -> Option<Uuid> {
@@ -4922,7 +5069,7 @@ fn live_hold_statuses() -> Vec<&'static str> {
 
 /// A built statement as SeaORM takes it. Every reader below builds its query and hands it over
 /// here, so no reader spells SQL and none of them repeats the handoff.
-fn build(query: sea_orm::sea_query::SelectStatement) -> Statement {
+pub(super) fn build(query: sea_orm::sea_query::SelectStatement) -> Statement {
     let (sql, values) = query.build(PostgresQueryBuilder);
     Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values)
 }
@@ -5667,6 +5814,10 @@ pub(super) async fn fetch_served_values(
             Expr::cust("COALESCE(s.n > 0 AND s.mean IS NOT NULL, false)"),
             Alias::new("from_mean"),
         )
+        .expr_as(
+            crate::routes::private::tools::service::reading_revision_expr(),
+            Alias::new("revision"),
+        )
         .from_as(readings::Entity, r.clone())
         .join_as(
             JoinType::LeftJoin,
@@ -5706,6 +5857,7 @@ pub(super) async fn fetch_served_values(
                 stream_id: row.stream_id,
                 value: row.input_value,
                 from_mean: row.from_mean,
+                revision: row.revision,
             });
         }
     }
@@ -9847,9 +9999,7 @@ macro_rules! reading_labelled {
                     self.parameter_code = Some(code.clone());
                     self.units = Some(units.clone());
                 }
-                self.instrument_name = ids
-                    .sensor
-                    .and_then(|id| labels.sensors.get(&id).cloned());
+                self.instrument_name = ids.sensor.and_then(|id| labels.sensors.get(&id).cloned());
                 self.calibration = ids
                     .calibration
                     .and_then(|id| labels.calibrations.get(&id).cloned());

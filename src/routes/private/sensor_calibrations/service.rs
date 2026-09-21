@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::models::SensorCalibration;
+use crate::routes::private::change_audit::service::{entity_revision, entity_revisions};
 use crate::routes::private::constants::models as constants;
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::derived_parameters::models::definition as calculation_formulas;
@@ -23,13 +24,16 @@ use crate::routes::private::derived_parameters::models::version as derived_versi
 use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::decision_model as reading_decisions;
 use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::models::{ConsumedInput, ConsumedReading};
 use crate::routes::private::readings::models::{Kind, Origin};
 use crate::routes::private::readings::samples::models as samples;
 use crate::routes::private::sensor_deployments::models as sensor_deployments;
 use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::sites;
 use crate::routes::private::standard_curves::models as standard_curves;
-use crate::routes::private::tools::service::{free_identifiers, read_only_through_guards};
+use crate::routes::private::tools::service::{
+    free_identifiers, read_only_through_guards, reading_revision_expr,
+};
 
 /// The reprocess engines are driven by `Job::run`, whose error type is `DbErr`. The shared bulk-write
 /// and aggregate-refresh primitives report `AppError`; carrying the message through keeps a failed
@@ -677,6 +681,20 @@ pub struct InputCandidate {
     pub stream_id: Uuid,
     pub value: f64,
     pub from_mean: bool,
+    /// The newest ledger sequence at the row's key, or `None` at its arrival state (Q215).
+    pub revision: Option<i64>,
+}
+
+impl InputCandidate {
+    fn consumed(&self, time: DateTime<Utc>) -> ConsumedReading {
+        ConsumedReading {
+            stream_id: self.stream_id,
+            time,
+            replicate_index: self.replicate_index,
+            revision: self.revision,
+            value: Some(self.value),
+        }
+    }
 }
 
 /// The reading a derived formula reads at a slot: continuous before spot, then the lowest
@@ -985,6 +1003,7 @@ fn input_value_query(
             Expr::cust("COALESCE(smp.n > 0 AND smp.mean IS NOT NULL, false)"),
             Alias::new("from_mean"),
         )
+        .expr_as(reading_revision_expr(), Alias::new("revision"))
         .from_as(readings::Entity, r.clone())
         .join_as(
             JoinType::LeftJoin,
@@ -1000,11 +1019,17 @@ fn input_value_query(
         .take()
 }
 
+/// The variables one instant binds, and every input as it was read (Q215).
+struct ResolvedDerived {
+    variables: HashMap<String, f64>,
+    consumed: Vec<ConsumedInput>,
+}
+
 async fn resolve_variables_for_derived(
     db: &DatabaseConnection,
     item: &DerivedWork,
     time: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<Option<HashMap<String, f64>>>, sea_orm::DbErr> {
+) -> Result<Option<Option<ResolvedDerived>>, sea_orm::DbErr> {
     let mapping_rows: Vec<(String, Option<Uuid>, Option<String>)> = derived_sources::Entity::find()
         .filter(derived_sources::Column::DerivedDefinitionId.eq(item.derived_definition_id))
         .select_only()
@@ -1023,6 +1048,7 @@ async fn resolve_variables_for_derived(
 
     let mut parameters = Vec::new();
     let mut properties = Vec::new();
+    let mut consumed = Vec::new();
     for (var_name, source_param_id, site_property) in mapping_rows {
         if let Some(source_param_id) = source_param_id {
             let candidates = InputCandidate::find_by_statement(build(input_value_query(
@@ -1033,15 +1059,34 @@ async fn resolve_variables_for_derived(
             .all(db)
             .await?;
             let value_row = chosen_input(&candidates);
-            if let Some(input) = value_row
-                && input.measurement_type.as_deref() == Some("spot")
-            {
-                tracing::debug!(
-                    variable = %var_name,
-                    parameter_id = %source_param_id,
-                    time = %time,
-                    "Derived input resolved from a grab (spot) reading"
-                );
+            if let Some(input) = value_row {
+                if input.measurement_type.as_deref() == Some("spot") {
+                    tracing::debug!(
+                        variable = %var_name,
+                        parameter_id = %source_param_id,
+                        time = %time,
+                        "Derived input resolved from a grab (spot) reading"
+                    );
+                }
+                // A mean stands on every member of its sample; a single row on itself.
+                let members: Vec<ConsumedReading> = if input.from_mean {
+                    candidates
+                        .iter()
+                        .filter(|c| c.from_mean)
+                        .map(|c| c.consumed(time))
+                        .collect()
+                } else {
+                    vec![input.consumed(time)]
+                };
+                consumed.push(ConsumedInput {
+                    variable: var_name.clone(),
+                    kind: if input.from_mean { "mean" } else { "reading" }.to_string(),
+                    subject: None,
+                    property: None,
+                    revision: None,
+                    members,
+                    value: serde_json::json!(input.value),
+                });
             }
             parameters.push((var_name, value_row.map(|input| input.value)));
         } else if let Some(property) = site_property {
@@ -1049,14 +1094,47 @@ async fn resolve_variables_for_derived(
         }
     }
     let site_properties = site_property_values(db, item.derived_site_id, &properties).await?;
+    if !site_properties.is_empty() {
+        let subject = format!("site:{}", item.derived_site_id);
+        let revision = entity_revision(db, &subject)
+            .await
+            .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+        for ((variable, value), (_, property)) in site_properties.iter().zip(&properties) {
+            consumed.push(ConsumedInput {
+                variable: variable.clone(),
+                kind: "site".to_string(),
+                subject: Some(subject.clone()),
+                property: Some(property.clone()),
+                revision,
+                members: Vec::new(),
+                value: value.map_or(serde_json::Value::Null, |v| serde_json::json!(v)),
+            });
+        }
+    }
     let declared: Vec<String> = parameters
         .iter()
         .chain(&site_properties)
         .map(|(variable, _)| variable.clone())
         .collect();
-    let constants = constants_named_by(db, &item.formula, &declared).await?;
+    let (constants, constants_read) = constants_consumed(db, &item.formula, &declared).await?;
+    consumed.extend(constants_read);
+    let step_subject = format!("calculation_formula:{}", item.derived_definition_id);
+    consumed.push(ConsumedInput {
+        variable: item.derived_parameter_code.clone(),
+        kind: "step".to_string(),
+        revision: entity_revision(db, &step_subject)
+            .await
+            .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?,
+        subject: Some(step_subject),
+        property: None,
+        members: Vec::new(),
+        value: serde_json::Value::String(item.formula.clone()),
+    });
     match bind_derived_variables(&item.formula, &parameters, &site_properties, &constants) {
-        Ok(variables) => Ok(Some(Some(variables))),
+        Ok(variables) => Ok(Some(Some(ResolvedDerived {
+            variables,
+            consumed,
+        }))),
         Err(reason) => {
             tracing::debug!(
                 definition_id = %item.derived_definition_id,
@@ -1096,6 +1174,53 @@ pub(crate) fn bind_derived_variables(
     Ok(variables)
 }
 
+/// The formula a captured set carries, and the numbers it was evaluated over.
+///
+/// A derived computation records its own arithmetic: the `step` entry's value is the formula text
+/// as it stood, so a replay needs no version lookup and cannot read a formula the computation did
+/// not use.
+pub struct CapturedSet<'a> {
+    pub formula: &'a str,
+    pub variables: HashMap<String, f64>,
+}
+
+/// Read a captured set out of the `consumed` a `derived_computed` or `formula_transition`
+/// decision stored. Every entry but the step binds its variable to the number it held; an entry
+/// whose value is not a number is a value that was not there, which binds as NA where the formula
+/// only reads it through a guard and refuses the replay otherwise, exactly as the computation did.
+pub fn captured_set(consumed: &[ConsumedInput]) -> Result<CapturedSet<'_>, String> {
+    let step = consumed
+        .iter()
+        .find(|input| input.kind == "step")
+        .ok_or_else(|| "the captured set names no formula".to_string())?;
+    let formula = step
+        .value
+        .as_str()
+        .ok_or_else(|| "the captured set's formula is not text".to_string())?;
+    let mut variables = HashMap::new();
+    for input in consumed.iter().filter(|input| input.kind != "step") {
+        match input.value.as_f64() {
+            Some(value) => {
+                variables.insert(input.variable.clone(), value);
+            }
+            None if read_only_through_guards(formula, &input.variable) => {
+                variables.insert(input.variable.clone(), f64::NAN);
+            }
+            None => return Err(format!("no value for {}", input.variable)),
+        }
+    }
+    Ok(CapturedSet { formula, variables })
+}
+
+/// The formula a derived value was computed with, run again over the values it consumed.
+///
+/// Nothing is read from the store and nothing is written: the answer is the arithmetic behind the
+/// stored number, which is what lets a reader check it against the inputs as they stand now.
+pub fn replay_captured(consumed: &[ConsumedInput]) -> Result<f64, String> {
+    let set = captured_set(consumed)?;
+    evaluate_formula(set.formula, &set.variables)
+}
+
 /// The constants a formula names, read from the constants table: every free identifier that is
 /// not one of its declared variables. A name that is neither is left unbound, so the evaluation
 /// reports it rather than a silent zero.
@@ -1104,18 +1229,49 @@ pub(crate) async fn constants_named_by<C: ConnectionTrait>(
     formula: &str,
     declared: &[String],
 ) -> Result<HashMap<String, f64>, sea_orm::DbErr> {
+    Ok(constants_consumed(db, formula, declared).await?.0)
+}
+
+/// [`constants_named_by`], and each constant as it was read: its row and revision (Q215).
+async fn constants_consumed<C: ConnectionTrait>(
+    db: &C,
+    formula: &str,
+    declared: &[String],
+) -> Result<(HashMap<String, f64>, Vec<ConsumedInput>), sea_orm::DbErr> {
     let names: Vec<String> = free_identifiers(formula)
         .into_iter()
         .filter(|name| !declared.contains(name))
         .collect();
     if names.is_empty() {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), Vec::new()));
     }
     let rows = constants::Entity::find()
         .filter(constants::Column::Name.is_in(names))
         .all(db)
         .await?;
-    Ok(rows.into_iter().map(|c| (c.name, c.value)).collect())
+    let subjects: Vec<String> = rows.iter().map(|c| format!("constant:{}", c.id)).collect();
+    let revisions = entity_revisions(db, &subjects)
+        .await
+        .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+    let consumed = rows
+        .iter()
+        .map(|c| {
+            let subject = format!("constant:{}", c.id);
+            ConsumedInput {
+                variable: c.name.clone(),
+                kind: "constant".to_string(),
+                revision: revisions.get(&subject).copied(),
+                subject: Some(subject),
+                property: None,
+                members: Vec::new(),
+                value: serde_json::json!(c.value),
+            }
+        })
+        .collect();
+    Ok((
+        rows.into_iter().map(|c| (c.name, c.value)).collect(),
+        consumed,
+    ))
 }
 
 /// The value of each `(variable, site column)` on the site's own row, `None` where the column is
@@ -1217,12 +1373,13 @@ struct StoredDerived {
 /// The kind projects no column: the upsert that follows is what writes the value. Nothing is
 /// recorded when no row is stored yet, because a first computation came from no version; the
 /// caller is told so, and records the arrival once the row exists.
-async fn record_formula_transition(
-    db: &DatabaseConnection,
+async fn record_formula_transition<C: ConnectionTrait>(
+    db: &C,
     stream_id: Uuid,
     time: chrono::DateTime<chrono::Utc>,
     result: f64,
     version: Option<Uuid>,
+    consumed: &[ConsumedInput],
 ) -> Result<bool, sea_orm::DbErr> {
     let stored = readings::Entity::find()
         .filter(readings::Column::StreamId.eq(stream_id))
@@ -1250,6 +1407,7 @@ async fn record_formula_transition(
             new: serde_json::json!({
                 "raw_value": result,
                 "derived_version_id": version,
+                "consumed": consumed,
             }),
             actor: "system".to_string(),
             reason: None,
@@ -1342,7 +1500,11 @@ async fn evaluate_and_upsert_derived(
         unattribute_derived_at(db, item, time).await?;
         return Ok(None);
     };
-    let Some(variables) = resolved else {
+    let Some(ResolvedDerived {
+        variables,
+        consumed,
+    }) = resolved
+    else {
         return Ok(None);
     };
 
@@ -1376,35 +1538,40 @@ async fn evaluate_and_upsert_derived(
     // A recompute that moves a stored value or the version it names records the move (Q116), so a
     // person opening the value reads what it was and which formula edit changed it. Recorded
     // before the write, because the decision captures `old` from the row as it still stands; a
-    // first insert is not a transition, and a pass that changes neither is not a decision.
-    let born = record_formula_transition(db, stream_id, time, result, version).await?;
-
-    crate::common::bulk_write::guarded_mutation(
-        db,
-        derived_upsert(
-            stream_id,
-            item.derived_site_id,
-            item.derived_parameter_id,
-            time,
-            result,
-            version,
-        ),
-    )
+    // first insert is not a transition, and a pass that changes neither is not a decision. The
+    // decision, the write and the arrival commit together, so the value and what it consumed
+    // (Q215) cannot be read apart.
+    let site_id = item.derived_site_id;
+    let parameter_id = item.derived_parameter_id;
+    crate::common::bulk_write::guarded(db, async |txn| {
+        let born = record_formula_transition(txn, stream_id, time, result, version, &consumed)
+            .await
+            .map_err(crate::error::AppError::from)?;
+        crate::common::bulk_write::mutation(
+            txn,
+            derived_upsert(stream_id, site_id, parameter_id, time, result, version),
+        )
+        .await?;
+        // A slot's first number is a change to the readings as much as a move is (Q57, Q118),
+        // and it is recorded after the write because the decision reads the row it is about.
+        if born {
+            record_derived_arrival(txn, stream_id, time, &consumed)
+                .await
+                .map_err(crate::error::AppError::from)?;
+        }
+        Ok(())
+    })
     .await
     .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
-    // A slot's first number is a change to the readings as much as a move is (Q57, Q118), and it
-    // is recorded after the write because the decision reads the row it is about.
-    if born {
-        record_derived_arrival(db, stream_id, time).await?;
-    }
     Ok(Some(SlotPass::Stored))
 }
 
 /// Record the arrival of a derived value, the state it arrived in read from the row itself.
-async fn record_derived_arrival(
-    db: &DatabaseConnection,
+async fn record_derived_arrival<C: ConnectionTrait>(
+    db: &C,
     stream_id: Uuid,
     time: chrono::DateTime<chrono::Utc>,
+    consumed: &[ConsumedInput],
 ) -> Result<(), sea_orm::DbErr> {
     crate::routes::private::readings::service::record_many(
         db,
@@ -1416,7 +1583,9 @@ async fn record_derived_arrival(
                 .add(row(readings::Column::Time).eq(time))
                 .add(row(readings::Column::ReplicateIndex).eq(0_i16))
         },
-        crate::routes::private::readings::service::NewValue::Born,
+        crate::routes::private::readings::service::NewValue::BornWith(
+            serde_json::json!({ "consumed": consumed }),
+        ),
         "system",
         None,
         crate::routes::private::readings::models::Origin::System,
@@ -2146,6 +2315,17 @@ async fn pinned_readings<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<Option<
 
 impl CRUDOperations for SensorCalibrationOperations {
     type Resource = SensorCalibration;
+
+    /// The change-audit trigger reads the writer from the transaction, so the label is declared on
+    /// every write this entity makes, before any hook or statement on it.
+    async fn after_begin<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+    ) -> Result<(), ApiError> {
+        crate::common::actor::declare(db)
+            .await
+            .map_err(ApiError::database)
+    }
 
     async fn before_create<C: ConnectionTrait + TransactionTrait>(
         &self,

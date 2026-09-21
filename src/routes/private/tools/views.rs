@@ -953,15 +953,20 @@ pub async fn save_formula_set(
         .ok_or_else(|| AppError::NotFound(format!("Tool script {id} not found")))?;
     let superseded = current.active_version_id;
 
-    let stored: Vec<(Uuid, String)> = formula_entity::Entity::find()
+    let before = formula_entity::Entity::find()
         .filter(formula_entity::Column::ToolScriptId.eq(id))
         .order_by_asc(formula_entity::Column::Ordinal)
         .order_by_asc(formula_entity::Column::Code)
         .all(&txn)
-        .await?
-        .into_iter()
-        .map(|f| (f.id, f.code))
+        .await?;
+    // What each formula publishes before the save, so a formula this save turns into a step can be
+    // told from one that was already a step and the catalog row it leaves behind can be named.
+    let published: Vec<(Uuid, Uuid)> = before
+        .iter()
+        .filter(|f| !f.intermediate)
+        .filter_map(|f| f.output_parameter_id.map(|p| (f.id, p)))
         .collect();
+    let stored: Vec<(Uuid, String)> = before.into_iter().map(|f| (f.id, f.code)).collect();
     let named: Vec<(Option<Uuid>, String)> = payload
         .formulas
         .iter()
@@ -995,6 +1000,29 @@ pub async fn save_formula_set(
 
     // One version for the whole save, whatever it touched.
     let version_id = mint_formula_version(&txn, id, Some(&actor)).await?;
+
+    // A formula this save turned into a step stops publishing. Nothing is deleted, so the response
+    // says what stays behind under each parameter and who still reads it.
+    let mut given_up = Vec::new();
+    for (formula_id, parameter_id) in published {
+        let Some(formula) = formula_entity::Entity::find_by_id(formula_id)
+            .one(&txn)
+            .await?
+        else {
+            continue;
+        };
+        if !formula.intermediate {
+            continue;
+        }
+        given_up.push(
+            crate::routes::private::derived_parameters::service::given_up_report(
+                &txn,
+                formula.code,
+                parameter_id,
+            )
+            .await?,
+        );
+    }
     txn.commit().await?;
 
     let version_no = match version_id {
@@ -1017,6 +1045,7 @@ pub async fn save_formula_set(
         updated,
         deleted,
         migrated,
+        given_up,
     }))
 }
 

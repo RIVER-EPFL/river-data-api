@@ -1097,3 +1097,86 @@ async fn formula_id(db: &sea_orm::DatabaseConnection, code: &str) -> String {
     .expect("id")
     .to_string()
 }
+
+/// Scenario: an author ticks a published output of a calculation as a step, which is how
+/// publication is disabled.
+///
+/// Expected behaviour: the save names what it stopped publishing, so the page can say it. Nothing
+/// is deleted: the response carries the parameter, the readings that stay under it and the
+/// formulas that still read it.
+#[tokio::test]
+#[serial]
+async fn a_set_save_names_the_output_it_stopped_publishing() {
+    let group_id = "00000000-0000-4000-c000-000000000102";
+    let (db, app, token) = setup().await;
+    seed_calculation(&db, group_id).await;
+    let script_id = calculation_id(&db).await;
+
+    let (status, text) = crate::common::save_formula_set(
+        &app,
+        &token,
+        &script_id,
+        json!([
+            { "code": "temp_step", "name": "Temp step", "units": "ratio",
+              "formula": "DO_Temperature / Dissolved_O2", "ordinal": 1 },
+            { "code": "temp_reader", "name": "Temp reader", "units": "ratio",
+              "formula": "temp_step * 2", "ordinal": 2 },
+        ]),
+    )
+    .await;
+    assert!((200..300).contains(&status), "save ({status}): {text}");
+    let parameter = minted_output(&db, "temp_step").await;
+
+    let step = formula_id(&db, "temp_step").await;
+    let reader = formula_id(&db, "temp_reader").await;
+    let (status, text) = crate::common::save_formula_set(
+        &app,
+        &token,
+        &script_id,
+        json!([
+            { "id": step, "code": "temp_step", "units": "ratio",
+              "formula": "DO_Temperature / Dissolved_O2", "ordinal": 1, "intermediate": true },
+            { "id": reader, "code": "temp_reader", "units": "ratio",
+              "formula": "temp_step * 2", "ordinal": 2 },
+        ]),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "tick as a step ({status}): {text}"
+    );
+
+    let saved: serde_json::Value = serde_json::from_str(&text).expect("the save response");
+    let given_up = saved["given_up"].as_array().expect("given_up");
+    assert_eq!(given_up.len(), 1, "one output stopped publishing: {saved}");
+    assert_eq!(given_up[0]["code"], "temp_step");
+    assert_eq!(given_up[0]["parameter_id"], parameter);
+    assert_eq!(
+        given_up[0]["readings_retained"], 0,
+        "the count is of what stays under the parameter: {saved}"
+    );
+
+    let (status, text) = crate::common::save_formula_set(
+        &app,
+        &token,
+        &script_id,
+        json!([
+            { "id": step, "code": "temp_step", "units": "ratio",
+              "formula": "DO_Temperature / Dissolved_O2", "ordinal": 1 },
+            { "id": reader, "code": "temp_reader", "units": "ratio",
+              "formula": "temp_step * 2", "ordinal": 2 },
+        ]),
+    )
+    .await;
+    assert!((200..300).contains(&status), "tick back ({status}): {text}");
+    let saved: serde_json::Value = serde_json::from_str(&text).expect("the save response");
+    assert!(
+        saved["given_up"].is_null() || saved["given_up"].as_array().expect("given_up").is_empty(),
+        "a save that publishes again gives up nothing: {saved}"
+    );
+    assert_eq!(
+        minted_output(&db, "temp_step").await,
+        parameter,
+        "ticking it back publishes the same catalog row, not a second one"
+    );
+}

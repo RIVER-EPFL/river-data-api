@@ -1251,3 +1251,227 @@ fn test_a_skipped_cell_traces_its_reason() {
     );
     assert!(gap.bindings.is_empty());
 }
+
+/// Scenario: the alternating shape a sheet writes by hand, a mean over the entered family, a
+/// per-replicate stage dividing by it, and an sd over that stage's own results.
+/// Expected behaviour: each reducer sees a finished vector, so the set evaluates in one pass and
+/// the sd is the sample sd of the three ratios.
+#[test]
+fn test_a_reducer_reads_a_vector_the_same_run_produced() {
+    let mut m = formula("m", 1, "mean(x)", None, &[("x", "X")]);
+    m.intermediate = true;
+    let formulas = [
+        m,
+        per_replicate("y", 2, "x / m", Some("Y"), &[("x", "X")], "x"),
+        formula("spread", 3, "sd(y)", Some("Spread"), &[("y", "Y")]),
+    ];
+    let produced = evaluate_over_replicates(
+        &formulas,
+        &HashMap::new(),
+        &replicates(&[("x", &[Some(2.0), Some(4.0), Some(6.0)])]),
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .expect("evaluates");
+    match &produced[1] {
+        // 2/4, 4/4, 6/4
+        Produced::PerReplicate { values, .. } => {
+            assert_eq!(values, &[Some(0.5), Some(1.0), Some(1.5)]);
+        }
+        other => panic!("the stage is one value per index: {other:?}"),
+    }
+    let Produced::Scalar(spread) = &produced[2] else {
+        panic!("the sd is one number: {:?}", produced[2]);
+    };
+    // sd(0.5, 1.0, 1.5) over n-1
+    assert!(
+        (spread.value.expect("a value") - 0.5).abs() < 1e-12,
+        "{spread:?}"
+    );
+}
+
+/// A repeat the visit did not measure is no member: the statistics are over what was entered.
+#[test]
+fn test_a_gap_is_not_a_member_of_the_reduction() {
+    let formulas = [formula("avg", 1, "mean(x)", Some("Avg"), &[("x", "X")])];
+    let (_, trace) = evaluate_with_trace(
+        &formulas,
+        &HashMap::new(),
+        &replicates(&[("x", &[Some(2.0), None, Some(4.0)])]),
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .expect("evaluates");
+    let cell = &trace[0].cells[0];
+    assert_eq!(cell.value, Some(3.0));
+    let reduction = &cell.reductions[0];
+    assert_eq!(reduction.call, "mean(x)");
+    assert_eq!(
+        reduction.members,
+        vec![0, 2],
+        "the gap at index 1 is left out"
+    );
+}
+
+/// One eligible value is a mean and no sd: there is no second value to vary from.
+#[test]
+fn test_one_member_gives_a_mean_and_no_sd() {
+    let formulas = [
+        formula("avg", 1, "mean(x)", Some("Avg"), &[("x", "X")]),
+        formula("spread", 2, "sd(x)", Some("Spread"), &[("x", "X")]),
+    ];
+    let produced = evaluate_over_replicates(
+        &formulas,
+        &HashMap::new(),
+        &replicates(&[("x", &[Some(7.0), None])]),
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .expect("evaluates");
+    let Produced::Scalar(avg) = &produced[0] else {
+        panic!("one number");
+    };
+    let Produced::Scalar(spread) = &produced[1] else {
+        panic!("one number");
+    };
+    assert_eq!(avg.value, Some(7.0));
+    assert_eq!(spread.value, None, "an sd of one value is NA, not zero");
+    assert!(!spread.refused, "NA is computed, not refused: {spread:?}");
+}
+
+/// No eligible member at all is a computed NA, which clears the stored value (Q229).
+#[test]
+fn test_a_reduction_over_nothing_is_na() {
+    let formulas = [formula("avg", 1, "mean(x)", Some("Avg"), &[("x", "X")])];
+    let produced = evaluate_over_replicates(
+        &formulas,
+        &HashMap::new(),
+        &replicates(&[("x", &[None, None])]),
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .expect("evaluates");
+    let Produced::Scalar(avg) = &produced[0] else {
+        panic!("one number");
+    };
+    assert_eq!(avg.value, None);
+    assert!(avg.skipped.is_none(), "it ran: {avg:?}");
+}
+
+/// A guard over an NA reduction stands in for it, the way it does for any other missing value.
+#[test]
+fn test_a_guard_supplies_a_fallback_for_an_na_reduction() {
+    let formulas = [formula(
+        "spread",
+        1,
+        "coalesce(sd(x), 0)",
+        Some("Spread"),
+        &[("x", "X")],
+    )];
+    let produced = evaluate_over_replicates(
+        &formulas,
+        &HashMap::new(),
+        &replicates(&[("x", &[Some(7.0)])]),
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .expect("evaluates");
+    let Produced::Scalar(spread) = &produced[0] else {
+        panic!("one number");
+    };
+    assert_eq!(spread.value, Some(0.0));
+}
+
+/// A family a formula only reduces is declared as the family, not as the group's served mean.
+#[test]
+fn test_a_reduced_family_is_declared_as_replicates() {
+    let formulas = [formula("avg", 1, "mean(x)", Some("Avg"), &[("x", "X")])];
+    let manifest = manifest_json("Average", None, &formulas, &["X".to_string()]).expect("manifest");
+    let params = manifest["params"].as_array().expect("params");
+    assert_eq!(params[0]["kind"], serde_json::json!("replicates"));
+    assert!(
+        manifest["event_inputs"]
+            .as_array()
+            .expect("event_inputs")
+            .is_empty(),
+        "the repeats are the input, not one served number: {manifest:?}"
+    );
+}
+
+/// A variable read both as a family and as one value is bound both ways: the repeat at this cell's
+/// index, and the statistic over the whole family.
+#[test]
+fn test_a_variable_read_inside_and_outside_a_reducer_is_bound_both_ways() {
+    let formulas = [formula(
+        "ratio",
+        1,
+        "x / mean(x)",
+        Some("Ratio"),
+        &[("x", "X")],
+    )];
+    let produced = evaluate_over_replicates(
+        &formulas,
+        &HashMap::new(),
+        &replicates(&[("x", &[Some(2.0), Some(4.0), Some(6.0)])]),
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .expect("evaluates");
+    let Produced::Scalar(ratio) = &produced[0] else {
+        panic!("one number");
+    };
+    // The first repeat over the family's mean, 2/4.
+    assert_eq!(ratio.value, Some(0.5));
+}
+
+/// A reducer naming something that is not a family skips the formula rather than reducing the one
+/// number it found.
+#[test]
+fn test_a_reducer_over_a_scalar_skips_the_formula() {
+    let formulas = [formula(
+        "ratio",
+        1,
+        "x / mean(x)",
+        Some("Ratio"),
+        &[("x", "X")],
+    )];
+    let produced = evaluate_over_replicates(
+        &formulas,
+        &inputs(&[("x", 6.0)]),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .expect("evaluates");
+    let Produced::Scalar(ratio) = &produced[0] else {
+        panic!("one number");
+    };
+    assert_eq!(
+        ratio.value, None,
+        "x is a number here and names no family, so the reduction has nothing to read"
+    );
+    assert!(
+        ratio
+            .skipped
+            .as_deref()
+            .is_some_and(|r| r.contains("mean(x)")),
+        "{ratio:?}"
+    );
+}
+
+/// `mean` over an expression is not a reduction: the engine defines it over a family named by the
+/// author, and anything else is refused as a call nothing defines.
+#[test]
+fn test_a_reducer_over_an_expression_is_refused() {
+    assert!(reducer_calls("mean(x + 1)").is_empty());
+    let formulas = [formula("avg", 1, "mean(x + 1)", Some("Avg"), &[("x", "X")])];
+    let err = evaluate_over_replicates(
+        &formulas,
+        &inputs(&[("x", 1.0)]),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    )
+    .expect_err("the expression names a function nothing defines");
+    assert!(err.contains("avg"), "{err}");
+}

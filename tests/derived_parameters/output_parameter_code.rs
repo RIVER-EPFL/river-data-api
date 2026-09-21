@@ -147,3 +147,126 @@ async fn a_first_save_does_not_adopt_a_parameter_no_calculation_produces() {
         "the refusal names the parameter holding the code: {text}"
     );
 }
+
+async fn count(db: &DatabaseConnection, sql: &str, id: Uuid) -> i64 {
+    db.query_one_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+        [id.into()],
+    ))
+    .await
+    .expect("the count reads")
+    .expect("one row")
+    .try_get::<i64>("", "n")
+    .expect("n")
+}
+
+async fn stored_output(db: &DatabaseConnection, definition_id: Uuid) -> Option<Uuid> {
+    db.query_one_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT output_parameter_id FROM calculation_formulas WHERE id = $1",
+        [definition_id.into()],
+    ))
+    .await
+    .expect("the formula reads")
+    .expect("the formula")
+    .try_get::<Option<Uuid>>("", "output_parameter_id")
+    .expect("output_parameter_id")
+}
+
+async fn set_step(app: &axum::Router, token: &str, id: &str, step: bool) -> (u16, String) {
+    crate::common::put_json_with_token(
+        app,
+        &format!("/api/derived_parameters/{id}"),
+        &serde_json::json!({ "intermediate": step }),
+        token,
+    )
+    .await
+}
+
+/// Scenario: an output with readings stored under it is ticked as a step, then ticked back.
+///
+/// Expected behaviour: publication stops and starts again, and the identity survives it. The same
+/// catalog parameter comes back, with every reading and every version it had.
+#[tokio::test]
+#[serial]
+async fn an_output_ticked_as_a_step_and_back_keeps_its_parameter_readings_and_versions() {
+    let f = crate::common::seeded_app().await;
+    let created = define(&f.app, &f.token, "m291_round").await;
+    let id = created["id"].as_str().expect("id").to_string();
+    let definition = Uuid::parse_str(&id).expect("a uuid");
+    let output = output_of(&created);
+
+    let (status, sp) = crate::common::post_json_with_token(
+        &f.app,
+        "/api/site_parameters",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID, "parameter_id": output.to_string(),
+            "name": "m291_round", "sensor_type": "derived", "entry_mode": "tool",
+        }),
+        &f.token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "assign ({status}): {sp}");
+    assert!(
+        crate::common::e2e::wait_for_jobs_by_trigger(&f.db, "derived_assignment", 30).await,
+        "the assignment backfills the history it covers"
+    );
+
+    let readings = count(
+        &f.db,
+        "SELECT count(*) AS n FROM readings WHERE parameter_id = $1",
+        output,
+    )
+    .await;
+    assert!(readings > 0, "the output has a history to keep");
+    let versions = count(
+        &f.db,
+        "SELECT count(*) AS n FROM derived_parameter_definition_versions WHERE definition_id = $1",
+        definition,
+    )
+    .await;
+    assert!(versions > 0, "the output has versions to keep");
+
+    let (status, body) = set_step(&f.app, &f.token, &id, true).await;
+    assert!(
+        (200..300).contains(&status),
+        "tick as a step ({status}): {body}"
+    );
+    assert_eq!(
+        stored_output(&f.db, definition).await,
+        None,
+        "a step publishes nothing, so the link is given up"
+    );
+
+    let (status, body) = set_step(&f.app, &f.token, &id, false).await;
+    assert!(
+        (200..300).contains(&status),
+        "tick back as an output ({status}): {body}"
+    );
+    assert_eq!(
+        stored_output(&f.db, definition).await,
+        Some(output),
+        "re-enabling publication recovers the same parameter, not a second one"
+    );
+    assert_eq!(
+        count(
+            &f.db,
+            "SELECT count(*) AS n FROM readings WHERE parameter_id = $1",
+            output
+        )
+        .await,
+        readings,
+        "the readings stored under it are untouched by either tick"
+    );
+    assert_eq!(
+        count(
+            &f.db,
+            "SELECT count(*) AS n FROM derived_parameter_definition_versions WHERE definition_id = $1",
+            definition
+        )
+        .await,
+        versions,
+        "and so is the version history"
+    );
+}

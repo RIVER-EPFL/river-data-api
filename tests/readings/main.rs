@@ -11,6 +11,7 @@ mod attribution_order;
 mod batch_overwrite_count;
 mod batch_standard_curve;
 mod collection_events;
+mod consumed_history;
 mod csv_import_chunked;
 mod csv_import_column_resolution;
 mod csv_import_family_guard;

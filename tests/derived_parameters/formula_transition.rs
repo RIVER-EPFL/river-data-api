@@ -74,6 +74,38 @@ async fn transitions(
         .collect()
 }
 
+/// The `derived_computed` decisions at one instant of the slot, as their `new` blobs.
+async fn arrivals(
+    db: &DatabaseConnection,
+    parameter_id: Uuid,
+    time: DateTime<Utc>,
+) -> Vec<serde_json::Value> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT d.new FROM reading_decisions d \
+               JOIN readings r ON r.stream_id = d.stream_id AND r.time = d.time \
+              WHERE d.kind = 'derived_computed' AND r.parameter_id = $1 AND d.time = $2 \
+              ORDER BY d.seq",
+            [parameter_id.into(), time.into()],
+        ))
+        .await
+        .expect("arrivals");
+    rows.iter()
+        .map(|r| r.try_get::<serde_json::Value>("", "new").expect("new"))
+        .collect()
+}
+
+/// The consumed entry for one variable of a decision's `new` blob.
+fn consumed<'a>(new: &'a serde_json::Value, variable: &str) -> &'a serde_json::Value {
+    new["consumed"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the decision names what it consumed: {new}"))
+        .iter()
+        .find(|c| c["variable"] == variable)
+        .unwrap_or_else(|| panic!("{variable} was consumed: {new}"))
+}
+
 /// Wait until the transition count stops being `before`, or give up. The recompute is a tracked
 /// job, so the decision lands after the endpoint answers.
 async fn wait_for_transitions(
@@ -161,6 +193,27 @@ async fn a_recompute_records_the_move_and_a_pass_that_moves_nothing_records_noth
         transitions(&db, parameter, at).await.is_empty(),
         "a first computation came from no version, so it is not a transition"
     );
+    // The arrival names what it consumed: the input at its arrival state, and the formula row
+    // at the revision the audit trail holds (Q215).
+    let born = arrivals(&db, parameter, at).await;
+    assert_eq!(born.len(), 1, "one arrival: {born:?}");
+    let input = consumed(&born[0], "Dissolved_O2");
+    assert_eq!(input["kind"], "reading", "{born:?}");
+    assert_eq!(input["members"][0]["value"].as_f64(), Some(250.0));
+    assert!(input["members"][0]["stream_id"].is_string(), "{born:?}");
+    assert!(
+        input["members"][0]["revision"].is_null(),
+        "untouched, so at its arrival state: {born:?}"
+    );
+    let step = consumed(&born[0], &code);
+    assert_eq!(step["kind"], "step");
+    assert_eq!(
+        step["subject"],
+        serde_json::json!(format!("calculation_formula:{definition_id}"))
+    );
+    let step_revision_at_birth = step["revision"]
+        .as_i64()
+        .expect("the formula row has a revision");
 
     let (status, body) = crate::common::put_json_with_token(
         &app,
@@ -190,6 +243,16 @@ async fn a_recompute_records_the_move_and_a_pass_that_moves_nothing_records_noth
         old["derived_version_id"], new["derived_version_id"],
         "the versions differ, which is the move"
     );
+    // The move names what it consumed, and the edited formula row is at a later revision.
+    let step = consumed(new, &code);
+    assert!(
+        step["revision"].as_i64().expect("a revision") > step_revision_at_birth,
+        "the edit advanced the formula's revision: {new}"
+    );
+    assert_eq!(
+        consumed(new, "Dissolved_O2")["members"][0]["value"].as_f64(),
+        Some(250.0)
+    );
 
     // A second recompute with nothing edited moves nothing, so it decides nothing.
     let (status, body) =
@@ -201,4 +264,147 @@ async fn a_recompute_records_the_move_and_a_pass_that_moves_nothing_records_noth
         1,
         "a recompute that changes no value writes no decision: {after:?}"
     );
+}
+
+/// The stream a slot's derived readings are stored under.
+async fn derived_stream(db: &DatabaseConnection, parameter_id: Uuid, time: DateTime<Utc>) -> Uuid {
+    db.query_one_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT stream_id FROM readings WHERE parameter_id = $1 AND time = $2 LIMIT 1",
+        [parameter_id.into(), time.into()],
+    ))
+    .await
+    .expect("the reading reads")
+    .expect("a derived reading")
+    .try_get::<Uuid>("", "stream_id")
+    .expect("stream_id")
+}
+
+/// Scenario: a reader is shown a derived value beside the input it consumed, and wants to check
+/// one against the other.
+///
+/// Expected behaviour: the replay runs the formula the computation recorded over the values it
+/// recorded, and answers the same number that is stored. It reads the captured set and nothing
+/// else, so flagging the input afterwards does not move it.
+#[tokio::test]
+#[serial]
+async fn a_derived_value_replays_its_own_formula_over_what_it_consumed() {
+    let (db, app, token) = setup().await;
+
+    let code = format!("replay_{}", Uuid::new_v4().simple());
+    let (status, def) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/derived_parameters",
+        &serde_json::json!({
+            "code": code,
+            "name": "Replay fixture",
+            "units": "mg/L",
+            "formula": "Dissolved_O2 * 0.032",
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create ({status}): {def}");
+    let output = def["output_parameter_id"]
+        .as_str()
+        .expect("output")
+        .to_string();
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/site_parameters",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "parameter_id": output,
+            "name": code,
+            "sensor_type": "derived",
+            "entry_mode": "tool",
+            "display_units": "mg/L",
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "assign ({status}): {body}");
+
+    let at: DateTime<Utc> = Utc::now() - Duration::hours(11);
+    let at = at - Duration::nanoseconds(i64::from(at.timestamp_subsec_nanos()));
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/readings/batch",
+        &serde_json::json!({
+            "readings": [{
+                "site_id": crate::common::SITE1_ID,
+                "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
+                "time": at.to_rfc3339(),
+                "raw_value": 250.0,
+            }]
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "ingest ({status}): {body}");
+
+    let parameter = Uuid::parse_str(&output).unwrap();
+    assert_eq!(derived_value(&db, parameter, at).await, Some(8.0));
+    let stream = derived_stream(&db, parameter, at).await;
+
+    let uri = format!(
+        "/api/readings/replay?stream_id={stream}&time={}&replicate_index=0",
+        at.to_rfc3339().replace('+', "%2B")
+    );
+    let (status, replay) = crate::common::get_json_with_token(&app, &uri, &token).await;
+    assert_eq!(status, 200, "replay ({status}): {replay}");
+    assert_eq!(replay["formula"], "Dissolved_O2 * 0.032");
+    // 250.0 * 0.032
+    assert_eq!(replay["replayed"].as_f64(), Some(8.0));
+    assert_eq!(
+        replay["stored"].as_f64(),
+        Some(8.0),
+        "the arithmetic answers the number standing there: {replay}"
+    );
+    assert_eq!(
+        replay["variables"]["Dissolved_O2"].as_f64(),
+        Some(250.0),
+        "the value the computation read, not the one the store holds now: {replay}"
+    );
+}
+
+/// Scenario: an instant with no computation recorded against it.
+///
+/// Expected behaviour: the reader is told there is nothing to replay rather than shown a number
+/// made up from the values as they stand.
+#[tokio::test]
+#[serial]
+async fn an_instant_with_no_computation_has_nothing_to_replay() {
+    let (db, app, token) = setup().await;
+    let at: DateTime<Utc> = Utc::now() - Duration::hours(12);
+    let at = at - Duration::nanoseconds(i64::from(at.timestamp_subsec_nanos()));
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/readings/batch",
+        &serde_json::json!({
+            "readings": [{
+                "site_id": crate::common::SITE1_ID,
+                "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
+                "time": at.to_rfc3339(),
+                "raw_value": 250.0,
+            }]
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "ingest ({status}): {body}");
+    let stream = derived_stream(
+        &db,
+        Uuid::parse_str(crate::common::GLOBAL_PARAM_DO_ID).unwrap(),
+        at,
+    )
+    .await;
+
+    let uri = format!(
+        "/api/readings/replay?stream_id={stream}&time={}&replicate_index=0",
+        at.to_rfc3339().replace('+', "%2B")
+    );
+    let (status, body) = crate::common::get_with_token(&app, &uri, &token).await;
+    assert_eq!(status, 404, "{body}");
 }

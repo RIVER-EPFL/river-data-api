@@ -455,6 +455,34 @@ pub async fn list_decisions(
     Ok(Json(history(&state.db, &key).await?))
 }
 
+/// A derived value's own arithmetic: the formula the computation recorded, run again over the
+/// values it consumed, beside the number the reading holds. Reads only; writes nothing and touches
+/// no live value. Requires `read_data`.
+#[utoipa::path(
+    get,
+    path = "/api/readings/replay",
+    params(DecisionsQuery),
+    responses(
+        (status = 200, description = "The recorded formula over the recorded values", body = ReplayResponse),
+        (status = 404, description = "No reading, or no computation captured at that key"),
+        (status = 409, description = "The captured set cannot be evaluated"),
+    ),
+    tag = "readings"
+)]
+pub async fn replay_derived(
+    State(state): State<AppState>,
+    Query(q): Query<DecisionsQuery>,
+) -> AppResult<Json<ReplayResponse>> {
+    let key = DecisionKey {
+        stream_id: q.stream_id,
+        time: q.time,
+        replicate_index: q.replicate_index.or(Some(0)),
+    };
+    Ok(Json(
+        crate::routes::private::readings::service::replay_at(&state.db, &key).await?,
+    ))
+}
+
 /// Everything that happened to one measured instant, in time order: the decisions taken on it, the
 /// ingest passes that carried it, the review holds it raised, the tool run that computed it, the
 /// jobs that rewrote it and what they skipped, the slot edits that changed how it is served, and
@@ -4589,6 +4617,7 @@ pub fn readings_read_routes(state: &AppState) -> axum::Router {
         .route("/readings/provenance", get(get_reading_provenance))
         .route("/readings/ledger", get(get_reading_ledger))
         .route("/readings/decisions", get(list_decisions))
+        .route("/readings/replay", get(replay_derived))
         .route("/readings/edits/inspect", post(inspect))
         .layer(axum::middleware::from_fn(require_read_data))
         .with_state(state.clone())

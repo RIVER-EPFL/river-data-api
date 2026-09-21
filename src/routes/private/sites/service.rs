@@ -5,13 +5,14 @@ use std::collections::HashMap;
 use axum::http::header::{self, HeaderValue};
 use axum::response::Response;
 use chrono::{DateTime, Utc};
+use crudcrate::{ApiError, CRUDOperations};
 use sea_orm::sea_query::{
     Alias, Expr, ExprTrait, Func, JoinType, PostgresQueryBuilder, Query as SeaQuery,
     SelectStatement,
 };
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult, Order, QueryFilter,
-    QueryOrder, QuerySelect, Statement,
+    QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use uuid::Uuid;
 
@@ -26,6 +27,27 @@ use crate::routes::private::sensor_calibrations::models as sensor_calibrations;
 use crate::routes::private::sensor_deployments::models as sensor_deployments;
 use crate::routes::private::sensors::models as sensors;
 use crate::routes::private::site_parameters;
+
+// --- The sites entity's hooks ---
+
+/// A site's columns are what a formula reads as a site property, and the change-audit trigger
+/// records every edit to them under the writer the transaction names.
+pub struct SiteOperations;
+
+impl CRUDOperations for SiteOperations {
+    type Resource = Site;
+
+    /// The change-audit trigger reads the writer from the transaction, so the label is declared on
+    /// every write this entity makes, before any hook or statement on it.
+    async fn after_begin<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+    ) -> Result<(), ApiError> {
+        crate::common::actor::declare(db)
+            .await
+            .map_err(ApiError::database)
+    }
+}
 
 // --- Site detail and the parameter list ---
 

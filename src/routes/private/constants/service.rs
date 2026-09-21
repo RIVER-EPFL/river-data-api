@@ -28,6 +28,17 @@ pub fn recompute_dedupe_key(name: &str) -> String {
 impl CRUDOperations for ConstantOperations {
     type Resource = Constant;
 
+    /// The change-audit trigger reads the writer from the transaction, so the label is declared on
+    /// every write this entity makes, before any hook or statement on it.
+    async fn after_begin<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+    ) -> Result<(), ApiError> {
+        crate::common::actor::declare(db)
+            .await
+            .map_err(ApiError::database)
+    }
+
     /// A value that moves invalidates every stored output computed from it, so the recompute is
     /// enqueued on the transaction the edit runs in and commits or rolls back with it. A units or
     /// description edit changes no calculation and recomputes nothing.

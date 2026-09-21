@@ -71,7 +71,7 @@ impl CRUDOperations for ParameterOperations {
         entity: &mut Parameter,
     ) -> Result<(), ApiError> {
         let given_up = given_up_codes(db).await.map_err(ApiError::database)?;
-        entity.unpublished_by = unpublished_by(&entity.code, &given_up);
+        entity.unpublished_by = unpublished_by(entity.id, &given_up);
         Ok(())
     }
 
@@ -85,38 +85,36 @@ impl CRUDOperations for ParameterOperations {
         }
         let given_up = given_up_codes(db).await.map_err(ApiError::database)?;
         for entity in entities.iter_mut() {
-            entity.unpublished_by = unpublished_by(&entity.code, &given_up);
+            entity.unpublished_by = unpublished_by(entity.id, &given_up);
         }
         Ok(())
     }
 }
 
-/// A formula that publishes no parameter and still names a code: the record of a catalog row a
-/// calculation minted and gave up.
+/// A catalog row a calculation minted and no longer publishes, named by the formula that gave it
+/// up (`calculation_formulas.given_up_parameter_id`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GivenUp {
-    pub code: String,
+    pub parameter_id: Uuid,
     /// The calculation the formula belongs to, or the formula's own name where it is standalone.
     pub calculation: String,
 }
 
-/// The calculation a parameter was minted by and is no longer published by, where the code is one
-/// a formula gave up. A code nothing gave up is an ordinary catalog row and reads as None.
+/// The calculation a parameter was minted by and is no longer published by. A parameter nothing
+/// gave up is an ordinary catalog row and reads as None.
 #[must_use]
-pub fn unpublished_by(code: &str, given_up: &[GivenUp]) -> Option<String> {
+pub fn unpublished_by(parameter_id: Uuid, given_up: &[GivenUp]) -> Option<String> {
     given_up
         .iter()
-        .find(|row| row.code.eq_ignore_ascii_case(code.trim()))
+        .find(|row| row.parameter_id == parameter_id)
         .map(|row| row.calculation.clone())
 }
 
-/// Every formula publishing nothing, named by the calculation it belongs to. The formulas are the
-/// record: a given-up row no longer satisfies a join on `output_parameter_id`, so the code is what
-/// ties it back.
+/// Every parameter a formula gave up, named by the calculation it belongs to.
 async fn given_up_codes<C: ConnectionTrait>(db: &C) -> Result<Vec<GivenUp>, sea_orm::DbErr> {
     use crate::routes::private::tools::models::script;
     let formulas = definition::Entity::find()
-        .filter(definition::Column::OutputParameterId.is_null())
+        .filter(definition::Column::GivenUpParameterId.is_not_null())
         .all(db)
         .await?;
     if formulas.is_empty() {
@@ -136,12 +134,14 @@ async fn given_up_codes<C: ConnectionTrait>(db: &C) -> Result<Vec<GivenUp>, sea_
     };
     Ok(formulas
         .into_iter()
-        .map(|formula| GivenUp {
-            code: formula.code,
-            calculation: formula
-                .tool_script_id
-                .and_then(|id| labels.get(&id).cloned())
-                .unwrap_or(formula.name),
+        .filter_map(|formula| {
+            Some(GivenUp {
+                parameter_id: formula.given_up_parameter_id?,
+                calculation: formula
+                    .tool_script_id
+                    .and_then(|id| labels.get(&id).cloned())
+                    .unwrap_or(formula.name),
+            })
         })
         .collect())
 }

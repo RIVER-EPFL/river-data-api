@@ -248,3 +248,20 @@ mod rename {
         assert!(rename_refusal(0, None).is_none());
     }
 }
+
+/// A continuous definition reads one value per instant, so a reducer in one names a family that
+/// cannot exist.
+mod reducers {
+    use super::super::refuse_reducers;
+
+    #[test]
+    fn test_a_continuous_formula_naming_a_reducer_is_refused_by_the_call() {
+        let refusal = refuse_reducers("mean(temp) * 2").expect_err("a family it cannot have");
+        assert!(format!("{refusal:?}").contains("mean(temp)"), "{refusal:?}");
+    }
+
+    #[test]
+    fn test_a_continuous_formula_reducing_nothing_passes() {
+        assert!(refuse_reducers("temp * 2 + offset").is_ok());
+    }
+}
