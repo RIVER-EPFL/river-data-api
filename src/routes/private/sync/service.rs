@@ -4979,10 +4979,6 @@ pub(super) async fn resolve_or_create_site_param<C: ConnectionTrait>(
             .await?
             .map_or_else(|| parameter_id.to_string(), |p| p.code);
         let param_name_val = free_slot_name(txn, site_id, &base, units, &code).await?;
-        let units_val = {
-            let u = units.trim();
-            (!u.is_empty()).then(|| u.to_string())
-        };
         site_parameters::ActiveModel {
             id: Set(id),
             instrument_sensor_id: Set(None),
@@ -4990,10 +4986,6 @@ pub(super) async fn resolve_or_create_site_param<C: ConnectionTrait>(
             parameter_id: Set(parameter_id),
             name: Set(param_name_val),
             sensor_type: Set(String::new()),
-            display_units: Set(units_val.clone()),
-            units_name: Set(units_val),
-            units_min: Set(None),
-            units_max: Set(None),
             decimal_places: Set(decimal_places),
             sample_interval_sec: Set(None),
             is_active: Set(Some(true)),

@@ -284,7 +284,6 @@ pub(super) fn build_parameter_response(
         units: d.units,
         entry_mode: p.entry_mode.clone(),
         sensor_type: d.sensor_type,
-        display_units: d.display_units,
         decimal_places: d.decimal_places,
         sample_interval_sec: p.sample_interval_sec,
         is_active: p.is_active,

@@ -10,7 +10,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::{
-    Alias, Condition, Expr, Func, JoinType, PostgresQueryBuilder, Query as SeaQuery,
+    Alias, Condition, Expr, JoinType, PostgresQueryBuilder, Query as SeaQuery,
 };
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, Order, PaginatorTrait,
@@ -538,10 +538,7 @@ pub async fn list_site_visits(
         .column((p.clone(), parameters::Column::Code))
         .column((p.clone(), parameters::Column::Name))
         .expr_as(
-            Func::coalesce([
-                Expr::col((sp.clone(), site_parameters::Column::DisplayUnits)),
-                Expr::col((p.clone(), parameters::Column::DefaultUnits)),
-            ]),
+            Expr::col((p.clone(), parameters::Column::DefaultUnits)),
             Alias::new("units"),
         )
         .column((sp.clone(), site_parameters::Column::DecimalPlaces))

@@ -1862,6 +1862,13 @@ pub struct ConsumedInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub revision: Option<i64>,
+    /// How the reading it names was reached (Q230): absent where it was read at the instant the
+    /// run computed, `hold` where it is the last value measured at or before it, which a
+    /// calculation on a stream does for an input the lab measures at a visit. Without it a held
+    /// value reads as a mis-stamped one, and a replay cannot tell which rule bound it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub alignment: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<ConsumedReading>,
     #[schema(value_type = Object)]
@@ -1906,6 +1913,12 @@ pub struct ConsumedMemberRef {
 pub struct ConsumedRef {
     pub variable: String,
     pub kind: String,
+    /// How the reading it names was reached (Q230), as the capture recorded it: absent where it
+    /// was read at the instant computed, `hold` where it is the last value measured at or before
+    /// it. Without it a held member reads as one stamped at the wrong instant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub alignment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub subject: Option<String>,

@@ -69,16 +69,12 @@ async fn seed_site_parameters(db: &DatabaseConnection) {
 
     for p in &configs {
         values.push(format!(
-            "('{id}', '{site_id}', '{param_id}', '{name}', '{sensor_type}', '{units}', '{uname}', {umin}, {umax}, {dp}, 600, true)",
+            "('{id}', '{site_id}', '{param_id}', '{name}', '{sensor_type}', {dp}, 600, true)",
             id = p.site_param_id,
             site_id = p.site_id,
             param_id = p.global_param_id,
             name = p.name,
             sensor_type = p.sensor_type,
-            units = p.display_units,
-            uname = p.units_name,
-            umin = p.units_min,
-            umax = p.units_max,
             dp = p.decimal_places,
         ));
     }
@@ -86,7 +82,7 @@ async fn seed_site_parameters(db: &DatabaseConnection) {
     exec(
         db,
         &format!(
-            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, display_units, units_name, units_min, units_max, decimal_places, sample_interval_sec, is_active) VALUES {}",
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, decimal_places, sample_interval_sec, is_active) VALUES {}",
             values.join(", ")
         ),
     )
@@ -179,7 +175,7 @@ fn generate_value(cfg: &ParamConfig, step: usize) -> f64 {
         _ => {}
     }
 
-    value.clamp(cfg.units_min, cfg.units_max)
+    value.clamp(cfg.value_min, cfg.value_max)
 }
 
 /// Every channel carries the instrument its readings name, the way registration mints one for a

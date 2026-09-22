@@ -227,7 +227,6 @@ async fn csv_import_recomputes_derived_via_worker() {
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID, "parameter_id": output_parameter_id, "name": derived_name,
             "sensor_type": "derived", "entry_mode": "tool",
-            "display_units": "mg/L",
         }),
         &token,
     )

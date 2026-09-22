@@ -218,12 +218,14 @@ async fn the_definition_document_is_the_group_in_its_own_order() {
 
     // One formula writing DO and reading Temperature moves both.
     let formula_id = uuid::Uuid::new_v4();
+    let calculation = crate::common::seed_formula_calculation(&db, "do_from_temp_set").await;
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO calculation_formulas (id, code, name, formula, output_parameter_id, ordinal) \
+            "INSERT INTO calculation_formulas \
+                 (id, code, name, formula, output_parameter_id, ordinal, tool_script_id) \
              VALUES ('{formula_id}', 'do_from_temp', 'DO from temperature', 'Temperature * 2', \
-                     '{}', 0)",
+                     '{}', 0, '{calculation}')",
             crate::common::GLOBAL_PARAM_DO_ID
         ),
     )

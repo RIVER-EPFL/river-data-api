@@ -140,6 +140,11 @@ pub mod source {
         #[crudcrate(filterable)]
         pub site_property: Option<String>,
         pub variable_name: String,
+        /// How the binder reaches a reading for this variable (Q230): `exact` at the instant being
+        /// computed, `hold` for the last value measured at or before it, which is what a
+        /// visit-measured input read by a calculation on a stream needs. DB CHECK over the two.
+        #[crudcrate(filterable, on_create = "exact".to_string())]
+        pub alignment: String,
         #[crudcrate(exclude(create, update))]
         pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     }

@@ -249,11 +249,12 @@ async fn test_cross_site() {
 async fn test_derived_sources_reassigned() {
     let (db, _, _) = setup().await;
 
+    let calculation = crate::common::seed_formula_calculation(&db, "test_derived_set").await;
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO calculation_formulas (id, code, name, units, formula)
-             VALUES (gen_random_uuid(), 'test_derived', 'Test', 'mg/L', 'dissolved_oxygen * 0.032')
+            "INSERT INTO calculation_formulas (id, code, name, units, formula, tool_script_id)
+             VALUES (gen_random_uuid(), 'test_derived', 'Test', 'mg/L', 'dissolved_oxygen * 0.032', '{calculation}')
              ON CONFLICT DO NOTHING"
         ),
     )
@@ -519,11 +520,13 @@ async fn test_needs_review_clears_through_update() {
 async fn a_merge_that_would_make_a_calculation_read_its_own_output_is_refused() {
     let (db, _app, _token) = setup().await;
     let definition = uuid::Uuid::new_v4();
+    let calculation = crate::common::seed_formula_calculation(&db, "loop_check_set").await;
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO calculation_formulas (id, code, name, formula, output_parameter_id) \
-             VALUES ('{definition}', 'loop_check', 'Loop check', 'a * 2', '{}')",
+            "INSERT INTO calculation_formulas \
+                 (id, code, name, formula, output_parameter_id, tool_script_id) \
+             VALUES ('{definition}', 'loop_check', 'Loop check', 'a * 2', '{}', '{calculation}')",
             crate::common::GLOBAL_PARAM_TEMP_ID
         ),
     )
@@ -578,11 +581,13 @@ async fn a_merge_that_would_make_a_calculation_read_its_own_output_is_refused() 
 async fn a_merge_that_closes_no_loop_still_merges() {
     let (db, _app, _token) = setup().await;
     let definition = uuid::Uuid::new_v4();
+    let calculation = crate::common::seed_formula_calculation(&db, "no_loop_set").await;
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO calculation_formulas (id, code, name, formula, output_parameter_id) \
-             VALUES ('{definition}', 'no_loop', 'No loop', 'a * 2', '{}')",
+            "INSERT INTO calculation_formulas \
+                 (id, code, name, formula, output_parameter_id, tool_script_id) \
+             VALUES ('{definition}', 'no_loop', 'No loop', 'a * 2', '{}', '{calculation}')",
             crate::common::GLOBAL_PARAM_TEMP_ID
         ),
     )
@@ -620,11 +625,13 @@ async fn a_merge_that_closes_no_loop_still_merges() {
 async fn a_formula_producing_the_merged_away_parameter_produces_the_survivor() {
     let (db, _app, _token) = setup().await;
     let definition = uuid::Uuid::new_v4();
+    let calculation = crate::common::seed_formula_calculation(&db, "produces_source_set").await;
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO calculation_formulas (id, code, name, formula, output_parameter_id) \
-             VALUES ('{definition}', 'produces_source', 'Produces source', 'a * 2', '{}')",
+            "INSERT INTO calculation_formulas \
+                 (id, code, name, formula, output_parameter_id, tool_script_id) \
+             VALUES ('{definition}', 'produces_source', 'Produces source', 'a * 2', '{}', '{calculation}')",
             crate::common::GLOBAL_PARAM_DO_ID
         ),
     )

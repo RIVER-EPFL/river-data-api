@@ -62,9 +62,9 @@ async fn scene() -> Option<Scene> {
         ),
         format!(
             "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, \
-                 display_units, sample_interval_sec, is_active) \
+                 sample_interval_sec, is_active) \
              VALUES ('{SITE_B_PARAM_ID}', '{SITE_B_ID}', '{GLOBAL_PARAM_TEMP_ID}', \
-                 'Water Temperature', 'DO_Temperature', 'degC', 600, true)"
+                 'Water Temperature', 'DO_Temperature', 600, true)"
         ),
         format!(
             // Explicitly instrument-less: the harness defaults `data_streams.sensor_id` to the

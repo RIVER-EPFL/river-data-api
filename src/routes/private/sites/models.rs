@@ -151,14 +151,12 @@ pub struct ParameterResponse {
     pub code: String,
     /// Human-readable parameter name (catalog `name`, e.g. "Dissolved Oxygen")
     pub name: String,
-    /// Resolved units: site override (`display_units`) falling back to the catalog `default_units`
+    /// Units, from the catalog `default_units`
     #[schema(required)]
     pub units: Option<String>,
     /// How this site fills the slot: 'manual' or 'tool'
     pub entry_mode: String,
     pub sensor_type: String,
-    #[schema(required)]
-    pub display_units: Option<String>,
     /// Display precision the client formats with; the API serves full precision.
     #[schema(required)]
     pub decimal_places: Option<i16>,

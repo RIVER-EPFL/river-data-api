@@ -18,6 +18,7 @@ use crate::routes::private::change_audit::service::{entity_revision, entity_revi
 use crate::routes::private::constants::models as constants;
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::derived_parameters::models::definition as calculation_formulas;
+use crate::routes::private::derived_parameters::service as derived;
 use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::decision_model as reading_decisions;
 use crate::routes::private::readings::models as readings;
@@ -673,6 +674,9 @@ struct DerivedWorkRow {
 /// the sample holds any, else its calibrated value, else its raw value.
 #[derive(Debug, Clone, FromQueryResult)]
 pub struct InputCandidate {
+    /// The instant the reading stands at, which is the instant being computed for a source read
+    /// exactly and an earlier visit's for one that is held (Q230).
+    pub time: DateTime<Utc>,
     pub measurement_type: Option<String>,
     pub replicate_index: i16,
     pub stream_id: Uuid,
@@ -683,10 +687,10 @@ pub struct InputCandidate {
 }
 
 impl InputCandidate {
-    fn consumed(&self, time: DateTime<Utc>) -> ConsumedReading {
+    fn consumed(&self) -> ConsumedReading {
         ConsumedReading {
             stream_id: self.stream_id,
-            time,
+            time: self.time,
             replicate_index: self.replicate_index,
             revision: self.revision,
             value: Some(self.value),
@@ -1007,20 +1011,45 @@ fn build(query: impl sea_orm::sea_query::QueryStatementBuilder) -> Statement {
     Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values)
 }
 
+/// The last instant a parameter was measured at a site, at or before `time`: what a held source
+/// binds to (Q230). A withdrawn or flagged row is not a measurement, here as in the binder.
+fn last_measured_query(
+    site_id: Uuid,
+    parameter_id: Uuid,
+    time: chrono::DateTime<chrono::Utc>,
+) -> sea_orm::sea_query::SelectStatement {
+    let h = Alias::new("h");
+    SeaQuery::select()
+        .expr(Func::max(Expr::col((h.clone(), readings::Column::Time))))
+        .from_as(readings::Entity, h.clone())
+        .and_where(Expr::col((h.clone(), readings::Column::SiteId)).eq(site_id))
+        .and_where(Expr::col((h.clone(), readings::Column::ParameterId)).eq(parameter_id))
+        .and_where(Expr::col((h.clone(), readings::Column::Time)).lte(time))
+        .and_where(Expr::col((h, readings::Column::WithdrawnAt)).is_null())
+        .and_where(Expr::cust("h.is_flagged IS NOT TRUE"))
+        .take()
+}
+
 /// The value one derived input resolves to at `time`, and the cadence it came from.
 ///
 /// Deterministic input pick when a sensor point and a grab share the timestamp: prefer the
 /// continuous reading, then tie-break by stream_id (stable across VACUUM). A withdrawn or flagged
 /// row is not a measurement, and a sample whose members are all gone carries n = 0 with a NULL
 /// mean, so neither may reach the formula.
+///
+/// `held` is Q230's second rule: the rows of the last instant at or before `time` rather than the
+/// rows at it, for an input the lab measures at a visit and a calculation on a stream reads. The
+/// whole instant is taken either way, because a replicate group's mean stands on its members.
 fn input_value_query(
     site_id: Uuid,
     parameter_id: Uuid,
     time: chrono::DateTime<chrono::Utc>,
+    held: bool,
 ) -> sea_orm::sea_query::SelectStatement {
     let r = Alias::new("r");
     let smp = Alias::new("smp");
     SeaQuery::select()
+        .column((r.clone(), readings::Column::Time))
         .column((r.clone(), readings::Column::MeasurementType))
         .column((r.clone(), readings::Column::ReplicateIndex))
         .column((r.clone(), readings::Column::StreamId))
@@ -1044,7 +1073,15 @@ fn input_value_query(
         )
         .and_where(Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
         .and_where(Expr::col((r.clone(), readings::Column::ParameterId)).eq(parameter_id))
-        .and_where(Expr::col((r.clone(), readings::Column::Time)).eq(time))
+        .and_where(if held {
+            // The last instant this parameter was measured at, at or before the one being
+            // computed. A parameter with nothing before it selects NULL and binds nothing, which
+            // is what an input the instant holds no value for already does.
+            Expr::col((r.clone(), readings::Column::Time))
+                .in_subquery(last_measured_query(site_id, parameter_id, time))
+        } else {
+            Expr::col((r.clone(), readings::Column::Time)).eq(time)
+        })
         .and_where(Expr::col((r, readings::Column::WithdrawnAt)).is_null())
         .and_where(Expr::cust("r.is_flagged IS NOT TRUE"))
         .take()
@@ -1111,10 +1148,12 @@ async fn resolve_set_inputs(
             let Some(&parameter_id) = catalog.get(&code.to_lowercase()) else {
                 continue;
             };
+            let held = formula.held.iter().any(|v| v == variable);
             let candidates = InputCandidate::find_by_statement(build(input_value_query(
                 item.derived_site_id,
                 parameter_id,
                 time,
+                held,
             )))
             .all(db)
             .await?;
@@ -1126,13 +1165,17 @@ async fn resolve_set_inputs(
                 candidates
                     .iter()
                     .filter(|c| c.from_mean)
-                    .map(|c| c.consumed(time))
+                    .map(InputCandidate::consumed)
                     .collect()
             } else {
-                vec![input.consumed(time)]
+                vec![input.consumed()]
             };
             consumed.push(ConsumedInput {
                 variable: variable.clone(),
+                // The rule that reached this reading, so the record says why a member stands at
+                // an instant the run did not compute at, and a reader can tell a held value from
+                // a mis-stamped one (Q230).
+                alignment: held.then(|| derived::HOLD.to_string()),
                 kind: if input.from_mean { "mean" } else { "reading" }.to_string(),
                 subject: None,
                 property: None,
@@ -1160,6 +1203,7 @@ async fn resolve_set_inputs(
             }
             consumed.push(ConsumedInput {
                 variable: variable.clone(),
+                alignment: None,
                 kind: "site".to_string(),
                 subject: Some(subject.clone()),
                 property: Some(property.clone()),
@@ -1213,6 +1257,7 @@ async fn output_capture<C: ConnectionTrait>(
             let subject = format!("calculation_formula:{step_id}");
             consumed.push(ConsumedInput {
                 variable: variable.clone(),
+                alignment: None,
                 kind: "computed".to_string(),
                 revision: entity_revision(db, &subject)
                     .await
@@ -1226,6 +1271,7 @@ async fn output_capture<C: ConnectionTrait>(
         }
         consumed.push(ConsumedInput {
             variable: variable.clone(),
+            alignment: None,
             kind: "constant".to_string(),
             subject: None,
             property: None,
@@ -1243,6 +1289,7 @@ async fn output_capture<C: ConnectionTrait>(
     };
     consumed.push(ConsumedInput {
         variable: formula.code.clone(),
+        alignment: None,
         kind: "step".to_string(),
         revision,
         subject,
@@ -1329,6 +1376,7 @@ async fn constants_consumed<C: ConnectionTrait>(
             let subject = format!("constant:{}", c.id);
             ConsumedInput {
                 variable: c.name.clone(),
+                alignment: None,
                 kind: "constant".to_string(),
                 revision: revisions.get(&subject).copied(),
                 subject: Some(subject),

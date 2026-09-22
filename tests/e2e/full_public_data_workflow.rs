@@ -227,7 +227,6 @@ async fn test_full_public_data_workflow() {
         &serde_json::json!({
             "site_id": site_id, "parameter_id": derived_param_id, "name": "DOmgL",
             "sensor_type": "derived", "entry_mode": "tool",
-            "display_units": "mg/L",
         }),
         &token,
     )
@@ -292,6 +291,35 @@ async fn test_full_public_data_workflow() {
             .any(|s| s["code"] == "e2e_station"),
         "sites: {sites}"
     );
+
+    // Units are the catalog's, so the public listing and the site's own report the same string
+    // for every slot.
+    let (status, public_params) = crate::common::get_json(
+        &app,
+        "/api/public/e2e_river/sites/e2e_station/parameters",
+    )
+    .await;
+    assert_eq!(status, 200, "public parameters: {public_params}");
+    let (status, site_params) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sites/{site_id}/parameters"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "site parameters: {site_params}");
+    for public in public_params.as_array().unwrap() {
+        let code = public["code"].as_str().unwrap();
+        let private = site_params
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["code"] == code)
+            .unwrap_or_else(|| panic!("the site lists {code}: {site_params}"));
+        assert_eq!(
+            public["units"], private["units"],
+            "{code} units agree across the two lists: {public_params} / {site_params}"
+        );
+    }
 
     // 11. Public readings reproduce the real raw data exactly AND the recomputed derived value.
     // Public parameters are keyed by their short `code`: "dissolved_oxygen", "temperature", "DOmgL".

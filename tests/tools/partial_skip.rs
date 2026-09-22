@@ -76,9 +76,9 @@ async fn declare_slot(db: &DatabaseConnection, code: &str) -> String {
         db,
         &format!(
             "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, \
-                 entry_mode, cadence, display_units) \
+                 entry_mode, cadence) \
              VALUES (gen_random_uuid(), '{SITE1_ID}', '{parameter_id}', '{code}', 'derived', \
-                 'tool', 'low', 'ratio')"
+                 'tool', 'low')"
         ),
     )
     .await;

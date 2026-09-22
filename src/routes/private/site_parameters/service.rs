@@ -342,10 +342,6 @@ pub async fn mint_tool_slot<C: ConnectionTrait>(
         parameter_id: Set(parameter_id),
         name: Set(parameter.name),
         sensor_type: Set(String::new()),
-        display_units: Set(Some(parameter.default_units)),
-        units_name: Set(None),
-        units_min: Set(None),
-        units_max: Set(None),
         decimal_places: Set(None),
         sample_interval_sec: Set(None),
         is_active: Set(Some(true)),
@@ -395,11 +391,9 @@ impl SlotDescriptor {
     /// catalog, which leaves the code empty and the units unresolved).
     pub fn resolve(slot: &SiteParameterModel, catalog: Option<&CatalogParameter>) -> Self {
         let catalog_name = catalog.map(|c| c.name.clone());
-        let units = slot.display_units.clone().or_else(|| {
-            catalog
-                .map(|c| c.default_units.clone())
-                .filter(|u| !u.is_empty())
-        });
+        let units = catalog
+            .map(|c| c.default_units.clone())
+            .filter(|u| !u.is_empty());
         Self {
             id: slot.id,
             parameter_id: slot.parameter_id,
@@ -413,7 +407,6 @@ impl SlotDescriptor {
                 slot.sensor_type.clone()
             },
             units,
-            display_units: slot.display_units.clone(),
             decimal_places: slot.decimal_places,
         }
     }
@@ -510,6 +503,26 @@ pub fn applied_cadence(input_cadences: &[Option<String>]) -> &'static str {
             .iter()
             .all(|cadence| cadence.as_deref() == Some("high"));
     if all_high { "high" } else { "low" }
+}
+
+/// The inputs whose declaration decides the arm a calculation's outputs run on (Q230): the ones
+/// read at the instant computed. A source held from the last visit says nothing about the arm,
+/// because it stands between visits whatever the stream does; counting it would put a set that
+/// mixes a stream reading and a lab value wholly on the visit arm, which is the case the hold
+/// exists for.
+#[must_use]
+pub fn cadence_deciding<'a>(
+    inputs_present: &'a [(Uuid, String)],
+    held_codes: &[String],
+) -> Vec<&'a (Uuid, String)> {
+    inputs_present
+        .iter()
+        .filter(|(_, code)| {
+            !held_codes
+                .iter()
+                .any(|held| held.eq_ignore_ascii_case(code))
+        })
+        .collect()
 }
 
 /// The `samples` rows a retag names: those whose slot is named by id, or reached through the

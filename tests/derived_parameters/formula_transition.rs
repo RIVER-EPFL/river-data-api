@@ -195,7 +195,6 @@ async fn a_recompute_records_the_move_and_a_pass_that_moves_nothing_records_noth
             "sensor_type": "derived",
             "entry_mode": "tool",
             "cadence": "high",
-            "display_units": "mg/L",
         }),
         &token,
     )
@@ -360,7 +359,6 @@ async fn a_derived_value_replays_its_own_formula_over_what_it_consumed() {
             "sensor_type": "derived",
             "entry_mode": "tool",
             "cadence": "high",
-            "display_units": "mg/L",
         }),
         &token,
     )

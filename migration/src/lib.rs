@@ -27,6 +27,8 @@ mod m20260922_000002_skipped_standard_curves;
 mod m20260922_000003_drop_slot_channel;
 mod m20260922_000004_site_parameter_cadence;
 mod m20260922_000005_decision_version_index;
+mod m20260922_000006_drop_slot_units;
+mod m20260922_000007_source_alignment;
 
 pub struct Migrator;
 
@@ -74,6 +76,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260922_000003_drop_slot_channel::Migration),
             Box::new(m20260922_000004_site_parameter_cadence::Migration),
             Box::new(m20260922_000005_decision_version_index::Migration),
+            Box::new(m20260922_000006_drop_slot_units::Migration),
+            Box::new(m20260922_000007_source_alignment::Migration),
         ]
     }
 }

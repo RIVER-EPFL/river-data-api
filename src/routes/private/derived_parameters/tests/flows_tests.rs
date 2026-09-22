@@ -41,3 +41,11 @@ fn test_gap_scan_is_the_anti_join_over_active_tool_slots() {
         assert!(str::contains(&sql, expected), "{expected} missing: {sql}");
     }
 }
+
+/// Expected behaviour: the gap scan looks for instants the same way (Q230), so the sweep that
+/// fills what a write missed does not mint a pulse at every visit a held source was measured at.
+#[test]
+fn test_the_gap_scan_counts_only_sources_read_at_the_instant() {
+    let sql = sql(None);
+    assert!(sql.contains(r#""dps"."alignment" = 'exact'"#), "{sql}");
+}

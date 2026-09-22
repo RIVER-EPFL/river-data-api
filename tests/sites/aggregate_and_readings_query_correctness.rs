@@ -42,8 +42,8 @@ async fn flagged_readings_excluded_from_aggregates() {
     crate::common::db::exec(
         &db,
         &format!(
-            "INSERT INTO site_parameters (id, site_id, parameter_id, name, display_units, sample_interval_sec, is_active) \
-             VALUES ('{spid}', '{sid}', '{gid}', 'Temperature', '°C', 600, true)",
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sample_interval_sec, is_active) \
+             VALUES ('{spid}', '{sid}', '{gid}', 'Temperature', 600, true)",
             spid = crate::common::PARAM_S1_TEMP_ID,
             sid = crate::common::SITE1_ID,
             gid = crate::common::GLOBAL_PARAM_TEMP_ID
@@ -245,8 +245,8 @@ async fn measurement_type_continuous_includes_legacy_null_rows() {
     crate::common::db::exec(
         &db,
         &format!(
-            "INSERT INTO site_parameters (id, site_id, parameter_id, name, display_units, sample_interval_sec, is_active) \
-             VALUES ('{spid}', '{sid}', '{gid}', 'Temperature', '°C', 600, true)",
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sample_interval_sec, is_active) \
+             VALUES ('{spid}', '{sid}', '{gid}', 'Temperature', 600, true)",
             spid = crate::common::PARAM_S1_TEMP_ID,
             sid = crate::common::SITE1_ID,
             gid = crate::common::GLOBAL_PARAM_TEMP_ID

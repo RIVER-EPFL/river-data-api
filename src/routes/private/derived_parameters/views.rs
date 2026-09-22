@@ -27,10 +27,12 @@ use crate::common::scope::require_sites_in_scope;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::routes::private::derived_parameters::models::StepDependents;
+use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings;
 use crate::routes::private::readings::samples::models as samples;
 use crate::routes::private::reprocessing_jobs::models::QueuedJobResponse;
 use crate::routes::private::sensor_calibrations::service::site_property_values;
+use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::tools::models::{DraftFormula, MissingConstant};
 use crate::routes::private::tools::service::{
     constants_of, evaluate_cells, in_order, numbers_by_name, pin_draft_formulas, resolve_constants,
@@ -46,6 +48,7 @@ struct SeriesPoint {
 /// a query and not to its reader is a compile error rather than a field silently left behind.
 #[derive(FromQueryResult)]
 struct SlotRow {
+    code: String,
     parameter_id: Uuid,
     units: String,
 }
@@ -270,31 +273,54 @@ pub async fn preview_derived(
         return Ok(Json(empty(&ordered)));
     }
 
-    // Resolve the codes the set reads to slots at this site.
-    let mut param_info: Vec<(String, Uuid, String)> = Vec::new();
-    for code in &read_codes {
-        let row = db
-            .query_one_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r"SELECT sp.parameter_id, COALESCE(sp.display_units, '') as units
-                  FROM site_parameters sp
-                  JOIN parameters pt ON pt.id = sp.parameter_id
-                  WHERE sp.site_id = $1 AND pt.code = $2
-                  LIMIT 1",
-                [payload.site_id.into(), code.clone().into()],
-            ))
-            .await
+    // Resolve the codes the set reads to slots at this site. Units are the catalog's.
+    let sp = Alias::new("sp");
+    let pt = Alias::new("pt");
+    let (sql, values) = SeaQuery::select()
+        .column((pt.clone(), parameters::Column::Code))
+        .column((sp.clone(), site_parameters::Column::ParameterId))
+        .expr_as(
+            Expr::col((pt.clone(), parameters::Column::DefaultUnits)),
+            Alias::new("units"),
+        )
+        .from_as(site_parameters::Entity, sp.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            parameters::Entity,
+            pt.clone(),
+            Expr::col((pt.clone(), parameters::Column::Id))
+                .equals((sp.clone(), site_parameters::Column::ParameterId)),
+        )
+        .and_where(Expr::col((sp.clone(), site_parameters::Column::SiteId)).eq(payload.site_id))
+        .and_where(Expr::col((pt.clone(), parameters::Column::Code)).is_in(read_codes.clone()))
+        .take()
+        .build(PostgresQueryBuilder);
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
+    let mut slots: HashMap<String, (Uuid, String)> = HashMap::new();
+    for row in rows {
+        let SlotRow {
+            code,
+            parameter_id,
+            units,
+        } = SlotRow::from_query_result(&row, "")
             .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-
-        if let Some(row) = row {
-            let SlotRow {
-                parameter_id,
-                units,
-            } = SlotRow::from_query_result(&row, "")
-                .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
-            param_info.push((code.clone(), parameter_id, units));
-        }
+        slots.entry(code).or_insert((parameter_id, units));
     }
+    let param_info: Vec<(String, Uuid, String)> = read_codes
+        .iter()
+        .filter_map(|code| {
+            slots
+                .get(code)
+                .map(|(id, units)| (code.clone(), *id, units.clone()))
+        })
+        .collect();
 
     // A site column the set reads is one value for the whole window; a constant is one value
     // everywhere. Both are bound the way the continuous path binds them.

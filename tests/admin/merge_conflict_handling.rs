@@ -42,9 +42,9 @@ async fn merge_preserves_conflicting_readings() {
     crate::common::db::exec(
         &db,
         &format!(
-            "INSERT INTO site_parameters (id, site_id, parameter_id, name, display_units, sample_interval_sec, is_active) VALUES \
-             ('{sp1}', '{sid}', '{p1}', 'Temp_A', '°C', 600, true), \
-             ('{sp2}', '{sid}', '{p2}', 'Temp_B', '°C', 600, true)",
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sample_interval_sec, is_active) VALUES \
+             ('{sp1}', '{sid}', '{p1}', 'Temp_A', 600, true), \
+             ('{sp2}', '{sid}', '{p2}', 'Temp_B', 600, true)",
             sp1 = crate::common::PARAM_S1_TEMP_ID,
             sp2 = crate::common::PARAM_S1_DO_ID,
             sid = crate::common::SITE1_ID,

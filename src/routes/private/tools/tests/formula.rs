@@ -19,6 +19,7 @@ fn formula(
             .iter()
             .map(|(v, p)| ((*v).to_string(), (*p).to_string()))
             .collect(),
+        held: Vec::new(),
         site_sources: Vec::new(),
         curve_slot: None,
         per_replicate: None,
@@ -1570,4 +1571,60 @@ fn test_a_step_read_only_through_a_guard_is_na_rather_than_a_skip() {
 
     let results = run(&[step, reader], &inputs(&[]));
     assert_eq!(value_of(&results, "co2"), Some(7.0));
+}
+
+// Scenario: a calculation on a high-frequency stream reads one input from the stream and one the
+// lab measures at a visit, declared held (Q230).
+//
+// Expected behaviour: the pinned manifest says which event input is held, and says nothing about
+// the one read at the instant, so a manifest written before the rule existed still reads as
+// exact.
+#[test]
+fn test_a_held_source_says_so_on_the_event_input_it_fills() {
+    let mut pco2 = formula(
+        "pco2_corr",
+        1,
+        "co2 * alkalinity",
+        Some("pco2_corr"),
+        &[("co2", "Vaisala_CO2_avg"), ("alkalinity", "Alkalinity")],
+    );
+    pco2.held = vec!["alkalinity".to_string()];
+    let manifest = manifest_json("pCO2", None, &[pco2], &[]).expect("the set has an order");
+
+    let inputs = manifest["event_inputs"].as_array().unwrap();
+    let held = inputs.iter().find(|i| i["param"] == "alkalinity").unwrap();
+    assert_eq!(held["alignment"], "hold");
+    let exact = inputs.iter().find(|i| i["param"] == "co2").unwrap();
+    assert!(
+        exact.get("alignment").is_none(),
+        "an input read at the instant says nothing, as every manifest before the rule did: {exact:?}"
+    );
+}
+
+// Expected behaviour: a manifest with no alignment on an event input parses, and reads as exact.
+#[test]
+fn test_an_event_input_with_no_alignment_reads_as_exact() {
+    let parsed: crate::routes::private::tools::models::ManifestEventInput =
+        serde_json::from_value(serde_json::json!({ "param": "co2", "parameter_code": "CO2" }))
+            .expect("a manifest written before the rule still reads");
+    assert_eq!(parsed.alignment, "exact");
+}
+
+/// Expected behaviour: the manifest names the codes a run holds between visits, and only those, so
+/// a reader of a pinned version knows which inputs stand between visits without the source rows.
+#[test]
+fn test_the_manifest_names_the_codes_it_holds() {
+    let mut pco2 = formula(
+        "pco2_corr",
+        1,
+        "co2 * alkalinity",
+        Some("pco2_corr"),
+        &[("co2", "Vaisala_CO2_avg"), ("alkalinity", "Alkalinity")],
+    );
+    pco2.held = vec!["alkalinity".to_string()];
+    let manifest: crate::routes::private::tools::models::Manifest = serde_json::from_value(
+        manifest_json("pCO2", None, &[pco2], &[]).expect("the set has an order"),
+    )
+    .expect("the manifest reads back");
+    assert_eq!(manifest.held_codes(), vec!["alkalinity".to_string()]);
 }

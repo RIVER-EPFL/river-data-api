@@ -12,10 +12,6 @@ fn slot() -> SiteParameterModel {
         instrument_sensor_id: None,
         name: "Slot name".to_string(),
         sensor_type: "sonde".to_string(),
-        display_units: None,
-        units_name: None,
-        units_min: None,
-        units_max: None,
         decimal_places: None,
         sample_interval_sec: None,
         is_active: Some(true),
@@ -40,19 +36,9 @@ fn catalog(default_units: &str) -> CatalogParameter {
 }
 
 #[test]
-fn site_override_wins_over_the_catalog_default() {
-    let mut s = slot();
-    s.display_units = Some("K".to_string());
-    let d = SlotDescriptor::resolve(&s, Some(&catalog("uM")));
-    assert_eq!(d.units.as_deref(), Some("K"));
-    assert_eq!(d.display_units.as_deref(), Some("K"));
-}
-
-#[test]
-fn a_slot_without_an_override_reports_the_catalog_default() {
+fn units_are_the_catalog_default() {
     let d = SlotDescriptor::resolve(&slot(), Some(&catalog("uM")));
     assert_eq!(d.units.as_deref(), Some("uM"));
-    assert_eq!(d.display_units, None);
 }
 
 #[test]
@@ -96,14 +82,13 @@ fn decimal_places_travels_with_the_slot() {
 
 #[test]
 fn resolve_all_keeps_input_order_and_tolerates_a_missing_catalog_entry() {
-    let mut known = slot();
-    known.display_units = Some("mm".to_string());
+    let known = slot();
     let mut unknown = slot();
     unknown.id = Uuid::from_u128(9);
     unknown.parameter_id = Uuid::from_u128(99);
 
     let mut map = HashMap::new();
-    map.insert(known.parameter_id, catalog("uM"));
+    map.insert(known.parameter_id, catalog("mm"));
 
     let resolved = SlotDescriptor::resolve_all(&[known.clone(), unknown.clone()], &map);
     assert_eq!(resolved.len(), 2);
@@ -238,4 +223,27 @@ fn test_applied_cadence_follows_the_inputs() {
     assert_eq!(super::applied_cadence(&[high(), low()]), "low");
     assert_eq!(super::applied_cadence(&[high(), None]), "low");
     assert_eq!(super::applied_cadence(&[]), "low");
+}
+
+/// Scenario: a calculation reads the oxygen stream at the instant and a lab alkalinity held from
+/// the last visit (Q230). The site declares the first high and the second low.
+///
+/// Expected behaviour: the arm the outputs run on is decided over the inputs read at the instant
+/// alone, so the set publishes on the stream. Counting the held one would put it wholly on the
+/// visit arm, which is the case the hold exists for.
+#[test]
+fn test_a_held_input_does_not_decide_the_arm() {
+    let oxygen = (Uuid::from_u128(1), "Dissolved_O2".to_string());
+    let alkalinity = (Uuid::from_u128(2), "Alkalinity".to_string());
+    let inputs = [oxygen.clone(), alkalinity.clone()];
+
+    let deciding = super::cadence_deciding(&inputs, &["alkalinity".to_string()]);
+    assert_eq!(deciding, vec![&oxygen], "the code matches whatever its case");
+
+    assert_eq!(super::cadence_deciding(&inputs, &[]).len(), 2);
+    assert!(
+        super::cadence_deciding(&inputs, &["dissolved_o2".to_string(), "alkalinity".to_string()])
+            .is_empty(),
+        "a set holding everything it reads decides nothing, and takes the visit arm"
+    );
 }

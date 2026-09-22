@@ -652,7 +652,6 @@ pub async fn provision<C: ConnectionTrait + sea_orm::TransactionTrait>(
                 site_id: Set(site.site_id),
                 parameter_id: Set(parameter_id),
                 name: Set(format!("{} {}", site.site_name, parameter.name)),
-                display_units: Set(Some(parameter.default_units)),
                 decimal_places: Set(declared.map(|v| v.decimals)),
                 sample_interval_sec: Set(Some(600)),
                 // An operator picked the station, so there is nothing here for a manager to

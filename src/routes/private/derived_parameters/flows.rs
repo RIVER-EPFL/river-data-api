@@ -12,6 +12,7 @@ use sea_orm::{
 use uuid::Uuid;
 
 use crate::common::sync_state;
+use crate::routes::private::derived_parameters::service as derived;
 use crate::routes::private::derived_parameters::service::DerivedPass;
 use crate::routes::private::readings;
 use crate::routes::private::reprocessing_jobs::flows::{
@@ -57,6 +58,13 @@ pub async fn site_has_active_derived(
 
 /// The gap scan, as the statement it emits.
 ///
+/// A source read at the instant being computed rather than held from an earlier one (Q230). Only
+/// these make an instant one a calculation computes at: a held source stands between visits, so
+/// counting its own instants would put a pulse at every visit the lab recorded.
+fn exact_source(dps: &Alias) -> Expr {
+    Expr::col((dps.clone(), source::Column::Alignment)).eq(derived::EXACT)
+}
+
 /// `since` bounds the readings side by time. Unbounded, the anti-join hashes the whole hypertable:
 /// on the production shape that is a parallel hash whose 16MB doubling step does not fit the DB
 /// pod's 64MB `/dev/shm` when another parallel query holds shared memory, so the run aborts and no
@@ -134,9 +142,10 @@ fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> SelectStatement {
             Expr::col((dps.clone(), source::Column::DerivedDefinitionId))
                 .equals((f, definition::Column::Id))
                 .and(
-                    Expr::col((dps, source::Column::ParameterId))
+                    Expr::col((dps.clone(), source::Column::ParameterId))
                         .equals((r.clone(), readings::Column::ParameterId)),
-                ),
+                )
+                .and(exact_source(&dps)),
         )
         .and_where(Expr::exists(derived_written).not())
         .order_by((r.clone(), readings::Column::SiteId), Order::Asc)
@@ -417,7 +426,8 @@ fn derived_instants(
                         .add(
                             sea_query::Expr::col((dps.clone(), source::Column::ParameterId))
                                 .equals((r.clone(), readings::Column::ParameterId)),
-                        ),
+                        )
+                        .add(exact_source(&dps)),
                 );
         }
         // Every formula that reads the parameter this reading carries.
@@ -427,8 +437,12 @@ fn derived_instants(
                     sea_query::JoinType::Join,
                     source::Entity,
                     dps.clone(),
-                    sea_query::Expr::col((dps.clone(), source::Column::ParameterId))
-                        .equals((r.clone(), readings::Column::ParameterId)),
+                    sea_query::Condition::all()
+                        .add(
+                            sea_query::Expr::col((dps.clone(), source::Column::ParameterId))
+                                .equals((r.clone(), readings::Column::ParameterId)),
+                        )
+                        .add(exact_source(&dps)),
                 )
                 .join_as(
                     sea_query::JoinType::Join,
@@ -501,8 +515,12 @@ fn instants_a_calculation_reads(calculation_id: Uuid, site_id: Uuid) -> sea_quer
             sea_query::JoinType::Join,
             source::Entity,
             dps.clone(),
-            sea_query::Expr::col((dps.clone(), source::Column::ParameterId))
-                .equals((r.clone(), readings::Column::ParameterId)),
+            sea_query::Condition::all()
+                .add(
+                    sea_query::Expr::col((dps.clone(), source::Column::ParameterId))
+                        .equals((r.clone(), readings::Column::ParameterId)),
+                )
+                .add(exact_source(&dps)),
         )
         .join_as(
             sea_query::JoinType::Join,

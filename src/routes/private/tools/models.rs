@@ -919,6 +919,18 @@ pub struct ManifestSiteInput {
 }
 
 impl Manifest {
+    /// The catalog parameter codes this calculation holds between visits rather than reading at
+    /// the instant it computes (Q230), lowercased. A replicate family is never one: it is read at
+    /// the visit that recorded it.
+    #[must_use]
+    pub fn held_codes(&self) -> Vec<String> {
+        self.event_inputs
+            .iter()
+            .filter(|e| e.alignment == "hold")
+            .map(|e| e.parameter_code.to_lowercase())
+            .collect()
+    }
+
     /// Every catalog parameter code this calculation reads at a visit, lowercased: the event
     /// inputs, plus the parameter each `replicates` param names. A replicate family is a read
     /// edge like any other, even though it is never an event input (resolving one would put the
@@ -963,6 +975,19 @@ pub struct ManifestEventInput {
     pub param: String,
     /// Catalog parameter code (`parameters.code`) read at the event.
     pub parameter_code: String,
+    /// How the value is reached (Q230): `exact` at the instant being computed, `hold` for the
+    /// last value measured at or before it. Absent is `exact`, which is what every manifest
+    /// written before this meant.
+    #[serde(default = "exact_alignment", skip_serializing_if = "is_exact")]
+    pub alignment: String,
+}
+
+fn exact_alignment() -> String {
+    "exact".to_string()
+}
+
+fn is_exact(alignment: &str) -> bool {
+    alignment == "exact"
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1629,6 +1654,11 @@ pub struct PinnedFormula {
     /// `(variable_name, parameter_code)`: the formula variable and the catalog parameter read
     /// into it.
     pub sources: Vec<(String, String)>,
+    /// The variables among `sources` bound by holding the last value measured at or before the
+    /// instant rather than reading one at it (Q230). Absent is read exactly, which is what every
+    /// version pinned before this meant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<String>,
     /// `(variable_name, site_property)`: the formula variable and the column of the site's own row
     /// read into it. A station's elevation is not a measurement anything took at a visit, so it is
     /// resolved from the site rather than asked for per event.

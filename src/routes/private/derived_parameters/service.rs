@@ -1,7 +1,7 @@
 use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -585,25 +585,32 @@ async fn stored_definition<C: ConnectionTrait>(
         .ok_or_else(|| ApiError::not_found("Derived parameter definition", None))
 }
 
-/// Delete existing sources and insert new ones for a derived definition.
+/// Delete existing sources and insert new ones for a derived definition, returning the parameter
+/// rows as written, which is what the response carries.
 async fn sync_sources<C: ConnectionTrait>(
     db: &C,
     definition_id: Uuid,
     resolved: &ResolvedSources,
-) -> Result<(), ApiError> {
+) -> Result<Vec<source::DerivedParameterSource>, ApiError> {
     let resolved_params = &resolved.parameters;
+    // A save rewrites the rows, so the alignment a person declared per variable (Q230) is read
+    // back first and carried onto the variable's new row: it is a declaration about the input,
+    // not about the text of the formula that reads it.
+    let held = held_variables(db, definition_id).await?;
     // Delete existing rows
     delete_sources(db, definition_id)
         .await
         .map_err(|e| ApiError::internal(format!("Failed to clear old sources: {e}"), None))?;
 
     // Insert new rows
+    let mut written = Vec::with_capacity(resolved_params.len());
     for (var_name, param_id) in resolved_params {
-        source::ActiveModel {
+        let row = source::ActiveModel {
             id: Set(Uuid::new_v4()),
             derived_definition_id: Set(definition_id),
             parameter_id: Set(Some(*param_id)),
             variable_name: Set(var_name.clone()),
+            alignment: Set(alignment_of(&held, var_name)),
             ..Default::default()
         }
         .insert(db)
@@ -611,6 +618,7 @@ async fn sync_sources<C: ConnectionTrait>(
         .map_err(|e| {
             ApiError::internal(format!("Failed to insert source '{var_name}': {e}"), None)
         })?;
+        written.push(source::DerivedParameterSource::from(row));
     }
 
     for (var_name, property) in &resolved.site_properties {
@@ -631,8 +639,39 @@ async fn sync_sources<C: ConnectionTrait>(
         })?;
     }
 
-    Ok(())
+    Ok(written)
 }
+
+/// The variables of a definition whose sources are held rather than read at the instant (Q230).
+async fn held_variables<C: ConnectionTrait>(
+    db: &C,
+    definition_id: Uuid,
+) -> Result<Vec<String>, ApiError> {
+    source::Entity::find()
+        .filter(source::Column::DerivedDefinitionId.eq(definition_id))
+        .filter(source::Column::Alignment.eq(HOLD))
+        .select_only()
+        .column(source::Column::VariableName)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))
+}
+
+/// What a rewritten source row declares, given the variables the definition held before it.
+#[must_use]
+pub fn alignment_of(held: &[String], variable: &str) -> String {
+    if held.iter().any(|v| v == variable) {
+        HOLD.to_string()
+    } else {
+        EXACT.to_string()
+    }
+}
+
+/// A source read at the instant being computed.
+pub const EXACT: &str = "exact";
+/// A source holding the last value measured at or before the instant being computed (Q230).
+pub const HOLD: &str = "hold";
 
 /// Every source row a definition owns, cleared.
 async fn delete_sources<C: ConnectionTrait>(
@@ -977,28 +1016,14 @@ impl CRUDOperations for CalculationFormulaOperations {
             curve_slot: entity.curve_slot.as_deref(),
         };
         let resolved = resolve_variables(db, &entity.formula, &context).await?;
-        sync_sources(db, entity.id, &resolved).await?;
+        let written = sync_sources(db, entity.id, &resolved).await?;
 
         // Auto-create a corresponding entry in the parameters table so this
         // derived output can be referenced as a parameter_id in site_parameters. An intermediate
         // is a step of the calculation and measures nothing, so it mints none (M180).
         ensure_output_parameter(db, entity).await?;
 
-        // Populate the sources field on the response
-        entity.sources = resolved
-            .parameters
-            .into_iter()
-            .map(|(var_name, param_id)| {
-                crate::routes::private::derived_parameters::models::source::DerivedParameterSource {
-                    id: Uuid::nil(), // Will be fetched by CrudCrate on next read
-                    derived_definition_id: entity.id,
-                    parameter_id: Some(param_id),
-                    site_property: None,
-                    variable_name: var_name,
-                    created_at: None,
-                }
-            })
-            .collect();
+        entity.sources = written;
 
         Ok(())
     }
@@ -1053,26 +1078,12 @@ impl CRUDOperations for CalculationFormulaOperations {
             curve_slot: entity.curve_slot.as_deref(),
         };
         let resolved = resolve_variables(db, &entity.formula, &context).await?;
-        sync_sources(db, entity.id, &resolved).await?;
+        let written = sync_sources(db, entity.id, &resolved).await?;
 
         // Keep the output parameter in sync; an intermediate has none to keep.
         ensure_output_parameter(db, entity).await?;
 
-        // Populate the sources field on the response
-        entity.sources = resolved
-            .parameters
-            .into_iter()
-            .map(|(var_name, param_id)| {
-                crate::routes::private::derived_parameters::models::source::DerivedParameterSource {
-                    id: Uuid::nil(),
-                    derived_definition_id: entity.id,
-                    parameter_id: Some(param_id),
-                    site_property: None,
-                    variable_name: var_name,
-                    created_at: None,
-                }
-            })
-            .collect();
+        entity.sources = written;
 
         Ok(())
     }

@@ -96,7 +96,6 @@ async fn define_assign_recompute(
             "name": code,
             "sensor_type": "derived",
             "entry_mode": "tool",
-            "display_units": "mg/L",
         }),
         token,
     )

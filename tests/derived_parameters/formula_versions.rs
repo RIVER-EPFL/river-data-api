@@ -76,7 +76,6 @@ async fn assign_slot(app: &axum::Router, token: &str, parameter_id: Uuid, code: 
             "sensor_type": "derived",
             "entry_mode": "tool",
             "cadence": "high",
-            "display_units": "mg/L",
         }),
         token,
     )

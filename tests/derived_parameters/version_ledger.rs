@@ -138,7 +138,6 @@ async fn each_version_lists_the_readings_it_computed_and_the_span_they_cover() {
             "sensor_type": "derived",
             "entry_mode": "tool",
             "cadence": "high",
-            "display_units": "mg/L",
         }),
         &token,
     )

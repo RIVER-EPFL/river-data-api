@@ -69,10 +69,10 @@ async fn setup() -> (DatabaseConnection, axum::Router, river_db::common::AppStat
         &db,
         &format!(
             "INSERT INTO site_parameters \
-             (id, site_id, parameter_id, name, sensor_type, display_units, units_name, \
-              units_min, units_max, decimal_places, sample_interval_sec, is_active) \
+             (id, site_id, parameter_id, name, sensor_type, \
+              decimal_places, sample_interval_sec, is_active) \
              VALUES ('{SP_B_DEPTH_ID}', '{SITE_B_ID}', '{GLOBAL_PARAM_DEPTH_ID}', 'Depth', 'Depth', \
-                     'mm', 'Millimeters', 0, 3000, 0, 600, true)"
+                     0, 600, true)"
         ),
     )
     .await;

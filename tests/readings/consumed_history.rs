@@ -85,7 +85,6 @@ async fn computed_slot(formula: &str, constants: &[(&str, f64)]) -> Fixture {
             "name": code,
             "sensor_type": "derived",
             "entry_mode": "tool",
-            "display_units": "mg/L",
         }),
         &f.token,
     )

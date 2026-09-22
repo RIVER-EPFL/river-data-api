@@ -840,7 +840,6 @@ async fn a_consumed_input_opens_the_reading_it_was_read_from() {
             "name": code,
             "sensor_type": "derived",
             "entry_mode": "tool",
-            "display_units": "mg/L",
         }),
         &token,
     )

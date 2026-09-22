@@ -455,24 +455,20 @@ async fn created_site_parameter_carries_display_name_units_and_aliases() {
         Some("Nitrate Flux"),
         "site_parameter should carry the display name"
     );
-    let display_units = scalar_opt_string(
+    let units = scalar_opt_string(
         &db,
         &format!(
-            "SELECT sp.display_units AS v FROM data_streams ds \
-             JOIN site_parameters sp ON ds.site_parameter_id = sp.id WHERE ds.id = '{stream_id}'"
+            "SELECT p.default_units AS v FROM data_streams ds \
+             JOIN site_parameters sp ON ds.site_parameter_id = sp.id \
+             JOIN parameters p ON p.id = sp.parameter_id WHERE ds.id = '{stream_id}'"
         ),
     )
     .await;
-    assert_eq!(display_units.as_deref(), Some("mg/L"));
-    let units_name = scalar_opt_string(
-        &db,
-        &format!(
-            "SELECT sp.units_name AS v FROM data_streams ds \
-             JOIN site_parameters sp ON ds.site_parameter_id = sp.id WHERE ds.id = '{stream_id}'"
-        ),
-    )
-    .await;
-    assert_eq!(units_name.as_deref(), Some("mg/L"));
+    assert_eq!(
+        units.as_deref(),
+        Some("mg/L"),
+        "the plan's declared units land on the catalog parameter"
+    );
 
     let aliases = scalar_opt_string(
         &db,
@@ -1244,8 +1240,8 @@ async fn two_new_slots_sharing_a_name_and_units_both_apply() {
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, display_units, units_name, is_active) \
-             VALUES ('{}', '{}', '{holder}', 'Flux', '', 'mg/L', 'mg/L', true)",
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active) \
+             VALUES ('{}', '{}', '{holder}', 'Flux', '', true)",
             Uuid::new_v4(),
             crate::common::SITE1_ID
         ),

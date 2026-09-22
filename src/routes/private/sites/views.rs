@@ -260,9 +260,9 @@ pub async fn get_site_readings(
     // Global parameter IDs from site_parameters (readings table uses global parameter_id)
     let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
 
-    // The catalog rows behind these slots. One resolver decides code, names, sensor_type and the
-    // units fallback for every series endpoint, so a slot without its own `display_units` reports
-    // the catalog default here exactly as the site detail does.
+    // The catalog rows behind these slots. One resolver decides code, names, sensor_type and
+    // units for every series endpoint, so a slot reports the catalog units here exactly as the
+    // site detail does.
     let catalog = site_parameters::catalog_map(&state.db, param_ids.iter().copied()).await?;
 
     let include_replicates = query.include_replicates.unwrap_or(false) || query.sample_id.is_some();
@@ -1715,10 +1715,7 @@ pub async fn get_site_statistics(
         .column((p.clone(), parameters::Column::Code))
         .column((p.clone(), parameters::Column::Name))
         .expr_as(
-            Func::coalesce([
-                Expr::col((sp.clone(), site_parameters::Column::DisplayUnits)),
-                Expr::col((p.clone(), parameters::Column::DefaultUnits)),
-            ]),
+            Expr::col((p.clone(), parameters::Column::DefaultUnits)),
             Alias::new("units"),
         )
         .column((sp.clone(), site_parameters::Column::DecimalPlaces));

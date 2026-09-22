@@ -47,8 +47,8 @@ async fn declare_slot(db: &DatabaseConnection, site_id: Uuid, parameter_id: Uuid
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO site_parameters \
-           (id, site_id, parameter_id, name, sensor_type, display_units, is_active, entry_mode, cadence) \
-         VALUES (gen_random_uuid(), $1, $2, 'Cadence test', 'derived', 'mg/L', true, 'tool', $3)",
+           (id, site_id, parameter_id, name, sensor_type, is_active, entry_mode, cadence) \
+         VALUES (gen_random_uuid(), $1, $2, 'Cadence test', 'derived', true, 'tool', $3)",
         [site_id.into(), parameter_id.into(), cadence.into()],
     ))
     .await

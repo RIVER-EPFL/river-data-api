@@ -27,17 +27,6 @@ pub struct Model {
     pub name: String,
     #[crudcrate(filterable, on_create = String::new())]
     pub sensor_type: String,
-    /// Site-level units override. NULL means "no override": every endpoint serving this slot
-    /// resolves units through [`SlotDescriptor`], which falls back to the
-    /// catalog `default_units`.
-    pub display_units: Option<String>,
-    /// Stored and returned by the CRUD endpoint; no server-side reader. Kept because existing
-    /// rows carry values.
-    pub units_name: Option<String>,
-    /// Stored and returned by the CRUD endpoint; no server-side reader.
-    pub units_min: Option<f64>,
-    /// Stored and returned by the CRUD endpoint; no server-side reader.
-    pub units_max: Option<f64>,
     /// Display precision, carried to the client by [`SlotDescriptor`]. The API
     /// serves full precision and the client formats, so a change here never rewrites a value.
     pub decimal_places: Option<i16>,
@@ -149,12 +138,9 @@ pub struct SlotDescriptor {
     pub name: String,
     /// Slot `sensor_type`, falling back to the slot name when unset.
     pub sensor_type: String,
-    /// Site override falling back to the catalog `default_units`. An empty catalog value is no
-    /// units at all, so it resolves to `None` rather than an empty string.
+    /// The catalog `default_units`. An empty catalog value is no units at all, so it resolves to
+    /// `None` rather than an empty string.
     pub units: Option<String>,
-    /// The site override alone, unresolved, for clients that distinguish an override from a
-    /// fallback.
-    pub display_units: Option<String>,
     /// Display precision the client formats with. The served values keep full precision.
     pub decimal_places: Option<i16>,
 }

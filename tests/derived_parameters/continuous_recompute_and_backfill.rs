@@ -121,7 +121,6 @@ async fn test_continuous_derived_recompute_after_ingest() {
         "name": derived_name,
         "sensor_type": "derived",
         "entry_mode": "tool",
-        "display_units": "mg/L",
     });
     let (status, sp_text) =
         crate::common::post_json_with_token(&app, "/api/site_parameters", &assign_body, &token)
@@ -245,7 +244,6 @@ async fn test_recompute_endpoint_backfills_historical_gap() {
         "name": derived_name,
         "sensor_type": "derived",
         "entry_mode": "tool",
-        "display_units": "mg/L",
     });
     let (status, _) =
         crate::common::post_json_with_token(&app, "/api/site_parameters", &assign_body, &token)
@@ -329,7 +327,6 @@ async fn test_continuous_derived_binds_a_constant_by_name() {
             "name": derived_name,
             "sensor_type": "derived",
             "entry_mode": "tool",
-            "display_units": "mg/L",
         }),
         &token,
     )
@@ -419,7 +416,6 @@ async fn na_clears_the_value_the_formula_no_longer_produces_and_a_divide_by_zero
                     "name": code,
                     "sensor_type": "derived",
                     "entry_mode": "tool",
-                    "display_units": "1/mg",
                 }),
                 &token,
             )
@@ -573,8 +569,8 @@ async fn declare_stream_slot(db: &DatabaseConnection, site_id: Uuid, parameter_i
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO site_parameters \
-           (id, site_id, parameter_id, name, sensor_type, display_units, is_active, entry_mode, cadence) \
-         VALUES (gen_random_uuid(), $1, $2, $3, 'derived', 'K', true, 'tool', 'high')",
+           (id, site_id, parameter_id, name, sensor_type, is_active, entry_mode, cadence) \
+         VALUES (gen_random_uuid(), $1, $2, $3, 'derived', true, 'tool', 'high')",
         [site_id.into(), parameter_id.into(), name.into()],
     ))
     .await

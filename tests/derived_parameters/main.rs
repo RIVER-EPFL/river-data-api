@@ -16,5 +16,6 @@ mod lifecycle_define_assign_publish;
 mod output_parameter_code;
 mod preview_set;
 mod shared_steps;
+mod source_alignment;
 mod slot_cadence;
 mod version_ledger;

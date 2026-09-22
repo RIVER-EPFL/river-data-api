@@ -4932,6 +4932,8 @@ pub async fn records_for_event(
 /// decision that wrote it, so the newest of those at the key is the set behind the stored number;
 /// a recompute that moved the value appended a `formula_transition` and a first computation a
 /// `derived_computed`, and both are read here by the ledger order the lock makes effect order.
+/// What the catalog supplied is reported as the first computation read it, which
+/// [`super::consumed::as_first_read`] resolves against the oldest of the same rows.
 pub(super) async fn fetch_consumed_sets(
     db: &sea_orm::DatabaseConnection,
     rows: &[RawRow],
@@ -4985,13 +4987,22 @@ pub(super) async fn fetch_consumed_sets(
             .order_by_desc(decision_model::Column::Seq)
             .all(db)
             .await?;
+        // Ordered newest first, so the last set seen at a stream is its first computation.
+        let mut newest: HashMap<Uuid, Vec<ConsumedInput>> = HashMap::new();
+        let mut first: HashMap<Uuid, Vec<ConsumedInput>> = HashMap::new();
         for row in ledger {
             if out.contains_key(&row.stream_id) {
                 continue;
             }
-            if let Some(set) = row.new.get("consumed").cloned().and_then(consumed_set) {
-                out.insert(row.stream_id, set);
-            }
+            let Some(set) = row.new.get("consumed").cloned().and_then(consumed_set) else {
+                continue;
+            };
+            newest.entry(row.stream_id).or_insert_with(|| set.clone());
+            first.insert(row.stream_id, set);
+        }
+        for (stream_id, set) in newest {
+            let origin = first.get(&stream_id).map_or(&[][..], Vec::as_slice);
+            out.insert(stream_id, super::consumed::as_first_read(set, origin));
         }
     }
     Ok(out)
@@ -5288,8 +5299,7 @@ fn site_rows_query(site_ids: &[Uuid]) -> sea_orm::sea_query::SelectStatement {
         .take()
 }
 
-/// The slot's code, name, unit and declared precision, the site's own configuration winning over
-/// the catalog default.
+/// The catalog's code, name and units, and the slot's declared precision.
 fn slot_identity_query(site_id: Uuid, parameter_id: Uuid) -> sea_orm::sea_query::SelectStatement {
     use crate::routes::private::parameters as parameters_entity;
     use crate::routes::private::site_parameters::models as site_parameters_model;
@@ -5302,10 +5312,7 @@ fn slot_identity_query(site_id: Uuid, parameter_id: Uuid) -> sea_orm::sea_query:
             (p.clone(), parameters_entity::Column::Name),
         ])
         .expr_as(
-            Func::coalesce([
-                Expr::col((sp.clone(), site_parameters_model::Column::DisplayUnits)),
-                Expr::col((p.clone(), parameters_entity::Column::DefaultUnits)),
-            ]),
+            Expr::col((p.clone(), parameters_entity::Column::DefaultUnits)),
             Alias::new("units"),
         )
         .column((sp.clone(), site_parameters_model::Column::DecimalPlaces))
@@ -5460,8 +5467,8 @@ pub(super) async fn fetch_calculations(
         );
     }
 
-    let active = active_version_numbers(db, &output_codes.keys().copied().collect::<Vec<_>>())
-        .await?;
+    let active =
+        active_version_numbers(db, &output_codes.keys().copied().collect::<Vec<_>>()).await?;
     for info in by_parameter.values_mut() {
         info.active_version_no = active.get(&info.tool_script_id).copied();
     }
@@ -5888,6 +5895,8 @@ pub(super) async fn fetch_served_values(
         slot.by_index.insert(row.replicate_index, row.value);
         if row.live {
             slot.live.push(InputCandidate {
+                // This query is over one instant, so every row it returns stands at it.
+                time,
                 measurement_type: row.measurement_type,
                 replicate_index: row.replicate_index,
                 stream_id: row.stream_id,

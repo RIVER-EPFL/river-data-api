@@ -179,6 +179,7 @@ fn resolve_one(
     ConsumedRef {
         variable: input.variable.clone(),
         kind: input.kind.clone(),
+        alignment: input.alignment.clone(),
         subject: input.subject.clone(),
         property: input.property.clone(),
         revision: input.revision,
@@ -188,6 +189,42 @@ fn resolve_one(
         state,
         members,
     }
+}
+
+/// The subject of an input that is the calculation's own text rather than something it read.
+const FORMULA_SUBJECT: &str = "calculation_formula:";
+
+/// The set a record reports over a key that has been computed more than once.
+///
+/// An input the calculation read from the catalog keeps the value and revision the first
+/// computation read of it: editing a constant repairs the values it produced, and the record
+/// still says which number produced them, marked `changed` against what the catalog holds
+/// now (Q244). A member reading and a step formula follow the newest capture instead: correcting
+/// a reading is the record following its source, and editing a step is the calculation itself
+/// moving, which the new capture is the account of.
+pub(super) fn as_first_read(
+    newest: Vec<ConsumedInput>,
+    first: &[ConsumedInput],
+) -> Vec<ConsumedInput> {
+    newest
+        .into_iter()
+        .map(|mut input| {
+            let Some(subject) = input.subject.as_deref() else {
+                return input;
+            };
+            if subject.starts_with(FORMULA_SUBJECT) {
+                return input;
+            }
+            if let Some(origin) = first
+                .iter()
+                .find(|o| o.variable == input.variable && o.subject.as_deref() == Some(subject))
+            {
+                input.revision = origin.revision;
+                input.value = origin.value.clone();
+            }
+            input
+        })
+        .collect()
 }
 
 /// A rendered mark read back as one of the three, so the aggregate cannot invent a fourth.

@@ -85,10 +85,9 @@ pub async fn seed_base_entities(db: &DatabaseConnection) {
         .iter()
         .map(|p| {
             format!(
-                "('{id}', '{site}', '{param}', '{name}', '{st}', '{u}', '{un}', {umin}, {umax}, {dp}, 600, true)",
+                "('{id}', '{site}', '{param}', '{name}', '{st}', {dp}, 600, true)",
                 id = p.site_param_id, site = p.site_id, param = p.global_param_id,
-                name = p.name, st = p.sensor_type, u = p.display_units,
-                un = p.units_name, umin = p.units_min, umax = p.units_max, dp = p.decimal_places,
+                name = p.name, st = p.sensor_type, dp = p.decimal_places,
             )
         })
         .collect();
@@ -97,8 +96,8 @@ pub async fn seed_base_entities(db: &DatabaseConnection) {
         db,
         &format!(
             "INSERT INTO site_parameters \
-             (id, site_id, parameter_id, name, sensor_type, display_units, units_name, \
-              units_min, units_max, decimal_places, sample_interval_sec, is_active) VALUES {}",
+             (id, site_id, parameter_id, name, sensor_type, decimal_places, \
+              sample_interval_sec, is_active) VALUES {}",
             values.join(", ")
         ),
     )

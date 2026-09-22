@@ -2,7 +2,7 @@ use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use super::super::models::{ConsumedInput, ConsumedReading};
-use super::{CHANGED, Standing, UNCHANGED, UNKNOWN, combine, mark, subject_ids};
+use super::{CHANGED, Standing, UNCHANGED, UNKNOWN, as_first_read, combine, mark, subject_ids};
 
 #[test]
 fn test_a_source_at_the_consumed_revision_is_unchanged() {
@@ -62,6 +62,7 @@ fn test_a_subject_is_read_by_its_own_prefix_only() {
 fn test_a_capture_round_trips_through_the_stored_json() {
     let input = ConsumedInput {
         variable: "WTW_Temp_degC_1".to_string(),
+        alignment: None,
         kind: "mean".to_string(),
         subject: None,
         property: None,
@@ -78,4 +79,126 @@ fn test_a_capture_round_trips_through_the_stored_json() {
     let stored = serde_json::to_value(&input).unwrap();
     let back: ConsumedInput = serde_json::from_value(stored).unwrap();
     assert_eq!(back, input);
+}
+
+// Scenario: a calculation on a stream consumed an input held from the last visit (Q230).
+//
+// Expected behaviour: the record names the reading at the visit's instant and says it was held,
+// so a reader can tell a held value from a mis-stamped one. An input read at the instant says
+// nothing, which is what every blob written before the rule meant.
+#[test]
+fn test_a_held_input_says_so_and_an_exact_one_says_nothing() {
+    let visit = Utc.with_ymd_and_hms(2026, 8, 1, 9, 14, 32).unwrap();
+    let held = ConsumedInput {
+        variable: "alkalinity".to_string(),
+        alignment: Some("hold".to_string()),
+        kind: "reading".to_string(),
+        subject: None,
+        property: None,
+        revision: None,
+        members: vec![ConsumedReading {
+            stream_id: Uuid::new_v4(),
+            time: visit,
+            replicate_index: 0,
+            revision: None,
+            value: Some(7.0),
+        }],
+        value: serde_json::json!(7.0),
+    };
+    let stored = serde_json::to_value(&held).unwrap();
+    assert_eq!(stored["alignment"], "hold");
+    assert_eq!(
+        stored["members"][0]["time"],
+        serde_json::to_value(visit).unwrap(),
+        "and the member stands at the instant it was measured, not at the one computed"
+    );
+    assert_eq!(
+        serde_json::from_value::<ConsumedInput>(stored).unwrap(),
+        held
+    );
+
+    let exact = ConsumedInput {
+        alignment: None,
+        ..held
+    };
+    let stored = serde_json::to_value(&exact).unwrap();
+    assert!(stored.get("alignment").is_none(), "{stored}");
+    assert_eq!(
+        serde_json::from_value::<ConsumedInput>(stored).unwrap(),
+        exact,
+        "a blob written before the rule reads back as read at the instant"
+    );
+}
+
+fn captured(
+    variable: &str,
+    subject: Option<&str>,
+    revision: Option<i64>,
+    value: f64,
+) -> ConsumedInput {
+    ConsumedInput {
+        variable: variable.to_string(),
+        alignment: None,
+        kind: "constant".to_string(),
+        subject: subject.map(str::to_string),
+        property: None,
+        revision,
+        members: Vec::new(),
+        value: serde_json::json!(value),
+    }
+}
+
+#[test]
+fn test_a_recaptured_subject_keeps_what_the_first_computation_read() {
+    let subject = format!("constant:{}", Uuid::new_v4());
+    let newest = vec![captured("k", Some(&subject), Some(827), 3.0)];
+    let first = vec![captured("k", Some(&subject), Some(826), 2.0)];
+    let reported = as_first_read(newest, &first);
+    assert_eq!(reported[0].revision, Some(826));
+    assert_eq!(reported[0].value.as_f64(), Some(2.0));
+}
+
+#[test]
+fn test_an_input_with_no_subject_follows_the_newest_capture() {
+    let newest = vec![captured("Dissolved_O2", None, Some(9), 11.0)];
+    let first = vec![captured("Dissolved_O2", None, Some(8), 10.0)];
+    let reported = as_first_read(newest, &first);
+    assert_eq!(reported[0].revision, Some(9));
+    assert_eq!(reported[0].value.as_f64(), Some(11.0));
+}
+
+#[test]
+fn test_a_subject_the_first_computation_did_not_read_stands_as_captured() {
+    let subject = format!("constant:{}", Uuid::new_v4());
+    let other = format!("constant:{}", Uuid::new_v4());
+    let newest = vec![captured("k", Some(&subject), Some(827), 3.0)];
+    // The formula changed: `k` now binds a different constant, and the same name under the other
+    // subject is not the value this input was read from.
+    let first = vec![captured("k", Some(&other), Some(400), 9.0)];
+    let reported = as_first_read(newest, &first);
+    assert_eq!(reported[0].revision, Some(827));
+    assert_eq!(reported[0].value.as_f64(), Some(3.0));
+}
+
+#[test]
+fn test_an_edited_step_follows_the_capture_the_recompute_made() {
+    let subject = format!("calculation_formula:{}", Uuid::new_v4());
+    let mut newest = captured("hs_k", Some(&subject), Some(674), 0.0);
+    newest.kind = "step".to_string();
+    newest.value = serde_json::json!("Dissolved_O2 * 3");
+    let mut first = captured("hs_k", Some(&subject), Some(672), 0.0);
+    first.kind = "step".to_string();
+    first.value = serde_json::json!("Dissolved_O2 * 2");
+    let reported = as_first_read(vec![newest], &[first]);
+    assert_eq!(reported[0].revision, Some(674));
+    assert_eq!(reported[0].value, serde_json::json!("Dissolved_O2 * 3"));
+}
+
+#[test]
+fn test_a_key_computed_once_reports_that_computation() {
+    let subject = format!("constant:{}", Uuid::new_v4());
+    let only = vec![captured("k", Some(&subject), Some(826), 2.0)];
+    let reported = as_first_read(only.clone(), &only);
+    assert_eq!(reported[0].revision, Some(826));
+    assert_eq!(reported[0].value.as_f64(), Some(2.0));
 }

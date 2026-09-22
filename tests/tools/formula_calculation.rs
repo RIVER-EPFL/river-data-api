@@ -840,10 +840,10 @@ async fn declare_slot(db: &sea_orm::DatabaseConnection, parameter_id: &str) {
     crate::common::exec(
         db,
         &format!(
-            "INSERT INTO site_parameters (id, site_id, parameter_id, name, display_units, \
-                 units_name, decimal_places, is_active, cadence) \
-             VALUES (gen_random_uuid(), '{}', '{parameter_id}', 'temp_ratio_out', 'ratio', \
-                 'ratio', 3, true, 'low')",
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, \
+                 decimal_places, is_active, cadence) \
+             VALUES (gen_random_uuid(), '{}', '{parameter_id}', 'temp_ratio_out', \
+                 3, true, 'low')",
             crate::common::SITE1_ID
         ),
     )

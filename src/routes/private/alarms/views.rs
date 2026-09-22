@@ -213,7 +213,7 @@ pub async fn get_site_alarms(
                 id: p.parameter_id,
                 name: d.slot_name,
                 sensor_type: d.sensor_type,
-                display_units: d.units,
+                units: d.units,
             }
         })
         .collect();
@@ -308,7 +308,7 @@ pub async fn get_site_alarms(
                 id: param.id,
                 name: param.name.clone(),
                 sensor_type: param.sensor_type.clone(),
-                units: param.display_units.clone(),
+                units: param.units.clone(),
                 values,
                 severities,
             })

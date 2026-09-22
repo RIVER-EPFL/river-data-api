@@ -295,3 +295,86 @@ async fn applying_a_calculation_the_site_cannot_feed_is_refused_naming_the_missi
         "a refused apply writes no slot"
     );
 }
+
+/// Scenario: the calculation reads the oxygen the site streams and a lab value it records at
+/// visits, the second declared held (Q230).
+///
+/// Expected behaviour: the output joins the stream arm. The arm is decided over the inputs read at
+/// the instant alone: a held source stands between visits whatever the stream does, so counting it
+/// would put the set wholly on the visit arm, which is the case the hold exists for.
+#[tokio::test]
+#[serial]
+async fn a_held_input_does_not_pull_the_output_onto_the_visit_arm() {
+    let f = crate::common::seeded_app().await;
+    let db = f.db.clone();
+    let script_id = seed_calculation(&db).await;
+
+    // The lab value: a catalog parameter the site records at visits.
+    let lab = Uuid::new_v4();
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO parameters (id, code, name, category) \
+             VALUES ('{lab}', 'Held_lab_value', 'Held lab value', 'measurement')"
+        ),
+    )
+    .await;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, \
+                                          is_active, entry_mode, cadence) \
+             VALUES (gen_random_uuid(), '{SITE1_ID}', '{lab}', 'Held lab value', '', true, \
+                     'manual', 'low')"
+        ),
+    )
+    .await;
+
+    let (status, text) = add_formula(&f, &script_id, "Dissolved_O2 * Held_lab_value").await;
+    assert!(
+        (200..300).contains(&status),
+        "add the formula ({status}): {text}"
+    );
+    let output_id = parameter_id(&db, OUTPUT_CODE)
+        .await
+        .expect("the formula save minted the output parameter");
+
+    // Without the declaration the low slot decides, and the whole set falls to the visit arm.
+    let (status, applied) = apply(&f, &script_id, false).await;
+    assert_eq!(status, 200, "{applied}");
+    assert_eq!(
+        slot(&db, &output_id).await.expect("the slot").2,
+        "low",
+        "read at the instant, the lab value is a visit slot and the set is the chain's"
+    );
+
+    // Declared held, the lab value says nothing about the arm, and the set publishes on the
+    // stream. The apply is idempotent, so the slot is cleared for it to mint again.
+    exec(
+        &db,
+        &format!(
+            "DELETE FROM site_parameters WHERE site_id = '{SITE1_ID}' \
+               AND parameter_id = '{output_id}'"
+        ),
+    )
+    .await;
+    exec(
+        &db,
+        &format!("UPDATE derived_parameter_sources SET alignment = 'hold' \
+                   WHERE parameter_id = '{lab}'"),
+    )
+    .await;
+    let (status, text) = add_formula(&f, &script_id, "Dissolved_O2 * Held_lab_value").await;
+    assert!(
+        (200..300).contains(&status),
+        "the save pins a version carrying the declaration ({status}): {text}"
+    );
+
+    let (status, applied) = apply(&f, &script_id, false).await;
+    assert_eq!(status, 200, "{applied}");
+    assert_eq!(
+        slot(&db, &output_id).await.expect("the slot").2,
+        "high",
+        "the held value stands between visits, so the stream decides the arm: {applied}"
+    );
+}

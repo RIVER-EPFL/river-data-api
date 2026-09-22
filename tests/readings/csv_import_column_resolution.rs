@@ -44,7 +44,6 @@ async fn configure_derived_and_exposure(
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID, "parameter_id": output_parameter_id, "name": derived_name,
             "sensor_type": "derived", "entry_mode": "tool",
-            "display_units": "mg/L",
         }),
         token,
     )

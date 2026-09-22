@@ -86,7 +86,7 @@ async fn derived_definition_populates_sources_and_assigns() {
         "/api/site_parameters",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID, "parameter_id": output_param_id, "name": "DOmgL_e2e",
-            "sensor_type": "derived", "entry_mode": "tool", "display_units": "mg/L",
+            "sensor_type": "derived", "entry_mode": "tool",
         }),
         &token,
     )
@@ -115,7 +115,7 @@ async fn derived_assignment_backfills_and_publishes() {
         "/api/site_parameters",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID, "parameter_id": output_param_id, "name": "DOmgL_e2e",
-            "sensor_type": "derived", "entry_mode": "tool", "display_units": "mg/L",
+            "sensor_type": "derived", "entry_mode": "tool",
         }),
         &token,
     )
@@ -225,7 +225,7 @@ async fn an_unrelated_sites_import_does_not_suppress_the_assignment_backfill() {
         "/api/site_parameters",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID, "parameter_id": output_param_id, "name": "DOmgL_e2e",
-            "sensor_type": "derived", "entry_mode": "tool", "display_units": "mg/L",
+            "sensor_type": "derived", "entry_mode": "tool",
         }),
         &token,
     )
@@ -276,7 +276,7 @@ async fn the_same_definitions_in_flight_backfill_is_not_duplicated() {
         "/api/site_parameters",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID, "parameter_id": output_param_id, "name": "DOmgL_e2e",
-            "sensor_type": "derived", "entry_mode": "tool", "display_units": "mg/L",
+            "sensor_type": "derived", "entry_mode": "tool",
         }),
         &token,
     )
@@ -317,7 +317,7 @@ async fn a_site_that_does_not_declare_the_slot_computed_is_left_alone() {
         "/api/site_parameters",
         &serde_json::json!({
             "site_id": crate::common::SITE2_ID, "parameter_id": output_param_id,
-            "name": "DOmgL_e2e", "display_units": "mg/L",
+            "name": "DOmgL_e2e",
         }),
         &token,
     )
@@ -333,7 +333,6 @@ async fn a_site_that_does_not_declare_the_slot_computed_is_left_alone() {
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID, "parameter_id": output_param_id, "name": "DOmgL_e2e",
             "sensor_type": "derived", "entry_mode": "tool",
-            "display_units": "mg/L",
         }),
         &token,
     )
@@ -400,7 +399,7 @@ async fn flagging_a_source_reading_withdraws_the_derived_value_it_fed() {
         "/api/site_parameters",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID, "parameter_id": output_param_id, "name": "DOmgL_flag",
-            "sensor_type": "derived", "entry_mode": "tool", "display_units": "mg/L",
+            "sensor_type": "derived", "entry_mode": "tool",
         }),
         &token,
     )

@@ -4288,6 +4288,10 @@
       "ConsumedInput": {
         "description": "One input a calculation consumed, captured when it was read (Q215): what it was bound to and\nthe exact revision of every row behind it, so a later reader can say whether the source has\nmoved since. `kind` is `reading` (one row), `mean` (the sample statistic over `members`),\n`replicates` (a family, one member per index, a gap as a member with no value), `site` (a\ncolumn of the site row), `constant`, `curve` (a catalog curve, or entered coefficients with no\nsubject), `computed` (the number a step of the same set produced, under the step's own code)\nor `step` (a formula of the pinned set). An entity input names its `change_audit` subject and\nthe newest `seq` for it.",
         "properties": {
+          "alignment": {
+            "description": "How the reading it names was reached (Q230): absent where it was read at the instant the\nrun computed, `hold` where it is the last value measured at or before it, which a\ncalculation on a stream does for an input the lab measures at a visit. Without it a held\nvalue reads as a mis-stamped one, and a replay cannot tell which rule bound it.",
+            "type": "string"
+          },
           "kind": {
             "type": "string"
           },
@@ -4427,6 +4431,10 @@
       "ConsumedRef": {
         "description": "One input of the calculation that made this record, as it was consumed and as its source\nstands now (Q215). `kind`, `subject` and `property` are the captured binding.",
         "properties": {
+          "alignment": {
+            "description": "How the reading it names was reached (Q230), as the capture recorded it: absent where it\nwas read at the instant computed, `hold` where it is the last value measured at or before\nit. Without it a held member reads as one stamped at the wrong instant.",
+            "type": "string"
+          },
           "current_revision": {
             "format": "int64",
             "type": [
@@ -5926,6 +5934,10 @@
       },
       "DerivedParameterSource": {
         "properties": {
+          "alignment": {
+            "description": "How the binder reaches a reading for this variable (Q230): `exact` at the instant being\ncomputed, `hold` for the last value measured at or before it, which is what a\nvisit-measured input read by a calculation on a stream needs. DB CHECK over the two.",
+            "type": "string"
+          },
           "created_at": {
             "format": "date-time",
             "type": [
@@ -5966,12 +5978,19 @@
           "parameter_id",
           "site_property",
           "variable_name",
+          "alignment",
           "created_at"
         ],
         "type": "object"
       },
       "DerivedParameterSourceCreate": {
         "properties": {
+          "alignment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "derived_definition_id": {
             "format": "uuid",
             "type": "string"
@@ -6001,6 +6020,10 @@
       },
       "DerivedParameterSourceList": {
         "properties": {
+          "alignment": {
+            "description": "How the binder reaches a reading for this variable (Q230): `exact` at the instant being\ncomputed, `hold` for the last value measured at or before it, which is what a\nvisit-measured input read by a calculation on a stream needs. DB CHECK over the two.",
+            "type": "string"
+          },
           "created_at": {
             "format": "date-time",
             "type": [
@@ -6041,12 +6064,17 @@
           "parameter_id",
           "site_property",
           "variable_name",
+          "alignment",
           "created_at"
         ],
         "type": "object"
       },
       "DerivedParameterSourceResponse": {
         "properties": {
+          "alignment": {
+            "description": "How the binder reaches a reading for this variable (Q230): `exact` at the instant being\ncomputed, `hold` for the last value measured at or before it, which is what a\nvisit-measured input read by a calculation on a stream needs. DB CHECK over the two.",
+            "type": "string"
+          },
           "created_at": {
             "format": "date-time",
             "type": [
@@ -6087,12 +6115,19 @@
           "parameter_id",
           "site_property",
           "variable_name",
+          "alignment",
           "created_at"
         ],
         "type": "object"
       },
       "DerivedParameterSourceUpdate": {
         "properties": {
+          "alignment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "derived_definition_id": {
             "format": "uuid",
             "type": [
@@ -10126,6 +10161,10 @@
         "additionalProperties": false,
         "description": "A same-event parameter read: when the request does not carry `param`, its value is resolved\nfrom the collection event's stored readings (the served spot value: the sample mean, else the\nlowest unflagged replicate). This is the portal's cross-tool prefill — pCO2 pulling field\ntemperature, DOM pulling the DOC average — as a declaration instead of R code.",
         "properties": {
+          "alignment": {
+            "description": "How the value is reached (Q230): `exact` at the instant being computed, `hold` for the\nlast value measured at or before it. Absent is `exact`, which is what every manifest\nwritten before this meant.",
+            "type": "string"
+          },
           "param": {
             "description": "The manifest param this fills.",
             "type": "string"
@@ -13431,12 +13470,6 @@
               "null"
             ]
           },
-          "display_units": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "entry_mode": {
             "description": "How this site fills the slot: 'manual' or 'tool'",
             "type": "string"
@@ -13503,7 +13536,7 @@
             "type": "string"
           },
           "units": {
-            "description": "Resolved units: site override (`display_units`) falling back to the catalog `default_units`",
+            "description": "Units, from the catalog `default_units`",
             "type": [
               "string",
               "null"
@@ -13518,7 +13551,6 @@
           "units",
           "entry_mode",
           "sensor_type",
-          "display_units",
           "decimal_places",
           "sample_interval_sec",
           "is_active",
@@ -22675,12 +22707,6 @@
               "null"
             ]
           },
-          "display_units": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "entry_mode": {
             "type": [
               "string",
@@ -22739,26 +22765,6 @@
             "format": "uuid",
             "type": "string"
           },
-          "units_max": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "units_min": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "units_name": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "variable_mappings": {}
         },
         "required": [
@@ -22791,13 +22797,6 @@
           "discovered_at": {
             "description": "Stamped by every sync path that mints a slot, and by nothing else, so it is what says a\nrow arrived from a source rather than by hand.",
             "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "display_units": {
-            "description": "Site-level units override. NULL means \"no override\": every endpoint serving this slot\nresolves units through [`SlotDescriptor`], which falls back to the\ncatalog `default_units`.",
             "type": [
               "string",
               "null"
@@ -22862,29 +22861,6 @@
             "format": "uuid",
             "type": "string"
           },
-          "units_max": {
-            "description": "Stored and returned by the CRUD endpoint; no server-side reader.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "units_min": {
-            "description": "Stored and returned by the CRUD endpoint; no server-side reader.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "units_name": {
-            "description": "Stored and returned by the CRUD endpoint; no server-side reader. Kept because existing\nrows carry values.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "updated_at": {
             "format": "date-time",
             "type": [
@@ -22902,10 +22878,6 @@
           "parameter_id",
           "name",
           "sensor_type",
-          "display_units",
-          "units_name",
-          "units_min",
-          "units_max",
           "decimal_places",
           "sample_interval_sec",
           "is_active",
@@ -22946,13 +22918,6 @@
           "discovered_at": {
             "description": "Stamped by every sync path that mints a slot, and by nothing else, so it is what says a\nrow arrived from a source rather than by hand.",
             "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "display_units": {
-            "description": "Site-level units override. NULL means \"no override\": every endpoint serving this slot\nresolves units through [`SlotDescriptor`], which falls back to the\ncatalog `default_units`.",
             "type": [
               "string",
               "null"
@@ -23017,29 +22982,6 @@
             "format": "uuid",
             "type": "string"
           },
-          "units_max": {
-            "description": "Stored and returned by the CRUD endpoint; no server-side reader.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "units_min": {
-            "description": "Stored and returned by the CRUD endpoint; no server-side reader.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "units_name": {
-            "description": "Stored and returned by the CRUD endpoint; no server-side reader. Kept because existing\nrows carry values.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "updated_at": {
             "format": "date-time",
             "type": [
@@ -23057,10 +22999,6 @@
           "parameter_id",
           "name",
           "sensor_type",
-          "display_units",
-          "units_name",
-          "units_min",
-          "units_max",
           "decimal_places",
           "sample_interval_sec",
           "is_active",
@@ -23089,12 +23027,6 @@
             "format": "int32",
             "type": [
               "integer",
-              "null"
-            ]
-          },
-          "display_units": {
-            "type": [
-              "string",
               "null"
             ]
           },
@@ -23157,26 +23089,6 @@
           },
           "site_id": {
             "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "units_max": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "units_min": {
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "units_name": {
             "type": [
               "string",
               "null"
@@ -32168,7 +32080,7 @@
     },
     "/api/derived_parameter_sources": {
       "get": {
-        "description": "Retrieves all derived_parameter_sources.\n\nThis resource manages derived_parameter_source items\n\nAdditional sortable columns: .\n\nAdditional filterable columns: \n- derived_definition_id\n- parameter_id\n- site_property.",
+        "description": "Retrieves all derived_parameter_sources.\n\nThis resource manages derived_parameter_source items\n\nAdditional sortable columns: .\n\nAdditional filterable columns: \n- derived_definition_id\n- parameter_id\n- site_property\n- alignment.",
         "operationId": "get_all_derived_parameter_sources",
         "parameters": [
           {

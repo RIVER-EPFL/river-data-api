@@ -191,8 +191,7 @@ fn frequency_is_the_declared_cadence_and_not_what_the_rows_hold() {
         },
     );
 
-    let response =
-        build_parameter_response(slot, &HashMap::new(), &extents, &HashMap::new());
+    let response = build_parameter_response(slot, &HashMap::new(), &extents, &HashMap::new());
 
     assert_eq!(response.frequency, "low");
     // The extent stays what it is: both arms of history are legitimately there.
@@ -230,10 +229,6 @@ fn slot_with_cadence(
         parameter_id,
         name: "Turbidity".to_string(),
         sensor_type: String::new(),
-        display_units: None,
-        units_name: None,
-        units_min: None,
-        units_max: None,
         decimal_places: None,
         sample_interval_sec: None,
         is_active: Some(true),

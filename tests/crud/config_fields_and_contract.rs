@@ -179,8 +179,8 @@ async fn site_parameter_create_honours_is_public() {
     );
 }
 
-// /sites/{id}/readings serves the site-level units with no catalog fallback, so an
-// adopt-created slot reports null units while /sites/{id}/parameters reports the catalog default.
+// Units are the catalog's, so every endpoint serving a slot reports the same string whatever
+// path created the slot.
 #[tokio::test]
 #[serial]
 async fn adopted_slot_reports_the_same_units_on_both_site_endpoints() {
@@ -199,7 +199,7 @@ async fn adopted_slot_reports_the_same_units_on_both_site_endpoints() {
     let site_id = e2e::create_site(&app, &jwt, &project_id, "RD051 Site", "rd051-site").await;
     let adopted_param =
         e2e::create_parameter(&app, &jwt, "Rd051Do", "RD051 Dissolved Oxygen", "uM").await;
-    let override_param =
+    let declared_param =
         e2e::create_parameter(&app, &jwt, "Rd051Temp", "RD051 Temperature", "degC").await;
 
     let sensor_id = e2e::create_sensor(&app, &jwt, &adopted_param, "RD051-0001").await;
@@ -224,16 +224,16 @@ async fn adopted_slot_reports_the_same_units_on_both_site_endpoints() {
         "adopt created the slot under test: {adopted}"
     );
 
-    let (status, overridden) = post_json_parse_with_token(
+    let (status, declared) = post_json_parse_with_token(
         &app,
         "/api/site_parameters",
-        &json!({ "site_id": site_id, "parameter_id": override_param, "display_units": "K" }),
+        &json!({ "site_id": site_id, "parameter_id": declared_param }),
         &jwt,
     )
     .await;
     assert!(
         (200..300).contains(&status),
-        "create a slot carrying a site-level units override ({status}): {overridden}"
+        "create a slot by hand ({status}): {declared}"
     );
 
     let (status, ingested) = post_json_parse_with_token(
@@ -241,7 +241,7 @@ async fn adopted_slot_reports_the_same_units_on_both_site_endpoints() {
         "/api/readings/batch",
         &json!({ "readings": [
             { "site_id": site_id, "parameter_id": adopted_param, "time": "2025-06-10T00:00:00Z", "raw_value": 210.0 },
-            { "site_id": site_id, "parameter_id": override_param, "time": "2025-06-10T00:00:00Z", "raw_value": 11.0 },
+            { "site_id": site_id, "parameter_id": declared_param, "time": "2025-06-10T00:00:00Z", "raw_value": 11.0 },
         ]}),
         &jwt,
     )
@@ -269,23 +269,21 @@ async fn adopted_slot_reports_the_same_units_on_both_site_endpoints() {
     assert_eq!(status, 200, "site readings ({status}): {series_view}");
     let series = &series_view["parameters"];
 
-    // A site-level override is reported by both endpoints, so the two agree whenever the slot
-    // carries its own units.
     assert_eq!(
-        entry_for(&catalog_view, &override_param)["units"],
-        json!("K"),
-        "the parameter list reports the site-level override: {catalog_view}"
+        entry_for(&catalog_view, &declared_param)["units"],
+        json!("degC"),
+        "the parameter list reports the catalog units: {catalog_view}"
     );
     assert_eq!(
-        entry_for(series, &override_param)["units"],
-        json!("K"),
-        "the readings series reports the site-level override: {series_view}"
+        entry_for(series, &declared_param)["units"],
+        json!("degC"),
+        "the readings series reports the same units for the same slot: {series_view}"
     );
 
     assert_eq!(
         entry_for(&catalog_view, &adopted_param)["units"],
         json!("uM"),
-        "the parameter list falls back to the catalog units: {catalog_view}"
+        "the parameter list reports the catalog units: {catalog_view}"
     );
     assert_eq!(
         entry_for(series, &adopted_param)["units"],
@@ -294,9 +292,9 @@ async fn adopted_slot_reports_the_same_units_on_both_site_endpoints() {
     );
 }
 
-// units_name, units_min, units_max, variable_mappings and decimal_places are accepted and
-// stored, and nothing consumes them: a slot set to one decimal place still renders full precision
-// and the setting never reaches the renderer.
+// variable_mappings and decimal_places are accepted and stored, and nothing consumes them: a slot
+// set to one decimal place still renders full precision and the setting never reaches the
+// renderer.
 #[tokio::test]
 #[serial]
 async fn site_parameter_display_config_reaches_a_reader() {
@@ -325,11 +323,7 @@ async fn site_parameter_display_config_reaches_a_reader() {
         &json!({
             "site_id": site_id,
             "parameter_id": configured_param,
-            "display_units": "mm",
             "decimal_places": 1,
-            "units_name": "millimetres",
-            "units_min": 0.5,
-            "units_max": 99.5,
             "variable_mappings": mappings,
         }),
         &jwt,
@@ -343,21 +337,6 @@ async fn site_parameter_display_config_reaches_a_reader() {
         configured["decimal_places"],
         json!(1),
         "decimal_places stored: {configured}"
-    );
-    assert_eq!(
-        configured["units_name"],
-        json!("millimetres"),
-        "units_name stored: {configured}"
-    );
-    assert_eq!(
-        configured["units_min"],
-        json!(0.5),
-        "units_min stored: {configured}"
-    );
-    assert_eq!(
-        configured["units_max"],
-        json!(99.5),
-        "units_max stored: {configured}"
     );
     assert_eq!(
         configured["variable_mappings"], mappings,
@@ -375,21 +354,6 @@ async fn site_parameter_display_config_reaches_a_reader() {
         reloaded["decimal_places"],
         json!(1),
         "decimal_places round-trips: {reloaded}"
-    );
-    assert_eq!(
-        reloaded["units_name"],
-        json!("millimetres"),
-        "units_name round-trips: {reloaded}"
-    );
-    assert_eq!(
-        reloaded["units_min"],
-        json!(0.5),
-        "units_min round-trips: {reloaded}"
-    );
-    assert_eq!(
-        reloaded["units_max"],
-        json!(99.5),
-        "units_max round-trips: {reloaded}"
     );
     assert_eq!(
         reloaded["variable_mappings"], mappings,

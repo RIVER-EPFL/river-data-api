@@ -79,8 +79,8 @@ async fn test_janitor_fills_derived_gaps() {
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         r"INSERT INTO site_parameters
-            (id, site_id, parameter_id, name, sensor_type, display_units, is_active, entry_mode)
-          VALUES (gen_random_uuid(), $1, $2, $3, 'derived', 'mg/L', true, 'tool')",
+            (id, site_id, parameter_id, name, sensor_type, is_active, entry_mode)
+          VALUES (gen_random_uuid(), $1, $2, $3, 'derived', true, 'tool')",
         [
             site_id.into(),
             derived_param_uuid.into(),

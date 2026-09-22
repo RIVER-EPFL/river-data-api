@@ -326,7 +326,7 @@ pub(super) struct ParameterWithThreshold {
     pub(super) id: Uuid,
     pub(super) name: String,
     pub(super) sensor_type: String,
-    pub(super) display_units: Option<String>,
+    pub(super) units: Option<String>,
 }
 /// The site's breaching readings over a range, one row per violating instant
 /// (`parameter_id, time, value, severity`), unordered. `param_ids` `None` covers every slot the

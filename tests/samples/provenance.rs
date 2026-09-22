@@ -329,10 +329,10 @@ async fn a_save_to_a_slot_the_site_does_not_hold_is_refused_however_it_is_verifi
         &db,
         &format!(
             "INSERT INTO site_parameters \
-             (id, site_id, parameter_id, name, sensor_type, display_units, units_name, \
-              units_min, units_max, decimal_places, sample_interval_sec, is_active) \
+             (id, site_id, parameter_id, name, sensor_type, \
+              decimal_places, sample_interval_sec, is_active) \
              VALUES (gen_random_uuid(), '{SITE1_ID}', '{fresh}', 'Fresh analyte', 'grab', \
-                     'ppb', 'ppb', 0, 100, 2, 900, true)"
+                     2, 900, true)"
         ),
     )
     .await;

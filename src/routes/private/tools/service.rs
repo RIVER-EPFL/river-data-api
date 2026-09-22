@@ -329,6 +329,7 @@ pub(super) const ACTIVE_TOOL_SQL: &str = r"
 pub(super) struct StoredFormula {
     tool_script_id: Uuid,
     sources: serde_json::Value,
+    held: serde_json::Value,
     site_sources: serde_json::Value,
     code: String,
     name: String,
@@ -379,6 +380,18 @@ pub(super) fn row_to_active(row: &sea_orm::QueryResult) -> AppResult<ActiveTool>
 
 /// A jsonb array of `[name, name]` pairs as the pairs themselves. Both source lists are built the
 /// same way in SQL, so both are read the same way here.
+/// A jsonb array of names as a list of strings.
+pub(super) fn names(raw: &serde_json::Value) -> Vec<String> {
+    raw.as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub(super) fn name_pairs(raw: &serde_json::Value) -> Vec<(String, String)> {
     raw.as_array()
         .map(|pairs| {
@@ -409,7 +422,9 @@ pub async fn load_formulas<C: ConnectionTrait>(
 
 /// A step's `(variable, parameter code)` readings and its `(variable, site column)` readings, the
 /// two shapes a `PinnedFormula` carries them in.
-type StepSources = (Vec<(String, String)>, Vec<(String, String)>);
+/// A step's parameter sources, its site sources, and the variables among the first that are held
+/// rather than read at the instant (Q230).
+type StepSources = (Vec<(String, String)>, Vec<(String, String)>, Vec<String>);
 
 /// The steps the given calculations declare, as the same pairs their own formulas arrive in. One
 /// step declared by two calculations is one pair each.
@@ -443,6 +458,9 @@ async fn load_declared_steps<C: ConnectionTrait>(
     let mut by_formula: HashMap<Uuid, StepSources> = HashMap::new();
     for (row, parameter) in sources {
         let entry = by_formula.entry(row.derived_definition_id).or_default();
+        if row.alignment == derived::HOLD {
+            entry.2.push(row.variable_name.clone());
+        }
         if let Some(parameter) = parameter {
             entry.0.push((row.variable_name.clone(), parameter.code));
         }
@@ -453,6 +471,7 @@ async fn load_declared_steps<C: ConnectionTrait>(
     for pairs in by_formula.values_mut() {
         pairs.0.sort();
         pairs.1.sort();
+        pairs.2.sort();
     }
 
     let mut pairs = Vec::with_capacity(declarations.len());
@@ -460,10 +479,10 @@ async fn load_declared_steps<C: ConnectionTrait>(
         let Some(step) = steps.iter().find(|s| s.id == declaration.formula_id) else {
             continue;
         };
-        let (sources, site_sources) = by_formula
+        let (sources, site_sources, held) = by_formula
             .get(&step.id)
             .cloned()
-            .unwrap_or_else(|| (Vec::new(), Vec::new()));
+            .unwrap_or_else(|| (Vec::new(), Vec::new(), Vec::new()));
         pairs.push((
             declaration.tool_script_id,
             PinnedFormula {
@@ -474,6 +493,7 @@ async fn load_declared_steps<C: ConnectionTrait>(
                 ordinal: step.ordinal,
                 output_parameter_code: None,
                 sources,
+                held,
                 site_sources,
                 curve_slot: step.curve_slot.clone(),
                 per_replicate: step.per_replicate.clone(),
@@ -506,6 +526,12 @@ async fn load_own_formulas<C: ConnectionTrait>(
                           WHERE src.derived_definition_id = d.id),
                         '[]'::jsonb) AS sources,
                     COALESCE(
+                        (SELECT jsonb_agg(src.variable_name ORDER BY src.variable_name)
+                           FROM derived_parameter_sources src
+                          WHERE src.derived_definition_id = d.id
+                            AND src.alignment = 'hold'),
+                        '[]'::jsonb) AS held,
+                    COALESCE(
                         (SELECT jsonb_agg(jsonb_build_array(src.variable_name, src.site_property)
                                             ORDER BY src.variable_name)
                            FROM derived_parameter_sources src
@@ -523,6 +549,7 @@ async fn load_own_formulas<C: ConnectionTrait>(
     for row in &rows {
         let stored = StoredFormula::from_query_result(row, "")?;
         let sources = name_pairs(&stored.sources);
+        let held = names(&stored.held);
         let site_sources = name_pairs(&stored.site_sources);
         formulas.push((
             stored.tool_script_id,
@@ -534,6 +561,7 @@ async fn load_own_formulas<C: ConnectionTrait>(
                 ordinal: stored.ordinal,
                 output_parameter_code: stored.output_parameter_code,
                 sources,
+                held,
                 site_sources,
                 curve_slot: stored.curve_slot,
                 per_replicate: stored.per_replicate,
@@ -737,6 +765,7 @@ pub(crate) async fn resolve_constants(
         let subject = format!("constant:{}", constant.id);
         consumed.push(ConsumedInput {
             variable: constant.name.clone(),
+            alignment: None,
             kind: "constant".to_string(),
             revision: revisions.get(&subject).copied(),
             subject: Some(subject),
@@ -847,6 +876,7 @@ pub async fn resolve_site_inputs(
                 body.insert(s.target().to_string(), value.clone());
                 consumed.push(ConsumedInput {
                     variable: s.target().to_string(),
+                    alignment: None,
                     kind: "site".to_string(),
                     subject: Some(subject.clone()),
                     property: Some(s.property.clone()),
@@ -1181,6 +1211,7 @@ pub async fn resolve_event_inputs(
         body.insert(e.param.clone(), serde_json::json!(value));
         consumed.push(ConsumedInput {
             variable: e.param.clone(),
+            alignment: None,
             kind: kind.to_string(),
             subject: None,
             property: None,
@@ -1247,6 +1278,7 @@ pub async fn resolve_replicate_inputs(
         body.insert(param.name.clone(), serde_json::Value::Array(values.clone()));
         consumed.push(ConsumedInput {
             variable: param.name.clone(),
+            alignment: None,
             kind: "replicates".to_string(),
             subject: None,
             property: None,
@@ -1485,6 +1517,7 @@ pub async fn resolve_run(
                 };
                 consumed.push(ConsumedInput {
                     variable: slot.name.clone(),
+                    alignment: None,
                     kind: "curve".to_string(),
                     subject,
                     property: None,
@@ -1523,6 +1556,7 @@ pub async fn resolve_run(
                 // Supplied by the caller in the catalog's place: a value with no source row.
                 consumed.push(ConsumedInput {
                     variable: name.clone(),
+                    alignment: None,
                     kind: "constant".to_string(),
                     subject: None,
                     property: None,
@@ -1594,6 +1628,7 @@ async fn formula_revisions(
                 .map(|id| format!("calculation_formula:{id}"));
             ConsumedInput {
                 variable: f.code.clone(),
+                alignment: None,
                 kind: "step".to_string(),
                 revision: subject.as_ref().and_then(|s| revisions.get(s).copied()),
                 subject,
@@ -2143,6 +2178,9 @@ pub(crate) async fn pin_draft_formulas(
             ordinal: draft.ordinal,
             output_parameter_code: (!draft.intermediate).then(|| code.to_string()),
             sources,
+            // A draft runs at one instant it is given, so there is nothing to hold and no stored
+            // source row to declare it on.
+            held: Vec::new(),
             site_sources: resolved.site_properties,
             curve_slot: draft.curve_slot.clone().filter(|c| !c.trim().is_empty()),
             per_replicate: draft.per_replicate.clone().filter(|p| !p.trim().is_empty()),
@@ -2553,7 +2591,13 @@ pub fn manifest_json(
                 "kind": "number",
                 "required": false,
             }));
-            event_inputs.push(json!({ "param": variable, "parameter_code": parameter_code }));
+            let mut input = json!({ "param": variable, "parameter_code": parameter_code });
+            // Declared only when held: an input that says nothing is read at the instant, which
+            // is what every manifest written before Q230 meant.
+            if formula.held.iter().any(|v| v == variable) {
+                input["alignment"] = json!(derived::HOLD);
+            }
+            event_inputs.push(input);
         }
         for (variable, property) in &formula.site_sources {
             if seen.contains(variable) {

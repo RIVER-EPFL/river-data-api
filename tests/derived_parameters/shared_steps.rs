@@ -372,7 +372,6 @@ async fn a_step_shared_with_a_visit_calculation_computes_on_the_stream_too() {
             "sensor_type": "derived",
             "entry_mode": "tool",
             "cadence": "high",
-            "display_units": "mg/L",
         }),
         &token,
     )
