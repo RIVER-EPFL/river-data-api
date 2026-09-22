@@ -11,15 +11,16 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 use super::models::{
-    ActiveTool, AuditCounts, Engine, EventAudit, EventContext, EventRecompute, MissingConstant,
-    RecomputeOutcome, RecomputeScope, RunOutcome, RunTrace, ToolCalculation, ToolResult,
-    parse_manifest, run,
+    ActiveTool, AuditCounts, Engine, EventAudit, EventContext, EventPreview, EventRecompute,
+    MissingConstant, PreviewedValue, RecomputeOutcome, RecomputeScope, RunOutcome, RunTrace,
+    ToolCalculation, ToolResult, parse_manifest, run,
 };
+use super::staged::{StagedCell, StagedVisit};
 use super::service::{
-    ParameterCatalog, ResolvedRun, build, evaluate_with_trace, execute_resolved, formula_bindings,
-    list_active_tools, load_parameter_catalog, numbers_by_name, parse_pinned, resolve_event_inputs,
-    resolve_replicate_inputs, resolve_run, resolve_site_inputs, run_active_tool, run_fingerprint,
-    runner_runtime, served_spot_value_expr, stored_curves,
+    ParameterCatalog, ResolvedRun, VisitContext, build, evaluate_with_trace, execute_resolved,
+    formula_bindings, list_active_tools, load_parameter_catalog, numbers_by_name, parse_pinned,
+    resolve_event_inputs, resolve_replicate_inputs, resolve_run, resolve_site_inputs,
+    run_active_tool, run_fingerprint, runner_runtime, served_spot_value_expr, stored_curves,
 };
 use crate::common::AppState;
 use crate::error::{AppError, AppResult};
@@ -325,8 +326,21 @@ pub(super) async fn blob_at_event(
         .flatten())
 }
 
+/// The slot value a body carries to name the curve a stored snapshot recorded: the catalog curve
+/// by id where the run chose one, so a later edit of its coefficients is picked up, else the
+/// coefficients the run was given by hand.
+fn curve_slot_value(curve: &serde_json::Value) -> Option<serde_json::Value> {
+    if let Some(id) = curve.get("standard_curve_id").and_then(|v| v.as_str()) {
+        return Some(serde_json::json!({ "standard_curve_id": id }));
+    }
+    let slope = curve.get("slope")?.as_f64()?;
+    let intercept = curve.get("intercept")?.as_f64()?;
+    Some(serde_json::json!({ "slope": slope, "intercept": intercept }))
+}
+
 /// The request body for a run at this event: the prior run's stored inputs when one exists (minus
-/// the params the context re-resolves, so upstream changes propagate), plus the context fields.
+/// the params the context re-resolves, so upstream changes propagate) and the curve each slot was
+/// filled with, plus the context fields.
 pub(super) fn body_for_run(
     tool: &ActiveTool,
     event: &EventContext,
@@ -353,6 +367,24 @@ pub(super) fn body_for_run(
         }
         for s in &tool.manifest.site_inputs {
             body.remove(s.target());
+        }
+    }
+    // The curves live beside the inputs in the blob, never in them, so a recompute that carried
+    // the inputs alone left every curve slot unsupplied and skipped the formula reading it.
+    if let Some(snapshots) = prior_blob
+        .and_then(|b| b.get("curves"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for snapshot in snapshots {
+            let Some(name) = snapshot.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if !tool.manifest.curves.iter().any(|c| c.name == name) {
+                continue;
+            }
+            if let Some(value) = snapshot.get("curve").and_then(curve_slot_value) {
+                body.insert(name.to_string(), value);
+            }
         }
     }
     body.insert("site_id".into(), serde_json::json!(event.site_id));
@@ -479,9 +511,72 @@ pub async fn recompute_event(
     actor: &str,
 ) -> AppResult<RecomputeOutcome> {
     let event = load_event(&state.db, event_id).await?;
+    let mut staged = StagedVisit::default();
+    Ok(walk_event(state, &event, &mut staged, &Pass::Save { actor })
+        .await?
+        .outcome)
+}
+
+/// The same chain over the same visit, run against what the operator has typed and not saved, and
+/// storing none of it: no `tool_runs` row, no reading, no decision, no finding, no output slot and
+/// no job, so nothing a save could cite as provenance (Q212). Save is the only writer, and it runs
+/// the same walk.
+pub async fn preview_event(
+    state: &AppState,
+    event_id: Uuid,
+    cells: &[StagedCell],
+) -> AppResult<EventPreview> {
+    let event = load_event(&state.db, event_id).await?;
+    let mut staged =
+        StagedVisit::resolve(&state.db, event.site_id, event.collected_at, cells).await?;
+    let pass = walk_event(state, &event, &mut staged, &Pass::Preview).await?;
+    Ok(EventPreview {
+        site_id: event.site_id,
+        collected_at: event.collected_at,
+        outputs: pass.outputs,
+        calculations: pass.calculations,
+        skipped: pass.outcome.skipped,
+        not_applicable: pass.outcome.not_applicable,
+        unchanged: pass.outcome.unchanged,
+    })
+}
+
+/// What a pass of the chain does with what each run produces. Everything before that point is the
+/// same decision on both paths: the dependency order, applicability, the prior run's inputs, the
+/// pinned version, constants, curves, slot ownership, and every skip and refusal.
+pub(super) enum Pass<'a> {
+    /// For keeps: mint the run, save the outputs, raise and close the findings.
+    Save { actor: &'a str },
+    /// For the screen: keep the outputs in the staged overlay alone, so the tools downstream read
+    /// them, and write nothing.
+    Preview,
+}
+
+/// What one pass of the chain over a visit did.
+pub(super) struct ChainPass {
+    outcome: RecomputeOutcome,
+    /// One entry per tool that ran, in the order it ran.
+    calculations: Vec<ToolCalculation>,
+    /// The values the pass produced, by output slot and replicate.
+    outputs: Vec<PreviewedValue>,
+}
+
+async fn walk_event(
+    state: &AppState,
+    event: &EventContext,
+    staged: &mut StagedVisit,
+    pass: &Pass<'_>,
+) -> AppResult<ChainPass> {
+    let event = event.clone();
     let tools = list_active_tools(&state.db).await?;
     let catalog = load_parameter_catalog(&state.db, tools.iter().map(|t| &t.manifest)).await?;
     let order = dependency_order(&tools, &catalog)?;
+    let actor = match pass {
+        Pass::Save { actor } => *actor,
+        Pass::Preview => "",
+    };
+    let mut calculations: Vec<ToolCalculation> = Vec::new();
+    let mut previewed: Vec<PreviewedValue> = Vec::new();
 
     let mut outcome = RecomputeOutcome {
         readings_withdrawn: 0,
@@ -522,14 +617,21 @@ pub async fn recompute_event(
         let body_bytes = serde_json::to_vec(&serde_json::Value::Object(body))
             .map_err(|e| AppError::Internal(e.to_string()))?;
 
-        let resolved = match resolve_run(state, tool, &body_bytes, None, MissingConstant::Refuse)
-            .await
+        let resolved = match resolve_run(
+            state,
+            tool,
+            &body_bytes,
+            None,
+            MissingConstant::Refuse,
+            Some(&*staged),
+        )
+        .await
         {
             Ok(resolved) => resolved,
             Err(e) => match skip_reason(&e) {
                 Some(reason) => {
                     outcome.findings_raised +=
-                        record_skip(&state.db, &event, &tool.name, &saved_outputs, &reason).await?;
+                        note_skip(state, pass, &event, &tool.name, &saved_outputs, &reason).await?;
                     outcome.skipped.push((tool.name.clone(), reason));
                     continue;
                 }
@@ -547,18 +649,19 @@ pub async fn recompute_event(
             continue;
         }
 
-        let result = match execute_and_store_resolved(state, tool, resolved, actor, "chain").await {
+        let (calculation, run_id) = match execute_pass(state, pass, tool, resolved).await {
             Ok(result) => result,
             Err(e) => match skip_reason(&e) {
                 Some(reason) => {
                     outcome.findings_raised +=
-                        record_skip(&state.db, &event, &tool.name, &saved_outputs, &reason).await?;
+                        note_skip(state, pass, &event, &tool.name, &saved_outputs, &reason).await?;
                     outcome.skipped.push((tool.name.clone(), reason));
                     continue;
                 }
                 None => return Err(e),
             },
         };
+        calculations.push(calculation.clone());
 
         // The outputs the run produced, saved to their resolved parameters. A per-replicate
         // (array) output is saved one reading per index, inheriting the position of the variable
@@ -588,13 +691,15 @@ pub async fn recompute_event(
         // (Q172): the value stored at this visit stands and stays served, so the finding is the
         // only thing that says the calculation divided by zero.
         for (key, parameter_id) in &owned_outputs {
-            if !result.calculation.refused.iter().any(|r| r == key) {
+            if !calculation.refused.iter().any(|r| r == key) {
                 continue;
             }
-            let reason = skipped_reason(&result.calculation.skipped, key)
+            let reason = skipped_reason(&calculation.skipped, key)
                 .unwrap_or_else(|| "the result is not a finite number".to_string());
-            raise_skip(&state.db, &event, &tool.name, key, *parameter_id, &reason).await?;
-            outcome.findings_raised += 1;
+            if let Pass::Save { .. } = pass {
+                raise_skip(&state.db, &event, &tool.name, key, *parameter_id, &reason).await?;
+                outcome.findings_raised += 1;
+            }
             outcome
                 .skipped
                 .push((tool.name.clone(), format!("{key}: {reason}")));
@@ -604,7 +709,17 @@ pub async fn recompute_event(
         // value is withdrawn rather than left standing beside a run that did not produce it. A
         // person's ruling on the row is not overridden: those keep their value and their hold.
         for (key, parameter_id) in &owned_outputs {
-            if !result.calculation.cleared.iter().any(|c| c == key) {
+            if !calculation.cleared.iter().any(|c| c == key) {
+                continue;
+            }
+            if let Pass::Preview = pass {
+                staged.retract(*parameter_id);
+                previewed.push(PreviewedValue {
+                    output: key.clone(),
+                    parameter_id: *parameter_id,
+                    replicate_index: None,
+                    value: None,
+                });
                 continue;
             }
             let withdrawn = crate::common::bulk_write::guarded(&state.db, async |txn| {
@@ -643,7 +758,7 @@ pub async fn recompute_event(
         let readings: Vec<GrabSampleReading> = owned_outputs
             .iter()
             .flat_map(
-                |(key, parameter_id)| match result.calculation.results.get(key) {
+                |(key, parameter_id)| match calculation.results.get(key) {
                     Some(value) => {
                         readings_for_output(key, *parameter_id, value, event.collected_at)
                     }
@@ -657,12 +772,37 @@ pub async fn recompute_event(
             // would replace it with a vaguer one.
             let unexplained: Vec<(String, Uuid)> = saved_outputs
                 .iter()
-                .filter(|(key, _)| !result.calculation.refused.iter().any(|r| r == key))
+                .filter(|(key, _)| !calculation.refused.iter().any(|r| r == key))
                 .cloned()
                 .collect();
             outcome.findings_raised +=
-                record_skip(&state.db, &event, &tool.name, &unexplained, &reason).await?;
+                note_skip(state, pass, &event, &tool.name, &unexplained, &reason).await?;
             outcome.skipped.push((tool.name.clone(), reason));
+            continue;
+        }
+
+        // The preview stops here: the values it produced go into the overlay, so the tools
+        // downstream read what this run made rather than what the store still holds, and nothing
+        // is written. Everything below is the save.
+        if let Pass::Preview = pass {
+            for (key, parameter_id) in &owned_outputs {
+                let produced = readings
+                    .iter()
+                    .filter(|r| r.output.as_deref() == Some(key.as_str()))
+                    .map(|r| (r.replicate_index.unwrap_or(0), r.value))
+                    .collect::<Vec<_>>();
+                if produced.is_empty() {
+                    continue;
+                }
+                staged.take_output(*parameter_id, &produced);
+                previewed.extend(produced.iter().map(|(index, value)| PreviewedValue {
+                    output: key.clone(),
+                    parameter_id: *parameter_id,
+                    replicate_index: Some(*index),
+                    value: Some(*value),
+                }));
+            }
+            outcome.tools_run += 1;
             continue;
         }
 
@@ -679,7 +819,7 @@ pub async fn recompute_event(
         // The site declared the inputs, so it gets the column the run publishes (Q193). The slot
         // is minted needing review, so a manager confirms it from the site's Parameters tab.
         for (key, parameter_id) in &owned_outputs {
-            if declared.contains(parameter_id) || result.calculation.results.get(key).is_none() {
+            if declared.contains(parameter_id) || calculation.results.get(key).is_none() {
                 continue;
             }
             if crate::routes::private::site_parameters::service::mint_tool_slot(
@@ -710,7 +850,7 @@ pub async fn recompute_event(
             notes: None,
             mode: Some(GrabWriteMode::Replace),
             dry_run: false,
-            tool_run_id: Some(result.run_id),
+            tool_run_id: run_id,
             check_id: None,
             // The tool's manifest is read by the save path itself; nothing here overrides
             // the slot's declaration.
@@ -735,7 +875,7 @@ pub async fn recompute_event(
         }
         // A set whose other outputs saved takes none of the whole-tool skip arms, so the outputs
         // the engine refused are filed here, one per slot, under the reason it gave.
-        for skip in &result.calculation.skipped {
+        for skip in &calculation.skipped {
             let Some((output, reason)) = skipped_entry(skip) else {
                 continue;
             };
@@ -743,8 +883,9 @@ pub async fn recompute_event(
             else {
                 continue;
             };
-            outcome.findings_raised += record_skip(
-                &state.db,
+            outcome.findings_raised += note_skip(
+                state,
+                pass,
                 &event,
                 &tool.name,
                 &[(output.to_string(), *parameter_id)],
@@ -757,7 +898,49 @@ pub async fn recompute_event(
         }
     }
 
-    Ok(outcome)
+    Ok(ChainPass {
+        outcome,
+        calculations,
+        outputs: previewed,
+    })
+}
+
+/// Execute the resolved run under this pass. The save mints the `tool_runs` row the saved
+/// readings cite; the preview mints none, so no value it returns can be cited as provenance
+/// (Q212).
+async fn execute_pass(
+    state: &AppState,
+    pass: &Pass<'_>,
+    tool: &ActiveTool,
+    resolved: ResolvedRun,
+) -> AppResult<(ToolCalculation, Option<Uuid>)> {
+    match pass {
+        Pass::Save { actor } => {
+            let result = execute_and_store_resolved(state, tool, resolved, actor, "chain").await?;
+            Ok((result.calculation, Some(result.run_id)))
+        }
+        Pass::Preview => {
+            let outcome = execute_resolved(state, tool, resolved).await?;
+            let runtime = runner_runtime(state).await;
+            Ok((calculation_of(tool, runtime.as_ref(), outcome), None))
+        }
+    }
+}
+
+/// File the finding a skip owes, where the pass is the one that writes. A preview reports the same
+/// skip and files nothing.
+async fn note_skip(
+    state: &AppState,
+    pass: &Pass<'_>,
+    event: &EventContext,
+    tool: &str,
+    outputs: &[(String, Uuid)],
+    reason: &str,
+) -> AppResult<usize> {
+    match pass {
+        Pass::Save { .. } => record_skip(&state.db, event, tool, outputs, reason).await,
+        Pass::Preview => Ok(0),
+    }
 }
 
 pub(super) async fn events_in_scope(
@@ -1116,12 +1299,16 @@ pub(super) async fn inputs_exist(
     if site.is_err() {
         return Ok(false);
     }
+    let visit = VisitContext {
+        site_id: Some(event.site_id),
+        collected_at: Some(event.collected_at),
+        staged: None,
+    };
     resolve_event_inputs(
         &state.db,
         &tool.name,
         &tool.manifest,
-        Some(event.site_id),
-        Some(event.collected_at),
+        visit,
         &mut body,
         &mut consumed,
     )
@@ -1129,8 +1316,7 @@ pub(super) async fn inputs_exist(
     resolve_replicate_inputs(
         &state.db,
         &tool.manifest,
-        Some(event.site_id),
-        Some(event.collected_at),
+        visit,
         &mut body,
         &mut consumed,
     )

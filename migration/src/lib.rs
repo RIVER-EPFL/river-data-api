@@ -22,6 +22,7 @@ mod m20260917_000002_standard_curve_proposals;
 pub mod m20260921_000001_entity_revisions;
 mod m20260921_000002_given_up_parameter;
 mod m20260921_000003_tool_run_visit;
+mod m20260922_000001_formula_owner_or_step;
 
 pub struct Migrator;
 
@@ -64,6 +65,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260921_000001_entity_revisions::Migration),
             Box::new(m20260921_000002_given_up_parameter::Migration),
             Box::new(m20260921_000003_tool_run_visit::Migration),
+            Box::new(m20260922_000001_formula_owner_or_step::Migration),
         ]
     }
 }

@@ -88,7 +88,7 @@ async fn test_removed_tools_return_404() {
 
     // Tools and helper calculations dropped for lacking a portal counterpart:
     // the ion charge balance, the isotope excesses, Gran titration alkalinity,
-    // the standalone dry-CO2 correction, spectral slope, and percent organic.
+    // the dry-CO2 correction, spectral slope, and percent organic.
     for tool in [
         "ions",
         "isotopes",

@@ -214,7 +214,7 @@ pub mod version {
 }
 
 /// A calculation's result as the runner returned it, stored nowhere.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Clone, Debug, Serialize, utoipa::ToSchema)]
 pub struct ToolCalculation {
     pub tool: String,
     #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
@@ -2273,10 +2273,44 @@ pub struct ActivationRecord {
     pub activated_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Clone, Debug)]
 pub struct EventContext {
     pub id: Uuid,
     pub site_id: Uuid,
     pub collected_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One value the chain would produce at a visit, were the staged cells saved. `value` is absent
+/// where the calculation cleared the slot, which a save records as a withdrawal.
+#[derive(Clone, Debug, Serialize, utoipa::ToSchema)]
+pub struct PreviewedValue {
+    /// The manifest key the value came out of.
+    pub output: String,
+    pub parameter_id: Uuid,
+    #[schema(required)]
+    pub replicate_index: Option<i16>,
+    #[schema(required)]
+    pub value: Option<f64>,
+}
+
+/// What the calculation chain would produce at a visit, given what the operator has typed and not
+/// saved. Nothing in it is stored and nothing in it names a run: Save executes the same walk and
+/// mints the run the stored values cite (Q212).
+#[derive(Clone, Debug, Serialize, utoipa::ToSchema)]
+pub struct EventPreview {
+    pub site_id: Uuid,
+    pub collected_at: chrono::DateTime<chrono::Utc>,
+    pub outputs: Vec<PreviewedValue>,
+    /// One entry per calculation that ran, in the order it ran, with the inputs, constants,
+    /// curves and versions it consumed.
+    pub calculations: Vec<ToolCalculation>,
+    /// Calculations that did not run at this visit, as `(tool, reason)`.
+    pub skipped: Vec<(String, String)>,
+    /// Calculations the site declares nothing for.
+    pub not_applicable: Vec<String>,
+    /// Calculations whose stored run already consumed exactly this: the slot keeps the value it
+    /// holds.
+    pub unchanged: Vec<String>,
 }
 
 pub struct RecomputeOutcome {

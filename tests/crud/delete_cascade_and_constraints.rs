@@ -141,6 +141,8 @@ async fn delete_derived_definition_with_sources() {
     let (db, app, token) = setup().await;
 
     let def_name = format!("test_del_{}", uuid::Uuid::new_v4().simple());
+    let calculation =
+        crate::common::seed_formula_calculation(&db, &format!("{def_name}_set")).await;
     let (_, def) = crate::common::post_json_parse_with_token(
         &app,
         "/api/derived_parameters",
@@ -149,6 +151,7 @@ async fn delete_derived_definition_with_sources() {
             "name": "Delete Test",
             "units": "mg/L",
             "formula": "Dissolved_O2 * 0.032",
+            "tool_script_id": calculation,
         }),
         &token,
     )

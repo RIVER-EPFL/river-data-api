@@ -4,9 +4,9 @@
 use serde_json::json;
 use serial_test::serial;
 
-async fn setup() -> (axum::Router, String) {
+async fn setup() -> (sea_orm::DatabaseConnection, axum::Router, String) {
     let f = crate::common::seeded_app().await;
-    (f.app, f.token)
+    (f.db, f.app, f.token)
 }
 
 async fn parameter_named(app: &axum::Router, token: &str, code: &str) -> serde_json::Value {
@@ -24,9 +24,10 @@ async fn parameter_named(app: &axum::Router, token: &str, code: &str) -> serde_j
 #[tokio::test]
 #[serial]
 async fn a_formula_ticked_as_a_step_leaves_its_parameter_named_in_the_catalogue() {
-    let (app, token) = setup().await;
+    let (db, app, token) = setup().await;
     let code = "k1_step";
 
+    let calculation = crate::common::seed_formula_calculation(&db, "k1_step_set").await;
     let (status, body) = crate::common::post_json_with_token(
         &app,
         "/api/derived_parameters",
@@ -35,6 +36,7 @@ async fn a_formula_ticked_as_a_step_leaves_its_parameter_named_in_the_catalogue(
             "name": "Rate constant",
             "units": "1/s",
             "formula": "Turbidity * 2",
+            "tool_script_id": calculation,
         }),
         &token,
     )

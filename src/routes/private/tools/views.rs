@@ -45,9 +45,6 @@ use crate::routes::private::derived_parameters::models::definition as formula_en
 use crate::routes::private::derived_parameters::models::definition::{
     CalculationFormula, CalculationFormulaCreate, CalculationFormulaUpdate,
 };
-use crate::routes::private::derived_parameters::service::{
-    resolve_identifiers, validate_formula, variables_of,
-};
 
 /// List the active analytical tools with their full input/output manifests.
 ///
@@ -578,7 +575,7 @@ pub async fn draft_run_formulas(
             script.name, script.engine
         )));
     }
-    let formulas = pin_draft_formulas(&state.db, &payload.formulas).await?;
+    let formulas = super::service::pin_draft_formulas(&state.db, &payload.formulas).await?;
     let replicated = replicated_for(&state.db).await?;
     let manifest_value = manifest_json(
         &script.label,
@@ -630,75 +627,8 @@ pub async fn draft_run_formulas(
     }))
 }
 
-/// The draft set as the engine reads a stored one: each formula parsed and its variables resolved
-/// against the catalog. A variable naming another draft's code is that formula's output, which a
-/// save would mint as a parameter of the same code, so it is a source of that code without a
-/// catalog row to prove it. A draft's own output is likewise the parameter its code would mint.
-async fn pin_draft_formulas(
-    db: &sea_orm::DatabaseConnection,
-    drafts: &[super::models::DraftFormula],
-) -> AppResult<Vec<super::models::PinnedFormula>> {
-    let codes: Vec<String> = drafts.iter().map(|d| d.code.trim().to_string()).collect();
-    // A step of the set stores nothing and reaches the formulas after it from the run, so it is
-    // no source: recording it as one sends the evaluation looking for a reading of it.
-    let steps: Vec<String> = drafts
-        .iter()
-        .filter(|d| d.intermediate)
-        .map(|d| d.code.trim().to_string())
-        .collect();
-    let refused = |code: &str, e: crudcrate::ApiError| {
-        AppError::BadRequest(format!("{code}: {}", api_message(e)))
-    };
-    let mut formulas = Vec::with_capacity(drafts.len());
-    for draft in drafts {
-        let code = draft.code.trim();
-        if code.is_empty() {
-            return Err(AppError::BadRequest("a formula needs a code".to_string()));
-        }
-        validate_formula(&draft.formula).map_err(|e| refused(code, e))?;
-        let (produced, external): (Vec<String>, Vec<String>) =
-            variables_of(&draft.formula, draft.curve_slot.as_deref())
-                .map_err(|e| refused(code, e))?
-                .into_iter()
-                .partition(|v| v != code && codes.contains(v));
-        let resolved = resolve_identifiers(db, &external)
-            .await
-            .map_err(|e| refused(code, e))?;
-        let mut sources: Vec<(String, String)> = resolved
-            .parameters
-            .into_iter()
-            .map(|(variable, _)| (variable.clone(), variable))
-            .chain(
-                produced
-                    .into_iter()
-                    .filter(|v| !steps.contains(v))
-                    .map(|v| (v.clone(), v)),
-            )
-            .collect();
-        sources.sort();
-        formulas.push(super::models::PinnedFormula {
-            code: code.to_string(),
-            label: draft
-                .name
-                .clone()
-                .filter(|n| !n.trim().is_empty())
-                .unwrap_or_else(|| code.to_string()),
-            units: draft.units.clone().filter(|u| !u.trim().is_empty()),
-            formula: draft.formula.clone(),
-            ordinal: draft.ordinal,
-            output_parameter_code: (!draft.intermediate).then(|| code.to_string()),
-            sources,
-            site_sources: resolved.site_properties,
-            curve_slot: draft.curve_slot.clone().filter(|c| !c.trim().is_empty()),
-            per_replicate: draft.per_replicate.clone().filter(|p| !p.trim().is_empty()),
-            intermediate: draft.intermediate,
-        });
-    }
-    Ok(formulas)
-}
-
 /// The message a refused formula carries, without the status prefix the error type adds.
-fn api_message(e: crudcrate::ApiError) -> String {
+pub(super) fn api_message(e: crudcrate::ApiError) -> String {
     match e {
         crudcrate::ApiError::BadRequest { message } => message,
         other => AppError::from(other).to_string(),

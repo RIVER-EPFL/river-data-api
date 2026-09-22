@@ -88,12 +88,15 @@ async fn test_continuous_derived_recompute_after_ingest() {
     let site_id = Uuid::parse_str(crate::common::SITE1_ID).unwrap();
 
     let derived_name = format!("dom_test_{}", Uuid::new_v4().simple());
+    let calculation =
+        crate::common::seed_formula_calculation(&db, &format!("{derived_name}_set")).await;
     let create_body = serde_json::json!({
         "code": derived_name,
         "name": "Test DO mg/L",
         "units": "mg/L",
         "formula": "Dissolved_O2 * 0.032",
         "description": "Continuous recompute test fixture",
+        "tool_script_id": calculation,
     });
     let (status, def_json) = crate::common::post_json_parse_with_token(
         &app,
@@ -206,11 +209,14 @@ async fn test_recompute_endpoint_backfills_historical_gap() {
     let site_id = Uuid::parse_str(crate::common::SITE1_ID).unwrap();
 
     let derived_name = format!("dom_backfill_{}", Uuid::new_v4().simple());
+    let calculation =
+        crate::common::seed_formula_calculation(&db, &format!("{derived_name}_set")).await;
     let create_body = serde_json::json!({
         "code": derived_name,
         "name": "Backfill DO mg/L",
         "units": "mg/L",
         "formula": "Dissolved_O2 * 0.032",
+        "tool_script_id": calculation,
     });
     let (status, def_json) = crate::common::post_json_parse_with_token(
         &app,
@@ -269,7 +275,7 @@ async fn test_recompute_endpoint_backfills_historical_gap() {
     );
 }
 
-/// Scenario: a standalone definition names a constant beside its source parameter, the shape the
+/// Scenario: a calculation's formula names a constant beside its source parameter, the shape the
 /// portal's "constant when the visit holds none" fallback takes.
 ///
 /// Expected behaviour: the constant is bound from the constants table and the derived reading
@@ -290,6 +296,8 @@ async fn test_continuous_derived_binds_a_constant_by_name() {
     .await;
 
     let derived_name = format!("do_scaled_{}", Uuid::new_v4().simple());
+    let calculation =
+        crate::common::seed_formula_calculation(&db, &format!("{derived_name}_set")).await;
     let (status, def_json) = crate::common::post_json_parse_with_token(
         &app,
         "/api/derived_parameters",
@@ -298,6 +306,7 @@ async fn test_continuous_derived_binds_a_constant_by_name() {
             "name": "Test DO scaled by constant",
             "units": "mg/L",
             "formula": "coalesce(Dissolved_O2, do_scale_factor) * do_scale_factor",
+            "tool_script_id": calculation,
         }),
         &token,
     )
@@ -376,7 +385,10 @@ async fn na_clears_the_value_the_formula_no_longer_produces_and_a_divide_by_zero
         let formula = formula.to_string();
         let app = app.clone();
         let token = token.clone();
+        let db = db.clone();
         async move {
+            let calculation =
+                crate::common::seed_formula_calculation(&db, &format!("{code}_set")).await;
             let (status, def) = crate::common::post_json_parse_with_token(
                 &app,
                 "/api/derived_parameters",
@@ -386,6 +398,7 @@ async fn na_clears_the_value_the_formula_no_longer_produces_and_a_divide_by_zero
                     "units": "1/mg",
                     "formula": formula,
                     "description": "Non-finite arms fixture",
+                    "tool_script_id": calculation,
                 }),
                 &token,
             )

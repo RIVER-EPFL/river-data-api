@@ -53,11 +53,14 @@ async fn test_janitor_fills_derived_gaps() {
     let site_id = Uuid::parse_str(crate::common::SITE1_ID).unwrap();
 
     let derived_name = format!("janitor_test_{}", Uuid::new_v4().simple());
+    let calculation =
+        crate::common::seed_formula_calculation(&db, &format!("{derived_name}_set")).await;
     let create_body = serde_json::json!({
         "code": derived_name,
         "name": "Janitor test mg/L",
         "units": "mg/L",
         "formula": "Dissolved_O2 * 0.032",
+        "tool_script_id": calculation,
     });
     let (status, def_json) = crate::common::post_json_parse_with_token(
         &app,

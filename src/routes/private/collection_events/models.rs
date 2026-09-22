@@ -81,6 +81,15 @@ pub struct StageEventRequest {
     pub notes: Option<String>,
 }
 
+/// The cells an operator has typed at a visit and not saved. A cell the request leaves out is one
+/// nobody touched, and reads from the store.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewEventRequest {
+    #[serde(default)]
+    pub staged: Vec<crate::routes::private::tools::staged::StagedCell>,
+}
+
 /// One visit of a field day: a site and the instant it was sampled.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]

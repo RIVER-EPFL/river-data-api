@@ -806,9 +806,10 @@ async fn a_per_replicate_chain_is_walkable_in_both_directions() {
 #[tokio::test]
 #[serial]
 async fn a_consumed_input_opens_the_reading_it_was_read_from() {
-    let (_db, app, token) = setup().await;
+    let (db, app, token) = setup().await;
 
     let code = format!("consumed_{}", uuid::Uuid::new_v4().simple());
+    let calculation = crate::common::seed_formula_calculation(&db, &format!("{code}_set")).await;
     let (status, def) = crate::common::post_json_parse_with_token(
         &app,
         "/api/derived_parameters",
@@ -817,6 +818,7 @@ async fn a_consumed_input_opens_the_reading_it_was_read_from() {
             "name": "Consumed input fixture",
             "units": "mg/L",
             "formula": "Dissolved_O2 * 2",
+            "tool_script_id": calculation,
         }),
         &token,
     )

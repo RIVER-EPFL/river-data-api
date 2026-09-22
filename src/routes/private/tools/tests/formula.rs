@@ -1475,3 +1475,99 @@ fn test_a_reducer_over_an_expression_is_refused() {
     .expect_err("the expression names a function nothing defines");
     assert!(err.contains("avg"), "{err}");
 }
+
+// --- M300, the portal's uncorrected path ---
+
+fn co2_corr(expr: &str) -> Vec<PinnedFormula> {
+    vec![with_curve(
+        formula("co2_corr", 1, expr, Some("co2_corr"), &[("ppm", "co2_ppm")]),
+        "vaisala",
+    )]
+}
+
+#[test]
+fn test_a_guarded_curve_reads_the_raw_value_when_no_curve_is_on_file() {
+    let results = evaluate(
+        &co2_corr("coalesce(ppm * curve_slope + curve_intercept, ppm)"),
+        &inputs(&[("ppm", 400.0)]),
+        &HashMap::new(),
+        &curves(&[]),
+    )
+    .expect("the guarded form evaluates with no curve");
+    assert_eq!(results[0].skipped, None);
+    assert!((results[0].value.unwrap() - 400.0).abs() < 1e-12);
+}
+
+#[test]
+fn test_a_guarded_curve_still_corrects_when_one_is_chosen() {
+    let results = evaluate(
+        &co2_corr("coalesce(ppm * curve_slope + curve_intercept, ppm)"),
+        &inputs(&[("ppm", 400.0)]),
+        &HashMap::new(),
+        &curves(&[("vaisala", 2.0, 5.0)]),
+    )
+    .expect("the chosen curve resolves");
+    // 400 * 2 + 5
+    assert!((results[0].value.unwrap() - 805.0).abs() < 1e-12);
+    assert_eq!(results[0].curve_slot.as_deref(), Some("vaisala"));
+}
+
+#[test]
+fn test_an_unguarded_curve_still_skips_when_none_is_supplied() {
+    let results = evaluate(
+        &co2_corr("ppm * curve_slope + curve_intercept"),
+        &inputs(&[("ppm", 400.0)]),
+        &HashMap::new(),
+        &curves(&[]),
+    )
+    .expect("the set evaluates");
+    let reason = results[0].skipped.as_deref().expect("co2_corr is skipped");
+    assert!(reason.contains("vaisala"), "{reason}");
+}
+
+#[test]
+fn test_one_guarded_coefficient_is_not_enough_to_evaluate_without_a_curve() {
+    let results = evaluate(
+        &co2_corr("coalesce(ppm * curve_slope, ppm) + curve_intercept"),
+        &inputs(&[("ppm", 400.0)]),
+        &HashMap::new(),
+        &curves(&[]),
+    )
+    .expect("the set evaluates");
+    let reason = results[0].skipped.as_deref().expect("co2_corr is skipped");
+    assert!(reason.contains("vaisala"), "{reason}");
+}
+
+/// A step whose own input is missing produces nothing, and the formulas naming it are skipped
+/// like any formula whose input does not resolve (M109); the rest of the set still runs.
+#[test]
+fn test_a_step_that_produced_nothing_skips_its_readers_and_leaves_the_set_running() {
+    let mut step = formula("k_h", 0, "t + 1", None, &[("t", "water_temp")]);
+    step.intermediate = true;
+    let reader = formula("co2", 1, "k_h * 2", Some("co2"), &[]);
+    let other = formula("ph", 2, "a * 3", Some("ph"), &[("a", "alkalinity")]);
+
+    let results = run(&[step, reader, other], &inputs(&[("a", 4.0)]));
+    assert_eq!(value_of(&results, "k_h"), None);
+    assert_eq!(value_of(&results, "co2"), None);
+    let skipped = results
+        .iter()
+        .find(|e| e.code == "co2")
+        .expect("the reader is reported")
+        .skipped
+        .clone()
+        .expect("the reader says why");
+    assert!(skipped.contains("k_h"), "{skipped}");
+    assert_eq!(value_of(&results, "ph"), Some(12.0), "12.0 = 4.0 * 3");
+}
+
+/// A step read only through a guard is NA rather than a skip, the arm the portal's fallbacks take.
+#[test]
+fn test_a_step_read_only_through_a_guard_is_na_rather_than_a_skip() {
+    let mut step = formula("k_h", 0, "t + 1", None, &[("t", "water_temp")]);
+    step.intermediate = true;
+    let reader = formula("co2", 1, "coalesce(k_h, 7)", Some("co2"), &[]);
+
+    let results = run(&[step, reader], &inputs(&[]));
+    assert_eq!(value_of(&results, "co2"), Some(7.0));
+}

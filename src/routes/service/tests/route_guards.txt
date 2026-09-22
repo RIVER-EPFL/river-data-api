@@ -33,6 +33,7 @@
 /collection_events/stage => require_enter_field_data
 /collection_events/stage_many => require_enter_field_data
 /collection_events/{id}/detail => require_read_data
+/collection_events/{id}/preview => require_write_data
 /collection_events/{id}/recompute => require_write_data
 /commands/{id} => -
 /credentials => require_admin

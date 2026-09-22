@@ -8,14 +8,19 @@ use crate::common::e2e;
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 
-/// Create the DOmgL derived definition over the seeded Dissolved_O2 source; returns (def_id, output_param_id).
-async fn create_derived(app: &axum::Router, token: &str) -> (String, String) {
+/// Create the DOmgL formula over the seeded Dissolved_O2 source; returns (def_id, output_param_id).
+async fn create_derived(
+    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    token: &str,
+) -> (String, String) {
+    let calculation = crate::common::seed_formula_calculation(db, "domgl_e2e_set").await;
     let (status, def) = crate::common::post_json_parse_with_token(
         app,
         "/api/derived_parameters",
         &serde_json::json!({
             "code": "DOmgL_e2e", "name": "DO mg/L (e2e)", "units": "mg/L",
-            "formula": "Dissolved_O2 * 0.032",
+            "formula": "Dissolved_O2 * 0.032", "tool_script_id": calculation,
         }),
         token,
     )
@@ -42,7 +47,7 @@ async fn derived_definition_populates_sources_and_assigns() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (def_id, output_param_id) = create_derived(&app, &token).await;
+    let (def_id, output_param_id) = create_derived(&db, &app, &token).await;
 
     // WS1c: the join populates `sources` on GET-by-id AND in the list endpoint.
     let (_s, got) = crate::common::get_json_with_token(
@@ -102,7 +107,7 @@ async fn derived_assignment_backfills_and_publishes() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (def_id, output_param_id) = create_derived(&app, &token).await;
+    let (def_id, output_param_id) = create_derived(&db, &app, &token).await;
 
     let (status, sp) = crate::common::post_json_parse_with_token(
         &app,
@@ -213,7 +218,7 @@ async fn an_unrelated_sites_import_does_not_suppress_the_assignment_backfill() {
     let app = crate::common::build_test_app(db.clone());
     insert_running_job(&db, "csv_import", crate::common::SITE2_ID).await;
 
-    let (def_id, output_param_id) = create_derived(&app, &token).await;
+    let (def_id, output_param_id) = create_derived(&db, &app, &token).await;
     let (status, sp) = crate::common::post_json_parse_with_token(
         &app,
         "/api/site_parameters",
@@ -253,7 +258,7 @@ async fn the_same_definitions_in_flight_backfill_is_not_duplicated() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (def_id, output_param_id) = create_derived(&app, &token).await;
+    let (def_id, output_param_id) = create_derived(&db, &app, &token).await;
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO reprocessing_jobs \
@@ -303,7 +308,7 @@ async fn a_site_that_does_not_declare_the_slot_computed_is_left_alone() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (_def_id, output_param_id) = create_derived(&app, &token).await;
+    let (_def_id, output_param_id) = create_derived(&db, &app, &token).await;
 
     // The second site holds the same output parameter as an ordinary slot, entered by hand.
     let (status, other) = crate::common::post_json_parse_with_token(
@@ -388,7 +393,7 @@ async fn flagging_a_source_reading_withdraws_the_derived_value_it_fed() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (_def_id, output_param_id) = create_derived(&app, &token).await;
+    let (_def_id, output_param_id) = create_derived(&db, &app, &token).await;
     let (status, sp) = crate::common::post_json_parse_with_token(
         &app,
         "/api/site_parameters",

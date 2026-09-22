@@ -66,17 +66,20 @@ async fn delete_with_token(app: &axum::Router, uri: &str, token: &str) -> (u16, 
 
 /// Create a derived parameter and return its id (for cleanup).
 async fn create_derived_param(
+    db: &sea_orm::DatabaseConnection,
     app: &axum::Router,
     token: &str,
     name: &str,
     formula: &str,
 ) -> (u16, serde_json::Value) {
+    let calculation = crate::common::seed_formula_calculation(db, &format!("{name}_set")).await;
     let body = serde_json::json!({
         "code": name,
         "name": format!("Test {name}"),
         "units": "test_units",
         "formula": formula,
-        "description": "Auto-created by test"
+        "description": "Auto-created by test",
+        "tool_script_id": calculation,
     });
     let (status, text) =
         crate::common::post_json_with_token(app, "/api/derived_parameters", &body, token).await;
@@ -100,11 +103,11 @@ async fn cleanup_derived_param(app: &axum::Router, token: &str, id: &str) {
 #[tokio::test]
 #[serial]
 async fn test_get_derived_parameter_populates_sources() {
-    let (_db, app, token) = setup().await;
+    let (db, app, token) = setup().await;
     let name = format!("get_sources_{}", uuid::Uuid::new_v4());
 
     let (status, created) =
-        create_derived_param(&app, &token, &name, "Turbidity + Dissolved_O2").await;
+        create_derived_param(&db, &app, &token, &name, "Turbidity + Dissolved_O2").await;
     assert!(
         (200..300).contains(&status),
         "create failed {status}: {created}"
@@ -161,11 +164,17 @@ async fn test_get_derived_parameter_populates_sources() {
 #[tokio::test]
 #[serial]
 async fn test_create_derived_parameter_valid_formula() {
-    let (_db, app, token) = setup().await;
+    let (db, app, token) = setup().await;
     let name = format!("valid_formula_{}", uuid::Uuid::new_v4());
 
-    let (status, json) =
-        create_derived_param(&app, &token, &name, "sqrt(Turbidity) * 2 + Dissolved_O2").await;
+    let (status, json) = create_derived_param(
+        &db,
+        &app,
+        &token,
+        &name,
+        "sqrt(Turbidity) * 2 + Dissolved_O2",
+    )
+    .await;
 
     assert!(
         (200..300).contains(&status),
@@ -217,10 +226,10 @@ async fn test_create_derived_parameter_valid_formula() {
 #[tokio::test]
 #[serial]
 async fn test_create_derived_parameter_invalid_formula() {
-    let (_db, app, token) = setup().await;
+    let (db, app, token) = setup().await;
     let name = format!("invalid_formula_{}", uuid::Uuid::new_v4());
 
-    let (status, _json) = create_derived_param(&app, &token, &name, "sqrt(").await;
+    let (status, _json) = create_derived_param(&db, &app, &token, &name, "sqrt(").await;
 
     assert_eq!(status, 400, "Invalid formula should return 400");
 }
@@ -232,10 +241,10 @@ async fn test_create_derived_parameter_invalid_formula() {
 #[tokio::test]
 #[serial]
 async fn test_create_derived_parameter_constants_only() {
-    let (_db, app, token) = setup().await;
+    let (db, app, token) = setup().await;
     let name = format!("constants_only_{}", uuid::Uuid::new_v4());
 
-    let (status, json) = create_derived_param(&app, &token, &name, "pi * 2 + 1").await;
+    let (status, json) = create_derived_param(&db, &app, &token, &name, "pi * 2 + 1").await;
 
     assert!(
         (200..300).contains(&status),
@@ -260,11 +269,11 @@ async fn test_create_derived_parameter_constants_only() {
 #[tokio::test]
 #[serial]
 async fn test_update_derived_parameter_formula() {
-    let (_db, app, token) = setup().await;
+    let (db, app, token) = setup().await;
     let name = format!("update_formula_{}", uuid::Uuid::new_v4());
 
     // Create with initial formula
-    let (status, json) = create_derived_param(&app, &token, &name, "Turbidity * 2").await;
+    let (status, json) = create_derived_param(&db, &app, &token, &name, "Turbidity * 2").await;
     assert!(
         (200..300).contains(&status),
         "Create should succeed: {json}"
@@ -329,7 +338,7 @@ async fn a_refused_update_stores_neither_the_formula_nor_its_sources() {
     let (db, app, token) = setup().await;
     let name = format!("refused_update_{}", uuid::Uuid::new_v4());
 
-    let (status, json) = create_derived_param(&app, &token, &name, "Turbidity * 2").await;
+    let (status, json) = create_derived_param(&db, &app, &token, &name, "Turbidity * 2").await;
     assert!(
         (200..300).contains(&status),
         "Create should succeed: {json}"
@@ -446,10 +455,11 @@ async fn test_preview_derived_invalid_formula() {
 #[tokio::test]
 #[serial]
 async fn test_formula_nonexistent_parameter_returns_400() {
-    let (_db, app, token) = setup().await;
+    let (db, app, token) = setup().await;
     let name = format!("nonexistent_param_{}", uuid::Uuid::new_v4());
 
-    let (status, json) = create_derived_param(&app, &token, &name, "NonexistentParam * 2").await;
+    let (status, json) =
+        create_derived_param(&db, &app, &token, &name, "NonexistentParam * 2").await;
 
     assert_eq!(
         status, 400,
@@ -464,7 +474,7 @@ async fn test_formula_nonexistent_parameter_returns_400() {
 #[tokio::test]
 #[serial]
 async fn test_formula_injection_attempt() {
-    let (_db, app, token) = setup().await;
+    let (db, app, token) = setup().await;
 
     let malicious_formulas = vec![
         "std::process::exit(1)",
@@ -476,7 +486,7 @@ async fn test_formula_injection_attempt() {
 
     for formula in malicious_formulas {
         let name = format!("injection_{}", uuid::Uuid::new_v4());
-        let (status, json) = create_derived_param(&app, &token, &name, formula).await;
+        let (status, json) = create_derived_param(&db, &app, &token, &name, formula).await;
 
         // meval should reject as unparseable (400) or strict validation rejects
         // unknown variable names (400). Either way, not 500.
@@ -583,7 +593,7 @@ async fn a_formula_naming_a_site_column_stores_it_as_a_site_source() {
     let (db, app, token) = setup().await;
     let name = format!("site_source_{}", uuid::Uuid::new_v4());
 
-    let (status, json) = create_derived_param(&app, &token, &name, "altitude_m * 2").await;
+    let (status, json) = create_derived_param(&db, &app, &token, &name, "altitude_m * 2").await;
     assert!(
         (200..300).contains(&status),
         "a site column is a source, not an unknown identifier: {status} {json}"
@@ -623,10 +633,10 @@ async fn a_formula_naming_a_site_column_stores_it_as_a_site_source() {
 #[tokio::test]
 #[serial]
 async fn a_formula_naming_nothing_at_all_is_still_refused() {
-    let (_db, app, token) = setup().await;
+    let (db, app, token) = setup().await;
     let name = format!("unknown_source_{}", uuid::Uuid::new_v4());
 
-    let (status, json) = create_derived_param(&app, &token, &name, "not_a_thing * 2").await;
+    let (status, json) = create_derived_param(&db, &app, &token, &name, "not_a_thing * 2").await;
     assert_eq!(status, 400, "{json}");
     let message = json.to_string();
     assert!(

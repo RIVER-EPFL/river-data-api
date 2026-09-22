@@ -1710,16 +1710,14 @@ pub struct EventRef {
     pub created_by: Option<String>,
 }
 
-/// The standalone formula behind a derived value: the definition it belongs to and the version it
-/// was made with. A row stored before versioning names no version, so `formula` is absent rather
-/// than filled from the definition's current text, which no longer describes it.
+/// The formula behind a derived value: the calculation it belongs to and the version it was made
+/// with. A row naming no version reports no formula, because the text that produced it is not
+/// recoverable from the definition's current one (M134).
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CalculationInfo {
     pub definition_id: Uuid,
-    /// The calculation the formula belongs to, absent for a standalone derived parameter.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub tool_script_id: Option<Uuid>,
+    /// The calculation the formula belongs to.
+    pub tool_script_id: Uuid,
     pub code: String,
     pub name: String,
     /// The version the stored value names, absent when the value predates versioning.
@@ -1735,7 +1733,7 @@ pub struct CalculationInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub content_hash: Option<String>,
-    /// The definition's newest version, so a value made by an older one is visible as such.
+    /// The calculation's newest version, so a value made by an older one is visible as such.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub active_version_no: Option<i32>,
@@ -1936,7 +1934,7 @@ pub struct ConsumerRef {
     pub definition_id: Uuid,
     pub formula_code: String,
     pub formula_name: String,
-    /// The calculation the formula belongs to, absent on a standalone derived parameter.
+    /// The calculation the formula belongs to, absent on a shared step, which belongs to none.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub calculation: Option<String>,
@@ -2025,16 +2023,6 @@ impl From<&HoldRow> for HoldRef {
             tool: row.tool.clone(),
         }
     }
-}
-
-#[derive(FromQueryResult)]
-pub(super) struct DefinitionRow {
-    pub(super) id: Uuid,
-    pub(super) code: String,
-    pub(super) name: String,
-    pub(super) output_parameter_id: Option<Uuid>,
-    pub(super) tool_script_id: Option<Uuid>,
-    pub(super) active_version_no: Option<i32>,
 }
 
 #[derive(FromQueryResult)]

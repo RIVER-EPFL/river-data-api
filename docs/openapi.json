@@ -2704,7 +2704,7 @@
             "type": "array"
           },
           "tool_script_id": {
-            "description": "The calculation this formula belongs to (M67). NULL is a standalone derived parameter, the\nper-reading continuous kind the derived job and janitor serve.",
+            "description": "The calculation this formula belongs to (M67). NULL is a shared step, owned by no\ncalculation and declared by each that reads it (Q156).",
             "format": "uuid",
             "type": [
               "string",
@@ -2815,7 +2815,7 @@
             "type": "array"
           },
           "tool_script_id": {
-            "description": "The calculation this formula belongs to (M67). NULL is a standalone derived parameter, the\nper-reading continuous kind the derived job and janitor serve.",
+            "description": "The calculation this formula belongs to (M67). NULL is a shared step, owned by no\ncalculation and declared by each that reads it (Q156).",
             "format": "uuid",
             "type": [
               "string",
@@ -2980,10 +2980,10 @@
         "type": "object"
       },
       "CalculationInfo": {
-        "description": "The standalone formula behind a derived value: the definition it belongs to and the version it\nwas made with. A row stored before versioning names no version, so `formula` is absent rather\nthan filled from the definition's current text, which no longer describes it.",
+        "description": "The formula behind a derived value: the calculation it belongs to and the version it was made\nwith. A row naming no version reports no formula, because the text that produced it is not\nrecoverable from the definition's current one (M134).",
         "properties": {
           "active_version_no": {
-            "description": "The definition's newest version, so a value made by an older one is visible as such.",
+            "description": "The calculation's newest version, so a value made by an older one is visible as such.",
             "format": "int32",
             "type": "integer"
           },
@@ -3004,7 +3004,7 @@
             "type": "string"
           },
           "tool_script_id": {
-            "description": "The calculation the formula belongs to, absent for a standalone derived parameter.",
+            "description": "The calculation the formula belongs to.",
             "format": "uuid",
             "type": "string"
           },
@@ -3020,6 +3020,7 @@
         },
         "required": [
           "definition_id",
+          "tool_script_id",
           "code",
           "name"
         ],
@@ -4465,7 +4466,7 @@
         "description": "One formula reading the record's parameter, with its output at the instant where one exists.",
         "properties": {
           "calculation": {
-            "description": "The calculation the formula belongs to, absent on a standalone derived parameter.",
+            "description": "The calculation the formula belongs to, absent on a shared step, which belongs to none.",
             "type": "string"
           },
           "definition_id": {
@@ -6106,7 +6107,11 @@
         "type": "object"
       },
       "DerivedSeries": {
+        "description": "What one formula of the set produced over the window. A step carries `intermediate`, so a\nreader can tell the value the set publishes from the working number that fed it.",
         "properties": {
+          "code": {
+            "type": "string"
+          },
           "errors": {
             "items": {
               "type": [
@@ -6119,8 +6124,17 @@
           "formula": {
             "type": "string"
           },
+          "intermediate": {
+            "type": "boolean"
+          },
           "name": {
             "type": "string"
+          },
+          "units": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "values": {
             "items": {
@@ -6134,8 +6148,11 @@
           }
         },
         "required": [
+          "code",
           "name",
+          "units",
           "formula",
+          "intermediate",
           "values",
           "errors"
         ],
@@ -6726,6 +6743,72 @@
           "unverified",
           "recompute",
           "cells"
+        ],
+        "type": "object"
+      },
+      "EventPreview": {
+        "description": "What the calculation chain would produce at a visit, given what the operator has typed and not\nsaved. Nothing in it is stored and nothing in it names a run: Save executes the same walk and\nmints the run the stored values cite (Q212).",
+        "properties": {
+          "calculations": {
+            "description": "One entry per calculation that ran, in the order it ran, with the inputs, constants,\ncurves and versions it consumed.",
+            "items": {
+              "$ref": "#/components/schemas/ToolCalculation"
+            },
+            "type": "array"
+          },
+          "collected_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "not_applicable": {
+            "description": "Calculations the site declares nothing for.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/components/schemas/PreviewedValue"
+            },
+            "type": "array"
+          },
+          "site_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "skipped": {
+            "description": "Calculations that did not run at this visit, as `(tool, reason)`.",
+            "items": {
+              "items": false,
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "unchanged": {
+            "description": "Calculations whose stored run already consumed exactly this: the slot keeps the value it\nholds.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "site_id",
+          "collected_at",
+          "outputs",
+          "calculations",
+          "skipped",
+          "not_applicable",
+          "unchanged"
         ],
         "type": "object"
       },
@@ -15373,8 +15456,12 @@
             "format": "date-time",
             "type": "string"
           },
-          "formula": {
-            "type": "string"
+          "formulas": {
+            "description": "The set as the editor holds it, steps included. One formula is a set of one.",
+            "items": {
+              "$ref": "#/components/schemas/DraftFormula"
+            },
+            "type": "array"
           },
           "site_id": {
             "format": "uuid",
@@ -15386,7 +15473,7 @@
           }
         },
         "required": [
-          "formula",
+          "formulas",
           "site_id",
           "start",
           "end"
@@ -15395,8 +15482,12 @@
       },
       "PreviewDerivedResponse": {
         "properties": {
-          "derived": {
-            "$ref": "#/components/schemas/DerivedSeries"
+          "formulas": {
+            "description": "One series per formula of the set, steps included, in the order the set evaluates.",
+            "items": {
+              "$ref": "#/components/schemas/DerivedSeries"
+            },
+            "type": "array"
           },
           "site": {
             "$ref": "#/components/schemas/PreviewSite"
@@ -15419,8 +15510,21 @@
           "site",
           "times",
           "source_parameters",
-          "derived"
+          "formulas"
         ],
+        "type": "object"
+      },
+      "PreviewEventRequest": {
+        "additionalProperties": false,
+        "description": "The cells an operator has typed at a visit and not saved. A cell the request leaves out is one\nnobody touched, and reads from the store.",
+        "properties": {
+          "staged": {
+            "items": {
+              "$ref": "#/components/schemas/StagedCell"
+            },
+            "type": "array"
+          }
+        },
         "type": "object"
       },
       "PreviewInstant": {
@@ -15585,6 +15689,40 @@
           "n",
           "mean",
           "sd"
+        ],
+        "type": "object"
+      },
+      "PreviewedValue": {
+        "description": "One value the chain would produce at a visit, were the staged cells saved. `value` is absent\nwhere the calculation cleared the slot, which a save records as a withdrawal.",
+        "properties": {
+          "output": {
+            "description": "The manifest key the value came out of.",
+            "type": "string"
+          },
+          "parameter_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "replicate_index": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "value": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "output",
+          "parameter_id",
+          "replicate_index",
+          "value"
         ],
         "type": "object"
       },
@@ -23293,6 +23431,39 @@
         ],
         "type": "object"
       },
+      "StagedCell": {
+        "description": "One cell of a visit as the operator has left it, before any save.\n\nA cell the request does not carry is a cell nobody touched: the calculation reads whatever the\nstore holds there. A cell carrying `value: null` is the operator emptying it, which a save\nrecords as a withdrawal, so the calculation reads the visit without it.",
+        "properties": {
+          "parameter_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "replicate_index": {
+            "description": "Position in the family. A single measurement is index 0.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "standard_curve_id": {
+            "description": "The standard curve the operator picked for this cell, where the slot takes one.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "value": {
+            "description": "The number as typed, uncorrected. `null` empties the cell.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "parameter_id",
+          "replicate_index",
+          "value"
+        ],
+        "type": "object"
+      },
       "StagedEvent": {
         "properties": {
           "collected_at": {
@@ -27476,16 +27647,16 @@
                 }
               }
             },
-            "description": "Computed values with per-timestamp errors"
+            "description": "A series per formula, with per-timestamp errors"
           },
           "400": {
-            "description": "Invalid formula syntax or unknown variables"
+            "description": "Invalid formula syntax, unknown variables, a cycle, or a curve slot"
           },
           "404": {
             "description": "Site not found"
           }
         },
-        "summary": "Preview a derived parameter formula against historical source readings at a given site,\nWITHOUT writing anything to the database. Used by the formula builder UI to validate\nformulas before saving. Requires `read_data`.",
+        "summary": "Preview a formula set against historical source readings at a given site, WITHOUT writing\nanything to the database. Used by the calculation editor to see what a set would produce\nbefore it is saved. Requires `read_data`.",
         "tags": [
           "actions"
         ]
@@ -30732,6 +30903,55 @@
           }
         },
         "summary": "One visit's grid row: every parameter measured at the event with its replicates, sample\nstatistics, tool provenance presence, and any open finding — plus findings for parameters\nthe audit says are missing entirely. Requires `read_data`.",
+        "tags": [
+          "collection_events"
+        ]
+      }
+    },
+    "/api/collection_events/{id}/preview": {
+      "post": {
+        "operationId": "preview_collection_event",
+        "parameters": [
+          {
+            "description": "Collection event id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewEventRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventPreview"
+                }
+              }
+            },
+            "description": "What the chain would produce"
+          },
+          "400": {
+            "description": "A staged cell names a parameter the site does not carry"
+          },
+          "404": {
+            "description": "Unknown collection event"
+          }
+        },
+        "summary": "What the calculation chain would produce at a visit, given the cells the operator has typed\nand not saved. The same walk the recompute runs, against the same inputs, storing nothing: no\nrun, no reading, no decision, no finding, no output slot and no job, so no value it returns can\nbe cited as provenance (Q212). Save is what executes and stores. Requires `write_data`.",
         "tags": [
           "collection_events"
         ]

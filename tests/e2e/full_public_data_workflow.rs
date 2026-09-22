@@ -202,12 +202,14 @@ async fn test_full_public_data_workflow() {
     );
 
     // 6. Derived parameter DOmgL = dissolved_oxygen * 0.032 (after-create hook makes the output param).
+    let calculation = crate::common::seed_formula_calculation(&db, "domgl_set").await;
     let (status, def) = crate::common::post_json_parse_with_token(
         &app,
         "/api/derived_parameters",
         &serde_json::json!({
             "code": "DOmgL", "name": "Dissolved Oxygen mg/L",
             "units": "mg/L", "formula": "dissolved_oxygen * 0.032",
+            "tool_script_id": calculation,
         }),
         &token,
     )

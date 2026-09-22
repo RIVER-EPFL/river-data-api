@@ -20,10 +20,11 @@ use uuid::Uuid;
 
 use super::models::{
     CellFinding, CellReplicate, CellSample, EnqueuedJobResponse, Entity, EventAuditRequest,
-    EventCell, EventDetailResponse, EventRecomputeRequest, ExpectedParameter, StageEventRequest,
-    StageEventsRequest, StageVisitRow, StagedEvent, VisitCell, VisitListQuery, VisitListRow,
-    VisitReplicate, VisitRow, VisitsQuery, VisitsResponse,
+    EventCell, EventDetailResponse, EventRecomputeRequest, ExpectedParameter, PreviewEventRequest,
+    StageEventRequest, StageEventsRequest, StageVisitRow, StagedEvent, VisitCell, VisitListQuery,
+    VisitListRow, VisitReplicate, VisitRow, VisitsQuery, VisitsResponse,
 };
+use crate::routes::private::tools::models::EventPreview;
 use super::service::{
     self, limit_clause, paging, range_clause, visit_count_columns, visit_list_order,
 };
@@ -156,6 +157,38 @@ pub async fn stage_collection_event(
     .await?;
     txn.commit().await?;
     Ok(Json(staged))
+}
+
+/// What the calculation chain would produce at a visit, given the cells the operator has typed
+/// and not saved. The same walk the recompute runs, against the same inputs, storing nothing: no
+/// run, no reading, no decision, no finding, no output slot and no job, so no value it returns can
+/// be cited as provenance (Q212). Save is what executes and stores. Requires `write_data`.
+#[utoipa::path(
+    post,
+    path = "/api/collection_events/{id}/preview",
+    params(("id" = Uuid, Path, description = "Collection event id")),
+    request_body = PreviewEventRequest,
+    responses(
+        (status = 200, description = "What the chain would produce", body = EventPreview),
+        (status = 400, description = "A staged cell names a parameter the site does not carry"),
+        (status = 404, description = "Unknown collection event"),
+    ),
+    tag = "collection_events"
+)]
+pub async fn preview_collection_event(
+    State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    Path(id): Path<Uuid>,
+    Json(req): Json<PreviewEventRequest>,
+) -> AppResult<Json<EventPreview>> {
+    let event = Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Collection event {id} not found")))?;
+    enforce_project_scope_for_sites(&state.db, &scope, &[event.site_id]).await?;
+    Ok(Json(
+        crate::routes::private::tools::flows::preview_event(&state, id, &req.staged).await?,
+    ))
 }
 
 /// The rows of a field day that repeat an earlier row's site and instant, each as

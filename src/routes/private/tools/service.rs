@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use super::flows::dependency_order;
+use super::staged::StagedVisit;
 use super::models::script::{self, ToolScript};
 use super::models::version as version_entity;
 use super::models::version::{ToolScriptVersion, ToolScriptVersionList};
@@ -36,6 +37,7 @@ use crate::error::{AppError, AppResult};
 use crate::routes::private::change_audit::service::{entity_revision, entity_revisions};
 use crate::routes::private::constants::models as constants;
 use crate::routes::private::data_streams::models as data_streams;
+use crate::routes::private::derived_parameters::service as derived;
 use crate::routes::private::parameter_groups::service::rules;
 use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::sensor_calibrations::service::evaluate_formula;
@@ -651,7 +653,7 @@ pub(super) async fn resolve_curve(
     })
 }
 
-pub(super) async fn resolve_constants(
+pub(crate) async fn resolve_constants(
     db: &DatabaseConnection,
     names: &[String],
     missing: MissingConstant,
@@ -855,15 +857,21 @@ pub fn served_spot_value_expr(site: Expr, parameter: Expr, instant: Expr) -> Exp
     Func::coalesce([Expr::expr(mean), Expr::expr(lowest_replicate)]).into()
 }
 
-/// One live spot row at a slot instant, with the sample statistic it stands under and the
+/// One live spot value at a slot instant, with the sample statistic it stands under and the
 /// revision it is at: what an event input or a family reads, and the identity the run records.
-#[derive(FromQueryResult)]
+///
+/// `stream_id` is absent for a cell an operator has staged against a slot that has never held a
+/// grab: there is no row to name yet, and a preview does not mint one. `judged` says somebody has
+/// ruled on the row, so a calculation clearing its output leaves it standing, the rule the save's
+/// withdrawal applies.
+#[derive(Clone, Debug, FromQueryResult)]
 struct SpotMember {
-    stream_id: Uuid,
+    stream_id: Option<Uuid>,
     replicate_index: i16,
     value: Option<f64>,
     mean: Option<f64>,
     revision: Option<i64>,
+    judged: bool,
 }
 
 /// The newest ledger sequence at the row `r` names, or NULL for a row no decision has touched
@@ -903,6 +911,10 @@ async fn spot_members(
             Alias::new("mean"),
         )
         .expr_as(reading_revision_expr(), Alias::new("revision"))
+        .expr_as(
+            crate::routes::private::readings::service::unjudged("r").not(),
+            Alias::new("judged"),
+        )
         .from_as(readings::Entity, r.clone())
         .join_as(
             JoinType::LeftJoin,
@@ -926,17 +938,137 @@ async fn spot_members(
         .collect()
 }
 
+/// The row identity a consumed member records. A staged cell at a slot with no grab stream names
+/// no row, so it carries its value in the input's own value and contributes no member.
 fn consumed_reading(
     member: &SpotMember,
     instant: chrono::DateTime<chrono::Utc>,
-) -> ConsumedReading {
-    ConsumedReading {
-        stream_id: member.stream_id,
+) -> Option<ConsumedReading> {
+    Some(ConsumedReading {
+        stream_id: member.stream_id?,
         time: instant,
         replicate_index: member.replicate_index,
         revision: member.revision,
         value: member.value,
+    })
+}
+
+/// The visit's live spot values for one parameter, indexed by replicate, with the pass's unsaved
+/// cells laid over them.
+struct StagedFamily {
+    /// One entry per index up to the highest the merge holds; `None` is a gap.
+    members: Vec<Option<SpotMember>>,
+    /// Whether the pass moved this family, so its statistics are recomputed here rather than read
+    /// from the stored `samples` row.
+    restated: bool,
+}
+
+impl StagedFamily {
+    /// The live values, lowest index first.
+    fn live(&self) -> Vec<&SpotMember> {
+        self.members
+            .iter()
+            .flatten()
+            .filter(|m| m.value.is_some())
+            .collect()
     }
+}
+
+/// The visit's family for one parameter: the stored spot rows with the pass's staged cells laid
+/// over them. A staged number stands at its index, an emptied cell leaves a gap, and an output a
+/// calculation retracted empties the family but for the rows somebody has ruled on.
+async fn family_at(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    instant: chrono::DateTime<chrono::Utc>,
+    staged: Option<&StagedVisit>,
+) -> AppResult<StagedFamily> {
+    let mut members: Vec<Option<SpotMember>> = Vec::new();
+    let place = |member: SpotMember, members: &mut Vec<Option<SpotMember>>| {
+        let index = usize::try_from(member.replicate_index).unwrap_or(0);
+        if members.len() <= index {
+            members.resize(index + 1, None);
+        }
+        members[index] = Some(member);
+    };
+    for member in spot_members(db, site_id, parameter_id, instant).await? {
+        place(member, &mut members);
+    }
+    let restated = staged.is_some_and(|s| s.touches(parameter_id));
+    if let Some(staged) = staged {
+        if staged.is_retracted(parameter_id) {
+            for slot in &mut members {
+                if slot.as_ref().is_some_and(|m| !m.judged) {
+                    *slot = None;
+                }
+            }
+        }
+        let stream_id = staged.stream_of(parameter_id);
+        for (replicate_index, value) in staged.cells_of(parameter_id) {
+            let index = usize::try_from(replicate_index).unwrap_or(0);
+            match value {
+                Some(value) => place(
+                    SpotMember {
+                        stream_id: members
+                            .get(index)
+                            .and_then(|m| m.as_ref().and_then(|m| m.stream_id))
+                            .or(stream_id),
+                        replicate_index,
+                        value: Some(value),
+                        mean: None,
+                        revision: members
+                            .get(index)
+                            .and_then(|m| m.as_ref().and_then(|m| m.revision)),
+                        judged: false,
+                    },
+                    &mut members,
+                ),
+                None => {
+                    if let Some(slot) = members.get_mut(index) {
+                        *slot = None;
+                    }
+                }
+            }
+        }
+        while members.last().is_some_and(Option::is_none) {
+            members.pop();
+        }
+    }
+    Ok(StagedFamily { members, restated })
+}
+
+/// The served spot value of a family: the sample statistic where the group has one, else the
+/// lowest live replicate. A family the pass restated has its statistics taken here, over the same
+/// rule the `samples` trigger applies: the sample sd is n-1 and a group of one has no statistic,
+/// so the single value is served as the reading it is.
+fn served_of(family: &StagedFamily) -> Option<(f64, &'static str, Vec<&SpotMember>)> {
+    let live = family.live();
+    if family.restated {
+        let values: Vec<f64> = live.iter().filter_map(|m| m.value).collect();
+        return match values.len() {
+            0 => None,
+            1 => Some((values[0], "reading", vec![live[0]])),
+            _ => crate::routes::private::sync::service::group_stats(&values)
+                .mean
+                .map(|mean| (mean, "mean", live)),
+        };
+    }
+    if let Some(mean) = live.iter().find_map(|m| m.mean) {
+        return Some((mean, "mean", live));
+    }
+    live.first()
+        .and_then(|m| m.value.map(|v| (v, "reading", vec![*m])))
+}
+
+/// The visit a run resolves its inputs against: where and when, and what the operator has typed
+/// there and not saved. A resolution with no visit (`site_id` or `collected_at` absent) reads
+/// nothing from the store and leaves every event input to the request.
+#[derive(Clone, Copy, Default)]
+pub struct VisitContext<'a> {
+    pub site_id: Option<Uuid>,
+    pub collected_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub staged: Option<&'a StagedVisit>,
 }
 
 /// Fill the params the manifest's `event_inputs` declare from the collection event's stored
@@ -947,11 +1079,15 @@ pub async fn resolve_event_inputs(
     db: &DatabaseConnection,
     tool_name: &str,
     manifest: &Manifest,
-    site_id: Option<Uuid>,
-    collected_at: Option<chrono::DateTime<chrono::Utc>>,
+    visit: VisitContext<'_>,
     body: &mut serde_json::Map<String, serde_json::Value>,
     consumed: &mut Vec<ConsumedInput>,
 ) -> AppResult<Vec<serde_json::Value>> {
+    let VisitContext {
+        site_id,
+        collected_at,
+        staged,
+    } = visit;
     let pending: Vec<&ManifestEventInput> = manifest
         .event_inputs
         .iter()
@@ -965,27 +1101,14 @@ pub async fn resolve_event_inputs(
         let Some(parameter_id) = catalog_parameter_id(db, &e.parameter_code).await? else {
             continue;
         };
-        let members = spot_members(db, site_id, parameter_id, collected_at).await?;
-        // The served spot value: the sample mean, else the lowest unflagged replicate.
-        let (value, kind, behind): (f64, &str, Vec<ConsumedReading>) =
-            match members.iter().find_map(|m| m.mean) {
-                Some(mean) => (
-                    mean,
-                    "mean",
-                    members
-                        .iter()
-                        .map(|m| consumed_reading(m, collected_at))
-                        .collect(),
-                ),
-                None => match members.iter().find(|m| m.value.is_some()) {
-                    Some(first) => (
-                        first.value.unwrap_or_default(),
-                        "reading",
-                        vec![consumed_reading(first, collected_at)],
-                    ),
-                    None => continue,
-                },
-            };
+        let family = family_at(db, site_id, parameter_id, collected_at, staged).await?;
+        let Some((value, kind, behind)) = served_of(&family) else {
+            continue;
+        };
+        let behind: Vec<ConsumedReading> = behind
+            .iter()
+            .filter_map(|m| consumed_reading(m, collected_at))
+            .collect();
         if let Some(param) = manifest.params.iter().find(|p| p.name == e.param)
             && !kind_accepts(&param.kind, &serde_json::json!(value))
         {
@@ -1024,11 +1147,15 @@ pub async fn resolve_event_inputs(
 pub async fn resolve_replicate_inputs(
     db: &DatabaseConnection,
     manifest: &Manifest,
-    site_id: Option<Uuid>,
-    collected_at: Option<chrono::DateTime<chrono::Utc>>,
+    visit: VisitContext<'_>,
     body: &mut serde_json::Map<String, serde_json::Value>,
     consumed: &mut Vec<ConsumedInput>,
 ) -> AppResult<Vec<serde_json::Value>> {
+    let VisitContext {
+        site_id,
+        collected_at,
+        staged,
+    } = visit;
     let (Some(site_id), Some(collected_at)) = (site_id, collected_at) else {
         return Ok(Vec::new());
     };
@@ -1043,11 +1170,12 @@ pub async fn resolve_replicate_inputs(
         let Some(parameter_id) = catalog_parameter_id(db, parameter_code).await? else {
             continue;
         };
-        let family = stored_replicates(db, site_id, parameter_id, collected_at).await?;
-        if family.is_empty() {
+        let family = family_at(db, site_id, parameter_id, collected_at, staged).await?;
+        if family.members.is_empty() {
             continue;
         }
         let values: Vec<serde_json::Value> = family
+            .members
             .iter()
             .map(|v| {
                 v.as_ref()
@@ -1062,7 +1190,12 @@ pub async fn resolve_replicate_inputs(
             subject: None,
             property: None,
             revision: None,
-            members: family.iter().flatten().cloned().collect(),
+            members: family
+                .members
+                .iter()
+                .flatten()
+                .filter_map(|m| consumed_reading(m, collected_at))
+                .collect(),
             value: serde_json::Value::Array(values.clone()),
         });
         resolved.push(serde_json::json!({
@@ -1074,26 +1207,6 @@ pub async fn resolve_replicate_inputs(
         }));
     }
     Ok(resolved)
-}
-
-/// The live, unflagged spot readings of one parameter at one instant, by replicate index. The
-/// list is as long as the highest index stored, so a missing index reads as a gap rather than
-/// shifting the ones after it.
-async fn stored_replicates(
-    db: &DatabaseConnection,
-    site_id: Uuid,
-    parameter_id: Uuid,
-    instant: chrono::DateTime<chrono::Utc>,
-) -> AppResult<Vec<Option<ConsumedReading>>> {
-    let mut family: Vec<Option<ConsumedReading>> = Vec::new();
-    for member in spot_members(db, site_id, parameter_id, instant).await? {
-        let index = usize::try_from(member.replicate_index).unwrap_or(0);
-        if family.len() <= index {
-            family.resize(index + 1, None);
-        }
-        family[index] = Some(consumed_reading(&member, instant));
-    }
-    Ok(family)
 }
 
 /// Validate a request body against the tool's manifest, resolve its constants and curves, and
@@ -1117,7 +1230,7 @@ pub async fn run_tool_body(
     constants_override: Option<&serde_json::Map<String, serde_json::Value>>,
     missing_constant: MissingConstant,
 ) -> AppResult<RunOutcome> {
-    let resolved = resolve_run(state, tool, body, constants_override, missing_constant).await?;
+    let resolved = resolve_run(state, tool, body, constants_override, missing_constant, None).await?;
     execute_resolved(state, tool, resolved).await
 }
 
@@ -1221,6 +1334,7 @@ pub async fn resolve_run(
     body: &[u8],
     constants_override: Option<&serde_json::Map<String, serde_json::Value>>,
     missing_constant: MissingConstant,
+    staged: Option<&StagedVisit>,
 ) -> AppResult<ResolvedRun> {
     let body: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| AppError::BadRequest(format!("Invalid request body: {e}")))?;
@@ -1250,27 +1364,22 @@ pub async fn resolve_run(
         &mut consumed,
     )
     .await?;
+    let visit = VisitContext {
+        site_id,
+        collected_at,
+        staged,
+    };
     let mut event_inputs = resolve_event_inputs(
         &state.db,
         &tool.name,
         manifest,
-        site_id,
-        collected_at,
+        visit,
         &mut body,
         &mut consumed,
     )
     .await?;
-    event_inputs.extend(
-        resolve_replicate_inputs(
-            &state.db,
-            manifest,
-            site_id,
-            collected_at,
-            &mut body,
-            &mut consumed,
-        )
-        .await?,
-    );
+    event_inputs
+        .extend(resolve_replicate_inputs(&state.db, manifest, visit, &mut body, &mut consumed).await?);
 
     // Defaults land before requiredness so a condition reads the same values the runner will,
     // whatever order the params are declared in.
@@ -1915,6 +2024,73 @@ pub(super) async fn call_runner(
         .map_err(|e| AppError::Internal(format!("the tool runner returned unparseable JSON: {e}")))
 }
 
+/// The draft set as the engine reads a stored one: each formula parsed and its variables resolved
+/// against the catalog. A variable naming another draft's code is that formula's output, which a
+/// save would mint as a parameter of the same code, so it is a source of that code without a
+/// catalog row to prove it. A draft's own output is likewise the parameter its code would mint.
+pub(crate) async fn pin_draft_formulas(
+    db: &sea_orm::DatabaseConnection,
+    drafts: &[crate::routes::private::tools::models::DraftFormula],
+) -> AppResult<Vec<crate::routes::private::tools::models::PinnedFormula>> {
+    let codes: Vec<String> = drafts.iter().map(|d| d.code.trim().to_string()).collect();
+    // A step of the set stores nothing and reaches the formulas after it from the run, so it is
+    // no source: recording it as one sends the evaluation looking for a reading of it.
+    let steps: Vec<String> = drafts
+        .iter()
+        .filter(|d| d.intermediate)
+        .map(|d| d.code.trim().to_string())
+        .collect();
+    let refused = |code: &str, e: crudcrate::ApiError| {
+        AppError::BadRequest(format!("{code}: {}", super::views::api_message(e)))
+    };
+    let mut formulas = Vec::with_capacity(drafts.len());
+    for draft in drafts {
+        let code = draft.code.trim();
+        if code.is_empty() {
+            return Err(AppError::BadRequest("a formula needs a code".to_string()));
+        }
+        derived::validate_formula(&draft.formula).map_err(|e| refused(code, e))?;
+        let (produced, external): (Vec<String>, Vec<String>) =
+            derived::variables_of(&draft.formula, draft.curve_slot.as_deref())
+                .map_err(|e| refused(code, e))?
+                .into_iter()
+                .partition(|v| v != code && codes.contains(v));
+        let resolved = derived::resolve_identifiers(db, &external)
+            .await
+            .map_err(|e| refused(code, e))?;
+        let mut sources: Vec<(String, String)> = resolved
+            .parameters
+            .into_iter()
+            .map(|(variable, _)| (variable.clone(), variable))
+            .chain(
+                produced
+                    .into_iter()
+                    .filter(|v| !steps.contains(v))
+                    .map(|v| (v.clone(), v)),
+            )
+            .collect();
+        sources.sort();
+        formulas.push(crate::routes::private::tools::models::PinnedFormula {
+            code: code.to_string(),
+            label: draft
+                .name
+                .clone()
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| code.to_string()),
+            units: draft.units.clone().filter(|u| !u.trim().is_empty()),
+            formula: draft.formula.clone(),
+            ordinal: draft.ordinal,
+            output_parameter_code: (!draft.intermediate).then(|| code.to_string()),
+            sources,
+            site_sources: resolved.site_properties,
+            curve_slot: draft.curve_slot.clone().filter(|c| !c.trim().is_empty()),
+            per_replicate: draft.per_replicate.clone().filter(|p| !p.trim().is_empty()),
+            intermediate: draft.intermediate,
+        });
+    }
+    Ok(formulas)
+}
+
 /// The variables a formula reads that are not sources: the coefficients of its curve slot.
 pub const CURVE_VARIABLES: [&str; 2] = ["curve_slope", "curve_intercept"];
 
@@ -2023,6 +2199,16 @@ pub fn read_only_through_guards(formula: &str, variable: &str) -> bool {
         return false;
     }
     read
+}
+
+/// Whether a formula's curve slot may go unchosen: every read of both coefficients sits inside a
+/// guard, so the uncorrected arm is what the expression falls back to. The portal's `Std curve
+/// corr?` unchecked is this case. A formula reading either coefficient bare is skipped without a
+/// curve instead, so a correction never silently does not happen.
+pub fn curve_optional(formula: &str) -> bool {
+    CURVE_VARIABLES
+        .iter()
+        .all(|variable| read_only_through_guards(formula, variable))
 }
 
 /// Every identifier a formula names that the language does not define itself, in the order they
@@ -2517,6 +2703,9 @@ struct SetState {
     /// Finished per-replicate outputs, by parameter code, and steps by their own code.
     vectors: HashMap<String, Vec<Option<f64>>>,
     step_vectors: HashMap<String, Vec<Option<f64>>>,
+    /// Every step the set declares, by its own code. A step is no formula's source, so this is
+    /// what tells a step that produced nothing from an identifier the set never had.
+    declared_steps: Vec<String>,
 }
 
 /// The value a variable holds at one cell: the family's value at this index where the visit
@@ -2535,7 +2724,7 @@ fn entered(
 }
 
 impl SetState {
-    fn new(width: usize) -> Self {
+    fn new(width: usize, declared_steps: Vec<String>) -> Self {
         Self {
             produced: HashMap::new(),
             steps: HashMap::new(),
@@ -2543,6 +2732,7 @@ impl SetState {
             steps_at_index: vec![HashMap::new(); width],
             vectors: HashMap::new(),
             step_vectors: HashMap::new(),
+            declared_steps,
         }
     }
 
@@ -2614,6 +2804,25 @@ impl SetState {
                 }
             }
         }
+        // A step of the set that produced no value is a missing input like any other (M109): the
+        // formulas reading it skip, and the rest of the set still runs. A step is no formula's
+        // source, so it is not covered by the loop above.
+        if skipped.is_none() {
+            for step in &self.declared_steps {
+                if step == &formula.code || variables.contains_key(step) {
+                    continue;
+                }
+                if !free_identifiers(&formula.formula).iter().any(|n| n == step) {
+                    continue;
+                }
+                if read_only_through_guards(&formula.formula, step) {
+                    variables.insert(step.clone(), f64::NAN);
+                } else {
+                    skipped = Some(format!("no value for {step}"));
+                    break;
+                }
+            }
+        }
         // A site property arrives resolved as an input under the variable's name.
         if skipped.is_none() {
             for (variable, property) in &formula.site_sources {
@@ -2638,6 +2847,10 @@ impl SetState {
                 Some(curve) => {
                     variables.insert(CURVE_VARIABLES[0].to_string(), curve.slope);
                     variables.insert(CURVE_VARIABLES[1].to_string(), curve.intercept);
+                }
+                None if curve_optional(&formula.formula) => {
+                    variables.insert(CURVE_VARIABLES[0].to_string(), f64::NAN);
+                    variables.insert(CURVE_VARIABLES[1].to_string(), f64::NAN);
                 }
                 None => skipped = Some(format!("curve '{slot}' was not supplied")),
             }
@@ -2778,7 +2991,7 @@ impl SetState {
 /// A source the formula reads only through a guard function is bound as NaN rather than skipped,
 /// so the portal's defaults and its comparisons against a missing value take the arm they take
 /// there ([`read_only_through_guards`]).
-fn evaluate_cells<'a>(
+pub(crate) fn evaluate_cells<'a>(
     formulas: &'a [PinnedFormula],
     inputs: &HashMap<String, f64>,
     replicates: &HashMap<String, Vec<Option<f64>>>,
@@ -2787,7 +3000,12 @@ fn evaluate_cells<'a>(
 ) -> Result<(Vec<&'a PinnedFormula>, Vec<Vec<Evaluated>>), String> {
     let ordered = in_order(formulas)?;
     let width = replicate_width(&ordered, replicates);
-    let mut state = SetState::new(width);
+    let declared_steps: Vec<String> = ordered
+        .iter()
+        .filter(|f| f.intermediate)
+        .map(|f| f.code.clone())
+        .collect();
+    let mut state = SetState::new(width, declared_steps);
     let mut cells: Vec<Vec<Evaluated>> = Vec::with_capacity(ordered.len());
     for formula in &ordered {
         if formula.per_replicate.is_none() {
@@ -2872,7 +3090,7 @@ pub fn evaluate_over_replicates(
 }
 
 /// The numbers a name-keyed object binds, dropping whatever is not one.
-pub(super) fn numbers_by_name(
+pub(crate) fn numbers_by_name(
     map: &serde_json::Map<String, serde_json::Value>,
 ) -> HashMap<String, f64> {
     map.iter()
@@ -3165,147 +3383,7 @@ pub async fn calculations_fed_by(
             parameter_code: p.code,
         })
         .collect();
-    let mut impacts = fed_closure(&tools, &catalog, &order, &touched);
-    impacts.extend(derived_fed_by(db, &touched).await?);
-    Ok(impacts)
-}
-
-/// One standalone derived definition as an edge of the same graph: what it reads and what it
-/// writes.
-///
-/// A derived parameter attached to a calculation is already in the manifest graph, because a
-/// formula calculation presents one. A standalone definition (`tool_script_id IS NULL` and not a
-/// step) is the continuous kind the derived job and the janitor serve, and it has no manifest, so
-/// its dependants were invisible to the closure entirely. A shared step belongs to no calculation
-/// either (Q156) and is not one of these: it mints no parameter, so it writes no edge.
-pub(super) struct DerivedEdge {
-    code: String,
-    label: String,
-    reads: Vec<String>,
-    output: Option<ImpactParameter>,
-}
-
-/// One standalone definition as the query selects it: the parameters it reads arrive as a JSON
-/// array of codes, and the output is a `LEFT JOIN` so a definition with no output parameter is
-/// legitimately two nulls.
-#[derive(FromQueryResult)]
-pub(super) struct DerivedEdgeRow {
-    code: String,
-    name: String,
-    output_id: Option<Uuid>,
-    output_code: Option<String>,
-    reads: serde_json::Value,
-}
-
-pub(super) async fn derived_edges(db: &DatabaseConnection) -> AppResult<Vec<DerivedEdge>> {
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT d.code, d.name, out.id AS output_id, out.code AS output_code,
-                    COALESCE(
-                      (SELECT jsonb_agg(p.code)
-                         FROM derived_parameter_sources src
-                         JOIN parameters p ON p.id = src.parameter_id
-                        WHERE src.derived_definition_id = d.id),
-                      '[]'::jsonb) AS reads
-               FROM calculation_formulas d
-               LEFT JOIN parameters out ON out.id = d.output_parameter_id
-              WHERE d.tool_script_id IS NULL AND d.intermediate = false
-              ORDER BY d.code"
-                .to_string(),
-        ))
-        .await?;
-    let mut edges = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let DerivedEdgeRow {
-            code,
-            name,
-            output_id,
-            output_code,
-            reads,
-        } = DerivedEdgeRow::from_query_result(row, "")?;
-        edges.push(DerivedEdge {
-            code,
-            label: name,
-            reads: reads
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_lowercase))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            output: match (output_id, output_code) {
-                (Some(parameter_id), Some(parameter_code)) => Some(ImpactParameter {
-                    parameter_id,
-                    parameter_code,
-                }),
-                _ => None,
-            },
-        });
-    }
-    Ok(edges)
-}
-
-/// The standalone derived definitions a touched set feeds, in the same shape a calculation
-/// answers in. The walk repeats until nothing new is reachable, so a derived parameter feeding
-/// another is followed however the definitions happen to be ordered.
-pub(super) async fn derived_fed_by(
-    db: &DatabaseConnection,
-    touched: &[ImpactParameter],
-) -> AppResult<Vec<CalculationImpact>> {
-    let edges = derived_edges(db).await?;
-    if edges.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(derived_closure(&edges, touched))
-}
-
-pub(super) fn derived_closure(
-    edges: &[DerivedEdge],
-    touched: &[ImpactParameter],
-) -> Vec<CalculationImpact> {
-    let mut reachable: HashMap<String, Vec<ImpactParameter>> = HashMap::new();
-    for p in touched {
-        reachable.insert(p.parameter_code.to_lowercase(), vec![p.clone()]);
-    }
-    let mut impacts: Vec<CalculationImpact> = Vec::new();
-    // A definition reading another's output is followed by re-walking until the reachable set
-    // stops growing: the definitions carry no order of their own, unlike the manifest tools.
-    loop {
-        let before = impacts.len();
-        for edge in edges {
-            if impacts.iter().any(|i| i.tool == edge.code) {
-                continue;
-            }
-            let mut reads: Vec<ImpactParameter> = Vec::new();
-            for code in &edge.reads {
-                for root in reachable.get(code).into_iter().flatten() {
-                    if !reads.iter().any(|x| x.parameter_id == root.parameter_id) {
-                        reads.push(root.clone());
-                    }
-                }
-            }
-            if reads.is_empty() {
-                continue;
-            }
-            if let Some(output) = &edge.output {
-                reachable
-                    .entry(output.parameter_code.to_lowercase())
-                    .or_default()
-                    .extend(reads.iter().cloned());
-            }
-            impacts.push(CalculationImpact {
-                tool: edge.code.clone(),
-                label: edge.label.clone(),
-                reads,
-                outputs: edge.output.iter().cloned().collect(),
-            });
-        }
-        if impacts.len() == before {
-            return impacts;
-        }
-    }
+    Ok(fed_closure(&tools, &catalog, &order, &touched))
 }
 
 /// The closure walk itself: with tools in run order, a tool is fed when an `event_input` names a
@@ -4002,7 +4080,7 @@ pub fn codes_held_elsewhere(held: &[(String, String)]) -> Result<(), String> {
 }
 
 /// Every code of `codes` a formula outside calculation `id` holds, with the calculation holding
-/// it, or "a standalone derived parameter" for a formula belonging to none.
+/// it, or "a shared step" for a formula belonging to none (Q156).
 pub async fn formula_codes_held_elsewhere<C: ConnectionTrait>(
     conn: &C,
     id: Uuid,
@@ -4035,7 +4113,7 @@ pub async fn formula_codes_held_elsewhere<C: ConnectionTrait>(
             let holder = f
                 .tool_script_id
                 .and_then(|script_id| holders.get(&script_id).cloned())
-                .unwrap_or_else(|| "a standalone derived parameter".to_string());
+                .unwrap_or_else(|| "a shared step".to_string());
             (f.code, holder)
         })
         .collect())
@@ -5021,3 +5099,7 @@ mod script_operations_tests;
 #[cfg(test)]
 #[path = "tests/scripts.rs"]
 mod scripts_tests;
+
+#[cfg(test)]
+#[path = "tests/families.rs"]
+mod families_tests;

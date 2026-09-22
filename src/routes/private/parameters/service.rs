@@ -96,7 +96,8 @@ impl CRUDOperations for ParameterOperations {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GivenUp {
     pub parameter_id: Uuid,
-    /// The calculation the formula belongs to, or the formula's own name where it is standalone.
+    /// The calculation the formula belongs to, or the formula's own name where it is a shared
+    /// step and belongs to none.
     pub calculation: String,
 }
 

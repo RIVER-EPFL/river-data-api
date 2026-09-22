@@ -249,19 +249,27 @@ mod rename {
     }
 }
 
-/// A continuous definition reads one value per instant, so a reducer in one names a family that
-/// cannot exist.
-mod reducers {
-    use super::super::refuse_reducers;
+/// A formula belongs to a calculation or is a step of one (Q231).
+mod ownership {
+    use super::super::require_owner_or_step;
+    use uuid::Uuid;
 
     #[test]
-    fn test_a_continuous_formula_naming_a_reducer_is_refused_by_the_call() {
-        let refusal = refuse_reducers("mean(temp) * 2").expect_err("a family it cannot have");
-        assert!(format!("{refusal:?}").contains("mean(temp)"), "{refusal:?}");
+    fn test_a_formula_owned_by_a_calculation_is_accepted() {
+        assert!(require_owner_or_step(Some(Uuid::new_v4()), false).is_ok());
     }
 
     #[test]
-    fn test_a_continuous_formula_reducing_nothing_passes() {
-        assert!(refuse_reducers("temp * 2 + offset").is_ok());
+    fn test_a_step_owned_by_no_calculation_is_accepted() {
+        assert!(require_owner_or_step(None, true).is_ok());
+    }
+
+    #[test]
+    fn test_an_output_owned_by_no_calculation_is_refused() {
+        let refusal = require_owner_or_step(None, false).expect_err("a kind that is gone");
+        assert!(
+            format!("{refusal:?}").contains("calculation"),
+            "{refusal:?}"
+        );
     }
 }

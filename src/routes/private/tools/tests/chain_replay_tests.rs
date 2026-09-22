@@ -137,3 +137,69 @@ fn test_disagrees_at_the_tolerance_and_across_zero() {
     assert!(!disagrees(0.0, 0.0));
     assert!(disagrees(0.0, 1e-6));
 }
+
+fn manifest_with_vaisala_curve() -> serde_json::Value {
+    manifest_with(serde_json::json!({
+        "curves": [{ "name": "vaisala", "label": "Vaisala curve" }],
+    }))
+}
+
+// Scenario: a run made with a standard curve is recomputed because one of its inputs moved.
+// Expected behaviour: the slot is named again by id, so the formula reading it runs and the
+// corrected output is rewritten instead of skipped.
+#[test]
+fn test_body_for_run_re_supplies_a_catalog_curve_by_id() {
+    let blob = serde_json::json!({
+        "inputs": { "lab_temp_c": 21.5 },
+        "curves": [{
+            "name": "vaisala",
+            "curve": {
+                "slope": 1.02,
+                "intercept": -3.5,
+                "standard_curve_id": "00000000-0000-0000-0000-00000000000a",
+                "label": "Vaisala 2026",
+            },
+        }],
+    });
+    let body = body_for_run(&tool(manifest_with_vaisala_curve()), &event(), Some(&blob));
+    assert_eq!(
+        body["vaisala"],
+        serde_json::json!({ "standard_curve_id": "00000000-0000-0000-0000-00000000000a" }),
+        "the curve is named by id, so edited coefficients are picked up"
+    );
+}
+
+// A run given coefficients by hand has no catalog curve to name, so the coefficients travel.
+#[test]
+fn test_body_for_run_re_supplies_hand_entered_coefficients() {
+    let blob = serde_json::json!({
+        "inputs": {},
+        "curves": [{
+            "name": "vaisala",
+            "curve": { "slope": 1.02, "intercept": -3.5, "standard_curve_id": null, "label": null },
+        }],
+    });
+    let body = body_for_run(&tool(manifest_with_vaisala_curve()), &event(), Some(&blob));
+    assert_eq!(
+        body["vaisala"],
+        serde_json::json!({ "slope": 1.02, "intercept": -3.5 })
+    );
+}
+
+#[test]
+fn test_body_for_run_with_no_stored_curve_names_no_slot() {
+    let blob = serde_json::json!({ "inputs": { "lab_temp_c": 21.5 }, "curves": [] });
+    let body = body_for_run(&tool(manifest_with_vaisala_curve()), &event(), Some(&blob));
+    assert!(!body.contains_key("vaisala"));
+}
+
+// A slot the manifest has since dropped would be an unknown field on the request.
+#[test]
+fn test_body_for_run_drops_a_curve_the_manifest_no_longer_declares() {
+    let blob = serde_json::json!({
+        "inputs": {},
+        "curves": [{ "name": "retired", "curve": { "slope": 1.0, "intercept": 0.0 } }],
+    });
+    let body = body_for_run(&tool(manifest_with_vaisala_curve()), &event(), Some(&blob));
+    assert!(!body.contains_key("retired"));
+}

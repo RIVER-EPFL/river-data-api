@@ -208,12 +208,14 @@ async fn csv_import_recomputes_derived_via_worker() {
     // A derived parameter (DO mg/L = Dissolved_O2 * 0.032) assigned to the site, so the imported
     // Dissolved_O2 rows produce derived readings when the worker recomputes them.
     let derived_name = format!("DOmgL_{}", Uuid::new_v4().simple());
+    let calculation =
+        crate::common::seed_formula_calculation(&db, &format!("{derived_name}_set")).await;
     let (_s, def) = crate::common::post_json_parse_with_token(
         &app,
         "/api/derived_parameters",
         &serde_json::json!({
             "code": derived_name, "name": "DO mg/L", "units": "mg/L",
-            "formula": "Dissolved_O2 * 0.032",
+            "formula": "Dissolved_O2 * 0.032", "tool_script_id": calculation,
         }),
         &token,
     )

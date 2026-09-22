@@ -58,10 +58,12 @@ async fn computed_slot(formula: &str, constants: &[(&str, f64)]) -> Fixture {
         assert!((200..300).contains(&status), "constant ({status}): {body}");
     }
     let code = format!("i118_{}", Uuid::new_v4().simple());
+    let calculation = crate::common::seed_formula_calculation(&f.db, &format!("{code}_set")).await;
     let (status, def) = crate::common::post_json_parse_with_token(
         &f.app,
         "/api/derived_parameters",
-        &json!({ "code": code, "name": "I118 fixture", "units": "mg/L", "formula": formula }),
+        &json!({ "code": code, "name": "I118 fixture", "units": "mg/L", "formula": formula,
+                 "tool_script_id": calculation }),
         &f.token,
     )
     .await;

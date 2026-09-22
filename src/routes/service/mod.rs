@@ -413,6 +413,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .layer(RequestBodyLimitLayer::new(DATA_BODY_LIMIT))
         .layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT))
         .route(
+            "/collection_events/{id}/preview",
+            post(crate::routes::private::collection_events::views::preview_collection_event),
+        )
+        .route(
             "/collection_events/{id}/recompute",
             post(crate::routes::private::collection_events::views::recompute_collection_event),
         )

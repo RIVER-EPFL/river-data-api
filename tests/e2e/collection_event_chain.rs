@@ -1262,3 +1262,187 @@ async fn a_script_error_midway_skips_its_step_and_everything_downstream() {
         "the audit duplicated the executor's findings: {after}"
     );
 }
+
+/// Scenario: a calculation whose formula reads a standard curve is run at a visit with a curve
+/// chosen by hand, and one of its inputs is corrected afterwards.
+///
+/// Expected behaviour: the recompute the correction fires supplies the same curve slot again, so
+/// the corrected output is rewritten under the curve instead of the formula being skipped for want
+/// of it. Formula-engined, so the arithmetic runs in-process and the story needs no R runner.
+///
+/// Run: cargo test --test e2e a_corrected_input_recomputes -- --test-threads=1
+#[tokio::test]
+#[serial]
+async fn a_corrected_input_recomputes_its_output_under_the_curve_the_run_chose() {
+    use sea_orm::ConnectionTrait;
+    if !crate::common::profile::Service::Keycloak
+        .require("a_corrected_input_recomputes_its_output_under_the_curve_the_run_chose")
+        .await
+    {
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    for sql in [
+        "UPDATE tool_scripts SET active_version_id = NULL WHERE name LIKE 'curvechain\\_%'",
+        "DELETE FROM tool_script_activations a USING tool_scripts s \
+          WHERE a.tool_script_id = s.id AND s.name LIKE 'curvechain\\_%'",
+        "DELETE FROM tool_script_versions v USING tool_scripts s \
+          WHERE v.tool_script_id = s.id AND s.name LIKE 'curvechain\\_%'",
+        "DELETE FROM calculation_formulas f USING tool_scripts s \
+          WHERE f.tool_script_id = s.id AND s.name LIKE 'curvechain\\_%'",
+        "DELETE FROM tool_scripts WHERE name LIKE 'curvechain\\_%'",
+    ] {
+        crate::common::exec(&db, sql).await;
+    }
+    let app = kc::build_test_app_with_keycloak(db.clone()).await;
+    let admin = kc::get_keycloak_jwt("admin", "admin").await;
+
+    let project_id = e2e::create_project(&app, &admin, "Curve Project", "curvep", false).await;
+    let site_id = e2e::create_site(&app, &admin, &project_id, "Curve Site", "curves").await;
+    let input = e2e::create_parameter(&app, &admin, "CurveIn", "Curve in", "ppm").await;
+
+    let (status, created) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/tool_scripts",
+        &json!({ "name": "curvechain_corr", "label": "Curve corr", "engine": "formula" }),
+        &admin,
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "create the calculation: {created}"
+    );
+    let script_id = e2e::id_of(&created);
+
+    let (status, saved) = crate::common::save_formula_set(
+        &app,
+        &admin,
+        &script_id,
+        json!([{
+            "code": "CurveOut", "name": "Curve out", "units": "ppm",
+            "formula": "CurveIn * curve_slope + curve_intercept",
+            "curve_slot": "vaisala", "ordinal": 1,
+        }]),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&status),
+        "save the formula ({status}): {saved}"
+    );
+    let output = minted_output(&db, "CurveOut").await;
+    e2e::declare_site_slots(
+        &db,
+        &app,
+        &admin,
+        &site_id,
+        "curve_group",
+        &[input.as_str(), output.as_str()],
+    )
+    .await;
+
+    // The curve the operator picks for this run: y = 2x + 1.
+    let analyser = e2e::create_sensor(&app, &admin, &input, "curve-analyser").await;
+    let curve_id = uuid::Uuid::new_v4().to_string();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO standard_curves (id, sensor_id, name, slope, intercept) \
+             VALUES ('{curve_id}', '{analyser}', 'Vaisala plate', 2.0, 1.0)"
+        ),
+    )
+    .await;
+
+    kc::ensure_realm_user("river1", "river1", &["riverdata-river"]).await;
+    kc::grant_project(&db, &kc::keycloak_user_id("river1").await, &project_id).await;
+    let river = kc::get_keycloak_jwt("river1", "river1").await;
+
+    let measure = |value: f64, replace: bool| {
+        let app = app.clone();
+        let river = river.clone();
+        let site_id = site_id.clone();
+        let input = input.clone();
+        async move {
+            let mut body = json!({
+                "site_id": site_id,
+                "readings": [{ "parameter_id": input, "value": value, "time": EVENT_TIME }],
+            });
+            if replace {
+                body["mode"] = json!("replace");
+            }
+            let (status, resp) =
+                crate::common::post_json_with_token(&app, "/api/grab_samples", &body, &river).await;
+            assert_eq!(status, 200, "save CurveIn: {resp}");
+        }
+    };
+    let stored_output = || {
+        let db = db.clone();
+        let site_id = site_id.clone();
+        let output = output.clone();
+        async move {
+            db.query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT COALESCE(calibrated_value, raw_value) AS value FROM readings \
+                     WHERE site_id = '{site_id}' AND parameter_id = '{output}' \
+                       AND withdrawn_at IS NULL ORDER BY replicate_index LIMIT 1"
+                ),
+            ))
+            .await
+            .expect("read the output")
+            .and_then(|r| r.try_get::<Option<f64>>("", "value").expect("value"))
+        }
+    };
+
+    // The input is entered, then the calculation is run by hand with the curve and saved: a
+    // curve slot is filled only by the person running it (M300), so this is the run that fixes
+    // which curve the visit's corrected value is made with.
+    measure(10.0, false).await;
+    assert!(e2e::wait_for_jobs_by_trigger(&db, "event_recompute", 60).await);
+    let (status, run) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/tools/curvechain_corr/calculate",
+        &json!({
+            "site_id": site_id,
+            "collected_at": EVENT_TIME,
+            "vaisala": { "standard_curve_id": curve_id },
+        }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "run with the curve: {run}");
+    assert_eq!(run["results"]["CurveOut"], 21.0, "10 * 2 + 1: {run}");
+    let (status, resp) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &json!({
+            "site_id": site_id,
+            "tool_run_id": run["run_id"],
+            "mode": "replace",
+            "readings": [{ "parameter_id": output, "value": 21.0,
+                            "time": EVENT_TIME, "output": "CurveOut" }],
+        }),
+        &river,
+    )
+    .await;
+    assert_eq!(status, 200, "save the corrected output: {resp}");
+    assert_eq!(stored_output().await, Some(21.0));
+
+    // The input was mistyped: 20, not 10. The chain fires, and the recompute has to name the
+    // curve the run chose or the formula reading it is skipped and 21 stands.
+    measure(20.0, true).await;
+    assert!(e2e::wait_for_jobs_by_trigger(&db, "event_recompute", 60).await);
+    e2e::drain_jobs(&db, 60).await;
+    assert_eq!(
+        stored_output().await,
+        Some(41.0),
+        "20 * 2 + 1, the correction recomputed under the run's own curve"
+    );
+
+    let findings =
+        serde_json::Value::Array(e2e::pending_event_findings(&app, &admin, &site_id).await);
+    assert!(
+        findings.as_array().unwrap().is_empty(),
+        "the curve was supplied, so no output was skipped: {findings}"
+    );
+}

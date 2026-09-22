@@ -94,67 +94,6 @@ fn matching_is_case_insensitive_like_the_catalog_index() {
     assert_eq!(fed.len(), 1);
 }
 
-fn edge(code: &str, reads: &[&str], writes: Option<&str>) -> DerivedEdge {
-    DerivedEdge {
-        code: code.to_string(),
-        label: code.to_uppercase(),
-        reads: reads.iter().map(|r| r.to_lowercase()).collect(),
-        output: writes.map(param),
-    }
-}
-
-#[test]
-fn a_standalone_derived_definition_reading_the_touched_parameter_is_reported() {
-    let fed = derived_closure(&[edge("b", &["A"], Some("B"))], &[param("A")]);
-    assert_eq!(fed.len(), 1);
-    assert_eq!(fed[0].tool, "b");
-    assert_eq!(fed[0].outputs[0].parameter_code, "B");
-}
-
-/// The definitions carry no order of their own, so a consumer declared before its producer is
-/// still followed.
-#[test]
-fn a_derived_definition_reading_another_s_output_is_followed_whatever_the_order() {
-    let fed = derived_closure(
-        &[edge("c", &["B"], Some("C")), edge("b", &["A"], Some("B"))],
-        &[param("A")],
-    );
-    let mut names: Vec<&str> = fed.iter().map(|f| f.tool.as_str()).collect();
-    names.sort_unstable();
-    assert_eq!(names, vec!["b", "c"]);
-    assert_eq!(
-        fed.iter().find(|f| f.tool == "c").unwrap().reads[0].parameter_code,
-        "A",
-        "traced back to the touched root"
-    );
-}
-
-#[test]
-fn a_derived_definition_reading_nothing_touched_is_not_reported() {
-    assert!(derived_closure(&[edge("y", &["X"], Some("Y"))], &[param("A")]).is_empty());
-}
-
-/// A definition with no output parameter yet is still reported: it reads the touched value, so
-/// an operator has to know it runs again, even though nothing downstream can read it.
-#[test]
-fn a_definition_with_no_output_is_reported_with_none() {
-    let fed = derived_closure(&[edge("b", &["A"], None)], &[param("A")]);
-    assert_eq!(fed.len(), 1);
-    assert!(fed[0].outputs.is_empty());
-}
-
-#[test]
-fn a_cycle_among_definitions_terminates_rather_than_walking_forever() {
-    let fed = derived_closure(
-        &[
-            edge("b", &["A", "C"], Some("B")),
-            edge("c", &["B"], Some("C")),
-        ],
-        &[param("A")],
-    );
-    assert_eq!(fed.len(), 2, "each definition is reported once: {fed:?}");
-}
-
 /// A calculation that evaluates over replicate families declares them as `replicates` params and
 /// has no event inputs at all: the family is the read, and it names its parameter on the param.
 fn replicate_tool(

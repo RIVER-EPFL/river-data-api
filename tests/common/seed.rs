@@ -614,3 +614,19 @@ pub async fn store_source_curve(
     .await;
     (curve_id, sensor_id)
 }
+
+/// A formula calculation, inserted directly: authoring one is an administrator's act behind a
+/// Keycloak gate (`/api/tool_scripts`), and a suite testing what its formulas compute is not
+/// testing that gate. Returns the calculation's id.
+pub async fn seed_formula_calculation(db: &DatabaseConnection, name: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    exec(
+        db,
+        &format!(
+            "INSERT INTO tool_scripts (id, name, label, engine, enabled) \
+             VALUES ('{id}', '{name}', '{name}', 'formula', true)"
+        ),
+    )
+    .await;
+    id
+}

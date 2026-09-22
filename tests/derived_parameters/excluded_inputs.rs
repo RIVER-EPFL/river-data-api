@@ -57,8 +57,14 @@ async fn poll_for_derived(
 
 /// Define a derived parameter over Dissolved_O2 at SITE1, assign it, run the recompute action,
 /// and return its output parameter id.
-async fn define_assign_recompute(app: &axum::Router, token: &str, label: &str) -> Uuid {
+async fn define_assign_recompute(
+    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    token: &str,
+    label: &str,
+) -> Uuid {
     let code = format!("{label}_{}", Uuid::new_v4().simple());
+    let calculation = crate::common::seed_formula_calculation(db, &format!("{code}_set")).await;
     let (status, def_json) = crate::common::post_json_parse_with_token(
         app,
         "/api/derived_parameters",
@@ -67,6 +73,7 @@ async fn define_assign_recompute(app: &axum::Router, token: &str, label: &str) -
             "name": "Excluded input fixture",
             "units": "mg/L",
             "formula": "Dissolved_O2 * 0.032",
+            "tool_script_id": calculation,
         }),
         token,
     )
@@ -127,7 +134,7 @@ async fn flagged_input_produces_no_derived_reading() {
     )
     .await;
 
-    let derived_param = define_assign_recompute(&app, &token, "dom_flagged").await;
+    let derived_param = define_assign_recompute(&db, &app, &token, "dom_flagged").await;
 
     assert!(
         poll_for_derived(&db, derived_param, neighbour_time, POLL_DEADLINE_SECS)
@@ -173,7 +180,7 @@ async fn withdrawn_input_produces_no_derived_reading() {
     )
     .await;
 
-    let derived_param = define_assign_recompute(&app, &token, "dom_withdrawn").await;
+    let derived_param = define_assign_recompute(&db, &app, &token, "dom_withdrawn").await;
 
     assert!(
         poll_for_derived(&db, derived_param, neighbour_time, POLL_DEADLINE_SECS)

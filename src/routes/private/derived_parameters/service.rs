@@ -3,7 +3,6 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, PaginatorTrait,
     QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
 };
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -21,77 +20,16 @@ use crate::routes::private::sync::models::{HoldKind, HoldStatus};
 use crate::routes::private::sync::service::{Hold, HoldKey, upsert_hold};
 use crate::routes::private::tools::service::{CURVE_VARIABLES, free_identifiers};
 
-/// A formula's content hash: sha256 over the text itself, so one text is one version however it
-/// was saved.
-fn formula_hash(formula: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(formula.as_bytes());
-    format!("sha256:{:x}", hasher.finalize())
-}
-
-/// Mint a version of a standalone definition's formula, unless the newest one already holds that
-/// text.
-///
-/// An edit is a new calculation rather than a correction of the old one (Q89), so the text a
-/// stored value was made with stays recoverable. A definition attached to a calculation is
-/// versioned by `tool_script_versions` instead, minted once per save of its formula set, so this
-/// covers only the standalone kind the per-reading engine serves.
-async fn mint_derived_version<C: ConnectionTrait>(
-    db: &C,
-    definition_id: Uuid,
-    formula: &str,
-    actor: Option<&str>,
-) -> Result<(), ApiError> {
-    let hash = formula_hash(formula);
-    let newest = super::models::version::Entity::find()
-        .filter(super::models::version::Column::DefinitionId.eq(definition_id))
-        .order_by_desc(super::models::version::Column::VersionNo)
-        .one(db)
-        .await
-        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-    // A re-save that changed nothing else leaves the formula where it is, so the newest version
-    // already carrying this text is the version.
-    if newest.as_ref().is_some_and(|v| v.content_hash == hash) {
-        return Ok(());
+/// A formula belongs to a calculation or is a step of one (Q231). The standalone derived
+/// definition, a formula owned by nothing and computed per source reading, is not a kind any
+/// more, so it is refused at the save rather than left to the table's CHECK.
+fn require_owner_or_step(tool_script_id: Option<Uuid>, intermediate: bool) -> Result<(), ApiError> {
+    if tool_script_id.is_none() && !intermediate {
+        return Err(ApiError::bad_request(
+            "A formula names the calculation it belongs to, or is a step of one".to_string(),
+        ));
     }
-    super::models::version::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        definition_id: Set(definition_id),
-        version_no: Set(newest.map_or(1, |v| v.version_no + 1)),
-        formula: Set(formula.to_string()),
-        content_hash: Set(hash),
-        created_by: Set(actor.map(str::to_string)),
-        ..Default::default()
-    }
-    .insert(db)
-    .await
-    .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
     Ok(())
-}
-
-/// Whether this definition is the standalone kind, ie. not attached to a calculation.
-async fn is_standalone<C: ConnectionTrait>(db: &C, definition_id: Uuid) -> Result<bool, ApiError> {
-    // No row is a definition that does not exist.
-    let row = super::models::definition::Entity::find_by_id(definition_id)
-        .one(db)
-        .await
-        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
-    // A shared step also belongs to no calculation (Q156), and is not the continuous kind: it
-    // mints no parameter and the derived job has nothing of it to serve.
-    Ok(row.is_some_and(|d| d.tool_script_id.is_none() && !d.intermediate))
-}
-
-/// A reducer takes a replicate family, and a continuous definition reads one value per instant, so
-/// there is nothing for it to reduce. It is refused at the save rather than left to fail on every
-/// reading the derived job computes.
-pub(crate) fn refuse_reducers(formula: &str) -> Result<(), ApiError> {
-    match crate::routes::private::tools::service::reducer_calls(formula).first() {
-        Some(call) => Err(ApiError::bad_request(format!(
-            "'{}' reduces a replicate family, which a continuous calculation does not have",
-            call.call
-        ))),
-        None => Ok(()),
-    }
 }
 
 pub(crate) fn validate_formula(formula: &str) -> Result<(), ApiError> {
@@ -1013,6 +951,7 @@ impl CRUDOperations for CalculationFormulaOperations {
         db: &C,
         data: &<CalculationFormula as CRUDResource>::CreateModel,
     ) -> Result<(), ApiError> {
+        require_owner_or_step(data.tool_script_id, data.intermediate.unwrap_or(false))?;
         validate_formula(&data.formula)?;
         let context = FormulaContext {
             tool_script_id: data.tool_script_id,
@@ -1045,11 +984,6 @@ impl CRUDOperations for CalculationFormulaOperations {
         // is a step of the calculation and measures nothing, so it mints none (M180).
         ensure_output_parameter(db, entity).await?;
 
-        if is_standalone(db, entity.id).await? {
-            refuse_reducers(&entity.formula)?;
-            mint_derived_version(db, entity.id, &entity.formula, None).await?;
-        }
-
         // Populate the sources field on the response
         entity.sources = resolved
             .parameters
@@ -1075,12 +1009,23 @@ impl CRUDOperations for CalculationFormulaOperations {
         id: Uuid,
         data: &<CalculationFormula as CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
+        // The stored row says what this definition produces, so the cycle and depth guards run
+        // before the write rather than after it: a refused update must leave nothing behind. It
+        // also carries what this update does not change: the curve slot, the owner and whether
+        // the formula is a step.
+        let stored = stored_definition(db, id).await?;
+        require_owner_or_step(
+            match &data.tool_script_id {
+                Some(owner) => *owner,
+                None => stored.tool_script_id,
+            },
+            match &data.intermediate {
+                Some(Some(step)) => *step,
+                _ => stored.intermediate,
+            },
+        )?;
         if let Some(Some(ref formula)) = data.formula {
             validate_formula(formula)?;
-            // The stored row says what this definition produces, so the cycle and depth guards run
-            // before the write rather than after it: a refused update must leave nothing behind.
-            // It also carries the curve slot when this update does not change it.
-            let stored = stored_definition(db, id).await?;
             let curve_slot = match &data.curve_slot {
                 Some(slot) => slot.clone(),
                 None => stored.curve_slot.clone(),
@@ -1112,11 +1057,6 @@ impl CRUDOperations for CalculationFormulaOperations {
 
         // Keep the output parameter in sync; an intermediate has none to keep.
         ensure_output_parameter(db, entity).await?;
-
-        if is_standalone(db, entity.id).await? {
-            refuse_reducers(&entity.formula)?;
-            mint_derived_version(db, entity.id, &entity.formula, None).await?;
-        }
 
         // Populate the sources field on the response
         entity.sources = resolved

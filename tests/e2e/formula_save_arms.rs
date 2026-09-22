@@ -10,8 +10,8 @@
 //! naming it is recomputed with a ledger row naming the value it replaced.
 //!
 //! The ledger row is a `chain` decision, not a `formula_transition`: the chain executor is what
-//! writes the recomputed value, and `formula_transition` belongs to the standalone derived
-//! parameter recompute (`readings/service.rs`, `Writer::DerivedRecompute`).
+//! writes the recomputed value, and `formula_transition` belongs to the continuous recompute on a
+//! stream (`readings/service.rs`, `Writer::DerivedRecompute`).
 //!
 //! The calculation is formula-engined, so the arithmetic runs in-process and the story needs no
 //! R runner.

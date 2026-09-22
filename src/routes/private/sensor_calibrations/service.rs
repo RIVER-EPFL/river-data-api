@@ -8,8 +8,7 @@ use sea_orm::sea_query::{
 };
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
-    FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
-    TransactionTrait,
+    FromQueryResult, PaginatorTrait, QueryFilter, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -20,7 +19,6 @@ use crate::routes::private::constants::models as constants;
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::derived_parameters::models::definition as calculation_formulas;
 use crate::routes::private::derived_parameters::models::source as derived_sources;
-use crate::routes::private::derived_parameters::models::version as derived_versions;
 use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::decision_model as reading_decisions;
 use crate::routes::private::readings::models as readings;
@@ -719,23 +717,6 @@ struct DerivedWork {
     derived_parameter_code: String,
 }
 
-/// The newest version of a definition's formula, which is the text this engine is about to
-/// evaluate. `None` for a definition minted before versioning, whose rows carry no version rather
-/// than a claim about which text produced them (Q89, M134).
-async fn newest_derived_version(
-    db: &DatabaseConnection,
-    definition_id: Uuid,
-) -> Result<Option<Uuid>, sea_orm::DbErr> {
-    derived_versions::Entity::find()
-        .filter(derived_versions::Column::DefinitionId.eq(definition_id))
-        .select_only()
-        .column(derived_versions::Column::Id)
-        .order_by_desc(derived_versions::Column::VersionNo)
-        .into_tuple::<Uuid>()
-        .one(db)
-        .await
-}
-
 /// The query behind [`fetch_derived_work_items`].
 fn derived_work_query(site_id: Uuid) -> SelectStatement {
     let sp = Alias::new("sp");
@@ -1223,16 +1204,7 @@ pub fn replay_captured(consumed: &[ConsumedInput]) -> Result<f64, String> {
 
 /// The constants a formula names, read from the constants table: every free identifier that is
 /// not one of its declared variables. A name that is neither is left unbound, so the evaluation
-/// reports it rather than a silent zero.
-pub(crate) async fn constants_named_by<C: ConnectionTrait>(
-    db: &C,
-    formula: &str,
-    declared: &[String],
-) -> Result<HashMap<String, f64>, sea_orm::DbErr> {
-    Ok(constants_consumed(db, formula, declared).await?.0)
-}
-
-/// [`constants_named_by`], and each constant as it was read: its row and revision (Q215).
+/// The constants a formula names, and each one as it was read: its row and revision (Q215).
 async fn constants_consumed<C: ConnectionTrait>(
     db: &C,
     formula: &str,
@@ -1531,9 +1503,7 @@ async fn evaluate_and_upsert_derived(
     };
 
     let stream_id = get_or_create_derived_stream(db, item).await?;
-    // The row names the formula text it was made with, so a later edit cannot rewrite the story of
-    // what this number came from (Q89).
-    let version = newest_derived_version(db, item.derived_definition_id).await?;
+    let version = None;
 
     // A recompute that moves a stored value or the version it names records the move (Q116), so a
     // person opening the value reads what it was and which formula edit changed it. Recorded

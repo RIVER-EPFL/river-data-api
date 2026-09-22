@@ -69,6 +69,7 @@ async fn a_computed_value_names_the_formula_it_was_made_with_and_an_edit_mints_a
     let (db, app, token) = setup().await;
 
     let code = format!("fver_{}", Uuid::new_v4().simple());
+    let calculation = crate::common::seed_formula_calculation(&db, &format!("{code}_set")).await;
     let (status, def) = crate::common::post_json_parse_with_token(
         &app,
         "/api/derived_parameters",
@@ -77,6 +78,7 @@ async fn a_computed_value_names_the_formula_it_was_made_with_and_an_edit_mints_a
             "name": "Formula version fixture",
             "units": "mg/L",
             "formula": "Dissolved_O2 * 0.032",
+            "tool_script_id": calculation,
         }),
         &token,
     )
@@ -169,6 +171,7 @@ async fn a_formula_value_resolves_the_calculation_that_produced_it() {
     let (db, app, token) = setup().await;
 
     let code = format!("fprov_{}", Uuid::new_v4().simple());
+    let calculation = crate::common::seed_formula_calculation(&db, &format!("{code}_set")).await;
     let (status, def) = crate::common::post_json_parse_with_token(
         &app,
         "/api/derived_parameters",
@@ -177,6 +180,7 @@ async fn a_formula_value_resolves_the_calculation_that_produced_it() {
             "name": "Formula provenance fixture",
             "units": "mg/L",
             "formula": "Dissolved_O2 * 0.032",
+            "tool_script_id": calculation,
         }),
         &token,
     )

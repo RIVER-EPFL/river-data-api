@@ -63,7 +63,6 @@ use crate::routes::private::collection_events::flows::TouchedEvent;
 use crate::routes::private::data_streams;
 use crate::routes::private::data_streams::models::receipts;
 use crate::routes::private::derived_parameters::models::definition as calculation_formulas;
-use crate::routes::private::derived_parameters::models::version as derived_versions;
 use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings;
 use crate::routes::private::readings::models::ConflictMode;
@@ -5438,78 +5437,27 @@ pub(super) async fn fetch_calculations(
             .into_tuple()
             .all(db)
             .await?;
-    // The newest version each of them has, which is what "active" means for a standalone formula.
-    let mut active_version: HashMap<Uuid, i32> = HashMap::new();
-    for (definition_id, version_no) in derived_versions::Entity::find()
-        .filter(
-            derived_versions::Column::DefinitionId
-                .is_in(definitions.iter().map(|(id, ..)| *id).collect::<Vec<_>>()),
-        )
-        .select_only()
-        .column(derived_versions::Column::DefinitionId)
-        .column_as(derived_versions::Column::VersionNo.max(), "version_no")
-        .group_by(derived_versions::Column::DefinitionId)
-        .into_tuple::<(Uuid, Option<i32>)>()
-        .all(db)
-        .await?
-    {
-        if let Some(version_no) = version_no {
-            active_version.insert(definition_id, version_no);
-        }
-    }
     let mut by_parameter: HashMap<Uuid, CalculationInfo> = HashMap::new();
     for (id, code, name, output_parameter_id, tool_script_id) in definitions {
-        let row = DefinitionRow {
-            active_version_no: active_version.get(&id).copied(),
-            id,
-            code,
-            name,
-            output_parameter_id,
-            tool_script_id,
-        };
-        let Some(output) = row.output_parameter_id else {
+        let (Some(output), Some(tool_script_id)) = (output_parameter_id, tool_script_id) else {
             continue;
         };
         by_parameter.insert(
             output,
             CalculationInfo {
-                definition_id: row.id,
-                tool_script_id: row.tool_script_id,
-                code: row.code,
-                name: row.name,
+                definition_id: id,
+                tool_script_id,
+                code,
+                name,
                 version_id: None,
                 version_no: None,
                 formula: None,
                 content_hash: None,
-                active_version_no: row.active_version_no,
+                active_version_no: None,
             },
         );
     }
-
-    let version_ids: Vec<Uuid> = rows
-        .iter()
-        .filter_map(|r| r.derived_version_id)
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    if version_ids.is_empty() {
-        return Ok((by_parameter, HashMap::new()));
-    }
-    let found: Vec<(Uuid, i32, String, String)> = derived_versions::Entity::find()
-        .filter(derived_versions::Column::Id.is_in(version_ids))
-        .select_only()
-        .column(derived_versions::Column::Id)
-        .column(derived_versions::Column::VersionNo)
-        .column(derived_versions::Column::Formula)
-        .column(derived_versions::Column::ContentHash)
-        .into_tuple()
-        .all(db)
-        .await?;
-    let mut versions = HashMap::new();
-    for (id, version_no, formula, content_hash) in found {
-        versions.insert(id, (version_no, formula, content_hash));
-    }
-    Ok((by_parameter, versions))
+    Ok((by_parameter, HashMap::new()))
 }
 
 /// A formula and what it reads, as the sources table records it today. Sources are not versioned,

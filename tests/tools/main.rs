@@ -29,6 +29,7 @@ mod scripts_lifecycle;
 mod seeded_cases;
 mod seeded_version_hashes;
 mod skipped_output;
+mod staged_preview;
 mod switched_off;
 mod two_stage_calculation;
 mod version_usage;

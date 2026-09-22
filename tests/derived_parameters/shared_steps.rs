@@ -184,6 +184,22 @@ async fn a_step_two_calculations_compute_is_authored_once_and_declared_by_each()
             "a shared step is owned by nobody: {calculation}"
         );
     }
+
+    // A third calculation cannot write the code either: one code is one formula whether the
+    // formula belongs to a calculation or to none.
+    let third = calculation(&db, "third_set").await;
+    let (status, refused) = crate::common::save_formula_set(
+        &app,
+        &token,
+        &third,
+        json!([{ "code": "guard", "units": "uM", "formula": "Dissolved_O2 * 4", "ordinal": 0 }]),
+    )
+    .await;
+    assert_eq!(status, 400, "the save is refused: {refused}");
+    assert!(
+        refused.contains("guard is a formula of a shared step"),
+        "the refusal names what holds the code: {refused}"
+    );
 }
 
 #[tokio::test]

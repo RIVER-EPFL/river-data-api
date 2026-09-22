@@ -130,6 +130,7 @@ async fn a_recompute_records_the_move_and_a_pass_that_moves_nothing_records_noth
     let (db, app, token) = setup().await;
 
     let code = format!("ftrans_{}", Uuid::new_v4().simple());
+    let calculation = crate::common::seed_formula_calculation(&db, &format!("{code}_set")).await;
     let (status, def) = crate::common::post_json_parse_with_token(
         &app,
         "/api/derived_parameters",
@@ -138,6 +139,7 @@ async fn a_recompute_records_the_move_and_a_pass_that_moves_nothing_records_noth
             "name": "Formula transition fixture",
             "units": "mg/L",
             "formula": "Dissolved_O2 * 0.032",
+            "tool_script_id": calculation,
         }),
         &token,
     )
@@ -292,6 +294,7 @@ async fn a_derived_value_replays_its_own_formula_over_what_it_consumed() {
     let (db, app, token) = setup().await;
 
     let code = format!("replay_{}", Uuid::new_v4().simple());
+    let calculation = crate::common::seed_formula_calculation(&db, &format!("{code}_set")).await;
     let (status, def) = crate::common::post_json_parse_with_token(
         &app,
         "/api/derived_parameters",
@@ -300,6 +303,7 @@ async fn a_derived_value_replays_its_own_formula_over_what_it_consumed() {
             "name": "Replay fixture",
             "units": "mg/L",
             "formula": "Dissolved_O2 * 0.032",
+            "tool_script_id": calculation,
         }),
         &token,
     )

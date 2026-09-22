@@ -1,5 +1,5 @@
-//! The three tables a calculation is made of: the formula and its output slot, the input
-//! parameters bound to its variable names, and the version history of the formula text.
+//! The two tables a calculation's formulas are made of: the formula and its output slot, and the
+//! input parameters bound to its variable names.
 //!
 //! One file, a module per entity, because an entity owns the names `Model`, `Entity` and
 //! `Column`, plus the read shapes the calculation routes answer in.
@@ -49,8 +49,8 @@ pub mod definition {
         /// rather than minting a second parameter or refusing the code.
         #[crudcrate(exclude(create, update))]
         pub given_up_parameter_id: Option<Uuid>,
-        /// The calculation this formula belongs to (M67). NULL is a standalone derived parameter, the
-        /// per-reading continuous kind the derived job and janitor serve.
+        /// The calculation this formula belongs to (M67). NULL is a shared step, owned by no
+        /// calculation and declared by each that reads it (Q156).
         #[crudcrate(filterable)]
         pub tool_script_id: Option<Uuid>,
         /// Evaluation order inside the calculation.
@@ -258,70 +258,6 @@ pub mod shared_step {
     impl Related<crate::routes::private::derived_parameters::models::definition::Entity> for Entity {
         fn to() -> RelationDef {
             Relation::CalculationFormula.def()
-        }
-    }
-
-    impl ActiveModelBehavior for ActiveModel {}
-}
-
-pub mod version {
-    //! A frozen formula, as an entity.
-    //!
-    //! An edit to a standalone derived definition is a new calculation rather than a correction of the
-    //! old one (Q89), so each text is kept under its own version number and a reading names the version
-    //! it was made with. Rows are append-only and no route lists them: a version is reached through its
-    //! definition, so the entity carries no router.
-
-    use crudcrate::EntityToModels;
-    use sea_orm::entity::prelude::*;
-
-    #[derive(
-        Clone,
-        Debug,
-        PartialEq,
-        DeriveEntityModel,
-        serde::Serialize,
-        serde::Deserialize,
-        EntityToModels,
-    )]
-    #[sea_orm(table_name = "derived_parameter_definition_versions")]
-    #[crudcrate(
-        api_struct = "DerivedDefinitionVersion",
-        name_singular = "derived_definition_version",
-        name_plural = "derived_definition_versions"
-    )]
-    pub struct Model {
-        #[sea_orm(primary_key, auto_increment = false)]
-        #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
-        pub id: Uuid,
-        #[crudcrate(filterable, sortable)]
-        pub definition_id: Uuid,
-        /// One-based and per definition, so `(definition_id, version_no)` is unique.
-        #[crudcrate(filterable, sortable)]
-        pub version_no: i32,
-        pub formula: String,
-        /// The hash the migration computes for the same text, so a re-save of an unchanged formula
-        /// mints no version.
-        #[crudcrate(filterable)]
-        pub content_hash: String,
-        pub created_by: Option<String>,
-        #[crudcrate(exclude(create, update), sortable)]
-        pub created_at: chrono::DateTime<chrono::Utc>,
-    }
-
-    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {
-        #[sea_orm(
-            belongs_to = "super::definition::Entity",
-            from = "Column::DefinitionId",
-            to = "super::definition::Column::Id"
-        )]
-        Definition,
-    }
-
-    impl Related<super::definition::Entity> for Entity {
-        fn to() -> RelationDef {
-            Relation::Definition.def()
         }
     }
 
