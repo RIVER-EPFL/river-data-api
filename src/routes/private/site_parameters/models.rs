@@ -41,7 +41,6 @@ pub struct Model {
     /// Display precision, carried to the client by [`SlotDescriptor`]. The API
     /// serves full precision and the client formats, so a change here never rewrites a value.
     pub decimal_places: Option<i16>,
-    pub channel_id: Option<i32>,
     pub sample_interval_sec: Option<i32>,
     // `on_create` is where the create-time default lives: the field stays in the create model so
     // the client's value is honoured, and an omitted field takes the expression rather than NULL.

@@ -1324,10 +1324,14 @@ async fn unattribute_derived_at(
     item: &DerivedWork,
     time: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), sea_orm::DbErr> {
-    crate::common::bulk_write::guarded_mutation(
-        db,
-        unattribute_statement(item.derived_site_id, item.derived_parameter_id, time),
-    )
+    crate::common::bulk_write::guarded(db, async |txn| {
+        crate::common::bulk_write::mutation_rows(
+            txn,
+            unattribute_statement(item.derived_site_id, item.derived_parameter_id, time),
+        )
+        .await?;
+        Ok(())
+    })
     .await
     .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
     Ok(())
@@ -1517,7 +1521,7 @@ async fn evaluate_and_upsert_derived(
         let born = record_formula_transition(txn, stream_id, time, result, version, &consumed)
             .await
             .map_err(crate::error::AppError::from)?;
-        crate::common::bulk_write::mutation(
+        crate::common::bulk_write::mutation_rows(
             txn,
             derived_upsert(stream_id, site_id, parameter_id, time, result, version),
         )

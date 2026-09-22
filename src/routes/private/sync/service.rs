@@ -896,6 +896,18 @@ pub fn hold_statement(hold: &Hold) -> sea_orm::sea_query::InsertStatement {
         .to_owned()
 }
 
+/// The (site, parameter) slots a plan's streams are paired to, each once. The re-derivation after
+/// an apply covers these and no others.
+pub(super) fn plan_slots(plan_id: Uuid) -> sea_orm::Select<data_streams::models::Entity> {
+    data_streams::models::Entity::find()
+        .inner_join(site_parameters::models::Entity)
+        .select_only()
+        .column(site_parameters::models::Column::SiteId)
+        .column(site_parameters::models::Column::ParameterId)
+        .distinct()
+        .filter(data_streams::models::Column::PairingPlanId.eq(plan_id))
+}
+
 /// Which streams' holds a pairing change moves.
 #[derive(Debug, Clone, Copy)]
 pub enum HoldScope {
@@ -1745,22 +1757,112 @@ pub(super) struct ReopenHoldRow {
     pub(super) resolution: Option<serde_json::Value>,
 }
 
-/// SQL fragment producing the accept-ours resolution object (actor and time stamped on the
+/// SQL fragment producing an acknowledgement's resolution object (actor and time stamped on the
 /// entry) while preserving any prior actions under `history` (a reopened hold can be
-/// re-resolved). Shared by single and bulk acknowledge; `by_bind` is the placeholder carrying
-/// the actor label.
-pub(super) fn accept_ours_resolution(by: &str) -> Expr {
+/// re-resolved). The action is the purpose's own, so a resolution record names what was decided.
+pub(super) fn acknowledgement_resolution(action: &str, by: &str) -> Expr {
     Expr::cust_with_values(
         "CASE \
          WHEN h.resolution IS NULL \
-             THEN jsonb_build_object('action', 'accept_ours', 'by', $1::text, 'at', NOW()) \
-         ELSE jsonb_build_object('action', 'accept_ours', 'by', $1::text, 'at', NOW(), \
+             THEN jsonb_build_object('action', $1::text, 'by', $2::text, 'at', NOW()) \
+         ELSE jsonb_build_object('action', $1::text, 'by', $2::text, 'at', NOW(), \
               'history', \
               COALESCE(h.resolution->'history', '[]'::jsonb) \
                   || jsonb_build_array(h.resolution - 'history')) \
          END",
-        [sea_orm::Value::from(by)],
+        [sea_orm::Value::from(action), sea_orm::Value::from(by)],
     )
+}
+
+/// What an acknowledgement is for. Each purpose owns the kinds one screen raises, and a route
+/// takes a purpose, so a route cannot reach another purpose's rows or mint another purpose's
+/// sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    /// The reconciliation brake held a pass and a person admits it.
+    StreamBrake,
+    /// A calculation output the audit reported as missing, stale or skipped.
+    CalculationFinding,
+    /// The source reports an instrument identity that is not the one on record.
+    IdentityChange,
+    /// The source changed a value river-data had already stored, and the correction applied.
+    SourceCorrection,
+    /// The statistics recomputed from the stored replicates stand.
+    Statistics,
+}
+
+impl Purpose {
+    pub const ALL: [Self; 5] = [
+        Self::StreamBrake,
+        Self::CalculationFinding,
+        Self::IdentityChange,
+        Self::SourceCorrection,
+        Self::Statistics,
+    ];
+
+    /// The kinds this purpose acknowledges, and no others.
+    #[must_use]
+    pub fn kinds(self) -> &'static [HoldKind] {
+        match self {
+            Self::StreamBrake => &[HoldKind::BrakeFired],
+            Self::CalculationFinding => &[
+                HoldKind::MissingOutput,
+                HoldKind::StaleOutput,
+                HoldKind::SkippedOutput,
+            ],
+            Self::IdentityChange => &[HoldKind::SourceIdentityChanged],
+            Self::SourceCorrection => &[HoldKind::SourceModified],
+            Self::Statistics => &[HoldKind::ReplicateStats],
+        }
+    }
+
+    #[must_use]
+    pub fn owns(self, kind: HoldKind) -> bool {
+        self.kinds().contains(&kind)
+    }
+
+    /// The action recorded in the hold's `resolution`.
+    #[must_use]
+    pub fn action(self) -> &'static str {
+        match self {
+            Self::StreamBrake => "release_brake",
+            Self::CalculationFinding => "dismiss_finding",
+            Self::IdentityChange => "accept_identity",
+            Self::SourceCorrection => "accept_correction",
+            Self::Statistics => "accept_ours",
+        }
+    }
+
+    /// The sentence this purpose puts on the chart. The numbers belong to the statistics
+    /// sentence alone: another kind's `expected` carries a window or an output name, not a mean.
+    #[must_use]
+    pub fn sentence(
+        self,
+        expected: &serde_json::Value,
+        computed: &serde_json::Value,
+        by: &str,
+    ) -> String {
+        match self {
+            Self::StreamBrake => format!(
+                "Brake released: one braked-scale reconciliation pass is admitted. Released by {by}."
+            ),
+            Self::CalculationFinding => {
+                format!(
+                    "Calculation finding dismissed: no recomputation is owed here. Dismissed by {by}."
+                )
+            }
+            Self::IdentityChange => format!(
+                "Identity change accepted: the instrument the source reports stands. Accepted by {by}."
+            ),
+            Self::SourceCorrection => format!(
+                "Source correction reviewed: the curation on the corrected reading stands. Reviewed by {by}."
+            ),
+            Self::Statistics => format!(
+                "Audit accepted: the statistics computed here stand ({}). Accepted by {by}.",
+                disagreement_phrase(expected, computed)
+            ),
+        }
+    }
 }
 
 /// The audit annotation category. Minted server-side only; the annotate dialog does not offer it.
@@ -1841,27 +1943,26 @@ pub(super) fn disagreement_phrase(
     )
 }
 
-/// The `expected`/`computed` blobs of one hold, for the annotation text.
-pub(super) async fn hold_numbers<C: ConnectionTrait>(
-    conn: &C,
-    hold_id: Uuid,
-) -> (serde_json::Value, serde_json::Value) {
-    hold_model::Entity::find_by_id(hold_id)
-        .one(conn)
-        .await
-        .ok()
-        .flatten()
-        .map_or_else(
-            || (serde_json::Value::Null, serde_json::Value::Null),
-            |hold| (hold.expected, hold.computed),
-        )
-}
-
-/// Accept the statistics recomputed from the stored replicates: the hold goes terminal, the
-/// decision is recorded on it, and the annotation that draws it on the chart is minted. Both the
-/// acknowledge route and `resolve {mode: "ours"}` are this and nothing else; only the response
-/// they build differs.
-pub(super) async fn accept_ours(state: &AppState, id: Uuid, by: &str) -> AppResult<()> {
+/// Acknowledge one pending hold for the purpose the route owns: the hold goes terminal, the
+/// decision is recorded on it under that purpose's action, and the sentence that draws it on the
+/// chart is minted. A hold of a kind the purpose does not own is refused, so a route cannot mint
+/// another purpose's sentence over it.
+pub(super) async fn acknowledge(
+    state: &AppState,
+    id: Uuid,
+    purpose: Purpose,
+    by: &str,
+) -> AppResult<()> {
+    let hold = hold_model::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("no replicate audit hold {id}")))?;
+    if !HoldKind::parse(&hold.kind).is_ok_and(|kind| purpose.owns(kind)) {
+        return Err(AppError::BadRequest(format!(
+            "hold {id} is of kind '{}', which this route does not acknowledge",
+            hold.kind
+        )));
+    }
     // The resolution expression names the row as `h`, so the statement aliases the table.
     let (sql, values) = SeaQuery::update()
         .table(
@@ -1872,7 +1973,10 @@ pub(super) async fn accept_ours(state: &AppState, id: Uuid, by: &str) -> AppResu
             hold_model::Column::Status,
             Expr::val(HoldStatus::Acknowledged.as_str()),
         )
-        .value(hold_model::Column::Resolution, accept_ours_resolution(by))
+        .value(
+            hold_model::Column::Resolution,
+            acknowledgement_resolution(purpose.action(), by),
+        )
         .value(hold_model::Column::AcknowledgedBy, Expr::val(by))
         .value(hold_model::Column::AcknowledgedAt, Expr::cust("NOW()"))
         .and_where(Expr::col(hold_model::Column::Id).eq(id))
@@ -1893,14 +1997,10 @@ pub(super) async fn accept_ours(state: &AppState, id: Uuid, by: &str) -> AppResu
             "no pending replicate audit hold {id}"
         )));
     }
-    let (expected, computed) = hold_numbers(&state.db, id).await;
     mint_audit_annotation(
         &state.db,
         id,
-        &format!(
-            "Audit accepted: the statistics computed here stand ({}). Accepted by {by}.",
-            disagreement_phrase(&expected, &computed)
-        ),
+        &purpose.sentence(&hold.expected, &hold.computed, by),
         by,
     )
     .await;
@@ -2377,7 +2477,7 @@ pub struct ExistingParamRef {
 /// so a warning always reads as something even where the structure is not used.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanWarning {
-    /// `units_mismatch` | `empty_name` | `near_duplicate`.
+    /// `units_mismatch` | `empty_name` | `near_duplicate` | `catalog_match`.
     pub kind: String,
     pub message: String,
     #[serde(default)]
@@ -2427,6 +2527,31 @@ impl PlanWarning {
         }
     }
 
+    /// A code the plan would create under names a parameter the catalog already holds. A typed code
+    /// attaches to nothing on its own (Q221), so the operator is told what they have written beside;
+    /// where the code itself is taken, the apply refuses outright.
+    pub fn catalog_match(proposed: &str, existing: &CatalogParam) -> Self {
+        Self {
+            kind: "catalog_match".to_string(),
+            message: format!(
+                "The catalog already holds '{}' ({}). Attach this column to it, or give the new \
+                 parameter a code of its own.",
+                existing.code, existing.name
+            ),
+            parameter: Some(proposed.to_string()),
+            existing: Some(ExistingParamRef {
+                id: existing.id,
+                code: existing.code.clone(),
+                name: existing.name.clone(),
+                units: existing.units.clone(),
+                category: existing.category.clone(),
+                site_parameter_count: existing.site_parameter_count,
+                reading_count: existing.reading_count,
+            }),
+            source_units: None,
+        }
+    }
+
     pub fn empty_name() -> Self {
         Self {
             kind: "empty_name".to_string(),
@@ -2465,8 +2590,9 @@ pub struct PlanInstrumentRef {
     /// `(source_system, source_key)` is an instrument's identity, so a later rename cannot break
     /// the mapping.
     pub source_key: String,
-    /// `stream` (already attributed), `curve_label` (matched against the source's own curve
-    /// labels), `manual` (repointed in the review), or `placeholder` (nothing matched).
+    /// `stream` (already attributed), `curve_label` (suggested from the source's own curve
+    /// labels), `manual` (repointed in the review), `ambiguous_label` (the label matched more than
+    /// one, so nothing is suggested), or `placeholder` (nothing matched).
     pub resolved_by: String,
     pub create: bool,
     /// The instrument row was minted by stream registration rather than named by the source or an
@@ -2497,6 +2623,18 @@ pub struct PlanInstrumentRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub name_conflict: Option<InstrumentNameConflict>,
+    /// The instruments a curve label matched when it matched more than one. Which analyser the
+    /// source meant is not in the label, so the tie is named and nothing is suggested (Q195).
+    #[serde(default)]
+    #[schema(required)]
+    pub label_candidates: Vec<PlanLabelCandidate>,
+}
+
+/// One instrument a curve label matched, enough of it to choose by.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct PlanLabelCandidate {
+    pub id: Uuid,
+    pub name: String,
 }
 
 /// The instrument a proposed name collides with, enough of it to choose by.
@@ -2730,6 +2868,43 @@ pub async fn load_instrument_catalog(
     })
 }
 
+/// What a curve column's stem matched among this source's instrument labels.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LabelMatch {
+    /// Nothing carries the stem.
+    None,
+    /// One instrument does. It is a suggestion, never a settled attribution: words matching is not
+    /// the source saying so.
+    One(Uuid),
+    /// Several do, and which analyser the source meant is not in the label. Reported rather than
+    /// dropped, because a tie is the review's question to answer.
+    Tie(Vec<Uuid>),
+}
+
+/// The instruments of this source whose label matches a curve column's stem.
+///
+/// A registration-minted default is not a candidate: its label is the parameter's own name, so
+/// `DOC` would tie with the analyser labelled `DOC corr` and make every stem ambiguous. The
+/// question a curve column asks is which instrument the source says produced the correction, and a
+/// default is the absence of that answer.
+pub(super) fn label_match(curve_column: &str, catalog: &InstrumentCatalog) -> LabelMatch {
+    let stem = curve_column_stem(curve_column);
+    let mut matches: Vec<Uuid> = catalog
+        .labels
+        .iter()
+        .filter(|(_, id)| !catalog.defaulted.contains(id))
+        .filter(|(label, _)| *label == stem || label.starts_with(&format!("{stem} ")))
+        .map(|(_, id)| *id)
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    matches.retain(|id| seen.insert(*id));
+    match matches.len() {
+        0 => LabelMatch::None,
+        1 => LabelMatch::One(matches[0]),
+        _ => LabelMatch::Tie(matches),
+    }
+}
+
 /// Which instrument a stream's curve references belong to, most specific first: the instrument the
 /// stream already names, then the source's own curve labels matched against the curve column, then
 /// a placeholder for an operator to confirm.
@@ -2738,28 +2913,6 @@ pub async fn load_instrument_catalog(
 /// curve catalog is replicated independently of the readings, so the instrument is knowable even
 /// when no row has yet named a curve. It is a heuristic, so it is reported as one, and an
 /// ambiguous stem resolves to nothing rather than to a guess.
-/// The one instrument of this source whose label matches a curve column's stem. An ambiguous stem
-/// matches nothing rather than guessing between two.
-///
-/// A registration-minted default is not a candidate: its label is the parameter's own name, so
-/// `DOC` would tie with the analyser labelled `DOC corr` and make every stem ambiguous. The
-/// question a curve column asks is which instrument the source says produced the correction, and a
-/// default is the absence of that answer.
-pub(super) fn label_match(curve_column: &str, catalog: &InstrumentCatalog) -> Option<Uuid> {
-    let stem = curve_column_stem(curve_column);
-    let matches: Vec<Uuid> = catalog
-        .labels
-        .iter()
-        .filter(|(_, id)| !catalog.defaulted.contains(id))
-        .filter(|(label, _)| *label == stem || label.starts_with(&format!("{stem} ")))
-        .map(|(_, id)| *id)
-        .collect();
-    match matches[..] {
-        [id] => Some(id),
-        _ => None,
-    }
-}
-
 pub fn resolve_instrument(
     stream_sensor_id: Option<Uuid>,
     curve_column: Option<&str>,
@@ -2791,6 +2944,7 @@ pub fn resolve_instrument(
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
             proposed_name: None,
             name_conflict: None,
+            label_candidates: vec![],
         });
     }
 
@@ -2815,26 +2969,34 @@ pub fn resolve_instrument(
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
             proposed_name: None,
             name_conflict: None,
+            label_candidates: vec![],
         });
     }
 
-    if let Some(id) = label_match(&column, catalog) {
-        let (name, source_key) = catalog.by_id.get(&id).cloned().unwrap_or_default();
-        return Some(PlanInstrumentRef {
-            curve_column,
-            id: Some(id),
-            name,
-            source_key: source_key.unwrap_or_default(),
-            resolved_by: "curve_label".to_string(),
-            create: false,
-            defaulted: catalog.defaulted.contains(&id),
-            confirmed: true,
-            stamps_readings,
-            curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
-            proposed_name: None,
-            name_conflict: None,
-        });
-    }
+    // A label match is words agreeing, not the source naming an instrument, so it is carried as a
+    // suggestion the review confirms (Q195). A tie names its candidates and suggests none.
+    let tied = match label_match(&column, catalog) {
+        LabelMatch::One(id) => {
+            let (name, source_key) = catalog.by_id.get(&id).cloned().unwrap_or_default();
+            return Some(PlanInstrumentRef {
+                curve_column,
+                id: Some(id),
+                name,
+                source_key: source_key.unwrap_or_default(),
+                resolved_by: "curve_label".to_string(),
+                create: false,
+                defaulted: catalog.defaulted.contains(&id),
+                confirmed: false,
+                stamps_readings,
+                curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
+                proposed_name: None,
+                name_conflict: None,
+                label_candidates: vec![],
+            });
+        }
+        LabelMatch::Tie(ids) => label_candidates(&ids, catalog),
+        LabelMatch::None => vec![],
+    };
 
     // Unconfirmed, and the apply refuses until an operator says yes (Q123). The name is a stem
     // taken from a column heading, and a lab instrument is provenance: once readings name it,
@@ -2846,7 +3008,11 @@ pub fn resolve_instrument(
         id: None,
         name: name.clone(),
         source_key,
-        resolved_by: "placeholder".to_string(),
+        resolved_by: if tied.is_empty() {
+            "placeholder".to_string()
+        } else {
+            "ambiguous_label".to_string()
+        },
         create: true,
         defaulted: false,
         confirmed: false,
@@ -2854,7 +3020,25 @@ pub fn resolve_instrument(
         curves: vec![],
         proposed_name: Some(name),
         name_conflict: None,
+        label_candidates: tied,
     })
+}
+
+/// The tied instruments, named so the review can pick one instead of creating another.
+fn label_candidates(ids: &[Uuid], catalog: &InstrumentCatalog) -> Vec<PlanLabelCandidate> {
+    let mut candidates: Vec<PlanLabelCandidate> = ids
+        .iter()
+        .map(|id| PlanLabelCandidate {
+            id: *id,
+            name: catalog
+                .by_id
+                .get(id)
+                .map(|(name, _)| name.clone())
+                .unwrap_or_else(|| id.to_string()),
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.name.cmp(&b.name));
+    candidates
 }
 
 /// The provenance key a stream's instrument is held under: the source's instrument for the raw
@@ -2900,6 +3084,7 @@ pub fn resolve_parameter_instrument(
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
             proposed_name: None,
             name_conflict: None,
+            label_candidates: vec![],
         };
     }
     // The lab's DOC analyser is one machine carried to every station, so it is called DOC. The
@@ -2920,6 +3105,7 @@ pub fn resolve_parameter_instrument(
         curves: vec![],
         proposed_name: Some(name),
         name_conflict: conflict,
+        label_candidates: vec![],
     }
 }
 
@@ -2948,6 +3134,7 @@ pub fn resolve_device_instrument(
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
             proposed_name: None,
             name_conflict: None,
+            label_candidates: vec![],
         };
     }
     PlanInstrumentRef {
@@ -2963,6 +3150,7 @@ pub fn resolve_device_instrument(
         curves: vec![],
         proposed_name: Some(slot.to_string()),
         name_conflict: catalog.named(slot),
+        label_candidates: vec![],
     }
 }
 
@@ -3051,6 +3239,24 @@ pub struct PlanParamRef {
     #[serde(default)]
     #[schema(required)]
     pub original_names: Vec<String>,
+    /// What the review decided this parameter is, kept on the plan so it survives a reload. Absent
+    /// where nobody has decided and the source's own name is still matched against the catalog as a
+    /// proposal; a code somebody typed attaches to nothing on its own (Q221).
+    #[serde(default)]
+    #[schema(required)]
+    pub attach: Option<PlanParamAttach>,
+}
+
+/// The review's answer to "which catalog parameter is this column": one that exists, or a new one
+/// under the code the entry carries. One field rather than an id beside a flag, so "attached to
+/// nothing in particular" cannot be written down.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(tag = "choice", rename_all = "snake_case")]
+pub enum PlanParamAttach {
+    /// Attach every entry of this group to the catalog parameter with this id.
+    Existing { id: Uuid },
+    /// Create a parameter under the entry's own code.
+    New,
 }
 
 /// The parameter group a column belongs to, as the source's own registry places it.
@@ -3386,6 +3592,7 @@ pub async fn create_plan(
                 group: plan_group(&stream.metadata),
                 calculation: plan_calculation(&stream.metadata),
                 original_names: vec![],
+                attach: None,
             },
             confidence: "none".to_string(),
             warnings: vec![],
@@ -3740,42 +3947,82 @@ fn held_curve_title(curve: &standard_curves::models::proposal::Model) -> String 
         .unwrap_or_else(|| format!("{} ({})", curve.label, curve.source_key))
 }
 
-/// Refuse a plan while any curve its source holds is attached to none of its instruments. The
-/// curve cannot be stored without one, and leaving it behind would leave the readings that name it
-/// uncorrected with nothing saying why (Q195).
+/// Refuse a plan while any curve its source holds has been neither attached to one of its
+/// instruments nor skipped. The curve cannot be stored without an instrument, and leaving it
+/// behind unsaid would leave the readings that name it uncorrected with nothing saying why (Q195);
+/// a skip is that saying so (Q220).
 pub async fn refuse_unattached_curves<C: ConnectionTrait>(
     conn: &C,
     source_system: &str,
     attachments: &[PlanCurveAttachment],
 ) -> AppResult<()> {
-    let unattached: Vec<String> = held_curves(conn, source_system)
+    let undecided: Vec<String> = held_curves(conn, source_system)
         .await?
         .iter()
+        .filter(|c| c.skipped_at.is_none())
         .filter(|c| !attachments.iter().any(|a| a.proposal_id == c.id))
         .map(held_curve_title)
         .collect();
-    if unattached.is_empty() {
+    if undecided.is_empty() {
         return Ok(());
     }
     Err(AppError::BadRequest(format!(
-        "{} standard curve{} from {source_system} {} attached to no instrument: {}. Attach each \
-         to one of the plan's instruments before applying.",
-        unattached.len(),
-        if unattached.len() == 1 { "" } else { "s" },
-        if unattached.len() == 1 { "is" } else { "are" },
-        unattached.join(", ")
+        "{} standard curve{} from {source_system} {} been ruled on: {}. Attach each to one of the \
+         plan's instruments, or skip it, before applying.",
+        undecided.len(),
+        if undecided.len() == 1 { "" } else { "s" },
+        if undecided.len() == 1 {
+            "has not"
+        } else {
+            "have not"
+        },
+        undecided.join(", ")
     )))
 }
 
-/// Fold the review's held-curve attachments into the plan's list. A held curve of this source may
-/// be attached to an instrument some paired entry proposes creating, or to one that exists; naming
-/// neither clears it. Anything else is a 400 now rather than a failed apply later.
+/// Stamp or clear a held curve's skip. Refuses a curve of another source, which is the same guard
+/// the attachment arm applies, so a stray id cannot reach across sources.
+async fn stamp_held_curve_skip(
+    db: &sea_orm::DatabaseConnection,
+    source_system: &str,
+    proposal_id: Uuid,
+    skip: bool,
+    actor: &str,
+) -> AppResult<()> {
+    use standard_curves::models::proposal;
+    let affected = proposal::Entity::update_many()
+        .col_expr(
+            proposal::Column::SkippedAt,
+            Expr::value(skip.then(Utc::now)),
+        )
+        .col_expr(
+            proposal::Column::SkippedBy,
+            Expr::value(skip.then(|| actor.to_string())),
+        )
+        .filter(proposal::Column::Id.eq(proposal_id))
+        .filter(proposal::Column::SourceSystem.eq(source_system))
+        .exec(db)
+        .await?;
+    if affected.rows_affected == 0 {
+        return Err(AppError::BadRequest(format!(
+            "{source_system} holds no curve {proposal_id}"
+        )));
+    }
+    Ok(())
+}
+
+/// Fold the review's held-curve decisions into the plan. A held curve of this source may be
+/// attached to an instrument some paired entry proposes creating, or to one that exists; naming
+/// neither clears it. A skip is the other decision the apply accepts: it is stamped on the held
+/// row, and attaching takes it back, because a curve cannot be both left behind and created
+/// (Q220). Anything else is a 400 now rather than a failed apply later.
 pub(super) async fn apply_held_curve_updates(
     db: &sea_orm::DatabaseConnection,
     source_system: &str,
     entries: &[PlanEntry],
     attachments: &mut Vec<PlanCurveAttachment>,
     updates: &[PlanHeldCurveUpdate],
+    actor: &str,
 ) -> AppResult<()> {
     use standard_curves::models::proposal;
     for update in updates {
@@ -3785,6 +4032,17 @@ pub(super) async fn apply_held_curve_updates(
             .as_deref()
             .map(str::trim)
             .filter(|k| !k.is_empty());
+        if update.skip == Some(true) && (source_key.is_some() || update.instrument_id.is_some()) {
+            return Err(AppError::BadRequest(
+                "a held curve is either skipped or attached to an instrument, not both".to_string(),
+            ));
+        }
+        if let Some(skip) = update.skip {
+            stamp_held_curve_skip(db, source_system, update.proposal_id, skip, actor).await?;
+            if skip {
+                continue;
+            }
+        }
         if source_key.is_none() && update.instrument_id.is_none() {
             continue;
         }
@@ -3828,6 +4086,7 @@ pub(super) async fn apply_held_curve_updates(
                 "instrument {id} does not exist"
             )));
         }
+        stamp_held_curve_skip(db, source_system, update.proposal_id, false, actor).await?;
         attachments.push(PlanCurveAttachment {
             proposal_id: update.proposal_id,
             instrument_source_key: source_key.map(str::to_string),
@@ -3922,22 +4181,19 @@ pub(super) struct ApplyCounters {
     pub(super) curves_created: u32,
 }
 
-/// The streams whose instrument is a creation nobody has agreed to.
+/// The streams whose instrument nobody has agreed to: a creation, or an attachment the plan
+/// suggested from a curve label.
 pub fn unconfirmed_instruments(entries: &[PlanEntry]) -> Vec<&str> {
     entries
         .iter()
         .filter(|e| e.action == "pair")
-        .filter(|e| {
-            e.instrument
-                .as_ref()
-                .is_some_and(|i| i.create && !i.confirmed)
-        })
+        .filter(|e| e.instrument.as_ref().is_some_and(|i| !i.confirmed))
         .map(|e| e.source_key.as_str())
         .collect()
 }
 
-/// An instrument nobody agreed to is not created silently: once readings name it, it is provenance,
-/// so a suggestion is confirmed before the apply mints it.
+/// An instrument nobody agreed to is not written silently: once readings name it, it is provenance,
+/// so a suggestion is confirmed before the apply mints it or attaches to it.
 pub fn refuse_unconfirmed_instruments(entries: &[PlanEntry]) -> AppResult<()> {
     let unconfirmed = unconfirmed_instruments(entries);
     if unconfirmed.is_empty() {
@@ -3982,6 +4238,61 @@ pub fn refuse_unchecked_entries(entries: &[PlanEntry]) -> AppResult<()> {
     )))
 }
 
+/// A parameter code two pairing rows would both create under, or one the catalog already holds:
+/// `LOWER(code)` is unique, so the apply's second insert fails halfway through the run. Reported
+/// as the plan's own refusal, naming the code and what it collides with.
+pub fn colliding_parameter_codes(entries: &[PlanEntry], catalog: &EntityCatalog) -> Vec<String> {
+    let mut by_code: HashMap<String, Vec<&PlanEntry>> = HashMap::new();
+    for entry in entries
+        .iter()
+        .filter(|e| e.action == "pair" && e.parameter.create)
+    {
+        let code = entry.parameter.name.trim().to_lowercase();
+        if code.is_empty() {
+            continue;
+        }
+        by_code.entry(code).or_default().push(entry);
+    }
+    let mut collisions: Vec<String> = Vec::new();
+    for (code, group) in by_code {
+        if let Some(existing) = catalog.params.iter().find(|p| p.code.to_lowercase() == code) {
+            collisions.push(format!(
+                "'{}' is already a catalog parameter; attach those columns to it or rename them",
+                existing.code
+            ));
+            continue;
+        }
+        let mut units: Vec<&str> = group.iter().map(|e| e.parameter.units.as_str()).collect();
+        units.sort_unstable();
+        units.dedup();
+        if units.len() > 1 {
+            collisions.push(format!(
+                "'{code}' is proposed with {} sets of units ({}); one code is one parameter",
+                units.len(),
+                units.join(", ")
+            ));
+        }
+    }
+    collisions.sort();
+    collisions
+}
+
+/// One code is one parameter, so a plan that would create two of them cannot be applied.
+pub fn refuse_colliding_parameter_codes(
+    entries: &[PlanEntry],
+    catalog: &EntityCatalog,
+) -> AppResult<()> {
+    let collisions = colliding_parameter_codes(entries, catalog);
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(format!(
+        "{} parameter code(s) cannot be created as proposed: {}",
+        collisions.len(),
+        collisions.join("; ")
+    )))
+}
+
 /// Apply a pairing plan: create entities, pair streams, backfill readings.
 pub async fn apply_plan(
     db: &sea_orm::DatabaseConnection,
@@ -4005,6 +4316,10 @@ pub async fn apply_plan(
 
     refuse_unconfirmed_instruments(&entries)?;
     refuse_unchecked_entries(&entries)?;
+    refuse_colliding_parameter_codes(
+        &entries,
+        &load_entity_catalog(db, &plan.source_system).await?,
+    )?;
     refuse_unattached_curves(db, &plan.source_system, &plan.curve_attachments.0).await?;
     if let Some(reason) =
         crate::routes::private::data_streams::service::pairing_refusal(&plan.source_system)
@@ -4186,23 +4501,7 @@ pub async fn apply_plan(
     // guard leaves pre-deployment history attributed by the pairing. Runs post-commit because the
     // reprocess opens its own transaction and refreshes continuous aggregates (which can't run
     // inside one).
-    let slot_rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            r"SELECT DISTINCT sp.site_id, sp.parameter_id
-              FROM data_streams ds JOIN site_parameters sp ON ds.site_parameter_id = sp.id
-              WHERE ds.pairing_plan_id = $1",
-            [plan_id.into()],
-        ))
-        .await
-        .unwrap_or_default();
-    let slots: Vec<(Uuid, Uuid)> = slot_rows
-        .into_iter()
-        .filter_map(|r| {
-            let r = SlotRow::from_query_result(&r, "").ok()?;
-            Some((r.site_id, r.parameter_id))
-        })
-        .collect();
+    let slots: Vec<(Uuid, Uuid)> = plan_slots(plan_id).into_tuple().all(db).await?;
     // History that ended before river-data held it did not go stale on river-data's watch, so the
     // first dispatcher tick after the apply announces none of it. Only the running service has the
     // threshold; a process without one sends no notifications either.
@@ -4526,7 +4825,6 @@ pub(super) async fn resolve_or_create_site_param<C: ConnectionTrait>(
             units_min: Set(None),
             units_max: Set(None),
             decimal_places: Set(decimal_places),
-            channel_id: Set(None),
             sample_interval_sec: Set(None),
             is_active: Set(Some(true)),
             is_public: Set(Some(false)),
@@ -4850,12 +5148,25 @@ pub(super) async fn pair_entry_stream<C: ConnectionTrait>(
 /// Rows the plan's readings point at through `column`, read before the readings lose it.
 /// Clear the attribution a plan's pairing gave `table`'s rows, keyed through the streams the plan
 /// paired. The columns are the ones the pairing set, per table.
+/// The rows a plan's streams own, as both the write and the span query select them.
+fn of_this_plan(plan_id: Uuid) -> Condition {
+    use sea_orm::sea_query::ExprTrait as _;
+    Condition::all()
+        .add(Expr::cust("stream_id = data_streams.id"))
+        .add(
+            Expr::col((
+                data_streams::models::Entity,
+                data_streams::models::Column::PairingPlanId,
+            ))
+            .eq(plan_id),
+        )
+}
+
 fn unattribute_plan_rows(
     table: impl sea_orm::sea_query::IntoTableRef,
     plan_id: Uuid,
     columns: &[&str],
 ) -> sea_orm::sea_query::UpdateStatement {
-    use sea_orm::sea_query::ExprTrait as _;
     let mut update = SeaQuery::update();
     update.table(table);
     for column in columns {
@@ -4863,14 +5174,20 @@ fn unattribute_plan_rows(
     }
     update
         .from(data_streams::models::Entity)
-        .and_where(Expr::cust("stream_id = data_streams.id"))
-        .and_where(
-            Expr::col((
-                data_streams::models::Entity,
-                data_streams::models::Column::PairingPlanId,
-            ))
-            .eq(plan_id),
-        )
+        .cond_where(of_this_plan(plan_id))
+        .take()
+}
+
+/// The `time` of every row [`unattribute_plan_rows`] is about to clear, for the span.
+fn plan_row_times(
+    table: impl sea_orm::sea_query::IntoTableRef,
+    plan_id: Uuid,
+) -> sea_orm::sea_query::SelectStatement {
+    SeaQuery::select()
+        .column(Alias::new("time"))
+        .from(table)
+        .from(data_streams::models::Entity)
+        .cond_where(of_this_plan(plan_id))
         .take()
 }
 
@@ -4990,15 +5307,18 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
 
     let unattributed = bulk_write::mutation(
         &txn,
-        unattribute_plan_rows(
-            readings::models::Entity,
-            plan_id,
-            &[
-                "site_id",
-                "parameter_id",
-                "sample_id",
-                "collection_event_id",
-            ],
+        bulk_write::Spanned::new(
+            plan_row_times(readings::models::Entity, plan_id),
+            unattribute_plan_rows(
+                readings::models::Entity,
+                plan_id,
+                &[
+                    "site_id",
+                    "parameter_id",
+                    "sample_id",
+                    "collection_event_id",
+                ],
+            ),
         ),
     )
     .await?;
@@ -5347,6 +5667,23 @@ pub(super) fn family_parameter_suggestion(name: &str) -> String {
     stripped
 }
 
+/// The catalog parameter an entry resolves to, and whether the apply creates one. The review's
+/// own choice answers where it has been made; where it has not, the source's own name is matched
+/// against the catalog as a proposal. An attachment to a parameter that has since left the catalog
+/// falls back to creating one, which the code-conflict warning then reports if the code is taken.
+pub(super) fn resolve_plan_parameter(
+    param: &PlanParamRef,
+    catalog: &EntityCatalog,
+) -> (Option<Uuid>, bool) {
+    match &param.attach {
+        Some(PlanParamAttach::Existing { id }) if catalog.params.iter().any(|p| p.id == *id) => {
+            (Some(*id), false)
+        }
+        Some(_) => (None, !param.name.trim().is_empty()),
+        None => match_entity_display(&param.name, &catalog.params),
+    }
+}
+
 pub(super) fn match_entity_display(name: &str, existing: &[CatalogParam]) -> (Option<Uuid>, bool) {
     if name.is_empty() {
         return (None, false);
@@ -5519,7 +5856,7 @@ pub fn reclassify_entry(entry: &mut PlanEntry, catalog: &EntityCatalog) {
     entry.site.id = site_id;
     entry.site.create = site_create;
 
-    let (param_id, param_create) = match_entity_display(&entry.parameter.name, &catalog.params);
+    let (param_id, param_create) = resolve_plan_parameter(&entry.parameter, catalog);
     entry.parameter.id = param_id;
     entry.parameter.create = param_create;
 
@@ -5560,6 +5897,15 @@ pub fn reclassify_entry(entry: &mut PlanEntry, catalog: &EntityCatalog) {
             &entry.parameter.name,
             existing,
         ));
+    }
+    if param_create
+        && let Some(id) =
+            lookup_parameter_by_code_name_or_alias(entry.parameter.name.trim(), &catalog.params)
+        && let Some(existing) = catalog.params.iter().find(|p| p.id == id)
+    {
+        entry
+            .warnings
+            .push(PlanWarning::catalog_match(&entry.parameter.name, existing));
     }
     if let Some(pid) = param_id
         && let Some(p) = catalog.params.iter().find(|p| p.id == pid)
@@ -5890,12 +6236,6 @@ pub fn apply_bulk_action(
 pub(super) struct HoldCountRow {
     pub(super) stream_id: Uuid,
     pub(super) holds: i64,
-}
-
-#[derive(FromQueryResult)]
-pub(super) struct SlotRow {
-    pub(super) site_id: Uuid,
-    pub(super) parameter_id: Uuid,
 }
 
 /// A catalog parameter's usage. `SUM` over a bigint is NUMERIC in Postgres, so the sum is cast in
@@ -6365,6 +6705,7 @@ pub(super) async fn apply_instrument_updates(
                             curves: Vec::new(),
                             proposed_name: Some(name),
                             name_conflict: None,
+                            label_candidates: vec![],
                         });
                 }
             }
@@ -6384,6 +6725,7 @@ pub(super) async fn apply_instrument_updates(
                 instrument.defaulted = is_minted_default(sensor);
                 instrument.confirmed = true;
                 instrument.curves = repointed_curves.clone();
+                instrument.label_candidates.clear();
             }
             // Naming an instrument proposes one; picking from the inventory attaches one. So a
             // name arriving at an entry that holds an existing instrument returns it to a
@@ -6407,9 +6749,28 @@ pub(super) async fn apply_instrument_updates(
                     instrument.defaulted = false;
                     instrument.confirmed = false;
                     instrument.curves = Vec::new();
+                    instrument.label_candidates.clear();
                 }
             }
 
+            // A tie is a choice, so it is not what an accept-everything button is for: the label
+            // matched two instruments and the plan suggested neither. Refused here rather than in
+            // the button, which a second client does not hold.
+            if update.instrument_confirmed == Some(true)
+                && instrument.resolved_by == "ambiguous_label"
+            {
+                return Err(AppError::BadRequest(format!(
+                    "the curve label of stream {} matches {}: pick one, or name the instrument to \
+                     create, before confirming",
+                    update.stream_id,
+                    instrument
+                        .label_candidates
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                )));
+            }
             if let Some(confirmed) = update.instrument_confirmed {
                 instrument.confirmed = confirmed;
             }
@@ -6524,3 +6885,7 @@ mod heartbeat_tests;
 #[cfg(test)]
 #[path = "tests/replicate_audit.rs"]
 mod replicate_audit_tests;
+
+#[cfg(test)]
+#[path = "tests/acknowledgement.rs"]
+mod acknowledgement_tests;

@@ -2,8 +2,8 @@ use super::{
     BulkWhere, EntityCatalog, InstrumentCatalog, InstrumentNameConflict, PlanCalculationRef,
     PlanEntry, PlanGroupRef, PlanInstrumentRef, apply_bulk_action, apply_group_updates,
     family_parameter_suggestion, group_code, instrument_key, join_named_proposal, linked_entity,
-    minted_param_needs_review, plan_calculation, proposal_conflict, resolve_parameter_instrument,
-    select_entries, stream_instrument_key,
+    minted_param_needs_review, plan_calculation, plan_slots, proposal_conflict,
+    resolve_parameter_instrument, select_entries, stream_instrument_key,
 };
 use crate::routes::private::sync::models::PlanEntryUpdate;
 use std::collections::{HashMap, HashSet};
@@ -59,11 +59,14 @@ fn test_the_instrument_a_stream_names_wins_over_a_matching_curve_label() {
     assert_eq!(attributed.resolved_by, "stream", "{attributed:?}");
     assert_eq!(attributed.id, Some(analyser));
 
-    // A stream naming none is where the curve label is read.
+    // A stream naming none is where the curve label is read. Words agreeing is a suggestion, not
+    // the source naming the analyser, so the apply waits for a person (Q195).
     let by_label = super::resolve_instrument(None, Some("doc_std_curve_id"), "cnet", &c)
         .expect("a curve column resolves");
     assert_eq!(by_label.resolved_by, "curve_label", "{by_label:?}");
     assert_eq!(by_label.id, Some(analyser));
+    assert!(!by_label.confirmed, "{by_label:?}");
+    assert!(by_label.label_candidates.is_empty(), "{by_label:?}");
 
     // With nothing to match, the question stands unanswered and the plan proposes one.
     let alone = super::resolve_instrument(None, Some("tss_std_curve_id"), "cnet", &c)
@@ -808,4 +811,247 @@ fn test_join_named_proposal_leaves_a_name_of_its_own_and_an_existing_instrument_
         "an inventory row is attached by id, not by name"
     );
     assert_eq!(instrument_key(&entries[2]), "instrument:cnet:C");
+}
+
+/// Expected behaviour: the slots a plan's apply re-derives are read as a built statement, once per
+/// slot, scoped to that plan. Written as SQL it silently returned nothing on a database error and
+/// the apply reported success.
+#[test]
+fn test_a_plan_reads_its_slots_once_each_through_the_pairing() {
+    use sea_orm::QueryTrait as _;
+    let sql = plan_slots(Uuid::nil())
+        .build(sea_orm::DatabaseBackend::Postgres)
+        .to_string();
+    assert!(sql.contains("SELECT DISTINCT"), "one row per slot: {sql}");
+    assert!(
+        sql.contains(r#""site_parameters"."site_id""#)
+            && sql.contains(r#""site_parameters"."parameter_id""#),
+        "the slot is the pairing's, not the stream's: {sql}"
+    );
+    assert!(
+        sql.contains(r#"INNER JOIN "site_parameters""#),
+        "an unpaired stream names no slot: {sql}"
+    );
+    assert!(
+        sql.contains(r#""data_streams"."pairing_plan_id" ="#),
+        "scoped to the plan: {sql}"
+    );
+}
+
+/// Scenario: two of the source's instruments carry a label the same curve column stem matches,
+/// which is the CNET chla pair: `chla acid` and `chla noacid` both answer to `chla`.
+/// Expected behaviour: neither is suggested, both are named, and the row cannot be confirmed as
+/// it stands (Q195).
+#[test]
+fn test_a_curve_label_matching_two_instruments_names_both_and_suggests_neither() {
+    let acid = Uuid::new_v4();
+    let noacid = Uuid::new_v4();
+    let mut c = catalog(&[]);
+    c.by_id.insert(acid, ("Chla acid".to_string(), None));
+    c.by_id.insert(noacid, ("Chla noacid".to_string(), None));
+    c.labels.push(("chla acid".to_string(), acid));
+    c.labels.push(("chla noacid".to_string(), noacid));
+
+    assert_eq!(
+        super::label_match("chla_std_curve_id", &c),
+        super::LabelMatch::Tie(vec![acid, noacid])
+    );
+
+    let tied = super::resolve_instrument(None, Some("chla_std_curve_id"), "cnet", &c)
+        .expect("a curve column resolves");
+    assert_eq!(tied.resolved_by, "ambiguous_label", "{tied:?}");
+    assert_eq!(tied.id, None, "{tied:?}");
+    assert!(!tied.confirmed, "{tied:?}");
+    assert_eq!(
+        tied.label_candidates
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Chla acid", "Chla noacid"]
+    );
+
+    // The narrower column names one of them, and that one is a suggestion like any other.
+    assert_eq!(
+        super::label_match("chla_acid_std_curve_id", &c),
+        super::LabelMatch::One(acid)
+    );
+    assert_eq!(
+        super::label_match("tss_std_curve_id", &c),
+        super::LabelMatch::None
+    );
+}
+
+/// Expected behaviour: an unconfirmed suggestion holds the apply back just as an unconfirmed
+/// creation does. A label match attaches to an instrument that already exists, so the creation
+/// filter alone would have let it through.
+#[test]
+fn test_an_unconfirmed_label_suggestion_holds_the_apply() {
+    let analyser = Uuid::new_v4();
+    let mut c = catalog(&[]);
+    c.by_id.insert(analyser, ("DOC corr".to_string(), None));
+    c.labels.push(("doc corr".to_string(), analyser));
+    let suggestion = super::resolve_instrument(None, Some("doc_std_curve_id"), "cnet", &c)
+        .expect("a curve column resolves");
+    assert!(!suggestion.create, "{suggestion:?}");
+
+    let entry = with_instrument("DOC", Some(suggestion));
+    let source_key = entry.source_key.clone();
+    assert_eq!(super::unconfirmed_instruments(&[entry]), [source_key]);
+}
+
+fn catalog_param(code: &str, units: &str) -> super::CatalogParam {
+    super::CatalogParam {
+        id: Uuid::new_v4(),
+        code: code.to_string(),
+        name: code.to_string(),
+        aliases: vec![],
+        units: units.to_string(),
+        category: "measurement".to_string(),
+        site_parameter_count: 0,
+        reading_count: 0,
+    }
+}
+
+fn param_catalog(params: Vec<super::CatalogParam>) -> EntityCatalog {
+    EntityCatalog {
+        params,
+        ..Default::default()
+    }
+}
+
+fn typed_code(stream_id: Uuid, code: &str) -> PlanEntryUpdate {
+    serde_json::from_value(serde_json::json!({
+        "stream_id": stream_id,
+        "parameter_name": code,
+    }))
+    .expect("a plan entry update")
+}
+
+/// Scenario: the operator types `DOC` over a column the source calls `DOC_ppb`, and the catalog
+/// already holds a `DOC`.
+///
+/// Expected behaviour: the typed code creates a parameter and joins nothing, and the plan says the
+/// code is taken rather than quietly attaching years of readings to this column (Q221).
+#[test]
+fn test_a_typed_code_creates_a_parameter_and_never_joins_an_existing_one() {
+    let doc = catalog_param("DOC", "ppb");
+    let catalog = param_catalog(vec![doc]);
+    let mut entry = plan_entry("FP1", "DOC_ppb", "none", 0);
+
+    entry.parameter.name = "DOC".to_string();
+    entry.parameter.attach = Some(super::PlanParamAttach::New);
+    super::reclassify_entry(&mut entry, &catalog);
+
+    assert_eq!(entry.parameter.id, None, "{:?}", entry.parameter);
+    assert!(entry.parameter.create, "{:?}", entry.parameter);
+    let kinds: Vec<&str> = entry.warnings.iter().map(|w| w.kind.as_str()).collect();
+    assert!(
+        kinds.contains(&"catalog_match"),
+        "the taken code is reported: {kinds:?}"
+    );
+}
+
+/// The catalog parameter chosen from the list, for a column whose own name matches nothing, is what
+/// the entry resolves to: the choice decides the identity, not the name beside it.
+#[test]
+fn test_an_explicit_attachment_resolves_to_the_catalog_parameter() {
+    let doc = catalog_param("DOC", "ppb");
+    let doc_id = doc.id;
+    let catalog = param_catalog(vec![doc]);
+    let mut entry = plan_entry("FP1", "DOC_ppb", "none", 0);
+
+    entry.parameter.units = "ppb".to_string();
+    entry.parameter.attach = Some(super::PlanParamAttach::Existing { id: doc_id });
+    super::reclassify_entry(&mut entry, &catalog);
+
+    assert_eq!(entry.parameter.id, Some(doc_id), "{:?}", entry.parameter);
+    assert!(!entry.parameter.create, "{:?}", entry.parameter);
+    assert!(entry.warnings.is_empty(), "{:?}", entry.warnings);
+}
+
+/// An entry nobody has edited still resolves by the source's own name: that match is the plan's
+/// proposal, not something an operator typed.
+#[test]
+fn test_an_undecided_entry_still_matches_the_source_s_own_name() {
+    let doc = catalog_param("DOC_ppb", "ppb");
+    let doc_id = doc.id;
+    let catalog = param_catalog(vec![doc]);
+    let mut entry = plan_entry("FP1", "DOC_ppb", "none", 0);
+    entry.parameter.units = "ppb".to_string();
+
+    super::reclassify_entry(&mut entry, &catalog);
+
+    assert_eq!(entry.parameter.attach, None, "{:?}", entry.parameter);
+    assert_eq!(entry.parameter.id, Some(doc_id), "{:?}", entry.parameter);
+    assert!(!entry.parameter.create, "{:?}", entry.parameter);
+}
+
+/// An attachment to a parameter that has left the catalog since the plan was reviewed creates one
+/// under the entry's code rather than pairing to an id that no longer resolves.
+#[test]
+fn test_an_attachment_to_a_vanished_parameter_falls_back_to_creating_one() {
+    let mut entry = plan_entry("FP1", "DOC_ppb", "none", 0);
+    entry.parameter.attach = Some(super::PlanParamAttach::Existing { id: Uuid::new_v4() });
+
+    super::reclassify_entry(&mut entry, &EntityCatalog::default());
+
+    assert_eq!(entry.parameter.id, None, "{:?}", entry.parameter);
+    assert!(entry.parameter.create, "{:?}", entry.parameter);
+}
+
+/// Typing a code records the choice, so it survives the plan being reloaded.
+#[test]
+fn test_typing_a_code_records_the_new_parameter_choice() {
+    let entry = plan_entry("FP1", "DOuM", "none", 0);
+    let update = typed_code(entry.stream_id, "DO_uM");
+
+    assert_eq!(update.parameter_name.as_deref(), Some("DO_uM"));
+    assert_eq!(
+        update.parameter_attach, None,
+        "the typed code carries no choice of its own; the route records `new`"
+    );
+}
+
+/// Scenario: DOuM and DOdegC are both proposed as `DO`, and a third column is typed over with a
+/// code the catalog already holds.
+///
+/// Expected behaviour: the apply refuses both, since `LOWER(code)` is unique and the second insert
+/// would fail halfway through the run.
+#[test]
+fn test_two_codes_that_cannot_both_be_created_refuse_the_apply() {
+    let mut um = plan_entry("FP1", "DO", "none", 0);
+    um.parameter.units = "uM".to_string();
+    let mut degc = plan_entry("FP1", "DO", "none", 0);
+    degc.parameter.units = "degC".to_string();
+    let mut taken = plan_entry("FP2", "DOC", "none", 0);
+    taken.parameter.attach = Some(super::PlanParamAttach::New);
+    let entries = vec![um, degc, taken];
+    let catalog = param_catalog(vec![catalog_param("DOC", "ppb")]);
+
+    let collisions = super::colliding_parameter_codes(&entries, &catalog);
+    assert_eq!(collisions.len(), 2, "{collisions:?}");
+    assert!(
+        collisions.iter().any(|c| c.contains("'do'")),
+        "the two unit sets are named: {collisions:?}"
+    );
+    assert!(
+        collisions.iter().any(|c| c.contains("'DOC'")),
+        "the taken catalog code is named: {collisions:?}"
+    );
+    assert!(
+        super::refuse_colliding_parameter_codes(&entries, &catalog).is_err(),
+        "the apply refuses"
+    );
+}
+
+/// A skipped row is not applied, so its code collides with nothing.
+#[test]
+fn test_a_skipped_row_s_code_collides_with_nothing() {
+    let mut um = plan_entry("FP1", "DO", "none", 0);
+    um.parameter.units = "uM".to_string();
+    let mut degc = plan_entry("FP1", "DO", "none", 0);
+    degc.parameter.units = "degC".to_string();
+    degc.action = "skip".to_string();
+
+    assert!(super::colliding_parameter_codes(&[um, degc], &EntityCatalog::default()).is_empty(),);
 }

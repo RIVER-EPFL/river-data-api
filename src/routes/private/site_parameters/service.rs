@@ -328,7 +328,6 @@ pub async fn mint_tool_slot<C: ConnectionTrait>(
         units_min: Set(None),
         units_max: Set(None),
         decimal_places: Set(None),
-        channel_id: Set(None),
         sample_interval_sec: Set(None),
         is_active: Set(Some(true)),
         is_public: Set(Some(false)),

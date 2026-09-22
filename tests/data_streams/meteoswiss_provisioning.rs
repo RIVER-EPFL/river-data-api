@@ -609,3 +609,129 @@ async fn subscribing_queues_one_history_backfill_per_station_and_variable() {
         "one run reads the archives every site subscribed to them shares"
     );
 }
+
+/// Scenario: an operator subscribes a site to pressure from a station carrying no barometer.
+/// Expected behaviour: the subscription is refused naming the station and the variable, offering
+/// stations that do publish it, and nothing is written.
+#[tokio::test]
+#[serial]
+async fn subscribing_to_a_station_that_publishes_no_pressure_is_refused() {
+    use crudcrate::CRUDOperations;
+
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+
+    store_stations(
+        &db,
+        &[
+            station("MAR", "Martigny", None),
+            station("SIO", "Sion", Some(482.0)),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let typed = |abbr: &str| MeteoswissSubscriptionCreate {
+        site_id: Uuid::parse_str(crate::common::fixtures::SITE1_ID).unwrap(),
+        station_abbr: abbr.to_string(),
+        variable: VARIABLE.to_string(),
+        enabled: Some(true),
+    };
+    MeteoswissSubscriptionOperations
+        .before_create(&db, &typed("SIO"))
+        .await
+        .expect("Sion carries a barometer");
+
+    let refusal = MeteoswissSubscriptionOperations
+        .before_create(&db, &typed("MAR"))
+        .await
+        .expect_err("Martigny publishes no pressure");
+    let message = format!("{refusal:?}");
+    assert!(str::contains(&message, "MAR"), "{message}");
+    assert!(str::contains(&message, VARIABLE), "{message}");
+    assert!(str::contains(&message, "SIO"), "{message}");
+
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT count(*) AS n FROM meteoswiss_subscriptions WHERE station_abbr = 'MAR'",
+        )
+        .await,
+        0,
+        "a refused subscription writes nothing"
+    );
+}
+
+/// Scenario: an operator subscribes a site to a station, and no data has landed yet.
+/// Expected behaviour: the slot and the paired stream exist the moment the subscribe returns,
+/// with nothing for a manager to confirm, and the first landing finds both and creates no second
+/// slot.
+#[tokio::test]
+#[serial]
+async fn subscribing_provisions_the_slot_and_the_stream_before_anything_lands() {
+    use crudcrate::CRUDOperations;
+
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+
+    let subscription = MeteoswissSubscriptionOperations
+        .perform_create(
+            &db,
+            MeteoswissSubscriptionCreate {
+                site_id: Uuid::parse_str(crate::common::fixtures::SITE1_ID).unwrap(),
+                station_abbr: STATION.to_string(),
+                variable: VARIABLE.to_string(),
+                enabled: Some(true),
+            },
+        )
+        .await
+        .expect("subscribe the site");
+
+    let slot = format!(
+        "SELECT count(*) AS n FROM site_parameters \
+          WHERE site_id = '{}' AND parameter_id = '{}'",
+        crate::common::fixtures::SITE1_ID,
+        subscription.parameter_id
+    );
+    assert_eq!(
+        scalar_i64(&db, &format!("{slot} AND needs_review = false")).await,
+        1,
+        "an operator picked the station, so there is nothing to confirm"
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT count(*) AS n FROM data_streams s \
+                   JOIN site_parameters sp ON sp.id = s.site_parameter_id \
+                  WHERE s.source_system = 'meteoswiss' AND s.paired_at IS NOT NULL \
+                    AND sp.site_id = '{}' AND sp.parameter_id = '{}'",
+                crate::common::fixtures::SITE1_ID,
+                subscription.parameter_id
+            ),
+        )
+        .await,
+        1,
+        "the stream is registered and paired by the subscribe"
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            "SELECT count(*) AS n FROM readings r \
+               JOIN data_streams s ON s.id = r.stream_id \
+              WHERE s.source_system = 'meteoswiss'",
+        )
+        .await,
+        0,
+        "nothing has landed yet"
+    );
+
+    // What every landing runs: it finds the slot and the stream and creates neither again.
+    let landed = subscribers(&db).await.unwrap();
+    provision(&db, &landed[0], subscription.parameter_id)
+        .await
+        .unwrap();
+    assert_eq!(scalar_i64(&db, &slot).await, 1);
+}

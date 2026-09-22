@@ -136,6 +136,9 @@ pub struct RegisterStandardCurveResponse {
     /// True when no stored curve carries this provenance, so the curve is held until a pairing
     /// plan attaches it to one of its instruments.
     pub proposed: bool,
+    /// True when the review left this curve behind. It is never stored, and the source is to stop
+    /// sending the readings that name it (Q220).
+    pub skipped: bool,
 }
 
 /// A source's standard curve held until a pairing plan attaches it to one of its instruments.
@@ -153,7 +156,7 @@ pub mod proposal {
         pub id: Uuid,
         pub source_system: String,
         pub source_key: String,
-        /// The source's own label for the curve, which is where an attachment is suggested from.
+        /// The source's own label for the curve, as the source wrote it.
         pub label: String,
         pub name: Option<String>,
         pub slope: f64,
@@ -163,6 +166,10 @@ pub mod proposal {
         pub notes: Option<String>,
         pub first_seen_at: chrono::DateTime<chrono::Utc>,
         pub last_seen_at: chrono::DateTime<chrono::Utc>,
+        /// Set when the review chose to leave this curve behind. It is never stored, and the
+        /// readings naming it are dropped at the source rather than arriving uncorrected (Q220).
+        pub skipped_at: Option<chrono::DateTime<chrono::Utc>>,
+        pub skipped_by: Option<String>,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

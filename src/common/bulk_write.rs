@@ -19,8 +19,8 @@
 
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::{
-    Alias, CommonTableExpression, DeleteStatement, Expr, Func, InsertStatement,
-    PostgresQueryBuilder, Query, SubQueryStatement, UpdateStatement, WithClause,
+    Alias, DeleteStatement, Expr, Func, InsertStatement, PostgresQueryBuilder, Query,
+    SelectStatement, UpdateStatement,
 };
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, FromQueryResult, Statement, TransactionSession,
@@ -31,10 +31,9 @@ use crate::error::{AppError, AppResult};
 
 const LIFT_CAP: &str = "SET LOCAL timescaledb.max_tuples_decompressed_per_dml_transaction = 0";
 
-/// The summary row a guarded statement reports, as the wrapper selects it.
+/// The span row the pre-write query reports.
 #[derive(FromQueryResult)]
-struct TouchedSummary {
-    touched_rows: i64,
+struct TouchedSpan {
     min_time: Option<chrono::DateTime<chrono::Utc>>,
     max_time: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -160,6 +159,15 @@ impl From<InsertStatement> for Dml {
 }
 
 impl Dml {
+    /// The statement as SQL, for a caller checking what it built.
+    fn to_sql(&self) -> String {
+        match self {
+            Self::Update(statement) => statement.to_string(PostgresQueryBuilder),
+            Self::Delete(statement) => statement.to_string(PostgresQueryBuilder),
+            Self::Insert(statement) => statement.to_string(PostgresQueryBuilder),
+        }
+    }
+
     /// The statement as built, with no `RETURNING`.
     fn build(self) -> Statement {
         let (sql, values) = match self {
@@ -170,23 +178,39 @@ impl Dml {
         Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values)
     }
 
-    /// The statement with `RETURNING time` on it, as the summary wrapper needs.
-    fn returning_time(self) -> SubQueryStatement {
-        let time = Alias::new("time");
-        match self {
-            Self::Update(mut statement) => {
-                statement.returning_col(time);
-                SubQueryStatement::UpdateStatement(statement)
-            }
-            Self::Delete(mut statement) => {
-                statement.returning_col(time);
-                SubQueryStatement::DeleteStatement(statement)
-            }
-            Self::Insert(mut statement) => {
-                statement.returning_col(time);
-                SubQueryStatement::InsertStatement(statement)
-            }
+}
+
+/// A hypertable write and the query naming the rows it is about to touch, from the same table on
+/// the same predicate, selecting their `time`.
+///
+/// The span is read from that query before the statement runs. TimescaleDB holds every row a
+/// hypertable `RETURNING` emits in the statement's executor memory, so a write that can reach a
+/// stream's whole history cannot report its span that way: the attribution UPDATE over 285k rows
+/// peaks at 25 MB without it and 1.48 GB with it.
+pub struct Spanned {
+    rows: SelectStatement,
+    write: Dml,
+}
+
+impl Spanned {
+    /// `rows` selects `time` over the rows `write` changes. The two carry one predicate between
+    /// them, so a caller builds it once and hands it to both. The span is read before the write,
+    /// so an `INSERT` has none to read and takes [`mutation_rows`] instead.
+    pub fn new(rows: SelectStatement, write: impl Into<Dml>) -> Self {
+        Self {
+            rows,
+            write: write.into(),
         }
+    }
+
+    /// The write and the query of the rows it touches, as SQL. The pair is only correct while the
+    /// query selects the rows the write changes, so it is rendered to be compared.
+    #[must_use]
+    pub fn as_sql(&self) -> (String, String) {
+        (
+            self.write.to_sql(),
+            self.rows.to_string(PostgresQueryBuilder),
+        )
     }
 }
 
@@ -194,20 +218,54 @@ impl Dml {
 /// it touched.
 pub async fn guarded_mutation<C: TransactionTrait>(
     db: &C,
-    statement: impl Into<Dml>,
+    spanned: Spanned,
 ) -> AppResult<TouchedRange> {
-    let statement = summary_of(statement.into());
-    guarded(db, async |txn| run_summary(txn, statement).await).await
+    guarded(db, async |txn| mutation(txn, spanned).await).await
 }
 
 /// One hypertable DML statement on a connection that is already inside a guarded transaction,
-/// reporting the rows and the time span it touched. The statement must be an `UPDATE`, `INSERT` or
-/// `DELETE` against a table with a `time` column, and must not carry its own `RETURNING`.
-pub async fn mutation<C: ConnectionTrait>(
-    conn: &C,
-    statement: impl Into<Dml>,
-) -> AppResult<TouchedRange> {
-    run_summary(conn, summary_of(statement.into())).await
+/// reporting the rows and the time span it touched. The span is read first, in the same
+/// transaction, so it names the rows as the statement is about to find them.
+pub async fn mutation<C: ConnectionTrait>(conn: &C, spanned: Spanned) -> AppResult<TouchedRange> {
+    let Spanned { rows, write } = spanned;
+    let span = span_of(conn, rows).await?;
+    let rows_written = conn.execute_raw(write.build()).await?.rows_affected();
+    Ok(TouchedRange {
+        rows: rows_written,
+        min_time: span.min_time,
+        max_time: span.max_time,
+    })
+}
+
+/// `MIN(time)` and `MAX(time)` over the caller's query of the rows, as a subquery.
+fn span_query(rows: SelectStatement) -> SelectStatement {
+    let time = Alias::new("time");
+    let touched = Alias::new("touched");
+    Query::select()
+        .expr_as(
+            Func::min(Expr::col((touched.clone(), time.clone()))),
+            Alias::new("min_time"),
+        )
+        .expr_as(
+            Func::max(Expr::col((touched.clone(), time))),
+            Alias::new("max_time"),
+        )
+        .from_subquery(rows, touched)
+        .to_owned()
+}
+
+/// The `[min, max]` of `time` over the rows a write is about to touch.
+async fn span_of<C: ConnectionTrait>(conn: &C, rows: SelectStatement) -> AppResult<TouchedSpan> {
+    let (sql, values) = span_query(rows).build(PostgresQueryBuilder);
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            values,
+        ))
+        .await?
+        .ok_or_else(|| AppError::Internal("Guarded mutation read no span row".to_string()))?;
+    Ok(TouchedSpan::from_query_result(&row, "")?)
 }
 
 /// One hypertable DML statement on a connection already inside a guarded transaction, reporting
@@ -224,83 +282,6 @@ pub async fn mutation_rows<C: ConnectionTrait>(
         .rows_affected())
 }
 
-/// [`guarded_mutation`] over a statement still spelled as text.
-pub async fn guarded_mutation_sql<C: TransactionTrait>(
-    db: &C,
-    statement: Statement,
-) -> AppResult<TouchedRange> {
-    guarded(db, async |txn| mutation_sql(txn, statement).await).await
-}
-
-/// The same wrapper over a statement still spelled as text. Every caller here is a lifted
-/// hypertable write not yet expressed through the builder.
-pub async fn mutation_sql<C: ConnectionTrait>(
-    conn: &C,
-    statement: Statement,
-) -> AppResult<TouchedRange> {
-    run_summary(
-        conn,
-        Statement {
-            sql: wrap_returning_time(&statement.sql),
-            values: statement.values,
-            db_backend: statement.db_backend,
-        },
-    )
-    .await
-}
-
-/// Read back the summary a wrapped statement returns. Takes the statement already wrapped, so
-/// nothing has to recognise the wrapper by its own text.
-async fn run_summary<C: ConnectionTrait>(
-    conn: &C,
-    statement: Statement,
-) -> AppResult<TouchedRange> {
-    let row = conn.query_one_raw(statement).await?.ok_or_else(|| {
-        AppError::Internal("Guarded mutation returned no summary row".to_string())
-    })?;
-    let summary = TouchedSummary::from_query_result(&row, "")?;
-    Ok(TouchedRange {
-        rows: u64::try_from(summary.touched_rows).unwrap_or(0),
-        min_time: summary.min_time,
-        max_time: summary.max_time,
-    })
-}
-
-/// The same wrapper as [`wrap_returning_time`], built rather than formatted.
-fn summary_of(statement: Dml) -> Statement {
-    let mut mutated = CommonTableExpression::new();
-    mutated
-        .table_name(Alias::new("mutated"))
-        .query(statement.returning_time());
-    let with = WithClause::new().cte(mutated).to_owned();
-
-    let query = Query::select()
-        .expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("touched_rows"))
-        .expr_as(
-            Func::min(Expr::col(Alias::new("time"))),
-            Alias::new("min_time"),
-        )
-        .expr_as(
-            Func::max(Expr::col(Alias::new("time"))),
-            Alias::new("max_time"),
-        )
-        .from(Alias::new("mutated"))
-        .to_owned()
-        .with(with);
-
-    let (sql, values) = query.build(PostgresQueryBuilder);
-    Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values)
-}
-
-/// Wrap a DML statement so it reports its row count and time span in one round trip.
-fn wrap_returning_time(sql: &str) -> String {
-    let body = sql.trim().trim_end_matches(';').trim_end();
-    format!(
-        "WITH mutated AS ({body} RETURNING time) \
-         SELECT COUNT(*)::bigint AS touched_rows, MIN(time) AS min_time, MAX(time) AS max_time \
-         FROM mutated"
-    )
-}
 
 #[cfg(test)]
 #[path = "tests/bulk_write_tests.rs"]

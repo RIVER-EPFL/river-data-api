@@ -1,6 +1,7 @@
 use super::{
     ATTRIBUTION, VARIABLES, archive_hrefs, attributions, distance_km, insert_chunk, latest, latin1,
-    listed_station, rank_stations, recent_url, require_declared, series, stac_item_url, stations,
+    listed_station, nothing_published, rank_stations, recent_url, require_declared, series,
+    stac_item_url, station_publishes, stations,
     stations_url, variable,
 };
 use crate::routes::private::meteoswiss::models::{Point, station, subscription};
@@ -286,10 +287,48 @@ fn test_latest_rejects_a_file_missing_the_variable() {
     assert!(str::contains(&refusal, "rre150z0"), "{refusal}");
 }
 
+/// Scenario: a backfill reads the archives for a station and variable and inserts nothing.
+/// Expected behaviour: every cell blank across archives that were read is the station's own answer
+/// and fails the run naming it; a run that read no archive, or that landed a reading, does not.
+#[test]
+fn test_a_backfill_that_read_only_blank_cells_fails_naming_the_station() {
+    let said = nothing_published("MAR", "prestas0", 3, 582_577, 0)
+        .expect("three archives, half a million blank cells and no reading");
+    assert!(str::contains(&said, "MAR"), "{said}");
+    assert!(str::contains(&said, "prestas0"), "{said}");
+    assert!(str::contains(&said, "3 archives"), "{said}");
+    assert!(str::contains(&said, "582577"), "{said}");
+
+    assert_eq!(
+        nothing_published("MAR", "prestas0", 0, 0, 0),
+        None,
+        "a run that read no archive has nothing to conclude from"
+    );
+    assert_eq!(
+        nothing_published("SIO", "prestas0", 3, 40, 12),
+        None,
+        "a run that landed a reading succeeded"
+    );
+    assert_eq!(
+        nothing_published("SIO", "prestas0", 1, 0, 0),
+        None,
+        "an archive with no cells at all is an empty interval, not a silent station"
+    );
+}
+
 /// Sion, Montagnier and Adelboden as the published list carries them.
 const SIO: (f64, f64) = (46.218790, 7.330250);
 const MOB: (f64, f64) = (46.071019, 7.225272);
 const ABO: (f64, f64) = (46.491703, 7.560703);
+
+/// A station of the published list that carries no barometer, the 19 of 158 that report no
+/// pressure.
+fn without_barometer(abbr: &str, name: &str, at: Option<(f64, f64)>) -> station::Model {
+    station::Model {
+        height_barometer_masl: None,
+        ..listed(abbr, name, at)
+    }
+}
 
 fn listed(abbr: &str, name: &str, at: Option<(f64, f64)>) -> station::Model {
     station::Model {
@@ -329,6 +368,7 @@ fn test_rank_stations_offers_the_nearest_first() {
             listed("MOB", "Montagnier, Bagnes", Some(MOB)),
         ],
         Some(MOB),
+        None,
     );
     let order: Vec<&str> = ranked.iter().map(|c| c.station_abbr.as_str()).collect();
     assert_eq!(order, vec!["MOB", "SIO", "ABO"]);
@@ -344,6 +384,7 @@ fn test_rank_stations_without_site_coordinates_lists_by_name() {
             listed("ABO", "Adelboden", Some(ABO)),
         ],
         None,
+        None,
     );
     let order: Vec<&str> = ranked.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(order, vec!["Adelboden", "Sion"]);
@@ -358,6 +399,7 @@ fn test_rank_stations_puts_a_station_with_no_coordinates_last() {
             listed("ABO", "Adelboden", Some(ABO)),
         ],
         Some(MOB),
+        None,
     );
     let order: Vec<&str> = ranked.iter().map(|c| c.station_abbr.as_str()).collect();
     assert_eq!(order, vec!["ABO", "XXX"]);
@@ -366,7 +408,7 @@ fn test_rank_stations_puts_a_station_with_no_coordinates_last() {
 
 #[test]
 fn test_a_candidate_carries_both_elevations() {
-    let ranked = rank_stations(vec![listed("SIO", "Sion", Some(SIO))], None);
+    let ranked = rank_stations(vec![listed("SIO", "Sion", Some(SIO))], None, None);
     assert_eq!(ranked[0].height_masl, Some(500.0));
     assert_eq!(ranked[0].height_barometer_masl, Some(501.0));
 }
@@ -425,6 +467,60 @@ fn test_only_a_listed_station_can_be_subscribed_to() {
 #[test]
 fn test_an_empty_station_list_accepts_any_abbreviation() {
     assert!(listed_station("MOP", &[]).is_ok());
+}
+
+/// Scenario: an operator subscribes a site to pressure from a station carrying no barometer.
+/// Expected behaviour: it is refused by name, and the stations offered instead all publish one.
+#[test]
+fn test_a_station_publishing_no_pressure_is_refused() {
+    let pressure = variable("prestas0").expect("prestas0 is declared");
+    let published = vec![
+        without_barometer("MAR", "Martigny", Some(MOB)),
+        listed("SIO", "Sion", Some(SIO)),
+        listed("ABO", "Adelboden", Some(ABO)),
+    ];
+    assert!(station_publishes("SIO", pressure, &published).is_ok());
+
+    let refusal =
+        station_publishes(" mar ", pressure, &published).expect_err("MAR carries no barometer");
+    let message = format!("{refusal:?}");
+    assert!(str::contains(&message, "MAR"), "{message}");
+    assert!(str::contains(&message, "prestas0"), "{message}");
+    assert!(str::contains(&message, "SIO"), "{message}");
+    assert!(!str::contains(&message, "Martigny"), "{message}");
+}
+
+/// A station the list does not hold at all is the other refusal's business, and an empty list
+/// stands between nobody and a subscription.
+#[test]
+fn test_an_unlisted_or_unknown_station_is_not_refused_for_publishing() {
+    let pressure = variable("prestas0").expect("prestas0 is declared");
+    let published = vec![listed("SIO", "Sion", Some(SIO))];
+    assert!(station_publishes("MOP", pressure, &published).is_ok());
+    assert!(station_publishes("MOP", pressure, &[]).is_ok());
+}
+
+/// The picker is told the same fact the refusal turns on, so it can grey what cannot be chosen.
+#[test]
+fn test_a_candidate_says_whether_it_publishes_the_asked_variable() {
+    let pressure = variable("prestas0").expect("prestas0 is declared");
+    let stations = vec![
+        listed("SIO", "Sion", Some(SIO)),
+        without_barometer("MAR", "Martigny", Some(MOB)),
+    ];
+    let asked = rank_stations(stations.clone(), None, Some(pressure));
+    let by_abbr = |ranked: &[super::super::models::StationCandidate], abbr: &str| {
+        ranked
+            .iter()
+            .find(|c| c.station_abbr == abbr)
+            .expect("the station is ranked")
+            .publishes
+    };
+    assert_eq!(by_abbr(&asked, "SIO"), Some(true));
+    assert_eq!(by_abbr(&asked, "MAR"), Some(false));
+
+    let unasked = rank_stations(stations, None, None);
+    assert_eq!(by_abbr(&unasked, "MAR"), None);
 }
 
 #[test]

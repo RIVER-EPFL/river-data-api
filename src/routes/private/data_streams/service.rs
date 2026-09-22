@@ -710,7 +710,13 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
             .take();
 
         let rows = if slot.timed {
-            let touched = bulk_write::mutation(conn, statement).await?;
+            let moving = SeaQuery::select()
+                .column(Alias::new("time"))
+                .from(slot.rows.table_ref())
+                .cond_where(on_source.clone())
+                .take();
+            let touched = bulk_write::mutation(conn, bulk_write::Spanned::new(moving, statement))
+                .await?;
             if slot.feeds_rollups {
                 moved.touched = moved.touched.merge(touched);
             }
@@ -788,11 +794,17 @@ pub(super) async fn release_slot_rows<C: ConnectionTrait>(
                     statement.value(Alias::new(*c), Expr::value(Option::<Uuid>::None));
                     carries = carries.add(Expr::col(Alias::new(*c)).is_not_null());
                 }
-                let statement = statement
-                    .cond_where(target.rows.clone().add(carries))
-                    .take();
+                let carrying = target.rows.clone().add(carries);
+                let statement = statement.cond_where(carrying.clone()).take();
                 if slot.timed {
-                    let range = bulk_write::mutation(conn, statement).await?;
+                    let releasing = SeaQuery::select()
+                        .column(Alias::new("time"))
+                        .from(slot.rows.table_ref())
+                        .cond_where(carrying)
+                        .take();
+                    let range =
+                        bulk_write::mutation(conn, bulk_write::Spanned::new(releasing, statement))
+                            .await?;
                     if slot.feeds_rollups {
                         touched = touched.merge(range);
                     }

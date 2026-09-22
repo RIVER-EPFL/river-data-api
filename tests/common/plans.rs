@@ -95,11 +95,13 @@ pub async fn acknowledge_plan(app: &Router, token: &str, plan_id: &str) {
     assert_eq!(status, 200, "ticking the plan's rows: {text}");
 }
 
-/// An instrument the plan proposes that nobody has confirmed and no existing name collides with.
+/// An instrument the plan suggests, to create or to attach, that nobody has confirmed, no existing
+/// name collides with, and no curve label ties.
 fn is_suggestion(entry: &serde_json::Value) -> bool {
     let instrument = &entry["instrument"];
-    instrument["create"] == json!(true)
+    !instrument.is_null()
         && instrument["confirmed"] != json!(true)
+        && instrument["resolved_by"] != json!("ambiguous_label")
         && instrument["name_conflict"].is_null()
 }
 

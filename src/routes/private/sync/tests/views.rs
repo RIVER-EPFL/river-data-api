@@ -60,7 +60,7 @@ fn an_entry_with_no_instrument_keys_on_its_parameter() {
 fn test_a_hold_reaches_its_slot_through_one_join_and_locks_only_the_hold() {
     use sea_orm::sea_query::{JoinType, LockType, PostgresQueryBuilder};
 
-    let paired = super::hold_on_its_slot()
+    let paired = super::hold_on_its_stream(JoinType::InnerJoin)
         .lock_with_tables(
             LockType::Update,
             [sea_orm::sea_query::Alias::new(super::HOLD)],

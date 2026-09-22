@@ -97,8 +97,10 @@
 /readings/unflag_range => require_write_data
 /readyz => -
 /replicate_audit_holds => deny_scoped_token+require_manage_sensors
-/replicate_audit_holds/acknowledge_bulk => deny_scoped_token+require_manage_sensors
-/replicate_audit_holds/{id}/acknowledge => deny_scoped_token+require_manage_sensors
+/replicate_audit_holds/{id}/accept_correction => deny_scoped_token+require_manage_sensors
+/replicate_audit_holds/{id}/accept_identity => deny_scoped_token+require_manage_sensors
+/replicate_audit_holds/{id}/dismiss_finding => deny_scoped_token+require_manage_sensors
+/replicate_audit_holds/{id}/release_brake => deny_scoped_token+require_manage_sensors
 /replicate_audit_holds/{id}/reopen => deny_scoped_token+require_manage_sensors
 /replicate_audit_holds/{id}/resolve => deny_scoped_token+require_manage_sensors
 /reprocessing_jobs/{id}/cancel => deny_scoped_token+require_manage_sensors

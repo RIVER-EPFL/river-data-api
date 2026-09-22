@@ -218,7 +218,9 @@ async fn patch_rename_reclassifies_entry_and_recomputes_warnings() {
     assert_eq!(entry["parameter"]["create"], serde_json::json!(true));
     assert_eq!(entry["warnings"], serde_json::json!([]));
 
-    // Mapping to an existing parameter with different units resolves the id and adds a warning
+    // Typing the name a catalog parameter carries creates one under that code and joins nothing
+    // (Q221); the plan says what the code is beside.
+    let temp_id: Uuid = crate::common::GLOBAL_PARAM_TEMP_ID.parse().unwrap();
     let (status, text) = crate::common::patch_plan_with_token(
         &app,
         &plan_id.to_string(),
@@ -229,7 +231,34 @@ async fn patch_rename_reclassifies_entry_and_recomputes_warnings() {
     assert_eq!(status, 200, "patch failed: {text}");
     let updated: serde_json::Value = serde_json::from_str(&text).unwrap();
     let entry = entry_for(&updated, stream_id);
-    let temp_id: Uuid = crate::common::GLOBAL_PARAM_TEMP_ID.parse().unwrap();
+    assert_eq!(entry["parameter"]["id"], serde_json::Value::Null);
+    assert_eq!(entry["parameter"]["create"], serde_json::json!(true));
+    assert_eq!(
+        entry["parameter"]["attach"],
+        serde_json::json!({ "choice": "new" })
+    );
+    let warnings = entry["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w["kind"] == "catalog_match" && w["existing"]["id"] == serde_json::json!(temp_id)),
+        "the parameter the typed name belongs to is named, got {warnings:?}"
+    );
+
+    // Choosing that parameter attaches to it, and the units it disagrees with are the warning then.
+    let (status, text) = crate::common::patch_plan_with_token(
+        &app,
+        &plan_id.to_string(),
+        &serde_json::json!({ "updates": [{
+            "stream_id": stream_id,
+            "parameter_attach": { "choice": "existing", "id": temp_id }
+        }] }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "patch failed: {text}");
+    let updated: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let entry = entry_for(&updated, stream_id);
     assert_eq!(entry["parameter"]["id"], serde_json::json!(temp_id));
     assert_eq!(entry["parameter"]["create"], serde_json::json!(false));
     assert_eq!(entry["confidence"], serde_json::json!("exact"));

@@ -139,6 +139,10 @@ pub struct StationCandidate {
     /// Great-circle distance from the site, absent where either end has no coordinates.
     #[schema(required)]
     pub distance_km: Option<f64>,
+    /// Whether the station publishes the variable the picker asked about, absent where it named
+    /// none. A station this is false for cannot be subscribed to for that variable.
+    #[schema(required)]
+    pub publishes: Option<bool>,
 }
 
 pub mod station {

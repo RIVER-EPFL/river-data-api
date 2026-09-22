@@ -26,7 +26,6 @@ use crate::common::middleware::{
 use crate::routes::service::ACTION_BODY_LIMIT;
 use river_data_core::commands as core_commands;
 
-use crate::routes::private::annotations::models as annotations;
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::site_parameters::models as site_parameters;
@@ -36,6 +35,7 @@ use river_data_core::models::{
 };
 
 use crate::common::AppState;
+use crate::common::authz::AccessScope;
 use crate::common::middleware::{AuthContext, ProjectScope};
 use crate::common::paging::Window;
 use crate::error::{AppError, AppResult};
@@ -685,26 +685,6 @@ fn hold_on_its_stream(to_slot: JoinType) -> SelectStatement {
         .take()
 }
 
-/// A hold whose stream is paired, read through that pairing.
-fn hold_on_its_slot() -> SelectStatement {
-    hold_on_its_stream(JoinType::InnerJoin)
-}
-
-/// The holds this bulk acknowledge has not already put a note on. An acknowledge that ran twice
-/// inside the minute the statement looks back over would otherwise annotate the same instant
-/// again.
-fn not_yet_annotated() -> SelectStatement {
-    let existing = Alias::new("a");
-    SeaQuery::select()
-        .expr(Expr::val(1))
-        .from_as(annotations::Entity, existing.clone())
-        .and_where(
-            Expr::col((existing, annotations::Column::AuditHoldId))
-                .equals((Alias::new(HOLD), hold_model::Column::Id)),
-        )
-        .take()
-}
-
 /// One built statement, ready to execute. Select, update or insert: every statement here reaches
 /// the connection this way, so nothing in the file hands the driver SQL it assembled itself.
 fn built<Q: sea_orm::sea_query::QueryStatementWriter>(query: Q) -> Statement {
@@ -829,26 +809,101 @@ async fn decide_hold<C: sea_orm::ConnectionTrait>(
     Ok(result.rows_affected)
 }
 
-/// Acknowledge one pending hold: the operator confirms the statistics recomputed from the stored
-/// replicates. Terminal; re-detection of the same disagreement leaves the decision standing.
-/// The acting identity is taken from the caller's authentication, never from the request.
+/// Admit the reconciliation pass the brake is holding on this stream. Exactly one braked-scale
+/// pass applies on the next sync cycle; a later reshape brakes afresh.
 #[utoipa::path(
     post,
-    path = "/api/sync/replicate_audit_holds/{id}/acknowledge",
+    path = "/api/sync/replicate_audit_holds/{id}/release_brake",
     responses(
         (status = 200, body = AcknowledgeResponse),
+        (status = 400, description = "The hold is not a fired brake"),
         (status = 404, description = "No pending hold with this id"),
     ),
     tag = "sync"
 )]
-pub async fn acknowledge_hold(
+pub async fn release_brake(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     ProjectScope(scope): ProjectScope,
     axum::Extension(auth): axum::Extension<AuthContext>,
 ) -> AppResult<Json<AcknowledgeResponse>> {
-    enforce_hold_scope(&state.db, &scope, id).await?;
-    accept_ours(&state, id, &crate::common::actor::label(&auth)).await?;
+    acknowledge_for(&state, &scope, id, Purpose::StreamBrake, &auth).await
+}
+
+/// Dismiss a calculation finding: the audit reported a missing, stale or skipped output here and
+/// a person rules that no recomputation is owed.
+#[utoipa::path(
+    post,
+    path = "/api/sync/replicate_audit_holds/{id}/dismiss_finding",
+    responses(
+        (status = 200, body = AcknowledgeResponse),
+        (status = 400, description = "The hold is not a calculation finding"),
+        (status = 404, description = "No pending hold with this id"),
+    ),
+    tag = "sync"
+)]
+pub async fn dismiss_finding(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    ProjectScope(scope): ProjectScope,
+    axum::Extension(auth): axum::Extension<AuthContext>,
+) -> AppResult<Json<AcknowledgeResponse>> {
+    acknowledge_for(&state, &scope, id, Purpose::CalculationFinding, &auth).await
+}
+
+/// Accept the instrument identity the source reports, against the one on record.
+#[utoipa::path(
+    post,
+    path = "/api/sync/replicate_audit_holds/{id}/accept_identity",
+    responses(
+        (status = 200, body = AcknowledgeResponse),
+        (status = 400, description = "The hold is not an identity change"),
+        (status = 404, description = "No pending hold with this id"),
+    ),
+    tag = "sync"
+)]
+pub async fn accept_identity(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    ProjectScope(scope): ProjectScope,
+    axum::Extension(auth): axum::Extension<AuthContext>,
+) -> AppResult<Json<AcknowledgeResponse>> {
+    acknowledge_for(&state, &scope, id, Purpose::IdentityChange, &auth).await
+}
+
+/// Mark a source correction reviewed: it has already applied, and the curation on the affected
+/// reading stands as it is.
+#[utoipa::path(
+    post,
+    path = "/api/sync/replicate_audit_holds/{id}/accept_correction",
+    responses(
+        (status = 200, body = AcknowledgeResponse),
+        (status = 400, description = "The hold is not a source correction"),
+        (status = 404, description = "No pending hold with this id"),
+    ),
+    tag = "sync"
+)]
+pub async fn accept_correction(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    ProjectScope(scope): ProjectScope,
+    axum::Extension(auth): axum::Extension<AuthContext>,
+) -> AppResult<Json<AcknowledgeResponse>> {
+    acknowledge_for(&state, &scope, id, Purpose::SourceCorrection, &auth).await
+}
+
+/// The body every acknowledging route shares: the caller's scope is enforced, the acting identity
+/// is taken from their authentication, and the purpose decides which kinds are reachable and what
+/// sentence is minted.
+async fn acknowledge_for(
+    state: &AppState,
+    scope: &AccessScope,
+    id: Uuid,
+    purpose: Purpose,
+    auth: &AuthContext,
+) -> AppResult<Json<AcknowledgeResponse>> {
+    enforce_hold_scope(&state.db, scope, id).await?;
+    acknowledge(state, id, purpose, &crate::common::actor::label(auth)).await?;
     Ok(Json(AcknowledgeResponse {
         acknowledged: 1,
         skipped_no_stream: 0,
@@ -883,7 +938,7 @@ pub async fn resolve_hold(
     let by = crate::common::actor::label(&auth);
     match payload.mode.as_str() {
         "ours" => {
-            accept_ours(&state, id, &by).await?;
+            acknowledge(&state, id, Purpose::Statistics, &by).await?;
             Ok(Json(ResolveHoldResponse {
                 status: "acknowledged".to_string(),
                 samples_affected: None,
@@ -1250,186 +1305,6 @@ pub async fn reopen_hold(
     }))
 }
 
-/// Acknowledge pending holds in bulk: one stream or a whole source, optionally bounded by a time
-/// window and by a `relative_delta` ceiling, for systematic offsets that would otherwise take one
-/// acknowledgement per instant.
-#[utoipa::path(
-    post,
-    path = "/api/sync/replicate_audit_holds/acknowledge_bulk",
-    request_body = BulkAcknowledgeRequest,
-    responses((status = 200, body = AcknowledgeResponse)),
-    tag = "sync"
-)]
-pub async fn acknowledge_holds_bulk(
-    State(state): State<AppState>,
-    ProjectScope(scope): ProjectScope,
-    axum::Extension(auth): axum::Extension<AuthContext>,
-    Json(payload): Json<BulkAcknowledgeRequest>,
-) -> AppResult<Json<AcknowledgeResponse>> {
-    let by = crate::common::actor::label(&auth);
-    let h = Alias::new("h");
-    let hold_col = |c: hold_model::Column| Expr::col((h.clone(), c));
-    let mut bounds = Condition::all();
-    // A restricted caller acknowledges only holds whose stream is paired to a site in their
-    // projects; unpaired (deferred) holds belong to no project and stay out of their reach.
-    if let Some(projects) = scope.sql_project_array() {
-        bounds = bounds.add(Expr::cust_with_values(
-            "EXISTS (SELECT 1 FROM site_parameters sp JOIN sites st ON st.id = sp.site_id \
-             WHERE sp.id = ds.site_parameter_id AND st.project_id = ANY($1))",
-            [projects],
-        ));
-    }
-    let stream_scoped = payload.stream_id.is_some() || payload.source_system.is_some();
-    if let Some(stream_id) = payload.stream_id {
-        bounds = bounds.add(hold_col(hold_model::Column::StreamId).eq(stream_id));
-    }
-    if let Some(source_system) = payload.source_system {
-        bounds = bounds.add(Expr::cust_with_values(
-            "ds.source_system = $1",
-            [sea_orm::Value::from(source_system)],
-        ));
-    }
-    if let Some(start) = payload.start {
-        bounds = bounds.add(
-            hold_col(hold_model::Column::GroupTime)
-                .gte(sea_orm::prelude::DateTimeWithTimeZone::from(start)),
-        );
-    }
-    if let Some(end) = payload.end {
-        bounds = bounds.add(
-            hold_col(hold_model::Column::GroupTime)
-                .lte(sea_orm::prelude::DateTimeWithTimeZone::from(end)),
-        );
-    }
-    if let Some(ceiling) = payload.max_relative_delta {
-        bounds = bounds.add(super::service::relative_delta_expr().lte(ceiling));
-    }
-    if let Some(ceiling) = payload.max_mean_relative_delta {
-        bounds = bounds.add(super::service::relative_delta_of("mean").lte(ceiling));
-    }
-    if let Some(ceiling) = payload.max_sd_relative_delta {
-        bounds = bounds.add(super::service::relative_delta_of("sd").lte(ceiling));
-    }
-    // Holds carrying no stream are out of the acknowledging statement's reach: it joins
-    // `data_streams`, and every filter this route takes is a replicate-statistics threshold. Count
-    // them so a sweep states what it passed over instead of returning a total that reads as the
-    // whole queue (B262). A call naming a stream or a source system asked for streams, so nothing
-    // was passed over; only the instant bounds narrow the rest.
-    let skipped_no_stream = if stream_scoped {
-        0
-    } else {
-        use sea_orm::PaginatorTrait as _;
-        let mut stream_less = hold_model::Entity::find()
-            .filter(hold_model::Column::Status.eq(HoldStatus::Pending.as_str()))
-            .filter(hold_model::Column::StreamId.is_null());
-        if let Some(start) = payload.start {
-            stream_less = stream_less.filter(hold_model::Column::GroupTime.gte(start));
-        }
-        if let Some(end) = payload.end {
-            stream_less = stream_less.filter(hold_model::Column::GroupTime.lte(end));
-        }
-        stream_less.count(&state.db).await?
-    };
-
-    let ds = Alias::new("ds");
-    let acknowledge = SeaQuery::update()
-        .table(
-            sea_orm::sea_query::IntoTableRef::into_table_ref(hold_model::Entity).alias(h.clone()),
-        )
-        .value(
-            hold_model::Column::Status,
-            Expr::val(HoldStatus::Acknowledged.as_str()),
-        )
-        .value(
-            hold_model::Column::Resolution,
-            crate::routes::private::sync::service::accept_ours_resolution(&by),
-        )
-        .value(hold_model::Column::AcknowledgedBy, Expr::val(by.clone()))
-        .value(hold_model::Column::AcknowledgedAt, Expr::cust("NOW()"))
-        .from(
-            sea_orm::sea_query::IntoTableRef::into_table_ref(
-                crate::routes::private::data_streams::models::Entity,
-            )
-            .alias(ds.clone()),
-        )
-        .cond_where(
-            Condition::all()
-                .add(
-                    Expr::col((
-                        ds.clone(),
-                        crate::routes::private::data_streams::models::Column::Id,
-                    ))
-                    .equals((h.clone(), hold_model::Column::StreamId)),
-                )
-                .add(hold_col(hold_model::Column::Status).eq(HoldStatus::Pending.as_str()))
-                .add(bounds),
-        )
-        .to_owned();
-    let acknowledged = state
-        .db
-        .execute_raw(built(acknowledge))
-        .await?
-        .rows_affected();
-    // One note per instant, as the single acknowledge writes: a sweep is many decisions, and each
-    // one is about a value somebody may later look at on a chart. The insert reads the holds this
-    // call just decided, identified by the actor and timestamp it stamped on them.
-    if acknowledged > 0 {
-        let note = Expr::cust_with_values(
-            "'Audit accepted in bulk: the statistics computed here stand (source mean '
-               || COALESCE(round((h.expected->>'mean')::numeric, 4)::text, 'none')
-               || ' sd ' || COALESCE(round((h.expected->>'sd')::numeric, 4)::text, 'none')
-               || ', recomputed mean '
-               || COALESCE(round((h.computed->>'mean')::numeric, 4)::text, 'none')
-               || ' sd ' || COALESCE(round((h.computed->>'sd')::numeric, 4)::text, 'none')
-               || ' over ' || COALESCE(h.computed->>'n', '0')
-               || ' replicates). Accepted by ' || $1 || '.'",
-            [by.clone()],
-        );
-        let decided_here = hold_on_its_slot()
-            .column((SLOT, site_parameters::Column::SiteId))
-            .column((SLOT, site_parameters::Column::ParameterId))
-            .column((HOLD, hold_model::Column::GroupTime))
-            .column((HOLD, hold_model::Column::GroupTime))
-            .expr(note)
-            .expr(Expr::val(AUDIT_ANNOTATION_CATEGORY))
-            .expr(Expr::val(by.clone()))
-            .column((HOLD, hold_model::Column::Id))
-            .and_where(
-                Expr::col((HOLD, hold_model::Column::Status)).eq(HoldStatus::Acknowledged.as_str()),
-            )
-            .and_where(Expr::col((HOLD, hold_model::Column::AcknowledgedBy)).eq(by.clone()))
-            .and_where(
-                Expr::col((HOLD, hold_model::Column::AcknowledgedAt))
-                    .gt(Expr::cust("NOW() - INTERVAL '1 minute'")),
-            )
-            .and_where(Expr::exists(not_yet_annotated()).not())
-            .take();
-        let mut annotate = SeaQuery::insert();
-        annotate
-            .into_table(annotations::Entity)
-            .columns([
-                annotations::Column::SiteId,
-                annotations::Column::ParameterId,
-                annotations::Column::StartTime,
-                annotations::Column::EndTime,
-                annotations::Column::Text,
-                annotations::Column::Category,
-                annotations::Column::CreatedBy,
-                annotations::Column::AuditHoldId,
-            ])
-            .select_from(decided_here)
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        let annotated = state.db.execute_raw(built(annotate.to_owned())).await;
-        if let Err(e) = annotated {
-            tracing::warn!("could not annotate bulk-acknowledged holds: {e}");
-        }
-    }
-    Ok(Json(AcknowledgeResponse {
-        acknowledged,
-        skipped_no_stream,
-    }))
-}
-
 /// Sync admin views are split by required authorization, and each group carries its own layers
 /// (Q143), so `service/mod.rs` mounts them under `/sync` and adds nothing. The layers used to sit
 /// at the nest site, where `tests/route_guards.rs` could not see them and all 36 routes recorded
@@ -1478,15 +1353,23 @@ pub fn manage_routes() -> Router<AppState> {
     Router::new()
         .route("/replicate_audit_holds", get(list_holds))
         .route(
-            "/replicate_audit_holds/{id}/acknowledge",
-            post(acknowledge_hold),
+            "/replicate_audit_holds/{id}/release_brake",
+            post(release_brake),
+        )
+        .route(
+            "/replicate_audit_holds/{id}/dismiss_finding",
+            post(dismiss_finding),
+        )
+        .route(
+            "/replicate_audit_holds/{id}/accept_identity",
+            post(accept_identity),
+        )
+        .route(
+            "/replicate_audit_holds/{id}/accept_correction",
+            post(accept_correction),
         )
         .route("/replicate_audit_holds/{id}/resolve", post(resolve_hold))
         .route("/replicate_audit_holds/{id}/reopen", post(reopen_hold))
-        .route(
-            "/replicate_audit_holds/acknowledge_bulk",
-            post(acknowledge_holds_bulk),
-        )
         .route(
             "/change_proposals/decide",
             post(crate::routes::private::readings::views::decide_proposals),
@@ -1727,8 +1610,15 @@ pub async fn update_pairing_plan(
             if let Some(ref name) = update.site_name {
                 entry.site.name = name.clone();
             }
+            // A code somebody typed is a new parameter until they say otherwise (Q221); an explicit
+            // choice in the same update is the one that counts.
             if let Some(ref name) = update.parameter_name {
                 entry.parameter.name = name.clone();
+                entry.parameter.attach =
+                    Some(crate::routes::private::sync::service::PlanParamAttach::New);
+            }
+            if let Some(attach) = update.parameter_attach.clone() {
+                entry.parameter.attach = Some(attach);
             }
             if let Some(ref units) = update.parameter_units {
                 entry.parameter.units = units.clone();
@@ -1775,6 +1665,7 @@ pub async fn update_pairing_plan(
         &entries,
         &mut attachments,
         &req.held_curves,
+        &crate::common::actor::label(&auth),
     )
     .await?;
 
@@ -2221,6 +2112,7 @@ pub async fn plan_instruments(
             name: acc.instrument.name,
             source_key: acc.instrument.source_key,
             resolved_by: acc.instrument.resolved_by,
+            label_candidates: acc.instrument.label_candidates,
             create: acc.instrument.create,
             confirmed: acc.instrument.confirmed,
             stamps_readings: acc.instrument.stamps_readings,
@@ -2379,6 +2271,7 @@ pub async fn plan_instruments(
                     name: i.name.clone(),
                     source_key: i.source_key.clone(),
                     resolved_by: i.resolved_by.clone(),
+                    label_candidates: i.label_candidates.clone(),
                     create: i.create,
                     confirmed: i.confirmed,
                     stamps_readings: i.stamps_readings,
@@ -2498,6 +2391,8 @@ async fn held_curve_rows(
                     r_squared: c.r_squared,
                     fitted_on: c.fitted_on,
                     attached,
+                    skipped: c.skipped_at.is_some(),
+                    skipped_by: c.skipped_by,
                 }
             })
             .collect(),

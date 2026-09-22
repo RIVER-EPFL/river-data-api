@@ -34,6 +34,24 @@ pub struct Variable {
     pub label: &'static str,
     pub units: &'static str,
     pub decimals: i16,
+    /// What marks a station as publishing this variable, in the station list.
+    pub published_by: StationMark,
+}
+
+/// The station-list column that is blank for a station publishing no such measurement. A station
+/// the mark leaves out is read for ever at blank cells, so a subscription to one is refused.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StationMark {
+    /// `height_barometer_masl`, blank for the 19 published stations carrying no barometer.
+    Barometer,
+}
+
+/// Whether the station publishes the variable, by the mark the declaration names.
+#[must_use]
+pub fn publishes(declared: &Variable, station: &station::Model) -> bool {
+    match declared.published_by {
+        StationMark::Barometer => station.height_barometer_masl.is_some(),
+    }
 }
 
 /// What a site may subscribe to. Station-level pressure is the variable the oxygen-saturation
@@ -44,6 +62,7 @@ pub const VARIABLES: &[Variable] = &[Variable {
     label: "Barometric Pressure",
     units: "hPa",
     decimals: 1,
+    published_by: StationMark::Barometer,
 }];
 
 /// The declaration for a variable, by the name a subscription holds.
@@ -399,6 +418,7 @@ pub fn distance_km(from: (f64, f64), to: (f64, f64)) -> f64 {
 pub fn rank_stations(
     stations: Vec<super::models::station::Model>,
     origin: Option<(f64, f64)>,
+    declared: Option<&Variable>,
 ) -> Vec<StationCandidate> {
     let mut candidates: Vec<StationCandidate> = stations
         .into_iter()
@@ -406,12 +426,14 @@ pub fn rank_stations(
             let distance_km = origin
                 .zip(station.latitude.zip(station.longitude))
                 .map(|(origin, at)| distance_km(origin, at));
+            let published = declared.map(|v| publishes(v, &station));
             StationCandidate {
                 station_abbr: station.station_abbr,
                 name: station.name,
                 data_since: station.data_since,
                 height_masl: station.height_masl,
                 height_barometer_masl: station.height_barometer_masl,
+                publishes: published,
                 latitude: station.latitude,
                 longitude: station.longitude,
                 distance_km,
@@ -512,9 +534,9 @@ pub async fn instrument<C: ConnectionTrait + sea_orm::TransactionTrait>(
     Ok(sensor.id)
 }
 
-/// The site's slot for the subscribed variable and the stream feeding it, created on first sync.
-/// Subscribing the site to a station and a variable is the whole operator action; the slot and the
-/// stream follow from it.
+/// The site's slot for the subscribed variable and the stream feeding it, created with the
+/// subscription. Subscribing the site to a station and a variable is the whole operator action;
+/// the slot and the stream follow from it, and a later pass finds both and creates nothing.
 pub async fn provision<C: ConnectionTrait + sea_orm::TransactionTrait>(
     db: &C,
     site: &Subscriber,
@@ -542,7 +564,9 @@ pub async fn provision<C: ConnectionTrait + sea_orm::TransactionTrait>(
                 display_units: Set(Some(parameter.default_units)),
                 decimal_places: Set(declared.map(|v| v.decimals)),
                 sample_interval_sec: Set(Some(600)),
-                needs_review: Set(true),
+                // An operator picked the station, so there is nothing here for a manager to
+                // confirm; the flag is for a column a tool save added.
+                needs_review: Set(false),
                 ..Default::default()
             }
             .insert(db)
@@ -738,15 +762,16 @@ pub struct MeteoswissSubscriptionOperations;
 impl crudcrate::CRUDOperations for MeteoswissSubscriptionOperations {
     type Resource = super::models::subscription::MeteoswissSubscription;
 
-    /// A variable the feed does not publish lands nowhere, and a station it does not list is read
-    /// for ever at a 404, so both are refused by name.
+    /// A variable the feed does not publish lands nowhere, a station it does not list is read for
+    /// ever at a 404, and a station that publishes no such measurement is read for ever at blank
+    /// cells, so all three are refused by name.
     async fn before_create<C: ConnectionTrait + sea_orm::TransactionTrait>(
         &self,
         db: &C,
         data: &<Self::Resource as crudcrate::CRUDResource>::CreateModel,
     ) -> Result<(), crudcrate::ApiError> {
         require_declared(&data.variable)?;
-        require_listed_station(db, &data.station_abbr).await
+        require_station_publishes(db, &data.station_abbr, &data.variable).await
     }
 
     /// The catalog row is the subscription's own: it is resolved, minted where the catalog does
@@ -765,23 +790,34 @@ impl crudcrate::CRUDOperations for MeteoswissSubscriptionOperations {
             .await
             .map(Self::Resource::from)
             .map_err(crudcrate::ApiError::database)?;
+        let site = subscriber(db, &subscription).await?;
+        provision(db, &site, parameter_id)
+            .await
+            .map_err(crudcrate::ApiError::database)?;
         enqueue_backfill(db, &subscription.station_abbr, &subscription.variable).await?;
         Ok(subscription)
     }
 
+    /// A subscription moved to another station or another variable is held to the same three
+    /// refusals as a new one, over whichever half of the pair the update leaves alone.
     async fn before_update<C: ConnectionTrait + sea_orm::TransactionTrait>(
         &self,
         db: &C,
-        _id: Uuid,
+        id: Uuid,
         data: &<Self::Resource as crudcrate::CRUDResource>::UpdateModel,
     ) -> Result<(), crudcrate::ApiError> {
-        if let Some(name) = data.variable.as_ref().and_then(Option::as_ref) {
+        let moved_variable = data.variable.as_ref().and_then(Option::as_ref);
+        let moved_station = data.station_abbr.as_ref().and_then(Option::as_ref);
+        if let Some(name) = moved_variable {
             require_declared(name)?;
         }
-        match data.station_abbr.as_ref().and_then(Option::as_ref) {
-            Some(abbr) => require_listed_station(db, abbr).await,
-            None => Ok(()),
+        if moved_variable.is_none() && moved_station.is_none() {
+            return Ok(());
         }
+        let (station, variable) = subscribed_pair(db, id).await?;
+        let station = moved_station.unwrap_or(&station);
+        let variable = moved_variable.unwrap_or(&variable);
+        require_station_publishes(db, station, variable).await
     }
 
     /// A subscription moved to another variable lands on that variable's catalog row.
@@ -833,6 +869,61 @@ async fn enqueue_backfill<C: ConnectionTrait>(
     Ok(())
 }
 
+/// The subscription as the landing reads it, so the slot and the stream are provisioned in the
+/// same shape whichever end asks for them.
+async fn subscriber<C: ConnectionTrait>(
+    db: &C,
+    subscription: &super::models::subscription::MeteoswissSubscription,
+) -> Result<Subscriber, crudcrate::ApiError> {
+    let site = crate::routes::private::sites::Entity::find_by_id(subscription.site_id)
+        .one(db)
+        .await
+        .map_err(crudcrate::ApiError::database)?
+        .ok_or_else(|| crudcrate::ApiError::not_found("site", None))?;
+    Ok(Subscriber {
+        subscription_id: subscription.id,
+        site_id: subscription.site_id,
+        site_name: site.name,
+        station: subscription.station_abbr.trim().to_uppercase(),
+        variable: subscription.variable.trim().to_lowercase(),
+        parameter_id: subscription.parameter_id,
+    })
+}
+
+/// The station and variable a subscription holds now, so an update moving one is checked against
+/// the other as it stands.
+async fn subscribed_pair<C: ConnectionTrait>(
+    db: &C,
+    id: Uuid,
+) -> Result<(String, String), crudcrate::ApiError> {
+    subscription::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .map_err(crudcrate::ApiError::database)?
+        .map(|row| (row.station_abbr, row.variable))
+        .ok_or_else(|| crudcrate::ApiError::not_found("MeteoSwiss subscription", None))
+}
+
+/// What a backfill that landed nothing has to say about it. A run that read at least one archive
+/// and found every cell blank has read the station's own answer: it publishes no such measurement
+/// for the interval, which is a failed run rather than a quiet one. A run that read no archive has
+/// nothing to conclude from, and one that landed a reading succeeded.
+#[must_use]
+pub fn nothing_published(
+    station: &str,
+    variable: &str,
+    archives_read: usize,
+    blank: usize,
+    inserted: usize,
+) -> Option<String> {
+    if archives_read == 0 || inserted > 0 || blank == 0 {
+        return None;
+    }
+    Some(format!(
+        "{station} publishes no {variable} in {archives_read} archives: {blank} cells, none with a value"
+    ))
+}
+
 /// The declaration for a subscribed variable, as a refusal where the feed publishes no such thing.
 fn declaration(name: &str) -> Result<&'static Variable, crudcrate::ApiError> {
     variable(name).ok_or_else(|| undeclared(name))
@@ -842,15 +933,19 @@ fn require_declared(name: &str) -> Result<(), crudcrate::ApiError> {
     declaration(name).map(|_| ())
 }
 
-/// A station out of the published list, read from the list as it stands.
-async fn require_listed_station<C: ConnectionTrait>(
+/// A station out of the published list that publishes the variable, read from the list as it
+/// stands.
+async fn require_station_publishes<C: ConnectionTrait>(
     db: &C,
     abbr: &str,
+    variable: &str,
 ) -> Result<(), crudcrate::ApiError> {
     let listed = search_stations(db, None)
         .await
         .map_err(crudcrate::ApiError::database)?;
-    listed_station(abbr, &listed)
+    let declared = declaration(variable)?;
+    listed_station(abbr, &listed)?;
+    station_publishes(abbr, declared, &listed)
 }
 
 /// The abbreviations a refusal offers instead of the one that was typed.
@@ -870,6 +965,47 @@ fn listed_station(abbr: &str, listed: &[station::Model]) -> Result<(), crudcrate
     Err(unlisted(&typed, listed))
 }
 
+/// A subscription names a station the list marks as publishing the variable. As with the list
+/// itself, a station the list does not hold at all is another refusal's business, and an empty
+/// list stands between nobody and a subscription.
+fn station_publishes(
+    abbr: &str,
+    declared: &Variable,
+    listed: &[station::Model],
+) -> Result<(), crudcrate::ApiError> {
+    let typed = abbr.trim().to_uppercase();
+    let Some(station) = listed
+        .iter()
+        .find(|station| station.station_abbr.trim().to_uppercase() == typed)
+    else {
+        return Ok(());
+    };
+    if publishes(declared, station) {
+        return Ok(());
+    }
+    Err(unpublished(&typed, declared, listed))
+}
+
+fn unpublished(
+    typed: &str,
+    declared: &Variable,
+    listed: &[station::Model],
+) -> crudcrate::ApiError {
+    let publishing: Vec<&station::Model> = listed
+        .iter()
+        .filter(|station| publishes(declared, station))
+        .collect();
+    let nearest: Vec<String> = nearest_of(typed, &publishing)
+        .into_iter()
+        .map(|station| format!("{} ({})", station.station_abbr, station.name))
+        .collect();
+    crudcrate::ApiError::bad_request(format!(
+        "MeteoSwiss station '{typed}' publishes no {}; nearest that does: {}",
+        declared.name,
+        nearest.join(", ")
+    ))
+}
+
 fn unlisted(typed: &str, listed: &[station::Model]) -> crudcrate::ApiError {
     let nearest: Vec<String> = nearest_stations(typed, listed)
         .into_iter()
@@ -884,12 +1020,18 @@ fn unlisted(typed: &str, listed: &[station::Model]) -> crudcrate::ApiError {
 /// The listed stations closest to what was typed, by edit distance on the abbreviation and then by
 /// name, so a refusal carries the one the operator meant.
 fn nearest_stations<'a>(typed: &str, listed: &'a [station::Model]) -> Vec<&'a station::Model> {
-    let mut by_distance: Vec<(usize, &station::Model)> = listed
+    let all: Vec<&station::Model> = listed.iter().collect();
+    nearest_of(typed, &all)
+}
+
+/// The same ranking over a chosen few, so a refusal can offer only the stations that qualify.
+fn nearest_of<'a>(typed: &str, candidates: &[&'a station::Model]) -> Vec<&'a station::Model> {
+    let mut by_distance: Vec<(usize, &station::Model)> = candidates
         .iter()
         .map(|station| {
             (
                 edit_distance(typed, &station.station_abbr.trim().to_uppercase()),
-                station,
+                *station,
             )
         })
         .collect();

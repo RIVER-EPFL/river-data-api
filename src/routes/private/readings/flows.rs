@@ -680,7 +680,7 @@ fn retag_readings(
     sensor_ids: &[Uuid],
     stream_ids: &[Uuid],
     source_system: Option<&str>,
-) -> sea_query::UpdateStatement {
+) -> crate::common::bulk_write::Spanned {
     use crate::routes::private::data_streams::models as data_streams;
     use crate::routes::private::readings::models as readings;
     use sea_orm::sea_query::ExprTrait;
@@ -710,17 +710,30 @@ fn retag_readings(
         )));
     }
 
+    // What the write changes and what the span reads are the same rows, so the predicate is built
+    // once: the `declared` arm joins `data_streams` to compare against each stream's own value.
+    let changing = || match target {
+        // sea-query has no IS DISTINCT FROM, and a NULL measurement_type reads as continuous, so
+        // the comparison cannot be a plain inequality.
+        Some(value) => sea_query::Condition::all().add(sea_query::Expr::cust(format!(
+            r#""readings"."measurement_type" IS DISTINCT FROM '{value}'"#
+        ))),
+        None => sea_query::Condition::all()
+            .add(col(&r, readings::Column::StreamId).equals((ds.clone(), data_streams::Column::Id)))
+            .add(
+                sea_query::Expr::col((ds.clone(), data_streams::Column::MeasurementType))
+                    .is_not_null(),
+            )
+            .add(sea_query::Expr::cust(
+                r#""readings"."measurement_type" IS DISTINCT FROM "data_streams"."measurement_type""#,
+            )),
+    };
+
     let mut update = sea_query::Query::update();
     update.table(readings::Entity);
     match target {
         Some(value) => {
-            update
-                .value(readings::Column::MeasurementType, value)
-                // sea-query has no IS DISTINCT FROM, and a NULL measurement_type reads as
-                // continuous, so the comparison cannot be a plain inequality.
-                .and_where(sea_query::Expr::cust(format!(
-                    r#""readings"."measurement_type" IS DISTINCT FROM '{value}'"#
-                )));
+            update.value(readings::Column::MeasurementType, value);
         }
         None => {
             update
@@ -728,22 +741,22 @@ fn retag_readings(
                     readings::Column::MeasurementType,
                     sea_query::Expr::col((ds.clone(), data_streams::Column::MeasurementType)),
                 )
-                .from(data_streams::Entity)
-                .and_where(
-                    col(&r, readings::Column::StreamId)
-                        .equals((ds.clone(), data_streams::Column::Id)),
-                )
-                .and_where(
-                    sea_query::Expr::col((ds.clone(), data_streams::Column::MeasurementType))
-                        .is_not_null(),
-                )
-                .and_where(sea_query::Expr::cust(
-                    r#""readings"."measurement_type" IS DISTINCT FROM "data_streams"."measurement_type""#,
-                ));
+                .from(data_streams::Entity);
         }
     }
-    update.cond_where(scope);
-    update.to_owned()
+    let update = update
+        .cond_where(changing())
+        .cond_where(scope.clone())
+        .to_owned();
+
+    let mut rows = sea_query::Query::select();
+    rows.column(readings::Column::Time).from(readings::Entity);
+    if target.is_none() {
+        rows.from(data_streams::Entity);
+    }
+    let rows = rows.cond_where(changing()).cond_where(scope).to_owned();
+
+    crate::common::bulk_write::Spanned::new(rows, update)
 }
 
 #[async_trait]

@@ -288,16 +288,19 @@ impl HoldKind {
         }
     }
 
+    /// One kind by name, as the column stores it.
+    pub fn parse(name: &str) -> AppResult<Self> {
+        serde_json::from_value(serde_json::Value::String(name.to_string()))
+            .map_err(|_| AppError::BadRequest(format!("unknown hold kind '{name}'")))
+    }
+
     /// A comma-separated list of kind names, as a list filter takes them.
     pub fn parse_list(list: &str) -> AppResult<Vec<Self>> {
         let kinds = list
             .split(',')
             .map(str::trim)
             .filter(|name| !name.is_empty())
-            .map(|name| {
-                serde_json::from_value(serde_json::Value::String(name.to_string()))
-                    .map_err(|_| AppError::BadRequest(format!("unknown hold kind '{name}'")))
-            })
+            .map(Self::parse)
             .collect::<AppResult<Vec<Self>>>()?;
         if kinds.is_empty() {
             return Err(AppError::BadRequest("kind names no hold kind".to_string()));
@@ -571,32 +574,6 @@ pub struct ResolveHoldResponse {
     pub samples_affected: Option<i64>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct BulkAcknowledgeRequest {
-    /// One stream, or omit to scope by source_system (or, with both omitted, every pending hold).
-    #[serde(default)]
-    pub stream_id: Option<Uuid>,
-    /// All of one source's streams, e.g. "cnet".
-    #[serde(default)]
-    pub source_system: Option<String>,
-    /// Restrict to holds whose group_time falls in [start, end]; omit either to leave it open.
-    #[serde(default)]
-    pub start: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub end: Option<DateTime<Utc>>,
-    /// Only acknowledge holds whose `relative_delta` (as reported by the list endpoint) is at or
-    /// below this. The knob behind "accept everything under N%": systematic small offsets are
-    /// waved through in one action while the large disagreements stay pending for review.
-    #[serde(default)]
-    pub max_relative_delta: Option<f64>,
-    /// Ceiling on `mean_relative_delta`. ANDs with the other ceilings.
-    #[serde(default)]
-    pub max_mean_relative_delta: Option<f64>,
-    /// Ceiling on `sd_relative_delta`. ANDs with the other ceilings.
-    #[serde(default)]
-    pub max_sd_relative_delta: Option<f64>,
-}
-
 #[derive(Deserialize)]
 pub struct CreatePairingPlanRequest {
     pub source_system: String,
@@ -757,6 +734,10 @@ pub struct PlanHeldCurveUpdate {
     /// An instrument that already exists. Naming neither clears the attachment.
     #[serde(default)]
     pub instrument_id: Option<Uuid>,
+    /// Leave the curve behind instead of attaching it: it is never stored and the source stops
+    /// sending the readings that name it. `Some(false)` takes the skip back (Q220).
+    #[serde(default)]
+    pub skip: Option<bool>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -781,6 +762,12 @@ pub struct PlanEntryUpdate {
     pub site_altitude_m: Option<f64>,
     #[serde(default)]
     pub parameter_name: Option<String>,
+    /// Which catalog parameter this column is, decided rather than matched: `{"choice":"existing",
+    /// "id":...}` attaches to that row, `{"choice":"new"}` creates one under the entry's code. A
+    /// `parameter_name` sent without it records `new`, so typing a code that happens to exist does
+    /// not attach to it (Q221).
+    #[serde(default)]
+    pub parameter_attach: Option<crate::routes::private::sync::service::PlanParamAttach>,
     #[serde(default)]
     pub parameter_units: Option<String>,
     /// Human display label for the parameter. Takes effect only when apply creates the
@@ -837,7 +824,8 @@ pub struct PlanInstrumentGroup {
     pub instrument_id: Option<Uuid>,
     pub name: String,
     pub source_key: String,
-    /// `stream` | `curve_label` | `manual` | `placeholder`.
+    /// `stream` | `curve_label` (suggested from the label) | `manual` | `ambiguous_label` (the
+    /// label matched more than one, so nothing is suggested) | `placeholder`.
     pub resolved_by: String,
     pub create: bool,
     pub confirmed: bool,
@@ -861,6 +849,11 @@ pub struct PlanInstrumentGroup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub name_conflict: Option<crate::routes::private::sync::service::InstrumentNameConflict>,
+    /// The instruments the curve label matched when it matched more than one. The row is then a
+    /// choice between them rather than a suggestion.
+    #[serde(default)]
+    #[schema(required)]
+    pub label_candidates: Vec<crate::routes::private::sync::service::PlanLabelCandidate>,
 }
 
 /// The source parameters this plan pairs that no instrument covers, so an operator can attach one
@@ -965,6 +958,11 @@ pub struct PlanHeldCurve {
     /// Where the apply will create it, or null while nothing is attached, which blocks the apply.
     #[schema(required)]
     pub attached: Option<PlanHeldCurveTarget>,
+    /// The review left this curve behind: it is not stored and the readings naming it are dropped
+    /// at the source. A skipped curve no longer blocks the apply.
+    pub skipped: bool,
+    #[schema(required)]
+    pub skipped_by: Option<String>,
 }
 
 /// The instrument a held curve is attached to.

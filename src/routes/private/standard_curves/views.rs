@@ -86,12 +86,13 @@ pub async fn register_standard_curve(
         .one(&state.db)
         .await?
     else {
-        hold_curve(&state.db, &source_system, &payload.curve).await?;
+        let skipped = hold_curve(&state.db, &source_system, &payload.curve).await?;
         return Ok(Json(RegisterStandardCurveResponse {
             id: None,
             sensor_id: None,
             superseded: false,
             proposed: true,
+            skipped,
         }));
     };
 
@@ -104,6 +105,7 @@ pub async fn register_standard_curve(
             sensor_id: Some(sensor_id),
             superseded: false,
             proposed: false,
+            skipped: false,
         }));
     }
     if !curve_is_used(&state.db, current.id).await? {
@@ -123,6 +125,7 @@ pub async fn register_standard_curve(
             sensor_id: Some(sensor_id),
             superseded: false,
             proposed: false,
+            skipped: false,
         }));
     }
     // Used curve edited upstream: mint a successor, move the provenance to it and retire the
@@ -172,15 +175,18 @@ pub async fn register_standard_curve(
         sensor_id: Some(sensor_id),
         superseded: true,
         proposed: false,
+        skipped: false,
     }))
 }
 
-/// Hold a curve no stored row carries yet, keeping the latest coefficients the source sent.
+/// Hold a curve no stored row carries yet, keeping the latest coefficients the source sent, and
+/// report whether the review has already left it behind. A skip survives re-registration: the
+/// conflict arm rewrites the coefficients and never the stamp.
 async fn hold_curve<C: ConnectionTrait>(
     conn: &C,
     source_system: &str,
     curve: &river_data_core::models::StandardCurveUpsert,
-) -> AppResult<()> {
+) -> AppResult<bool> {
     use super::models::proposal;
     use sea_orm::sea_query::OnConflict;
 
@@ -198,6 +204,8 @@ async fn hold_curve<C: ConnectionTrait>(
         notes: Set(curve.notes.clone()),
         first_seen_at: Set(now),
         last_seen_at: Set(now),
+        skipped_at: Set(None),
+        skipped_by: Set(None),
     };
     proposal::Entity::insert(row)
         .on_conflict(
@@ -216,7 +224,12 @@ async fn hold_curve<C: ConnectionTrait>(
         )
         .exec_without_returning(conn)
         .await?;
-    Ok(())
+    Ok(proposal::Entity::find()
+        .filter(proposal::Column::SourceSystem.eq(source_system))
+        .filter(proposal::Column::SourceKey.eq(curve.source_key.clone()))
+        .one(conn)
+        .await?
+        .is_some_and(|held| held.skipped_at.is_some()))
 }
 
 async fn insert_curve<C: ConnectionTrait>(

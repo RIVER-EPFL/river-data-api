@@ -301,13 +301,13 @@ async fn acknowledged_decision_stands_against_redetection() {
     let hold_id = pending_hold_id(&fx).await;
     let (status, body) = crate::common::post_json_parse_with_token(
         &fx.app,
-        &format!("/api/sync/replicate_audit_holds/{hold_id}/acknowledge"),
-        &json!({}),
+        &format!("/api/sync/replicate_audit_holds/{hold_id}/resolve"),
+        &json!({"mode": "ours"}),
         &fx.token,
     )
     .await;
-    assert_eq!(status, 200, "acknowledge ({status}): {body}");
-    assert_eq!(body["acknowledged"], 1);
+    assert_eq!(status, 200, "accept ours ({status}): {body}");
+    assert_eq!(body["status"], "acknowledged");
     assert_eq!(hold_status(&fx.db, &hold_id).await, "acknowledged");
 
     let resolved = list_holds(&fx, "&status=resolved").await;
@@ -409,151 +409,6 @@ async fn matching_resend_supersedes_stale_hold() {
     .await;
     assert_eq!(hold_status(&fx.db, &hold_id).await, "superseded");
     assert_eq!(readings_at(&fx, T1).await, 3);
-}
-
-#[tokio::test]
-#[serial]
-async fn hold_list_and_bulk_acknowledge() {
-    let fx = setup("audit-bulk").await;
-
-    let mut readings = group(T1, &[10.0, 20.0, 30.0]);
-    readings.extend(group(T2, &[40.0, 50.0, 60.0]));
-    ingest_audited(
-        &fx,
-        readings,
-        json!([
-            {"time": T1, "expected_mean": 99.0},
-            {"time": T2, "expected_mean": 99.0},
-        ]),
-    )
-    .await;
-
-    let holds = list_holds(&fx, "").await;
-    assert_eq!(holds["total"], 2);
-    assert_eq!(holds["pending"], 2);
-    for hold in holds["holds"].as_array().unwrap() {
-        for field in [
-            "id",
-            "stream_id",
-            "source_system",
-            "source_key",
-            "group_time",
-            "expected",
-            "computed",
-            "delta",
-            "status",
-            "classification",
-            "created_at",
-        ] {
-            assert!(!hold[field].is_null(), "hold row carries {field}: {hold}");
-        }
-        assert!(hold["acknowledged_by"].is_null());
-        assert!(hold["resolution"].is_null());
-    }
-
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &fx.app,
-        "/api/sync/replicate_audit_holds/acknowledge_bulk",
-        &json!({"stream_id": fx.stream, "start": T1, "end": T1}),
-        &fx.token,
-    )
-    .await;
-    assert_eq!(status, 200, "bulk acknowledge ({status}): {body}");
-    assert_eq!(
-        body["acknowledged"], 1,
-        "the window covers one hold: {body}"
-    );
-
-    let pending = list_holds(&fx, "&status=pending").await;
-    assert_eq!(
-        pending["total"], 1,
-        "the hold outside the window stays pending"
-    );
-    assert_eq!(
-        pending["holds"][0]["group_time"].as_str().unwrap(),
-        "2025-06-01T09:00:00Z",
-        "the remaining pending hold is the one at T2"
-    );
-    let resolved = list_holds(&fx, "&status=resolved").await;
-    assert_eq!(resolved["holds"][0]["resolution"]["action"], "accept_ours");
-}
-
-/// Scenario: one group disagrees by a hair (a systematic small offset), another wildly (a stale
-/// aggregate). Expected behaviour: bulk acknowledge with a `max_relative_delta` ceiling accepts
-/// only the small one; the large disagreement stays pending for review, and the ceiling uses the
-/// same relative_delta the list endpoint reports.
-#[tokio::test]
-#[serial]
-async fn threshold_bulk_acknowledge_takes_only_small_deltas() {
-    let fx = setup("audit-threshold").await;
-
-    let mut readings = group(T1, &[10.0, 20.0, 30.0]);
-    readings.extend(group(T2, &[40.0, 50.0, 60.0]));
-    ingest_audited(
-        &fx,
-        readings,
-        json!([
-            // Computed mean 20; off by 0.1 -> relative_delta 0.005.
-            {"time": T1, "expected_mean": 20.1},
-            // Computed mean 50; off by 25 -> relative_delta 0.5.
-            {"time": T2, "expected_mean": 75.0},
-        ]),
-    )
-    .await;
-
-    let holds = list_holds(&fx, "&status=pending").await;
-    for hold in holds["holds"].as_array().unwrap() {
-        let rel = hold["relative_delta"].as_f64().unwrap();
-        let mean_rel = hold["mean_relative_delta"].as_f64().unwrap();
-        let sd_rel = hold["sd_relative_delta"].as_f64().unwrap();
-        assert!(
-            sd_rel.abs() < 1e-12,
-            "no sd was audited, so its delta is zero: {sd_rel}"
-        );
-        assert!(
-            (rel - mean_rel).abs() < 1e-12,
-            "the overall is the greater of the two: {rel} vs {mean_rel}"
-        );
-        match hold["group_time"].as_str().unwrap() {
-            "2025-06-01T08:00:00Z" => assert!((rel - 0.1 / 20.1).abs() < 1e-6, "T1 rel: {rel}"),
-            "2025-06-01T09:00:00Z" => assert!((rel - 1.0 / 3.0).abs() < 1e-6, "T2 rel: {rel}"),
-            other => panic!("unexpected hold at {other}"),
-        }
-    }
-
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &fx.app,
-        "/api/sync/replicate_audit_holds/acknowledge_bulk",
-        &json!({"stream_id": fx.stream, "max_relative_delta": 0.01}),
-        &fx.token,
-    )
-    .await;
-    assert_eq!(status, 200, "threshold bulk acknowledge ({status}): {body}");
-    assert_eq!(body["acknowledged"], 1, "only the small delta: {body}");
-
-    let pending = list_holds(&fx, "&status=pending").await;
-    assert_eq!(pending["total"], 1);
-    assert_eq!(
-        pending["holds"][0]["group_time"].as_str().unwrap(),
-        "2025-06-01T09:00:00Z",
-        "the large disagreement stays pending"
-    );
-
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &fx.app,
-        "/api/sync/replicate_audit_holds/acknowledge_bulk",
-        &json!({"source_system": "auditsrc", "max_relative_delta": 1.0}),
-        &fx.token,
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "source-wide bulk acknowledge ({status}): {body}"
-    );
-    assert_eq!(
-        body["acknowledged"], 1,
-        "the large one under a high ceiling: {body}"
-    );
 }
 
 /// The portals round aggregate cells to 2 decimals before storing, so an expected mean that is
@@ -1115,14 +970,24 @@ async fn the_acting_identity_comes_from_auth_and_is_recorded_on_the_resolution()
     .await;
     let hold_id = pending_hold_id(&fx).await;
 
-    let (status, body) = crate::common::post_json_parse_with_token(
+    // A request naming its own actor is refused outright rather than ignored.
+    let (status, body) = crate::common::post_json_with_token(
         &fx.app,
-        &format!("/api/sync/replicate_audit_holds/{hold_id}/acknowledge"),
-        &json!({"acknowledged_by": "mallory"}),
+        &format!("/api/sync/replicate_audit_holds/{hold_id}/resolve"),
+        &json!({"mode": "ours", "acknowledged_by": "mallory"}),
         &fx.token,
     )
     .await;
-    assert_eq!(status, 200, "acknowledge ({status}): {body}");
+    assert_eq!(status, 422, "a caller-named actor ({status}): {body}");
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        &format!("/api/sync/replicate_audit_holds/{hold_id}/resolve"),
+        &json!({"mode": "ours"}),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "accept ours ({status}): {body}");
 
     let resolved = list_holds(&fx, "&status=resolved").await;
     let hold = &resolved["holds"][0];
@@ -1245,7 +1110,7 @@ async fn hold_review_is_confined_to_the_callers_projects() {
     assert_eq!(body["pending"], 0, "{body}");
 
     for path in [
-        format!("/api/sync/replicate_audit_holds/{hold_id}/acknowledge"),
+        format!("/api/sync/replicate_audit_holds/{hold_id}/release_brake"),
         format!("/api/sync/replicate_audit_holds/{hold_id}/resolve"),
         format!("/api/sync/replicate_audit_holds/{hold_id}/reopen"),
     ] {
@@ -1253,18 +1118,6 @@ async fn hold_review_is_confined_to_the_callers_projects() {
             crate::common::post_json_with_token(&app, &path, &json!({"mode": "ours"}), &jwt).await;
         assert_eq!(status, 403, "{path} ({status}): {body}");
     }
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/sync/replicate_audit_holds/acknowledge_bulk",
-        &json!({"stream_id": stream}),
-        &jwt,
-    )
-    .await;
-    assert_eq!(status, 200, "bulk acknowledge ({status}): {body}");
-    assert_eq!(
-        body["acknowledged"], 0,
-        "bulk acknowledge cannot reach the other project's holds: {body}"
-    );
 
     // Granted the hold's own project, the same manager sees and resolves it. The grant is read
     // through the grants cache, so drop what it holds rather than waiting out its TTL.
@@ -1365,43 +1218,6 @@ async fn the_sql_signature_and_classify_agree() {
         all["total"].as_i64().unwrap(),
         "and together they account for every hold: {all}"
     );
-}
-
-/// Scenario: a bulk accept over two instants.
-///
-/// Expected behaviour: every accepted instant gets its own audit annotation so a sweep is as
-/// visible on the charts as a single decision.
-#[tokio::test]
-#[serial]
-async fn a_bulk_accept_annotates_every_instant_it_decides() {
-    let fx = setup("bulkann").await;
-
-    for t in [T1, T2] {
-        ingest_audited(
-            &fx,
-            group(t, &[10.0, 12.0, 14.0]),
-            json!([{"time": t, "expected_mean": 40.0, "expected_sd": 2.0, "expected_n": 3}]),
-        )
-        .await;
-    }
-    assert_eq!(list_holds(&fx, "").await["total"], 2);
-
-    let (status, body) = crate::common::post_json_parse_with_token(
-        &fx.app,
-        "/api/sync/replicate_audit_holds/acknowledge_bulk",
-        &json!({"stream_id": fx.stream}),
-        &fx.token,
-    )
-    .await;
-    assert_eq!(status, 200, "bulk ({status}): {body}");
-    assert_eq!(body["acknowledged"], 2, "{body}");
-
-    let annotations = count(
-        &fx.db,
-        "SELECT COUNT(*) FROM annotations WHERE category = 'audit' AND audit_hold_id IS NOT NULL",
-    )
-    .await;
-    assert_eq!(annotations, 2, "one note per instant the sweep decided");
 }
 
 /// Scenario: a reviewer working a stale-subset hold wants to know, before flagging, whether

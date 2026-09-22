@@ -833,10 +833,12 @@ fn table() -> Table {
         Scope::DenyScopedToken,
         &[
             ("GET", "/api/sync/replicate_audit_holds"),
-            ("POST", "/api/sync/replicate_audit_holds/{id}/acknowledge"),
+            ("POST", "/api/sync/replicate_audit_holds/{id}/release_brake"),
+            ("POST", "/api/sync/replicate_audit_holds/{id}/dismiss_finding"),
+            ("POST", "/api/sync/replicate_audit_holds/{id}/accept_identity"),
+            ("POST", "/api/sync/replicate_audit_holds/{id}/accept_correction"),
             ("POST", "/api/sync/replicate_audit_holds/{id}/resolve"),
             ("POST", "/api/sync/replicate_audit_holds/{id}/reopen"),
-            ("POST", "/api/sync/replicate_audit_holds/acknowledge_bulk"),
             ("POST", "/api/sync/change_proposals/decide"),
         ],
     );

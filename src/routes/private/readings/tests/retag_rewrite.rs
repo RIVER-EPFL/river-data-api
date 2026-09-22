@@ -45,6 +45,36 @@ fn test_retag_scope_matches_by_stream_ownership_too() {
     );
 }
 
+/// Scenario: the retag reads the span it is about to write before writing it (B392).
+/// Expected behaviour: the query of the rows carries the same scope and the same IS DISTINCT FROM
+/// comparison as the write, and joins `data_streams` only on the arm that reads it, so the two
+/// cannot drift into naming different rows.
+#[test]
+fn test_the_span_query_selects_the_rows_the_retag_writes() {
+    let ids = vec![Uuid::nil()];
+
+    let (write, rows) = retag_readings(Some("spot"), &ids, &ids, Some("cnet")).as_sql();
+    assert!(rows.starts_with(r#"SELECT "time" FROM "readings""#), "{rows}");
+    assert!(!rows.contains(r#"FROM "readings", "data_streams""#), "{rows}");
+    for predicate in [
+        r#""readings"."measurement_type" IS DISTINCT FROM 'spot'"#,
+        r#""readings"."sensor_id" IN"#,
+        r#""readings"."stream_id" IN"#,
+    ] {
+        assert!(write.contains(predicate), "{write}");
+        assert!(rows.contains(predicate), "{rows}");
+    }
+
+    let (_, declared) = retag_readings(None, &ids, &ids, None).as_sql();
+    assert!(declared.contains(r#""data_streams""#), "{declared}");
+    assert!(
+        declared.contains(
+            r#""readings"."measurement_type" IS DISTINCT FROM "data_streams"."measurement_type""#
+        ),
+        "{declared}"
+    );
+}
+
 /// The source system is optional, and an absent one adds no arm rather than a NULL comparison.
 #[test]
 fn test_retag_scope_leaves_out_an_absent_source_system() {
@@ -57,6 +87,7 @@ fn test_retag_scope_leaves_out_an_absent_source_system() {
     );
 }
 
-fn build_update(update: &sea_query::UpdateStatement) -> String {
-    update.to_string(sea_query::PostgresQueryBuilder)
+/// The write's own SQL. The span query beside it is asserted on separately.
+fn build_update(spanned: &crate::common::bulk_write::Spanned) -> String {
+    spanned.as_sql().0
 }

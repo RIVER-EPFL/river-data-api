@@ -2443,65 +2443,6 @@
         ],
         "description": "Wrapper type for batch update request items.\nEach item contains an `id` field and the update fields flattened into the same object."
       },
-      "BulkAcknowledgeRequest": {
-        "properties": {
-          "end": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "max_mean_relative_delta": {
-            "description": "Ceiling on `mean_relative_delta`. ANDs with the other ceilings.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "max_relative_delta": {
-            "description": "Only acknowledge holds whose `relative_delta` (as reported by the list endpoint) is at or\nbelow this. The knob behind \"accept everything under N%\": systematic small offsets are\nwaved through in one action while the large disagreements stay pending for review.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "max_sd_relative_delta": {
-            "description": "Ceiling on `sd_relative_delta`. ANDs with the other ceilings.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "source_system": {
-            "description": "All of one source's streams, e.g. \"cnet\".",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "start": {
-            "description": "Restrict to holds whose group_time falls in [start, end]; omit either to leave it open.",
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "stream_id": {
-            "description": "One stream, or omit to scope by source_system (or, with both omitted, every pending hold).",
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "type": "object"
-      },
       "BulkAction": {
         "additionalProperties": false,
         "properties": {
@@ -14350,6 +14291,17 @@
               "null"
             ]
           },
+          "parameter_attach": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanParamAttach",
+                "description": "Which catalog parameter this column is, decided rather than matched: `{\"choice\":\"existing\",\n\"id\":...}` attaches to that row, `{\"choice\":\"new\"}` creates one under the entry's code. A\n`parameter_name` sent without it records `new`, so typing a code that happens to exist does\nnot attach to it (Q221)."
+              }
+            ]
+          },
           "parameter_label": {
             "description": "Human display label for the parameter. Takes effect only when apply creates the\nparameter (`create: true`); a matched existing parameter keeps its own name.",
             "type": [
@@ -14501,6 +14453,16 @@
               "null"
             ]
           },
+          "skipped": {
+            "description": "The review left this curve behind: it is not stored and the readings naming it are dropped\nat the source. A skipped curve no longer blocks the apply.",
+            "type": "boolean"
+          },
+          "skipped_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "slope": {
             "format": "double",
             "type": "number"
@@ -14518,7 +14480,9 @@
           "intercept",
           "r_squared",
           "fitted_on",
-          "attached"
+          "attached",
+          "skipped",
+          "skipped_by"
         ],
         "type": "object"
       },
@@ -14574,6 +14538,13 @@
           "proposal_id": {
             "format": "uuid",
             "type": "string"
+          },
+          "skip": {
+            "description": "Leave the curve behind instead of attaching it: it is never stored and the source stops\nsending the readings that name it. `Some(false)` takes the skip back (Q220).",
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
         "required": [
@@ -14617,6 +14588,13 @@
               "null"
             ]
           },
+          "label_candidates": {
+            "description": "The instruments the curve label matched when it matched more than one. The row is then a\nchoice between them rather than a suggestion.",
+            "items": {
+              "$ref": "#/components/schemas/PlanLabelCandidate"
+            },
+            "type": "array"
+          },
           "name": {
             "type": "string"
           },
@@ -14638,7 +14616,7 @@
             ]
           },
           "resolved_by": {
-            "description": "`stream` | `curve_label` | `manual` | `placeholder`.",
+            "description": "`stream` | `curve_label` (suggested from the label) | `manual` | `ambiguous_label` (the\nlabel matched more than one, so nothing is suggested) | `placeholder`.",
             "type": "string"
           },
           "scope": {
@@ -14679,7 +14657,8 @@
           "site_count",
           "anchor_stream_id",
           "curves",
-          "proposed_name"
+          "proposed_name",
+          "label_candidates"
         ],
         "type": "object"
       },
@@ -14804,6 +14783,13 @@
               "null"
             ]
           },
+          "label_candidates": {
+            "description": "The instruments a curve label matched when it matched more than one. Which analyser the\nsource meant is not in the label, so the tie is named and nothing is suggested (Q195).",
+            "items": {
+              "$ref": "#/components/schemas/PlanLabelCandidate"
+            },
+            "type": "array"
+          },
           "name": {
             "type": "string"
           },
@@ -14819,7 +14805,7 @@
             ]
           },
           "resolved_by": {
-            "description": "`stream` (already attributed), `curve_label` (matched against the source's own curve\nlabels), `manual` (repointed in the review), or `placeholder` (nothing matched).",
+            "description": "`stream` (already attributed), `curve_label` (suggested from the source's own curve\nlabels), `manual` (repointed in the review), `ambiguous_label` (the label matched more than\none, so nothing is suggested), or `placeholder` (nothing matched).",
             "type": "string"
           },
           "source_key": {
@@ -14841,7 +14827,8 @@
           "defaulted",
           "confirmed",
           "stamps_readings",
-          "curves"
+          "curves",
+          "label_candidates"
         ],
         "type": "object"
       },
@@ -14908,6 +14895,23 @@
         ],
         "type": "object"
       },
+      "PlanLabelCandidate": {
+        "description": "One instrument a curve label matched, enough of it to choose by.",
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "type": "object"
+      },
       "PlanObjectUpdate": {
         "additionalProperties": false,
         "properties": {
@@ -14924,8 +14928,59 @@
         ],
         "type": "object"
       },
+      "PlanParamAttach": {
+        "description": "The review's answer to \"which catalog parameter is this column\": one that exists, or a new one\nunder the code the entry carries. One field rather than an id beside a flag, so \"attached to\nnothing in particular\" cannot be written down.",
+        "oneOf": [
+          {
+            "description": "Attach every entry of this group to the catalog parameter with this id.",
+            "properties": {
+              "choice": {
+                "enum": [
+                  "existing"
+                ],
+                "type": "string"
+              },
+              "id": {
+                "format": "uuid",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "choice"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Create a parameter under the entry's own code.",
+            "properties": {
+              "choice": {
+                "enum": [
+                  "new"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "choice"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "PlanParamRef": {
         "properties": {
+          "attach": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanParamAttach",
+                "description": "What the review decided this parameter is, kept on the plan so it survives a reload. Absent\nwhere nobody has decided and the source's own name is still matched against the catalog as a\nproposal; a code somebody typed attaches to nothing on its own (Q221)."
+              }
+            ]
+          },
           "calculation": {
             "oneOf": [
               {
@@ -14992,7 +15047,8 @@
           "units",
           "group",
           "calculation",
-          "original_names"
+          "original_names",
+          "attach"
         ],
         "type": "object"
       },
@@ -15396,7 +15452,7 @@
             ]
           },
           "kind": {
-            "description": "`units_mismatch` | `empty_name` | `near_duplicate`.",
+            "description": "`units_mismatch` | `empty_name` | `near_duplicate` | `code_conflict`.",
             "type": "string"
           },
           "message": {
@@ -17663,6 +17719,10 @@
               "null"
             ]
           },
+          "skipped": {
+            "description": "True when the review left this curve behind. It is never stored, and the source is to stop\nsending the readings that name it (Q220).",
+            "type": "boolean"
+          },
           "superseded": {
             "description": "True when the stored coefficients differed and the curve was already applied to readings,\nso a new row was minted under this provenance. History keeps the old row.",
             "type": "boolean"
@@ -17672,7 +17732,8 @@
           "id",
           "sensor_id",
           "superseded",
-          "proposed"
+          "proposed",
+          "skipped"
         ],
         "type": "object"
       },
@@ -22526,13 +22587,6 @@
       },
       "SiteParameterCreate": {
         "properties": {
-          "channel_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "decimal_places": {
             "format": "int32",
             "type": [
@@ -22634,13 +22688,6 @@
       },
       "SiteParameterList": {
         "properties": {
-          "channel_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "created_at": {
             "format": "date-time",
             "type": [
@@ -22775,7 +22822,6 @@
           "units_min",
           "units_max",
           "decimal_places",
-          "channel_id",
           "sample_interval_sec",
           "is_active",
           "is_public",
@@ -22792,13 +22838,6 @@
       },
       "SiteParameterResponse": {
         "properties": {
-          "channel_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "created_at": {
             "format": "date-time",
             "type": [
@@ -22933,7 +22972,6 @@
           "units_min",
           "units_max",
           "decimal_places",
-          "channel_id",
           "sample_interval_sec",
           "is_active",
           "is_public",
@@ -22950,13 +22988,6 @@
       },
       "SiteParameterUpdate": {
         "properties": {
-          "channel_id": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "decimal_places": {
             "format": "int32",
             "type": [
@@ -23981,6 +24012,13 @@
           "name": {
             "type": "string"
           },
+          "publishes": {
+            "description": "Whether the station publishes the variable the picker asked about, absent where it named\nnone. A station this is false for cannot be subscribed to for that variable.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "station_abbr": {
             "type": "string"
           }
@@ -23993,7 +24031,8 @@
           "height_barometer_masl",
           "latitude",
           "longitude",
-          "distance_km"
+          "distance_km",
+          "publishes"
         ],
         "type": "object"
       },
@@ -33341,6 +33380,18 @@
             "required": false,
             "schema": {
               "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "The variable being subscribed to, which says of each candidate whether it publishes one.",
+            "in": "query",
+            "name": "variable",
+            "required": false,
+            "schema": {
               "type": [
                 "string",
                 "null"
@@ -47843,40 +47894,9 @@
         ]
       }
     },
-    "/api/sync/replicate_audit_holds/acknowledge_bulk": {
+    "/api/sync/replicate_audit_holds/{id}/accept_correction": {
       "post": {
-        "operationId": "acknowledge_holds_bulk",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/BulkAcknowledgeRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AcknowledgeResponse"
-                }
-              }
-            },
-            "description": ""
-          }
-        },
-        "summary": "Acknowledge pending holds in bulk: one stream or a whole source, optionally bounded by a time\nwindow and by a `relative_delta` ceiling, for systematic offsets that would otherwise take one\nacknowledgement per instant.",
-        "tags": [
-          "sync"
-        ]
-      }
-    },
-    "/api/sync/replicate_audit_holds/{id}/acknowledge": {
-      "post": {
-        "operationId": "acknowledge_hold",
+        "operationId": "accept_correction",
         "parameters": [
           {
             "in": "path",
@@ -47899,11 +47919,128 @@
             },
             "description": ""
           },
+          "400": {
+            "description": "The hold is not a source correction"
+          },
           "404": {
             "description": "No pending hold with this id"
           }
         },
-        "summary": "Acknowledge one pending hold: the operator confirms the statistics recomputed from the stored\nreplicates. Terminal; re-detection of the same disagreement leaves the decision standing.\nThe acting identity is taken from the caller's authentication, never from the request.",
+        "summary": "Mark a source correction reviewed: it has already applied, and the curation on the affected\nreading stands as it is.",
+        "tags": [
+          "sync"
+        ]
+      }
+    },
+    "/api/sync/replicate_audit_holds/{id}/accept_identity": {
+      "post": {
+        "operationId": "accept_identity",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcknowledgeResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "The hold is not an identity change"
+          },
+          "404": {
+            "description": "No pending hold with this id"
+          }
+        },
+        "summary": "Accept the instrument identity the source reports, against the one on record.",
+        "tags": [
+          "sync"
+        ]
+      }
+    },
+    "/api/sync/replicate_audit_holds/{id}/dismiss_finding": {
+      "post": {
+        "operationId": "dismiss_finding",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcknowledgeResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "The hold is not a calculation finding"
+          },
+          "404": {
+            "description": "No pending hold with this id"
+          }
+        },
+        "summary": "Dismiss a calculation finding: the audit reported a missing, stale or skipped output here and\na person rules that no recomputation is owed.",
+        "tags": [
+          "sync"
+        ]
+      }
+    },
+    "/api/sync/replicate_audit_holds/{id}/release_brake": {
+      "post": {
+        "operationId": "release_brake",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcknowledgeResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "The hold is not a fired brake"
+          },
+          "404": {
+            "description": "No pending hold with this id"
+          }
+        },
+        "summary": "Admit the reconciliation pass the brake is holding on this stream. Exactly one braked-scale\npass applies on the next sync cycle; a later reshape brakes afresh.",
         "tags": [
           "sync"
         ]

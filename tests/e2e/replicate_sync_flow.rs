@@ -286,8 +286,8 @@ async fn replicate_sync_full_flow() {
 
     let (status, body) = crate::common::post_json_with_token(
         &app,
-        &format!("/api/sync/replicate_audit_holds/{hold_id}/acknowledge"),
-        &json!({}),
+        &format!("/api/sync/replicate_audit_holds/{hold_id}/resolve"),
+        &json!({"mode": "ours"}),
         &token,
     )
     .await;

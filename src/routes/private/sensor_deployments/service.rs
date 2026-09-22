@@ -331,17 +331,21 @@ impl CRUDOperations for SensorDeploymentOperations {
         // be excluded by metadata: the clear goes through the guarded writer, which lifts the
         // decompression cap it would otherwise hit on a sensor with historical readings.
         use sea_orm::sea_query::ExprTrait;
-        crate::common::bulk_write::guarded_mutation(
-            db,
-            sea_orm::sea_query::Query::update()
-                .table(readings::Entity)
-                .value(
-                    readings::Column::DeploymentId,
-                    Expr::value(Option::<Uuid>::None),
-                )
-                .and_where(Expr::col(readings::Column::DeploymentId).eq(Expr::value(id)))
-                .to_owned(),
-        )
+        crate::common::bulk_write::guarded(db, async |txn| {
+            crate::common::bulk_write::mutation_rows(
+                txn,
+                sea_orm::sea_query::Query::update()
+                    .table(readings::Entity)
+                    .value(
+                        readings::Column::DeploymentId,
+                        Expr::value(Option::<Uuid>::None),
+                    )
+                    .and_where(Expr::col(readings::Column::DeploymentId).eq(Expr::value(id)))
+                    .to_owned(),
+            )
+            .await?;
+            Ok(())
+        })
         .await
         .map_err(|e| {
             ApiError::internal(

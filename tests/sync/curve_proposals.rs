@@ -7,8 +7,9 @@
 //! (Q195). A curve names one instrument (`standard_curves.sensor_id` is NOT NULL).
 //!
 //! Expected behaviour: registering a curve creates neither the curve nor an instrument and holds it
-//! for the plan; the plan attaches it to one of its instruments; the apply creates the curve under
-//! that instrument, and refuses while a held curve is attached to none.
+//! for the plan; the plan attaches it to one of its instruments, or skips it (Q220); the apply
+//! creates the curve under that instrument, and refuses while a held curve is neither attached nor
+//! skipped.
 //!
 //! Run: cargo test --test sync curve_proposals -- --test-threads=1
 
@@ -323,4 +324,146 @@ async fn a_sync_service_cannot_declare_the_instrument_a_stream_reports() {
     )
     .await;
     assert_eq!(status, 403, "the plan decides a feed's instrument: {body}");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_skipped_curve_is_never_stored_and_stops_blocking_the_apply() {
+    let f = crate::common::seeded_app().await;
+    seed_stream(&f.db).await;
+    register_curve(&f.app, &f.token, 2.0).await;
+    let plan_id = create_plan(&f.app, &f.token).await;
+    let instruments = plan_instruments(&f.app, &f.token, &plan_id).await;
+    let proposal_id = instruments["held_curves"][0]["id"].clone();
+
+    let (status, plan) = crate::common::get_json_with_token(
+        &f.app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &f.token,
+    )
+    .await;
+    assert_eq!(status, 200, "{plan}");
+    let (status, patched) = crate::common::patch_json_parse_with_token(
+        &f.app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &json!({
+            "expected_version": plan["version"],
+            "updates": [],
+            "held_curves": [{ "proposal_id": proposal_id, "skip": true }],
+        }),
+        &f.token,
+    )
+    .await;
+    assert_eq!(status, 200, "skip the held curve: {patched}");
+
+    let instruments = plan_instruments(&f.app, &f.token, &plan_id).await;
+    assert_eq!(
+        instruments["held_curves"][0]["skipped"],
+        json!(true),
+        "the plan shows the curve as left behind: {instruments}"
+    );
+    assert_eq!(
+        instruments["held_curves"][0]["attached"],
+        json!(null),
+        "and attached to nothing: {instruments}"
+    );
+
+    crate::common::plans::acknowledge_plan(&f.app, &f.token, &plan_id).await;
+    let (status, text) =
+        crate::common::post_plan_action_with_token(&f.app, &plan_id, "apply", &f.token).await;
+    assert!(
+        (200..300).contains(&status),
+        "a skipped curve does not block the apply ({status}): {text}"
+    );
+    assert_eq!(
+        crate::common::jobs::wait_for_job(&f.db, &job_id_of(&text)).await,
+        "completed"
+    );
+    assert_eq!(
+        count(
+            &f.db,
+            &format!("standard_curves WHERE source_system = '{SOURCE}'")
+        )
+        .await,
+        0,
+        "a skipped curve is not stored"
+    );
+
+    // The source keeps offering it, and the answer tells it to stop sending the readings that
+    // name it.
+    let body = register_curve(&f.app, &f.token, 2.0).await;
+    assert_eq!(body["proposed"], json!(true), "{body}");
+    assert_eq!(body["skipped"], json!(true), "{body}");
+    assert_eq!(body["id"], json!(null), "still nothing stored: {body}");
+}
+
+#[tokio::test]
+#[serial]
+async fn attaching_a_skipped_curve_takes_the_skip_back() {
+    let f = crate::common::seeded_app().await;
+    seed_stream(&f.db).await;
+    register_curve(&f.app, &f.token, 2.0).await;
+    let plan_id = create_plan(&f.app, &f.token).await;
+    let instruments = plan_instruments(&f.app, &f.token, &plan_id).await;
+    let proposal_id = instruments["held_curves"][0]["id"].clone();
+
+    let (status, plan) = crate::common::get_json_with_token(
+        &f.app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &f.token,
+    )
+    .await;
+    assert_eq!(status, 200, "{plan}");
+    let instrument_key = plan["entries"][0]["instrument"]["source_key"].clone();
+    let (status, patched) = crate::common::patch_json_parse_with_token(
+        &f.app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &json!({
+            "expected_version": plan["version"],
+            "updates": [],
+            "held_curves": [
+                { "proposal_id": proposal_id, "skip": true },
+                { "proposal_id": proposal_id, "instrument_source_key": instrument_key },
+            ],
+        }),
+        &f.token,
+    )
+    .await;
+    assert_eq!(status, 200, "skip then attach: {patched}");
+
+    let instruments = plan_instruments(&f.app, &f.token, &plan_id).await;
+    assert_eq!(
+        instruments["held_curves"][0]["skipped"],
+        json!(false),
+        "attaching a curve is the opposite of leaving it behind: {instruments}"
+    );
+    assert_eq!(
+        instruments["held_curves"][0]["attached"]["instrument_source_key"], instrument_key,
+        "{instruments}"
+    );
+
+    // The two decisions are exclusive in one update too.
+    let (status, plan) = crate::common::get_json_with_token(
+        &f.app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &f.token,
+    )
+    .await;
+    assert_eq!(status, 200, "{plan}");
+    let (status, refused) = crate::common::patch_json_with_token(
+        &f.app,
+        &format!("/api/sync/pairing-plans/{plan_id}"),
+        &json!({
+            "expected_version": plan["version"],
+            "updates": [],
+            "held_curves": [{
+                "proposal_id": proposal_id,
+                "instrument_source_key": instrument_key,
+                "skip": true,
+            }],
+        }),
+        &f.token,
+    )
+    .await;
+    assert_eq!(status, 400, "skipped or attached, not both: {refused}");
 }

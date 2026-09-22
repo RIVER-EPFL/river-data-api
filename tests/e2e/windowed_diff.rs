@@ -582,7 +582,7 @@ async fn a_bulk_reshape_is_braked_and_new_rows_still_apply() {
         .unwrap();
     let (status, body) = crate::common::post_json_with_token(
         &fx.app,
-        &format!("/api/sync/replicate_audit_holds/{hold_id}/acknowledge"),
+        &format!("/api/sync/replicate_audit_holds/{hold_id}/release_brake"),
         &json!({}),
         &fx.token,
     )

@@ -8,7 +8,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::models::StationCandidate;
-use super::service::{rank_stations, search_stations, site_origin};
+use super::service::{rank_stations, search_stations, site_origin, variable};
 use crate::common::AppState;
 use crate::error::AppResult;
 
@@ -18,6 +18,8 @@ pub struct StationQuery {
     pub q: Option<String>,
     /// The site being configured, whose coordinates rank the candidates.
     pub site_id: Option<Uuid>,
+    /// The variable being subscribed to, which says of each candidate whether it publishes one.
+    pub variable: Option<String>,
 }
 
 /// The stations a site may subscribe to, nearest first. Requires `read_metadata`.
@@ -37,5 +39,6 @@ pub async fn list_stations(
         Some(site_id) => site_origin(&state.db, site_id).await?,
         None => None,
     };
-    Ok(Json(rank_stations(matching, origin)))
+    let declared = q.variable.as_deref().and_then(variable);
+    Ok(Json(rank_stations(matching, origin, declared)))
 }

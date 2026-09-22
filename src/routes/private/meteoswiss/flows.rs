@@ -8,8 +8,9 @@ use std::collections::BTreeMap;
 
 use super::models::{Fetched, Point, Subscriber};
 use super::service::{
-    advance_cursor, archive_hrefs, cursor, fetch, insert, instrument, latest, provision,
-    recent_url, series, stac_item_url, stations, stations_url, store_stations, subscribers,
+    advance_cursor, archive_hrefs, cursor, fetch, insert, instrument, latest, nothing_published,
+    provision, recent_url, series, stac_item_url, stations, stations_url, store_stations,
+    subscribers,
 };
 use crate::config::Config;
 use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport, Schedule};
@@ -249,6 +250,12 @@ impl Job for MeteoswissSync {
                 };
                 let Some(point) = reported.get(&station) else {
                     absent += 1;
+                    ctx.log(
+                        "warn",
+                        "A MeteoSwiss station carries no value for the interval",
+                        serde_json::json!({ "station": station, "variable": variable }),
+                    )
+                    .await;
                     continue;
                 };
                 for site in sites {
@@ -532,6 +539,11 @@ impl Job for MeteoswissBackfill {
                 .count("unreadable_rows", unreadable),
         )
         .await;
+        if let Some(said) =
+            nothing_published(&station, &variable, archives_read, blank, landed.inserted)
+        {
+            return Err(DbErr::Custom(said));
+        }
         Ok(i64::try_from(landed.inserted).unwrap_or(i64::MAX))
     }
 }

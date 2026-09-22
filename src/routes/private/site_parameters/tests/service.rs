@@ -17,7 +17,6 @@ fn slot() -> SiteParameterModel {
         units_min: None,
         units_max: None,
         decimal_places: None,
-        channel_id: None,
         sample_interval_sec: None,
         is_active: Some(true),
         is_public: Some(false),
