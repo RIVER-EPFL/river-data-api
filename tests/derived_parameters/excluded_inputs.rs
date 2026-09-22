@@ -82,7 +82,6 @@ async fn define_assign_recompute(
         (200..300).contains(&status),
         "create derived ({status}): {def_json}"
     );
-    let def_id = def_json["id"].as_str().expect("def id").to_string();
     let output_parameter_id = def_json["output_parameter_id"]
         .as_str()
         .expect("output parameter id")
@@ -107,7 +106,7 @@ async fn define_assign_recompute(
         "assign site_parameter ({status}): {text}"
     );
 
-    let uri = format!("/api/actions/derived_parameters/{def_id}/recompute");
+    let uri = format!("/api/actions/derived_parameters/{calculation}/recompute");
     let (status, text) =
         crate::common::post_json_with_token(app, &uri, &serde_json::json!({}), token).await;
     assert!((200..300).contains(&status), "recompute ({status}): {text}");

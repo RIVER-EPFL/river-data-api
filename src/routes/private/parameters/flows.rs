@@ -34,6 +34,14 @@ impl Job for MergeParameters {
         )
         .await
         .map_err(|e| DbErr::Custom(e.to_string()))?;
+        ctx.info(&format!(
+            "Merged {} slots and reassigned {}, moving {} readings and {} streams onto the survivor",
+            result.sites_merged,
+            result.sites_reassigned,
+            result.readings_moved,
+            result.streams_updated
+        ))
+        .await;
         ctx.report(
             JobReport::new()
                 .scope("source_deleted", result.source_deleted)

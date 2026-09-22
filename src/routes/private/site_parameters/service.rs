@@ -200,7 +200,7 @@ impl CRUDOperations for SiteParameterOperations {
 
         // Backfill derived values for the readings already present at this site when a
         // derived site_parameter is assigned. Enqueued as a durable `derived_assignment` job on
-        // the claim-based worker pool. The guard skips the enqueue only when this definition's
+        // the claim-based worker pool. The guard skips the enqueue only when this calculation's
         // own assignment or recompute is already in flight. An import or pairing backfill at any
         // site is not an overlap: rows it lands after this point reach the new slot through its
         // own derived cascade, and rows already present are this job's to compute.
@@ -209,7 +209,7 @@ impl CRUDOperations for SiteParameterOperations {
         // when the worker claims the row, so it coalesces only while a job is queued, and the
         // skip has to hold while one is running too.
         if entity.entry_mode == "tool"
-            && let Some(def_id) = definition_producing(db, entity.parameter_id).await?
+            && let Some(calculation_id) = calculation_producing(db, entity.parameter_id).await?
         {
             let site_id = entity.site_id;
 
@@ -222,7 +222,7 @@ impl CRUDOperations for SiteParameterOperations {
                     reprocessing_jobs::Column::TriggerType
                         .is_in(["derived_assignment", "derived_recompute"]),
                 )
-                .filter(reprocessing_jobs::Column::TriggerId.eq(def_id))
+                .filter(reprocessing_jobs::Column::TriggerId.eq(calculation_id))
                 .select_only()
                 .column(reprocessing_jobs::Column::Id)
                 .into_tuple::<Uuid>()
@@ -232,16 +232,16 @@ impl CRUDOperations for SiteParameterOperations {
 
             if in_flight.is_some() {
                 tracing::info!(
-                    %def_id, %site_id,
-                    "Skipping derived assignment backfill: this definition's backfill is already in flight"
+                    %calculation_id, %site_id,
+                    "Skipping derived assignment backfill: this calculation's backfill is already in flight"
                 );
             } else {
                 crate::routes::private::reprocessing_jobs::service::enqueue(
                     db,
                     "derived_assignment",
                     None,
-                    Some(def_id),
-                    &serde_json::json!({ "derived_definition_id": def_id, "site_id": site_id }),
+                    Some(calculation_id),
+                    &serde_json::json!({ "calculation_id": calculation_id, "site_id": site_id }),
                     None,
                 )
                 .await
@@ -274,21 +274,23 @@ impl CRUDOperations for SiteParameterOperations {
     }
 }
 
-/// The definition that produces a parameter, if one does. A calculation names the parameter it
+/// The calculation that produces a parameter, if one does. A formula names the parameter it
 /// outputs, and an output has exactly one producer (`idx_derived_definitions_output_parameter`),
-/// so the slot needs no reference of its own.
-async fn definition_producing<C: ConnectionTrait>(
+/// so the slot needs no reference of its own. `None` for a formula that belongs to no
+/// calculation, which computes nothing on its own.
+async fn calculation_producing<C: ConnectionTrait>(
     db: &C,
     parameter_id: Uuid,
 ) -> Result<Option<Uuid>, ApiError> {
-    calculation_formulas::Entity::find()
+    Ok(calculation_formulas::Entity::find()
         .filter(calculation_formulas::Column::OutputParameterId.eq(parameter_id))
         .select_only()
-        .column(calculation_formulas::Column::Id)
-        .into_tuple::<Uuid>()
+        .column(calculation_formulas::Column::ToolScriptId)
+        .into_tuple::<Option<Uuid>>()
         .one(db)
         .await
-        .map_err(ApiError::database)
+        .map_err(ApiError::database)?
+        .flatten())
 }
 
 /// The cadence a site declares for one catalog parameter, or `None` where it holds no slot for

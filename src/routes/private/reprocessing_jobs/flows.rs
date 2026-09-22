@@ -96,6 +96,20 @@ impl SlotOutcome {
         self.succeeded == 0 && !self.failed.is_empty()
     }
 
+    /// The closing line a walk writes: what it moved, over how many of the things it walked, and
+    /// how many it could not. `noun` is the plural of what was walked, "slots" or "instruments".
+    #[must_use]
+    pub fn line(&self, noun: &str) -> String {
+        let mut line = format!(
+            "Moved {} readings across {} {noun}",
+            self.readings, self.succeeded
+        );
+        if !self.failed.is_empty() {
+            line.push_str(&format!(", {} failed", self.failed.len()));
+        }
+        line
+    }
+
     /// One timeline line per failed slot, then the counts and the failed set on the report.
     pub(crate) async fn record(&self, ctx: &JobContext, report: JobReport) -> JobReport {
         for (slot, error) in &self.failed {
@@ -196,7 +210,8 @@ impl Job for RefreshAggregates {
         )
         .await;
         match outcome {
-            Ok(Ok(())) => {
+            Ok(Ok(report)) => {
+                ctx.info(&report.line()).await;
                 ctx.report(JobReport::new().scope("window", format!("{window:?}")))
                     .await;
                 Ok(0)
@@ -357,14 +372,18 @@ impl Job for JanitorRun {
                     serde_json::json!({}),
                 )
                 .await;
-                if let Some((lo, hi)) = drift.span
-                    && let Err(e) = crate::common::aggregates::refresh(
+                if let Some((lo, hi)) = drift.span {
+                    match crate::common::aggregates::refresh(
                         db,
                         crate::common::aggregates::Window::Range(lo, hi),
                     )
                     .await
-                {
-                    tracing::warn!(error = %e, "Janitor: refresh after curve drift failed");
+                    {
+                        Ok(report) => ctx.info(&report.line()).await,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Janitor: refresh after curve drift failed");
+                        }
+                    }
                 }
                 // A rewritten spot value is an input somebody's calculation read, so the visits it
                 // moved recompute in dependency order rather than being left stale (Q108).

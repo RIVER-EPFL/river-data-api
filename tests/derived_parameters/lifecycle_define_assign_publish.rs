@@ -8,12 +8,13 @@ use crate::common::e2e;
 use sea_orm::{ConnectionTrait, Statement};
 use serial_test::serial;
 
-/// Create the DOmgL formula over the seeded Dissolved_O2 source; returns (def_id, output_param_id).
+/// Create the DOmgL formula over the seeded Dissolved_O2 source.
+/// The formula, its output parameter and the calculation that owns it.
 async fn create_derived(
     db: &sea_orm::DatabaseConnection,
     app: &axum::Router,
     token: &str,
-) -> (String, String) {
+) -> (String, String, String) {
     let calculation = crate::common::seed_formula_calculation(db, "domgl_e2e_set").await;
     let (status, def) = crate::common::post_json_parse_with_token(
         app,
@@ -33,7 +34,7 @@ async fn create_derived(
         .as_str()
         .expect("output_parameter_id")
         .to_string();
-    (e2e::id_of(&def), output)
+    (e2e::id_of(&def), output, calculation.to_string())
 }
 
 /// Supported today: a derived definition populates `sources` on GET-by-id and list, and can be
@@ -47,7 +48,7 @@ async fn derived_definition_populates_sources_and_assigns() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (def_id, output_param_id) = create_derived(&db, &app, &token).await;
+    let (def_id, output_param_id, _calculation) = create_derived(&db, &app, &token).await;
 
     // WS1c: the join populates `sources` on GET-by-id AND in the list endpoint.
     let (_s, got) = crate::common::get_json_with_token(
@@ -107,7 +108,7 @@ async fn derived_assignment_backfills_and_publishes() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (def_id, output_param_id) = create_derived(&db, &app, &token).await;
+    let (_def_id, output_param_id, calculation) = create_derived(&db, &app, &token).await;
 
     let (status, sp) = crate::common::post_json_parse_with_token(
         &app,
@@ -151,7 +152,7 @@ async fn derived_assignment_backfills_and_publishes() {
     // Recompute + public exposure.
     let (status, _r) = crate::common::post_json_with_token(
         &app,
-        &format!("/api/actions/derived_parameters/{def_id}/recompute"),
+        &format!("/api/actions/derived_parameters/{calculation}/recompute"),
         &serde_json::json!({}),
         &token,
     )
@@ -218,7 +219,7 @@ async fn an_unrelated_sites_import_does_not_suppress_the_assignment_backfill() {
     let app = crate::common::build_test_app(db.clone());
     insert_running_job(&db, "csv_import", crate::common::SITE2_ID).await;
 
-    let (def_id, output_param_id) = create_derived(&db, &app, &token).await;
+    let (_def_id, output_param_id, calculation) = create_derived(&db, &app, &token).await;
     let (status, sp) = crate::common::post_json_parse_with_token(
         &app,
         "/api/site_parameters",
@@ -236,7 +237,7 @@ async fn an_unrelated_sites_import_does_not_suppress_the_assignment_backfill() {
 
     let enqueued = e2e::count(
         &db,
-        &format!("SELECT COUNT(*) FROM reprocessing_jobs WHERE trigger_type = 'derived_assignment' AND trigger_id = '{def_id}'"),
+        &format!("SELECT COUNT(*) FROM reprocessing_jobs WHERE trigger_type = 'derived_assignment' AND trigger_id = '{calculation}'"),
     )
     .await;
     assert_eq!(
@@ -258,7 +259,7 @@ async fn the_same_definitions_in_flight_backfill_is_not_duplicated() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (def_id, output_param_id) = create_derived(&db, &app, &token).await;
+    let (_def_id, output_param_id, calculation) = create_derived(&db, &app, &token).await;
     db.execute_raw(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         "INSERT INTO reprocessing_jobs \
@@ -266,7 +267,7 @@ async fn the_same_definitions_in_flight_backfill_is_not_duplicated() {
               lease_expires_at) \
          VALUES (gen_random_uuid(), 'derived_assignment', $1::uuid, 'running', 'data', \
                  '{}'::jsonb, 'another-replica', 1, now() + interval '1 hour')",
-        [def_id.clone().into()],
+        [calculation.clone().into()],
     ))
     .await
     .unwrap();
@@ -286,12 +287,12 @@ async fn the_same_definitions_in_flight_backfill_is_not_duplicated() {
     );
     let rows = e2e::count(
         &db,
-        &format!("SELECT COUNT(*) FROM reprocessing_jobs WHERE trigger_type = 'derived_assignment' AND trigger_id = '{def_id}'"),
+        &format!("SELECT COUNT(*) FROM reprocessing_jobs WHERE trigger_type = 'derived_assignment' AND trigger_id = '{calculation}'"),
     )
     .await;
     assert_eq!(
         rows, 1,
-        "this definition's own in-flight backfill is not doubled"
+        "this calculation's own in-flight backfill is not doubled"
     );
 }
 
@@ -308,7 +309,7 @@ async fn a_site_that_does_not_declare_the_slot_computed_is_left_alone() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (_def_id, output_param_id) = create_derived(&db, &app, &token).await;
+    let (_def_id, output_param_id, _calculation) = create_derived(&db, &app, &token).await;
 
     // The second site holds the same output parameter as an ordinary slot, entered by hand.
     let (status, other) = crate::common::post_json_parse_with_token(
@@ -393,7 +394,7 @@ async fn flagging_a_source_reading_withdraws_the_derived_value_it_fed() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let (_def_id, output_param_id) = create_derived(&db, &app, &token).await;
+    let (_def_id, output_param_id, _calculation) = create_derived(&db, &app, &token).await;
     let (status, sp) = crate::common::post_json_parse_with_token(
         &app,
         "/api/site_parameters",

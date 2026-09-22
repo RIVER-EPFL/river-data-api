@@ -515,7 +515,8 @@ impl Job for AlarmBackfill {
                 ));
             };
             let mut results = Vec::with_capacity(slots.len());
-            for (site_id, parameter_id) in &slots {
+            for (walked, (site_id, parameter_id)) in slots.iter().enumerate() {
+                ctx.set_step(walked + 1, slots.len()).await;
                 let written =
                     evaluate_alarm_episodes(ctx.db(), *site_id, *parameter_id, start, end).await;
                 results.push((

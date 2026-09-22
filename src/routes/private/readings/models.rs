@@ -1846,8 +1846,9 @@ pub struct ConsumedReading {
 /// moved since. `kind` is `reading` (one row), `mean` (the sample statistic over `members`),
 /// `replicates` (a family, one member per index, a gap as a member with no value), `site` (a
 /// column of the site row), `constant`, `curve` (a catalog curve, or entered coefficients with no
-/// subject), or `step` (a formula of the pinned set). An entity input names its `change_audit`
-/// subject and the newest `seq` for it.
+/// subject), `computed` (the number a step of the same set produced, under the step's own code)
+/// or `step` (a formula of the pinned set). An entity input names its `change_audit` subject and
+/// the newest `seq` for it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ConsumedInput {
     pub variable: String,

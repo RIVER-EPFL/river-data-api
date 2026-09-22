@@ -36,7 +36,7 @@ fn a_kind_that_reads_its_scope_from_params_is_a_form() {
     assert_eq!(
         names("derived_recompute"),
         [
-            "derived_definition_id",
+            "calculation_id",
             "site_ids",
             "parameter_ids",
             "start",

@@ -1829,16 +1829,23 @@ impl Job for EventAudit {
             ))
             .await?;
 
+        ctx.info(&format!(
+            "Auditing {} visits against {} calculations",
+            event_rows.len(),
+            tools.len()
+        ))
+        .await;
         let mut counts = AuditCounts {
             events_audited: 0,
             missing: 0,
             stale: 0,
             superseded: 0,
         };
-        for row in &event_rows {
+        for (walked, row) in event_rows.iter().enumerate() {
             if ctx.is_cancelled() {
                 break;
             }
+            ctx.set_step(walked + 1, event_rows.len()).await;
             let id: Uuid = row.try_get("", "id")?;
             let event = load_event(&state.db, id).await.map_err(as_db_err)?;
             audit_event(&state, &event, &tools, &catalog, &order, &mut counts)
@@ -1846,6 +1853,11 @@ impl Job for EventAudit {
                 .map_err(as_db_err)?;
         }
 
+        ctx.info(&format!(
+            "Audited {} visits: {} missing outputs, {} stale, {} findings superseded",
+            counts.events_audited, counts.missing, counts.stale, counts.superseded
+        ))
+        .await;
         ctx.report(
             JobReport::new()
                 .scope_opt("site_id", site_id.map(|id| id.to_string()))

@@ -576,6 +576,44 @@ pub async fn list_active_tools(db: &DatabaseConnection) -> AppResult<Vec<ActiveT
     Ok(tools)
 }
 
+/// The formula set a calculation computes on a stream with, as its formulas stand.
+///
+/// The set is read from the formulas rather than from the active version: a stream pass recomputes
+/// continuously and an edit is meant to reach the values it already stored, which is what the
+/// janitor's drift sweep and `formula_transition` are for. The version a value names is its
+/// provenance, not the set that produced it.
+///
+/// `None` where the id names nothing, the calculation is switched off (Q174), or it is a script
+/// calculation: a script runs at a visit, where somebody chose its inputs.
+pub async fn stream_calculation<C: ConnectionTrait>(
+    db: &C,
+    script_id: Uuid,
+) -> AppResult<Option<StreamCalculation>> {
+    let Some(row) = script::Entity::find_by_id(script_id).one(db).await? else {
+        return Ok(None);
+    };
+    if !row.enabled || Engine::parse(&row.engine) != Some(Engine::Formula) {
+        return Ok(None);
+    }
+    let formulas: Vec<PinnedFormula> = load_formulas(db, &[script_id])
+        .await?
+        .into_iter()
+        .map(|(_, formula)| formula)
+        .collect();
+    Ok(Some(StreamCalculation {
+        id: script_id,
+        name: row.name,
+        formulas,
+    }))
+}
+
+/// One formula calculation as the stream engine runs it.
+pub struct StreamCalculation {
+    pub id: Uuid,
+    pub name: String,
+    pub formulas: Vec<PinnedFormula>,
+}
+
 /// The switch a run by name is held to: a calculation switched off is refused, and the refusal
 /// names the switch rather than reporting the calculation missing (Q174).
 pub(super) fn admit_run(name: &str, enabled: bool) -> AppResult<()> {

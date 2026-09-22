@@ -6,11 +6,11 @@ use chrono::{DateTime, Utc};
 use sea_orm::DbErr;
 use std::collections::BTreeMap;
 
-use super::models::{Fetched, Point, Subscriber};
+use super::models::{Fetched, Point, Series, Subscriber};
 use super::service::{
-    advance_cursor, archive_hrefs, cursor, fetch, insert, instrument, latest, nothing_published,
-    provision, recent_url, series, stac_item_url, stations, stations_url, store_stations,
-    subscribers,
+    advance_cursor, announcement, archive_hrefs, archives_since, cursor, fetch, historical, insert,
+    instrument, latest, nothing_published, provision, recent_url, series, site_floor,
+    stac_item_url, stations, stations_url, store_stations, subscribers,
 };
 use crate::config::Config;
 use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport, Schedule};
@@ -55,12 +55,37 @@ fn http_client(timeout_seconds: u64) -> Result<reqwest::Client, DbErr> {
         .map_err(|e| DbErr::Custom(format!("Failed to build the MeteoSwiss client: {e}")))
 }
 
-/// Which of a file's points a pass lands: what the stream has not seen, or the whole file, which is
-/// what a backfill reads because its points are older than the cursor by construction.
-#[derive(Clone, Copy, PartialEq)]
+/// Which of a file's points a pass lands. A backfill ignores the cursor, because its points are
+/// older than the cursor by construction, and reads back to the site's own earliest data and no
+/// further: an archive older than that is history nothing at the site will line a value up with.
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Backlog {
     FromCursor,
     Everything,
+    Since(DateTime<Utc>),
+}
+
+/// The line an archive read writes to the run's timeline: the file by its own name, and what came
+/// out of it. A person watching a backfill reads it to see which of the station's files it is on.
+fn archive_line(href: &str, series: &Series) -> String {
+    let name = href.rsplit('/').next().unwrap_or(href);
+    format!(
+        "Read {name}: {} rows, {} blank, {} unreadable",
+        series.points.len(),
+        series.blank,
+        series.unreadable
+    )
+}
+
+/// What a backfill lands at one site from one archive. `None` is an archive the site reads nothing
+/// out of: a decade file at a site that holds no data of its own, which wants no history, while
+/// the recent file still lands there so a fresh subscription is visibly working.
+fn backlog_for(floor: Option<DateTime<Utc>>, historical: bool) -> Option<Backlog> {
+    match floor {
+        Some(floor) => Some(Backlog::Since(floor)),
+        None if historical => None,
+        None => Some(Backlog::Everything),
+    }
 }
 
 /// Land the points a pass read for one subscription.
@@ -71,18 +96,22 @@ async fn land(
     points: &[Point],
     landed: &mut Landed,
     backlog: Backlog,
-) -> Result<(), DbErr> {
+) -> Result<usize, DbErr> {
     let stream_id = provision(ctx.db(), site, site.parameter_id).await?;
     let cursor = cursor(ctx.db(), stream_id).await?;
     let fresh: Vec<&Point> = points
         .iter()
-        .filter(|p| backlog == Backlog::Everything || cursor.is_none_or(|c| p.time > c))
+        .filter(|p| match backlog {
+            Backlog::FromCursor => cursor.is_none_or(|c| p.time > c),
+            Backlog::Everything => true,
+            Backlog::Since(floor) => p.time >= floor,
+        })
         .collect();
     if fresh.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let sensor_id = instrument(ctx.db(), station).await?;
-    landed.inserted += insert(
+    let written = insert(
         ctx.db(),
         stream_id,
         site.site_id,
@@ -91,20 +120,25 @@ async fn land(
         &fresh,
     )
     .await?;
+    landed.inserted += written;
+    if let Some(event) = announcement(site.site_id, site.parameter_id, stream_id, written) {
+        let _ = ctx.events().send(event);
+    }
     landed.saw(fresh.iter().map(|p| p.time).min());
     if let Some(newest) = fresh.iter().map(|p| p.time).max() {
         advance_cursor(ctx.db(), stream_id, newest).await?;
     }
-    Ok(())
+    Ok(written)
 }
 
 /// A pressure series rolls up like any other continuous parameter, so a pass makes what it landed
 /// visible over the span it moved.
 async fn refresh(ctx: &JobContext, landed: &Landed) -> Result<(), DbErr> {
     if let Some(since) = landed.earliest {
-        crate::common::sync_state::refresh_continuous_aggregates(ctx.db(), since)
+        let report = crate::common::sync_state::refresh_continuous_aggregates(ctx.db(), since)
             .await
             .map_err(|e| DbErr::Custom(format!("Aggregate refresh failed: {e}")))?;
+        ctx.info(&report.line()).await;
     }
     Ok(())
 }
@@ -407,8 +441,10 @@ impl Job for MeteoswissRecent {
     }
 }
 
-/// Read every archive a station publishes and land it under the same streams, so a subscription
-/// made today carries the history a correction of an old grab sample needs.
+/// Read the archives a station publishes back to the earliest data its subscribed sites hold of
+/// their own, and land them under the same streams, so a subscription made today carries the
+/// history a correction of an old grab sample needs and no more: a decade the site was not
+/// measured in is history nothing there will ever line a value up with.
 ///
 /// Enqueued once per (station, variable) when a site subscribes, and rerunnable: the inserts do
 /// nothing on conflict, so a second run re-reads the same files and writes only what is missing.
@@ -471,16 +507,32 @@ impl Job for MeteoswissBackfill {
         };
         let hrefs = archive_hrefs(&item).map_err(|e| DbErr::Custom(format!("{item_url}: {e}")))?;
 
+        // How far back each site reads, and the deepest of them, which is the only history any
+        // archive is fetched for.
+        let mut floors: BTreeMap<uuid::Uuid, Option<DateTime<Utc>>> = BTreeMap::new();
+        for site in &sites {
+            let floor = site_floor(ctx.db(), site.site_id).await?;
+            floors.insert(site.site_id, floor);
+        }
+        let deepest = floors.values().copied().flatten().min();
+        let hrefs = archives_since(hrefs, deepest);
+
         let mut landed = Landed::default();
+        let mut per_site: BTreeMap<uuid::Uuid, usize> = BTreeMap::new();
         let mut archives_read = 0usize;
         let mut archives_failed = 0usize;
         let mut blank = 0usize;
         let mut unreadable = 0usize;
 
-        for href in hrefs {
+        let archive_count = hrefs.len();
+        for (walked, href) in hrefs.into_iter().enumerate() {
             if ctx.is_cancelled() {
                 break;
             }
+            // The position in the station's archive list, so the bar has a denominator: an
+            // archive skipped as unchanged or unreadable still advances the walk.
+            ctx.set_step(walked + 1, archive_count).await;
+            let historical = historical(&href);
             let body = match fetch(ctx.db(), &client, &href).await {
                 Ok(Fetched::Body(body)) => body,
                 Ok(Fetched::Unchanged) => continue,
@@ -511,21 +563,23 @@ impl Job for MeteoswissBackfill {
             archives_read += 1;
             blank += series.blank;
             unreadable += series.unreadable;
+            ctx.info(&archive_line(&href, &series)).await;
             for site in &sites {
-                land(
-                    &ctx,
-                    site,
-                    &station,
-                    &series.points,
-                    &mut landed,
-                    Backlog::Everything,
-                )
-                .await?;
+                let floor = floors.get(&site.site_id).copied().flatten();
+                let Some(backlog) = backlog_for(floor, historical) else {
+                    continue;
+                };
+                let written =
+                    land(&ctx, site, &station, &series.points, &mut landed, backlog).await?;
+                *per_site.entry(site.site_id).or_default() += written;
             }
-            ctx.set_progress(i32::try_from(archives_read).unwrap_or(i32::MAX), None)
-                .await;
         }
 
+        for site in &sites {
+            let written = per_site.get(&site.site_id).copied().unwrap_or_default();
+            ctx.info(&format!("Landed {written} at {}", site.site_name))
+                .await;
+        }
         refresh(&ctx, &landed).await?;
         ctx.report(
             JobReport::new()
@@ -547,3 +601,7 @@ impl Job for MeteoswissBackfill {
         Ok(i64::try_from(landed.inserted).unwrap_or(i64::MAX))
     }
 }
+
+#[cfg(test)]
+#[path = "tests/flows.rs"]
+mod tests;

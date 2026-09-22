@@ -15,12 +15,21 @@ fn expr_sql(e: Expr) -> String {
         .to_owned()
 }
 
+/// Scenario: a site declares a slot for the output of a formula calculation.
+///
+/// Expected behaviour: the stream engine's unit of work is the calculation, so the query selects
+/// the slots whose producing formula belongs to one. A formula belonging to no calculation is a
+/// shared step (Q156) and computes nothing on its own.
 #[test]
-fn test_derived_work_query_selects_standalone_definitions() {
+fn test_derived_work_query_selects_calculation_outputs() {
     let sql = rendered(derived_work_query(Uuid::nil()));
     assert!(
-        sql.contains(r#""d"."tool_script_id" IS NULL"#),
-        "calculation-owned formulas belong to the chain: {sql}"
+        sql.contains(r#""d"."tool_script_id" IS NOT NULL"#),
+        "a formula owned by no calculation computes nothing on its own: {sql}"
+    );
+    assert!(
+        sql.contains(r#""d"."tool_script_id" AS "tool_script_id""#),
+        "the calculation is what the work is grouped by: {sql}"
     );
 }
 
@@ -309,84 +318,6 @@ fn a_chain_written_bound_is_derived_and_an_operator_written_one_is_only_shortene
     );
 }
 
-/// A continuous derived formula binds what a formula set binds: a constant by name, a site column
-/// from the site's row, and a guarded absent input as NaN so `coalesce` takes its other arm.
-#[test]
-fn a_derived_formula_binds_constants_site_properties_and_guarded_gaps() {
-    let constants = HashMap::from([("lab_temp_avg_degC".to_string(), 22.5)]);
-    let parameters = vec![("WTW_Temp_degC_1".to_string(), Some(8.7))];
-    let site = vec![("altitude_m".to_string(), Some(801.0))];
-    let vars = bind_derived_variables(
-        "WTW_Temp_degC_1 * altitude_m + lab_temp_avg_degC",
-        &parameters,
-        &site,
-        &constants,
-    )
-    .unwrap();
-    assert_eq!(vars["lab_temp_avg_degC"], 22.5);
-    assert_eq!(vars["altitude_m"], 801.0);
-    assert_eq!(vars["WTW_Temp_degC_1"], 8.7);
-
-    let absent = vec![("lab_co2_lab_temp".to_string(), None)];
-    let vars = bind_derived_variables(
-        "coalesce(lab_co2_lab_temp, lab_temp_avg_degC) + 273.15",
-        &absent,
-        &[],
-        &constants,
-    )
-    .unwrap();
-    assert!(vars["lab_co2_lab_temp"].is_nan());
-    // 22.5 + 273.15
-    let value = evaluate_formula(
-        "coalesce(lab_co2_lab_temp, lab_temp_avg_degC) + 273.15",
-        &vars,
-    )
-    .unwrap();
-    assert!((value - 295.65).abs() < 1e-9);
-}
-
-/// An input read outside every guard skips the instant rather than computing over NaN, and the
-/// reason names the variable.
-#[test]
-fn an_unguarded_absent_input_skips_the_instant() {
-    let absent = vec![("Dissolved_O2".to_string(), None)];
-    let skipped = bind_derived_variables("Dissolved_O2 * 0.032", &absent, &[], &HashMap::new());
-    assert_eq!(skipped, Err("no value for Dissolved_O2".to_string()));
-
-    let site = vec![("altitude_m".to_string(), None)];
-    let skipped = bind_derived_variables("altitude_m / 2", &[], &site, &HashMap::new());
-    assert_eq!(skipped, Err("no value for altitude_m".to_string()));
-}
-
-mod non_finite_results {
-    use crate::routes::private::sensor_calibrations::service::{DerivedOutcome, derived_outcome};
-
-    /// Scenario: an input is corrected so the formula evaluates to NA at an instant whose slot
-    /// already holds a number from an earlier pass.
-    ///
-    /// Expected behaviour: NA is the formula saying there is no value, so the slot is cleared and
-    /// stops serving a number the formula no longer produces (Q172).
-    #[test]
-    fn na_clears_the_slot_rather_than_leaving_the_old_value() {
-        assert_eq!(derived_outcome(f64::NAN), DerivedOutcome::Clear);
-    }
-
-    /// A divide by zero says the formula could not compute, not that the quantity is absent, so
-    /// the value that stands is left alone until the input is corrected (Q172).
-    #[test]
-    fn a_divide_by_zero_refuses_and_leaves_the_stored_value_standing() {
-        assert_eq!(derived_outcome(f64::INFINITY), DerivedOutcome::Refuse);
-        assert_eq!(derived_outcome(f64::NEG_INFINITY), DerivedOutcome::Refuse);
-    }
-
-    #[test]
-    fn a_finite_result_is_stored_at_the_value_the_formula_produced() {
-        assert_eq!(derived_outcome(4.2), DerivedOutcome::Store(4.2));
-        assert_eq!(derived_outcome(0.0), DerivedOutcome::Store(0.0));
-        assert_eq!(derived_outcome(-1.5), DerivedOutcome::Store(-1.5));
-    }
-}
-
 fn candidate(
     measurement_type: Option<&str>,
     replicate_index: i16,
@@ -514,5 +445,83 @@ mod replay {
         let set = captured_set(&consumed).expect("a captured set");
         assert_eq!(set.formula, "Dissolved_O2 * 2");
         assert_eq!(set.variables.len(), 1, "{:?}", set.variables);
+    }
+}
+
+/// Scenario: a continuous calculation whose set is a step read by two outputs, the shape a portal
+/// calculation has.
+///
+/// Expected behaviour: the unit of work is the calculation, so the step is evaluated once and both
+/// outputs come out of that one evaluation. Evaluating per output would run the step twice.
+mod a_set_is_one_unit_of_work {
+    use crate::routes::private::sensor_calibrations::service::runs_on_streams;
+    use crate::routes::private::tools::models::PinnedFormula;
+    use crate::routes::private::tools::service::evaluate;
+    use std::collections::HashMap;
+
+    fn formula(code: &str, text: &str, sources: &[&str], step: bool) -> PinnedFormula {
+        PinnedFormula {
+            code: code.to_string(),
+            label: code.to_string(),
+            units: None,
+            formula: text.to_string(),
+            ordinal: 0,
+            output_parameter_code: (!step).then(|| code.to_string()),
+            sources: sources
+                .iter()
+                .map(|s| ((*s).to_string(), (*s).to_string()))
+                .collect(),
+            site_sources: Vec::new(),
+            curve_slot: None,
+            per_replicate: None,
+            intermediate: step,
+        }
+    }
+
+    fn set() -> Vec<PinnedFormula> {
+        vec![
+            formula("water_k", "WTW_Temp_degC_1 + 273.15", &["WTW_Temp_degC_1"], true),
+            formula("k_half", "water_k / 2", &[], false),
+            formula("k_tenth", "water_k / 10", &[], false),
+        ]
+    }
+
+    #[test]
+    fn a_step_two_outputs_read_is_evaluated_once_and_both_outputs_store() {
+        let inputs = HashMap::from([("WTW_Temp_degC_1".to_string(), 8.85)]);
+        let cells = evaluate(&set(), &inputs, &HashMap::new(), &HashMap::new()).unwrap();
+        let value = |code: &str| {
+            cells
+                .iter()
+                .find(|cell| cell.code == code)
+                .and_then(|cell| cell.value)
+        };
+        // 8.85 + 273.15
+        assert_eq!(value("water_k"), Some(282.0));
+        assert_eq!(value("k_half"), Some(141.0));
+        assert_eq!(value("k_tenth"), Some(28.2));
+        assert_eq!(cells.len(), 3, "one cell per formula, the step included");
+    }
+
+    /// The step's own cell carries no output parameter, so the pass stores two readings, not
+    /// three: a step is a value the set passes forward, not a measurement.
+    #[test]
+    fn a_step_is_not_one_of_the_values_stored() {
+        let set = set();
+        let stored: Vec<&str> = set
+            .iter()
+            .filter_map(|f| f.output_parameter_code.as_deref())
+            .collect();
+        assert_eq!(stored, ["k_half", "k_tenth"]);
+    }
+
+    /// A set whose formula corrects with a lab curve is chosen per grab sample, so there is nobody
+    /// to choose it at an ingest (Q228).
+    #[test]
+    fn a_set_declaring_a_curve_slot_is_the_visit_arm_s() {
+        assert!(runs_on_streams(&set()));
+        let mut with_curve = set();
+        with_curve[1].curve_slot = Some("doc".to_string());
+        assert!(!runs_on_streams(&with_curve));
     }
 }

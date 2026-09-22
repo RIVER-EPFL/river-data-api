@@ -226,7 +226,6 @@ async fn test_recompute_endpoint_backfills_historical_gap() {
     )
     .await;
     assert!((200..300).contains(&status));
-    let derived_def_id = def_json["id"].as_str().unwrap().to_string();
     let output_parameter_id = def_json["output_parameter_id"]
         .as_str()
         .unwrap()
@@ -253,7 +252,7 @@ async fn test_recompute_endpoint_backfills_historical_gap() {
             .await;
     assert!((200..300).contains(&status));
 
-    let uri = format!("/api/actions/derived_parameters/{derived_def_id}/recompute");
+    let uri = format!("/api/actions/derived_parameters/{calculation}/recompute");
     let (status, _) =
         crate::common::post_json_with_token(&app, &uri, &serde_json::json!({}), &token).await;
     assert!(

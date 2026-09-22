@@ -318,3 +318,35 @@ fn test_floor_twelve_hourly_is_midnight_or_noon() {
         t("2026-08-12T00:00:00Z")
     );
 }
+
+/// Expected behaviour: the line a job writes for a refresh names how many rollups moved, the span
+/// they moved over and the seconds the job spent waiting, so the gap between "started" and
+/// "completed" is accounted for.
+#[test]
+fn test_the_refresh_line_names_the_rollups_the_span_and_the_wait() {
+    let report = RefreshReport {
+        views: 6,
+        from: t("2004-02-01T00:00:00Z"),
+        to: t("2026-09-22T10:00:00Z"),
+        elapsed_ms: 6_842,
+    };
+    assert_eq!(
+        report.line(),
+        "Refreshed 6 rollups from 2004-02-01T00:00:00Z to 2026-09-22T10:00:00Z in 6.8 s"
+    );
+}
+
+#[test]
+fn test_one_rollup_is_not_pluralised() {
+    let report = RefreshReport {
+        views: 1,
+        from: t("2026-09-22T09:00:00Z"),
+        to: t("2026-09-22T10:00:00Z"),
+        elapsed_ms: 40,
+    };
+    assert!(
+        report.line().starts_with("Refreshed 1 rollup from"),
+        "{}",
+        report.line()
+    );
+}

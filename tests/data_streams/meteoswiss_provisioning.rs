@@ -156,6 +156,17 @@ async fn meteoswiss_readings_land_attributed_and_a_replay_inserts_nothing() {
     .await
     .unwrap();
     assert_eq!(written, 3);
+    // What landed is announced, so the site's cached responses are dropped and an open site page
+    // refetches (B427).
+    assert!(
+        river_db::routes::private::meteoswiss::service::announcement(
+            site.site_id,
+            parameter,
+            stream_id,
+            written
+        )
+        .is_some(),
+    );
 
     let attributed = scalar_i64(
         &db,
@@ -182,6 +193,16 @@ async fn meteoswiss_readings_land_attributed_and_a_replay_inserts_nothing() {
     .await
     .unwrap();
     assert_eq!(replayed, 0);
+    assert!(
+        river_db::routes::private::meteoswiss::service::announcement(
+            site.site_id,
+            parameter,
+            stream_id,
+            replayed
+        )
+        .is_none(),
+        "a replay changed nothing, so nothing is invalidated"
+    );
     assert_eq!(
         scalar_i64(
             &db,
@@ -734,4 +755,79 @@ async fn subscribing_provisions_the_slot_and_the_stream_before_anything_lands() 
         .await
         .unwrap();
     assert_eq!(scalar_i64(&db, &slot).await, 1);
+}
+
+/// Scenario: a station publishes twenty years of pressure and the site it feeds has been measured
+/// since 2025.
+/// Expected behaviour: the floor a backfill reads back to is the site's own earliest reading, and
+/// the pressure the feed has already landed does not deepen it.
+#[tokio::test]
+#[serial]
+async fn the_backfill_floor_is_the_site_s_own_earliest_reading() {
+    use river_db::routes::private::meteoswiss::service::site_floor;
+
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    ensure_pressure_parameter(&db).await;
+    subscribe(&db, crate::common::fixtures::SITE1_ID, STATION).await;
+
+    let site_id = Uuid::parse_str(crate::common::fixtures::SITE1_ID).unwrap();
+    let parameter = subscribers(&db).await.unwrap()[0].parameter_id;
+    let site = Subscriber {
+        subscription_id: Uuid::new_v4(),
+        site_id,
+        site_name: "Site 1".to_string(),
+        station: STATION.to_string(),
+        variable: VARIABLE.to_string(),
+        parameter_id: parameter,
+    };
+    let stream_id = provision(&db, &site, parameter).await.unwrap();
+    let sensor_id = instrument(&db, STATION).await.unwrap();
+
+    let own = crate::common::fixtures::base_time();
+    assert_eq!(
+        site_floor(&db, site_id).await.unwrap(),
+        Some(own),
+        "the site's own readings start at the fixture's base time"
+    );
+
+    // Two decades of pressure land under the station's stream.
+    let archive = points(Utc.with_ymd_and_hms(2004, 2, 1, 0, 0, 0).unwrap(), &[915.0; 3]);
+    let refs: Vec<&Point> = archive.iter().collect();
+    river_db::routes::private::meteoswiss::service::insert(
+        &db, stream_id, site_id, parameter, sensor_id, &refs,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        site_floor(&db, site_id).await.unwrap(),
+        Some(own),
+        "a station's own history is not the site's data, so it cannot deepen the floor"
+    );
+}
+
+/// A site measured for the first time next week holds nothing to line a pressure value up with, so
+/// there is no floor and the backfill reads no decade file.
+#[tokio::test]
+#[serial]
+async fn a_site_holding_nothing_has_no_floor() {
+    use river_db::routes::private::meteoswiss::service::site_floor;
+
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+
+    let bare = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO sites (id, name, project_id) \
+             SELECT '{bare}', 'Bare Site', id FROM projects LIMIT 1"
+        ),
+    )
+    .await;
+
+    assert_eq!(site_floor(&db, bare).await.unwrap(), None);
 }

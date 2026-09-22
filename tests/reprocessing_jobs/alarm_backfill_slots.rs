@@ -110,12 +110,15 @@ async fn alarm_backfill_with_slots_reconstructs_episodes_per_pair() {
     let row = db
         .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            format!("SELECT status FROM reprocessing_jobs WHERE id = '{id}'"),
+            format!("SELECT status, progress, total FROM reprocessing_jobs WHERE id = '{id}'"),
         ))
         .await
         .unwrap()
         .unwrap();
     assert_eq!(row.try_get::<String>("", "status").unwrap(), "completed");
+    // The walk carries its own length, so the run reads as a bar rather than as a bare count.
+    assert_eq!(row.try_get::<i32>("", "total").unwrap(), 1);
+    assert_eq!(row.try_get::<i32>("", "progress").unwrap(), 1);
 
     assert_eq!(
         turbidity_episode_count(&db).await,

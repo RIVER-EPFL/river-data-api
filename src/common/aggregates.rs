@@ -134,21 +134,51 @@ impl Window {
     }
 }
 
+/// What one refresh did. A job waits on the refresh, so the run says how many rollups it moved,
+/// over what span and how long it took, rather than leaving that time unaccounted for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshReport {
+    pub views: usize,
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub elapsed_ms: u128,
+}
+
+impl RefreshReport {
+    /// The timeline line a job writes for this refresh.
+    #[must_use]
+    pub fn line(&self) -> String {
+        format!(
+            "Refreshed {} rollup{} from {} to {} in {:.1} s",
+            self.views,
+            if self.views == 1 { "" } else { "s" },
+            self.from.format("%Y-%m-%dT%H:%M:%SZ"),
+            self.to.format("%Y-%m-%dT%H:%M:%SZ"),
+            self.elapsed_ms as f64 / 1000.0,
+        )
+    }
+}
+
 /// Refresh every rollup over `window`.
 ///
 /// Each view is attempted even if an earlier one fails, so one broken view cannot leave the others
 /// stale; the first error is returned once every view has been tried. A caller inside a tracked job
 /// must propagate the error, a swallowed refresh reports a job as completed while the rollups still
 /// serve the old numbers.
-pub async fn refresh(db: &DatabaseConnection, window: Window) -> AppResult<()> {
+pub async fn refresh(db: &DatabaseConnection, window: Window) -> AppResult<RefreshReport> {
     let now = Utc::now();
+    let started = std::time::Instant::now();
     let mut first_error = None;
     let mut failed = 0;
+    let mut refreshed = 0;
 
     for resolution in Resolution::ALL {
         let statement = refresh_statement(resolution, window, now)?;
         match db.execute_raw(statement).await {
-            Ok(_) => tracing::debug!(view = resolution.view(), "Continuous aggregate refreshed"),
+            Ok(_) => {
+                refreshed += 1;
+                tracing::debug!(view = resolution.view(), "Continuous aggregate refreshed");
+            }
             Err(e) => {
                 tracing::warn!(view = resolution.view(), error = %e, "Failed to refresh continuous aggregate");
                 failed += 1;
@@ -160,7 +190,15 @@ pub async fn refresh(db: &DatabaseConnection, window: Window) -> AppResult<()> {
     }
 
     match first_error {
-        None => Ok(()),
+        None => {
+            let (from, to) = window.bounds(now);
+            Ok(RefreshReport {
+                views: refreshed,
+                from,
+                to,
+                elapsed_ms: started.elapsed().as_millis(),
+            })
+        }
         Some(e) => {
             tracing::error!(failed, error = %e, "Continuous aggregate refresh failed");
             Err(e.into())

@@ -307,6 +307,8 @@ impl Job for BackfillAttribution {
                 "backfill_attribution: no slots given".to_string(),
             ));
         }
+        ctx.info(&format!("Re-attributing {} slot(s)", slots.len()))
+            .await;
         let mut results = Vec::with_capacity(slots.len());
         for (site_id, parameter_id) in slots {
             let moved = reprocess_site_parameter_readings(
@@ -324,6 +326,7 @@ impl Job for BackfillAttribution {
         }
         let outcome = SlotOutcome::from(results);
         let total = outcome.readings;
+        ctx.info(&outcome.line("slots")).await;
         let report = outcome
             .record(&ctx, JobReport::new().count("readings_updated", total))
             .await;

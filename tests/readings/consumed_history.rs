@@ -24,9 +24,11 @@ struct Fixture {
     /// The state the router shares, so a test can mint a sync credential the way the control
     /// plane's own admin route does.
     state: river_db::common::AppState,
-    /// The formula, its output parameter, and the instant the visit sits at.
+    /// The formula, the calculation that owns it, its output parameter, and the instant the
+    /// visit sits at.
     code: String,
     definition: String,
+    calculation: String,
     output: String,
     at: DateTime<Utc>,
 }
@@ -99,6 +101,7 @@ async fn computed_slot(formula: &str, constants: &[(&str, f64)]) -> Fixture {
         state: f.state,
         code,
         definition,
+        calculation: calculation.to_string(),
         output,
         at,
     }
@@ -390,7 +393,7 @@ async fn an_edited_step_reads_as_changed_and_an_unmoved_value_keeps_its_record()
     )
     .await;
     assert!((200..300).contains(&status), "edit ({status}): {body}");
-    let uri = format!("/api/actions/derived_parameters/{}/recompute", f.definition);
+    let uri = format!("/api/actions/derived_parameters/{}/recompute", f.calculation);
     let (status, body) =
         crate::common::post_json_with_token(&f.app, &uri, &json!({}), &f.token).await;
     assert!((200..300).contains(&status), "recompute ({status}): {body}");

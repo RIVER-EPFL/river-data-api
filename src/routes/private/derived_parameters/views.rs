@@ -503,10 +503,10 @@ pub async fn step_dependents(
 #[utoipa::path(
     post,
     path = "/api/actions/derived_parameters/{id}/recompute",
-    params(("id" = Uuid, Path, description = "Derived parameter definition UUID")),
+    params(("id" = Uuid, Path, description = "Calculation UUID")),
     responses(
         (status = 200, description = "Background recompute job triggered", body = QueuedJobResponse),
-        (status = 404, description = "Derived parameter definition not found"),
+        (status = 404, description = "Calculation not found"),
     ),
     tag = "actions"
 )]
@@ -518,9 +518,9 @@ pub async fn recompute_derived(
     Ok(Json(QueuedJobResponse::queued(Some(job_id))))
 }
 
-/// Enqueue a durable `derived_recompute` job for one derived parameter definition. Runs on the
-/// claim-based worker pool
-/// (`DerivedRecompute`), reading `derived_definition_id` back from the job's params.
+/// Enqueue a durable `derived_recompute` job for one calculation. Runs on the claim-based worker
+/// pool (`DerivedRecompute`), reading `calculation_id` back from the job's params. A definition is
+/// no longer a thing that computes on its own, so the scope is the calculation (Q231).
 pub async fn spawn_recompute_derived(
     db: &sea_orm::DatabaseConnection,
     _events: crate::common::EventSender,
@@ -531,7 +531,7 @@ pub async fn spawn_recompute_derived(
         "derived_recompute",
         None,
         Some(id),
-        &serde_json::json!({ "derived_definition_id": id }),
+        &serde_json::json!({ "calculation_id": id }),
         None,
     )
     .await?

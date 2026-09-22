@@ -136,7 +136,7 @@ fn pass(site: Uuid, parameter: Uuid, pass: SlotPass) -> DerivedSlot {
     DerivedSlot {
         site_id: site,
         parameter_id: parameter,
-        definition_id: Uuid::from_u128(9),
+        calculation_id: Uuid::from_u128(9),
         pass,
     }
 }

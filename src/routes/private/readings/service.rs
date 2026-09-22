@@ -6464,7 +6464,7 @@ pub async fn run<'a>(
 
     if let Some(window) = plan.refresh {
         match aggregates::refresh(sink.db, window).await {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(e) if plan.refresh_fatal => return Err(e),
             Err(e) => tracing::warn!(error = %e, "aggregate refresh after a write failed"),
         }

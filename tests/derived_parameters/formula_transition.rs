@@ -226,7 +226,7 @@ async fn a_recompute_records_the_move_and_a_pass_that_moves_nothing_records_noth
     .await;
     assert!((200..300).contains(&status), "edit ({status}): {body}");
 
-    let uri = format!("/api/actions/derived_parameters/{definition_id}/recompute");
+    let uri = format!("/api/actions/derived_parameters/{calculation}/recompute");
     let (status, body) =
         crate::common::post_json_with_token(&app, &uri, &serde_json::json!({}), &token).await;
     assert!((200..300).contains(&status), "recompute ({status}): {body}");

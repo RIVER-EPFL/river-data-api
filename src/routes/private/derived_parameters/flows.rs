@@ -63,10 +63,11 @@ pub async fn site_has_active_derived(
 /// gap is filled that hour. Bounded, it is an index-range probe over the last few hours; the
 /// periodic unbounded run is what still covers drift older than the window.
 fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> SelectStatement {
-    let (r, sp, d, dps, r2) = (
+    let (r, sp, d, f, dps, r2) = (
         Alias::new("r"),
         Alias::new("sp"),
         Alias::new("d"),
+        Alias::new("f"),
         Alias::new("dps"),
         Alias::new("r2"),
     );
@@ -115,14 +116,23 @@ fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> SelectStatement {
             d.clone(),
             Expr::col((d.clone(), definition::Column::OutputParameterId))
                 .equals((sp.clone(), site_parameters::Column::ParameterId))
-                .and(Expr::col((d.clone(), definition::Column::ToolScriptId)).is_null()),
+                .and(Expr::col((d.clone(), definition::Column::ToolScriptId)).is_not_null()),
+        )
+        // Any formula of the same calculation: a source only a step reads still makes the instant
+        // one the set computes at, because the step feeds the output the slot holds.
+        .join_as(
+            JoinType::Join,
+            definition::Entity,
+            f.clone(),
+            Expr::col((f.clone(), definition::Column::ToolScriptId))
+                .equals((d, definition::Column::ToolScriptId)),
         )
         .join_as(
             JoinType::Join,
             source::Entity,
             dps.clone(),
             Expr::col((dps.clone(), source::Column::DerivedDefinitionId))
-                .equals((d, definition::Column::Id))
+                .equals((f, definition::Column::Id))
                 .and(
                     Expr::col((dps, source::Column::ParameterId))
                         .equals((r.clone(), readings::Column::ParameterId)),
@@ -353,20 +363,24 @@ fn parse_timestamps(value: Option<&serde_json::Value>) -> Vec<chrono::DateTime<c
 }
 /// Recompute derived values from their source readings, then refresh continuous aggregates. Backs
 /// the `derived_recompute` trigger, in either of two scopes: one derived parameter definition over
-/// its whole history (`derived_definition_id`), or every definition reading a given slot over a
+/// its whole history (`calculation_id`), or every calculation reading a given slot over a
 /// window (`site_ids`, `parameter_ids`, `start`, `end`), which is what a curation decision leaves
 /// behind.
 pub struct DerivedRecompute;
 
 /// The `(site, time)` instants a derived recompute covers: every reading of a parameter some
-/// calculation reads, at a site whose slot for that calculation's output is tool-entered on the
-/// stream arm. A low-cadence slot is the chain's, computed at the visit that recorded it.
+/// calculation reads, at a site whose slot for one of that calculation's outputs is tool-entered
+/// on the stream arm. A low-cadence slot is the chain's, computed at the visit that recorded it.
+///
+/// A source only a step reads counts: the step feeds the output the slot holds, so the instant is
+/// one the set computes at.
 fn derived_instants(
     scope: sea_query::Condition,
-    join_definition_on: Option<Uuid>,
+    join_calculation_on: Option<Uuid>,
 ) -> sea_query::SelectStatement {
     let r = sea_query::Alias::new("r");
-    let d = sea_query::Alias::new("d");
+    let f = sea_query::Alias::new("f");
+    let o = sea_query::Alias::new("o");
     let dps = sea_query::Alias::new("dps");
     let sp = sea_query::Alias::new("sp");
 
@@ -377,15 +391,16 @@ fn derived_instants(
         .column((r.clone(), readings::Column::Time))
         .from_as(readings::Entity, r.clone());
 
-    match join_definition_on {
-        // One calculation: the definition is the given row, and the sources join to it.
-        Some(definition_id) => {
+    match join_calculation_on {
+        // One calculation: its formulas are the given rows, and the sources join to them.
+        Some(calculation_id) => {
             query
                 .join_as(
                     sea_query::JoinType::Join,
                     definition::Entity,
-                    d.clone(),
-                    sea_query::Expr::col((d.clone(), definition::Column::Id)).eq(definition_id),
+                    f.clone(),
+                    sea_query::Expr::col((f.clone(), definition::Column::ToolScriptId))
+                        .eq(calculation_id),
                 )
                 .join_as(
                     sea_query::JoinType::Join,
@@ -397,7 +412,7 @@ fn derived_instants(
                                 dps.clone(),
                                 source::Column::DerivedDefinitionId,
                             ))
-                            .equals((d.clone(), definition::Column::Id)),
+                            .equals((f.clone(), definition::Column::Id)),
                         )
                         .add(
                             sea_query::Expr::col((dps.clone(), source::Column::ParameterId))
@@ -405,7 +420,7 @@ fn derived_instants(
                         ),
                 );
         }
-        // Every calculation that reads the parameter this reading carries.
+        // Every formula that reads the parameter this reading carries.
         None => {
             query
                 .join_as(
@@ -418,14 +433,35 @@ fn derived_instants(
                 .join_as(
                     sea_query::JoinType::Join,
                     definition::Entity,
-                    d.clone(),
-                    sea_query::Expr::col((d.clone(), definition::Column::Id))
-                        .equals((dps.clone(), source::Column::DerivedDefinitionId)),
+                    f.clone(),
+                    sea_query::Condition::all()
+                        .add(
+                            sea_query::Expr::col((f.clone(), definition::Column::Id))
+                                .equals((dps.clone(), source::Column::DerivedDefinitionId)),
+                        )
+                        .add(
+                            sea_query::Expr::col((f.clone(), definition::Column::ToolScriptId))
+                                .is_not_null(),
+                        ),
                 );
         }
     }
 
     query
+        .join_as(
+            sea_query::JoinType::Join,
+            definition::Entity,
+            o.clone(),
+            sea_query::Condition::all()
+                .add(
+                    sea_query::Expr::col((o.clone(), definition::Column::ToolScriptId))
+                        .equals((f, definition::Column::ToolScriptId)),
+                )
+                .add(
+                    sea_query::Expr::col((o.clone(), definition::Column::OutputParameterId))
+                        .is_not_null(),
+                ),
+        )
         .join_as(
             sea_query::JoinType::Join,
             site_parameters::Entity,
@@ -442,7 +478,7 @@ fn derived_instants(
                 .add(sea_query::Expr::col((sp.clone(), site_parameters::Column::Cadence)).eq("high"))
                 .add(
                     sea_query::Expr::col((sp, site_parameters::Column::ParameterId))
-                        .equals((d, definition::Column::OutputParameterId)),
+                        .equals((o, definition::Column::OutputParameterId)),
                 ),
         )
         .cond_where(scope)
@@ -451,9 +487,11 @@ fn derived_instants(
         .to_owned()
 }
 
-/// The instants at one site where a calculation's inputs were recorded.
-fn instants_a_calculation_reads(definition_id: Uuid, site_id: Uuid) -> sea_query::SelectStatement {
+/// The instants at one site where a calculation's inputs were recorded. Every formula of the set
+/// counts, a step included: a step's source is an input the set reads.
+fn instants_a_calculation_reads(calculation_id: Uuid, site_id: Uuid) -> sea_query::SelectStatement {
     let r = sea_query::Alias::new("r");
+    let f = sea_query::Alias::new("f");
     let dps = sea_query::Alias::new("dps");
     sea_query::Query::select()
         .distinct()
@@ -466,8 +504,15 @@ fn instants_a_calculation_reads(definition_id: Uuid, site_id: Uuid) -> sea_query
             sea_query::Expr::col((dps.clone(), source::Column::ParameterId))
                 .equals((r.clone(), readings::Column::ParameterId)),
         )
+        .join_as(
+            sea_query::JoinType::Join,
+            definition::Entity,
+            f.clone(),
+            sea_query::Expr::col((f.clone(), definition::Column::Id))
+                .equals((dps, source::Column::DerivedDefinitionId)),
+        )
         .and_where(
-            sea_query::Expr::col((dps, source::Column::DerivedDefinitionId)).eq(definition_id),
+            sea_query::Expr::col((f, definition::Column::ToolScriptId)).eq(calculation_id),
         )
         .and_where(sea_query::Expr::col((r.clone(), readings::Column::SiteId)).eq(site_id))
         .order_by((r, readings::Column::Time), sea_query::Order::Asc)
@@ -476,11 +521,11 @@ fn instants_a_calculation_reads(definition_id: Uuid, site_id: Uuid) -> sea_query
 
 /// The `(site, time)` instants a `derived_recompute` run must recompute, in either scope.
 fn derived_recompute_instants(params: &serde_json::Value) -> Result<Statement, DbErr> {
-    if params.get("derived_definition_id").is_some() {
-        let derived_id = required_uuid(params, "derived_definition_id")?;
+    if params.get("calculation_id").is_some() {
+        let calculation_id = required_uuid(params, "calculation_id")?;
         return Ok(build(&derived_instants(
             sea_query::Condition::all(),
-            Some(derived_id),
+            Some(calculation_id),
         )));
     }
 
@@ -574,9 +619,9 @@ impl Job for DerivedRecompute {
             ctx.report(
                 JobReport::new()
                     .scope_opt(
-                        "derived_definition_id",
+                        "calculation_id",
                         ctx.params()
-                            .get("derived_definition_id")
+                            .get("calculation_id")
                             .and_then(|v| v.as_str().map(str::to_string)),
                     )
                     .scope_opt("earliest_filled", min_filled.map(|t| t.to_rfc3339()))
@@ -597,7 +642,7 @@ impl Job for DerivedRecompute {
 }
 /// Backfill derived values for the readings already present at a site when a derived
 /// `site_parameter` is assigned, then refresh continuous aggregates. Backs the `derived_assignment`
-/// trigger. Reads `derived_definition_id` and `site_id` from params.
+/// trigger. Reads `calculation_id` and `site_id` from params.
 pub struct DerivedAssignment;
 
 #[async_trait]
@@ -607,14 +652,14 @@ impl Job for DerivedAssignment {
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        let def_id = required_uuid(ctx.params(), "derived_definition_id")?;
+        let calculation_id = required_uuid(ctx.params(), "calculation_id")?;
         let site_id = required_uuid(ctx.params(), "site_id")?;
-        tracing::info!(%def_id, %site_id, "Computing derived values after site assignment");
+        tracing::info!(%calculation_id, %site_id, "Computing derived values after site assignment");
         ctx.set_site(site_id).await;
 
         let rows = ctx
             .db()
-            .query_all_raw(build(&instants_a_calculation_reads(def_id, site_id)))
+            .query_all_raw(build(&instants_a_calculation_reads(calculation_id, site_id)))
             .await?;
 
         let mut filled = 0i64;
@@ -644,7 +689,7 @@ impl Job for DerivedAssignment {
         let refused_slots = refused.report(ctx.db()).await?;
         ctx.report(
             JobReport::new()
-                .scope("derived_definition_id", def_id.to_string())
+                .scope("calculation_id", calculation_id.to_string())
                 .scope("site_id", site_id.to_string())
                 .scope_opt("earliest_filled", earliest.map(|t| t.to_rfc3339()))
                 .count("timestamps", rows.len())
@@ -652,7 +697,7 @@ impl Job for DerivedAssignment {
                 .count("refused_slots", refused_slots),
         )
         .await;
-        tracing::info!(%def_id, %site_id, filled, "Derived assignment backfill completed");
+        tracing::info!(%calculation_id, %site_id, filled, "Derived assignment backfill completed");
         Ok(filled)
     }
 }

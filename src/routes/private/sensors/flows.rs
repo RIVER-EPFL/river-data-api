@@ -134,7 +134,8 @@ impl Job for ReprocessAll {
         ctx.info(&format!("Backdating {slot_count} slot(s)")).await;
 
         let mut results = Vec::with_capacity(slot_count);
-        for (site_id, parameter_id) in slots {
+        for (walked, (site_id, parameter_id)) in slots.into_iter().enumerate() {
+            ctx.set_step(walked + 1, slot_count).await;
             let moved = reprocess_site_parameter_readings(
                 ctx.db(),
                 site_id,
@@ -150,6 +151,7 @@ impl Job for ReprocessAll {
         }
         let outcome = SlotOutcome::from(results);
         let total = outcome.readings;
+        ctx.info(&outcome.line("slots")).await;
         let report = outcome
             .record(
                 &ctx,
@@ -187,8 +189,14 @@ impl Job for BackfillCalibrations {
                 "backfill_calibrations: no instruments given".to_string(),
             ));
         }
-        let mut results = Vec::with_capacity(sensors.len());
-        for sensor_id in sensors {
+        let sensor_count = sensors.len();
+        ctx.info(&format!(
+            "Re-deriving calibrations for {sensor_count} instrument(s)"
+        ))
+        .await;
+        let mut results = Vec::with_capacity(sensor_count);
+        for (walked, sensor_id) in sensors.into_iter().enumerate() {
+            ctx.set_step(walked + 1, sensor_count).await;
             let moved = reprocess_sensor_readings(ctx.db(), sensor_id, Some(ctx.job_id()))
                 .await
                 .map(|n| n as i64);
@@ -196,6 +204,7 @@ impl Job for BackfillCalibrations {
         }
         let outcome = SlotOutcome::from(results);
         let total = outcome.readings;
+        ctx.info(&outcome.line("instruments")).await;
         let report = outcome
             .record(&ctx, JobReport::new().count("readings_updated", total))
             .await;

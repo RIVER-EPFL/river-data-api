@@ -1094,7 +1094,7 @@ pub struct DerivedPass {
 }
 
 struct Tally {
-    definition_id: Uuid,
+    calculation_id: Uuid,
     instants: usize,
     first: chrono::DateTime<chrono::Utc>,
     last: chrono::DateTime<chrono::Utc>,
@@ -1117,7 +1117,7 @@ impl DerivedPass {
                             tally.last = Ord::max(tally.last, time);
                         })
                         .or_insert(Tally {
-                            definition_id: slot.definition_id,
+                            calculation_id: slot.calculation_id,
                             instants: 1,
                             first: time,
                             last: time,
@@ -1156,7 +1156,7 @@ impl DerivedPass {
                 kind: HoldKind::SkippedOutput,
                 expected: serde_json::json!({
                     "reason": "the formula computed a value that is not finite",
-                    "derived_definition_id": tally.definition_id,
+                    "calculation_id": tally.calculation_id,
                 }),
                 computed: serde_json::json!({
                     "instants": tally.instants,

@@ -239,7 +239,7 @@ pub fn manual_run_for(trigger_type: &str) -> ManualRun {
         // the first missing key or moves nothing and reports zero (B262). What they read is what
         // they declare.
         "derived_recompute" => declared(vec![
-            spec("derived_definition_id", Uuid, false, "Calculation"),
+            spec("calculation_id", Uuid, false, "Calculation"),
             spec("site_ids", UuidList, false, "Sites"),
             spec("parameter_ids", UuidList, false, "Parameters"),
             spec("start", Instant, false, "Window start"),
@@ -271,7 +271,7 @@ pub fn manual_run_for(trigger_type: &str) -> ManualRun {
             spec("parameter_id", Uuid, false, "Parameter"),
         ]),
         "derived_assignment" => declared(vec![
-            spec("derived_definition_id", Uuid, true, "Calculation"),
+            spec("calculation_id", Uuid, true, "Calculation"),
             spec("site_id", Uuid, true, "Site"),
         ]),
         "merge_parameters" => declared(vec![
@@ -791,6 +791,19 @@ pub struct JobContext {
     params: serde_json::Value,
 }
 
+/// A count as the progress columns carry it. Saturating: a walk longer than the column can hold
+/// still reports a truthful "at least this far" rather than wrapping.
+fn as_progress(n: usize) -> i32 {
+    i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+/// Whether a walk of `len` items reports at `done`. The first and the last always report, so the
+/// length reaches the row immediately and the bar ends full; in between, a hundredth of the walk,
+/// which moves a bar without a write per row.
+fn reports_step(done: usize, len: usize) -> bool {
+    done <= 1 || done >= len || done.is_multiple_of((len / 100).max(1))
+}
+
 impl JobContext {
     /// Build a context for a job claimed by the worker pool. Returns the context plus the in-process
     /// cancel flag the worker's heartbeat flips when it sees `cancel_requested` on the row (or when
@@ -915,6 +928,17 @@ impl JobContext {
         {
             tracing::warn!(error = %e, job_id = %self.job_id, "Failed to set job site_id");
         }
+    }
+
+    /// Where a walk of `len` items has got to, so the bar has a denominator. The length is the
+    /// collection's own, read before the walk starts. A long walk reports every hundredth item
+    /// rather than every one, so watching a run costs no write per row.
+    pub async fn set_step(&self, done: usize, len: usize) {
+        if !reports_step(done, len) {
+            return;
+        }
+        self.set_progress(as_progress(done), Some(as_progress(len)))
+            .await;
     }
 
     /// Atomically persist `progress` (and `total` when provided) onto the row **and** emit the

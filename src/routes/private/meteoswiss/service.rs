@@ -7,11 +7,11 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult,
-    QueryFilter, Set, Statement,
+    QueryFilter, QuerySelect, Set, Statement,
 };
 use uuid::Uuid;
 
@@ -212,6 +212,97 @@ pub fn archive_hrefs(item: &serde_json::Value) -> Result<Vec<String>, String> {
     // `_t_recent` sorts after every decade, so the pass reads oldest to newest.
     hrefs.sort();
     Ok(hrefs.into_iter().map(|(_, href)| href).collect())
+}
+
+/// Whether an archive is one of the decade files rather than the recent one.
+#[must_use]
+pub fn historical(href: &str) -> bool {
+    href.contains("_t_historical_")
+}
+
+/// The decade a historical archive covers, read out of its published name
+/// (`ogd-smn_mob_t_historical_2010-2019.csv`).
+fn decade(href: &str) -> Option<(i32, i32)> {
+    let tail = href.rsplit("_t_historical_").next()?;
+    let years = tail.split('.').next()?;
+    let (from, until) = years.split_once('-')?;
+    Some((from.parse().ok()?, until.parse().ok()?))
+}
+
+/// The archives that can hold a point at or after `floor`: the recent file always, and a decade
+/// file whose last year is the floor's year or later. A `None` floor is a site holding no data of
+/// its own, which wants no history at all. A historical name the decade cannot be read out of is
+/// kept, so a changed publication format costs a fetch rather than a site's history.
+#[must_use]
+pub fn archives_since(hrefs: Vec<String>, floor: Option<DateTime<Utc>>) -> Vec<String> {
+    hrefs
+        .into_iter()
+        .filter(|href| {
+            if !historical(href) {
+                return true;
+            }
+            match (floor, decade(href)) {
+                (None, _) => false,
+                (Some(floor), Some((_, until))) => until >= floor.year(),
+                (Some(_), None) => true,
+            }
+        })
+        .collect()
+}
+
+#[derive(FromQueryResult)]
+struct FloorRow {
+    floor: Option<DateTime<Utc>>,
+}
+
+/// The earliest instant a site holds data of its own, the streams this feed provisions left out.
+///
+/// A fed parameter is only ever read beside the site's own measurements, so this is how far back a
+/// backfill reads: an archive older than the site's first reading is history nothing at the site
+/// will ever line a value up with. `None` is a site holding nothing yet.
+pub async fn site_floor<C: ConnectionTrait>(
+    db: &C,
+    site_id: Uuid,
+) -> Result<Option<DateTime<Utc>>, DbErr> {
+    let fed = fed_streams(db, site_id).await?;
+    let mut query = readings::Entity::find()
+        .select_only()
+        .expr_as(
+            sea_orm::sea_query::Func::min(sea_orm::sea_query::Expr::col(readings::Column::Time)),
+            "floor",
+        )
+        .filter(readings::Column::SiteId.eq(site_id));
+    if !fed.is_empty() {
+        query = query.filter(readings::Column::StreamId.is_not_in(fed));
+    }
+    Ok(query
+        .into_model::<FloorRow>()
+        .one(db)
+        .await?
+        .and_then(|row| row.floor))
+}
+
+/// The streams this feed provisions at a site, which speak for the station rather than for the
+/// site.
+async fn fed_streams<C: ConnectionTrait>(db: &C, site_id: Uuid) -> Result<Vec<Uuid>, DbErr> {
+    let slots: Vec<Uuid> = site_parameters::Entity::find()
+        .select_only()
+        .column(site_parameters::Column::Id)
+        .filter(site_parameters::Column::SiteId.eq(site_id))
+        .into_tuple()
+        .all(db)
+        .await?;
+    if slots.is_empty() {
+        return Ok(Vec::new());
+    }
+    data_streams::Entity::find()
+        .select_only()
+        .column(data_streams::Column::Id)
+        .filter(data_streams::Column::SourceSystem.eq(SOURCE_SYSTEM))
+        .filter(data_streams::Column::SiteParameterId.is_in(slots))
+        .into_tuple()
+        .all(db)
+        .await
 }
 
 /// The published path for one station's recent file, under the OGD collection base URL.
@@ -652,6 +743,26 @@ pub async fn insert<C: ConnectionTrait>(
         written += usize::try_from(affected).unwrap_or(0);
     }
     Ok(written)
+}
+
+/// What a land owes the rest of the system: the slot and channel it wrote to, and how many rows.
+///
+/// `DataIngested` is the whole cache-invalidation contract (`common/cache.rs`), and an open site
+/// page refreshes on it, so a pass that writes readings and stays quiet leaves both serving the
+/// answer from before it ran. A pass that wrote nothing has nothing to invalidate.
+#[must_use]
+pub fn announcement(
+    site_id: Uuid,
+    parameter_id: Uuid,
+    stream_id: Uuid,
+    written: usize,
+) -> Option<crate::common::AppEvent> {
+    (written > 0).then_some(crate::common::AppEvent::DataIngested {
+        site_id: Some(site_id),
+        parameter_id: Some(parameter_id),
+        stream_id: Some(stream_id),
+        count: written,
+    })
 }
 
 /// One chunk's insert. Every column the feed knows is set and the rest take their database

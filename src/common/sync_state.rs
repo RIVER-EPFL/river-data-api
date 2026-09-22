@@ -8,7 +8,7 @@
 use chrono::{DateTime, Utc};
 use sea_orm::DatabaseConnection;
 
-use crate::common::aggregates::{self, Window};
+use crate::common::aggregates::{self, RefreshReport, Window};
 use crate::error::AppResult;
 
 /// Refresh every rollup from `since` (bucket-floored) to now, so a change reaches the rollups
@@ -16,6 +16,6 @@ use crate::error::AppResult;
 pub async fn refresh_continuous_aggregates(
     db: &DatabaseConnection,
     since: DateTime<Utc>,
-) -> AppResult<()> {
+) -> AppResult<RefreshReport> {
     aggregates::refresh(db, Window::Since(since)).await
 }

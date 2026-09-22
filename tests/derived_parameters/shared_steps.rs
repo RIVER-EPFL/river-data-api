@@ -310,3 +310,112 @@ async fn a_formula_turned_into_a_step_gives_up_its_output_parameter() {
     .await;
     assert_eq!(stored, "none", "and so does the stored row");
 }
+
+/// Scenario: one step is owned by a calculation the lab runs at a visit and declared by a second
+/// calculation a site computes on its stream. The site declares a high-cadence slot for the second
+/// calculation's output, and a logger reading lands.
+///
+/// Expected behaviour: the stream pass evaluates the declared step as part of its own set and
+/// stores the output. A step shared between the arms is authored once and computes in both, which
+/// is the whole point of sharing it.
+#[tokio::test]
+#[serial]
+async fn a_step_shared_with_a_visit_calculation_computes_on_the_stream_too() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let (db, app, token) = setup().await;
+    let site_id = uuid::Uuid::parse_str(crate::common::SITE1_ID).expect("a uuid");
+
+    let visit_side = calculation(&db, "visit_side_set").await;
+    let stream_side = calculation(&db, "stream_side_set").await;
+
+    let step = post(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": "o2_doubled", "name": "Oxygen doubled", "units": "uM",
+            "formula": "Dissolved_O2 * 2", "tool_script_id": visit_side,
+            "ordinal": 0, "intermediate": true,
+        }),
+        &token,
+    )
+    .await;
+    post(
+        &app,
+        "/api/calculation_shared_steps",
+        &json!({ "tool_script_id": stream_side, "formula_id": id_of(&step) }),
+        &token,
+    )
+    .await;
+    let output = post(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": "o2_doubled_mgl", "name": "Oxygen doubled mg/L", "units": "mg/L",
+            "formula": "o2_doubled * 0.032", "tool_script_id": stream_side, "ordinal": 1,
+        }),
+        &token,
+    )
+    .await;
+    let output_parameter_id = output["output_parameter_id"]
+        .as_str()
+        .expect("the formula minted its output")
+        .to_string();
+
+    post(
+        &app,
+        "/api/site_parameters",
+        &json!({
+            "site_id": crate::common::SITE1_ID,
+            "parameter_id": output_parameter_id,
+            "name": "o2_doubled_mgl",
+            "sensor_type": "derived",
+            "entry_mode": "tool",
+            "cadence": "high",
+            "display_units": "mg/L",
+        }),
+        &token,
+    )
+    .await;
+
+    let at = chrono::Utc::now() - chrono::Duration::hours(4);
+    let at = at - chrono::Duration::nanoseconds(i64::from(at.timestamp_subsec_nanos()));
+    let (status, written) = crate::common::post_json_with_token(
+        &app,
+        "/api/readings/batch",
+        &json!({
+            "readings": [{
+                "site_id": crate::common::SITE1_ID,
+                "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
+                "time": at.to_rfc3339(),
+                "raw_value": 100.0,
+            }]
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "batch ({status}): {written}");
+
+    let output_uuid = uuid::Uuid::parse_str(&output_parameter_id).expect("a uuid");
+    river_db::routes::private::sensor_calibrations::service::recalculate_derived_at_timestamp(
+        &db, site_id, at,
+    )
+    .await
+    .expect("the stream pass runs");
+
+    let stored: Option<f64> = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT raw_value FROM readings WHERE site_id = $1 AND parameter_id = $2 AND time = $3",
+            [site_id.into(), output_uuid.into(), at.into()],
+        ))
+        .await
+        .expect("a query")
+        .map(|row| row.try_get::<f64>("", "raw_value").expect("a value"));
+    // (100 * 2) * 0.032
+    assert_eq!(
+        stored,
+        Some(6.4),
+        "the declared step evaluated inside the stream set"
+    );
+}

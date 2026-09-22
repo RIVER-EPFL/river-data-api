@@ -41,3 +41,26 @@ fn an_empty_slot_set_is_not_a_failure() {
     assert_eq!(outcome.readings, 0);
     assert!(!outcome.all_failed());
 }
+
+/// Expected behaviour: the closing line a walk writes names what moved and over how many, and
+/// mentions failures only when there were some, so a clean run reads as a clean run.
+#[test]
+fn test_the_closing_line_names_the_failures_only_when_there_are_some() {
+    let clean = SlotOutcome::from([
+        (serde_json::json!({ "slot": 1 }), Ok(12_000)),
+        (serde_json::json!({ "slot": 2 }), Ok(3)),
+    ]);
+    assert_eq!(clean.line("slots"), "Moved 12003 readings across 2 slots");
+
+    let partial = SlotOutcome::from([
+        (serde_json::json!({ "slot": 1 }), Ok(5)),
+        (
+            serde_json::json!({ "slot": 2 }),
+            Err(sea_orm::DbErr::Custom("no".to_string())),
+        ),
+    ]);
+    assert_eq!(
+        partial.line("instruments"),
+        "Moved 5 readings across 1 instruments, 1 failed"
+    );
+}

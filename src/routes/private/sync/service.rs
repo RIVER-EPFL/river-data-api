@@ -4401,6 +4401,18 @@ pub fn refuse_colliding_parameter_codes(
 }
 
 /// Apply a pairing plan: create entities, pair streams, backfill readings.
+/// A named step of a long-running flow, written to the run's timeline when one is watching. The
+/// flows below are reached both from a job and from a request, so the line is conditional on the
+/// context rather than on a branch at every call site.
+async fn step(
+    progress: Option<&crate::routes::private::reprocessing_jobs::service::JobContext>,
+    line: &str,
+) {
+    if let Some(ctx) = progress {
+        ctx.info(line).await;
+    }
+}
+
 pub async fn apply_plan(
     db: &sea_orm::DatabaseConnection,
     plan_id: Uuid,
@@ -4505,6 +4517,14 @@ pub async fn apply_plan(
         &minted,
     )
     .await?;
+    step(
+        progress,
+        &format!(
+            "Registered {} instruments, assigned {} curves and created {}",
+            counters.instruments_created, counters.curves_assigned, counters.curves_created
+        ),
+    )
+    .await;
 
     // How far the apply has got, on the pool connection rather than inside `txn`, so the operator
     // sees an import of a couple of thousand entries move instead of a spinner.
@@ -4585,8 +4605,29 @@ pub async fn apply_plan(
         counters.streams_paired += 1;
     }
 
+    step(
+        progress,
+        &format!(
+            "Paired {} streams, skipped {}; created {} sites, {} parameters and {} slots",
+            counters.streams_paired,
+            counters.streams_skipped,
+            counters.sites_created,
+            counters.params_created,
+            counters.sp_created
+        ),
+    )
+    .await;
+
     let backfilled = backfill_plan_readings(&txn, plan_id).await?;
     let readings_backfilled = backfilled.readings;
+    step(
+        progress,
+        &format!(
+            "Attributed {readings_backfilled} readings to the slots this plan paired, across {} visits",
+            backfilled.touched_events.len()
+        ),
+    )
+    .await;
     finalize_plan(&txn, plan_id, &counters, readings_backfilled).await?;
     txn.commit().await?;
 
@@ -4637,6 +4678,14 @@ pub async fn apply_plan(
         progress.map(crate::routes::private::reprocessing_jobs::service::JobContext::job_id),
     )
     .await?;
+    step(
+        progress,
+        &format!(
+            "Queued re-derivation of {} slots by deployment and calibration window",
+            slots.len()
+        ),
+    )
+    .await;
     let result = ApplyResult {
         projects_created: counters.projects_created,
         sites_created: counters.sites_created,

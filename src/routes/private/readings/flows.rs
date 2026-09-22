@@ -422,6 +422,12 @@ impl CsvImport {
 
         let total = i32::try_from(models.len()).unwrap_or(i32::MAX);
         ctx.set_progress(0, Some(total)).await;
+        ctx.info(&format!(
+            "Staged {} readings at {site_name} over {} instants, {replicate_groups} of them replicate groups",
+            models.len(),
+            distinct_ts.len()
+        ))
+        .await;
 
         // An overwrite replaces the whole replicate set, not the Nth row by the Nth: stored spot
         // replicates beyond the incoming count would survive a positional upsert and keep
@@ -579,6 +585,10 @@ impl CsvImport {
             ConflictMode::Overwrite => (affected_total.saturating_sub(overlapping), corrected),
         };
         tracing::info!(site = %site_name, inserted_total, overwritten, "CSV import inserted readings");
+        ctx.info(&format!(
+            "Wrote {inserted_total} readings and corrected {overwritten}"
+        ))
+        .await;
 
         if inserted_total > 0 || overwritten > 0 {
             // Phase 2: derived recompute over the imported timestamps.
@@ -604,6 +614,11 @@ impl CsvImport {
                 }
             }
             refused.report(ctx.db()).await?;
+            ctx.info(&format!(
+                "Recomputed the calculations at {} instants",
+                distinct_ts.len()
+            ))
+            .await;
 
             // An import is a person entering visits after the fact, so the rollups are refreshed
             // from the earliest instant it landed, and a failure there fails the job: a swallowed
@@ -857,12 +872,13 @@ impl Job for MeasurementRetag {
                 .await;
             return Ok(0);
         };
-        crate::common::aggregates::refresh(
+        let refreshed = crate::common::aggregates::refresh(
             ctx.db(),
             crate::common::aggregates::Window::Range(lo, hi),
         )
         .await
         .map_err(|e| DbErr::Custom(e.to_string()))?;
+        ctx.info(&refreshed.line()).await;
 
         // Reclassified rows change what bounded cached responses would serve.
         if retagged > 0

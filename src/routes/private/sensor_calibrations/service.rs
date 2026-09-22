@@ -18,7 +18,6 @@ use crate::routes::private::change_audit::service::{entity_revision, entity_revi
 use crate::routes::private::constants::models as constants;
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::derived_parameters::models::definition as calculation_formulas;
-use crate::routes::private::derived_parameters::models::source as derived_sources;
 use crate::routes::private::parameters::models as parameters;
 use crate::routes::private::readings::decision_model as reading_decisions;
 use crate::routes::private::readings::models as readings;
@@ -29,8 +28,9 @@ use crate::routes::private::sensor_deployments::models as sensor_deployments;
 use crate::routes::private::site_parameters::models as site_parameters;
 use crate::routes::private::sites;
 use crate::routes::private::standard_curves::models as standard_curves;
+use crate::routes::private::tools::models::PinnedFormula;
 use crate::routes::private::tools::service::{
-    free_identifiers, read_only_through_guards, reading_revision_expr,
+    StreamCalculation, free_identifiers, read_only_through_guards, reading_revision_expr,
 };
 
 /// The reprocess engines are driven by `Job::run`, whose error type is `DbErr`. The shared bulk-write
@@ -663,8 +663,7 @@ fn register_guards(ctx: &mut meval::Context) {
 #[derive(FromQueryResult)]
 struct DerivedWorkRow {
     id: Uuid,
-    derived_definition_id: Uuid,
-    formula: String,
+    tool_script_id: Uuid,
     site_id: Uuid,
     parameter_id: Uuid,
     parameter_code: String,
@@ -708,16 +707,63 @@ pub fn chosen_input(candidates: &[InputCandidate]) -> Option<&InputCandidate> {
     })
 }
 
-struct DerivedWork {
+/// One output of a calculation, at the site that configured a slot for it.
+struct DerivedOutput {
     site_param_id: Uuid,
-    derived_definition_id: Uuid,
-    formula: String,
+    parameter_id: Uuid,
+    /// The catalog code, which is the key the set's evaluation reports the value under.
+    parameter_code: String,
+}
+
+/// One calculation's work at one site: the pinned set its active version renders, and the outputs
+/// the site declared a stream-arm slot for. The unit of work is the calculation, not a formula: a
+/// set with steps produces its outputs from one evaluation, so resolving and evaluating per
+/// formula would compute the shared steps once per output.
+struct DerivedWork {
+    calculation: StreamCalculation,
     derived_site_id: Uuid,
-    derived_parameter_id: Uuid,
-    derived_parameter_code: String,
+    outputs: Vec<DerivedOutput>,
+}
+
+impl DerivedWork {
+    /// The catalog codes this set reads that it does not produce itself, lowercased.
+    fn source_codes(&self) -> Vec<String> {
+        let produced: Vec<String> = self
+            .calculation
+            .formulas
+            .iter()
+            .filter_map(|f| f.output_parameter_code.as_ref())
+            .map(|c| c.to_lowercase())
+            .collect();
+        let mut codes: Vec<String> = Vec::new();
+        for formula in &self.calculation.formulas {
+            for (_, code) in &formula.sources {
+                let code = code.to_lowercase();
+                if !produced.contains(&code) && !codes.contains(&code) {
+                    codes.push(code);
+                }
+            }
+        }
+        codes
+    }
+
+    /// The catalog codes this set produces, lowercased.
+    fn output_codes(&self) -> Vec<String> {
+        self.calculation
+            .formulas
+            .iter()
+            .filter_map(|f| f.output_parameter_code.as_ref())
+            .map(|c| c.to_lowercase())
+            .collect()
+    }
 }
 
 /// The query behind [`fetch_derived_work_items`].
+///
+/// One row per output slot the site fills on the stream arm: `entry_mode` is its declaration that
+/// the slot computes rather than being typed into, `cadence` that a stream carries it rather than
+/// a visit (Q234). The producing calculation is the one whose formula outputs the slot's
+/// parameter.
 fn derived_work_query(site_id: Uuid) -> SelectStatement {
     let sp = Alias::new("sp");
     let d = Alias::new("d");
@@ -725,10 +771,9 @@ fn derived_work_query(site_id: Uuid) -> SelectStatement {
     SeaQuery::select()
         .column((sp.clone(), site_parameters::Column::Id))
         .expr_as(
-            Expr::col((d.clone(), calculation_formulas::Column::Id)),
-            Alias::new("derived_definition_id"),
+            Expr::col((d.clone(), calculation_formulas::Column::ToolScriptId)),
+            Alias::new("tool_script_id"),
         )
-        .column((d.clone(), calculation_formulas::Column::Formula))
         .column((sp.clone(), site_parameters::Column::SiteId))
         .column((sp.clone(), site_parameters::Column::ParameterId))
         .expr_as(
@@ -751,16 +796,23 @@ fn derived_work_query(site_id: Uuid) -> SelectStatement {
                 .equals((sp.clone(), site_parameters::Column::ParameterId)),
         )
         .and_where(Expr::col((sp.clone(), site_parameters::Column::SiteId)).eq(site_id))
-        .and_where(Expr::col((d, calculation_formulas::Column::ToolScriptId)).is_null())
+        .and_where(Expr::col((d, calculation_formulas::Column::ToolScriptId)).is_not_null())
         .and_where(Expr::col((sp.clone(), site_parameters::Column::EntryMode)).eq("tool"))
         .and_where(Expr::col((sp, site_parameters::Column::Cadence)).eq("high"))
         .take()
 }
 
-/// The slots this site computes on a stream. The producing definition is the one whose output is
-/// the slot's parameter; `entry_mode` is the site's own declaration that it computes the slot
-/// rather than taking it by hand, and `cadence` that the stream carries it rather than a visit
-/// (Q234).
+/// Whether a calculation computes on the stream arm at all (Q228).
+///
+/// A curve slot is chosen by hand per grab sample, so a set that declares one has no stream
+/// equivalent: there is nobody to choose the curve at an ingest. Such a set is the visit arm's
+/// alone, and a slot configured for it here computes nothing rather than computing uncorrected.
+#[must_use]
+pub fn runs_on_streams(formulas: &[PinnedFormula]) -> bool {
+    formulas.iter().all(|f| f.curve_slot.is_none())
+}
+
+/// The calculations this site computes on a stream, each with the outputs it fills here.
 async fn fetch_derived_work_items(
     db: &DatabaseConnection,
     site_id: Uuid,
@@ -768,88 +820,96 @@ async fn fetch_derived_work_items(
     let rows = DerivedWorkRow::find_by_statement(build(derived_work_query(site_id)))
         .all(db)
         .await?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    let mut items = Vec::with_capacity(rows.len());
+    let mut items: Vec<DerivedWork> = Vec::new();
     for row in rows {
-        items.push(DerivedWork {
+        let output = DerivedOutput {
             site_param_id: row.id,
-            derived_definition_id: row.derived_definition_id,
-            formula: row.formula,
+            parameter_id: row.parameter_id,
+            parameter_code: row.parameter_code,
+        };
+        if let Some(work) = items
+            .iter_mut()
+            .find(|w| w.calculation.id == row.tool_script_id)
+        {
+            work.outputs.push(output);
+            continue;
+        }
+        let Some(calculation) =
+            crate::routes::private::tools::service::stream_calculation(db, row.tool_script_id)
+                .await
+                .map_err(app_error_as_db_err)?
+        else {
+            continue;
+        };
+        if !runs_on_streams(&calculation.formulas) {
+            continue;
+        }
+        items.push(DerivedWork {
+            calculation,
             derived_site_id: row.site_id,
-            derived_parameter_id: row.parameter_id,
-            derived_parameter_code: row.parameter_code,
+            outputs: vec![output],
         });
     }
     Ok(items)
 }
 
-async fn build_evaluation_order(
-    db: &DatabaseConnection,
-    work_items: &[DerivedWork],
-) -> Result<Vec<usize>, sea_orm::DbErr> {
-    let derived_param_ids: std::collections::HashSet<Uuid> =
-        work_items.iter().map(|w| w.derived_parameter_id).collect();
-
-    let mut deps: Vec<Vec<usize>> = Vec::with_capacity(work_items.len());
-    for item in work_items {
-        let source_param_ids =
-            source_parameter_ids_for_definition(db, item.derived_definition_id).await?;
-        let mut item_deps = Vec::new();
-        for source_param_id in source_param_ids {
-            if derived_param_ids.contains(&source_param_id)
-                && let Some(other) = work_items
-                    .iter()
-                    .position(|w| w.derived_parameter_id == source_param_id)
-            {
-                item_deps.push(other);
-            }
-        }
-        deps.push(item_deps);
-    }
+/// The order the site's calculations evaluate in: a calculation reading a parameter another one
+/// produces runs after it, so a chained output reads the value this pass just stored rather than
+/// the one the last pass left. The relation is between calculations, since a set's own formulas
+/// are already ordered by `in_order`.
+fn build_evaluation_order(work_items: &[DerivedWork]) -> Result<Vec<usize>, sea_orm::DbErr> {
+    let deps: Vec<Vec<usize>> = work_items
+        .iter()
+        .map(|item| {
+            let sources = item.source_codes();
+            work_items
+                .iter()
+                .enumerate()
+                .filter(|(_, other)| {
+                    !std::ptr::eq(*other, item)
+                        && other.output_codes().iter().any(|code| sources.contains(code))
+                })
+                .map(|(index, _)| index)
+                .collect()
+        })
+        .collect();
 
     crate::common::dependency::order(&deps).map_err(|cycle| {
         let members: Vec<&str> = cycle
             .iter()
-            .map(|&idx| work_items[idx].derived_parameter_code.as_str())
+            .map(|&idx| work_items[idx].calculation.name.as_str())
             .collect();
         sea_orm::DbErr::Custom(format!(
-            "Derived parameters form a dependency cycle and cannot be evaluated: {}",
+            "Calculations form a dependency cycle and cannot be evaluated: {}",
             members.join(", ")
         ))
     })
 }
 
+/// The stream one output writes on: the slot's own, minted on first use.
 async fn get_or_create_derived_stream(
     db: &DatabaseConnection,
-    item: &DerivedWork,
+    tool_name: &str,
+    site_id: Uuid,
+    output: &DerivedOutput,
 ) -> Result<Uuid, sea_orm::DbErr> {
-    let existing = stream_for_slot(db, item.site_param_id).await?;
-    if let Some(id) = existing {
+    if let Some(id) = stream_for_slot(db, output.site_param_id).await? {
         return Ok(id);
     }
 
-    let def_name: String = calculation_formulas::Entity::find_by_id(item.derived_definition_id)
-        .select_only()
-        .column(calculation_formulas::Column::Name)
-        .into_tuple::<String>()
-        .one(db)
-        .await?
-        .ok_or_else(|| {
-            sea_orm::DbErr::Custom(format!(
-                "derived_parameter_definition {} not found",
-                item.derived_definition_id
-            ))
-        })?;
-
-    let source_key = format!("{}_{}", def_name, item.derived_site_id);
+    let source_key = format!("{}_{}_{}", tool_name, output.parameter_code, site_id);
     let stream_id = Uuid::new_v4();
     let now = Utc::now();
     data_streams::Entity::insert(data_streams::ActiveModel {
         id: Set(stream_id),
         source_system: Set("derived".to_string()),
         source_key: Set(source_key),
-        source_name: Set(Some(def_name)),
-        site_parameter_id: Set(Some(item.site_param_id)),
+        source_name: Set(Some(tool_name.to_string())),
+        site_parameter_id: Set(Some(output.site_param_id)),
         is_active: Set(true),
         discovered_at: Set(now.into()),
         paired_at: Set(Some(now.into())),
@@ -867,7 +927,7 @@ async fn get_or_create_derived_stream(
     .exec(db)
     .await?;
 
-    stream_for_slot(db, item.site_param_id)
+    stream_for_slot(db, output.site_param_id)
         .await?
         .ok_or_else(|| {
             sea_orm::DbErr::Custom(
@@ -890,22 +950,6 @@ async fn stream_for_slot(
         .await
 }
 
-async fn source_parameter_ids_for_definition(
-    db: &DatabaseConnection,
-    derived_definition_id: Uuid,
-) -> Result<Vec<Uuid>, sea_orm::DbErr> {
-    Ok(derived_sources::Entity::find()
-        .filter(derived_sources::Column::DerivedDefinitionId.eq(derived_definition_id))
-        .select_only()
-        .column(derived_sources::Column::ParameterId)
-        .into_tuple::<Option<Uuid>>()
-        .all(db)
-        .await?
-        .into_iter()
-        .flatten()
-        .collect())
-}
-
 /// What one derived slot's pass did at one instant. The instant is the caller's, which is what
 /// lets a run report a slot once for the whole pass rather than once per instant (Q172).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -921,7 +965,8 @@ pub enum SlotPass {
 pub struct DerivedSlot {
     pub site_id: Uuid,
     pub parameter_id: Uuid,
-    pub definition_id: Uuid,
+    /// The calculation that produced the value.
+    pub calculation_id: Uuid,
     pub pass: SlotPass,
 }
 
@@ -937,18 +982,10 @@ pub async fn recalculate_derived_at_timestamp(
         return Ok(Vec::new());
     }
 
-    let ordered = build_evaluation_order(db, &work_items).await?;
+    let ordered = build_evaluation_order(&work_items)?;
     let mut passes = Vec::new();
     for idx in ordered {
-        let item = &work_items[idx];
-        if let Some(pass) = evaluate_and_upsert_derived(db, item, time).await? {
-            passes.push(DerivedSlot {
-                site_id: item.derived_site_id,
-                parameter_id: item.derived_parameter_id,
-                definition_id: item.derived_definition_id,
-                pass,
-            });
-        }
+        passes.extend(evaluate_set_and_upsert(db, &work_items[idx], time).await?);
     }
     Ok(passes)
 }
@@ -1004,78 +1041,102 @@ fn input_value_query(
 
 /// The variables one instant binds, and every input as it was read (Q215).
 struct ResolvedDerived {
-    variables: HashMap<String, f64>,
+    /// The inputs the set binds, by variable name, as [`evaluate`] takes them.
+    inputs: HashMap<String, f64>,
+    /// The constants the set names, resolved once for the whole set.
+    constants: HashMap<String, f64>,
+    /// Every input as it was read (Q215), keyed by the variable it bound.
     consumed: Vec<ConsumedInput>,
 }
 
-async fn resolve_variables_for_derived(
-    db: &DatabaseConnection,
-    item: &DerivedWork,
-    time: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<Option<ResolvedDerived>>, sea_orm::DbErr> {
-    let mapping_rows: Vec<(String, Option<Uuid>, Option<String>)> = derived_sources::Entity::find()
-        .filter(derived_sources::Column::DerivedDefinitionId.eq(item.derived_definition_id))
+/// The parameter a set reads into one variable, resolved from the catalog once per pass.
+async fn source_parameter_ids<C: ConnectionTrait>(
+    db: &C,
+    codes: &[String],
+) -> Result<HashMap<String, Uuid>, sea_orm::DbErr> {
+    if codes.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(Uuid, String)> = parameters::Entity::find()
+        .filter(
+            Expr::expr(Func::lower(Expr::col(parameters::Column::Code)))
+                .is_in(codes.iter().map(|c| c.to_lowercase()).collect::<Vec<_>>()),
+        )
         .select_only()
-        .column(derived_sources::Column::VariableName)
-        .column(derived_sources::Column::ParameterId)
-        .column(derived_sources::Column::SiteProperty)
+        .column(parameters::Column::Id)
+        .column(parameters::Column::Code)
         .into_tuple()
         .all(db)
         .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, code)| (code.to_lowercase(), id))
+        .collect())
+}
 
-    // A definition with no declared sources computes nothing at any instant. That is a definition
-    // that was never finished, not an input that went away, so it leaves whatever is stored alone.
-    if mapping_rows.is_empty() {
-        return Ok(Some(None));
-    }
+/// Resolve every source the set reads at one instant, once for the whole set.
+///
+/// A variable the instant holds no value for is left unbound rather than refused here: the set
+/// evaluator decides per formula whether a missing value is a guarded NA or a skip, so a set
+/// whose second formula reads a parameter this visit lacks still computes its first.
+async fn resolve_set_inputs(
+    db: &DatabaseConnection,
+    item: &DerivedWork,
+    time: chrono::DateTime<chrono::Utc>,
+) -> Result<ResolvedDerived, sea_orm::DbErr> {
+    let formulas = &item.calculation.formulas;
+    let produced: Vec<String> = item.output_codes();
+    let catalog = source_parameter_ids(db, &item.source_codes()).await?;
 
-    let mut parameters = Vec::new();
-    let mut properties = Vec::new();
-    let mut consumed = Vec::new();
-    for (var_name, source_param_id, site_property) in mapping_rows {
-        if let Some(source_param_id) = source_param_id {
+    let mut inputs: HashMap<String, f64> = HashMap::new();
+    let mut consumed: Vec<ConsumedInput> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for formula in formulas {
+        for (variable, code) in &formula.sources {
+            if seen.contains(variable) || produced.contains(&code.to_lowercase()) {
+                continue;
+            }
+            seen.push(variable.clone());
+            let Some(&parameter_id) = catalog.get(&code.to_lowercase()) else {
+                continue;
+            };
             let candidates = InputCandidate::find_by_statement(build(input_value_query(
                 item.derived_site_id,
-                source_param_id,
+                parameter_id,
                 time,
             )))
             .all(db)
             .await?;
-            let value_row = chosen_input(&candidates);
-            if let Some(input) = value_row {
-                if input.measurement_type.as_deref() == Some("spot") {
-                    tracing::debug!(
-                        variable = %var_name,
-                        parameter_id = %source_param_id,
-                        time = %time,
-                        "Derived input resolved from a grab (spot) reading"
-                    );
-                }
-                // A mean stands on every member of its sample; a single row on itself.
-                let members: Vec<ConsumedReading> = if input.from_mean {
-                    candidates
-                        .iter()
-                        .filter(|c| c.from_mean)
-                        .map(|c| c.consumed(time))
-                        .collect()
-                } else {
-                    vec![input.consumed(time)]
-                };
-                consumed.push(ConsumedInput {
-                    variable: var_name.clone(),
-                    kind: if input.from_mean { "mean" } else { "reading" }.to_string(),
-                    subject: None,
-                    property: None,
-                    revision: None,
-                    members,
-                    value: serde_json::json!(input.value),
-                });
-            }
-            parameters.push((var_name, value_row.map(|input| input.value)));
-        } else if let Some(property) = site_property {
-            properties.push((var_name, property));
+            let Some(input) = chosen_input(&candidates) else {
+                continue;
+            };
+            // A mean stands on every member of its sample; a single row on itself.
+            let members: Vec<ConsumedReading> = if input.from_mean {
+                candidates
+                    .iter()
+                    .filter(|c| c.from_mean)
+                    .map(|c| c.consumed(time))
+                    .collect()
+            } else {
+                vec![input.consumed(time)]
+            };
+            consumed.push(ConsumedInput {
+                variable: variable.clone(),
+                kind: if input.from_mean { "mean" } else { "reading" }.to_string(),
+                subject: None,
+                property: None,
+                revision: None,
+                members,
+                value: serde_json::json!(input.value),
+            });
+            inputs.insert(variable.clone(), input.value);
         }
     }
+
+    let properties: Vec<(String, String)> = formulas
+        .iter()
+        .flat_map(|f| f.site_sources.iter().cloned())
+        .collect();
     let site_properties = site_property_values(db, item.derived_site_id, &properties).await?;
     if !site_properties.is_empty() {
         let subject = format!("site:{}", item.derived_site_id);
@@ -1083,6 +1144,9 @@ async fn resolve_variables_for_derived(
             .await
             .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
         for ((variable, value), (_, property)) in site_properties.iter().zip(&properties) {
+            if let Some(value) = value {
+                inputs.insert(variable.clone(), *value);
+            }
             consumed.push(ConsumedInput {
                 variable: variable.clone(),
                 kind: "site".to_string(),
@@ -1094,67 +1158,88 @@ async fn resolve_variables_for_derived(
             });
         }
     }
-    let declared: Vec<String> = parameters
-        .iter()
-        .chain(&site_properties)
-        .map(|(variable, _)| variable.clone())
+
+    let declared: Vec<String> = inputs
+        .keys()
+        .cloned()
+        .chain(site_properties.iter().map(|(variable, _)| variable.clone()))
+        .chain(formulas.iter().filter(|f| f.intermediate).map(|f| f.code.clone()))
         .collect();
-    let (constants, constants_read) = constants_consumed(db, &item.formula, &declared).await?;
+    let set_text = formulas
+        .iter()
+        .map(|f| f.formula.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (constants, constants_read) = constants_consumed(db, &set_text, &declared).await?;
     consumed.extend(constants_read);
-    let step_subject = format!("calculation_formula:{}", item.derived_definition_id);
-    consumed.push(ConsumedInput {
-        variable: item.derived_parameter_code.clone(),
-        kind: "step".to_string(),
-        revision: entity_revision(db, &step_subject)
-            .await
-            .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?,
-        subject: Some(step_subject),
-        property: None,
-        members: Vec::new(),
-        value: serde_json::Value::String(item.formula.clone()),
-    });
-    match bind_derived_variables(&item.formula, &parameters, &site_properties, &constants) {
-        Ok(variables) => Ok(Some(Some(ResolvedDerived {
-            variables,
-            consumed,
-        }))),
-        Err(reason) => {
-            tracing::debug!(
-                definition_id = %item.derived_definition_id,
-                time = %time,
-                reason,
-                "Derived formula skipped at this instant"
-            );
-            Ok(None)
-        }
-    }
+
+    Ok(ResolvedDerived {
+        inputs,
+        constants,
+        consumed,
+    })
 }
 
-/// The variables a derived formula binds at one instant, or why the instant is skipped.
-///
-/// A constant is bound by name. A parameter or site property the instant does not hold is NaN
-/// where the formula reads it only through a guard (`coalesce`, `is_missing`, a comparison), so
-/// the portal's fallback takes its other arm, and a skip where it is read anywhere else. The same
-/// binding a formula set gets in `tools::service::evaluate_set`.
-pub(crate) fn bind_derived_variables(
-    formula: &str,
-    parameters: &[(String, Option<f64>)],
-    site_properties: &[(String, Option<f64>)],
-    constants: &HashMap<String, f64>,
-) -> Result<HashMap<String, f64>, String> {
-    let mut variables = constants.clone();
-    for (variable, value) in parameters.iter().chain(site_properties) {
-        match value {
-            Some(value) => {
-                variables.insert(variable.clone(), *value);
-            }
-            None if read_only_through_guards(formula, variable) => {
-                variables.insert(variable.clone(), f64::NAN);
-            }
-            None => return Err(format!("no value for {variable}")),
+/// The capture one output of a set carries: every input its own formula bound, named as it was
+/// read, plus the formula itself. A step it read is captured as the number that step computed,
+/// under the step's own code, so the replay is the output's arithmetic over what it consumed and
+/// needs nothing from the store.
+async fn output_capture<C: ConnectionTrait>(
+    db: &C,
+    formula: &PinnedFormula,
+    formula_id: Option<Uuid>,
+    evaluated: &crate::routes::private::tools::models::Evaluated,
+    resolved: &ResolvedDerived,
+    steps: &HashMap<String, (Uuid, f64)>,
+) -> Result<Vec<ConsumedInput>, sea_orm::DbErr> {
+    let mut consumed: Vec<ConsumedInput> = Vec::new();
+    for (variable, value) in &evaluated.bindings {
+        if let Some(input) = resolved.consumed.iter().find(|c| &c.variable == variable) {
+            consumed.push(input.clone());
+            continue;
         }
+        if let Some((step_id, computed)) = steps.get(&variable.to_lowercase()) {
+            let subject = format!("calculation_formula:{step_id}");
+            consumed.push(ConsumedInput {
+                variable: variable.clone(),
+                kind: "computed".to_string(),
+                revision: entity_revision(db, &subject)
+                    .await
+                    .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?,
+                subject: Some(subject),
+                property: None,
+                members: Vec::new(),
+                value: serde_json::json!(computed),
+            });
+            continue;
+        }
+        consumed.push(ConsumedInput {
+            variable: variable.clone(),
+            kind: "constant".to_string(),
+            subject: None,
+            property: None,
+            revision: None,
+            members: Vec::new(),
+            value: serde_json::json!(value),
+        });
     }
-    Ok(variables)
+    let subject = formula_id.map(|id| format!("calculation_formula:{id}"));
+    let revision = match &subject {
+        Some(subject) => entity_revision(db, subject)
+            .await
+            .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?,
+        None => None,
+    };
+    consumed.push(ConsumedInput {
+        variable: formula.code.clone(),
+        kind: "step".to_string(),
+        revision,
+        subject,
+        property: None,
+        members: Vec::new(),
+        value: serde_json::Value::String(formula.formula.clone()),
+    });
+    Ok(consumed)
 }
 
 /// The formula a captured set carries, and the numbers it was evaluated over.
@@ -1292,44 +1377,17 @@ fn unattribute_statement(
         .take()
 }
 
-/// What a derived pass does with the number the formula produced at one instant (Q172).
-///
-/// NaN is NA: the formula says there is no value here, so nothing is stored and whatever the slot
-/// holds from an earlier pass is cleared. `withdrawn_at` is confined to spot rows by
-/// `readings_withdrawn_spot_only`, so clearing a derived row is the unattribution the recalled
-/// input arm already uses.
-///
-/// Inf and -Inf are a refusal, not an NA: a divide by zero says the formula could not compute
-/// here, which is not the same as saying the quantity is absent. Nothing is stored and the value
-/// that stands stays served until the input is corrected.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DerivedOutcome {
-    Store(f64),
-    Clear,
-    Refuse,
-}
-
-#[must_use]
-pub fn derived_outcome(result: f64) -> DerivedOutcome {
-    if result.is_nan() {
-        DerivedOutcome::Clear
-    } else if result.is_infinite() {
-        DerivedOutcome::Refuse
-    } else {
-        DerivedOutcome::Store(result)
-    }
-}
-
 /// Clear the site off a stored derived row, the unattributed state a recalled input leaves it in.
 async fn unattribute_derived_at(
     db: &DatabaseConnection,
-    item: &DerivedWork,
+    site_id: Uuid,
+    parameter_id: Uuid,
     time: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), sea_orm::DbErr> {
     crate::common::bulk_write::guarded(db, async |txn| {
         crate::common::bulk_write::mutation_rows(
             txn,
-            unattribute_statement(item.derived_site_id, item.derived_parameter_id, time),
+            unattribute_statement(site_id, parameter_id, time),
         )
         .await?;
         Ok(())
@@ -1464,82 +1522,162 @@ fn derived_upsert(
         .take()
 }
 
-/// Evaluate one derived slot at one instant and store what it produced. The outcome is the
-/// caller's to report; `None` is a pass with nothing to say about this slot.
-async fn evaluate_and_upsert_derived(
+/// Evaluate one calculation's set at one instant and store every output the site fills here.
+///
+/// The set is evaluated once: a step two outputs read is computed once, and each output is stored
+/// on its own stream with its own decision. A formula the instant cannot bind is skipped by the
+/// evaluator and the rest of the set still stores (Q228).
+async fn evaluate_set_and_upsert(
     db: &DatabaseConnection,
     item: &DerivedWork,
     time: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<SlotPass>, sea_orm::DbErr> {
-    let Some(resolved) = resolve_variables_for_derived(db, item, time).await? else {
-        // The inputs no longer resolve at this instant, so the stored derived value is the output
-        // of a measurement that is not served any more. It leaves the site the same way its input
-        // did rather than staying in the aggregates and the public arm.
-        unattribute_derived_at(db, item, time).await?;
-        return Ok(None);
-    };
-    let Some(ResolvedDerived {
-        variables,
-        consumed,
-    }) = resolved
-    else {
-        return Ok(None);
-    };
+) -> Result<Vec<DerivedSlot>, sea_orm::DbErr> {
+    use crate::routes::private::tools::service::evaluate;
 
-    let result = match evaluate_formula(&item.formula, &variables) {
-        Ok(result) => result,
+    let resolved = resolve_set_inputs(db, item, time).await?;
+    let evaluated = match evaluate(
+        &item.calculation.formulas,
+        &resolved.inputs,
+        &resolved.constants,
+        &HashMap::new(),
+    ) {
+        Ok(cells) => cells,
         Err(error) => {
             tracing::warn!(
-                definition_id = %item.derived_definition_id,
-                formula = %item.formula,
+                calculation = %item.calculation.name,
                 time = %time,
                 error,
-                "Derived formula failed to evaluate"
+                "Continuous calculation could not be evaluated"
             );
-            return Ok(None);
+            return Ok(Vec::new());
         }
     };
-    let result = match derived_outcome(result) {
-        DerivedOutcome::Store(value) => value,
-        DerivedOutcome::Clear => {
-            unattribute_derived_at(db, item, time).await?;
-            return Ok(None);
+
+    let ordered = crate::routes::private::tools::service::in_order(&item.calculation.formulas)
+        .map_err(sea_orm::DbErr::Custom)?;
+    let codes: Vec<String> = item
+        .calculation
+        .formulas
+        .iter()
+        .map(|f| f.code.clone())
+        .collect();
+    let formula_ids = formula_ids_by_code(db, &codes).await?;
+    // Every step's number, so an output that read one captures the value rather than the code.
+    let steps: HashMap<String, (Uuid, f64)> = ordered
+        .iter()
+        .zip(&evaluated)
+        .filter(|(formula, _)| formula.intermediate)
+        .filter_map(|(formula, cell)| {
+            let id = *formula_ids.get(&formula.code.to_lowercase())?;
+            Some((formula.code.to_lowercase(), (id, cell.value?)))
+        })
+        .collect();
+
+    let mut passes = Vec::new();
+    for (formula, cell) in ordered.iter().zip(&evaluated) {
+        let Some(code) = formula.output_parameter_code.as_ref() else {
+            continue;
+        };
+        let Some(output) = item
+            .outputs
+            .iter()
+            .find(|o| o.parameter_code.eq_ignore_ascii_case(code))
+        else {
+            continue;
+        };
+        let site_id = item.derived_site_id;
+        // A divide by zero is refused, not cleared (Q172): the value that stands stays served and
+        // the finding is the only thing that says the formula stopped computing.
+        if cell.refused {
+            passes.push(DerivedSlot {
+                site_id,
+                parameter_id: output.parameter_id,
+                calculation_id: item.calculation.id,
+                pass: SlotPass::Refused,
+            });
+            continue;
         }
-        DerivedOutcome::Refuse => return Ok(Some(SlotPass::Refused)),
-    };
+        // Everything else with no value is the unattribution arm: an input the formula reads
+        // outside a guard went away, or the arithmetic came out NA. Either way the slot stops
+        // serving a number it no longer computes.
+        let Some(value) = cell.value else {
+            unattribute_derived_at(db, site_id, output.parameter_id, time).await?;
+            continue;
+        };
 
-    let stream_id = get_or_create_derived_stream(db, item).await?;
-    let version = None;
-
-    // A recompute that moves a stored value or the version it names records the move (Q116), so a
-    // person opening the value reads what it was and which formula edit changed it. Recorded
-    // before the write, because the decision captures `old` from the row as it still stands; a
-    // first insert is not a transition, and a pass that changes neither is not a decision. The
-    // decision, the write and the arrival commit together, so the value and what it consumed
-    // (Q215) cannot be read apart.
-    let site_id = item.derived_site_id;
-    let parameter_id = item.derived_parameter_id;
-    crate::common::bulk_write::guarded(db, async |txn| {
-        let born = record_formula_transition(txn, stream_id, time, result, version, &consumed)
-            .await
-            .map_err(crate::error::AppError::from)?;
-        crate::common::bulk_write::mutation_rows(
-            txn,
-            derived_upsert(stream_id, site_id, parameter_id, time, result, version),
+        let consumed = output_capture(
+            db,
+            formula,
+            formula_ids.get(&formula.code.to_lowercase()).copied(),
+            cell,
+            &resolved,
+            &steps,
         )
         .await?;
-        // A slot's first number is a change to the readings as much as a move is (Q57, Q118),
-        // and it is recorded after the write because the decision reads the row it is about.
-        if born {
-            record_derived_arrival(txn, stream_id, time, &consumed)
+        let stream_id =
+            get_or_create_derived_stream(db, &item.calculation.name, site_id, output).await?;
+        let version = None;
+        let parameter_id = output.parameter_id;
+        // A recompute that moves a stored value or the version it names records the move (Q116),
+        // so a person opening the value reads what it was and which formula edit changed it.
+        // Recorded before the write, because the decision captures `old` from the row as it still
+        // stands; a first insert is not a transition, and a pass that changes neither is not a
+        // decision. The decision, the write and the arrival commit together, so the value and what
+        // it consumed (Q215) cannot be read apart.
+        crate::common::bulk_write::guarded(db, async |txn| {
+            let born = record_formula_transition(txn, stream_id, time, value, version, &consumed)
                 .await
                 .map_err(crate::error::AppError::from)?;
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
-    Ok(Some(SlotPass::Stored))
+            crate::common::bulk_write::mutation_rows(
+                txn,
+                derived_upsert(stream_id, site_id, parameter_id, time, value, version),
+            )
+            .await?;
+            // A slot's first number is a change to the readings as much as a move is (Q57, Q118),
+            // and it is recorded after the write because the decision reads the row it is about.
+            if born {
+                record_derived_arrival(txn, stream_id, time, &consumed)
+                    .await
+                    .map_err(crate::error::AppError::from)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+        passes.push(DerivedSlot {
+            site_id,
+            parameter_id,
+            calculation_id: item.calculation.id,
+            pass: SlotPass::Stored,
+        });
+    }
+    Ok(passes)
+}
+
+/// The `calculation_formulas` row behind each code of a set, so a captured step names the formula
+/// it came from. Read by code rather than by owner, because a step the calculation declared
+/// rather than wrote belongs to no calculation (Q156) and is still part of the set.
+async fn formula_ids_by_code<C: ConnectionTrait>(
+    db: &C,
+    codes: &[String],
+) -> Result<HashMap<String, Uuid>, sea_orm::DbErr> {
+    if codes.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(calculation_formulas::Entity::find()
+        .filter(
+            Expr::expr(Func::lower(Expr::col(calculation_formulas::Column::Code)))
+                .is_in(codes.iter().map(|c| c.to_lowercase()).collect::<Vec<_>>()),
+        )
+        .select_only()
+        .column(calculation_formulas::Column::Id)
+        .column(calculation_formulas::Column::Code)
+        .into_tuple::<(Uuid, String)>()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|(id, code)| (code.to_lowercase(), id))
+        .collect())
 }
 
 /// Record the arrival of a derived value, the state it arrived in read from the row itself.

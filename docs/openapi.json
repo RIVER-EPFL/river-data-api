@@ -4286,7 +4286,7 @@
         "type": "object"
       },
       "ConsumedInput": {
-        "description": "One input a calculation consumed, captured when it was read (Q215): what it was bound to and\nthe exact revision of every row behind it, so a later reader can say whether the source has\nmoved since. `kind` is `reading` (one row), `mean` (the sample statistic over `members`),\n`replicates` (a family, one member per index, a gap as a member with no value), `site` (a\ncolumn of the site row), `constant`, `curve` (a catalog curve, or entered coefficients with no\nsubject), or `step` (a formula of the pinned set). An entity input names its `change_audit`\nsubject and the newest `seq` for it.",
+        "description": "One input a calculation consumed, captured when it was read (Q215): what it was bound to and\nthe exact revision of every row behind it, so a later reader can say whether the source has\nmoved since. `kind` is `reading` (one row), `mean` (the sample statistic over `members`),\n`replicates` (a family, one member per index, a gap as a member with no value), `site` (a\ncolumn of the site row), `constant`, `curve` (a catalog curve, or entered coefficients with no\nsubject), `computed` (the number a step of the same set produced, under the step's own code)\nor `step` (a formula of the pinned set). An entity input names its `change_audit` subject and\nthe newest `seq` for it.",
         "properties": {
           "kind": {
             "type": "string"
@@ -27552,7 +27552,7 @@
         "operationId": "recompute_derived",
         "parameters": [
           {
-            "description": "Derived parameter definition UUID",
+            "description": "Calculation UUID",
             "in": "path",
             "name": "id",
             "required": true,
@@ -27574,7 +27574,7 @@
             "description": "Background recompute job triggered"
           },
           "404": {
-            "description": "Derived parameter definition not found"
+            "description": "Calculation not found"
           }
         },
         "summary": "Recompute every derived value for a given derived parameter definition. Backfills via\njoining source readings; tracked as a `reprocessing_jobs` row. Refreshes continuous\naggregates on completion. Requires `write_metadata`.",

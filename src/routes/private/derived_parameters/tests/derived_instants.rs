@@ -11,7 +11,11 @@ fn test_derived_instants_reaches_the_tool_entered_slot_in_both_scopes() {
         assert!(sql.contains(r#"SELECT DISTINCT"#), "{sql}");
         assert!(sql.contains(r#"FROM "readings" AS "r""#), "{sql}");
         assert!(
-            sql.contains(r#"JOIN "calculation_formulas" AS "d""#),
+            sql.contains(r#"JOIN "calculation_formulas" AS "f""#),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(r#"JOIN "calculation_formulas" AS "o""#),
             "{sql}"
         );
         assert!(
@@ -21,7 +25,7 @@ fn test_derived_instants_reaches_the_tool_entered_slot_in_both_scopes() {
         assert!(sql.contains(r#""sp"."entry_mode" = 'tool'"#), "{sql}");
         assert!(sql.contains(r#""sp"."cadence" = 'high'"#), "{sql}");
         assert!(
-            sql.contains(r#""sp"."parameter_id" = "d"."output_parameter_id""#),
+            sql.contains(r#""sp"."parameter_id" = "o"."output_parameter_id""#),
             "{sql}"
         );
         assert!(

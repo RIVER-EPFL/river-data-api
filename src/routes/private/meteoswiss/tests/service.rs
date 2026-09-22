@@ -1,8 +1,7 @@
 use super::{
-    ATTRIBUTION, VARIABLES, archive_hrefs, attributions, distance_km, insert_chunk, latest, latin1,
-    listed_station, nothing_published, rank_stations, recent_url, require_declared, series,
-    stac_item_url, station_publishes, stations,
-    stations_url, variable,
+    ATTRIBUTION, VARIABLES, announcement, archive_hrefs, archives_since, attributions, distance_km,
+    insert_chunk, latest, latin1, listed_station, nothing_published, rank_stations, recent_url,
+    require_declared, series, stac_item_url, station_publishes, stations, stations_url, variable,
 };
 use crate::routes::private::meteoswiss::models::{Point, station, subscription};
 use chrono::{TimeZone, Utc};
@@ -552,8 +551,88 @@ fn test_archive_hrefs_are_the_ten_minute_files_oldest_first() {
     );
 }
 
+fn names(hrefs: &[String]) -> Vec<&str> {
+    hrefs
+        .iter()
+        .map(|href| href.rsplit('/').next().unwrap())
+        .collect()
+}
+
+#[test]
+fn test_a_decade_ending_before_the_site_s_own_data_is_not_read() {
+    let hrefs = archive_hrefs(&stac_item()).expect("the item lists assets");
+    let floor = Utc.with_ymd_and_hms(2021, 3, 4, 0, 0, 0).unwrap();
+    assert_eq!(
+        names(&archives_since(hrefs, Some(floor))),
+        vec![
+            "ogd-smn_mob_t_historical_2020-2029.csv",
+            "ogd-smn_mob_t_recent.csv",
+        ],
+        "the 2010-2019 decade ends before the site's first reading"
+    );
+}
+
+#[test]
+fn test_a_decade_the_floor_falls_inside_is_read() {
+    let hrefs = archive_hrefs(&stac_item()).expect("the item lists assets");
+    let floor = Utc.with_ymd_and_hms(2019, 12, 31, 23, 50, 0).unwrap();
+    assert_eq!(names(&archives_since(hrefs, Some(floor))).len(), 3);
+}
+
+#[test]
+fn test_a_site_with_no_data_of_its_own_reads_the_recent_file_alone() {
+    let hrefs = archive_hrefs(&stac_item()).expect("the item lists assets");
+    assert_eq!(
+        names(&archives_since(hrefs, None)),
+        vec!["ogd-smn_mob_t_recent.csv"]
+    );
+}
+
+/// A decade the published name does not carry is read rather than dropped: the cost of a changed
+/// format is a fetch, not a site losing its history.
+#[test]
+fn test_an_unreadable_decade_is_read() {
+    let hrefs = vec!["https://x/ogd-smn_mob_t_historical_archive.csv".to_string()];
+    let floor = Utc.with_ymd_and_hms(2021, 1, 1, 0, 0, 0).unwrap();
+    assert_eq!(archives_since(hrefs.clone(), Some(floor)), hrefs);
+}
+
 #[test]
 fn test_archive_hrefs_refuses_an_item_with_no_assets() {
     let refusal = archive_hrefs(&serde_json::Value::Null).expect_err("nothing to read");
     assert!(str::contains(&refusal, "assets"), "{refusal}");
+}
+
+/// Scenario: a pass lands pressure at Martigny, and the next archive it reads holds nothing new.
+///
+/// Expected behaviour: the rows it wrote are announced, naming the slot and the channel, because
+/// `DataIngested` is what drops that site's cached responses and refreshes an open site page; a
+/// write of nothing announces nothing.
+#[test]
+fn test_a_land_announces_the_rows_it_wrote_and_nothing_else() {
+    let site_id = Uuid::new_v4();
+    let parameter_id = Uuid::new_v4();
+    let stream_id = Uuid::new_v4();
+
+    let event = announcement(site_id, parameter_id, stream_id, 525_599)
+        .expect("rows written are announced");
+    match event {
+        crate::common::AppEvent::DataIngested {
+            site_id: s,
+            parameter_id: p,
+            stream_id: st,
+            count,
+        } => {
+            assert_eq!(s, Some(site_id));
+            assert_eq!(p, Some(parameter_id));
+            assert_eq!(st, Some(stream_id));
+            assert_eq!(count, 525_599);
+        }
+        other => panic!("a land announces an ingest, got {other:?}"),
+    }
+
+    assert!(
+        announcement(site_id, parameter_id, stream_id, 0).is_none(),
+        "a pass that wrote nothing invalidates nothing"
+    );
 }

@@ -112,3 +112,30 @@ fn test_is_retry_budget_spent_at_and_past_the_limit() {
     // No retries configured: the first orphaning is final
     assert!(is_retry_budget_spent(0, 0));
 }
+
+/// Expected behaviour: a walk's position and its length reach the columns as they are, and a
+/// collection longer than the columns can hold still reports a truthful "at least this far"
+/// rather than wrapping into a negative.
+#[test]
+fn a_walk_is_counted_into_the_progress_columns_and_never_wraps() {
+    assert_eq!(as_progress(0), 0);
+    assert_eq!(as_progress(8), 8);
+    assert_eq!(as_progress(usize::MAX), i32::MAX);
+}
+
+/// Expected behaviour: the length reaches the row on the first item and the bar ends full, and a
+/// long walk reports a hundred times rather than once per row.
+#[test]
+fn a_walk_reports_its_ends_and_a_hundredth_of_what_is_between() {
+    assert!(reports_step(1, 8), "the first item carries the length");
+    assert!(reports_step(8, 8), "the last item fills the bar");
+    for done in 2..8 {
+        assert!(reports_step(done, 8), "a short walk reports every item");
+    }
+
+    // A hundred steps of a thousand, plus the first item, which carries the length.
+    let reported = (1..=100_000).filter(|d| reports_step(*d, 100_000)).count();
+    assert_eq!(reported, 101, "a long walk reports a hundred steps, not a hundred thousand");
+    assert!(reports_step(1, 100_000));
+    assert!(reports_step(100_000, 100_000));
+}
