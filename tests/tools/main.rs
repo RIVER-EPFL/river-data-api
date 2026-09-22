@@ -6,6 +6,7 @@
 #[allow(dead_code, unused_imports)]
 mod common;
 
+mod apply_calculation;
 mod audit_applicability;
 mod calculation_closure;
 mod calculators;

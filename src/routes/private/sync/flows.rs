@@ -265,3 +265,64 @@ impl Job for SyncFullReassert {
 #[cfg(test)]
 #[path = "tests/flows.rs"]
 mod tests;
+
+/// The re-derivation a pairing plan's apply hands on: every slot the plan paired that holds a
+/// reading, re-derived by the deployment and calibration windows. One tracked job under the apply,
+/// in `ReprocessAll`'s shape, rather than one job per slot: a failed slot is logged and the run
+/// continues, and the panel shows this row's progress instead of thousands of anonymous ones
+/// (B418).
+pub struct AttributePlanSlots;
+
+#[async_trait]
+impl Job for AttributePlanSlots {
+    fn name(&self) -> &'static str {
+        "plan_attribution"
+    }
+
+    async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
+        let plan_id = crate::routes::private::reprocessing_jobs::flows::required_uuid(
+            ctx.params(),
+            "plan_id",
+        )?;
+        let slots: Vec<(Uuid, Uuid)> = super::service::plan_slots_holding_readings(plan_id)
+            .into_tuple()
+            .all(ctx.db())
+            .await?;
+        let total = i32::try_from(slots.len()).unwrap_or(i32::MAX);
+        ctx.info(&format!("Attributing {} slot(s)", slots.len())).await;
+
+        let mut results = Vec::with_capacity(slots.len());
+        for (done, (site_id, parameter_id)) in slots.into_iter().enumerate() {
+            let moved = crate::routes::private::sensor_calibrations::service::reprocess_site_parameter_readings(
+                ctx.db(),
+                site_id,
+                parameter_id,
+                Some(ctx.job_id()),
+            )
+            .await
+            .map(|n| n as i64);
+            results.push((
+                serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
+                moved,
+            ));
+            ctx.set_progress(i32::try_from(done + 1).unwrap_or(i32::MAX), Some(total))
+                .await;
+        }
+        let outcome = crate::routes::private::reprocessing_jobs::flows::SlotOutcome::from(results);
+        let readings_updated = outcome.readings;
+        let report = outcome
+            .record(
+                &ctx,
+                JobReport::new()
+                    .scope("plan_id", plan_id.to_string())
+                    .count("slots", usize::try_from(total).unwrap_or(0))
+                    .count("readings_updated", readings_updated),
+            )
+            .await;
+        ctx.report(report).await;
+        if outcome.all_failed() {
+            return Err(outcome.error());
+        }
+        Ok(readings_updated)
+    }
+}

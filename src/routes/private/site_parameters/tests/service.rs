@@ -22,6 +22,7 @@ fn slot() -> SiteParameterModel {
         is_public: Some(false),
         needs_review: false,
         entry_mode: "manual".to_string(),
+        cadence: "high".to_string(),
         variable_mappings: None,
         created_at: None,
         updated_at: None,
@@ -186,4 +187,55 @@ fn test_only_a_slot_that_measured_nothing_can_be_deleted() {
         refusal.contains("Active"),
         "the refusal points at the toggle that retires: {refusal}"
     );
+}
+
+/// Scenario: `suva` reads DOC and a254 and writes suva; Martigny declares DOC and a254 but not
+/// suva.
+///
+/// Expected behaviour: both inputs are present, the output is the one slot the apply mints, and
+/// an output the site already carries is left where it is.
+#[test]
+fn test_partition_calculation_separates_missing_inputs_from_outputs_to_mint() {
+    let doc = (Uuid::from_u128(10), "DOC".to_string());
+    let a254 = (Uuid::from_u128(11), "a254".to_string());
+    let suva = (Uuid::from_u128(12), "suva".to_string());
+    let held = [doc.0, a254.0].into_iter().collect();
+
+    let partition = super::partition_calculation(&[doc.clone(), a254.clone()], &[suva.clone()], &held);
+    assert_eq!(partition.inputs_present, vec![doc.clone(), a254.clone()]);
+    assert!(partition.inputs_missing.is_empty());
+    assert!(partition.outputs_existing.is_empty());
+    assert_eq!(partition.outputs_to_create, vec![suva.clone()]);
+
+    let without_a254 = [doc.0].into_iter().collect();
+    let partition = super::partition_calculation(&[doc.clone(), a254.clone()], &[suva.clone()], &without_a254);
+    assert_eq!(partition.inputs_missing, vec![a254.clone()]);
+    assert_eq!(partition.outputs_to_create, vec![suva.clone()]);
+
+    let with_suva = [doc.0, a254.0, suva.0].into_iter().collect();
+    let partition = super::partition_calculation(&[doc, a254], &[suva.clone()], &with_suva);
+    assert_eq!(partition.outputs_existing, vec![suva]);
+    assert!(partition.outputs_to_create.is_empty());
+}
+
+/// Expected behaviour: a parameter a manifest names twice is partitioned once, so the apply does
+/// not try to mint one slot twice in the same transaction.
+#[test]
+fn test_partition_calculation_counts_a_repeated_parameter_once() {
+    let suva = (Uuid::from_u128(12), "suva".to_string());
+    let partition =
+        super::partition_calculation(&[], &[suva.clone(), suva.clone()], &std::collections::HashSet::new());
+    assert_eq!(partition.outputs_to_create, vec![suva]);
+}
+
+/// Expected behaviour: the output slot joins the stream arm only where every input the
+/// calculation reads is a high-cadence slot at that site (Q234).
+#[test]
+fn test_applied_cadence_follows_the_inputs() {
+    let high = || Some("high".to_string());
+    let low = || Some("low".to_string());
+    assert_eq!(super::applied_cadence(&[high(), high()]), "high");
+    assert_eq!(super::applied_cadence(&[high(), low()]), "low");
+    assert_eq!(super::applied_cadence(&[high(), None]), "low");
+    assert_eq!(super::applied_cadence(&[]), "low");
 }

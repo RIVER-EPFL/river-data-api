@@ -79,11 +79,11 @@ async fn seed_visit(db: &DatabaseConnection) -> Uuid {
     event_id
 }
 
-async fn slot(db: &DatabaseConnection, parameter_id: &str) -> Option<(bool, String, bool)> {
+async fn slot(db: &DatabaseConnection, parameter_id: &str) -> Option<(bool, String, bool, String)> {
     db.query_one_raw(Statement::from_string(
         DatabaseBackend::Postgres,
         format!(
-            "SELECT needs_review, entry_mode, COALESCE(is_public, false) AS is_public \
+            "SELECT needs_review, entry_mode, COALESCE(is_public, false) AS is_public, cadence \
                FROM site_parameters \
               WHERE site_id = '{SITE1_ID}' AND parameter_id = '{parameter_id}'"
         ),
@@ -95,6 +95,7 @@ async fn slot(db: &DatabaseConnection, parameter_id: &str) -> Option<(bool, Stri
             r.try_get("", "needs_review").expect("needs_review"),
             r.try_get("", "entry_mode").expect("entry_mode"),
             r.try_get("", "is_public").expect("is_public"),
+            r.try_get("", "cadence").expect("cadence"),
         )
     })
 }
@@ -161,7 +162,7 @@ async fn a_run_publishing_where_the_site_declares_its_inputs_mints_the_output_sl
     );
     assert!(outcome.readings_written >= 1, "the computed value landed");
 
-    let (needs_review, entry_mode, is_public) = slot(&db, &output_id)
+    let (needs_review, entry_mode, is_public, cadence) = slot(&db, &output_id)
         .await
         .expect("the run minted the output slot");
     assert!(
@@ -175,6 +176,10 @@ async fn a_run_publishing_where_the_site_declares_its_inputs_mints_the_output_sl
     assert!(
         !is_public,
         "a minted slot is not published until somebody says so"
+    );
+    assert_eq!(
+        cadence, "low",
+        "the run that minted it was a visit's, so the slot is the visit arm's"
     );
 }
 

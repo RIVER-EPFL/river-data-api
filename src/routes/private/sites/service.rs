@@ -260,85 +260,22 @@ pub(super) fn empty_extent() -> ParameterExtent {
     }
 }
 
-/// Declared cadence per site_parameter, for slots with no data yet: paired stream
-/// declarations first, then the open deployment's sensor data_frequency.
-pub(super) async fn declared_frequencies(
-    db: &sea_orm::DatabaseConnection,
-    site_id: Uuid,
-) -> AppResult<HashMap<Uuid, &'static str>> {
-    let mut map: HashMap<Uuid, &'static str> = HashMap::new();
-
-    for row in DeployedFrequencyRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT d.parameter_id, bool_or(sn.data_frequency = 'low') AS any_low, \
-                    bool_or(sn.data_frequency = 'high') AS any_high \
-             FROM sensor_deployments d JOIN sensors sn ON sn.id = d.sensor_id \
-             WHERE d.site_id = $1 AND d.deployed_until IS NULL \
-             GROUP BY d.parameter_id",
-        [site_id.into()],
-    ))
-    .all(db)
-    .await?
-    {
-        if let Some(pid) = row.parameter_id {
-            map.insert(
-                pid,
-                match (row.any_high, row.any_low) {
-                    (false, true) => "low",
-                    (true, true) => "mixed",
-                    _ => "high",
-                },
-            );
-        }
-    }
-
-    for row in DeclaredFrequencyRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT sp.parameter_id, bool_or(ds.measurement_type = 'spot') AS any_spot, \
-                    bool_or(ds.measurement_type <> 'spot') AS any_continuous \
-             FROM site_parameters sp JOIN data_streams ds ON ds.site_parameter_id = sp.id \
-             WHERE sp.site_id = $1 AND ds.measurement_type IS NOT NULL \
-             GROUP BY sp.parameter_id",
-        [site_id.into()],
-    ))
-    .all(db)
-    .await?
-    {
-        map.insert(
-            row.parameter_id,
-            match (row.any_continuous, row.any_spot) {
-                (false, true) => "low",
-                (true, true) => "mixed",
-                _ => "high",
-            },
-        );
-    }
-
-    Ok(map)
-}
-
 /// Build a `ParameterResponse` from a site_parameter, enriched with the global catalog
 /// (code/name/units) and the per-parameter reading extent.
 pub(super) fn build_parameter_response(
     p: site_parameters::Model,
     globals: &HashMap<Uuid, site_parameters::CatalogParameter>,
     extents: &HashMap<Uuid, ParameterExtent>,
-    declared: &HashMap<Uuid, &'static str>,
     attributions: &HashMap<Uuid, ExternalSource>,
 ) -> ParameterResponse {
     let d = site_parameters::SlotDescriptor::resolve(&p, globals.get(&p.parameter_id));
     let extent = extents.get(&p.parameter_id);
     let has_spot = extent.is_some_and(|e| e.spot_count > 0);
     let has_continuous = extent.is_some_and(|e| e.continuous_count > 0);
-    // Observed cadence when there is data; the DECLARED tier (stream declaration, sensor
-    // data_frequency) for empty slots, so a new lab parameter opens on the right chart mode.
-    let frequency = match (has_continuous, has_spot) {
-        (false, true) => "low",
-        (true, true) => "mixed",
-        (true, false) => "high",
-        (false, false) => declared.get(&p.parameter_id).copied().unwrap_or("high"),
-    }
-    .to_string();
+    // The slot's own declaration, not what its rows happen to hold: a slot flipped to grab
+    // sampling keeps the logger week it already carries, and the declaration is what the chain
+    // and the stream engine divide on.
+    let frequency = p.cadence.clone();
     ParameterResponse {
         id: p.id,
         parameter_id: p.parameter_id,

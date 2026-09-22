@@ -731,6 +731,19 @@ pub fn instrument_refusal(
     None
 }
 
+/// The cadence a slot this instrument is adopted into is filled at: the instrument's own
+/// `data_frequency`, which already speaks `high|low`. An instrument the register has lost falls
+/// back to `high`, the cadence a slot declares when nobody declares one.
+pub async fn cadence_of<C: ConnectionTrait>(db: &C, sensor_id: Uuid) -> AppResult<String> {
+    Ok(Entity::find_by_id(sensor_id)
+        .select_only()
+        .column(Column::DataFrequency)
+        .into_tuple::<String>()
+        .one(db)
+        .await?
+        .unwrap_or_else(|| "high".to_string()))
+}
+
 /// The same rule over the instruments one request names, in one query. A grab save carries an
 /// instrument per row, so asking per row would be a query per row on the entry path.
 pub async fn require_measuring_instruments<C: ConnectionTrait>(

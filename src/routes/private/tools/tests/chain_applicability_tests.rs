@@ -102,3 +102,44 @@ mod reported_skips {
         assert_eq!(skipped_entry(&serde_json::json!("doc_avg")), None);
     }
 }
+
+/// Scenario: a site declares pCO2 as a tool slot the stream engine fills, and the lab enters a
+/// visit whose values a calculation producing pCO2 reads.
+///
+/// Expected behaviour: the chain leaves that output alone and says why, because `readings` holds
+/// one row per slot instant and writing it would replace the stream pass's value and provenance.
+mod the_arm_a_slot_is_filled_on {
+    use crate::routes::private::readings::models::Owner;
+    use crate::routes::private::tools::flows::output_skip_reason;
+
+    #[test]
+    fn a_high_cadence_slot_is_the_stream_engine_s_and_a_visit_skips_it() {
+        let reason = output_skip_reason("pco2", Owner::Tool, Some("high"))
+            .expect("a high-cadence output is not the chain's to write");
+        assert!(reason.contains("pco2"), "{reason}");
+        assert!(reason.contains("stream"), "{reason}");
+    }
+
+    #[test]
+    fn a_low_cadence_slot_is_written_at_the_visit() {
+        assert_eq!(output_skip_reason("pco2", Owner::Tool, Some("low")), None);
+    }
+
+    /// A site holding no slot for the output is the mint case: the run publishes it, so there is
+    /// no declaration to read and nothing to skip.
+    #[test]
+    fn an_undeclared_output_is_written_and_its_slot_minted() {
+        assert_eq!(output_skip_reason("pco2", Owner::Tool, None), None);
+    }
+
+    /// The detached ruling is the older gate and outranks cadence: a manual value stands whatever
+    /// arm the slot is on.
+    #[test]
+    fn a_detached_slot_is_skipped_on_either_arm() {
+        for cadence in [Some("low"), Some("high"), None] {
+            let reason = output_skip_reason("pco2", Owner::Manual, cadence)
+                .expect("a detached output is never written by the chain");
+            assert!(reason.contains("detached"), "{reason}");
+        }
+    }
+}

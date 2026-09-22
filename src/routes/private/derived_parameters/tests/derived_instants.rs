@@ -19,6 +19,7 @@ fn test_derived_instants_reaches_the_tool_entered_slot_in_both_scopes() {
             "{sql}"
         );
         assert!(sql.contains(r#""sp"."entry_mode" = 'tool'"#), "{sql}");
+        assert!(sql.contains(r#""sp"."cadence" = 'high'"#), "{sql}");
         assert!(
             sql.contains(r#""sp"."parameter_id" = "d"."output_parameter_id""#),
             "{sql}"

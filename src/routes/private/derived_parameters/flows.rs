@@ -30,10 +30,10 @@ const MAX_GAPS_PER_RUN: usize = 50_000;
 /// The statuses a prune leaves alone: a job still queued or running is not history yet.
 const IN_FLIGHT: [&str; 4] = ["queued", "pending", "running", "retrying"];
 
-/// Whether a site has any active derived `site_parameter`. The spawn-guard for the ingest/batch
-/// derived-compute jobs: when false, a derived recompute at that site would do nothing, so the job
-/// is skipped entirely (the dominant source of empty `ingest_derived` jobs). Anything genuinely
-/// needed is still caught by the periodic janitor gap scan.
+/// Whether a site has any active derived `site_parameter` on the stream arm. The spawn-guard for
+/// the ingest/batch derived-compute jobs: when false, a derived recompute at that site would do
+/// nothing, so the job is skipped entirely (the dominant source of empty `ingest_derived` jobs).
+/// Anything genuinely needed is still caught by the periodic janitor gap scan.
 pub async fn site_has_active_derived(
     db: &DatabaseConnection,
     site_id: Uuid,
@@ -41,6 +41,7 @@ pub async fn site_has_active_derived(
     let row = site_parameters::Entity::find()
         .filter(site_parameters::Column::SiteId.eq(site_id))
         .filter(site_parameters::Column::EntryMode.eq("tool"))
+        .filter(site_parameters::Column::Cadence.eq("high"))
         .filter(
             sea_orm::Condition::any()
                 .add(site_parameters::Column::IsActive.eq(true))
@@ -99,6 +100,7 @@ fn gap_scan(since: Option<chrono::DateTime<chrono::Utc>>) -> SelectStatement {
             Expr::col((sp.clone(), site_parameters::Column::SiteId))
                 .equals((r.clone(), readings::Column::SiteId))
                 .and(Expr::col((sp.clone(), site_parameters::Column::EntryMode)).eq("tool"))
+                .and(Expr::col((sp.clone(), site_parameters::Column::Cadence)).eq("high"))
                 .and(
                     Expr::expr(Func::coalesce([
                         Expr::col((sp.clone(), site_parameters::Column::IsActive)),
@@ -357,7 +359,8 @@ fn parse_timestamps(value: Option<&serde_json::Value>) -> Vec<chrono::DateTime<c
 pub struct DerivedRecompute;
 
 /// The `(site, time)` instants a derived recompute covers: every reading of a parameter some
-/// calculation reads, at a site whose slot for that calculation's output is tool-entered.
+/// calculation reads, at a site whose slot for that calculation's output is tool-entered on the
+/// stream arm. A low-cadence slot is the chain's, computed at the visit that recorded it.
 fn derived_instants(
     scope: sea_query::Condition,
     join_definition_on: Option<Uuid>,
@@ -436,6 +439,7 @@ fn derived_instants(
                     sea_query::Expr::col((sp.clone(), site_parameters::Column::EntryMode))
                         .eq("tool"),
                 )
+                .add(sea_query::Expr::col((sp.clone(), site_parameters::Column::Cadence)).eq("high"))
                 .add(
                     sea_query::Expr::col((sp, site_parameters::Column::ParameterId))
                         .equals((d, definition::Column::OutputParameterId)),

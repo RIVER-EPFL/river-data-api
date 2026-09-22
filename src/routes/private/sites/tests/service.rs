@@ -168,3 +168,84 @@ fn test_the_bucket_width_matches_the_view_the_resolution_names() {
     assert_eq!(bucket_interval(Resolution::SixHourly), "6 hours");
     assert_eq!(bucket_interval(Resolution::TwelveHourly), "12 hours");
 }
+
+/// Expected behaviour: `frequency` is the slot's declared cadence, whatever its rows hold. A slot
+/// declared `low` that still carries a week of logger readings reads as `low`, because the
+/// declaration is what the chain and the stream engine divide on.
+#[test]
+fn frequency_is_the_declared_cadence_and_not_what_the_rows_hold() {
+    use super::{ParameterExtent, build_parameter_response};
+    use std::collections::HashMap;
+
+    let parameter_id = uuid::Uuid::from_u128(2);
+    let slot = slot_with_cadence(parameter_id, "low");
+    let mut extents = HashMap::new();
+    extents.insert(
+        parameter_id,
+        ParameterExtent {
+            data_start: None,
+            data_end: None,
+            reading_count: 12,
+            spot_count: 4,
+            continuous_count: 8,
+        },
+    );
+
+    let response =
+        build_parameter_response(slot, &HashMap::new(), &extents, &HashMap::new());
+
+    assert_eq!(response.frequency, "low");
+    // The extent stays what it is: both arms of history are legitimately there.
+    assert!(response.has_spot);
+    assert!(response.has_continuous);
+}
+
+/// Expected behaviour: a slot with no readings at all reports its declaration just the same, so a
+/// new one opens on the right chart mode with nothing to observe.
+#[test]
+fn an_empty_slot_reports_its_declaration() {
+    use super::{ParameterExtent, build_parameter_response};
+    use std::collections::HashMap;
+
+    let parameter_id = uuid::Uuid::from_u128(3);
+    let response = build_parameter_response(
+        slot_with_cadence(parameter_id, "high"),
+        &HashMap::new(),
+        &HashMap::<uuid::Uuid, ParameterExtent>::new(),
+        &HashMap::new(),
+    );
+
+    assert_eq!(response.frequency, "high");
+    assert!(!response.has_spot);
+    assert!(!response.has_continuous);
+}
+
+fn slot_with_cadence(
+    parameter_id: uuid::Uuid,
+    cadence: &str,
+) -> crate::routes::private::site_parameters::Model {
+    crate::routes::private::site_parameters::Model {
+        id: uuid::Uuid::from_u128(10),
+        site_id: uuid::Uuid::from_u128(1),
+        parameter_id,
+        name: "Turbidity".to_string(),
+        sensor_type: String::new(),
+        display_units: None,
+        units_name: None,
+        units_min: None,
+        units_max: None,
+        decimal_places: None,
+        sample_interval_sec: None,
+        is_active: Some(true),
+        is_public: Some(false),
+        needs_review: false,
+        entry_mode: "manual".to_string(),
+        cadence: cadence.to_string(),
+        instrument_sensor_id: None,
+        variable_mappings: None,
+        created_at: None,
+        updated_at: None,
+        discovered_at: None,
+        parameter: Vec::new(),
+    }
+}

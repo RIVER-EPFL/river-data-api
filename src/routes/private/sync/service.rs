@@ -896,6 +896,27 @@ pub fn hold_statement(hold: &Hold) -> sea_orm::sea_query::InsertStatement {
         .to_owned()
 }
 
+/// The slots of [`plan_slots`] that hold a reading. A slot with none has nothing to re-derive, and
+/// on the CNET apply of 2026-09-22 that was 1124 of 2852 (B418).
+pub fn plan_slots_holding_readings(plan_id: Uuid) -> sea_orm::Select<data_streams::models::Entity> {
+    let slot = |column| Expr::col((site_parameters::models::Entity, column));
+    let reading = |column| Expr::col((readings::models::Entity, column));
+    plan_slots(plan_id).filter(Expr::exists(
+        SeaQuery::select()
+            .expr(Expr::val(1))
+            .from(readings::models::Entity)
+            .and_where(
+                reading(readings::models::Column::SiteId)
+                    .eq(slot(site_parameters::models::Column::SiteId)),
+            )
+            .and_where(
+                reading(readings::models::Column::ParameterId)
+                    .eq(slot(site_parameters::models::Column::ParameterId)),
+            )
+            .take(),
+    ))
+}
+
 /// The (site, parameter) slots a plan's streams are paired to, each once. The re-derivation after
 /// an apply covers these and no others.
 pub(super) fn plan_slots(plan_id: Uuid) -> sea_orm::Select<data_streams::models::Entity> {
@@ -2477,7 +2498,8 @@ pub struct ExistingParamRef {
 /// so a warning always reads as something even where the structure is not used.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PlanWarning {
-    /// `units_mismatch` | `empty_name` | `near_duplicate` | `catalog_match`.
+    /// `units_mismatch` | `empty_name` | `near_duplicate` | `catalog_match` |
+    /// `duplicate_parameter_code` | `duplicate_site_name` | `duplicate_project_name`.
     pub kind: String,
     pub message: String,
     #[serde(default)]
@@ -2548,6 +2570,28 @@ impl PlanWarning {
                 site_parameter_count: existing.site_parameter_count,
                 reading_count: existing.reading_count,
             }),
+            source_units: None,
+        }
+    }
+
+    /// Two of the plan's own rows would create the same thing: one code with two sets of units, or
+    /// two names that read as one place. The catalog cannot say so, because neither exists yet.
+    pub fn duplicate_in_plan(kind: &str, proposed: &str, other: &str) -> Self {
+        Self {
+            kind: format!("duplicate_{kind}"),
+            message: match kind {
+                "parameter_code" => format!(
+                    "This plan would create '{proposed}' twice, once per set of units ({other}). \
+                     One code is one parameter: give each row a code of its own, or agree on the \
+                     units."
+                ),
+                _ => format!(
+                    "This plan would also create '{other}', which reads as the same name. They \
+                     differ only in case, spacing or punctuation."
+                ),
+            },
+            parameter: Some(proposed.to_string()),
+            existing: None,
             source_units: None,
         }
     }
@@ -3674,6 +3718,7 @@ pub async fn create_plan(
         ));
     }
 
+    flag_duplicates_in_plan(&mut entries);
     let summary = compute_summary(&entries);
     // The register rows this source has offered and no plan has taken yet. Snapshotted onto the
     // plan so the review's decisions are the plan's, like every other proposal it carries.
@@ -4238,6 +4283,68 @@ pub fn refuse_unchecked_entries(entries: &[PlanEntry]) -> AppResult<()> {
     )))
 }
 
+/// Warn every pairing row the plan would create twice over: a parameter code proposed with two sets
+/// of units, and a site or project name another row spells differently. The catalog check cannot see
+/// these, because neither side of the pair exists yet, and the review is where the two rows are
+/// visible together.
+pub fn flag_duplicates_in_plan(entries: &mut [PlanEntry]) {
+    let mut param_units: HashMap<String, Vec<String>> = HashMap::new();
+    let mut site_spellings: HashMap<String, Vec<String>> = HashMap::new();
+    let mut project_spellings: HashMap<String, Vec<String>> = HashMap::new();
+    for entry in entries.iter().filter(|e| e.action == "pair") {
+        if entry.parameter.create && !entry.parameter.name.trim().is_empty() {
+            let units = param_units
+                .entry(entry.parameter.name.trim().to_lowercase())
+                .or_default();
+            if !units.contains(&entry.parameter.units) {
+                units.push(entry.parameter.units.clone());
+            }
+        }
+        for (create, name, spellings) in [
+            (entry.site.create, &entry.site.name, &mut site_spellings),
+            (
+                entry.project.create,
+                &entry.project.name,
+                &mut project_spellings,
+            ),
+        ] {
+            let canonical = canonical_name(name);
+            if !create || canonical.is_empty() {
+                continue;
+            }
+            let seen = spellings.entry(canonical).or_default();
+            if !seen.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+                seen.push(name.clone());
+            }
+        }
+    }
+
+    for entry in entries.iter_mut().filter(|e| e.action == "pair") {
+        if let Some(units) = param_units.get(&entry.parameter.name.trim().to_lowercase())
+            && units.len() > 1
+        {
+            let others: Vec<&str> = units.iter().map(String::as_str).collect();
+            entry.warnings.push(PlanWarning::duplicate_in_plan(
+                "parameter_code",
+                &entry.parameter.name,
+                &others.join(", "),
+            ));
+        }
+        for (kind, name, spellings) in [
+            ("site_name", &entry.site.name, &site_spellings),
+            ("project_name", &entry.project.name, &project_spellings),
+        ] {
+            if let Some(seen) = spellings.get(&canonical_name(name))
+                && let Some(other) = seen.iter().find(|s| !s.eq_ignore_ascii_case(name))
+            {
+                entry
+                    .warnings
+                    .push(PlanWarning::duplicate_in_plan(kind, name, other));
+            }
+        }
+    }
+}
+
 /// A parameter code two pairing rows would both create under, or one the catalog already holds:
 /// `LOWER(code)` is unique, so the apply's second insert fails halfway through the run. Reported
 /// as the plan's own refusal, naming the code and what it collides with.
@@ -4521,19 +4628,15 @@ pub async fn apply_plan(
         }
     }
 
-    // Re-derivation runs as tracked jobs so a failure is visible and rerunnable rather than a log
-    // line lost on restart.
-    for (site_id, parameter_id) in slots {
-        crate::routes::private::reprocessing_jobs::service::enqueue(
-            db,
-            "pairing_backfill",
-            None,
-            None,
-            &serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
-            None,
-        )
-        .await?;
-    }
+    // Re-derivation runs as one tracked job under the apply, so a failure is visible and the panel
+    // shows the plan's own progress rather than a row per slot (B418).
+    crate::routes::private::reprocessing_jobs::service::enqueue_child(
+        db,
+        "plan_attribution",
+        &serde_json::json!({ "plan_id": plan_id }),
+        progress.map(crate::routes::private::reprocessing_jobs::service::JobContext::job_id),
+    )
+    .await?;
     let result = ApplyResult {
         projects_created: counters.projects_created,
         sites_created: counters.sites_created,
@@ -4763,6 +4866,24 @@ pub(super) async fn free_slot_name<C: ConnectionTrait>(
     unreachable!()
 }
 
+/// The cadence the slot a stream pairs into is filled at, read from the stream's own declaration:
+/// a portal's grab column declares `spot` and is the visit arm's, everything else is the stream
+/// arm's. An undeclared stream falls back to `high`, as a slot with no declaration does.
+async fn stream_cadence<C: ConnectionTrait>(txn: &C, stream_id: Uuid) -> AppResult<String> {
+    let declared = data_streams::models::Entity::find_by_id(stream_id)
+        .select_only()
+        .column(data_streams::models::Column::MeasurementType)
+        .into_tuple::<Option<String>>()
+        .one(txn)
+        .await?
+        .flatten();
+    Ok(if declared.as_deref() == Some("spot") {
+        "low".to_string()
+    } else {
+        "high".to_string()
+    })
+}
+
 /// The slot an entry pairs into, created when the site has none. The entry's declared decimal
 /// places reach an existing slot too.
 pub(super) async fn resolve_or_create_site_param<C: ConnectionTrait>(
@@ -4830,6 +4951,7 @@ pub(super) async fn resolve_or_create_site_param<C: ConnectionTrait>(
             is_public: Set(Some(false)),
             needs_review: Set(false),
             entry_mode: Set("manual".to_string()),
+            cadence: Set(stream_cadence(txn, entry.stream_id).await?),
             variable_mappings: Set(None),
             created_at: Set(Some(Utc::now())),
             updated_at: Set(Some(Utc::now())),

@@ -179,8 +179,9 @@ pub struct ParameterResponse {
     pub has_continuous: bool,
     /// Whether any spot (grab/lab) readings exist for this parameter at the site
     pub has_spot: bool,
-    /// Data-driven cadence classification: 'low' (spot-only), 'high' (no spot), or 'mixed'.
-    /// Low-frequency series render marker-only over their full range and skip the aggregate path.
+    /// The slot's declared cadence: 'high' (a stream carries it) or 'low' (a person records it at
+    /// a visit). Low-frequency series render marker-only over their full range and skip the
+    /// aggregate path.
     pub frequency: String,
     /// The outside feed the values come from, where the site subscribes to one for this parameter.
     /// None is the site's own instruments.
@@ -249,20 +250,6 @@ pub(super) struct FlaggedHeadRow {
 pub(super) struct CursorRow {
     pub(super) parameter_id: Uuid,
     pub(super) max_time: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, FromQueryResult)]
-pub(super) struct DeployedFrequencyRow {
-    pub(super) parameter_id: Option<Uuid>,
-    pub(super) any_low: bool,
-    pub(super) any_high: bool,
-}
-
-#[derive(Debug, FromQueryResult)]
-pub(super) struct DeclaredFrequencyRow {
-    pub(super) parameter_id: Uuid,
-    pub(super) any_spot: bool,
-    pub(super) any_continuous: bool,
 }
 
 // --- Readings ---

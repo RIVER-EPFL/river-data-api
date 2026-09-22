@@ -125,6 +125,7 @@
 /services/{id}/commands => deny_scoped_token+require_admin_or_token_write_metadata
 /services/{id}/revoke => deny_scoped_token+require_admin_or_token_write_metadata
 /sites/{id}/visits => require_read_data
+/sites/{site_id}/calculations => deny_scoped_token+require_manage_sensors
 /sites/{site_id}/parameter_groups => deny_scoped_token+require_manage_sensors
 /standard_curves/register => deny_scoped_token+require_admin_or_token_write_metadata
 /standard_curves/{id}/retire => deny_scoped_token+require_manage_sensors

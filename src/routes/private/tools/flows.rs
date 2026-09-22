@@ -223,15 +223,49 @@ pub fn applies_at_site(
     saved_outputs.iter().any(|(_, id)| declared.contains(id))
 }
 
+/// Why the chain leaves one of a run's outputs alone at a visit, or `None` when it writes it.
+///
+/// A slot an admin detached at this visit is a manual value until an input moves or it is
+/// returned (Q40, Q47). A slot the site declares high cadence is the stream engine's (Q234):
+/// `readings` holds one row per slot instant, so a visit that wrote it would overwrite the value
+/// and provenance the stream pass put there. A two-output calculation may have one output on each
+/// arm, which is why the question is asked per output rather than per run.
+#[must_use]
+pub fn output_skip_reason(
+    key: &str,
+    owner: crate::routes::private::readings::models::Owner,
+    cadence: Option<&str>,
+) -> Option<String> {
+    if owner == crate::routes::private::readings::models::Owner::Manual {
+        return Some(format!("output {key} is detached at this visit"));
+    }
+    if cadence == Some("high") {
+        return Some(format!(
+            "output {key} is a high-cadence slot at this site, computed on its stream"
+        ));
+    }
+    None
+}
+
 /// The catalog ids of the parameters a calculation reads at a visit, for the applicability test.
 /// A code the catalog does not hold resolves to nothing and is left out: it is a read the site
 /// cannot declare, and `resolve_run` reports it as the skip it is.
 #[must_use]
 pub fn read_inputs(tool: &ActiveTool, catalog: &ParameterCatalog) -> Vec<Uuid> {
+    read_input_members(tool, catalog)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// The same reads, carrying the code each resolved from, for the flows that name a missing input
+/// back to a person rather than testing a set.
+#[must_use]
+pub fn read_input_members(tool: &ActiveTool, catalog: &ParameterCatalog) -> Vec<(Uuid, String)> {
     tool.manifest
         .read_codes()
         .iter()
-        .filter_map(|code| catalog.resolve_code(code).map(|p| p.id))
+        .filter_map(|code| catalog.resolve_code(code).map(|p| (p.id, p.code)))
         .collect()
 }
 
@@ -666,25 +700,24 @@ async fn walk_event(
         // The outputs the run produced, saved to their resolved parameters. A per-replicate
         // (array) output is saved one reading per index, inheriting the position of the variable
         // it evaluated over.
-        // A slot an admin detached at this visit is a manual value until an input moves or it
-        // is returned (Q40, Q47): the chain leaves it alone and says so.
         let mut owned_outputs: Vec<(String, Uuid)> = Vec::with_capacity(saved_outputs.len());
         for (key, parameter_id) in &saved_outputs {
-            if crate::routes::private::readings::service::output_owner(
+            let owner = crate::routes::private::readings::service::output_owner(
                 &state.db,
                 event.site_id,
                 *parameter_id,
                 event.collected_at,
             )
-            .await?
-                == crate::routes::private::readings::models::Owner::Manual
-            {
-                outcome.skipped.push((
-                    tool.name.clone(),
-                    format!("output {key} is detached at this visit"),
-                ));
-            } else {
-                owned_outputs.push((key.clone(), *parameter_id));
+            .await?;
+            let cadence = crate::routes::private::site_parameters::service::slot_cadence(
+                &state.db,
+                event.site_id,
+                *parameter_id,
+            )
+            .await?;
+            match output_skip_reason(key, owner, cadence.as_deref()) {
+                Some(reason) => outcome.skipped.push((tool.name.clone(), reason)),
+                None => owned_outputs.push((key.clone(), *parameter_id)),
             }
         }
         // An output whose formula produced a number that is not finite is refused, not cleared

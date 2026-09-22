@@ -29,6 +29,7 @@ fn test_gap_scan_is_the_anti_join_over_active_tool_slots() {
         r#"SELECT DISTINCT "r"."site_id", "r"."time" FROM "readings" AS "r""#,
         r#"JOIN "site_parameters" AS "sp""#,
         r#""sp"."entry_mode" = 'tool'"#,
+        r#""sp"."cadence" = 'high'"#,
         r#"COALESCE("sp"."is_active", TRUE) = TRUE"#,
         r#"JOIN "calculation_formulas" AS "d""#,
         r#""d"."tool_script_id" IS NULL"#,

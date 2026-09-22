@@ -22,6 +22,8 @@ use uuid::Uuid;
 
 use super::models::ActiveModel;
 use super::models::AppliedSlot;
+use super::models::ApplyCalculationRequest;
+use super::models::ApplyCalculationResponse;
 use super::models::ApplyGroupRequest;
 use super::models::ApplyGroupResponse;
 use super::models::Column;
@@ -29,7 +31,11 @@ use super::models::Entity;
 use super::models::GroupMember;
 use super::service::MergeSiteParametersRequest;
 use super::service::MergeSiteParametersResponse;
+use super::service::CalculationMember;
+use super::service::applied_cadence;
+use super::service::partition_calculation;
 use super::service::partition_members;
+use super::service::slot_cadence;
 use crate::common::AppState;
 use crate::common::middleware::ProjectScope;
 use crate::common::scope::Unowned;
@@ -39,6 +45,7 @@ use crate::error::AppError;
 use crate::error::AppResult;
 use crate::routes::private::parameter_groups::member_model;
 use crate::routes::private::parameter_groups::service::rules::Role;
+use crate::routes::private::tools;
 
 #[utoipa::path(
     post,
@@ -151,6 +158,9 @@ pub async fn apply_group(
             is_public: Set(Some(false)),
             needs_review: Set(false),
             instrument_sensor_id: Set(payload.instrument_sensor_id),
+            // A group is the form a visit is entered on, so the slots it applies are the visit
+            // arm's and the chain computes their calculated members there.
+            cadence: Set("low".to_string()),
             ..Default::default()
         }
         .insert(&txn)
@@ -170,6 +180,149 @@ pub async fn apply_group(
         created,
         existing: already.iter().map(|m| slot(m, None)).collect(),
     }))
+}
+
+/// Apply a calculation at a site: check the site declares everything the calculation reads, and
+/// mint the output slots it lacks.
+///
+/// Refused while an input is undeclared, naming each one: the calculation would be
+/// `not_applicable` there, learned after the fact from a job log. The outputs a successful apply
+/// mints are the site's declaration of the calculation, so they carry no review flag; the ones the
+/// chain mints on its own still do (Q193). Applying twice creates nothing the second time.
+#[utoipa::path(
+    post,
+    path = "/api/sites/{site_id}/calculations",
+    request_body = ApplyCalculationRequest,
+    responses(
+        (status = 200, body = ApplyCalculationResponse),
+        (status = 400, description = "The site does not declare every parameter the calculation reads"),
+        (status = 404, description = "No site or no calculation with this id"),
+        (status = 409, description = "The calculation is switched off"),
+    ),
+    tag = "site_parameters"
+)]
+pub async fn apply_calculation(
+    State(state): State<AppState>,
+    Path(site_id): Path<Uuid>,
+    Json(payload): Json<ApplyCalculationRequest>,
+) -> AppResult<Json<ApplyCalculationResponse>> {
+    let site = crate::routes::private::sites::models::Entity::find_by_id(site_id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Site {site_id} not found")))?;
+    let tool = tools::service::find_active_tool_by_id(&state.db, payload.calculation_id).await?;
+    let catalog =
+        tools::service::load_parameter_catalog(&state.db, std::iter::once(&tool.manifest)).await?;
+    let inputs = tools::flows::read_input_members(&tool, &catalog);
+    let outputs: Vec<CalculationMember> = tool
+        .manifest
+        .outputs
+        .iter()
+        .filter_map(|o| catalog.resolve(o).map(|p| (p.id, p.code)))
+        .collect();
+    let declared = tools::flows::declared_parameters(&state.db, site_id).await?;
+    let partition = partition_calculation(&inputs, &outputs, &declared);
+
+    let slot = |(parameter_id, parameter_code): &CalculationMember,
+                role: &str,
+                site_parameter_id: Option<Uuid>| AppliedSlot {
+        parameter_id: *parameter_id,
+        parameter_code: parameter_code.clone(),
+        role: role.to_string(),
+        site_parameter_id,
+    };
+    let answer = |dry_run: bool, outputs_created: Vec<AppliedSlot>| ApplyCalculationResponse {
+        site_id,
+        calculation_id: payload.calculation_id,
+        calculation_name: tool.name.clone(),
+        dry_run,
+        inputs_present: partition
+            .inputs_present
+            .iter()
+            .map(|m| slot(m, Role::Measured.as_str(), None))
+            .collect(),
+        inputs_missing: partition
+            .inputs_missing
+            .iter()
+            .map(|m| slot(m, Role::Measured.as_str(), None))
+            .collect(),
+        outputs_existing: partition
+            .outputs_existing
+            .iter()
+            .map(|m| slot(m, Role::Output.as_str(), None))
+            .collect(),
+        outputs_created,
+    };
+
+    if payload.dry_run {
+        let would_create = partition
+            .outputs_to_create
+            .iter()
+            .map(|m| slot(m, Role::Output.as_str(), None))
+            .collect();
+        return Ok(Json(answer(true, would_create)));
+    }
+
+    if !partition.inputs_missing.is_empty() {
+        let missing: Vec<&str> = partition
+            .inputs_missing
+            .iter()
+            .map(|(_, code)| code.as_str())
+            .collect();
+        return Err(AppError::BadRequest(format!(
+            "{} does not measure {}, which '{}' reads. Add those parameters to the site before \
+             applying it.",
+            site.name,
+            missing.join(", "),
+            tool.name
+        )));
+    }
+
+    // The cadence the outputs take is read before the transaction opens: it is the site's
+    // declaration for the inputs, which this call does not touch.
+    let mut input_cadences = Vec::with_capacity(partition.inputs_present.len());
+    for (parameter_id, _) in &partition.inputs_present {
+        input_cadences.push(slot_cadence(&state.db, site_id, *parameter_id).await?);
+    }
+    let cadence = applied_cadence(&input_cadences);
+
+    // One transaction: a half-applied calculation is one whose chain writes some of its outputs
+    // and mints the rest flagged for review, which is the state this action exists to prevent.
+    let txn = state.db.begin().await?;
+    crate::common::actor::declare(&txn).await?;
+    let mut created = Vec::with_capacity(partition.outputs_to_create.len());
+    for member in &partition.outputs_to_create {
+        let parameter = crate::routes::private::parameters::Entity::find_by_id(member.0)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Parameter {} not found", member.0)))?;
+        let id = Uuid::new_v4();
+        ActiveModel {
+            id: Set(id),
+            site_id: Set(site_id),
+            parameter_id: Set(member.0),
+            name: Set(parameter.name),
+            sensor_type: Set(String::new()),
+            display_units: Set(Some(parameter.default_units)),
+            is_active: Set(Some(true)),
+            is_public: Set(Some(false)),
+            // Applied by a person against a checked declaration, so there is nothing to confirm.
+            needs_review: Set(false),
+            entry_mode: Set("tool".to_string()),
+            cadence: Set(cadence.to_string()),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await?;
+        created.push(slot(member, Role::Output.as_str(), Some(id)));
+    }
+    txn.commit().await?;
+
+    if !created.is_empty() {
+        crate::common::cache::invalidate_site(&state.response_cache, site_id);
+    }
+
+    Ok(Json(answer(false, created)))
 }
 
 // --- The slot merge action ---

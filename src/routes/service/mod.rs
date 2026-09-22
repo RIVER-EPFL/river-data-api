@@ -630,6 +630,13 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/sites/{site_id}/parameter_groups",
             post(crate::routes::private::site_parameters::views::apply_group),
         )
+        // Applying one calculation is the same act at a finer grain: it checks the site's slots
+        // against what the calculation reads and mints the outputs it lacks, so it carries the
+        // same MANAGER gate.
+        .route(
+            "/sites/{site_id}/calculations",
+            post(crate::routes::private::site_parameters::views::apply_calculation),
+        )
         .layer(RequestBodyLimitLayer::new(ACTION_BODY_LIMIT))
         .layer(middleware::from_fn(deny_scoped_token))
         .layer(middleware::from_fn(require_manage_sensors))

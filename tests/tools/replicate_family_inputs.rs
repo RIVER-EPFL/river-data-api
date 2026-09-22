@@ -91,8 +91,8 @@ async fn configure_slot(db: &sea_orm::DatabaseConnection, parameter_id: &str, na
     crate::common::exec(
         db,
         &format!(
-            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active) \
-             VALUES (gen_random_uuid(), '{site}', '{parameter_id}', '{name}', 'lab', true)",
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active, cadence) \
+             VALUES (gen_random_uuid(), '{site}', '{parameter_id}', '{name}', 'lab', true, 'low')",
             site = crate::common::SITE1_ID,
         ),
     )

@@ -786,6 +786,7 @@ fn table() -> Table {
             ("POST", "/api/standard_curves/{id}/retire"),
             ("POST", "/api/standard_curves/{id}/unretire"),
             ("POST", "/api/sites/{site_id}/parameter_groups"),
+            ("POST", "/api/sites/{site_id}/calculations"),
         ],
     );
 

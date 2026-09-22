@@ -116,6 +116,7 @@ pub const RERUNNABLE: &[&str] = &[
     "event_audit",
     "reprocess_all",
     "pairing_backfill",
+    "plan_attribution",
 ];
 
 /// What one kind needs before a person can run it off-cadence.
@@ -281,7 +282,9 @@ pub fn manual_run_for(trigger_type: &str) -> ManualRun {
             spec("source_site_parameter_id", Uuid, true, "Absorbed slot"),
             spec("target_site_parameter_id", Uuid, true, "Surviving slot"),
         ]),
-        "plan_apply" | "plan_revert" => declared(vec![spec("plan_id", Uuid, true, "Pairing plan")]),
+        "plan_apply" | "plan_revert" | "plan_attribution" => {
+            declared(vec![spec("plan_id", Uuid, true, "Pairing plan")])
+        }
         "alarm_backfill" => declared(vec![
             spec("slots", PairList, false, "Slots"),
             spec("start", Instant, false, "Window start"),
@@ -618,6 +621,9 @@ pub fn build_registry() -> JobRegistry {
         ));
     }
     registry.register(Arc::new(super::flows::RefreshAggregates));
+    registry.register(Arc::new(
+        crate::routes::private::sync::flows::AttributePlanSlots,
+    ));
     for trigger in [
         "sensor_swap",
         "pairing_backfill",
@@ -1451,6 +1457,30 @@ pub async fn enqueue<C: ConnectionTrait>(
     params: &serde_json::Value,
     dedupe_key: Option<&str>,
 ) -> Result<Option<Uuid>, sea_orm::DbErr> {
+    enqueue_under(db, trigger_type, sensor_id, trigger_id, params, dedupe_key, None).await
+}
+
+/// Enqueue the work a running job hands on, naming that job as the parent. The panel shows the
+/// parent's own progress rather than the fan-out, and the child outlives the parent's own row.
+pub async fn enqueue_child<C: ConnectionTrait>(
+    db: &C,
+    trigger_type: &str,
+    params: &serde_json::Value,
+    parent_job_id: Option<Uuid>,
+) -> Result<Option<Uuid>, sea_orm::DbErr> {
+    enqueue_under(db, trigger_type, None, None, params, None, parent_job_id).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_under<C: ConnectionTrait>(
+    db: &C,
+    trigger_type: &str,
+    sensor_id: Option<Uuid>,
+    trigger_id: Option<Uuid>,
+    params: &serde_json::Value,
+    dedupe_key: Option<&str>,
+    parent_job_id: Option<Uuid>,
+) -> Result<Option<Uuid>, sea_orm::DbErr> {
     let id = Uuid::new_v4();
     let category = category_for(trigger_type);
     // The conflict target carries the index's own predicate: the unique index on `dedupe_key` is
@@ -1464,6 +1494,7 @@ pub async fn enqueue<C: ConnectionTrait>(
         category: Set(category.to_string()),
         params: Set(params.clone()),
         dedupe_key: Set(dedupe_key.map(ToString::to_string)),
+        parent_job_id: Set(parent_job_id),
         next_attempt_at: Set(chrono::Utc::now().into()),
         ..Default::default()
     })

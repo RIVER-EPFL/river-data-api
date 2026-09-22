@@ -43,6 +43,7 @@ async fn resolve_or_create_site_parameter<C: ConnectionTrait>(
     db: &C,
     site_id: Uuid,
     parameter_id: Uuid,
+    sensor_id: Uuid,
     create: bool,
 ) -> AppResult<(Uuid, bool)> {
     let existing = site_parameters::Entity::find()
@@ -66,6 +67,7 @@ async fn resolve_or_create_site_parameter<C: ConnectionTrait>(
         .one(db)
         .await?
         .ok_or_else(|| AppError::NotFound("Parameter not found".to_string()))?;
+    let cadence = crate::routes::private::sensors::service::cadence_of(db, sensor_id).await?;
     let sp = site_parameters::ActiveModel {
         id: Set(Uuid::new_v4()),
         instrument_sensor_id: Set(None),
@@ -83,6 +85,7 @@ async fn resolve_or_create_site_parameter<C: ConnectionTrait>(
         is_public: Set(Some(false)),
         needs_review: Set(false),
         entry_mode: Set("manual".to_string()),
+        cadence: Set(cadence),
         variable_mappings: Set(None),
         created_at: Set(Some(Utc::now())),
         updated_at: Set(Some(Utc::now())),
@@ -264,6 +267,7 @@ pub async fn adopt_sensor(
         &txn,
         payload.site_id,
         parameter_id,
+        sensor_id,
         payload.create_site_parameter,
     )
     .await?;
@@ -487,6 +491,7 @@ pub async fn swap_sensors(
         &txn,
         payload.site_id,
         parameter_id,
+        payload.incoming_sensor_id,
         payload.create_site_parameter,
     )
     .await?;

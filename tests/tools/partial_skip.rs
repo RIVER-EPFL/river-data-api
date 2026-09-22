@@ -58,8 +58,9 @@ async fn seed_calculation(db: &DatabaseConnection) -> (String, String) {
     (script_id, GROUP_ID.to_string())
 }
 
-/// The parameter a saved formula minted, declared at the site so the chain applies there. A
-/// calculation mints its own output (Q191), so the slot is declared after the formula is added.
+/// The parameter a saved formula minted, declared at the site so the chain applies there, on the
+/// visit arm the chain writes. A calculation mints its own output (Q191), so the slot is declared
+/// after the formula is added.
 async fn declare_slot(db: &DatabaseConnection, code: &str) -> String {
     let parameter_id: Uuid = db
         .query_one_raw(Statement::from_string(
@@ -75,9 +76,9 @@ async fn declare_slot(db: &DatabaseConnection, code: &str) -> String {
         db,
         &format!(
             "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, \
-                 entry_mode, display_units) \
+                 entry_mode, cadence, display_units) \
              VALUES (gen_random_uuid(), '{SITE1_ID}', '{parameter_id}', '{code}', 'derived', \
-                 'tool', 'ratio')"
+                 'tool', 'low', 'ratio')"
         ),
     )
     .await;

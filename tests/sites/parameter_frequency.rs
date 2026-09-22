@@ -1,7 +1,7 @@
-//! The frequency classification on `GET /sites/{id}/parameters`: `has_continuous`/`has_spot`
-//! counts ride the extent scan and `frequency` derives from them ('low' = spot-only,
-//! 'mixed' = both, 'high' otherwise). The UI uses these to default charts to marker-only
-//! rendering for low-frequency (lab/campaign) series.
+//! The cadence on `GET /sites/{id}/parameters`: `has_continuous`/`has_spot` counts ride the extent
+//! scan and say what the slot holds, while `frequency` is the slot's own `cadence` column and says
+//! what it is filled at. The UI uses these to default charts to marker-only rendering for
+//! low-frequency (lab/campaign) series.
 //!
 //! Run: cargo test --test sites -- --test-threads=1
 
@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 #[tokio::test]
 #[serial]
-async fn parameters_report_frequency_from_measurement_types() {
+async fn parameters_report_the_declared_cadence_whatever_the_rows_hold() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
@@ -18,8 +18,8 @@ async fn parameters_report_frequency_from_measurement_types() {
     let app = crate::common::build_test_app(db.clone());
     let site_id = crate::common::SITE1_ID;
 
-    // Turn one seeded parameter into a mixed series (continuous seed data + one spot grab), and
-    // one into spot-only by retagging all its readings.
+    // One parameter carries both arms (continuous seed data plus one spot grab) and one carries
+    // spot rows alone, so the readings disagree with what the slots declare below.
     let stream_id = Uuid::new_v4();
     crate::common::exec(
         &db,
@@ -75,6 +75,16 @@ async fn parameters_report_frequency_from_measurement_types() {
     )
     .await;
 
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE site_parameters SET cadence = 'low' \
+             WHERE site_id = '{site_id}' AND parameter_id = '{param}'",
+            param = crate::common::GLOBAL_PARAM_TEMP_ID,
+        ),
+    )
+    .await;
+
     let (status, body) = crate::common::get_json_with_token(
         &app,
         &format!("/api/sites/{site_id}/parameters"),
@@ -91,15 +101,18 @@ async fn parameters_report_frequency_from_measurement_types() {
             .unwrap_or_else(|| panic!("parameter {id} missing from response"))
     };
 
-    let mixed = by_param(crate::common::GLOBAL_PARAM_TEMP_ID);
-    assert_eq!(mixed["frequency"], "mixed", "temp: {mixed}");
-    assert_eq!(mixed["has_spot"], true);
-    assert_eq!(mixed["has_continuous"], true);
+    // The slot carrying both arms is declared `low`: the declaration is what the chain and the
+    // stream engine divide on, so it is what the endpoint reports.
+    let both = by_param(crate::common::GLOBAL_PARAM_TEMP_ID);
+    assert_eq!(both["frequency"], "low", "temp: {both}");
+    assert_eq!(both["has_spot"], true);
+    assert_eq!(both["has_continuous"], true);
 
-    let low = by_param(crate::common::GLOBAL_PARAM_TURB_ID);
-    assert_eq!(low["frequency"], "low", "turbidity: {low}");
-    assert_eq!(low["has_spot"], true);
-    assert_eq!(low["has_continuous"], false);
+    // Spot rows alone under a slot still declared `high`: the rows do not move the declaration.
+    let spot_only = by_param(crate::common::GLOBAL_PARAM_TURB_ID);
+    assert_eq!(spot_only["frequency"], "high", "turbidity: {spot_only}");
+    assert_eq!(spot_only["has_spot"], true);
+    assert_eq!(spot_only["has_continuous"], false);
 
     let high = by_param(crate::common::GLOBAL_PARAM_DO_ID);
     assert_eq!(high["frequency"], "high", "do: {high}");

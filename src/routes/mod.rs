@@ -325,6 +325,7 @@ pub fn validate_optional_time_range(
         private::site_parameters::views::merge_site_parameters_handler,
         private::parameter_groups::views::group_definition,
         private::site_parameters::views::apply_group,
+        private::site_parameters::views::apply_calculation,
         private::parameters::views::merge_parameters_handler,
         private::projects::views::invalidate_public_config,
         private::sync::views::create_pairing_plan,

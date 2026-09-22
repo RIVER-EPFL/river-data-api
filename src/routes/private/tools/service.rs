@@ -602,6 +602,24 @@ pub async fn find_active_tool(db: &DatabaseConnection, name: &str) -> AppResult<
     Ok(tools.remove(0))
 }
 
+/// The active calculation a site-apply names by id. Same switch as a run by name: a calculation
+/// switched off is refused naming the switch (Q174).
+pub async fn find_active_tool_by_id(db: &DatabaseConnection, id: Uuid) -> AppResult<ActiveTool> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("{ACTIVE_TOOL_SQL} WHERE s.id = $1"),
+            [id.into()],
+        ))
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Calculation {id} not found")))?;
+    let name: String = row.try_get("", "name")?;
+    admit_run(&name, row.try_get::<bool>("", "enabled")?)?;
+    let mut tools = vec![row_to_active(&row)?];
+    attach_formulas(db, &mut tools).await?;
+    Ok(tools.remove(0))
+}
+
 pub(super) async fn resolve_curve(
     db: &DatabaseConnection,
     slot: &ManifestCurve,

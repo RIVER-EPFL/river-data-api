@@ -1655,6 +1655,9 @@ pub async fn update_pairing_plan(
     );
     apply_site_attribute_updates(&mut entries, &req.updates);
     apply_instrument_updates(&state, &plan.source_system, &mut entries, &req.updates).await?;
+    // Over the whole plan, after every rename in this request has landed: one row cannot see the
+    // other's spelling, and reclassifying an entry clears its warnings.
+    crate::routes::private::sync::service::flag_duplicates_in_plan(&mut entries);
 
     let mut intents = crate::routes::private::sync::service::plan_curve_intents(&plan)?;
     apply_curve_updates(&state.db, &entries, &mut intents, &req.curves).await?;

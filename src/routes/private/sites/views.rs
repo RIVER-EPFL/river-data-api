@@ -86,12 +86,11 @@ pub async fn list_site_parameters(
     let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
     let globals = site_parameters::catalog_map(&state.db, param_ids.iter().copied()).await?;
     let extents = parameter_extents(&state.db, site.id).await?;
-    let declared = declared_frequencies(&state.db, site.id).await?;
     let attributions = meteoswiss::site_attributions(&state.db, site.id).await?;
 
     let response: Vec<ParameterResponse> = params_list
         .into_iter()
-        .map(|p| build_parameter_response(p, &globals, &extents, &declared, &attributions))
+        .map(|p| build_parameter_response(p, &globals, &extents, &attributions))
         .collect();
 
     Ok(Json(response))
@@ -135,12 +134,11 @@ pub async fn get_site_detail(
     let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
     let globals = site_parameters::catalog_map(&state.db, param_ids.iter().copied()).await?;
     let extents = parameter_extents(&state.db, site.id).await?;
-    let declared = declared_frequencies(&state.db, site.id).await?;
     let attributions = meteoswiss::site_attributions(&state.db, site.id).await?;
 
     let parameters: Vec<ParameterResponse> = params_list
         .into_iter()
-        .map(|p| build_parameter_response(p, &globals, &extents, &declared, &attributions))
+        .map(|p| build_parameter_response(p, &globals, &extents, &attributions))
         .collect();
 
     // The extents cover the same rows this range spans (`WHERE site_id = $1`), so folding them is

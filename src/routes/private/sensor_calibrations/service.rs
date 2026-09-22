@@ -752,13 +752,15 @@ fn derived_work_query(site_id: Uuid) -> SelectStatement {
         )
         .and_where(Expr::col((sp.clone(), site_parameters::Column::SiteId)).eq(site_id))
         .and_where(Expr::col((d, calculation_formulas::Column::ToolScriptId)).is_null())
-        .and_where(Expr::col((sp, site_parameters::Column::EntryMode)).eq("tool"))
+        .and_where(Expr::col((sp.clone(), site_parameters::Column::EntryMode)).eq("tool"))
+        .and_where(Expr::col((sp, site_parameters::Column::Cadence)).eq("high"))
         .take()
 }
 
-/// The slots this site computes. The producing definition is the one whose output is the slot's
-/// parameter; `entry_mode` is the site's own declaration that it computes the slot rather than
-/// taking it by hand.
+/// The slots this site computes on a stream. The producing definition is the one whose output is
+/// the slot's parameter; `entry_mode` is the site's own declaration that it computes the slot
+/// rather than taking it by hand, and `cadence` that the stream carries it rather than a visit
+/// (Q234).
 async fn fetch_derived_work_items(
     db: &DatabaseConnection,
     site_id: Uuid,

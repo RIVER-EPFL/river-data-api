@@ -25,6 +25,7 @@ mod m20260921_000003_tool_run_visit;
 mod m20260922_000001_formula_owner_or_step;
 mod m20260922_000002_skipped_standard_curves;
 mod m20260922_000003_drop_slot_channel;
+mod m20260922_000004_site_parameter_cadence;
 
 pub struct Migrator;
 
@@ -70,6 +71,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260922_000001_formula_owner_or_step::Migration),
             Box::new(m20260922_000002_skipped_standard_curves::Migration),
             Box::new(m20260922_000003_drop_slot_channel::Migration),
+            Box::new(m20260922_000004_site_parameter_cadence::Migration),
         ]
     }
 }

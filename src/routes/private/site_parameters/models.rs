@@ -59,6 +59,12 @@ pub struct Model {
     /// parameter's group binding, never this column.
     #[crudcrate(filterable, on_create = "manual".to_string())]
     pub entry_mode: String,
+    /// The cadence this site fills the slot at: 'high' (a stream carries it, and the continuous
+    /// engine computes it there) or 'low' (a person records it at a visit, and the chain computes
+    /// it from that visit's values). `readings` holds one row per slot instant, so the
+    /// declaration is what keeps the two engines off each other's rows.
+    #[crudcrate(filterable, on_create = "high".to_string())]
+    pub cadence: String,
     /// The instrument that measures this slot, declared here rather than inferred at the write.
     /// NULL is undeclared: a value entered there takes the entry channel's own instrument, which
     /// is a marker for a slot nobody has declared and not a statement about what measured it.
@@ -188,6 +194,32 @@ pub struct ApplyGroupResponse {
     pub created: Vec<AppliedSlot>,
     /// Members the site already carried, left exactly as they are.
     pub existing: Vec<AppliedSlot>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyCalculationRequest {
+    /// The tool script the calculation is authored as.
+    pub calculation_id: Uuid,
+    /// Report what would be created, and what is missing, without creating anything.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ApplyCalculationResponse {
+    pub site_id: Uuid,
+    pub calculation_id: Uuid,
+    pub calculation_name: String,
+    pub dry_run: bool,
+    /// Read inputs the site already declares.
+    pub inputs_present: Vec<AppliedSlot>,
+    /// Read inputs the site does not declare. Non-empty refuses the apply.
+    pub inputs_missing: Vec<AppliedSlot>,
+    /// Output slots the site already carries, left exactly as they are.
+    pub outputs_existing: Vec<AppliedSlot>,
+    /// Output slots this call created, or would create.
+    pub outputs_created: Vec<AppliedSlot>,
 }
 
 /// One member of a group as the apply flow reads it: the catalog parameter, its code, and the role

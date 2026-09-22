@@ -2,8 +2,8 @@ use super::{
     BulkWhere, EntityCatalog, InstrumentCatalog, InstrumentNameConflict, PlanCalculationRef,
     PlanEntry, PlanGroupRef, PlanInstrumentRef, apply_bulk_action, apply_group_updates,
     family_parameter_suggestion, group_code, instrument_key, join_named_proposal, linked_entity,
-    minted_param_needs_review, plan_calculation, plan_slots, proposal_conflict,
-    resolve_parameter_instrument, select_entries, stream_instrument_key,
+    minted_param_needs_review, plan_calculation, plan_slots, plan_slots_holding_readings,
+    proposal_conflict, resolve_parameter_instrument, select_entries, stream_instrument_key,
 };
 use crate::routes::private::sync::models::PlanEntryUpdate;
 use std::collections::{HashMap, HashSet};
@@ -1054,4 +1054,103 @@ fn test_a_skipped_row_s_code_collides_with_nothing() {
     degc.action = "skip".to_string();
 
     assert!(super::colliding_parameter_codes(&[um, degc], &EntityCatalog::default()).is_empty(),);
+}
+/// Expected behaviour: the re-derivation after an apply visits only the slots that hold a reading.
+/// On the CNET apply of 2026-09-22, 1124 of 2852 slots held none and cost 35 ms each for nothing.
+#[test]
+fn test_a_plan_attributes_only_the_slots_holding_readings() {
+    use sea_orm::QueryTrait as _;
+    let sql = plan_slots_holding_readings(Uuid::nil())
+        .build(sea_orm::DatabaseBackend::Postgres)
+        .to_string();
+    assert!(sql.contains("EXISTS"), "a slot with no reading is skipped: {sql}");
+    assert!(
+        sql.contains(r#"FROM "readings""#),
+        "the test is against the readings: {sql}"
+    );
+    assert!(
+        sql.contains(r#""readings"."site_id" = "site_parameters"."site_id""#)
+            && sql.contains(r#""readings"."parameter_id" = "site_parameters"."parameter_id""#),
+        "correlated to the slot, not to any reading: {sql}"
+    );
+    assert!(
+        sql.contains(r#""data_streams"."pairing_plan_id" ="#),
+        "still scoped to the plan: {sql}"
+    );
+}
+
+/// Scenario: DOuM and DOdegC are both proposed as `DO`, the station is spelled `FP1` on one row and
+/// `FP-1` on another, and a third row pairs onto a site nothing else names.
+///
+/// Expected behaviour: each row of a pair is told what it collides with, in the plan rather than at
+/// apply; the row colliding with nothing carries no warning.
+#[test]
+fn test_the_plan_names_what_two_of_its_own_rows_would_create_twice() {
+    let mut um = plan_entry("FP1", "DO", "none", 0);
+    um.parameter.units = "uM".to_string();
+    um.warnings.clear();
+    let mut degc = plan_entry("FP-1", "DO", "none", 0);
+    degc.parameter.units = "degC".to_string();
+    degc.warnings.clear();
+    let mut alone = plan_entry("Saxon", "Depth", "none", 0);
+    alone.warnings.clear();
+    let mut entries = vec![um, degc, alone];
+
+    super::flag_duplicates_in_plan(&mut entries);
+
+    let kinds = |e: &super::PlanEntry| -> Vec<String> {
+        e.warnings.iter().map(|w| w.kind.clone()).collect()
+    };
+    assert_eq!(
+        kinds(&entries[0]),
+        ["duplicate_parameter_code", "duplicate_site_name"],
+        "{:?}",
+        entries[0].warnings
+    );
+    assert_eq!(
+        kinds(&entries[1]),
+        ["duplicate_parameter_code", "duplicate_site_name"],
+    );
+    assert!(entries[0].warnings[0].message.contains("degC"));
+    assert!(entries[0].warnings[1].message.contains("FP-1"));
+    assert!(kinds(&entries[2]).is_empty(), "{:?}", entries[2].warnings);
+}
+
+/// A skipped row creates nothing, so it collides with nothing.
+#[test]
+fn test_a_skipped_row_is_not_a_duplicate() {
+    let mut um = plan_entry("FP1", "DO", "none", 0);
+    um.parameter.units = "uM".to_string();
+    um.warnings.clear();
+    let mut degc = plan_entry("FP1", "DO", "none", 0);
+    degc.parameter.units = "degC".to_string();
+    degc.action = "skip".to_string();
+    degc.warnings.clear();
+    let mut entries = vec![um, degc];
+
+    super::flag_duplicates_in_plan(&mut entries);
+
+    assert!(entries[0].warnings.is_empty(), "{:?}", entries[0].warnings);
+}
+
+/// An entry attaching to a parameter or a site that already exists creates nothing, so two of them
+/// under one code is one parameter used twice, not a collision.
+#[test]
+fn test_an_attached_row_is_not_a_duplicate() {
+    let existing = Uuid::new_v4();
+    let mut a = plan_entry("FP1", "DO", "none", 0);
+    a.parameter.units = "uM".to_string();
+    a.parameter.create = false;
+    a.parameter.id = Some(existing);
+    a.warnings.clear();
+    let mut b = plan_entry("FP1", "DO", "none", 0);
+    b.parameter.units = "degC".to_string();
+    b.parameter.create = false;
+    b.parameter.id = Some(existing);
+    b.warnings.clear();
+    let mut entries = vec![a, b];
+
+    super::flag_duplicates_in_plan(&mut entries);
+
+    assert!(entries[0].warnings.is_empty(), "{:?}", entries[0].warnings);
 }

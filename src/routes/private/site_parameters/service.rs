@@ -291,6 +291,23 @@ async fn definition_producing<C: ConnectionTrait>(
         .map_err(ApiError::database)
 }
 
+/// The cadence a site declares for one catalog parameter, or `None` where it holds no slot for
+/// it. `high` is the stream arm, `low` the visit arm.
+pub async fn slot_cadence<C: ConnectionTrait>(
+    db: &C,
+    site_id: Uuid,
+    parameter_id: Uuid,
+) -> AppResult<Option<String>> {
+    Ok(Entity::find()
+        .filter(Column::SiteId.eq(site_id))
+        .filter(Column::ParameterId.eq(parameter_id))
+        .select_only()
+        .column(Column::Cadence)
+        .into_tuple::<String>()
+        .one(db)
+        .await?)
+}
+
 /// The slot a publishing run mints at a site that declared the calculation's inputs but not its
 /// output (Q193). It carries `needs_review` until a manager confirms it from the site's Parameters
 /// tab, it computes rather than being typed into, and it is not public. `None` when the site
@@ -333,6 +350,8 @@ pub async fn mint_tool_slot<C: ConnectionTrait>(
         is_public: Set(Some(false)),
         needs_review: Set(true),
         entry_mode: Set("tool".to_string()),
+        // The run that mints it is a visit's, so the slot it needs is the visit arm's.
+        cadence: Set("low".to_string()),
         variable_mappings: Set(None),
         created_at: Set(Some(chrono::Utc::now())),
         updated_at: Set(Some(chrono::Utc::now())),
@@ -428,6 +447,67 @@ pub fn partition_members(
         }
     }
     (create, existing)
+}
+
+/// A calculation's read inputs and its outputs, partitioned against the slots the site already
+/// declares. Applying is refused while `inputs_missing` is non-empty, so the same partition both
+/// decides the refusal and lists what the apply would mint.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CalculationPartition {
+    pub inputs_present: Vec<CalculationMember>,
+    pub inputs_missing: Vec<CalculationMember>,
+    pub outputs_existing: Vec<CalculationMember>,
+    pub outputs_to_create: Vec<CalculationMember>,
+}
+
+/// One parameter a calculation reads or writes: the catalog id and the code a refusal names it by.
+pub type CalculationMember = (Uuid, String);
+
+/// What applying a calculation at a site would do. An input the site declares is present, one it
+/// does not is missing; an output it declares is left alone, one it does not is minted. A
+/// parameter named twice by the manifest is partitioned once.
+#[must_use]
+pub fn partition_calculation(
+    read_inputs: &[CalculationMember],
+    outputs: &[CalculationMember],
+    held: &std::collections::HashSet<Uuid>,
+) -> CalculationPartition {
+    let mut partition = CalculationPartition::default();
+    let mut seen = std::collections::HashSet::new();
+    for member in read_inputs {
+        if !seen.insert(member.0) {
+            continue;
+        }
+        if held.contains(&member.0) {
+            partition.inputs_present.push(member.clone());
+        } else {
+            partition.inputs_missing.push(member.clone());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for member in outputs {
+        if !seen.insert(member.0) {
+            continue;
+        }
+        if held.contains(&member.0) {
+            partition.outputs_existing.push(member.clone());
+        } else {
+            partition.outputs_to_create.push(member.clone());
+        }
+    }
+    partition
+}
+
+/// The cadence an applied output slot takes, from the cadences the site declares for the
+/// calculation's read inputs (Q234): the stream arm only where every input is on the stream arm
+/// there, the visit arm otherwise. A calculation that reads nothing is a visit's.
+#[must_use]
+pub fn applied_cadence(input_cadences: &[Option<String>]) -> &'static str {
+    let all_high = !input_cadences.is_empty()
+        && input_cadences
+            .iter()
+            .all(|cadence| cadence.as_deref() == Some("high"));
+    if all_high { "high" } else { "low" }
 }
 
 /// The `samples` rows a retag names: those whose slot is named by id, or reached through the

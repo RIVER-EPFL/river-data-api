@@ -24,6 +24,19 @@ fn test_derived_work_query_selects_standalone_definitions() {
     );
 }
 
+/// A slot the site declares low cadence is filled at a visit, and the chain computes it there.
+/// Without the predicate the stream engine evaluates it at the same instant and upserts over the
+/// chain's row, since both write `(stream_id, time, replicate_index)`.
+#[test]
+fn test_derived_work_query_takes_only_high_cadence_slots() {
+    use sea_orm::sea_query::PostgresQueryBuilder;
+    let sql = derived_work_query(Uuid::nil()).to_string(PostgresQueryBuilder);
+    assert!(
+        sql.contains(r#""sp"."cadence" = 'high'"#),
+        "a low-cadence slot is the chain's, computed at its visit: {sql}"
+    );
+}
+
 /// The report and the split ask the same question at different moments: a reading whose curve
 /// belongs to another instrument. Keeping the predicate in one place is what stops the report
 /// listing rows the split would not have asked about.

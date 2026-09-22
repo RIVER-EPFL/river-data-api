@@ -1981,6 +1981,81 @@
         ],
         "type": "object"
       },
+      "ApplyCalculationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "calculation_id": {
+            "description": "The tool script the calculation is authored as.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "dry_run": {
+            "description": "Report what would be created, and what is missing, without creating anything.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "calculation_id"
+        ],
+        "type": "object"
+      },
+      "ApplyCalculationResponse": {
+        "properties": {
+          "calculation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "calculation_name": {
+            "type": "string"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "inputs_missing": {
+            "description": "Read inputs the site does not declare. Non-empty refuses the apply.",
+            "items": {
+              "$ref": "#/components/schemas/AppliedSlot"
+            },
+            "type": "array"
+          },
+          "inputs_present": {
+            "description": "Read inputs the site already declares.",
+            "items": {
+              "$ref": "#/components/schemas/AppliedSlot"
+            },
+            "type": "array"
+          },
+          "outputs_created": {
+            "description": "Output slots this call created, or would create.",
+            "items": {
+              "$ref": "#/components/schemas/AppliedSlot"
+            },
+            "type": "array"
+          },
+          "outputs_existing": {
+            "description": "Output slots the site already carries, left exactly as they are.",
+            "items": {
+              "$ref": "#/components/schemas/AppliedSlot"
+            },
+            "type": "array"
+          },
+          "site_id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "site_id",
+          "calculation_id",
+          "calculation_name",
+          "dry_run",
+          "inputs_present",
+          "inputs_missing",
+          "outputs_existing",
+          "outputs_created"
+        ],
+        "type": "object"
+      },
       "ApplyGroupRequest": {
         "additionalProperties": false,
         "properties": {
@@ -13378,7 +13453,7 @@
             ]
           },
           "frequency": {
-            "description": "Data-driven cadence classification: 'low' (spot-only), 'high' (no spot), or 'mixed'.\nLow-frequency series render marker-only over their full range and skip the aggregate path.",
+            "description": "The slot's declared cadence: 'high' (a stream carries it) or 'low' (a person records it at\na visit). Low-frequency series render marker-only over their full range and skip the\naggregate path.",
             "type": "string"
           },
           "has_continuous": {
@@ -15452,7 +15527,7 @@
             ]
           },
           "kind": {
-            "description": "`units_mismatch` | `empty_name` | `near_duplicate` | `code_conflict`.",
+            "description": "`units_mismatch` | `empty_name` | `near_duplicate` | `catalog_match` |\n`duplicate_parameter_code` | `duplicate_site_name` | `duplicate_project_name`.",
             "type": "string"
           },
           "message": {
@@ -22587,6 +22662,12 @@
       },
       "SiteParameterCreate": {
         "properties": {
+          "cadence": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "decimal_places": {
             "format": "int32",
             "type": [
@@ -22688,6 +22769,10 @@
       },
       "SiteParameterList": {
         "properties": {
+          "cadence": {
+            "description": "The cadence this site fills the slot at: 'high' (a stream carries it, and the continuous\nengine computes it there) or 'low' (a person records it at a visit, and the chain computes\nit from that visit's values). `readings` holds one row per slot instant, so the\ndeclaration is what keeps the two engines off each other's rows.",
+            "type": "string"
+          },
           "created_at": {
             "format": "date-time",
             "type": [
@@ -22827,6 +22912,7 @@
           "is_public",
           "needs_review",
           "entry_mode",
+          "cadence",
           "instrument_sensor_id",
           "variable_mappings",
           "created_at",
@@ -22838,6 +22924,10 @@
       },
       "SiteParameterResponse": {
         "properties": {
+          "cadence": {
+            "description": "The cadence this site fills the slot at: 'high' (a stream carries it, and the continuous\nengine computes it there) or 'low' (a person records it at a visit, and the chain computes\nit from that visit's values). `readings` holds one row per slot instant, so the\ndeclaration is what keeps the two engines off each other's rows.",
+            "type": "string"
+          },
           "created_at": {
             "format": "date-time",
             "type": [
@@ -22977,6 +23067,7 @@
           "is_public",
           "needs_review",
           "entry_mode",
+          "cadence",
           "instrument_sensor_id",
           "variable_mappings",
           "created_at",
@@ -22988,6 +23079,12 @@
       },
       "SiteParameterUpdate": {
         "properties": {
+          "cadence": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "decimal_places": {
             "format": "int32",
             "type": [
@@ -43226,7 +43323,7 @@
     },
     "/api/site_parameters": {
       "get": {
-        "description": "Retrieves all site_parameters.\n\nThis resource manages site_parameter items\n\nAdditional sortable columns: \n- name\n- needs_review\n- created_at\n- discovered_at.\n\nAdditional filterable columns: \n- site_id\n- parameter_id\n- name\n- sensor_type\n- is_active\n- is_public\n- needs_review\n- entry_mode\n- instrument_sensor_id\n- discovered_at.",
+        "description": "Retrieves all site_parameters.\n\nThis resource manages site_parameter items\n\nAdditional sortable columns: \n- name\n- needs_review\n- created_at\n- discovered_at.\n\nAdditional filterable columns: \n- site_id\n- parameter_id\n- name\n- sensor_type\n- is_active\n- is_public\n- needs_review\n- entry_mode\n- cadence\n- instrument_sensor_id\n- discovered_at.",
         "operationId": "get_all_site_parameters",
         "parameters": [
           {
@@ -44615,6 +44712,58 @@
         "summary": "List annotations for a site, optionally filtered by parameter and time range",
         "tags": [
           "sites"
+        ]
+      }
+    },
+    "/api/sites/{site_id}/calculations": {
+      "post": {
+        "description": "Refused while an input is undeclared, naming each one: the calculation would be\n`not_applicable` there, learned after the fact from a job log. The outputs a successful apply\nmints are the site's declaration of the calculation, so they carry no review flag; the ones the\nchain mints on its own still do (Q193). Applying twice creates nothing the second time.",
+        "operationId": "apply_calculation",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "site_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplyCalculationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplyCalculationResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "The site does not declare every parameter the calculation reads"
+          },
+          "404": {
+            "description": "No site or no calculation with this id"
+          },
+          "409": {
+            "description": "The calculation is switched off"
+          }
+        },
+        "summary": "Apply a calculation at a site: check the site declares everything the calculation reads, and\nmint the output slots it lacks.",
+        "tags": [
+          "site_parameters"
         ]
       }
     },

@@ -567,6 +567,9 @@ pub async fn provision<C: ConnectionTrait + sea_orm::TransactionTrait>(
                 // An operator picked the station, so there is nothing here for a manager to
                 // confirm; the flag is for a column a tool save added.
                 needs_review: Set(false),
+                // The subscription registers its stream `continuous`, so the slot it fills is the
+                // stream arm's.
+                cadence: Set("high".to_string()),
                 ..Default::default()
             }
             .insert(db)
