@@ -603,6 +603,7 @@ pub async fn stream_calculation<C: ConnectionTrait>(
     Ok(Some(StreamCalculation {
         id: script_id,
         name: row.name,
+        active_version_id: row.active_version_id,
         formulas,
     }))
 }
@@ -611,6 +612,10 @@ pub async fn stream_calculation<C: ConnectionTrait>(
 pub struct StreamCalculation {
     pub id: Uuid,
     pub name: String,
+    /// The version a value it stores names. `None` until the set has been saved through
+    /// `/tool_scripts/{id}/formulas`: one save is one version (Q186), so a calculation nobody has
+    /// saved has no version to pin and its values say so rather than naming a made-up one.
+    pub active_version_id: Option<Uuid>,
     pub formulas: Vec<PinnedFormula>,
 }
 
@@ -3403,6 +3408,72 @@ pub async fn version_usage(
         .collect()
 }
 
+/// The statement behind [`version_ledger`], as text, so a test can read what it asks for.
+///
+/// The grouping key is the version the decision names, which outlives every job row, so a stream
+/// pass needs no run identity of its own. Only the two kinds that carry a computation are counted:
+/// a flag or a withdrawal on a computed reading is curation, not a version's work. Counting
+/// distinct `(stream_id, time, replicate_index)` is what makes a reading moved twice under one
+/// version one reading; `at` is when the computing happened and `time` where the value sits.
+///
+/// The `FILTER` is load-bearing: a row of all-NULL columns from the outer join is not itself NULL,
+/// so `COUNT(DISTINCT ...)` over it counts one, and a version that computed nothing would report a
+/// reading it never made.
+#[must_use]
+pub fn version_ledger_sql() -> &'static str {
+    "SELECT v.id AS version_id,
+            v.version_no AS version_no,
+            COUNT(DISTINCT (d.stream_id, d.time, d.replicate_index))
+              FILTER (WHERE d.stream_id IS NOT NULL)::bigint AS readings,
+            MIN(d.time) AS first_instant,
+            MAX(d.time) AS last_instant,
+            MIN(d.at) AS first_computed,
+            MAX(d.at) AS last_computed
+       FROM tool_script_versions v
+       LEFT JOIN reading_decisions d
+         ON d.kind IN ('derived_computed', 'formula_transition')
+        AND d.new ->> 'derived_version_id' = v.id::text
+      WHERE v.tool_script_id = $1
+      GROUP BY v.id, v.version_no
+      ORDER BY v.version_no DESC"
+}
+
+/// What each version of a calculation has computed on the stream arm, newest first (Q232).
+///
+/// The visit arm lists runs; a stream pass mints none, so its history is read off the curation
+/// ledger, where every computed value left a `derived_computed` or a `formula_transition` naming
+/// the version that made it.
+pub async fn version_ledger(
+    db: &DatabaseConnection,
+    script_id: Uuid,
+) -> AppResult<Vec<crate::routes::private::tools::models::VersionLedgerRow>> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            version_ledger_sql(),
+            vec![script_id.into()],
+        ))
+        .await?;
+    let instant = |row: &sea_orm::QueryResult, column: &str| -> AppResult<Option<chrono::DateTime<chrono::Utc>>> {
+        Ok(row
+            .try_get::<Option<sea_orm::prelude::DateTimeWithTimeZone>>("", column)?
+            .map(|t| t.with_timezone(&chrono::Utc)))
+    };
+    rows.iter()
+        .map(|row| {
+            Ok(crate::routes::private::tools::models::VersionLedgerRow {
+                version_id: row.try_get("", "version_id")?,
+                version_no: row.try_get("", "version_no")?,
+                readings: row.try_get("", "readings")?,
+                first_instant: instant(row, "first_instant")?,
+                last_instant: instant(row, "last_instant")?,
+                first_computed: instant(row, "first_computed")?,
+                last_computed: instant(row, "last_computed")?,
+            })
+        })
+        .collect()
+}
+
 /// [`calculations_fed_by`] for any subject.
 pub async fn calculations_fed_by_subject(
     db: &DatabaseConnection,
@@ -4204,48 +4275,76 @@ pub async fn audit_after_activation<C: ConnectionTrait>(db: &C, name: &str) {
     }
 }
 
-/// What an activation enqueues to repair the values the version it replaced produced (Q170).
-///
-/// `None` on the leaving arm, and on a first activation, which supersedes nothing. On the
-/// correcting arm the scope is the superseded version id: the visits it produced values at are a
-/// finite set its provenance names, and it stops growing the moment the activation commits.
-#[must_use]
-pub fn migration_job(
-    migrate_stored: bool,
-    name: &str,
-    superseded: Option<Uuid>,
-) -> Option<(serde_json::Value, String)> {
-    if !migrate_stored {
-        return None;
-    }
-    let superseded = superseded?;
-    Some((
-        serde_json::json!({ "version": superseded, "calculation": name }),
-        format!("event_recompute:version:{superseded}"),
-    ))
+/// One job an activation enqueues to repair what the version it replaced produced.
+pub struct MigrationJob {
+    pub kind: &'static str,
+    pub params: serde_json::Value,
+    pub dedupe_key: String,
 }
 
-/// Enqueue what [`migration_job`] decided, if anything.
+/// What an activation enqueues to repair the values the version it replaced produced (Q170): one
+/// job per arm the calculation computes on.
+///
+/// Empty on the leaving arm, and on a first activation, which supersedes nothing.
+///
+/// The visit arm is scoped to the superseded version: the visits it produced values at are a
+/// finite set its provenance names, and it stops growing the moment the activation commits. The
+/// stream arm is scoped to the calculation instead, because a stream pass names no visit and
+/// mints no run: its values are found through the slots the calculation outputs. A pass that moves
+/// nothing records nothing, so the wider scope costs a pass rather than a ledger row.
+#[must_use]
+pub fn migration_jobs(
+    migrate_stored: bool,
+    name: &str,
+    script_id: Uuid,
+    superseded: Option<Uuid>,
+) -> Vec<MigrationJob> {
+    if !migrate_stored {
+        return Vec::new();
+    }
+    let Some(superseded) = superseded else {
+        return Vec::new();
+    };
+    vec![
+        MigrationJob {
+            kind: "event_recompute",
+            params: serde_json::json!({ "version": superseded, "calculation": name }),
+            dedupe_key: format!("event_recompute:version:{superseded}"),
+        },
+        MigrationJob {
+            kind: "derived_recompute",
+            params: serde_json::json!({ "calculation_id": script_id }),
+            dedupe_key: format!("derived_recompute:version:{superseded}"),
+        },
+    ]
+}
+
+/// Enqueue what [`migration_jobs`] decided, if anything.
 pub async fn recompute_after_activation<C: ConnectionTrait>(
     db: &C,
     migrate_stored: bool,
     name: &str,
+    script_id: Uuid,
     superseded: Option<Uuid>,
 ) {
-    let Some((params, key)) = migration_job(migrate_stored, name, superseded) else {
-        return;
-    };
-    if let Err(e) = crate::routes::private::reprocessing_jobs::service::enqueue(
-        db,
-        "event_recompute",
-        None,
-        None,
-        &params,
-        Some(&key),
-    )
-    .await
-    {
-        tracing::warn!(error = %e, calculation = %name, "failed to enqueue the version migration");
+    for job in migration_jobs(migrate_stored, name, script_id, superseded) {
+        if let Err(e) = crate::routes::private::reprocessing_jobs::service::enqueue(
+            db,
+            job.kind,
+            None,
+            None,
+            &job.params,
+            Some(&job.dedupe_key),
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %e,
+                calculation = %name,
+                kind = job.kind,
+                "failed to enqueue the version migration"
+            );
+        }
     }
 }
 
@@ -5159,3 +5258,7 @@ mod scripts_tests;
 #[cfg(test)]
 #[path = "tests/families.rs"]
 mod families_tests;
+
+#[cfg(test)]
+#[path = "tests/version_ledger.rs"]
+mod version_ledger_tests;

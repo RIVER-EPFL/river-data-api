@@ -1179,7 +1179,7 @@ async fn site_targeted_actions_refuse_a_site_outside_the_callers_grants() {
         &app,
         "/api/actions/preview_derived",
         &json!({
-            "formula": "a * 2",
+            "formulas": [{ "code": "a_doubled", "formula": "a * 2", "ordinal": 1 }],
             "site_id": scene.site_b.as_str(),
             "start": window_start,
             "end": window_end,

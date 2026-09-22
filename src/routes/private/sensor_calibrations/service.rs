@@ -825,21 +825,9 @@ async fn fetch_derived_work_items(
     }
 
     let mut items: Vec<DerivedWork> = Vec::new();
-    for row in rows {
-        let output = DerivedOutput {
-            site_param_id: row.id,
-            parameter_id: row.parameter_id,
-            parameter_code: row.parameter_code,
-        };
-        if let Some(work) = items
-            .iter_mut()
-            .find(|w| w.calculation.id == row.tool_script_id)
-        {
-            work.outputs.push(output);
-            continue;
-        }
+    for (tool_script_id, site_id, outputs) in group_by_calculation(rows) {
         let Some(calculation) =
-            crate::routes::private::tools::service::stream_calculation(db, row.tool_script_id)
+            crate::routes::private::tools::service::stream_calculation(db, tool_script_id)
                 .await
                 .map_err(app_error_as_db_err)?
         else {
@@ -850,11 +838,34 @@ async fn fetch_derived_work_items(
         }
         items.push(DerivedWork {
             calculation,
-            derived_site_id: row.site_id,
-            outputs: vec![output],
+            derived_site_id: site_id,
+            outputs,
         });
     }
     Ok(items)
+}
+
+/// The work query returns one row per output slot; a calculation with two outputs at a site is
+/// still one unit of work. Grouping here is what makes the set evaluate once per instant rather
+/// than once per output, so the whole set is read and computed a single time.
+fn group_by_calculation(rows: Vec<DerivedWorkRow>) -> Vec<(Uuid, Uuid, Vec<DerivedOutput>)> {
+    let mut grouped: Vec<(Uuid, Uuid, Vec<DerivedOutput>)> = Vec::new();
+    for row in rows {
+        let output = DerivedOutput {
+            site_param_id: row.id,
+            parameter_id: row.parameter_id,
+            parameter_code: row.parameter_code,
+        };
+        if let Some((_, _, outputs)) = grouped
+            .iter_mut()
+            .find(|(script_id, _, _)| *script_id == row.tool_script_id)
+        {
+            outputs.push(output);
+        } else {
+            grouped.push((row.tool_script_id, row.site_id, vec![output]));
+        }
+    }
+    grouped
 }
 
 /// The order the site's calculations evaluate in: a calculation reading a parameter another one
@@ -1616,7 +1627,9 @@ async fn evaluate_set_and_upsert(
         .await?;
         let stream_id =
             get_or_create_derived_stream(db, &item.calculation.name, site_id, output).await?;
-        let version = None;
+        // The value names the version of the set that made it, which is what lets a reader open
+        // the formula text behind a number computed months ago (C310).
+        let version = item.calculation.active_version_id;
         let parameter_id = output.parameter_id;
         // A recompute that moves a stored value or the version it names records the move (Q116),
         // so a person opening the value reads what it was and which formula edit changed it.

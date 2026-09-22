@@ -33,6 +33,54 @@ fn test_derived_work_query_selects_calculation_outputs() {
     );
 }
 
+/// Scenario: a calculation publishes two outputs, and the site declares a slot for each, so the
+/// work query returns two rows for one calculation.
+///
+/// Expected behaviour: they group into one unit of work carrying both outputs. This is what makes
+/// the set evaluate once per instant: grouped per output instead, a two-output set would resolve
+/// its sources and run its formulas twice at every instant and write the same two readings.
+#[test]
+fn test_two_output_rows_of_one_calculation_are_one_unit_of_work() {
+    let calculation = Uuid::from_u128(1);
+    let site = Uuid::from_u128(2);
+    let row = |slot: u128, parameter: u128, code: &str| super::DerivedWorkRow {
+        id: Uuid::from_u128(slot),
+        tool_script_id: calculation,
+        site_id: site,
+        parameter_id: Uuid::from_u128(parameter),
+        parameter_code: code.to_string(),
+    };
+
+    let grouped = super::group_by_calculation(vec![row(10, 20, "k_half"), row(11, 21, "k_tenth")]);
+    assert_eq!(grouped.len(), 1, "one calculation is one pass");
+    assert_eq!(grouped[0].0, calculation);
+    assert_eq!(grouped[0].1, site);
+    let codes: Vec<&str> = grouped[0]
+        .2
+        .iter()
+        .map(|o| o.parameter_code.as_str())
+        .collect();
+    assert_eq!(codes, ["k_half", "k_tenth"], "both outputs ride the pass");
+}
+
+/// Two calculations at one site stay two units of work: they are ordered against each other, and
+/// one reading the other's output.
+#[test]
+fn test_two_calculations_stay_two_units_of_work() {
+    let site = Uuid::from_u128(2);
+    let row = |script: u128, slot: u128| super::DerivedWorkRow {
+        id: Uuid::from_u128(slot),
+        tool_script_id: Uuid::from_u128(script),
+        site_id: site,
+        parameter_id: Uuid::from_u128(slot + 100),
+        parameter_code: format!("out_{slot}"),
+    };
+    let grouped = super::group_by_calculation(vec![row(1, 10), row(2, 11), row(1, 12)]);
+    assert_eq!(grouped.len(), 2);
+    assert_eq!(grouped[0].2.len(), 2, "the first calculation's two outputs");
+    assert_eq!(grouped[1].2.len(), 1);
+}
+
 /// A slot the site declares low cadence is filled at a visit, and the chain computes it there.
 /// Without the predicate the stream engine evaluates it at the same instant and upserts over the
 /// chain's row, since both write `(stream_id, time, replicate_index)`.

@@ -89,25 +89,41 @@ async fn test_derived_parameter_skips_infinity() {
     )
     .await;
 
-    // Create a derived parameter definition with a division formula
+    // The formula belongs to a calculation: a formula owned by none is a shared step and computes
+    // on its own nowhere (Q156), so the stream engine would never select it.
+    let calculation = crate::common::seed_formula_calculation(&db, "temp_over_do_set").await;
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO calculation_formulas (id, code, name, units, formula) \
-             VALUES ('{derived_def_id}', 'TempOverDO', 'Temp / DO', 'ratio', 'temp / do_val')"
+            "INSERT INTO calculation_formulas \
+                 (id, code, name, units, formula, tool_script_id, output_parameter_id) \
+             VALUES ('{derived_def_id}', 'TempOverDO', 'Temp / DO', 'ratio', 'temp / do_val', \
+                 '{calculation}', '{derived_param_id}')"
         ),
     )
     .await;
 
-    // Create a site_parameter for the derived value
+    // What each variable reads, which is where the engine gets its inputs: the formula text is
+    // evaluated over these pairs, never parsed for parameter codes.
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active, entry_mode, variable_mappings) \
-             VALUES ('{derived_sp_id}', '{site_id}', '{derived_param_id}', 'TempOverDO', 'TempOverDO', true, 'tool', \
-             '{{\"temp\": \"{sp_temp}\", \"do_val\": \"{sp_do}\"}}'::jsonb)",
-            sp_temp = crate::common::PARAM_S1_TEMP_ID,
-            sp_do = crate::common::PARAM_S1_DO_ID,
+            "INSERT INTO derived_parameter_sources \
+                 (id, derived_definition_id, parameter_id, variable_name) \
+             VALUES (gen_random_uuid(), '{derived_def_id}', '{temp_param}', 'temp'), \
+                    (gen_random_uuid(), '{derived_def_id}', '{do_param}', 'do_val')",
+            temp_param = crate::common::GLOBAL_PARAM_TEMP_ID,
+            do_param = crate::common::GLOBAL_PARAM_DO_ID,
+        ),
+    )
+    .await;
+
+    // The slot the calculation publishes here: computed rather than typed into, on the stream arm.
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO site_parameters (id, site_id, parameter_id, name, sensor_type, is_active, entry_mode, cadence) \
+             VALUES ('{derived_sp_id}', '{site_id}', '{derived_param_id}', 'TempOverDO', 'TempOverDO', true, 'tool', 'high')"
         ),
     )
     .await;
@@ -177,6 +193,40 @@ async fn test_derived_parameter_skips_infinity() {
     assert!(
         row.is_none(),
         "derived reading with Infinity result should NOT have been written to the database"
+    );
+
+    // The absence above is only evidence if the engine had the slot to begin with: a work set that
+    // selected nothing would report the same. A divisor it can divide by writes the value.
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE readings SET raw_value = 5.0, calibrated_value = NULL \
+              WHERE stream_id = '{do_stream_id}' AND time = '{time}' AND replicate_index = 0"
+        ),
+    )
+    .await;
+    river_db::routes::private::sensor_calibrations::service::recalculate_derived_at_timestamp(
+        &db, site_uuid, time_dt,
+    )
+    .await
+    .expect("recalculate should not error");
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT raw_value FROM readings WHERE site_id = $1 AND parameter_id = $2 AND time = $3",
+            [
+                site_uuid.into(),
+                derived_param_id.parse::<uuid::Uuid>().unwrap().into(),
+                time_dt.into(),
+            ],
+        ))
+        .await
+        .unwrap()
+        .expect("the engine selects this slot and writes its value");
+    let value: f64 = row.try_get("", "raw_value").expect("raw_value");
+    assert!(
+        (value - 2.0).abs() < 1e-9,
+        "10.0 / 5.0, so the slot the skip was measured against is one the engine computes: {value}"
     );
 
     crate::common::cleanup_test_db(&db).await;

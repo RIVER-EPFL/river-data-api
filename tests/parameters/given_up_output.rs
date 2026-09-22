@@ -27,7 +27,8 @@ async fn a_formula_ticked_as_a_step_leaves_its_parameter_named_in_the_catalogue(
     let (db, app, token) = setup().await;
     let code = "k1_step";
 
-    let calculation = crate::common::seed_formula_calculation(&db, "k1_step_set").await;
+    let calculation =
+        crate::common::seed_labelled_formula_calculation(&db, "k1_step_set", "Reaeration").await;
     let (status, body) = crate::common::post_json_with_token(
         &app,
         "/api/derived_parameters",
@@ -66,8 +67,8 @@ async fn a_formula_ticked_as_a_step_leaves_its_parameter_named_in_the_catalogue(
 
     let given_up = parameter_named(&app, &token, code).await;
     assert_eq!(
-        given_up["unpublished_by"], "Rate constant",
-        "the catalogue names the calculation that gave the row up: {given_up}"
+        given_up["unpublished_by"], "Reaeration",
+        "the catalogue names the calculation that gave the row up, not the formula: {given_up}"
     );
 
     let id = given_up["id"].as_str().expect("the parameter's id");
@@ -75,7 +76,7 @@ async fn a_formula_ticked_as_a_step_leaves_its_parameter_named_in_the_catalogue(
         crate::common::get_json_with_token(&app, &format!("/api/parameters/{id}"), &token).await;
     assert_eq!(status, 200, "{one}");
     assert_eq!(
-        one["unpublished_by"], "Rate constant",
+        one["unpublished_by"], "Reaeration",
         "the detail reads it the same way: {one}"
     );
 }

@@ -28,7 +28,13 @@ use crate::routes::private::sync::models::services as sync_services;
 
 const PG: sea_orm::DatabaseBackend = sea_orm::DatabaseBackend::Postgres;
 
-pub async fn sweep(state: &AppState) -> Result<SweepOutcome, sea_orm::DbErr> {
+/// Prune the subscriptions of every user whose access was revoked. `ctx` is the job running it,
+/// so a sweep behind a long subscriber list reports where it has got to; a caller without a job
+/// passes `None`.
+pub async fn sweep(
+    state: &AppState,
+    ctx: Option<&JobContext>,
+) -> Result<SweepOutcome, sea_orm::DbErr> {
     let db = &state.db;
     let mut outcome = SweepOutcome::default();
 
@@ -40,7 +46,11 @@ pub async fn sweep(state: &AppState) -> Result<SweepOutcome, sea_orm::DbErr> {
         .all(db)
         .await?;
 
-    for sub in subs {
+    let len = subs.len();
+    for (walked, sub) in subs.into_iter().enumerate() {
+        if let Some(ctx) = ctx {
+            ctx.set_step(walked + 1, len).await;
+        }
         let resolution = state.authorizer.resolve(state, &sub).await;
         if matches!(resolution, Some(RoleResolution::Revoked)) {
             let res = push_subscription::Entity::delete_many()
@@ -1337,7 +1347,7 @@ impl Job for PushSubscriptionReconcile {
             tracing::debug!("push_subscription_reconcile: no AppState in process; skipping");
             return Ok(0);
         };
-        match sweep(&state).await {
+        match sweep(&state, Some(&ctx)).await {
             Ok(o) => {
                 if o.total() > 0 {
                     tracing::info!(

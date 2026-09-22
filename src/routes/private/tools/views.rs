@@ -26,6 +26,7 @@ use super::models::{
     DraftRunResults, Engine, FormulaDraftRunRequest, FormulaDraftRunResponse,
     FormulaDraftRunResults, InspectScriptRequest, InspectScriptResponse, LintFinding,
     MissingConstant, RunTrace, SaveFormulaSetRequest, SaveFormulaSetResponse, SavedFormula,
+    VersionLedgerRow,
     ToolCalculation, ToolDescriptor, ToolResult, UpdateScriptRequest, ValidateResponse,
     VersionUsage, parse_manifest, reconcile_manifest, run as tool_run,
 };
@@ -799,6 +800,7 @@ pub async fn activate_version(
         &state.db,
         payload.migrate_stored,
         &script.name,
+        id,
         current.active_version_id,
     )
     .await;
@@ -966,7 +968,8 @@ pub async fn save_formula_set(
     // The audit is the backstop under either arm: it reports what the save left disagreeing.
     audit_after_activation(&state.db, &script.name).await;
     let migrated = payload.migrate_stored && superseded.is_some() && version_id != superseded;
-    super::service::recompute_after_activation(&state.db, migrated, &script.name, superseded).await;
+    super::service::recompute_after_activation(&state.db, migrated, &script.name, id, superseded)
+        .await;
 
     Ok(Json(SaveFormulaSetResponse {
         version_id,
@@ -991,6 +994,20 @@ pub async fn list_version_usage(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Vec<VersionUsage>>> {
     Ok(Json(super::service::version_usage(&state.db, id).await?))
+}
+
+/// What each version of the calculation has computed on the stream arm, newest first (Q232).
+///
+/// The visit arm answers this with its runs; a stream pass mints none, so the history is read off
+/// the curation ledger. Requires `read_data`: it is a reading of what was computed, not of how the
+/// calculation is written.
+#[utoipa::path(get, path = "/api/tool_scripts/{id}/version_ledger", params(("id" = Uuid, Path)),
+    responses((status = 200, body = [VersionLedgerRow])), tag = "tool_scripts")]
+pub async fn list_version_ledger(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<VersionLedgerRow>>> {
+    Ok(Json(super::service::version_ledger(&state.db, id).await?))
 }
 
 /// The script's activation history, newest first. Requires Administrator.

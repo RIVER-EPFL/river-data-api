@@ -33,6 +33,20 @@ async fn define(
     serde_json::from_str(&text).expect("the created calculation")
 }
 
+/// The calculation's versions, in order, as the round trip must leave them.
+async fn versions(db: &DatabaseConnection, definition: Uuid) -> String {
+    crate::common::e2e::scalar(
+        db,
+        &format!(
+            "SELECT COALESCE(string_agg(v.version_no::text, ',' ORDER BY v.version_no), 'none') \
+               FROM tool_script_versions v \
+               JOIN calculation_formulas d ON d.tool_script_id = v.tool_script_id \
+              WHERE d.id = '{definition}'"
+        ),
+    )
+    .await
+}
+
 async fn rename(app: &axum::Router, token: &str, id: &str, code: &str) -> (u16, String) {
     crate::common::put_json_with_token(
         app,
@@ -230,6 +244,21 @@ async fn an_output_ticked_as_a_step_and_back_keeps_its_parameter_readings_and_ve
     .await;
     assert!(readings > 0, "the output has a history to keep");
 
+    // A version to lose: the formula was authored one at a time, which mints none, and an
+    // assertion over an empty list would hold whatever either tick did to it.
+    crate::common::exec(
+        &f.db,
+        &format!(
+            "INSERT INTO tool_script_versions \
+                 (tool_script_id, version_no, script, manifest, content_hash) \
+             SELECT d.tool_script_id, 1, '', '{{}}'::jsonb, 'm291_round' \
+               FROM calculation_formulas d WHERE d.id = '{definition}'"
+        ),
+    )
+    .await;
+    let versions_before = versions(&f.db, definition).await;
+    assert_eq!(versions_before, "1", "the calculation holds one version");
+
     let (status, body) = set_step(&f.app, &f.token, &id, true).await;
     assert!(
         (200..300).contains(&status),
@@ -260,5 +289,19 @@ async fn an_output_ticked_as_a_step_and_back_keeps_its_parameter_readings_and_ve
         .await,
         readings,
         "the readings stored under it are untouched by either tick"
+    );
+    assert_eq!(
+        versions(&f.db, definition).await,
+        versions_before,
+        "neither tick mints a version or drops one"
+    );
+    assert_eq!(
+        crate::common::e2e::scalar(
+            &f.db,
+            "SELECT count(*)::text FROM parameters WHERE LOWER(code) = LOWER('m291_round')"
+        )
+        .await,
+        "1",
+        "the code names one catalog row throughout, not a second one minted on the way back"
     );
 }

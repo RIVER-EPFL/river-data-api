@@ -105,7 +105,7 @@ const CARRIED: &[Carried] = &[
             ("calibration_id", Reference::Natural("sensor_calibrations")),
             ("deployment_id", Reference::Natural("sensor_deployments")),
             ("standard_curve_id", Reference::Natural("standard_curves")),
-            ("derived_version_id", Reference::Dropped),
+            ("derived_version_id", Reference::Natural("tool_script_versions")),
             (
                 "collection_event_id",
                 Reference::Natural("collection_events"),
@@ -256,6 +256,14 @@ fn natural_keys() -> Vec<(&'static str, String)> {
             format!(
                 "SELECT e.id, lower(s.name) || '{SEP}' || e.collected_at::text AS k
                    FROM public.collection_events e JOIN public.sites s ON s.id = e.site_id"
+            ),
+        ),
+        (
+            "tool_script_versions",
+            format!(
+                "SELECT v.id, lower(c.name) || '{SEP}' || v.version_no::text AS k
+                   FROM public.tool_script_versions v
+                   JOIN public.tool_scripts c ON c.id = v.tool_script_id"
             ),
         ),
     ]

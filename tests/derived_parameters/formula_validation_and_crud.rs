@@ -435,17 +435,20 @@ async fn test_preview_derived_invalid_formula() {
     let (_db, app, token) = setup().await;
 
     let body = serde_json::json!({
-        "formula": ")))",
+        "formulas": [{ "code": "broken", "formula": ")))", "ordinal": 0 }],
         "site_id": crate::common::SITE1_ID,
         "start": "2025-01-15T00:00:00Z",
         "end": "2025-01-16T00:00:00Z"
     });
 
-    let (status, _text) =
+    let (status, text) =
         crate::common::post_json_with_token(&app, "/api/actions/preview_derived", &body, &token)
             .await;
 
-    assert_eq!(status, 400, "Invalid formula in preview should return 400");
+    assert_eq!(
+        status, 400,
+        "an unparseable formula is refused by the route, not by serde: {text}"
+    );
 }
 
 // =============================================================================
@@ -559,7 +562,7 @@ async fn test_preview_resolves_variables_by_code_not_name() {
     let (_db, app, token) = setup().await;
 
     let body = serde_json::json!({
-        "formula": "DO_Temperature * 2",
+        "formulas": [{ "code": "do_temp_doubled", "formula": "DO_Temperature * 2", "ordinal": 0 }],
         "site_id": crate::common::SITE1_ID,
         "start": "2025-01-15T00:00:00Z",
         "end": "2025-01-16T00:00:00Z"

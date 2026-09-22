@@ -422,11 +422,16 @@ async fn recalled_inputs_take_their_derived_output_out_of_the_site() {
         ),
     )
     .await;
+    // A formula owned by no calculation is a shared step and computes on its own nowhere (Q156),
+    // so the stream engine only reaches this one through the calculation that owns it.
+    let calculation = crate::common::seed_formula_calculation(&db, "temp_doubled_set").await;
     exec(
         &db,
         &format!(
-            "INSERT INTO calculation_formulas (id, code, name, units, formula, output_parameter_id) \
-             VALUES ('{derived_def}', 'TempDoubled', 'Temperature doubled', '°C', 'temp * 2', '{derived_param}')"
+            "INSERT INTO calculation_formulas \
+                 (id, code, name, units, formula, output_parameter_id, tool_script_id) \
+             VALUES ('{derived_def}', 'TempDoubled', 'Temperature doubled', '°C', 'temp * 2', \
+                 '{derived_param}', '{calculation}')"
         ),
     )
     .await;
@@ -443,9 +448,8 @@ async fn recalled_inputs_take_their_derived_output_out_of_the_site() {
         &db,
         &format!(
             "INSERT INTO site_parameters \
-             (id, site_id, parameter_id, name, sensor_type, is_active, entry_mode, variable_mappings) \
-             VALUES ('{derived_sp}', '{SITE1_ID}', '{derived_param}', 'TempDoubled', 'TempDoubled', true, 'tool', \
-                     '{{\"temp\": \"{PARAM_S1_TEMP_ID}\"}}'::jsonb)"
+             (id, site_id, parameter_id, name, sensor_type, is_active, entry_mode, cadence) \
+             VALUES ('{derived_sp}', '{SITE1_ID}', '{derived_param}', 'TempDoubled', 'TempDoubled', true, 'tool', 'high')"
         ),
     )
     .await;

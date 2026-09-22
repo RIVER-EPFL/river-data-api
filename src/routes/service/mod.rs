@@ -492,6 +492,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             get(crate::routes::private::reprocessing_jobs::views::get_job_logs),
         )
         .route("/tools", get(tools::views::list_tools))
+        .route(
+            "/tool_scripts/{id}/version_ledger",
+            get(crate::routes::private::tools::views::list_version_ledger),
+        )
         // What a step feeds: a step mints no parameter, so the closure above cannot answer for it.
         .route(
             "/derived_parameters/{id}/dependents",

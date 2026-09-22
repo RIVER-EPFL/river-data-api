@@ -1926,6 +1926,31 @@ pub struct VersionUsage {
     pub readings: i64,
 }
 
+/// What one version of a calculation has computed on the stream arm: the readings whose curation
+/// ledger names it, the span of instants they sit at, and when the computing happened.
+///
+/// A stream pass mints no run: it recomputes continuously, and two passes under one version are
+/// one row here. A version that computed nothing carries zeros and null spans, so the ledger shows
+/// the set's history whole rather than only the versions that happened to leave rows.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VersionLedgerRow {
+    pub version_id: Uuid,
+    pub version_no: i32,
+    /// Distinct reading keys the version wrote at, not decisions: a reading moved twice under one
+    /// version is one reading.
+    pub readings: i64,
+    /// The earliest and latest instant of those readings.
+    #[schema(required)]
+    pub first_instant: Option<chrono::DateTime<chrono::Utc>>,
+    #[schema(required)]
+    pub last_instant: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the version first and last computed one of them.
+    #[schema(required)]
+    pub first_computed: Option<chrono::DateTime<chrono::Utc>>,
+    #[schema(required)]
+    pub last_computed: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 pub struct ToolScriptOperations;
 
 #[derive(Debug, Serialize, ToSchema)]

@@ -1657,10 +1657,11 @@ impl Job for EventRecompute {
         let mut findings_raised = 0usize;
         let mut findings_closed = 0usize;
         let mut slots_minted = 0usize;
-        for event_id in &events {
+        for (walked, event_id) in events.iter().enumerate() {
             if ctx.is_cancelled() {
                 break;
             }
+            ctx.set_step(walked + 1, events.len()).await;
             let outcome = recompute_event(&state, *event_id, &actor)
                 .await
                 .map_err(as_db_err)?;

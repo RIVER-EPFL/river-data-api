@@ -210,7 +210,8 @@ pub fn render_resolved(events: &[PendingEvent], dashboard_base: Option<&str>) ->
 pub(super) const CHANNEL_HEALTH_KIND: &str = "channel_health";
 
 /// Probe every configured channel and upsert its health row, returning how many were probed. A
-/// no-op when nothing is configured.
+/// no-op when nothing is configured. The walk is a handful of channels, so it reports no progress
+/// step: the job is over before a bar could move.
 pub async fn probe_once(db: &DatabaseConnection, config: &Config) -> usize {
     let channels = build_channels(config);
     for ch in &channels {

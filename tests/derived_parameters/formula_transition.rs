@@ -124,6 +124,55 @@ async fn wait_for_transitions(
     }
 }
 
+/// Save a calculation's whole set, the one act that mints a version (Q186). An `id` updates the
+/// stored formula rather than replacing it, so its output parameter and its readings stay.
+async fn save_set(
+    app: &axum::Router,
+    token: &str,
+    calculation: Uuid,
+    code: &str,
+    formula_id: Option<Uuid>,
+    formula: &str,
+) {
+    let mut row = serde_json::json!({
+        "code": code,
+        "name": "Formula transition fixture",
+        "units": "mg/L",
+        "formula": formula,
+        "ordinal": 0,
+    });
+    if let Some(id) = formula_id {
+        row["id"] = serde_json::json!(id);
+    }
+    let (status, body) = crate::common::post_json_with_token(
+        app,
+        &format!("/api/tool_scripts/{calculation}/formulas"),
+        &serde_json::json!({ "formulas": [row] }),
+        token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "save set ({status}): {body}");
+}
+
+/// The formula row a save wrote, and the parameter it outputs.
+async fn saved_formula(db: &DatabaseConnection, code: &str) -> (Uuid, Uuid) {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id, output_parameter_id FROM calculation_formulas \
+              WHERE LOWER(code) = LOWER($1)",
+            [code.into()],
+        ))
+        .await
+        .expect("a query")
+        .expect("the save wrote the formula");
+    (
+        row.try_get("", "id").expect("an id"),
+        row.try_get("", "output_parameter_id")
+            .expect("an output parameter"),
+    )
+}
+
 #[tokio::test]
 #[serial]
 async fn a_recompute_records_the_move_and_a_pass_that_moves_nothing_records_nothing() {
@@ -131,25 +180,10 @@ async fn a_recompute_records_the_move_and_a_pass_that_moves_nothing_records_noth
 
     let code = format!("ftrans_{}", Uuid::new_v4().simple());
     let calculation = crate::common::seed_formula_calculation(&db, &format!("{code}_set")).await;
-    let (status, def) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/derived_parameters",
-        &serde_json::json!({
-            "code": code,
-            "name": "Formula transition fixture",
-            "units": "mg/L",
-            "formula": "Dissolved_O2 * 0.032",
-            "tool_script_id": calculation,
-        }),
-        &token,
-    )
-    .await;
-    assert!((200..300).contains(&status), "create ({status}): {def}");
-    let output = def["output_parameter_id"]
-        .as_str()
-        .expect("output")
-        .to_string();
-    let definition_id = def["id"].as_str().expect("id").to_string();
+    // The set-level save is the one act that mints a version (Q186), and a stored value names the
+    // version that made it, so the move this story is about is a move between two of them.
+    save_set(&app, &token, calculation, &code, None, "Dissolved_O2 * 0.032").await;
+    let (definition_id, output) = saved_formula(&db, &code).await;
 
     let (status, body) = crate::common::post_json_with_token(
         &app,
@@ -160,6 +194,7 @@ async fn a_recompute_records_the_move_and_a_pass_that_moves_nothing_records_noth
             "name": code,
             "sensor_type": "derived",
             "entry_mode": "tool",
+            "cadence": "high",
             "display_units": "mg/L",
         }),
         &token,
@@ -185,7 +220,7 @@ async fn a_recompute_records_the_move_and_a_pass_that_moves_nothing_records_noth
     .await;
     assert!((200..300).contains(&status), "ingest ({status}): {body}");
 
-    let parameter = Uuid::parse_str(&output).unwrap();
+    let parameter = output;
     assert_eq!(
         derived_value(&db, parameter, at).await,
         Some(8.0), // 250.0 * 0.032
@@ -217,14 +252,15 @@ async fn a_recompute_records_the_move_and_a_pass_that_moves_nothing_records_noth
         .as_i64()
         .expect("the formula row has a revision");
 
-    let (status, body) = crate::common::put_json_with_token(
+    save_set(
         &app,
-        &format!("/api/derived_parameters/{definition_id}"),
-        &serde_json::json!({ "formula": "Dissolved_O2 * 0.064" }),
         &token,
+        calculation,
+        &code,
+        Some(definition_id),
+        "Dissolved_O2 * 0.064",
     )
     .await;
-    assert!((200..300).contains(&status), "edit ({status}): {body}");
 
     let uri = format!("/api/actions/derived_parameters/{calculation}/recompute");
     let (status, body) =
@@ -323,6 +359,7 @@ async fn a_derived_value_replays_its_own_formula_over_what_it_consumed() {
             "name": code,
             "sensor_type": "derived",
             "entry_mode": "tool",
+            "cadence": "high",
             "display_units": "mg/L",
         }),
         &token,

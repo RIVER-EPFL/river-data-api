@@ -1,7 +1,12 @@
-//! Scenario: a continuous derived value is computed, and later the formula that made it is edited.
+//! Scenario: a continuous derived value is computed, and later the set that made it is saved again
+//! with a different formula.
 //!
-//! Expected behaviour: the stored value names the formula version it was made with, and an edit
-//! mints a version rather than rewriting one, so the old text stays recoverable (Q89, M103, M113).
+//! Expected behaviour: the stored value names the version of the calculation it was made with, and
+//! a save mints a version rather than rewriting one, so the old text stays recoverable (Q89, M103,
+//! M113). One version table answers for both arms (Q231): the value a visit produced and the value
+//! a stream pass produced name rows of `tool_script_versions`.
+//!
+//! Run with: cargo test --test derived_parameters formula_versions
 
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
@@ -19,6 +24,84 @@ async fn setup() -> (DatabaseConnection, axum::Router, String) {
     (db, app, token)
 }
 
+/// Save a calculation's whole set, the one act that mints a version (Q186).
+async fn save_set(
+    app: &axum::Router,
+    token: &str,
+    calculation: Uuid,
+    code: &str,
+    formula: &str,
+) -> serde_json::Value {
+    let (status, body) = crate::common::post_json_parse_with_token(
+        app,
+        &format!("/api/tool_scripts/{calculation}/formulas"),
+        &serde_json::json!({
+            "formulas": [{
+                "code": code,
+                "name": "Formula version fixture",
+                "units": "mg/L",
+                "formula": formula,
+                "ordinal": 0,
+            }]
+        }),
+        token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "save set ({status}): {body}");
+    body
+}
+
+/// The output parameter the calculation's formula mints.
+async fn output_parameter(db: &DatabaseConnection, code: &str) -> Uuid {
+    db.query_one_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT output_parameter_id FROM calculation_formulas WHERE LOWER(code) = LOWER($1)",
+        [code.into()],
+    ))
+    .await
+    .expect("a query")
+    .expect("the save minted the output")
+    .try_get::<Uuid>("", "output_parameter_id")
+    .expect("an output parameter")
+}
+
+async fn assign_slot(app: &axum::Router, token: &str, parameter_id: Uuid, code: &str) {
+    let (status, body) = crate::common::post_json_with_token(
+        app,
+        "/api/site_parameters",
+        &serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "parameter_id": parameter_id,
+            "name": code,
+            "sensor_type": "derived",
+            "entry_mode": "tool",
+            "cadence": "high",
+            "display_units": "mg/L",
+        }),
+        token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "assign ({status}): {body}");
+}
+
+async fn ingest_source(app: &axum::Router, token: &str, at: DateTime<Utc>, value: f64) {
+    let (status, body) = crate::common::post_json_with_token(
+        app,
+        "/api/readings/batch",
+        &serde_json::json!({
+            "readings": [{
+                "site_id": crate::common::SITE1_ID,
+                "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
+                "time": at.to_rfc3339(),
+                "raw_value": value,
+            }]
+        }),
+        token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "ingest ({status}): {body}");
+}
+
 /// The formula text the reading at this instant names, once one is stored. `None` while nothing is
 /// there yet, so a caller can poll; `Some(None)` for a row naming no version.
 async fn formula_of(
@@ -31,8 +114,8 @@ async fn formula_of(
         let row = db
             .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT v.formula AS formula FROM readings r \
-                   LEFT JOIN derived_parameter_definition_versions v ON v.id = r.derived_version_id \
+                "SELECT v.script AS script FROM readings r \
+                   LEFT JOIN tool_script_versions v ON v.id = r.derived_version_id \
                   WHERE r.parameter_id = $1 AND r.time = $2 LIMIT 1",
                 [parameter_id.into(), time.into()],
             ))
@@ -40,27 +123,37 @@ async fn formula_of(
             .ok()
             .flatten();
         if let Some(r) = row {
-            return Some(r.try_get::<Option<String>>("", "formula").ok().flatten());
+            let script = r.try_get::<Option<String>>("", "script").ok().flatten();
+            return Some(script.and_then(|body| {
+                serde_json::from_str::<Vec<serde_json::Value>>(&body)
+                    .ok()?
+                    .first()
+                    .and_then(|f| f["formula"].as_str().map(str::to_string))
+            }));
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     None
 }
 
-async fn versions_of(db: &DatabaseConnection, code: &str) -> Vec<String> {
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT v.formula FROM derived_parameter_definition_versions v \
-               JOIN calculation_formulas d ON d.id = v.definition_id \
-              WHERE d.code = $1 ORDER BY v.version_no",
-            [code.into()],
-        ))
-        .await
-        .expect("versions");
-    rows.iter()
-        .filter_map(|r| r.try_get::<String>("", "formula").ok())
-        .collect()
+/// Every version a calculation holds, in order.
+async fn versions_of(db: &DatabaseConnection, calculation: Uuid) -> Vec<String> {
+    db.query_all_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT script FROM tool_script_versions WHERE tool_script_id = $1 ORDER BY version_no",
+        [calculation.into()],
+    ))
+    .await
+    .expect("versions")
+    .iter()
+    .filter_map(|r| r.try_get::<String>("", "script").ok())
+    .filter_map(|body| {
+        serde_json::from_str::<Vec<serde_json::Value>>(&body)
+            .ok()?
+            .first()
+            .and_then(|f| f["formula"].as_str().map(str::to_string))
+    })
+    .collect()
 }
 
 #[tokio::test]
@@ -70,68 +163,22 @@ async fn a_computed_value_names_the_formula_it_was_made_with_and_an_edit_mints_a
 
     let code = format!("fver_{}", Uuid::new_v4().simple());
     let calculation = crate::common::seed_formula_calculation(&db, &format!("{code}_set")).await;
-    let (status, def) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/derived_parameters",
-        &serde_json::json!({
-            "code": code,
-            "name": "Formula version fixture",
-            "units": "mg/L",
-            "formula": "Dissolved_O2 * 0.032",
-            "tool_script_id": calculation,
-        }),
-        &token,
-    )
-    .await;
-    assert!((200..300).contains(&status), "create ({status}): {def}");
-    let output = def["output_parameter_id"]
-        .as_str()
-        .expect("output")
-        .to_string();
-    let definition_id = def["id"].as_str().expect("id").to_string();
+    save_set(&app, &token, calculation, &code, "Dissolved_O2 * 0.032").await;
 
-    // Creating the definition mints version 1.
+    // Saving the set mints version 1.
     assert_eq!(
-        versions_of(&db, &code).await,
+        versions_of(&db, calculation).await,
         vec!["Dissolved_O2 * 0.032".to_string()],
-        "the definition's first text is its first version"
+        "the set's first text is its first version"
     );
 
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/site_parameters",
-        &serde_json::json!({
-            "site_id": crate::common::SITE1_ID,
-            "parameter_id": output,
-            "name": code,
-            "sensor_type": "derived",
-            "entry_mode": "tool",
-            "display_units": "mg/L",
-        }),
-        &token,
-    )
-    .await;
-    assert!((200..300).contains(&status), "assign ({status}): {body}");
+    let parameter = output_parameter(&db, &code).await;
+    assign_slot(&app, &token, parameter, &code).await;
 
     let at: DateTime<Utc> = Utc::now() - Duration::hours(12);
     let at = at - Duration::nanoseconds(i64::from(at.timestamp_subsec_nanos()));
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/readings/batch",
-        &serde_json::json!({
-            "readings": [{
-                "site_id": crate::common::SITE1_ID,
-                "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
-                "time": at.to_rfc3339(),
-                "raw_value": 250.0,
-            }]
-        }),
-        &token,
-    )
-    .await;
-    assert!((200..300).contains(&status), "ingest ({status}): {body}");
+    ingest_source(&app, &token, at, 250.0).await;
 
-    let parameter = Uuid::parse_str(&output).unwrap();
     let named = formula_of(&db, parameter, at)
         .await
         .expect("the derived value is computed");
@@ -141,26 +188,25 @@ async fn a_computed_value_names_the_formula_it_was_made_with_and_an_edit_mints_a
         "the stored value names the text that produced it"
     );
 
-    // An edit is a new calculation, not a correction of the old one: the first version stands.
-    let (status, body) = crate::common::put_json_with_token(
-        &app,
-        &format!("/api/derived_parameters/{definition_id}"),
-        &serde_json::json!({ "formula": "Dissolved_O2 * 0.064" }),
-        &token,
-    )
-    .await;
-    assert!((200..300).contains(&status), "edit ({status}): {body}");
+    // A second save is a new version, not a correction of the old one: the first stands, and the
+    // value that names it still reads as made by it.
+    save_set(&app, &token, calculation, &code, "Dissolved_O2 * 0.064").await;
     assert_eq!(
-        versions_of(&db, &code).await,
+        versions_of(&db, calculation).await,
         vec![
             "Dissolved_O2 * 0.032".to_string(),
             "Dissolved_O2 * 0.064".to_string()
         ],
-        "the edit mints a version and leaves the one the stored value names"
+        "the save mints a version and leaves the one the stored value names"
+    );
+    assert_eq!(
+        formula_of(&db, parameter, at).await.flatten().as_deref(),
+        Some("Dissolved_O2 * 0.032"),
+        "the stored value stays on the version that made it"
     );
 }
 
-/// Scenario: the record of a value computed by a standalone formula is opened in the inspector.
+/// Scenario: the record of a value a formula calculation computed is opened in the inspector.
 ///
 /// Expected behaviour: it resolves the calculation that made it, the same way a value produced by
 /// a script resolves its run (C94). A row stored before versioning names no version, and the
@@ -172,60 +218,14 @@ async fn a_formula_value_resolves_the_calculation_that_produced_it() {
 
     let code = format!("fprov_{}", Uuid::new_v4().simple());
     let calculation = crate::common::seed_formula_calculation(&db, &format!("{code}_set")).await;
-    let (status, def) = crate::common::post_json_parse_with_token(
-        &app,
-        "/api/derived_parameters",
-        &serde_json::json!({
-            "code": code,
-            "name": "Formula provenance fixture",
-            "units": "mg/L",
-            "formula": "Dissolved_O2 * 0.032",
-            "tool_script_id": calculation,
-        }),
-        &token,
-    )
-    .await;
-    assert!((200..300).contains(&status), "create ({status}): {def}");
-    let output = def["output_parameter_id"]
-        .as_str()
-        .expect("output")
-        .to_string();
+    save_set(&app, &token, calculation, &code, "Dissolved_O2 * 0.032").await;
 
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/site_parameters",
-        &serde_json::json!({
-            "site_id": crate::common::SITE1_ID,
-            "parameter_id": output,
-            "name": code,
-            "sensor_type": "derived",
-            "entry_mode": "tool",
-            "display_units": "mg/L",
-        }),
-        &token,
-    )
-    .await;
-    assert!((200..300).contains(&status), "assign ({status}): {body}");
+    let parameter = output_parameter(&db, &code).await;
+    assign_slot(&app, &token, parameter, &code).await;
 
     let at: DateTime<Utc> = Utc::now() - Duration::hours(11);
     let at = at - Duration::nanoseconds(i64::from(at.timestamp_subsec_nanos()));
-    let (status, body) = crate::common::post_json_with_token(
-        &app,
-        "/api/readings/batch",
-        &serde_json::json!({
-            "readings": [{
-                "site_id": crate::common::SITE1_ID,
-                "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
-                "time": at.to_rfc3339(),
-                "raw_value": 250.0,
-            }]
-        }),
-        &token,
-    )
-    .await;
-    assert!((200..300).contains(&status), "ingest ({status}): {body}");
-
-    let parameter = Uuid::parse_str(&output).unwrap();
+    ingest_source(&app, &token, at, 250.0).await;
     formula_of(&db, parameter, at)
         .await
         .expect("the derived value is computed");
@@ -233,7 +233,7 @@ async fn a_formula_value_resolves_the_calculation_that_produced_it() {
     let uri = format!(
         "/api/readings/provenance?site_id={}&parameter_id={}&time={}",
         crate::common::SITE1_ID,
-        output,
+        parameter,
         at.to_rfc3339().replace('+', "%2B")
     );
     let (status, body) = crate::common::get_json_with_token(&app, &uri, &token).await;
@@ -247,39 +247,11 @@ async fn a_formula_value_resolves_the_calculation_that_produced_it() {
     assert_eq!(calc["version_no"], 1);
     assert_eq!(calc["active_version_no"], 1);
     assert!(calc["content_hash"].is_string());
-    assert!(
-        calc.get("tool_script_id").is_none(),
-        "a standalone formula belongs to no calculation: {body}"
-    );
-
-    // A formula a calculation owns names that calculation, so the record opens its page.
-    let script = db
-        .query_one_raw(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id FROM tool_scripts ORDER BY created_at LIMIT 1",
-        ))
-        .await
-        .expect("script query")
-        .expect("a seeded tool script")
-        .try_get::<Uuid>("", "id")
-        .expect("script id");
-    db.execute_unprepared(&format!(
-        "UPDATE calculation_formulas SET tool_script_id = '{script}' WHERE output_parameter_id = '{parameter}'"
-    ))
-    .await
-    .expect("own the formula");
-    let (status, body) = crate::common::get_json_with_token(&app, &uri, &token).await;
-    assert_eq!(status, 200, "{body}");
     assert_eq!(
-        body["records"][0]["calculation"]["tool_script_id"],
-        script.to_string(),
-        "{body}"
+        calc["tool_script_id"],
+        calculation.to_string(),
+        "the record opens the calculation's page: {body}"
     );
-    db.execute_unprepared(&format!(
-        "UPDATE calculation_formulas SET tool_script_id = NULL WHERE output_parameter_id = '{parameter}'"
-    ))
-    .await
-    .expect("release the formula");
 
     // A value stored before versioning names none, and the record says so rather than naming
     // today's formula.

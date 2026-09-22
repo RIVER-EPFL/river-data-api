@@ -619,12 +619,22 @@ pub async fn store_source_curve(
 /// Keycloak gate (`/api/tool_scripts`), and a suite testing what its formulas compute is not
 /// testing that gate. Returns the calculation's id.
 pub async fn seed_formula_calculation(db: &DatabaseConnection, name: &str) -> Uuid {
+    seed_labelled_formula_calculation(db, name, name).await
+}
+
+/// The same calculation with a label of its own, for the tests that assert on what a person reads
+/// rather than on the machine name.
+pub async fn seed_labelled_formula_calculation(
+    db: &DatabaseConnection,
+    name: &str,
+    label: &str,
+) -> Uuid {
     let id = Uuid::new_v4();
     exec(
         db,
         &format!(
             "INSERT INTO tool_scripts (id, name, label, engine, enabled) \
-             VALUES ('{id}', '{name}', '{name}', 'formula', true)"
+             VALUES ('{id}', '{name}', '{label}', 'formula', true)"
         ),
     )
     .await;

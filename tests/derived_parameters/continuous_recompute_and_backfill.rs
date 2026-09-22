@@ -538,3 +538,157 @@ async fn na_clears_the_value_the_formula_no_longer_produces_and_a_divide_by_zero
     assert_eq!(served, Some(-0.02), "1 / -50");
     assert_eq!(standing, None, "the repaired slot's finding is closed");
 }
+
+/// One formula of a set, posted to its calculation. A step declares `intermediate`, an output
+/// publishes a parameter of its own.
+async fn add_formula(
+    app: &axum::Router,
+    token: &str,
+    calculation: Uuid,
+    code: &str,
+    formula: &str,
+    ordinal: i32,
+    step: bool,
+) -> serde_json::Value {
+    let (status, body) = crate::common::post_json_parse_with_token(
+        app,
+        "/api/derived_parameters",
+        &serde_json::json!({
+            "code": code,
+            "name": code,
+            "units": "K",
+            "formula": formula,
+            "tool_script_id": calculation,
+            "ordinal": ordinal,
+            "intermediate": step,
+        }),
+        token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "add {code} ({status}): {body}");
+    body
+}
+
+async fn declare_stream_slot(db: &DatabaseConnection, site_id: Uuid, parameter_id: Uuid, name: &str) {
+    db.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "INSERT INTO site_parameters \
+           (id, site_id, parameter_id, name, sensor_type, display_units, is_active, entry_mode, cadence) \
+         VALUES (gen_random_uuid(), $1, $2, $3, 'derived', 'K', true, 'tool', 'high')",
+        [site_id.into(), parameter_id.into(), name.into()],
+    ))
+    .await
+    .expect("the slot is declared");
+}
+
+/// Scenario: a calculation whose two outputs both read one step, at a site declaring a slot for
+/// each on the stream arm, and a logger reading lands.
+///
+/// Expected behaviour: the ingest publishes both outputs at that instant from a single evaluation
+/// of the set, and the step publishes nothing: a step is a value the set passes forward, not a
+/// measurement. The engine's unit of work is the calculation, so a set with two outputs is one
+/// pass and not two.
+#[tokio::test]
+#[serial]
+async fn a_set_with_a_step_and_two_outputs_publishes_both_from_one_pass() {
+    let (db, app, token) = setup().await;
+    let site_id = Uuid::parse_str(crate::common::SITE1_ID).unwrap();
+
+    let suffix = Uuid::new_v4().simple().to_string();
+    let calculation =
+        crate::common::seed_formula_calculation(&db, &format!("two_step_{suffix}_set")).await;
+    let step_code = format!("water_k_{suffix}");
+    let half_code = format!("k_half_{suffix}");
+    let tenth_code = format!("k_tenth_{suffix}");
+
+    let step = add_formula(
+        &app,
+        &token,
+        calculation,
+        &step_code,
+        "Dissolved_O2 + 273.15",
+        0,
+        true,
+    )
+    .await;
+    assert!(
+        step["output_parameter_id"].is_null(),
+        "a step publishes no parameter: {step}"
+    );
+    let half = add_formula(
+        &app,
+        &token,
+        calculation,
+        &half_code,
+        &format!("{step_code} / 2"),
+        1,
+        false,
+    )
+    .await;
+    let tenth = add_formula(
+        &app,
+        &token,
+        calculation,
+        &tenth_code,
+        &format!("{step_code} / 10"),
+        2,
+        false,
+    )
+    .await;
+
+    let output_id = |formula: &serde_json::Value| {
+        Uuid::parse_str(formula["output_parameter_id"].as_str().expect("an output"))
+            .expect("a uuid")
+    };
+    let half_param = output_id(&half);
+    let tenth_param = output_id(&tenth);
+    declare_stream_slot(&db, site_id, half_param, &half_code).await;
+    declare_stream_slot(&db, site_id, tenth_param, &tenth_code).await;
+
+    let at = Utc::now() - Duration::hours(30);
+    let at = at - Duration::nanoseconds(i64::from(at.timestamp_subsec_nanos()));
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        "/api/readings/batch",
+        &serde_json::json!({
+            "readings": [{
+                "site_id": crate::common::SITE1_ID,
+                "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
+                "time": at.to_rfc3339(),
+                "raw_value": 8.85,
+            }]
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "ingest ({status}): {text}");
+
+    // 8.85 + 273.15 = 282.0, halved and tenthed
+    let half_value = poll_for_derived(&db, site_id, half_param, at, POLL_DEADLINE_SECS).await;
+    assert_eq!(
+        half_value.map(|v| (v * 1e6).round() / 1e6),
+        Some(141.0),
+        "the first output reads the step the same pass produced"
+    );
+    let tenth_value = poll_for_derived(&db, site_id, tenth_param, at, POLL_DEADLINE_SECS).await;
+    assert_eq!(
+        tenth_value.map(|v| (v * 1e6).round() / 1e6),
+        Some(28.2),
+        "the second output reads it too, from the same pass"
+    );
+
+    let step_readings = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::bigint AS n FROM readings r \
+               JOIN parameters p ON p.id = r.parameter_id \
+              WHERE r.site_id = $1 AND LOWER(p.code) = LOWER($2)",
+            [site_id.into(), step_code.clone().into()],
+        ))
+        .await
+        .expect("the query runs")
+        .expect("a count row")
+        .try_get::<i64>("", "n")
+        .expect("n");
+    assert_eq!(step_readings, 0, "the step stores nothing of its own");
+}

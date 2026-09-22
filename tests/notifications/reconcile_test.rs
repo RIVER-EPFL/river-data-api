@@ -65,7 +65,7 @@ async fn sweep_prunes_revoked_keeps_active_and_unresolvable() {
     // sub-none is left unprimed: with no Keycloak backend `resolve` returns None (fail open on an
     // unreachable authority), so the sweep must retain it.
 
-    let outcome = flows::sweep(&state).await.unwrap();
+    let outcome = flows::sweep(&state, None).await.unwrap();
 
     assert_eq!(outcome.revoked, 1, "one push subscription pruned");
 

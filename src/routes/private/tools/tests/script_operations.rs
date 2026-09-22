@@ -20,7 +20,7 @@ fn test_only_the_two_engines_are_accepted() {
 }
 
 mod activation_arm {
-    use crate::routes::private::tools::service::migration_job;
+    use crate::routes::private::tools::service::migration_jobs;
     use uuid::Uuid;
 
     /// Scenario: an author activates a corrected version of a calculation that has already
@@ -28,22 +28,52 @@ mod activation_arm {
     #[test]
     fn the_correcting_arm_scopes_the_repair_to_the_version_it_replaced() {
         let superseded = Uuid::new_v4();
-        let (params, key) = migration_job(true, "pco2", Some(superseded)).expect("a job");
-        assert_eq!(params["version"], serde_json::json!(superseded));
-        assert_eq!(params["calculation"], "pco2");
-        assert_eq!(key, format!("event_recompute:version:{superseded}"));
+        let jobs = migration_jobs(true, "pco2", Uuid::new_v4(), Some(superseded));
+        let visit = jobs
+            .iter()
+            .find(|j| j.kind == "event_recompute")
+            .expect("the visit arm");
+        assert_eq!(visit.params["version"], serde_json::json!(superseded));
+        assert_eq!(visit.params["calculation"], "pco2");
+        assert_eq!(
+            visit.dedupe_key,
+            format!("event_recompute:version:{superseded}")
+        );
+    }
+
+    /// A calculation computes on both arms, and a stream pass names no visit: its values are found
+    /// through the calculation, so the stream arm is scoped to it rather than to the version.
+    #[test]
+    fn the_stream_arm_is_repaired_too_and_is_scoped_to_the_calculation() {
+        let superseded = Uuid::new_v4();
+        let script_id = Uuid::new_v4();
+        let jobs = migration_jobs(true, "pco2", script_id, Some(superseded));
+        let stream = jobs
+            .iter()
+            .find(|j| j.kind == "derived_recompute")
+            .expect("the stream arm");
+        assert_eq!(
+            stream.params["calculation_id"],
+            serde_json::json!(script_id)
+        );
+        assert_eq!(
+            stream.dedupe_key,
+            format!("derived_recompute:version:{superseded}"),
+            "one enqueue per arm per save"
+        );
+        assert_eq!(jobs.len(), 2, "one job per arm, and no more");
     }
 
     #[test]
     fn the_leaving_arm_repairs_nothing_and_the_history_stands() {
-        assert!(migration_job(false, "pco2", Some(Uuid::new_v4())).is_none());
+        assert!(migration_jobs(false, "pco2", Uuid::new_v4(), Some(Uuid::new_v4())).is_empty());
     }
 
     /// A first activation replaces no version, so there is nothing to migrate however the author
     /// answered.
     #[test]
     fn a_first_activation_supersedes_nothing() {
-        assert!(migration_job(true, "pco2", None).is_none());
+        assert!(migration_jobs(true, "pco2", Uuid::new_v4(), None).is_empty());
     }
 }
 

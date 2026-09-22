@@ -298,11 +298,16 @@ async fn a_derived_input_is_the_reading_the_compute_chose() {
     let definition = "00000000-0000-4000-c000-0000000009f3";
     crate::common::seed_data_stream(&db, logger, "test", "do_logger").await;
     crate::common::seed_data_stream(&db, output, "test", "derived_output").await;
+    // The formula belongs to a calculation: one owned by none is a shared step (Q156), which the
+    // `calculation_formulas_owner_or_step` CHECK refuses outright when it is not marked one.
+    let calculation = crate::common::seed_formula_calculation(&db, "do_twice_set").await;
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO calculation_formulas (id, code, name, units, formula, output_parameter_id) \
-             VALUES ('{definition}', 'DoTwice', 'DO twice', '', 'do_val * 2', '{GLOBAL_PARAM_TURB_ID}')"
+            "INSERT INTO calculation_formulas \
+                 (id, code, name, units, formula, output_parameter_id, tool_script_id) \
+             VALUES ('{definition}', 'DoTwice', 'DO twice', '', 'do_val * 2', \
+                 '{GLOBAL_PARAM_TURB_ID}', '{calculation}')"
         ),
     )
     .await;

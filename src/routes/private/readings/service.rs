@@ -5438,10 +5438,12 @@ pub(super) async fn fetch_calculations(
             .all(db)
             .await?;
     let mut by_parameter: HashMap<Uuid, CalculationInfo> = HashMap::new();
+    let mut output_codes: HashMap<Uuid, String> = HashMap::new();
     for (id, code, name, output_parameter_id, tool_script_id) in definitions {
         let (Some(output), Some(tool_script_id)) = (output_parameter_id, tool_script_id) else {
             continue;
         };
+        output_codes.insert(tool_script_id, code.clone());
         by_parameter.insert(
             output,
             CalculationInfo {
@@ -5457,7 +5459,93 @@ pub(super) async fn fetch_calculations(
             },
         );
     }
-    Ok((by_parameter, HashMap::new()))
+
+    let active = active_version_numbers(db, &output_codes.keys().copied().collect::<Vec<_>>())
+        .await?;
+    for info in by_parameter.values_mut() {
+        info.active_version_no = active.get(&info.tool_script_id).copied();
+    }
+
+    let named: Vec<Uuid> = rows
+        .iter()
+        .filter_map(|r| r.derived_version_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let versions = formula_versions_named(db, &named, &output_codes).await?;
+    Ok((by_parameter, versions))
+}
+
+/// The newest version number of each calculation, so a value made by an older one reads as such.
+async fn active_version_numbers(
+    db: &sea_orm::DatabaseConnection,
+    script_ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, i32>> {
+    if script_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT s.id AS script_id, v.version_no \
+               FROM tool_scripts s \
+               JOIN tool_script_versions v ON v.id = s.active_version_id \
+              WHERE s.id = ANY($1::uuid[])",
+            [script_ids.to_vec().into()],
+        ))
+        .await?;
+    let mut active = HashMap::new();
+    for row in &rows {
+        let script_id: Uuid = row.try_get("", "script_id")?;
+        let version_no: i32 = row.try_get("", "version_no")?;
+        active.insert(script_id, version_no);
+    }
+    Ok(active)
+}
+
+/// The versions the stored values name, each with the formula text that produced the output.
+///
+/// The text comes out of the version's own rendered set rather than the formula row as it stands,
+/// which is the whole point of naming a version: the number was made by that text, whatever the
+/// calculation says today.
+async fn formula_versions_named(
+    db: &sea_orm::DatabaseConnection,
+    version_ids: &[Uuid],
+    output_codes: &HashMap<Uuid, String>,
+) -> AppResult<HashMap<Uuid, FormulaVersion>> {
+    if version_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id, tool_script_id, version_no, script, content_hash \
+               FROM tool_script_versions WHERE id = ANY($1::uuid[])",
+            [version_ids.to_vec().into()],
+        ))
+        .await?;
+    let mut versions: HashMap<Uuid, FormulaVersion> = HashMap::new();
+    for row in &rows {
+        let id: Uuid = row.try_get("", "id")?;
+        let tool_script_id: Uuid = row.try_get("", "tool_script_id")?;
+        let version_no: i32 = row.try_get("", "version_no")?;
+        let script: String = row.try_get("", "script")?;
+        let content_hash: String = row.try_get("", "content_hash")?;
+        let Some(code) = output_codes.get(&tool_script_id) else {
+            continue;
+        };
+        let formula = crate::routes::private::tools::service::parse_pinned(&script)
+            .ok()
+            .and_then(|set| {
+                set.into_iter()
+                    .find(|f| f.code.eq_ignore_ascii_case(code))
+                    .map(|f| f.formula)
+            });
+        if let Some(formula) = formula {
+            versions.insert(id, (version_no, formula, content_hash));
+        }
+    }
+    Ok(versions)
 }
 
 /// A formula and what it reads, as the sources table records it today. Sources are not versioned,

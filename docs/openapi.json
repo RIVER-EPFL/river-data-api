@@ -26981,6 +26981,64 @@
         ],
         "type": "object"
       },
+      "VersionLedgerRow": {
+        "description": "What one version of a calculation has computed on the stream arm: the readings whose curation\nledger names it, the span of instants they sit at, and when the computing happened.\n\nA stream pass mints no run: it recomputes continuously, and two passes under one version are\none row here. A version that computed nothing carries zeros and null spans, so the ledger shows\nthe set's history whole rather than only the versions that happened to leave rows.",
+        "properties": {
+          "first_computed": {
+            "description": "When the version first and last computed one of them.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "first_instant": {
+            "description": "The earliest and latest instant of those readings.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_computed": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_instant": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "readings": {
+            "description": "Distinct reading keys the version wrote at, not decisions: a reading moved twice under one\nversion is one reading.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "version_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "version_no": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version_id",
+          "version_no",
+          "readings",
+          "first_instant",
+          "last_instant",
+          "first_computed",
+          "last_computed"
+        ],
+        "type": "object"
+      },
       "VersionUsage": {
         "description": "What one version of a calculation has already produced: the readings whose stored provenance\nnames it, and the visits those readings belong to. A version that produced nothing carries\nzeros, because \"nothing stored\" and \"not counted\" are different claims.",
         "properties": {
@@ -51479,6 +51537,42 @@
           }
         },
         "summary": "Run an unsaved formula set at a visit, in place of the calculation's stored formulas.",
+        "tags": [
+          "tool_scripts"
+        ]
+      }
+    },
+    "/api/tool_scripts/{id}/version_ledger": {
+      "get": {
+        "description": "The visit arm answers this with its runs; a stream pass mints none, so the history is read off\nthe curation ledger. Requires `read_data`: it is a reading of what was computed, not of how the\ncalculation is written.",
+        "operationId": "list_version_ledger",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/VersionLedgerRow"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "summary": "What each version of the calculation has computed on the stream arm, newest first (Q232).",
         "tags": [
           "tool_scripts"
         ]
