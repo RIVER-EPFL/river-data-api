@@ -106,3 +106,45 @@ async fn cancel_endpoint_rejects_non_cancellable_and_unknown() {
 
     crate::common::cleanup_test_db(&db).await;
 }
+
+#[tokio::test]
+#[serial]
+async fn cancelling_a_queued_job_lets_its_key_enqueue_again() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+    let params = serde_json::json!({});
+    let enqueue = || {
+        river_db::routes::private::reprocessing_jobs::service::enqueue(
+            &db,
+            "event_recompute",
+            None,
+            None,
+            &params,
+            Some("event_recompute:cancelled-visit"),
+        )
+    };
+
+    let first = enqueue()
+        .await
+        .unwrap()
+        .expect("the first enqueue queues a job");
+    let (status, _t) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/reprocessing_jobs/{first}/cancel"),
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "a queued event_recompute is cancellable");
+
+    let second = enqueue()
+        .await
+        .unwrap()
+        .expect("the cancelled job no longer holds the key");
+    assert_ne!(second, first);
+
+    crate::common::cleanup_test_db(&db).await;
+}

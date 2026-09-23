@@ -13,6 +13,7 @@ use sea_orm::QueryOrder;
 use sea_orm::QuerySelect;
 use sea_orm::Select;
 use sea_orm::Statement;
+use sea_orm::UpdateMany;
 use sea_orm::sea_query::Expr;
 use serde::Deserialize;
 use serde::Serialize;
@@ -168,10 +169,25 @@ pub async fn cancel_job(
         )));
     }
 
-    // Set the durable flag so the owning replica, which may not be this one, stops the job at its
-    // next checkpoint; a still-queued job is cancelled outright since nothing is running it yet.
+    let flagged = cancel_request(id).exec(&state.db).await?.rows_affected;
+
+    if flagged > 0 {
+        Ok(Json(CancelResponse {
+            status: "cancelling".to_string(),
+        }))
+    } else {
+        Err(AppError::Conflict(
+            "job is not in a cancellable state".to_string(),
+        ))
+    }
+}
+
+/// The cancel of one job still in flight. The durable flag lets the owning replica, which may not be
+/// this one, stop the job at its next checkpoint; a still-queued job is cancelled outright since
+/// nothing is running it yet, and frees its dedupe key as a claim does.
+fn cancel_request(id: Uuid) -> UpdateMany<Entity> {
     let queued = || Column::Status.eq("queued");
-    let flagged = Entity::update_many()
+    Entity::update_many()
         .col_expr(Column::CancelRequested, Expr::value(true))
         .col_expr(
             Column::Status,
@@ -185,21 +201,14 @@ pub async fn cancel_job(
                 .finally(Expr::col(Column::CompletedAt))
                 .into(),
         )
+        .col_expr(
+            Column::DedupeKey,
+            Expr::case(queued(), Expr::value(Option::<String>::None))
+                .finally(Expr::col(Column::DedupeKey))
+                .into(),
+        )
         .filter(Column::Id.eq(id))
         .filter(Column::Status.is_in(CANCELLABLE_STATES))
-        .exec(&state.db)
-        .await?
-        .rows_affected;
-
-    if flagged > 0 {
-        Ok(Json(CancelResponse {
-            status: "cancelling".to_string(),
-        }))
-    } else {
-        Err(AppError::Conflict(
-            "job is not in a cancellable state".to_string(),
-        ))
-    }
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -350,22 +359,23 @@ pub struct RunNowResponse {
 }
 
 /// `POST /api/schedules/{job_name}/run_now`, fire one off-cadence run with the schedule's current
-/// tunables snapshot and whatever inputs the kind declares. 404 if `job_name` is not a known job,
-/// 400 if it is not run by hand or an input it declares is missing. Requires `write_metadata`
-/// (+ non-scoped token).
+/// tunables snapshot and the inputs the kind declares, recorded under the caller. 404 if `job_name`
+/// is not a known job, 400 if it is not run by hand, a key is not an input it declares, or an input
+/// it requires is missing. Requires `write_metadata` (+ non-scoped token).
 #[utoipa::path(
     post,
     path = "/api/schedules/{job_name}/run_now",
     params(("job_name" = String, Path, description = "Registered job name")),
     responses(
         (status = 200, description = "The enqueued run", body = RunNowResponse),
-        (status = 400, description = "The job is not run by hand, or an input it declares is missing"),
+        (status = 400, description = "The job is not run by hand, a key is not an input it declares, or a required input is missing"),
         (status = 404, description = "No job of that name is registered"),
     ),
     tag = "schedules"
 )]
 pub async fn run_now(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
     Path(job_name): Path<String>,
     body: Option<Json<serde_json::Value>>,
 ) -> AppResult<Json<RunNowResponse>> {
@@ -374,18 +384,11 @@ pub async fn run_now(
             "no job named '{job_name}' is registered"
         )));
     };
-    let supplied = body.map_or_else(|| serde_json::json!({}), |Json(v)| v);
+    let supplied = body.map_or(serde_json::Value::Null, |Json(v)| v);
     let offer = job.manual_run();
     if offer == service::ManualRun::NotOffered {
         return Err(AppError::BadRequest(format!(
             "'{job_name}' is not run by hand: its inputs come from the route that enqueues it"
-        )));
-    }
-    let missing = service::missing_params(&offer, &supplied);
-    if !missing.is_empty() {
-        return Err(AppError::BadRequest(format!(
-            "'{job_name}' needs {}",
-            missing.join(", ")
         )));
     }
 
@@ -395,18 +398,12 @@ pub async fn run_now(
         .one(&state.db)
         .await?
         .map_or_else(|| serde_json::json!({}), |row| row.tunables);
+    let params = service::manual_params(&offer, &supplied, tunables, &auth)
+        .map_err(|reason| AppError::BadRequest(format!("'{job_name}' {reason}")))?;
 
     // Per-second dedupe key so an accidental double-click collapses to one run; a deliberate second
     // run in a later second is allowed.
     let dedupe_key = format!("{job_name}:run_now:{}", chrono::Utc::now().timestamp());
-    // The declared inputs travel beside the snapshot, under their own names, so the job reads them
-    // exactly as it reads the ones its action route sends.
-    let mut params = serde_json::json!({ "trigger": "run_now", "tunables": tunables });
-    if let (Some(object), Some(supplied)) = (params.as_object_mut(), supplied.as_object()) {
-        for (key, value) in supplied {
-            object.insert(key.clone(), value.clone());
-        }
-    }
     let job_id =
         service::enqueue(&state.db, &job_name, None, None, &params, Some(&dedupe_key)).await?;
 

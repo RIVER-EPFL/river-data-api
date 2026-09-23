@@ -146,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Seeded recurring-service schedules");
     }
 
-    tokio::spawn({
+    let worker = tokio::spawn({
         let db = background_db.clone();
         let events = state.events.clone();
         let registry = registry.clone();
@@ -235,11 +235,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(address = %addr, "Starting server");
     let listener = TcpListener::bind(&addr).await?;
     let mut server_shutdown = shutdown_rx.clone();
-    axum::serve(listener, routes::connected_service(app))
-        .with_graceful_shutdown(async move {
+    let server =
+        axum::serve(listener, routes::connected_service(app)).with_graceful_shutdown(async move {
             let _ = server_shutdown.changed().await;
-        })
-        .await?;
+        });
+    river_db::routes::private::reprocessing_jobs::service::serve_then_drain_worker(
+        server.into_future(),
+        shutdown_rx,
+        worker,
+        Duration::from_secs(
+            river_db::routes::private::reprocessing_jobs::service::SHUTDOWN_DRAIN_SECONDS,
+        ),
+    )
+    .await?;
 
     tracing::info!("Server shut down gracefully");
     Ok(())

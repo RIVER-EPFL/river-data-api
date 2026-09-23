@@ -31,6 +31,7 @@ impl Job for MergeSiteParameters {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("system"),
             merge_origin(ctx.params()),
+            Some(ctx.events()),
         )
         .await
         .map_err(|e| DbErr::Custom(e.to_string()))?;

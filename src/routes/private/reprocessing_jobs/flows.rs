@@ -136,6 +136,52 @@ impl SlotOutcome {
     }
 }
 
+/// Which of a janitor tick's steps failed and why, in the order they ran. A tick with any failed
+/// step is a failed run, so the retry and the job_failed notice reach a sweep failing every tick.
+pub struct JanitorOutcome {
+    pub failed: Vec<(&'static str, String)>,
+}
+
+/// The outcome of a tick whose every step was attempted, from each step's name and result.
+pub fn janitor_outcome(
+    steps: impl IntoIterator<Item = (&'static str, Result<(), String>)>,
+) -> JanitorOutcome {
+    JanitorOutcome {
+        failed: steps
+            .into_iter()
+            .filter_map(|(step, result)| result.err().map(|e| (step, e)))
+            .collect(),
+    }
+}
+
+impl JanitorOutcome {
+    /// The failed steps on the report's scope, an empty list for a clean tick.
+    #[must_use]
+    pub fn report_into(&self, report: JobReport) -> JobReport {
+        report.scope(
+            "failed_steps",
+            self.failed
+                .iter()
+                .map(|(step, error)| serde_json::json!({ "step": step, "error": error }))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// `value` when every step succeeded, otherwise an error naming each failed step.
+    pub fn result(&self, value: i64) -> Result<i64, DbErr> {
+        if self.failed.is_empty() {
+            return Ok(value);
+        }
+        let steps = self
+            .failed
+            .iter()
+            .map(|(step, error)| format!("{step}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(DbErr::Custom(format!("janitor steps failed: {steps}")))
+    }
+}
+
 /// Parse an array of `[site_id, parameter_id]` UUID pairs under `key`. Each element is a two-string
 /// array; malformed elements are skipped.
 pub(crate) fn uuid_pair_array(params: &serde_json::Value, key: &str) -> Vec<(Uuid, Uuid)> {
@@ -343,95 +389,38 @@ impl Job for JanitorRun {
         //    configured interval.
         let since = (!do_full)
             .then(|| chrono::Utc::now() - chrono::Duration::seconds((cadence_seconds * 2) as i64));
-        let gaps = janitor::run_once(db, Some(&ctx), since).await?;
+        let (gaps, gap_fill) = match janitor::run_once(db, Some(&ctx), since).await {
+            Ok(gaps) => (gaps, Ok(())),
+            Err(e) => {
+                tracing::warn!(error = %e, "Janitor: derived gap fill failed");
+                (janitor::GapFill::default(), Err(e.to_string()))
+            }
+        };
 
         // 2. Repair corrected readings whose stored value is no longer what their own curves
         //    produce, whichever route moved them apart. Hooks make that repair immediate; this makes
         //    it eventual, so a hook that never fired costs staleness rather than a wrong number.
         //    Refreshed over the span it moved, before the rollups below settle for this tick.
-        let mut recomposed = 0u64;
-        match crate::routes::private::sensor_calibrations::service::sweep_curve_drift(
-            db,
-            Some(ctx.job_id()),
-        )
-        .await
-        {
-            Ok(drift) if drift.moved > 0 => {
-                recomposed = drift.moved;
-                tracing::info!(
-                    moved = drift.moved,
-                    "Janitor: recomposed drifted curve values"
-                );
-                ctx.log(
-                    "info",
-                    &format!(
-                        "recomposed {} readings whose value had drifted from their curves",
-                        drift.moved
-                    ),
-                    serde_json::json!({}),
-                )
-                .await;
-                if let Some((lo, hi)) = drift.span {
-                    match crate::common::aggregates::refresh(
-                        db,
-                        crate::common::aggregates::Window::Range(lo, hi),
-                    )
-                    .await
-                    {
-                        Ok(report) => ctx.info(&report.line()).await,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Janitor: refresh after curve drift failed");
-                        }
-                    }
-                }
-                // A rewritten spot value is an input somebody's calculation read, so the visits it
-                // moved recompute in dependency order rather than being left stale (Q108).
-                match crate::routes::private::collection_events::flows::events_from_pairs(
-                    db,
-                    &drift.touched,
-                )
-                .await
-                {
-                    Ok(events) => {
-                        if let Err(e) =
-                            crate::routes::private::collection_events::flows::enqueue_for(
-                                db,
-                                &events,
-                                "janitor",
-                                crate::routes::private::collection_events::flows::Writer::Person,
-                            )
-                            .await
-                        {
-                            tracing::warn!(error = %e, "Janitor: recompute after curve drift failed");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Janitor: resolving drifted visits failed");
-                    }
-                }
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "Janitor: curve drift sweep failed"),
-        }
+        let drift = recompose_curve_drift(db, &ctx).await;
 
         // 3. Abandoned chunked uploads. An upload that stops part-way leaves its text in
         // `csv_import_chunks` and nothing else deletes it.
-        let sessions_pruned =
+        let (sessions_pruned, import_session_prune) =
             match crate::routes::private::readings::service::prune_import_sessions(db).await {
-                Ok(n) => n,
+                Ok(n) => (n, Ok(())),
                 Err(e) => {
                     tracing::warn!(error = %e, "Janitor: pruning abandoned import sessions failed");
-                    0
+                    (0, Err(e.to_string()))
                 }
             };
 
         // Staged CSV rows no import will read: a job whose body never returned took nothing.
-        let staging_pruned =
+        let (staging_pruned, import_staging_prune) =
             match crate::routes::private::readings::flows::prune_orphaned_staging(db).await {
-                Ok(n) => n,
+                Ok(n) => (n, Ok(())),
                 Err(e) => {
                     tracing::warn!(error = %e, "Janitor: pruning orphaned import staging failed");
-                    0
+                    (0, Err(e.to_string()))
                 }
             };
 
@@ -444,19 +433,159 @@ impl Job for JanitorRun {
         )
         .await;
 
+        let outcome = janitor_outcome([
+            ("gap_fill", gap_fill),
+            ("curve_drift", drift.sweep),
+            ("curve_drift_refresh", drift.refresh),
+            ("curve_drift_recompute", drift.recompute),
+            ("curve_drift_derived", drift.derived),
+            ("import_session_prune", import_session_prune),
+            ("import_staging_prune", import_staging_prune),
+            ("job_prune", pruned.result()),
+        ]);
+
         // What this tick actually changed, so a run's effect is readable per job rather than only
         // in its logs.
         ctx.report(
-            gaps.report_into(JobReport::new())
-                .scope("full_scan", do_full)
-                .count("recomposed", recomposed)
-                .count("import_sessions_pruned", sessions_pruned)
-                .count("import_staging_pruned", staging_pruned)
-                .count("pruned", pruned),
+            outcome.report_into(
+                gaps.report_into(JobReport::new())
+                    .scope("full_scan", do_full)
+                    .count("recomposed", drift.moved)
+                    .count("derived_recomputes_queued", drift.derived_queued)
+                    .count("import_sessions_pruned", sessions_pruned)
+                    .count("import_staging_pruned", staging_pruned)
+                    .count("pruned", pruned.deleted),
+            ),
         )
         .await;
-        Ok(pruned as i64)
+        outcome.result(pruned.deleted as i64)
     }
+}
+
+/// What the janitor's curve-drift step moved, and the result of each of its four parts.
+struct DriftSteps {
+    moved: u64,
+    derived_queued: usize,
+    sweep: Result<(), String>,
+    refresh: Result<(), String>,
+    recompute: Result<(), String>,
+    derived: Result<(), String>,
+}
+
+/// Recompose drifted curve values, refresh the rollups over the span they moved, and enqueue the
+/// visits and the stream-arm calculations whose inputs moved. A part not reached because nothing
+/// moved reports `Ok`.
+async fn recompose_curve_drift(db: &sea_orm::DatabaseConnection, ctx: &JobContext) -> DriftSteps {
+    let mut steps = DriftSteps {
+        moved: 0,
+        derived_queued: 0,
+        sweep: Ok(()),
+        refresh: Ok(()),
+        recompute: Ok(()),
+        derived: Ok(()),
+    };
+    let drift = match crate::routes::private::sensor_calibrations::service::sweep_curve_drift(
+        db,
+        Some(ctx.job_id()),
+    )
+    .await
+    {
+        Ok(drift) => drift,
+        Err(e) => {
+            tracing::warn!(error = %e, "Janitor: curve drift sweep failed");
+            steps.sweep = Err(e.to_string());
+            return steps;
+        }
+    };
+    if drift.moved == 0 {
+        return steps;
+    }
+    steps.moved = drift.moved;
+    tracing::info!(
+        moved = drift.moved,
+        "Janitor: recomposed drifted curve values"
+    );
+    ctx.log(
+        "info",
+        &format!(
+            "recomposed {} readings whose value had drifted from their curves",
+            drift.moved
+        ),
+        serde_json::json!({}),
+    )
+    .await;
+    if let Some((lo, hi)) = drift.span {
+        match crate::common::aggregates::refresh(
+            db,
+            crate::common::aggregates::Window::Range(lo, hi),
+        )
+        .await
+        {
+            Ok(report) => ctx.info(&report.line()).await,
+            Err(e) => {
+                tracing::warn!(error = %e, "Janitor: refresh after curve drift failed");
+                steps.refresh = Err(e.to_string());
+            }
+        }
+    }
+    // A rewritten spot value is an input somebody's calculation read, so the visits it moved
+    // recompute in dependency order rather than being left stale (Q108).
+    let enqueued = match crate::routes::private::collection_events::flows::events_from_pairs(
+        db,
+        &drift.touched,
+    )
+    .await
+    {
+        Ok(events) => {
+            crate::routes::private::collection_events::flows::enqueue_for(
+                db,
+                &events,
+                "janitor",
+                crate::routes::private::collection_events::flows::Writer::Person,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = enqueued {
+        tracing::warn!(error = %e, "Janitor: recompute after curve drift failed");
+        steps.recompute = Err(e.to_string());
+    }
+    // A rewritten continuous value is an input a stream calculation read at that instant, so each
+    // slot it moved recomputes over its span as a job of its own under this run (Q108).
+    match enqueue_drift_derived(db, ctx, &drift.stream_slots).await {
+        Ok(queued) => steps.derived_queued = queued,
+        Err(e) => {
+            tracing::warn!(error = %e, "Janitor: derived recompute after curve drift failed");
+            steps.derived = Err(e.to_string());
+        }
+    }
+    steps
+}
+
+/// Enqueue a windowed `derived_recompute` for each drifted slot at a site with a stream-arm
+/// calculation, returning how many were queued.
+async fn enqueue_drift_derived(
+    db: &sea_orm::DatabaseConnection,
+    ctx: &JobContext,
+    slots: &[crate::routes::private::sensor_calibrations::service::DriftSlot],
+) -> Result<usize, DbErr> {
+    use crate::routes::private::derived_parameters::flows::site_has_active_derived;
+    let mut queued = 0;
+    for slot in slots {
+        if !site_has_active_derived(db, slot.site_id).await? {
+            continue;
+        }
+        crate::routes::private::reprocessing_jobs::service::enqueue_child(
+            db,
+            "derived_recompute",
+            &slot.recompute_params(),
+            Some(ctx.job_id()),
+        )
+        .await?;
+        queued += 1;
+    }
+    Ok(queued)
 }
 
 #[cfg(test)]
@@ -466,3 +595,7 @@ mod tunable_validation_tests;
 #[cfg(test)]
 #[path = "tests/slot_outcome.rs"]
 mod slot_outcome_tests;
+
+#[cfg(test)]
+#[path = "tests/janitor_outcome.rs"]
+mod janitor_outcome_tests;

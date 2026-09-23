@@ -685,6 +685,7 @@ async fn a_merge_moves_every_reading_as_a_slot_move_and_deletes_none() {
         },
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await
     .expect("the merge applies");

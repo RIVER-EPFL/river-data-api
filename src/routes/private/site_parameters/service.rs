@@ -628,6 +628,7 @@ pub async fn merge_site_parameters(
     req: &MergeSiteParametersRequest,
     actor: &str,
     origin: crate::routes::private::readings::models::Origin,
+    events: Option<&crate::common::EventSender>,
 ) -> AppResult<MergeSiteParametersResponse> {
     let source_id = req.source_site_parameter_id;
     let target_id = req.target_site_parameter_id;
@@ -638,7 +639,7 @@ pub async fn merge_site_parameters(
         ));
     }
 
-    let (response, touched, touched_events) = bulk_write::guarded(db, async |txn| {
+    let (response, touched, touched_events, changed) = bulk_write::guarded(db, async |txn| {
         let (source_site_id, source_param_id, target_site_id, target_param_id) =
             validate_merge_candidates(txn, source_id, target_id).await?;
         if source_site_id != target_site_id {
@@ -686,6 +687,7 @@ pub async fn merge_site_parameters(
             },
             moved.touched,
             moved.touched_events,
+            moved.changed,
         ))
     })
     .await?;
@@ -698,6 +700,9 @@ pub async fn merge_site_parameters(
         crate::routes::private::collection_events::flows::Writer::Person,
     )
     .await?;
+    if let Some(events) = events {
+        changed.announce(events);
+    }
     Ok(response)
 }
 

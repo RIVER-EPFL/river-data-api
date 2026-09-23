@@ -302,6 +302,81 @@ async fn run_now_enqueues_for_known_job_and_404s_for_unknown() {
     crate::common::cleanup_test_db(&db).await;
 }
 
+/// A manual run is recorded under whoever asked for it, and a body naming someone else, or carrying
+/// a tunable the schedule's validation never saw, is refused before anything is enqueued.
+#[tokio::test]
+#[serial]
+async fn run_now_records_the_caller_and_refuses_keys_the_kind_does_not_declare() {
+    let (db, app, token) = setup().await;
+    insert_schedule(&db, JOB, 3600).await;
+
+    for (job_name, body) in [
+        (
+            JOB,
+            serde_json::json!({ "tunables": { "retention_days": 1 } }),
+        ),
+        (
+            "merge_parameters",
+            serde_json::json!({
+                "source_parameter_id": Uuid::new_v4(),
+                "target_parameter_id": Uuid::new_v4(),
+                "actor": "someone else",
+                "origin": "csv",
+            }),
+        ),
+    ] {
+        let (status, refused) = crate::common::post_json_with_token(
+            &app,
+            &format!("/api/schedules/{job_name}/run_now"),
+            &body,
+            &token,
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "{job_name} takes only its declared inputs: {refused}"
+        );
+    }
+    let (count, _) = job_params_of(&db).await;
+    assert_eq!(count, 0, "a refused run enqueues nothing");
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/schedules/{JOB}/run_now"),
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a bare run of a button kind is admitted: {body}"
+    );
+    let (_, params) = job_params_of(&db).await;
+    let actor = params["actor"].as_str().unwrap_or_default();
+    assert!(
+        actor.starts_with("token:"),
+        "the run names the token that asked for it: {params}"
+    );
+    assert_eq!(params["origin"], "manual", "{params}");
+    crate::common::cleanup_test_db(&db).await;
+}
+
+async fn job_params_of(db: &DatabaseConnection) -> (i64, serde_json::Value) {
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) OVER () AS n, params FROM reprocessing_jobs ORDER BY created_at DESC LIMIT 1",
+        ))
+        .await
+        .unwrap();
+    row.map_or((0, serde_json::Value::Null), |r| {
+        (
+            r.try_get::<i64>("", "n").unwrap(),
+            r.try_get::<serde_json::Value>("", "params").unwrap(),
+        )
+    })
+}
+
 #[tokio::test]
 #[serial]
 async fn list_reflects_running_for_in_flight_job() {

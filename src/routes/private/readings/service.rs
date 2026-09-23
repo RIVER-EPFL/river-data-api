@@ -1485,7 +1485,7 @@ pub(super) fn family_kinds(kind: Kind) -> Vec<String> {
 /// The live decision of this kind's family standing on the same reading key, which the row being
 /// written supersedes. NULL where the key carries none. `target` is the alias the enclosing select
 /// reads its keys from.
-pub(super) fn supersedes(kind: Kind, target: &Alias) -> Expr {
+pub(crate) fn supersedes(kind: Kind, target: &Alias) -> Expr {
     let d = Alias::new("d");
     Expr::from(
         Query::select()

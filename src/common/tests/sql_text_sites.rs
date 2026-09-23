@@ -46,7 +46,7 @@ const ALLOWED: &[(&str, usize, usize)] = &[
     ("src/routes/private/reprocessing_jobs/service.rs", 1, 3),
     ("src/routes/private/reprocessing_jobs/views.rs", 1, 0),
     ("src/routes/private/sensor_calibrations/resolver.rs", 0, 9),
-    ("src/routes/private/sensor_calibrations/service.rs", 2, 99),
+    ("src/routes/private/sensor_calibrations/service.rs", 2, 98),
     ("src/routes/private/sensor_calibrations/views.rs", 0, 19),
     ("src/routes/private/sensor_deployments/flows.rs", 2, 0),
     ("src/routes/private/sensor_deployments/service.rs", 1, 0),

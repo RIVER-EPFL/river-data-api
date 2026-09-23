@@ -482,7 +482,7 @@ async fn recalled_inputs_take_their_derived_output_out_of_the_site() {
         .await;
     }
 
-    reprocess_sensor_readings(&db, sensor.id, None)
+    reprocess_sensor_readings(&db, sensor.id, None, None)
         .await
         .expect("reprocess");
 
@@ -545,6 +545,7 @@ async fn slot_reprocess_recalls_only_after_the_first_deployment() {
         &db,
         SITE1_ID.parse().unwrap(),
         GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
+        None,
         None,
     )
     .await
@@ -650,6 +651,7 @@ async fn slot_reprocess_leaves_spot_grabs_untouched() {
         &db,
         SITE1_ID.parse().unwrap(),
         GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
+        None,
         None,
     )
     .await
@@ -1450,6 +1452,7 @@ async fn slot_reprocess_picks_the_later_of_two_open_windows() {
         SITE1_ID.parse().unwrap(),
         GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
         None,
+        None,
     )
     .await
     .expect("reprocess");
@@ -1533,7 +1536,7 @@ async fn a_reprocess_records_the_readings_it_moved_against_its_job() {
     )
     .await;
 
-    reprocess_sensor_readings(&db, sensor.id, Some(job))
+    reprocess_sensor_readings(&db, sensor.id, Some(job), None)
         .await
         .expect("reprocess");
 
@@ -1566,7 +1569,7 @@ async fn a_reprocess_records_the_readings_it_moved_against_its_job() {
     let after_first = crate::common::e2e::count(&db, recorded).await;
     assert!(after_first > 0, "the run that moved readings recorded them");
 
-    reprocess_sensor_readings(&db, sensor.id, Some(job))
+    reprocess_sensor_readings(&db, sensor.id, Some(job), None)
         .await
         .expect("reprocess again");
     let after_second = crate::common::e2e::count(&db, recorded).await;

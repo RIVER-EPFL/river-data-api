@@ -34,3 +34,16 @@ fn test_timeline_from_the_start_admits_seq_zero() {
     let out = sql(Uuid::nil(), -1, 1000);
     assert!(out.contains(r#""seq" > -1"#), "{out}");
 }
+
+#[test]
+fn test_cancel_request_frees_dedupe_key_of_queued_job() {
+    let out = cancel_request(Uuid::nil())
+        .build(sea_orm::DatabaseBackend::Postgres)
+        .to_string();
+    assert!(
+        out.contains(
+            r#""dedupe_key" = (CASE WHEN ("reprocessing_jobs"."status" = 'queued') THEN NULL ELSE "dedupe_key" END)"#
+        ),
+        "{out}"
+    );
+}

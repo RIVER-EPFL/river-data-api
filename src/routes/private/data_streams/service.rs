@@ -8,7 +8,7 @@ use sea_orm::sea_query::{
 };
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, Order, QueryFilter,
-    QueryOrder, QuerySelect, Set, Statement, TransactionTrait, UpdateMany,
+    QueryOrder, QuerySelect, QueryTrait, Set, Statement, TransactionTrait, UpdateMany,
 };
 use uuid::Uuid;
 
@@ -699,6 +699,8 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
         moved.touched_events = recorded.touched_events;
     }
 
+    moved.changed = readings_per_site(conn, site, source_param, target_param).await?;
+
     let mut on_source =
         Condition::all().add(Expr::col(Alias::new("parameter_id")).eq(source_param));
     if let Some(site_id) = site {
@@ -742,6 +744,45 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
     }
 
     Ok(moved)
+}
+
+/// The readings a slot move is about to carry, counted per site at both parameters.
+async fn readings_per_site<C: ConnectionTrait>(
+    conn: &C,
+    site: Option<Uuid>,
+    source_param: Uuid,
+    target_param: Uuid,
+) -> AppResult<crate::common::SlotTally> {
+    let counts: Vec<(Uuid, i64)> = readings_model::Entity::find()
+        .select_only()
+        .column(readings_model::Column::SiteId)
+        .column_as(Expr::col(readings_model::Column::Time).count(), "rows")
+        .filter(readings_model::Column::ParameterId.eq(source_param))
+        .filter(readings_model::Column::SiteId.is_not_null())
+        .apply_if(site, |q, site_id| {
+            q.filter(readings_model::Column::SiteId.eq(site_id))
+        })
+        .group_by(readings_model::Column::SiteId)
+        .into_tuple()
+        .all(conn)
+        .await?;
+    Ok(slot_move_tally(&counts, source_param, target_param))
+}
+
+/// A slot move's per-site reading counts as the slots whose served series it changed: the source
+/// parameter's, which loses the readings, and the target's, which gains them.
+fn slot_move_tally(
+    counts: &[(Uuid, i64)],
+    source_param: Uuid,
+    target_param: Uuid,
+) -> crate::common::SlotTally {
+    let mut changed = crate::common::SlotTally::default();
+    for &(site_id, rows) in counts {
+        let rows = usize::try_from(rows).unwrap_or(0);
+        changed.add(Some(site_id), Some(source_param), rows);
+        changed.add(Some(site_id), Some(target_param), rows);
+    }
+    changed
 }
 
 /// The rows one [`SlotScope`] addresses. The condition names columns every slot table carries,

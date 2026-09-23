@@ -137,6 +137,7 @@ async fn merge_preserves_conflicting_readings() {
         },
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await;
 

@@ -332,6 +332,7 @@ impl Job for AttributePlanSlots {
                 site_id,
                 parameter_id,
                 Some(ctx.job_id()),
+                Some(ctx.events()),
             )
             .await
             .map(|n| n as i64);

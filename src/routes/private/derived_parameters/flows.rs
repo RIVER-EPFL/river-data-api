@@ -314,38 +314,43 @@ pub async fn run_once(
 ///   3. A hard count cap on `maintenance` rows so an ingestion burst can't blow storage between the
 ///      daily prunes. Each window/cap of 0 disables that layer.
 ///
-/// Returns the total rows deleted (across all layers).
+/// Returns the rows deleted across all layers and, when any layer failed, which and why. Every
+/// layer is attempted whatever the others did.
 pub async fn prune_tracked_jobs(
     db: &DatabaseConnection,
     maintenance_days: u32,
     operator_days: u32,
     maintenance_max_rows: u64,
-) -> u64 {
-    let mut deleted = 0u64;
+) -> Pruned {
+    let mut pruned = Pruned::default();
 
     if maintenance_days > 0 {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(maintenance_days));
-        deleted += run_delete(
-            jobs::Entity::delete_many()
-                .filter(jobs::Column::Category.eq("maintenance"))
-                .filter(jobs::Column::CreatedAt.lt(cutoff))
-                .filter(jobs::Column::Status.is_not_in(IN_FLIGHT)),
-            db,
-            "maintenance age",
-        )
-        .await;
+        pruned.add(
+            run_delete(
+                jobs::Entity::delete_many()
+                    .filter(jobs::Column::Category.eq("maintenance"))
+                    .filter(jobs::Column::CreatedAt.lt(cutoff))
+                    .filter(jobs::Column::Status.is_not_in(IN_FLIGHT)),
+                db,
+                "maintenance age",
+            )
+            .await,
+        );
     }
     if operator_days > 0 {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(operator_days));
-        deleted += run_delete(
-            jobs::Entity::delete_many()
-                .filter(jobs::Column::Category.is_in(["operator", "metadata"]))
-                .filter(jobs::Column::CreatedAt.lt(cutoff))
-                .filter(jobs::Column::Status.is_not_in(IN_FLIGHT)),
-            db,
-            "operator/metadata age",
-        )
-        .await;
+        pruned.add(
+            run_delete(
+                jobs::Entity::delete_many()
+                    .filter(jobs::Column::Category.is_in(["operator", "metadata"]))
+                    .filter(jobs::Column::CreatedAt.lt(cutoff))
+                    .filter(jobs::Column::Status.is_not_in(IN_FLIGHT)),
+                db,
+                "operator/metadata age",
+            )
+            .await,
+        );
     }
     if maintenance_max_rows > 0 {
         // Keep the most-recent N maintenance rows; delete the older overflow.
@@ -357,30 +362,60 @@ pub async fn prune_tracked_jobs(
             .order_by_desc(jobs::Column::CreatedAt)
             .offset(maintenance_max_rows)
             .into_query();
-        deleted += run_delete(
-            jobs::Entity::delete_many().filter(jobs::Column::Id.in_subquery(overflow)),
-            db,
-            "maintenance count cap",
-        )
-        .await;
+        pruned.add(
+            run_delete(
+                jobs::Entity::delete_many().filter(jobs::Column::Id.in_subquery(overflow)),
+                db,
+                "maintenance count cap",
+            )
+            .await,
+        );
     }
 
-    if deleted > 0 {
-        tracing::info!(deleted, "Tracked-job retention: pruned old job rows");
+    if pruned.deleted > 0 {
+        tracing::info!(
+            deleted = pruned.deleted,
+            "Tracked-job retention: pruned old job rows"
+        );
     }
-    deleted
+    pruned
+}
+
+/// What a retention pass deleted, and each layer that failed with its error.
+#[derive(Debug, Default)]
+pub struct Pruned {
+    pub deleted: u64,
+    pub failed: Vec<String>,
+}
+
+impl Pruned {
+    fn add(&mut self, layer: Result<u64, String>) {
+        match layer {
+            Ok(n) => self.deleted += n,
+            Err(e) => self.failed.push(e),
+        }
+    }
+
+    /// `Ok` when every layer ran, otherwise every failed layer and its error.
+    pub fn result(&self) -> Result<(), String> {
+        if self.failed.is_empty() {
+            Ok(())
+        } else {
+            Err(self.failed.join("; "))
+        }
+    }
 }
 
 async fn run_delete(
     delete: sea_orm::DeleteMany<jobs::Entity>,
     db: &DatabaseConnection,
     label: &str,
-) -> u64 {
+) -> Result<u64, String> {
     match delete.exec(db).await {
-        Ok(res) => res.rows_affected,
+        Ok(res) => Ok(res.rows_affected),
         Err(e) => {
             tracing::warn!(error = %e, label, "Tracked-job retention: prune layer failed");
-            0
+            Err(format!("{label}: {e}"))
         }
     }
 }

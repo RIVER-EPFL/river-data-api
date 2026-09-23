@@ -3,9 +3,14 @@
 //! The table is the one source the route's refusal and the page's form both read, so what it
 //! answers for a kind is the contract; these pin the three classes and the refusal's wording.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use super::{ManualRun, ParamKind, build_registry, manual_run_for, missing_params, runnable_jobs};
+use super::{
+    ManualRun, ParamKind, build_registry, manual_params, manual_run_for, missing_params,
+    runnable_jobs,
+};
+use crate::common::middleware::AuthContext;
 
 fn declared(kind: &str) -> Vec<super::ParamSpec> {
     match manual_run_for(kind) {
@@ -201,4 +206,122 @@ fn a_declared_kind_carries_its_specs() {
         panic!("measurement_retag declares inputs");
     };
     assert!(!params.is_empty());
+}
+
+fn person(email: &str) -> AuthContext {
+    AuthContext::Keycloak {
+        roles: Vec::new(),
+        sub: "sub-1".to_string(),
+        email: Some(email.to_string()),
+        email_verified: true,
+        grants: Arc::new(HashSet::new()),
+    }
+}
+
+const SOURCE: &str = "00000000-0000-0000-0000-000000000001";
+const TARGET: &str = "00000000-0000-0000-0000-000000000002";
+
+#[test]
+fn test_manual_params_carries_declared_inputs_and_the_callers_identity() {
+    let params = manual_params(
+        &manual_run_for("merge_parameters"),
+        &serde_json::json!({ "source_parameter_id": SOURCE, "target_parameter_id": TARGET }),
+        serde_json::json!({ "batch": 5 }),
+        &person("evan@epfl.ch"),
+    )
+    .unwrap();
+    assert_eq!(
+        params,
+        serde_json::json!({
+            "trigger": "run_now",
+            "tunables": { "batch": 5 },
+            "source_parameter_id": SOURCE,
+            "target_parameter_id": TARGET,
+            "actor": "evan@epfl.ch",
+            "origin": "manual",
+        })
+    );
+}
+
+/// The ledger names who asked for a merge; a body that names someone else is refused rather than
+/// believed, whatever else it carries.
+#[test]
+fn test_manual_params_refuses_actor_and_origin_from_the_body() {
+    let offer = manual_run_for("merge_parameters");
+    for (key, value) in [("actor", "someone else"), ("origin", "csv")] {
+        let mut body =
+            serde_json::json!({ "source_parameter_id": SOURCE, "target_parameter_id": TARGET });
+        body[key] = serde_json::json!(value);
+        let refused = manual_params(
+            &offer,
+            &body,
+            serde_json::json!({}),
+            &person("evan@epfl.ch"),
+        )
+        .unwrap_err();
+        assert!(refused.contains(key), "{refused}");
+    }
+}
+
+/// The schedule's tunables are validated when edited; one typed into a run would reach the job
+/// unchecked, and so would a forged trigger or scheduler stamp.
+#[test]
+fn test_manual_params_refuses_undeclared_keys() {
+    for key in ["tunables", "trigger", "scheduled_at", "interval_seconds"] {
+        let refused = manual_params(
+            &manual_run_for("janitor_service"),
+            &serde_json::json!({ key: 1 }),
+            serde_json::json!({}),
+            &person("evan@epfl.ch"),
+        )
+        .unwrap_err();
+        assert!(refused.contains(key), "{refused}");
+    }
+}
+
+#[test]
+fn test_manual_params_names_missing_inputs_and_rejects_a_non_object() {
+    let offer = manual_run_for("merge_parameters");
+    let refused = manual_params(
+        &offer,
+        &serde_json::json!({ "source_parameter_id": SOURCE }),
+        serde_json::json!({}),
+        &person("evan@epfl.ch"),
+    )
+    .unwrap_err();
+    assert!(refused.contains("Surviving parameter"), "{refused}");
+    assert!(
+        manual_params(
+            &offer,
+            &serde_json::json!([SOURCE, TARGET]),
+            serde_json::json!({}),
+            &person("e")
+        )
+        .is_err()
+    );
+}
+
+/// An empty body is a bare run; a declared input sent as null is left out, as if unsent.
+#[test]
+fn test_manual_params_bare_run_and_null_inputs() {
+    let bare = manual_params(
+        &manual_run_for("alarm_sweep"),
+        &serde_json::Value::Null,
+        serde_json::json!({}),
+        &AuthContext::SyncService {
+            service_id: uuid::Uuid::nil(),
+        },
+    )
+    .unwrap();
+    assert_eq!(bare["trigger"], "run_now");
+    assert_eq!(bare["origin"], "sync");
+    let windowed = manual_params(
+        &manual_run_for("refresh_aggregates"),
+        &serde_json::json!({ "from": null, "since": "2026-01-01T00:00:00Z" }),
+        serde_json::json!({}),
+        &person("evan@epfl.ch"),
+    )
+    .unwrap();
+    assert!(windowed.get("from").is_none());
+    assert_eq!(windowed["since"], "2026-01-01T00:00:00Z");
 }

@@ -324,6 +324,57 @@ pub fn missing_params(offer: &ManualRun, supplied: &serde_json::Value) -> Vec<&'
         .collect()
 }
 
+/// The params a manual run is enqueued with: the schedule's `tunables` snapshot, the inputs the
+/// kind declares and nothing else, and the caller's `actor` and `origin` from `auth`. `Err` names
+/// an undeclared key, a missing input or a body that is not an object.
+pub fn manual_params(
+    offer: &ManualRun,
+    supplied: &serde_json::Value,
+    tunables: serde_json::Value,
+    auth: &crate::common::middleware::AuthContext,
+) -> Result<serde_json::Value, String> {
+    let empty = serde_json::Map::new();
+    let supplied = match supplied {
+        serde_json::Value::Null => &empty,
+        serde_json::Value::Object(object) => object,
+        _ => return Err("a run's inputs are an object keyed by input name".to_string()),
+    };
+    let declared: &[ParamSpec] = match offer {
+        ManualRun::Declared { params } => params,
+        ManualRun::NoParameters | ManualRun::NotOffered => &[],
+    };
+    let mut undeclared: Vec<&str> = supplied
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !declared.iter().any(|p| p.name == *key))
+        .collect();
+    if !undeclared.is_empty() {
+        undeclared.sort_unstable();
+        return Err(format!("takes no input named {}", undeclared.join(", ")));
+    }
+    let missing = missing_params(offer, &serde_json::Value::Object(supplied.clone()));
+    if !missing.is_empty() {
+        return Err(format!("needs {}", missing.join(", ")));
+    }
+    let mut params = serde_json::Map::new();
+    params.insert("trigger".to_string(), serde_json::json!("run_now"));
+    params.insert("tunables".to_string(), tunables);
+    for (key, value) in supplied {
+        if !value.is_null() {
+            params.insert(key.clone(), value.clone());
+        }
+    }
+    params.insert(
+        "actor".to_string(),
+        serde_json::json!(crate::common::actor::label(auth)),
+    );
+    params.insert(
+        "origin".to_string(),
+        serde_json::json!(auth.origin().as_str()),
+    );
+    Ok(serde_json::Value::Object(params))
+}
+
 /// Whether a running job of this `trigger_type` can be cooperatively cancelled, ie. it iterates a
 /// loop and checks `JobContext::is_cancelled` at its batch checkpoints. Single-statement jobs
 /// (aggregate refresh, pairing backfill) have no checkpoint and report 409 on a cancel attempt.
@@ -2046,6 +2097,36 @@ pub async fn run_workers(
             return;
         }
     }
+}
+
+/// How long a stopping process waits for the worker's claimed job, counted from the shutdown
+/// signal. Below the API Deployment's `terminationGracePeriodSeconds` (120).
+pub const SHUTDOWN_DRAIN_SECONDS: u64 = 100;
+
+/// Run `server` to its end, then wait for the `worker` loop started with the same `shutdown` to
+/// return, up to `drain` after the signal. A job still running at the limit is cancelled and
+/// reclaimed by the reaper once its lease lapses.
+pub async fn serve_then_drain_worker(
+    server: impl std::future::Future<Output = std::io::Result<()>>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    worker: tokio::task::JoinHandle<()>,
+    drain: Duration,
+) -> std::io::Result<()> {
+    let mut shutdown = shutdown;
+    let drained = tokio::spawn(async move {
+        let _ = shutdown.wait_for(|stopping| *stopping).await;
+        match tokio::time::timeout(drain, worker).await {
+            Ok(Ok(())) => tracing::info!("job worker drained"),
+            Ok(Err(e)) => tracing::error!(error = %e, "job worker task failed"),
+            Err(_) => tracing::warn!(
+                drain_seconds = drain.as_secs(),
+                "job worker still running at the drain limit; its job is left to the reaper"
+            ),
+        }
+    });
+    server.await?;
+    let _ = drained.await;
+    Ok(())
 }
 
 // --- CRUD operations ---

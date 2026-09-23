@@ -88,6 +88,7 @@ async fn test_simple_reassign() {
         ),
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await
     .expect("merge should succeed");
@@ -157,6 +158,7 @@ async fn test_conflict_merge() {
         ),
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await
     .expect("merge should succeed");
@@ -211,6 +213,7 @@ async fn test_cross_site() {
         ),
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await
     .expect("merge should succeed");
@@ -278,6 +281,7 @@ async fn test_derived_sources_reassigned() {
         ),
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await
     .expect("merge should succeed");
@@ -341,6 +345,7 @@ async fn test_aliases_absorbed() {
         ),
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await
     .expect("merge should succeed");
@@ -374,6 +379,7 @@ async fn test_same_id_rejection() {
         ),
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await;
     assert!(result.is_err(), "should reject same-id merge");
@@ -393,6 +399,7 @@ async fn test_not_found_rejection() {
         ),
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await;
     assert!(result.is_err(), "should reject nonexistent source");
@@ -474,6 +481,7 @@ async fn test_merge_clears_needs_review_on_survivor() {
         ),
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await
     .expect("merge succeeds");
@@ -550,6 +558,7 @@ async fn a_merge_that_would_make_a_calculation_read_its_own_output_is_refused() 
         ),
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await
     .expect_err("the merge closes a loop and is refused");
@@ -611,6 +620,7 @@ async fn a_merge_that_closes_no_loop_still_merges() {
         ),
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await
     .expect("no loop, so nothing to refuse");
@@ -645,6 +655,7 @@ async fn a_formula_producing_the_merged_away_parameter_produces_the_survivor() {
         ),
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await
     .expect("the formula's output moves with everything else the merge moves");
@@ -696,6 +707,7 @@ async fn a_merge_leaves_one_entry_naming_both_sides() {
         ),
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await;
     assert!(refused.is_err(), "a merge onto an absent target is refused");
@@ -712,6 +724,7 @@ async fn a_merge_leaves_one_entry_naming_both_sides() {
         ),
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await
     .expect("merge should succeed");
@@ -793,6 +806,7 @@ async fn test_merge_refuses_two_curves_landing_on_one_channel_at_one_instant() {
         ),
         "tester",
         river_db::routes::private::readings::models::Origin::Manual,
+        None,
     )
     .await;
     match result {

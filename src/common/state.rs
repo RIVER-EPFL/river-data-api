@@ -2,6 +2,7 @@ use axum_keycloak_auth::instance::KeycloakAuthInstance;
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
 use sea_orm::DatabaseConnection;
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast};
@@ -68,6 +69,60 @@ pub enum AppEvent {
 }
 
 pub type EventSender = broadcast::Sender<AppEvent>;
+
+/// Readings a bulk rewrite changed, counted per (site, parameter) slot.
+///
+/// A job that rewrites stored values in place (a reprocess, a slot merge) owes the same
+/// `DataIngested` a write does, one per slot it changed: it is what drops that site's cached
+/// responses and refreshes an open site page.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SlotTally(BTreeMap<(uuid::Uuid, Option<uuid::Uuid>), usize>);
+
+impl SlotTally {
+    /// Count `rows` at a slot. A row with no site reaches no site endpoint, so it is not counted.
+    pub fn add(
+        &mut self,
+        site_id: Option<uuid::Uuid>,
+        parameter_id: Option<uuid::Uuid>,
+        rows: usize,
+    ) {
+        let Some(site_id) = site_id else {
+            return;
+        };
+        if rows > 0 {
+            *self.0.entry((site_id, parameter_id)).or_default() += rows;
+        }
+    }
+
+    pub fn merge(&mut self, other: SlotTally) {
+        for ((site_id, parameter_id), rows) in other.0 {
+            self.add(Some(site_id), parameter_id, rows);
+        }
+    }
+
+    /// One `DataIngested` per slot counted.
+    #[must_use]
+    pub fn events(&self) -> Vec<AppEvent> {
+        self.0
+            .iter()
+            .map(
+                |(&(site_id, parameter_id), &count)| AppEvent::DataIngested {
+                    site_id: Some(site_id),
+                    parameter_id,
+                    stream_id: None,
+                    count,
+                },
+            )
+            .collect()
+    }
+
+    /// Send [`Self::events`]. A bus with no subscriber drops them, which is not an error.
+    pub fn announce(&self, events: &EventSender) {
+        for event in self.events() {
+            let _ = events.send(event);
+        }
+    }
+}
 
 /// Global handle so CrudCrate operation hooks (which only receive `&self` + `db`)
 /// can emit events without modifying the CrudCrate trait signatures.
@@ -218,3 +273,7 @@ impl AppState {
         state
     }
 }
+
+#[cfg(test)]
+#[path = "tests/state.rs"]
+mod tests;

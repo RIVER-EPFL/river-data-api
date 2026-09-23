@@ -304,11 +304,23 @@ fn every_reprocess_step_records_what_it_moved() {
                 "{name} records only the rows that moved: {sql}"
             );
             assert!(
-                sql.ends_with(r#"SELECT "site_id", "parameter_id", "time" FROM "moved""#),
-                "{name} reports the instants the cascade follows, and the parameter a held pulse \
-                 reads: {sql}"
+                sql.contains(r#"SELECT "m"."site_id", "m"."time", "m"."parameter_id", "#),
+                "{name} reports the instants the cascade follows, and the slot of each, whose \
+                 parameter a held pulse reads: {sql}"
+            );
+            assert!(
+                sql.ends_with(r#"AS "changed" FROM "moved" AS "m""#),
+                "{name} reports whether each visited row moved, which is what it announces: {sql}"
             );
         }
+        assert!(
+            rendered(steps.attribution.clone()).contains(r#""m"."was_site_id" AS "left_site_id""#),
+            "a row the attribution moves off a site leaves that site's series stale too"
+        );
+        assert!(
+            rendered(steps.calibration.clone()).contains(r#"AS uuid) AS "left_site_id""#),
+            "the curve step moves no row between sites"
+        );
         assert!(
             rendered(steps.spot.clone()).contains("r.measurement_type = 'spot'"),
             "the grab step takes the rows the window resolution holds back"
@@ -316,6 +328,34 @@ fn every_reprocess_step_records_what_it_moved() {
         assert!(
             !rendered(steps.calibration.clone()).contains("r.measurement_type = 'spot'"),
             "and the window resolution leaves them alone"
+        );
+    }
+}
+
+/// Expected behaviour: a `reprocess` or `curve_recompose` row takes its `supersedes` from the
+/// ledger's family rule, and each of those kinds stands alone, so the row supersedes nothing: a
+/// second reprocess does not hide the one before it.
+#[test]
+fn a_reprocess_or_recompose_row_supersedes_nothing() {
+    for kind in [Kind::Reprocess, Kind::CurveRecompose] {
+        let insert = ledger_insert(
+            kind,
+            Origin::System,
+            "moved",
+            "m",
+            Expr::val(1),
+            Expr::val(2),
+            None,
+            None,
+        );
+        let sql = insert.to_string(PostgresQueryBuilder);
+        assert!(
+            !sql.contains(&format!("p.kind = '{}'", kind.as_str())),
+            "{kind:?} names no previous decision of its own kind: {sql}"
+        );
+        assert!(
+            sql.contains(r#"FROM "reading_decisions" AS "d""#) && sql.contains("1 = 2"),
+            "{kind:?} reads the family rule, whose empty family matches no decision: {sql}"
         );
     }
 }
@@ -780,4 +820,139 @@ fn test_pending_follow_moves_only_a_changed_state() {
     assert_eq!(pending_follow(true, false), Some(Kind::Verify));
     assert_eq!(pending_follow(true, true), None);
     assert_eq!(pending_follow(false, false), None);
+}
+
+fn visited(site: u128, left: Option<u128>, changed: bool) -> MovedReading {
+    MovedReading {
+        site_id: Some(Uuid::from_u128(site)),
+        time: chrono::DateTime::parse_from_rfc3339("2025-01-10T10:00:00Z").unwrap(),
+        parameter_id: Some(Uuid::from_u128(100)),
+        left_site_id: left.map(Uuid::from_u128),
+        changed,
+    }
+}
+
+fn announced_sites(tally: &crate::common::SlotTally) -> Vec<(Uuid, usize)> {
+    tally
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            crate::common::AppEvent::DataIngested {
+                site_id: Some(site_id),
+                count,
+                ..
+            } => Some((site_id, count)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Scenario: a reprocess visits readings, re-deriving some and leaving others as they were.
+///
+/// Expected behaviour: only a reading whose columns moved is announced, at the site it is served at
+/// now and, when the run moved it between sites, at the site it was served at before.
+#[test]
+fn test_tally_moved_counts_only_rows_that_changed() {
+    let mut tally = crate::common::SlotTally::default();
+    tally_moved(&mut tally, &visited(1, Some(1), false));
+    assert!(
+        tally.events().is_empty(),
+        "a visited row left as it was announces nothing"
+    );
+
+    tally_moved(&mut tally, &visited(1, Some(1), true));
+    tally_moved(&mut tally, &visited(1, None, true));
+    assert_eq!(
+        announced_sites(&tally),
+        vec![(Uuid::from_u128(1), 2)],
+        "a row that stayed on its site is counted there once"
+    );
+}
+
+#[test]
+fn test_tally_moved_counts_both_sites_of_a_row_moved_between_them() {
+    let mut tally = crate::common::SlotTally::default();
+    tally_moved(&mut tally, &visited(2, Some(1), true));
+    assert_eq!(
+        announced_sites(&tally),
+        vec![(Uuid::from_u128(1), 1), (Uuid::from_u128(2), 1)],
+        "the site the row left serves a stale series as much as the one it joined"
+    );
+}
+
+/// Scenario: the drift sweep moves a continuous sensor's corrected values, which no visit owns.
+///
+/// Expected behaviour: the sweep's summary groups the moved rows that carry no collection event by
+/// (site, parameter) with the span each covers, so the caller can recompute the stream-arm
+/// calculations that read them; a visit's rows stay with the visit pairs.
+#[test]
+fn test_curve_drift_statement_reports_stream_slots_moved_outside_a_visit() {
+    use sea_orm::sea_query::Query;
+    let sql = rendered(curve_drift_statement(None));
+    assert!(
+        sql.contains("tgt.site_id"),
+        "the write returns the site each moved row stands at: {sql}"
+    );
+    let slots = rendered(Query::select().expr(drifted_stream_slots()).take());
+    assert!(
+        slots.contains(r#"FROM "drift""#),
+        "the slots are read from what the write returned: {slots}"
+    );
+    assert!(
+        slots.contains(r#""collection_event_id" IS NULL"#),
+        "a visit's rows are the chain's, not the stream arm's: {slots}"
+    );
+    assert!(
+        slots.contains(r#"GROUP BY "site_id", "parameter_id""#),
+        "one entry per slot: {slots}"
+    );
+    assert!(
+        slots.contains(r#"MIN("time") AS "lo""#) && slots.contains(r#"MAX("time") AS "hi""#),
+        "each slot carries the span it moved: {slots}"
+    );
+    assert!(
+        sql.contains(r#"AS "stream_slots""#),
+        "the sweep's summary carries them: {sql}"
+    );
+}
+
+/// Expected behaviour: the jsonb the summary returns reads back as slots, timestamps in the
+/// offset form Postgres renders them in.
+#[test]
+fn test_stream_slots_parse_from_the_summary_json() {
+    let site = Uuid::from_u128(1);
+    let parameter = Uuid::from_u128(2);
+    let slots = stream_slots(Some(serde_json::json!([{
+        "site_id": site,
+        "parameter_id": parameter,
+        "start": "2025-06-15T10:00:00+00:00",
+        "end": "2025-06-15T12:30:00.5+00:00",
+    }])));
+    assert_eq!(slots.len(), 1);
+    assert_eq!(slots[0].site_id, site);
+    assert_eq!(slots[0].parameter_id, parameter);
+    assert_eq!(slots[0].start.to_rfc3339(), "2025-06-15T10:00:00+00:00");
+    assert_eq!(slots[0].end.to_rfc3339(), "2025-06-15T12:30:00.500+00:00");
+    assert!(stream_slots(None).is_empty(), "nothing moved");
+}
+
+/// Expected behaviour: a slot becomes the windowed `derived_recompute` scope, the shape the job
+/// reads back (`site_ids`, `parameter_ids`, `start`, `end`).
+#[test]
+fn test_drift_slot_recompute_params_name_the_slot_and_its_span() {
+    let slot = DriftSlot {
+        site_id: Uuid::from_u128(1),
+        parameter_id: Uuid::from_u128(2),
+        start: "2025-06-15T10:00:00Z".parse().unwrap(),
+        end: "2025-06-15T12:00:00Z".parse().unwrap(),
+    };
+    assert_eq!(
+        slot.recompute_params(),
+        serde_json::json!({
+            "site_ids": [Uuid::from_u128(1).to_string()],
+            "parameter_ids": [Uuid::from_u128(2).to_string()],
+            "start": "2025-06-15T10:00:00+00:00",
+            "end": "2025-06-15T12:00:00+00:00",
+        })
+    );
 }

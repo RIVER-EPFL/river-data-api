@@ -8,5 +8,6 @@ mod common;
 
 mod eviction;
 mod invalidation_mechanism;
+mod job_rewrites;
 mod key_and_invalidation;
 mod key_generation;

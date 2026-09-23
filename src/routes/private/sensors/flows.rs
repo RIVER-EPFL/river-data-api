@@ -42,7 +42,9 @@ impl Job for ReprocessSensor {
         let sensor_id = required_uuid(ctx.params(), "sensor_id")?;
         ctx.info(&format!("Reprocessing readings for sensor {sensor_id}"))
             .await;
-        let count = reprocess_sensor_readings(ctx.db(), sensor_id, Some(ctx.job_id())).await?;
+        let count =
+            reprocess_sensor_readings(ctx.db(), sensor_id, Some(ctx.job_id()), Some(ctx.events()))
+                .await?;
         if let Ok(Some(row)) = ctx
             .db()
             .query_one_raw(build(
@@ -92,11 +94,17 @@ impl Job for ReprocessSlot {
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let site_id = required_uuid(ctx.params(), "site_id")?;
         let parameter_id = required_uuid(ctx.params(), "parameter_id")?;
-        let count =
-            reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id, Some(ctx.job_id()))
-                .await? as i64;
+        let count = reprocess_site_parameter_readings(
+            ctx.db(),
+            site_id,
+            parameter_id,
+            Some(ctx.job_id()),
+            Some(ctx.events()),
+        )
+        .await? as i64;
         if let Some(sensor_id) = optional_uuid(ctx.params(), "sensor_id") {
-            reprocess_sensor_readings(ctx.db(), sensor_id, Some(ctx.job_id())).await?;
+            reprocess_sensor_readings(ctx.db(), sensor_id, Some(ctx.job_id()), Some(ctx.events()))
+                .await?;
         }
         ctx.set_site(site_id).await;
         ctx.report(
@@ -140,6 +148,7 @@ impl Job for ReprocessAll {
                 site_id,
                 parameter_id,
                 Some(ctx.job_id()),
+                Some(ctx.events()),
             )
             .await
             .map(|n| n as i64);
@@ -196,9 +205,14 @@ impl Job for BackfillCalibrations {
         let mut results = Vec::with_capacity(sensor_count);
         for (walked, sensor_id) in sensors.into_iter().enumerate() {
             ctx.set_step(walked + 1, sensor_count).await;
-            let moved = reprocess_sensor_readings(ctx.db(), sensor_id, Some(ctx.job_id()))
-                .await
-                .map(|n| n as i64);
+            let moved = reprocess_sensor_readings(
+                ctx.db(),
+                sensor_id,
+                Some(ctx.job_id()),
+                Some(ctx.events()),
+            )
+            .await
+            .map(|n| n as i64);
             results.push((serde_json::json!({ "sensor_id": sensor_id }), moved));
         }
         let outcome = SlotOutcome::from(results);

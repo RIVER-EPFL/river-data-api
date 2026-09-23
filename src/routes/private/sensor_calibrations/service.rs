@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use crudcrate::{ApiError, CRUDOperations, CRUDResource, MergeIntoActiveModel};
+use sea_orm::sea_query::extension::postgres::PgFunc;
 use sea_orm::sea_query::{
     Alias, CommonTableExpression, Condition, Expr, ExprTrait as _, Func, IntoIden, IntoTableRef,
     JoinType, OnConflict, Order, PostgresQueryBuilder, Query as SeaQuery, ReturningClause,
@@ -457,6 +458,7 @@ struct DriftRow {
     lo: Option<DateTime<Utc>>,
     hi: Option<DateTime<Utc>>,
     touched: Option<serde_json::Value>,
+    stream_slots: Option<serde_json::Value>,
 }
 
 /// What a curve-drift sweep moved: the row count and the span those rows cover.
@@ -466,6 +468,38 @@ pub struct CurveDrift {
     /// The `(collection_event_id, parameter_id)` pairs the sweep moved, so the caller can recompute
     /// the visits whose calculations read a value that just changed under them (Q108).
     pub touched: Vec<(Uuid, Uuid)>,
+    /// The slots the sweep moved on rows no visit owns, each with its span, so the caller can
+    /// recompute the stream-arm calculations that read them (Q108).
+    pub stream_slots: Vec<DriftSlot>,
+}
+
+/// One (site, parameter) slot a drift sweep moved outside any visit, and the span it moved.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct DriftSlot {
+    pub site_id: Uuid,
+    pub parameter_id: Uuid,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+impl DriftSlot {
+    /// The windowed `derived_recompute` params that recompute every calculation reading this slot.
+    #[must_use]
+    pub fn recompute_params(&self) -> serde_json::Value {
+        serde_json::json!({
+            "site_ids": [self.site_id.to_string()],
+            "parameter_ids": [self.parameter_id.to_string()],
+            "start": self.start.to_rfc3339(),
+            "end": self.end.to_rfc3339(),
+        })
+    }
+}
+
+/// The summary's `stream_slots` aggregate as slots; an empty set aggregates to NULL.
+fn stream_slots(value: Option<serde_json::Value>) -> Vec<DriftSlot> {
+    value
+        .and_then(|v| serde_json::from_value::<Vec<DriftSlot>>(v).ok())
+        .unwrap_or_default()
 }
 
 /// The columns every ledger insert here names: the decision's own, plus the run that made the move.
@@ -475,18 +509,6 @@ fn decision_columns() -> Vec<Alias> {
         .chain(std::iter::once("job_id"))
         .map(Alias::new)
         .collect()
-}
-
-/// The decision this one supersedes: the newest live decision of the same kind on the same reading.
-fn supersedes(alias: &str, kind: Kind) -> Expr {
-    Expr::cust(format!(
-        "(SELECT p.id FROM reading_decisions p \
-           WHERE p.stream_id = {alias}.stream_id AND p.time = {alias}.time \
-             AND p.replicate_index IS NOT DISTINCT FROM {alias}.replicate_index \
-             AND p.kind = '{kind}' AND p.rolled_back_by IS NULL \
-           ORDER BY p.at DESC, p.id DESC LIMIT 1)",
-        kind = kind.as_str(),
-    ))
 }
 
 /// One `reading_decisions` row per reading a run moved, read from the CTE `source` (as `alias`) the
@@ -513,7 +535,10 @@ fn ledger_insert(
         .expr(new)
         .expr(Expr::val("system"))
         .expr(Expr::val(origin.as_str()))
-        .expr(supersedes(alias, kind))
+        .expr(crate::routes::private::readings::service::supersedes(
+            kind,
+            &Alias::new(alias),
+        ))
         .expr(Expr::val(job_id))
         .from_as(Alias::new(source), Alias::new(alias));
     if let Some(filter) = filter {
@@ -558,41 +583,7 @@ pub async fn sweep_curve_drift(
     db: &DatabaseConnection,
     job_id: Option<Uuid>,
 ) -> crate::error::AppResult<CurveDrift> {
-    let drifted = own_curve_rows(corrected_rows("r").and(Expr::cust_with_exprs(
-        "tgt.calibrated_value IS DISTINCT FROM ($1)",
-        [recomposed_own_curve_value()],
-    )));
-    let update = recompose_statement(drifted)
-        .returning(ReturningClause::Exprs(vec![Expr::cust(
-            "tgt.stream_id, tgt.time, tgt.replicate_index, tgt.collection_event_id, \
-             tgt.parameter_id, r.calibrated_value AS was, tgt.calibrated_value AS became",
-        )]))
-        .take();
-    let recorded = ledger_insert(
-        Kind::CurveRecompose,
-        Origin::Janitor,
-        "drift",
-        "d",
-        Expr::cust("jsonb_build_object('calibrated_value', to_jsonb(d.was))"),
-        Expr::cust("jsonb_build_object('calibrated_value', to_jsonb(d.became))"),
-        None,
-        job_id,
-    );
-    let query = SeaQuery::select()
-        .expr_as(Expr::cust("count(*)"), Alias::new("moved"))
-        .expr_as(Expr::cust("min(time)"), Alias::new("lo"))
-        .expr_as(Expr::cust("max(time)"), Alias::new("hi"))
-        .expr_as(
-            Expr::cust(
-                "(SELECT jsonb_agg(DISTINCT jsonb_build_array(collection_event_id, parameter_id)) \
-                    FROM drift \
-                   WHERE collection_event_id IS NOT NULL AND parameter_id IS NOT NULL)",
-            ),
-            Alias::new("touched"),
-        )
-        .from(Alias::new("drift"))
-        .take()
-        .with(with_ledger("drift", update, recorded));
+    let query = curve_drift_statement(job_id);
 
     // Drift in a chunk past the compression policy has to decompress, and the roll-up carries its
     // own `RETURNING tgt.time`, so this is `guarded` rather than `guarded_mutation`.
@@ -608,6 +599,7 @@ pub async fn sweep_curve_drift(
             moved: 0,
             span: None,
             touched: Vec::new(),
+            stream_slots: Vec::new(),
         });
     };
     let row = DriftRow::from_query_result(&row, "")?;
@@ -621,7 +613,86 @@ pub async fn sweep_curve_drift(
         moved,
         span: lo.zip(hi),
         touched,
+        stream_slots: stream_slots(row.stream_slots),
     })
+}
+
+/// The (site, parameter) slots the `drift` CTE moved on rows no visit owns, each with the span it
+/// moved, as a json array of `DriftSlot` objects (NULL when there are none).
+fn drifted_stream_slots() -> Expr {
+    let (drift, slots) = (Alias::new("drift"), Alias::new("slots"));
+    let (lo, hi) = (Alias::new("lo"), Alias::new("hi"));
+    let per_slot = SeaQuery::select()
+        .column(readings::Column::SiteId)
+        .column(readings::Column::ParameterId)
+        .expr_as(Func::min(Expr::col(readings::Column::Time)), lo.clone())
+        .expr_as(Func::max(Expr::col(readings::Column::Time)), hi.clone())
+        .from(drift)
+        .and_where(Expr::col(readings::Column::CollectionEventId).is_null())
+        .and_where(Expr::col(readings::Column::SiteId).is_not_null())
+        .and_where(Expr::col(readings::Column::ParameterId).is_not_null())
+        .group_by_col(readings::Column::SiteId)
+        .group_by_col(readings::Column::ParameterId)
+        .take();
+    let object = PgFunc::json_build_object(vec![
+        (Expr::val("site_id"), Expr::col(readings::Column::SiteId)),
+        (
+            Expr::val("parameter_id"),
+            Expr::col(readings::Column::ParameterId),
+        ),
+        (Expr::val("start"), Expr::col(lo)),
+        (Expr::val("end"), Expr::col(hi)),
+    ]);
+    let aggregated = SeaQuery::select()
+        .expr(PgFunc::json_agg(object))
+        .from_subquery(per_slot, slots)
+        .take();
+    Expr::SubQuery(
+        None,
+        Box::new(SubQueryStatement::SelectStatement(aggregated)),
+    )
+}
+
+/// The drift sweep as one statement: the recompose, its ledger insert, and a summary row of what
+/// moved (the count, the span, the visit pairs and the stream slots).
+fn curve_drift_statement(job_id: Option<Uuid>) -> WithQuery {
+    let drifted = own_curve_rows(corrected_rows("r").and(Expr::cust_with_exprs(
+        "tgt.calibrated_value IS DISTINCT FROM ($1)",
+        [recomposed_own_curve_value()],
+    )));
+    let update = recompose_statement(drifted)
+        .returning(ReturningClause::Exprs(vec![Expr::cust(
+            "tgt.stream_id, tgt.time, tgt.replicate_index, tgt.collection_event_id, \
+             tgt.site_id, tgt.parameter_id, r.calibrated_value AS was, \
+             tgt.calibrated_value AS became",
+        )]))
+        .take();
+    let recorded = ledger_insert(
+        Kind::CurveRecompose,
+        Origin::Janitor,
+        "drift",
+        "d",
+        Expr::cust("jsonb_build_object('calibrated_value', to_jsonb(d.was))"),
+        Expr::cust("jsonb_build_object('calibrated_value', to_jsonb(d.became))"),
+        None,
+        job_id,
+    );
+    SeaQuery::select()
+        .expr_as(Expr::cust("count(*)"), Alias::new("moved"))
+        .expr_as(Expr::cust("min(time)"), Alias::new("lo"))
+        .expr_as(Expr::cust("max(time)"), Alias::new("hi"))
+        .expr_as(
+            Expr::cust(
+                "(SELECT jsonb_agg(DISTINCT jsonb_build_array(collection_event_id, parameter_id)) \
+                    FROM drift \
+                   WHERE collection_event_id IS NOT NULL AND parameter_id IS NOT NULL)",
+            ),
+            Alias::new("touched"),
+        )
+        .expr_as(drifted_stream_slots(), Alias::new("stream_slots"))
+        .from(Alias::new("drift"))
+        .take()
+        .with(with_ledger("drift", update, recorded))
 }
 
 pub fn evaluate_formula(formula: &str, variables: &HashMap<String, f64>) -> Result<f64, String> {
@@ -2154,9 +2225,11 @@ fn moved_pairs(was: &str, now: &str, columns: &[&str]) -> String {
 /// job that made the move, in the same transaction as the write.
 ///
 /// `update_sql` ends in a `RETURNING` of `stream_id`, `time`, `replicate_index`, the `site_id` the
-/// cascade follows, and a `was_<col>`/`now_<col>` pair per column in `columns`. A visited row whose
-/// columns all came back the same is not a move and records nothing; the statement still returns
-/// it, so the caller's count and cascade are unchanged.
+/// cascade follows, `parameter_id`, and a `was_<col>`/`now_<col>` pair per column in `columns`. A
+/// visited row whose columns all came back the same is not a move and records nothing; the
+/// statement still returns it, so the caller's count and cascade are unchanged, and reports it as
+/// not `changed`, so it is not announced. `left_site_id` is the site a row that changed site was
+/// served at before, which is stale too.
 fn record_moved(write: UpdateStatement, columns: &[&str], job_id: Option<Uuid>) -> WithQuery {
     let pairs = |side: &str| {
         columns
@@ -2165,11 +2238,14 @@ fn record_moved(write: UpdateStatement, columns: &[&str], job_id: Option<Uuid>) 
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let changed = columns
-        .iter()
-        .map(|c| format!("m.was_{c} IS DISTINCT FROM m.now_{c}"))
-        .collect::<Vec<_>>()
-        .join(" OR ");
+    let changed = Expr::cust(format!(
+        "({})",
+        columns
+            .iter()
+            .map(|c| format!("m.was_{c} IS DISTINCT FROM m.now_{c}"))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    ));
     let recorded = ledger_insert(
         Kind::Reprocess,
         Origin::System,
@@ -2177,14 +2253,22 @@ fn record_moved(write: UpdateStatement, columns: &[&str], job_id: Option<Uuid>) 
         "m",
         Expr::cust(format!("jsonb_build_object({})", pairs("was"))),
         Expr::cust(format!("jsonb_build_object({})", pairs("now"))),
-        Some(Expr::cust(format!("({changed})"))),
+        Some(changed.clone()),
         job_id,
     );
+    let m = |c: &str| Expr::col((Alias::new("m"), Alias::new(c)));
+    let left_site = if columns.contains(&"site_id") {
+        m("was_site_id")
+    } else {
+        Expr::val(Option::<Uuid>::None).cast_as(Alias::new("uuid"))
+    };
     SeaQuery::select()
-        .column(Alias::new("site_id"))
-        .column(Alias::new("parameter_id"))
-        .column(Alias::new("time"))
-        .from(Alias::new("moved"))
+        .expr(m("site_id"))
+        .expr(m("time"))
+        .expr(m("parameter_id"))
+        .expr_as(left_site, Alias::new("left_site_id"))
+        .expr_as(changed, Alias::new("changed"))
+        .from_as(Alias::new("moved"), Alias::new("m"))
         .take()
         .with(with_ledger("moved", write, recorded))
 }
@@ -2193,13 +2277,14 @@ pub async fn reprocess_sensor_readings(
     db: &DatabaseConnection,
     sensor_id: Uuid,
     job_id: Option<Uuid>,
+    events: Option<&crate::common::EventSender>,
 ) -> Result<usize, sea_orm::DbErr> {
     // Repair a `valid_until` a bulk load left NULL, so the stored window agrees with the one the
     // resolver serves. `pick_calibration_lateral` is single-valued whether or not windows overlap,
     // so the derivation does not need this; what needs it is the curve editor, which reads
     // `valid_until` and would otherwise show a window open past the point a later curve takes over.
     recompute_valid_until(db, sensor_id).await?;
-    reprocess(db, Scope::Sensor(sensor_id), job_id).await
+    reprocess(db, Scope::Sensor(sensor_id), job_id, events).await
 }
 
 /// Per-(site, parameter) reprocess. See [`Scope::Slot`].
@@ -2208,6 +2293,7 @@ pub async fn reprocess_site_parameter_readings(
     site_id: Uuid,
     parameter_id: Uuid,
     job_id: Option<Uuid>,
+    events: Option<&crate::common::EventSender>,
 ) -> Result<usize, sea_orm::DbErr> {
     reprocess(
         db,
@@ -2216,6 +2302,7 @@ pub async fn reprocess_site_parameter_readings(
             parameter_id,
         },
         job_id,
+        events,
     )
     .await
 }
@@ -2378,27 +2465,33 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
 /// own statement, so a reading that changed site, instrument or corrected value under a re-derived
 /// timeline says so in the one place a value's history is read from. A visited row the step leaves
 /// as it found it records nothing.
+///
+/// Last, the run announces one `DataIngested` per slot whose readings it changed on `events`, the
+/// cache-invalidation contract every writer of stored values keeps (`common/cache.rs`). It goes
+/// after the cascade and the rollup refresh, so a read the announcement prompts sees both.
 pub async fn reprocess(
     db: &DatabaseConnection,
     scope: Scope,
     job_id: Option<Uuid>,
+    events: Option<&crate::common::EventSender>,
 ) -> Result<usize, sea_orm::DbErr> {
     let steps = reprocess_statements(scope, job_id);
 
-    let (readings_updated, moved) = crate::common::bulk_write::guarded(db, async |txn| {
+    let (readings_updated, moved, changed) = crate::common::bulk_write::guarded(db, async |txn| {
         let mut touched: Vec<(Uuid, DateTime<Utc>, Option<Uuid>)> = Vec::new();
+        let mut changed = crate::common::SlotTally::default();
         let mut readings_updated = 0usize;
         for query in [&steps.attribution, &steps.calibration, &steps.spot] {
-            readings_updated += write_and_collect(txn, query, &mut touched).await?;
+            readings_updated += write_and_collect(txn, query, &mut touched, &mut changed).await?;
         }
 
         // The recall's rows are not part of `readings_updated`: it clears an attribution rather
         // than re-deriving one.
-        write_and_collect(txn, &steps.recall, &mut touched).await?;
+        write_and_collect(txn, &steps.recall, &mut touched, &mut changed).await?;
 
         touched.sort_unstable();
         touched.dedup();
-        Ok((readings_updated, touched))
+        Ok((readings_updated, touched, changed))
     })
     .await
     .map_err(app_error_as_db_err)?;
@@ -2436,6 +2529,9 @@ pub async fn reprocess(
             .map_err(app_error_as_db_err)?;
     }
 
+    if let Some(events) = events {
+        changed.announce(events);
+    }
     Ok(readings_updated)
 }
 
@@ -2483,26 +2579,42 @@ async fn cascade_instants(
     Ok(instants.into_iter().collect())
 }
 
-/// Run one of the engine's statements, collecting the attributed instants it wrote. Each is a
-/// [`record_moved`] wrapper returning `site_id` and `time` per row it touched; an unattributed row
-/// returns a NULL site and is not an instant anything derives from.
-/// One reading a recompute moved, and the slot it belongs to.
+/// One reading a recompute visited, the slot it belongs to, and whether its columns moved.
 #[derive(FromQueryResult)]
 struct MovedReading {
     site_id: Option<Uuid>,
-    parameter_id: Option<Uuid>,
     time: chrono::DateTime<chrono::FixedOffset>,
+    parameter_id: Option<Uuid>,
+    left_site_id: Option<Uuid>,
+    changed: bool,
 }
 
+/// Count a visited reading at the slots whose served series it changed: where it is served now,
+/// and where it was served before when it changed site. A row left as it was changes neither.
+fn tally_moved(changed: &mut crate::common::SlotTally, moved: &MovedReading) {
+    if !moved.changed {
+        return;
+    }
+    changed.add(moved.site_id, moved.parameter_id, 1);
+    if moved.left_site_id != moved.site_id {
+        changed.add(moved.left_site_id, moved.parameter_id, 1);
+    }
+}
+
+/// Run one of the engine's statements, collecting the attributed instants it wrote and the slots
+/// it changed. Each is a [`record_moved`] wrapper returning a row per reading it visited; an
+/// unattributed row returns a NULL site and is not an instant anything derives from.
 async fn write_and_collect<C: ConnectionTrait>(
     conn: &C,
     query: &WithQuery,
     touched: &mut Vec<(Uuid, DateTime<Utc>, Option<Uuid>)>,
+    changed: &mut crate::common::SlotTally,
 ) -> Result<usize, sea_orm::DbErr> {
     let rows = conn.query_all_raw(build(query.clone())).await?;
     for row in &rows {
         // `site_id` is nullable on an unpaired reading, which has no slot to touch.
         let moved = MovedReading::from_query_result(row, "")?;
+        tally_moved(changed, &moved);
         if let Some(site_id) = moved.site_id {
             touched.push((site_id, moved.time.with_timezone(&Utc), moved.parameter_id));
         }

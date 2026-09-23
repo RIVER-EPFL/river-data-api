@@ -88,3 +88,73 @@ async fn shutdown_lets_the_claimed_job_finish() {
         "the finished job records what it did"
     );
 }
+
+/// The process's own stop: the HTTP server returns as soon as the signal lands when no request is
+/// in flight, and whatever follows it decides whether the claimed job finishes before exit.
+#[tokio::test]
+#[serial]
+async fn server_stop_waits_for_the_claimed_job() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let started_tx = std::sync::Mutex::new(Some(started_tx));
+    let job = ClosureJob::new("test_retry", move |_ctx| {
+        let announce = started_tx.lock().unwrap().take();
+        async move {
+            if let Some(tx) = announce {
+                let _ = tx.send(());
+            }
+            tokio::time::sleep(WORK).await;
+            Ok(7)
+        }
+    });
+
+    let events = tokio::sync::broadcast::channel(16).0;
+    let registry = Arc::new(registry_of(job));
+    let job_id = jobs::enqueue(&db, "test_retry", None, None, &serde_json::json!({}), None)
+        .await
+        .unwrap()
+        .expect("a fresh enqueue inserts a row");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn({
+        let db = db.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
+        async move {
+            jobs::run_workers(db, events, registry, async move {
+                let _ = shutdown_rx.changed().await;
+            })
+            .await;
+        }
+    });
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut server_shutdown = shutdown_rx.clone();
+    let server = axum::serve(listener, axum::Router::new()).with_graceful_shutdown(async move {
+        let _ = server_shutdown.changed().await;
+    });
+
+    started_rx.await.expect("the job announces itself");
+    let _ = shutdown_tx.send(true);
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        jobs::serve_then_drain_worker(
+            server.into_future(),
+            shutdown_rx,
+            worker,
+            Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("the stop returns once the worker has drained")
+    .expect("the server stops cleanly");
+
+    let (status, readings_updated) = job_row(&db, job_id).await;
+    assert_eq!(
+        status, "completed",
+        "the process does not exit while its claimed job is still writing"
+    );
+    assert_eq!(readings_updated, Some(7));
+}

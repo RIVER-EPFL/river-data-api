@@ -270,12 +270,19 @@ impl Job for ReprocessDeployment {
                 .map(|d| d.parameter_id),
         };
         let count = if let Some(parameter_id) = parameter_id {
-            reprocess_site_parameter_readings(ctx.db(), site_id, parameter_id, Some(ctx.job_id()))
-                .await? as i64
+            reprocess_site_parameter_readings(
+                ctx.db(),
+                site_id,
+                parameter_id,
+                Some(ctx.job_id()),
+                Some(ctx.events()),
+            )
+            .await? as i64
         } else {
             0
         };
-        reprocess_sensor_readings(ctx.db(), sensor_id, Some(ctx.job_id())).await?;
+        reprocess_sensor_readings(ctx.db(), sensor_id, Some(ctx.job_id()), Some(ctx.events()))
+            .await?;
         ctx.set_site(site_id).await;
         ctx.report(
             JobReport::new()
@@ -316,6 +323,7 @@ impl Job for BackfillAttribution {
                 site_id,
                 parameter_id,
                 Some(ctx.job_id()),
+                Some(ctx.events()),
             )
             .await
             .map(|n| n as i64);

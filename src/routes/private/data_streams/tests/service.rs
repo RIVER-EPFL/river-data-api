@@ -367,3 +367,33 @@ mod decimal_places {
         );
     }
 }
+
+/// Expected behaviour: a merge announces every site it moved readings at under both parameters, the
+/// absorbed one whose series empties and the surviving one whose series grows.
+#[test]
+fn test_slot_move_tally_announces_the_source_and_the_target_slot() {
+    let (site_a, site_b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+    let (source, target) = (Uuid::from_u128(10), Uuid::from_u128(20));
+    let announced: Vec<(Option<Uuid>, Option<Uuid>, usize)> =
+        slot_move_tally(&[(site_a, 3), (site_b, 0)], source, target)
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                crate::common::AppEvent::DataIngested {
+                    site_id,
+                    parameter_id,
+                    count,
+                    ..
+                } => Some((site_id, parameter_id, count)),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(
+        announced,
+        vec![
+            (Some(site_a), Some(source), 3),
+            (Some(site_a), Some(target), 3),
+        ],
+        "a site with nothing to move announces nothing"
+    );
+}

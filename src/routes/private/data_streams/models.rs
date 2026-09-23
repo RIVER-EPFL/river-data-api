@@ -476,6 +476,9 @@ pub struct SlotMove {
     pub touched: TouchedRange,
     /// Visits whose inputs moved, for the post-commit calculation hook.
     pub touched_events: Vec<crate::routes::private::collection_events::flows::TouchedEvent>,
+    /// The readings moved per site, at the absorbed and the surviving parameter, for the caller's
+    /// post-commit announcement.
+    pub changed: crate::common::SlotTally,
 }
 
 /// One committed windowed ingest pass.

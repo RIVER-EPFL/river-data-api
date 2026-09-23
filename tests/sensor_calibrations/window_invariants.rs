@@ -614,6 +614,7 @@ async fn slot_reprocess_clears_a_reading_in_a_curve_gap() {
         SITE1_ID.parse().unwrap(),
         GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
         None,
+        None,
     )
     .await
     .expect("slot reprocess");
@@ -690,6 +691,7 @@ async fn slot_reprocess_leaves_a_reading_before_the_first_curve_uncorrected() {
         SITE1_ID.parse().unwrap(),
         GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
         None,
+        None,
     )
     .await
     .expect("slot reprocess");
@@ -762,6 +764,7 @@ async fn slot_reprocess_prefers_a_parameter_curve_over_an_open_wildcard() {
         &db,
         SITE1_ID.parse().unwrap(),
         GLOBAL_PARAM_TEMP_ID.parse().unwrap(),
+        None,
         None,
     )
     .await

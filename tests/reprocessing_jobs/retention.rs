@@ -54,8 +54,12 @@ async fn retention_prunes_by_category_tier_and_cascades_logs() {
     .await
     .unwrap();
 
-    let deleted = prune_tracked_jobs(&db, 14, 180, 0).await;
-    assert_eq!(deleted, 2, "one old maintenance + one ancient operator row");
+    let pruned = prune_tracked_jobs(&db, 14, 180, 0).await;
+    assert!(pruned.failed.is_empty());
+    assert_eq!(
+        pruned.deleted, 2,
+        "one old maintenance + one ancient operator row"
+    );
 
     assert!(!exists(&db, old_maint).await);
     assert!(exists(&db, recent_maint).await);
@@ -86,8 +90,9 @@ async fn retention_count_cap_trims_maintenance_overflow() {
         insert_backdated(&db, "maintenance", &format!("{i} minutes")).await;
     }
 
-    let deleted = prune_tracked_jobs(&db, 0, 0, 2).await;
-    assert_eq!(deleted, 3);
+    let pruned = prune_tracked_jobs(&db, 0, 0, 2).await;
+    assert!(pruned.failed.is_empty());
+    assert_eq!(pruned.deleted, 3);
 
     let remaining = db
         .query_one_raw(Statement::from_string(

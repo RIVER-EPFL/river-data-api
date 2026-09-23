@@ -556,3 +556,182 @@ async fn a_recomposed_value_records_the_move_against_the_run_that_made_it() {
         .unwrap();
     assert_eq!(count, 1);
 }
+
+/// Scenario: the sweep recomposes a continuous sensor's corrected value that a stream-arm
+/// calculation reads at the same instant, and no visit owns that reading.
+///
+/// Expected behaviour: the janitor hands the moved slot to a windowed `derived_recompute` under
+/// its own run, and the derived value follows the recomposed input rather than keeping the old one
+/// (Q108: nothing is left stale).
+#[tokio::test]
+#[serial]
+async fn the_janitor_recomputes_a_stream_calculation_whose_continuous_input_it_recomposed() {
+    use river_db::routes::private::reprocessing_jobs::service as jobs;
+
+    let (db, app, token) = setup().await;
+    let site = SITE1_ID.parse::<Uuid>().unwrap();
+    let time = dt("2025-06-15T12:00:00Z");
+
+    let code = format!("drift_do_{}", Uuid::new_v4().simple());
+    let calculation = crate::common::seed_formula_calculation(&db, &format!("{code}_set")).await;
+    let (status, definition) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/derived_parameters",
+        &serde_json::json!({
+            "code": code,
+            "name": "Drift DO mg/L",
+            "units": "mg/L",
+            "formula": "Dissolved_O2 * 0.032",
+            "tool_script_id": calculation,
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create derived: {definition}");
+    let output: Uuid = definition["output_parameter_id"]
+        .as_str()
+        .expect("the output parameter is created with the formula")
+        .parse()
+        .unwrap();
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/site_parameters",
+        &serde_json::json!({
+            "site_id": SITE1_ID,
+            "parameter_id": output,
+            "name": code,
+            "sensor_type": "derived",
+            "entry_mode": "tool",
+        }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "assign the output: {body}");
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/readings/batch",
+        &serde_json::json!({ "readings": [{
+            "site_id": SITE1_ID,
+            "parameter_id": GLOBAL_PARAM_DO_ID,
+            "time": time.to_rfc3339(),
+            "raw_value": 10.0,
+        }]}),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "continuous source: {body}");
+
+    let sensor = create_sensor(&db, "Drift-logger-01", GLOBAL_PARAM_DO_ID).await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE readings SET calibration_id = '{}', calibrated_value = 10.0 \
+             WHERE site_id = '{SITE1_ID}' AND parameter_id = '{GLOBAL_PARAM_DO_ID}' \
+               AND time = '{}'",
+            sensor.base_calibration_id,
+            time.to_rfc3339()
+        ),
+    )
+    .await;
+    settle(&db).await;
+    river_db::routes::private::sensor_calibrations::service::recalculate_derived_at_timestamp(
+        &db, site, time,
+    )
+    .await
+    .expect("the derived value is computed from the corrected input");
+    assert_eq!(
+        derived_at(&db, output, time).await,
+        Some(0.32),
+        "10 * 0.032"
+    );
+
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE sensor_calibrations SET slope = 5.0 WHERE id = '{}'",
+            sensor.base_calibration_id
+        ),
+    )
+    .await;
+
+    let mut registry = jobs::build_registry();
+    jobs::register_scheduled_services(&mut registry, &crate::common::cached_test_config());
+    let ev: river_db::common::EventSender = tokio::sync::broadcast::channel(64).0;
+    let janitor = jobs::enqueue(
+        &db,
+        "janitor_service",
+        None,
+        None,
+        &serde_json::json!({}),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("enqueue inserts a row");
+    jobs::drain(&db, &ev, &registry, &jobs::worker_id())
+        .await
+        .unwrap();
+    settle(&db).await;
+
+    let children = crate::common::e2e::count(
+        &db,
+        &format!(
+            "SELECT count(*) AS c FROM reprocessing_jobs \
+             WHERE parent_job_id = '{janitor}' AND trigger_type = 'derived_recompute' \
+               AND status = 'completed'"
+        ),
+    )
+    .await;
+    assert_eq!(children, 1, "one recompute for the one drifted slot");
+    assert_eq!(
+        derived_at(&db, output, time).await,
+        Some(1.6),
+        "5 * 10 * 0.032: the derived value follows the recomposed input"
+    );
+}
+
+/// Wait until no job is queued or running, so a background worker's run cannot land after the
+/// assertion it would otherwise race.
+async fn settle(db: &DatabaseConnection) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let busy = crate::common::e2e::count(
+            db,
+            "SELECT count(*) AS c FROM reprocessing_jobs WHERE status IN ('queued', 'running')",
+        )
+        .await;
+        if busy == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "jobs still in flight after 60s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// The stored derived value at an instant, rounded to the precision the assertions compare at.
+async fn derived_at(
+    db: &DatabaseConnection,
+    parameter_id: Uuid,
+    time: chrono::DateTime<chrono::Utc>,
+) -> Option<f64> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COALESCE(calibrated_value, raw_value) AS value FROM readings \
+             WHERE site_id = $1 AND parameter_id = $2 AND time = $3",
+            [
+                SITE1_ID.parse::<Uuid>().unwrap().into(),
+                parameter_id.into(),
+                time.into(),
+            ],
+        ))
+        .await
+        .unwrap()?;
+    row.try_get::<Option<f64>>("", "value")
+        .unwrap()
+        .map(|v| (v * 1e9).round() / 1e9)
+}
