@@ -301,6 +301,100 @@ async fn apply_attaches_collection_events_for_spot_readings() {
     crate::common::cleanup_test_db(&db).await;
 }
 
+/// A draft vaisala plan pairing one fresh stream to Site 1 / Temperature, reviewed and ready to
+/// apply.
+async fn reviewed_single_stream_plan(
+    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    token: &str,
+    source_key: &str,
+) -> (Uuid, Uuid) {
+    let stream_id = Uuid::new_v4();
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
+             VALUES ('{stream_id}', 'vaisala', '{source_key}', '{source_key}', true)"
+        ),
+    )
+    .await;
+    let entries = serde_json::json!([{
+        "stream_id": stream_id,
+        "source_key": source_key,
+        "source_name": source_key,
+        "action": "pair",
+        "project": { "id": crate::common::PROJECT_ID, "name": "Test Project", "create": false },
+        "site": { "id": crate::common::SITE1_ID, "name": "Site 1", "create": false, "latitude": null, "longitude": null, "altitude_m": null },
+        "parameter": { "id": crate::common::GLOBAL_PARAM_TEMP_ID, "name": "Temperature", "create": false, "units": "C", "group_key": null, "original_names": [] },
+        "confidence": "exact",
+        "warnings": [],
+        "original_parameter_name": null
+    }]);
+    let plan_id = Uuid::new_v4();
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO pairing_plans (id, source_system, status, summary, entries) \
+             VALUES ('{plan_id}', 'vaisala', 'draft', '{{}}'::jsonb, '{}'::jsonb)",
+            entries.to_string().replace('\'', "''")
+        ),
+    )
+    .await;
+    crate::common::plans::acknowledge_plan(app, token, &plan_id.to_string()).await;
+    (plan_id, stream_id)
+}
+
+/// Apply a reviewed plan through the route and wait for the apply and the attribution it queued.
+async fn apply_and_settle(
+    db: &sea_orm::DatabaseConnection,
+    app: &axum::Router,
+    token: &str,
+    plan_id: Uuid,
+) {
+    let (status, text) =
+        crate::common::post_plan_action_with_token(app, &plan_id.to_string(), "apply", token).await;
+    assert!((200..300).contains(&status), "apply ({status}): {text}");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(db, &job_id_of(&text)).await,
+        "completed"
+    );
+    assert_eq!(
+        crate::common::jobs::wait_for_triggered_job(db, "plan_attribution", None).await,
+        "completed"
+    );
+}
+
+async fn attribution_jobs(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> i64 {
+    count(
+        db,
+        &format!(
+            "reprocessing_jobs WHERE trigger_type = 'plan_attribution' \
+             AND params->>'plan_id' = '{plan_id}'"
+        ),
+    )
+    .await
+}
+
+async fn replay_apply(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> Uuid {
+    let replay = river_db::routes::private::reprocessing_jobs::service::enqueue(
+        db,
+        "plan_apply",
+        None,
+        None,
+        &serde_json::json!({ "plan_id": plan_id }),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("the replay is enqueued");
+    assert_eq!(
+        crate::common::jobs::wait_for_job(db, &replay.to_string()).await,
+        "completed",
+        "a run over an applied plan is a replay, not a failure"
+    );
+    replay
+}
+
 /// Scenario: a `plan_apply` run commits, loses its lease, and the reaper hands the row to another
 /// worker.
 ///
@@ -315,65 +409,10 @@ async fn a_replayed_apply_reports_a_replay_instead_of_failing() {
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let app = crate::common::build_test_app(db.clone());
 
-    let stream_id = Uuid::new_v4();
-    crate::common::exec(
-        &db,
-        &format!(
-            "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
-             VALUES ('{stream_id}', 'vaisala', 'loc-replay-1', 'Loc Replay 1', true)"
-        ),
-    )
-    .await;
-    let entries = serde_json::json!([{
-        "stream_id": stream_id,
-        "source_key": "loc-replay-1",
-        "source_name": "Loc Replay 1",
-        "action": "pair",
-        "project": { "id": crate::common::PROJECT_ID, "name": "Test Project", "create": false },
-        "site": { "id": crate::common::SITE1_ID, "name": "Site 1", "create": false, "latitude": null, "longitude": null, "altitude_m": null },
-        "parameter": { "id": crate::common::GLOBAL_PARAM_TEMP_ID, "name": "Temperature", "create": false, "units": "C", "group_key": null, "original_names": [] },
-        "confidence": "exact",
-        "warnings": [],
-        "original_parameter_name": null
-    }]);
-    let plan_id = Uuid::new_v4();
-    crate::common::exec(
-        &db,
-        &format!(
-            "INSERT INTO pairing_plans (id, source_system, status, summary, entries) \
-             VALUES ('{plan_id}', 'vaisala', 'draft', '{{}}'::jsonb, '{}'::jsonb)",
-            entries.to_string().replace('\'', "''")
-        ),
-    )
-    .await;
+    let (plan_id, _) = reviewed_single_stream_plan(&db, &app, &token, "loc-replay-1").await;
+    apply_and_settle(&db, &app, &token, plan_id).await;
 
-    crate::common::plans::acknowledge_plan(&app, &token, &plan_id.to_string()).await;
-    let (status, text) =
-        crate::common::post_plan_action_with_token(&app, &plan_id.to_string(), "apply", &token)
-            .await;
-    assert!((200..300).contains(&status), "apply ({status}): {text}");
-    assert_eq!(
-        crate::common::jobs::wait_for_job(&db, &job_id_of(&text)).await,
-        "completed"
-    );
-
-    let replay = river_db::routes::private::reprocessing_jobs::service::enqueue(
-        &db,
-        "plan_apply",
-        None,
-        None,
-        &serde_json::json!({ "plan_id": plan_id }),
-        None,
-    )
-    .await
-    .unwrap()
-    .expect("the replay is enqueued");
-
-    assert_eq!(
-        crate::common::jobs::wait_for_job(&db, &replay.to_string()).await,
-        "completed",
-        "a run over an applied plan is a replay, not a failure"
-    );
+    let replay = replay_apply(&db, plan_id).await;
     let counts = db
         .query_one_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -388,6 +427,98 @@ async fn a_replayed_apply_reports_a_replay_instead_of_failing() {
         counts,
         serde_json::json!({}),
         "the replay claims none of the first run's work"
+    );
+    assert_eq!(
+        attribution_jobs(&db, plan_id).await,
+        1,
+        "the first run's attribution stands, so the replay queues no second one"
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// Scenario: the attribution a plan apply hands on cannot be queued.
+///
+/// Expected behaviour: the apply is not committed without it: the plan stays a draft and its
+/// stream unpaired, so a retry applies it whole rather than finding it applied and stopping.
+#[tokio::test]
+#[serial]
+async fn an_apply_whose_attribution_cannot_be_queued_commits_nothing() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let (plan_id, stream_id) =
+        reviewed_single_stream_plan(&db, &app, &token, "loc-lost-attribution").await;
+    crate::common::jobs::refuse_enqueue(&db, "plan_attribution").await;
+    let applied = river_db::routes::private::sync::service::apply_plan(&db, plan_id, None).await;
+    crate::common::jobs::restore_enqueue(&db).await;
+
+    assert!(applied.is_err(), "the apply reports the refused enqueue");
+    assert_eq!(
+        count(
+            &db,
+            &format!("pairing_plans WHERE id = '{plan_id}' AND status = 'draft'")
+        )
+        .await,
+        1,
+        "the plan is still a draft"
+    );
+    assert_eq!(
+        scalar_opt_uuid(
+            &db,
+            &format!("SELECT site_parameter_id AS v FROM data_streams WHERE id = '{stream_id}'")
+        )
+        .await,
+        None,
+        "the stream is still unpaired"
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
+/// Scenario: a plan was applied and its attribution job is gone (lost before this fix, or pruned),
+/// and the `plan_apply` row runs again.
+///
+/// Expected behaviour: the replay queues the attribution under itself, so the paired readings are
+/// re-derived by window rather than keeping the pairing's frozen context.
+#[tokio::test]
+#[serial]
+async fn a_replayed_apply_queues_the_attribution_its_plan_lacks() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let (plan_id, _) = reviewed_single_stream_plan(&db, &app, &token, "loc-replay-2").await;
+    apply_and_settle(&db, &app, &token, plan_id).await;
+    crate::common::exec(
+        &db,
+        "DELETE FROM reprocessing_jobs WHERE trigger_type = 'plan_attribution'",
+    )
+    .await;
+
+    let replay = replay_apply(&db, plan_id).await;
+    assert_eq!(
+        attribution_jobs(&db, plan_id).await,
+        1,
+        "the replay queues the attribution the plan lacked"
+    );
+    assert_eq!(
+        scalar_opt_uuid(
+            &db,
+            "SELECT parent_job_id AS v FROM reprocessing_jobs WHERE trigger_type = 'plan_attribution'"
+        )
+        .await,
+        Some(replay),
+        "the attribution is the replay's child"
+    );
+    assert_eq!(
+        crate::common::jobs::wait_for_triggered_job(&db, "plan_attribution", None).await,
+        "completed"
     );
 
     crate::common::cleanup_test_db(&db).await;

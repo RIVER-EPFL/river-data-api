@@ -275,7 +275,7 @@ fn unattributing_a_derived_row_clears_the_site_and_nothing_else() {
     );
 }
 
-/// The engine's four writes, each read without a database: what it selects, what it writes, and
+/// The engine's five writes, each read without a database: what it selects, what it writes, and
 /// the ledger row it records. The order is the contract (attribution before the curve pick), and
 /// each write's ledger insert reads the CTE that write returned.
 #[test]
@@ -293,6 +293,7 @@ fn every_reprocess_step_records_what_it_moved() {
             ("calibration", &steps.calibration),
             ("spot", &steps.spot),
             ("recall", &steps.recall),
+            ("release", &steps.release),
         ] {
             let sql = rendered(query.clone());
             assert!(
@@ -360,6 +361,35 @@ fn a_reprocess_or_recompose_row_supersedes_nothing() {
     }
 }
 
+/// A reading whose deployment reference names another instrument, or a window that does not hold
+/// its instant, loses the reference and nothing else.
+#[test]
+fn the_release_clears_only_a_deployment_reference_no_window_backs() {
+    for scope in [
+        Scope::Sensor(Uuid::nil()),
+        Scope::Slot {
+            site_id: Uuid::nil(),
+            parameter_id: Uuid::nil(),
+        },
+    ] {
+        let sql = rendered(reprocess_statements(scope, None).release);
+        assert!(
+            sql.contains(r#"SET "deployment_id" = $"#) && !sql.contains(r#""site_id" = $"#),
+            "only the reference is written: {sql}"
+        );
+        for backing in [
+            r#""d"."id" = "r"."deployment_id""#,
+            r#""d"."sensor_id" = "r"."sensor_id""#,
+            r#""d"."parameter_id" = "r"."parameter_id""#,
+            r#""r"."time" >= "d"."deployed_from""#,
+            r#""r"."time" < "d"."deployed_until""#,
+            r#"NOT EXISTS"#,
+        ] {
+            assert!(sql.contains(backing), "the backing checks {backing}: {sql}");
+        }
+    }
+}
+
 /// A multi-parameter instrument holds one calibration timeline per parameter, so one parameter's
 /// next curve must never truncate another's window, and two curves sharing an instant must still
 /// chain to one answer.
@@ -391,7 +421,7 @@ fn a_chain_written_bound_is_derived_and_an_operator_written_one_is_only_shortene
     let calibration = rendered(calibration_chain_statement(Uuid::nil()));
     assert!(
         calibration.contains(
-            "CASE WHEN sc.valid_until_explicit THEN LEAST(sc.valid_until, ordered.next_from)"
+            r#"CASE WHEN ("sc"."valid_until_explicit") THEN LEAST("sc"."valid_until", "ordered"."next_from")"#
         ),
         "an explicit bound survives unless the next curve is earlier: {calibration}"
     );
@@ -404,6 +434,24 @@ fn a_chain_written_bound_is_derived_and_an_operator_written_one_is_only_shortene
         deployment
             .contains("COALESCE(d.deployed_until, 'infinity'::timestamptz) <> ordered.new_until"),
         "and the write is held to the rows the chain moves: {deployment}"
+    );
+}
+
+/// The chain runs inside a retirement's transaction as well as on its own in every reprocess, and
+/// two chains rewriting the same rows lock them in opposite orders. Holding the write to the rows
+/// whose bound moves keeps a chain with nothing to change from locking anything.
+#[test]
+fn the_calibration_chain_writes_only_the_bounds_it_moves() {
+    let sql = rendered(calibration_chain_statement(Uuid::nil()));
+    assert!(
+        sql.contains(
+            r#""sc"."valid_until" <> (CASE WHEN ("sc"."valid_until_explicit") THEN LEAST("sc"."valid_until", "ordered"."next_from") ELSE "ordered"."next_from" END)"#
+        ),
+        "the write is held to the rows the chain moves: {sql}"
+    );
+    assert!(
+        sql.contains(r#"("sc"."valid_until" IS NULL) <> ((CASE"#),
+        "including a move to or from an open end: {sql}"
     );
 }
 
@@ -954,5 +1002,53 @@ fn test_drift_slot_recompute_params_name_the_slot_and_its_span() {
             "start": "2025-06-15T10:00:00+00:00",
             "end": "2025-06-15T12:00:00+00:00",
         })
+    );
+}
+
+/// Scenario: an update to a curve names its parameter, its start, both, or neither.
+///
+/// Expected behaviour: any update that moves the channel or the start is checked for a collision at
+/// the place the curve lands, the patched value winning over the stored one; an update moving
+/// neither (coefficients, a label, an end date) has nothing to collide with.
+#[test]
+fn test_patched_opening_checks_where_the_curve_lands() {
+    let stored_parameter = Some(Uuid::from_u128(1));
+    let other_parameter = Some(Uuid::from_u128(2));
+    let stored_from = chrono::DateTime::parse_from_rfc3339("2025-05-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let moved_from = chrono::DateTime::parse_from_rfc3339("2025-06-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    assert_eq!(
+        patched_opening(stored_parameter, stored_from, None, None),
+        None,
+        "neither moved"
+    );
+    assert_eq!(
+        patched_opening(stored_parameter, stored_from, Some(other_parameter), None),
+        Some((other_parameter, stored_from)),
+        "a channel move is checked at the stored start"
+    );
+    assert_eq!(
+        patched_opening(stored_parameter, stored_from, Some(None), None),
+        Some((None, stored_from)),
+        "clearing the parameter lands the curve on every channel"
+    );
+    assert_eq!(
+        patched_opening(stored_parameter, stored_from, None, Some(Some(moved_from))),
+        Some((stored_parameter, moved_from)),
+        "a start move is checked on the stored channel"
+    );
+    assert_eq!(
+        patched_opening(
+            stored_parameter,
+            stored_from,
+            Some(other_parameter),
+            Some(Some(moved_from))
+        ),
+        Some((other_parameter, moved_from)),
+        "both moved"
     );
 }

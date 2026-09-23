@@ -143,3 +143,30 @@ pub async fn wait_for_triggered_job(
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
+
+/// Make every enqueue of a `trigger_type` job fail, which is what a dropped connection on the
+/// enqueue looks like to the route making it. [`restore_enqueue`] undoes it.
+pub async fn refuse_enqueue(db: &sea_orm::DatabaseConnection, trigger_type: &str) {
+    restore_enqueue(db).await;
+    for sql in [
+        format!(
+            "CREATE FUNCTION test_refuse_enqueue() RETURNS trigger AS $$ BEGIN \
+             IF NEW.trigger_type = '{trigger_type}' THEN RAISE EXCEPTION 'enqueue refused'; END IF; \
+             RETURN NEW; END; $$ LANGUAGE plpgsql"
+        ),
+        "CREATE TRIGGER test_refuse_enqueue BEFORE INSERT ON reprocessing_jobs \
+         FOR EACH ROW EXECUTE FUNCTION test_refuse_enqueue()"
+            .to_string(),
+    ] {
+        crate::common::exec(db, &sql).await;
+    }
+}
+
+pub async fn restore_enqueue(db: &sea_orm::DatabaseConnection) {
+    for sql in [
+        "DROP TRIGGER IF EXISTS test_refuse_enqueue ON reprocessing_jobs",
+        "DROP FUNCTION IF EXISTS test_refuse_enqueue()",
+    ] {
+        crate::common::exec(db, sql).await;
+    }
+}

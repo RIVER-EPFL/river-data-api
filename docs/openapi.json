@@ -20891,6 +20891,7 @@
         "type": "object"
       },
       "SensorCalibrationCreate": {
+        "additionalProperties": false,
         "properties": {
           "intercept": {
             "format": "double",
@@ -21021,6 +21022,7 @@
             ]
           },
           "sensor_id": {
+            "description": "The instrument the curve was fitted on, fixed once created.",
             "format": "uuid",
             "type": "string"
           },
@@ -21137,6 +21139,7 @@
             ]
           },
           "sensor_id": {
+            "description": "The instrument the curve was fitted on, fixed once created.",
             "format": "uuid",
             "type": "string"
           },
@@ -21182,6 +21185,7 @@
         "type": "object"
       },
       "SensorCalibrationUpdate": {
+        "additionalProperties": false,
         "properties": {
           "intercept": {
             "format": "double",
@@ -21219,13 +21223,6 @@
             "format": "double",
             "type": [
               "number",
-              "null"
-            ]
-          },
-          "sensor_id": {
-            "format": "uuid",
-            "type": [
-              "string",
               "null"
             ]
           },

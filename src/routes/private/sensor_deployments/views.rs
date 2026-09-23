@@ -213,19 +213,17 @@ pub async fn rollback_deployment(
                 }
             })?;
     }
-    txn.commit()
-        .await
-        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
-    // 5. Re-chain the remaining timeline and re-derive every reading for the sensor by window. The
-    //    rolled-back deployment's readings now fall in the reopened previous deployment's window (or
-    //    in a gap → no site, if there was no previous). Re-chaining only ever shortens, so it can't
-    //    violate the slot-exclusion constraint. Reprocess also refreshes the continuous aggregates.
-    recompute_deployed_until(db, sensor_id)
+    // 5. Re-chain the remaining timeline and queue the re-derivation of every reading for the sensor
+    //    by window, in the rollback's own transaction. The rolled-back deployment's readings now fall
+    //    in the reopened previous deployment's window (or in a gap → no site, if there was no
+    //    previous). Re-chaining only ever shortens, so it can't violate the slot-exclusion
+    //    constraint. Reprocess also refreshes the continuous aggregates.
+    recompute_deployed_until(&txn, sensor_id)
         .await
         .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
     let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
-        db,
+        &txn,
         "manual_reprocess",
         Some(sensor_id),
         None,
@@ -235,6 +233,9 @@ pub async fn rollback_deployment(
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
     .ok_or_else(|| AppError::Internal("failed to enqueue the rollback reprocess".to_string()))?;
+    txn.commit()
+        .await
+        .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
 
     tracing::info!(
         deployment_id = %payload.deployment_id,
@@ -519,12 +520,31 @@ pub async fn backfill_attribution(
         ));
     }
 
-    // Backdate each selected deployment to its target_from (>= prior end, so no slot overlap), then
-    // re-chain that sensor's deployed_until. Collect the distinct slots + sensors touched.
     let estimated_readings: i64 = selected.iter().map(|c| c.claimable_count).sum();
+    let deployments_updated = selected.len();
+    let job_id = crate::common::bulk_write::guarded(db, async |txn| {
+        backdate_and_enqueue(txn, &selected).await
+    })
+    .await?;
+
+    Ok(Json(BackfillAttributionResponse {
+        job_id,
+        status: "queued".to_string(),
+        deployments_updated,
+        estimated_readings,
+    }))
+}
+
+/// Backdate each selected deployment to its `target_from` (>= prior end, so no slot overlap),
+/// re-chain each touched sensor's `deployed_until`, and queue the window reprocess of every touched
+/// slot. Returns the queued job.
+async fn backdate_and_enqueue<C: sea_orm::ConnectionTrait>(
+    txn: &C,
+    selected: &[BackfillCandidate],
+) -> AppResult<Uuid> {
     let mut slots: HashSet<(Uuid, Uuid)> = HashSet::new();
     let mut sensors: HashSet<Uuid> = HashSet::new();
-    for c in &selected {
+    for c in selected {
         // Idempotent backdate: only move `deployed_from` earlier. After the first apply the row sits
         // at `target_from`, so a client retry replayed against another replica matches no rows
         // (`deployed_from > target_from` is false) and can't double-apply or re-widen the window.
@@ -535,22 +555,21 @@ pub async fn backfill_attribution(
             )
             .filter(deployments::Column::Id.eq(c.deployment_id))
             .filter(deployments::Column::DeployedFrom.gt(c.target_from))
-            .exec(db)
+            .exec(txn)
             .await
             .map_err(|e| AppError::Internal(format!("DB error: {e}")))?;
         slots.insert((c.site_id, c.parameter_id));
         sensors.insert(c.sensor_id);
     }
     for sensor_id in &sensors {
-        recompute_deployed_until(db, *sensor_id)
+        recompute_deployed_until(txn, *sensor_id)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
     }
 
-    let deployments_updated = selected.len();
     let slots_param: Vec<[Uuid; 2]> = slots.into_iter().map(|(s, p)| [s, p]).collect();
-    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
-        db,
+    crate::routes::private::reprocessing_jobs::service::enqueue(
+        txn,
         "backfill_attribution",
         None,
         None,
@@ -559,14 +578,7 @@ pub async fn backfill_attribution(
     )
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
-    .ok_or_else(|| AppError::Internal("failed to enqueue backfill_attribution job".to_string()))?;
-
-    Ok(Json(BackfillAttributionResponse {
-        job_id,
-        status: "queued".to_string(),
-        deployments_updated,
-        estimated_readings,
-    }))
+    .ok_or_else(|| AppError::Internal("failed to enqueue backfill_attribution job".to_string()))
 }
 
 /// The row shapes the raw operator-action queries return, so each mapping is checked against the

@@ -79,3 +79,20 @@ fn a_reprocess_prefers_the_open_deployment_then_the_most_recent() {
     assert!(sql.contains("\"sensor_id\" = "), "{sql}");
     assert!(sql.contains("\"site_id\" = "), "{sql}");
 }
+
+/// A deployment that began after the recall instant is not closed at it, or its window inverts.
+#[test]
+fn a_recall_closes_only_what_had_begun_by_its_instant() {
+    let at = DateTime::from_timestamp(1_767_225_600, 0).expect("2026-01-01");
+    let sql = super::super::models::Entity::find()
+        .filter(open_at(Uuid::from_u128(1), Uuid::from_u128(2), at))
+        .build(sea_orm::DatabaseBackend::Postgres)
+        .to_string();
+    assert!(sql.contains("\"deployed_until\" IS NULL"), "{sql}");
+    assert!(
+        sql.contains("\"deployed_from\" <= '2026-01-01 00:00:00"),
+        "{sql}"
+    );
+    assert!(sql.contains("\"sensor_id\" = "), "{sql}");
+    assert!(sql.contains("\"parameter_id\" = "), "{sql}");
+}

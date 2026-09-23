@@ -268,18 +268,9 @@ pub async fn adopt_sensor(
     )
     .await?;
 
-    // Auto-recall this sensor's currently-open deployment FOR THIS PARAMETER at the new start (twin of
-    // the sensor_deployments before_create hook). Scoped to the parameter so adopting one channel of a
-    // multi-channel instrument doesn't recall its other channels.
-    deployments::Entity::update_many()
-        .col_expr(
-            deployments::Column::DeployedUntil,
-            Expr::value(Some(deployed_from)),
-        )
-        .filter(deployments::Column::SensorId.eq(sensor_id))
-        .filter(deployments::Column::ParameterId.eq(parameter_id))
-        .filter(deployments::Column::DeployedUntil.is_null())
-        .exec(&txn)
+    // The recall the deployment create runs: this channel only, and only what had begun by the new
+    // start, so a backdated adopt leaves a later deployment standing.
+    deployments::flows::recall_open_deployments(&txn, sensor_id, parameter_id, deployed_from, None)
         .await?;
 
     // Insert the deployment, authoring parameter_id (nothing derives it from the sensor);
@@ -319,23 +310,22 @@ pub async fn adopt_sensor(
     }
     // Re-chain the timeline and backfill parameter_id (reprocess sets site_id/deployment_id but not
     // parameter_id, aggregates group by parameter) inside the same transaction as the deployment
-    // insert, so a failure can't leave a half-applied adopt. The reprocess itself is a post-commit
-    // tracked job (heavy, async, retryable).
+    // insert, so a failure can't leave a half-applied adopt.
     recompute_deployed_until(&txn, sensor_id).await?;
     claim_unparameterised(&txn, sensor_id, parameter_id).await?;
-    txn.commit().await?;
 
     // Slot-scoped reprocess re-attributes the (site, parameter) by deployment window, so a backdated
     // deployed_from stamps the sensor onto previously unattributed (sensor_id NULL) history. The
-    // per-sensor pass then reconciles the sensor's own rows at any vacated slot.
-    let adopt_site_id = payload.site_id;
+    // per-sensor pass then reconciles the sensor's own rows at any vacated slot. Queued on the
+    // adopt's transaction: nothing else re-derives attribution, so a deployment without its job
+    // would leave that history unattributed.
     let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
-        db,
+        &txn,
         "manual_adopt",
         Some(sensor_id),
         Some(dep_id),
         &serde_json::json!({
-            "site_id": adopt_site_id,
+            "site_id": payload.site_id,
             "parameter_id": parameter_id,
             "sensor_id": sensor_id,
         }),
@@ -344,6 +334,7 @@ pub async fn adopt_sensor(
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
     .ok_or_else(|| AppError::Internal("failed to enqueue adopt job".to_string()))?;
+    txn.commit().await?;
 
     Ok(Json(AdoptResponse {
         deployment_id: dep_id,
@@ -493,24 +484,28 @@ pub async fn swap_sensors(
     .await?;
 
     // Recall the INCOMING sensor's open deployment for THIS PARAMETER at the swap instant, so it can't
-    // end up double-open for the channel (twin of the outgoing recall + the adopt before_create hook).
-    // Scoped to the parameter so swapping one channel doesn't recall the instrument's other channels.
-    deployments::Entity::update_many()
-        .col_expr(deployments::Column::DeployedUntil, Expr::value(Some(at)))
-        .filter(deployments::Column::SensorId.eq(payload.incoming_sensor_id))
-        .filter(deployments::Column::ParameterId.eq(parameter_id))
-        .filter(deployments::Column::DeployedUntil.is_null())
-        .exec(&txn)
-        .await?;
+    // end up double-open for the channel. Scoped to the parameter so swapping one channel doesn't
+    // recall the instrument's other channels.
+    deployments::flows::recall_open_deployments(
+        &txn,
+        payload.incoming_sensor_id,
+        parameter_id,
+        at,
+        None,
+    )
+    .await?;
 
     // End the outgoing sensor's open deployment at THIS (site, parameter) slot only, a multi-channel
-    // outgoing instrument keeps its other channels running.
+    // outgoing instrument keeps its other channels running. A row that began after the swap instant is
+    // not ended before its start; it still holds the slot, and the insert below refuses as a conflict.
     // No row is no deployment to end, which is the open case the swap allows.
     let ended_deployment_id: Option<Uuid> = deployments::Entity::find()
-        .filter(deployments::Column::SensorId.eq(payload.outgoing_sensor_id))
+        .filter(deployments::flows::open_at(
+            payload.outgoing_sensor_id,
+            parameter_id,
+            at,
+        ))
         .filter(deployments::Column::SiteId.eq(payload.site_id))
-        .filter(deployments::Column::ParameterId.eq(parameter_id))
-        .filter(deployments::Column::DeployedUntil.is_null())
         .select_only()
         .column(deployments::Column::Id)
         .into_tuple::<Uuid>()
@@ -549,8 +544,8 @@ pub async fn swap_sensors(
     }
     // Re-chain both sensors' timelines, relink the feed to the incoming sensor (so FUTURE ingest
     // stamps B, the stream's frozen sensor_id is only a hint; the deployment timeline is
-    // authoritative), and backfill parameter_id, all inside the swap transaction so a failure can't
-    // leave a half-applied swap. The handover reprocess is a post-commit tracked job.
+    // authoritative), backfill parameter_id and queue the handover reprocess, all inside the swap
+    // transaction so a failure can't leave a half-applied swap.
     recompute_deployed_until(&txn, payload.outgoing_sensor_id).await?;
     recompute_deployed_until(&txn, payload.incoming_sensor_id).await?;
     data_streams::models::Entity::update_many()
@@ -566,23 +561,22 @@ pub async fn swap_sensors(
         .exec(&txn)
         .await?;
     claim_unparameterised(&txn, payload.incoming_sensor_id, parameter_id).await?;
-    txn.commit().await?;
 
     // Per-(site,parameter) handover reprocess: re-owns existing readings to whichever sensor's
     // deployment window covers each time, so the outgoing sensor's post-swap readings re-attribute
     // to the incoming sensor (a per-sensor reprocess can't, since those rows still carry sensor A).
-    let site_id = payload.site_id;
     let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
-        db,
+        &txn,
         "sensor_swap",
         None,
         Some(site_parameter_id),
-        &serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
+        &serde_json::json!({ "site_id": payload.site_id, "parameter_id": parameter_id }),
         None,
     )
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?
     .ok_or_else(|| AppError::Internal("failed to enqueue swap job".to_string()))?;
+    txn.commit().await?;
 
     Ok(Json(SwapResponse {
         ended_deployment_id,

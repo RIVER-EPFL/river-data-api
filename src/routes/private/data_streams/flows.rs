@@ -8,7 +8,7 @@
 //!
 //! No curve is stamped and no value computed. The instrument's newest calibration is not in
 //! general the one covering a given reading's time, so which curve corrects a reading is left to
-//! the slot reprocess every caller enqueues post-commit.
+//! the slot reprocess every caller enqueues on the pairing's own transaction.
 
 use async_trait::async_trait;
 use sea_orm::sea_query::{Alias, Expr, Func, PostgresQueryBuilder, Query, UpdateStatement};
@@ -30,7 +30,9 @@ use crate::routes::private::readings::status_events::models as status_events;
 use crate::routes::private::reprocessing_jobs::flows::required_uuid;
 use crate::routes::private::reprocessing_jobs::service::{Job, JobContext, JobReport};
 use crate::routes::private::site_parameters::models as site_parameters;
-use crate::routes::private::sync::service::{HoldScope, repoint_holds};
+use crate::routes::private::sync::service::{
+    HoldScope, has_plan_attribution, queue_plan_attribution, repoint_holds,
+};
 
 /// The scope as a predicate over `data_streams ds`, which is the one table all four statements
 /// and the three shared helpers join.
@@ -299,7 +301,8 @@ async fn plan_status<C: ConnectionTrait>(db: &C, plan_id: Uuid) -> Result<Option
 
 /// Apply a pairing plan: resolve entities, execute pairings, backfill readings, mark the plan
 /// `applied`. The status transition is guarded (only a `draft` plan applies), and a re-execution
-/// after a lost lease finds the plan already applied and reports a replay; not offered as a rerun. Backs the `apply_pairing_plan`
+/// after a lost lease finds the plan already applied and reports a replay, queueing the plan's
+/// attribution if no job for it exists; not offered as a rerun. Backs the `apply_pairing_plan`
 /// operator action.
 pub struct PlanApply;
 
@@ -312,10 +315,17 @@ impl Job for PlanApply {
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
         let plan_id = required_uuid(ctx.params(), "plan_id")?;
         if plan_status(ctx.db(), plan_id).await?.as_deref() == Some("applied") {
-            ctx.report(JobReport::new().scope("plan_id", plan_id.to_string()))
-                .await;
-            ctx.info("Plan is already applied; this run is a replay and changed nothing")
-                .await;
+            let mut report = JobReport::new().scope("plan_id", plan_id.to_string());
+            if has_plan_attribution(ctx.db(), plan_id).await? {
+                ctx.info("Plan is already applied; this run is a replay and changed nothing")
+                    .await;
+            } else {
+                queue_plan_attribution(ctx.db(), plan_id, Some(ctx.job_id())).await?;
+                report = report.count("attribution_queued", 1);
+                ctx.info("Plan is already applied but its attribution was never queued; queued it")
+                    .await;
+            }
+            ctx.report(report).await;
             return Ok(0);
         }
         let result =

@@ -4845,6 +4845,12 @@ pub async fn apply_plan(
     )
     .await;
     finalize_plan(&txn, plan_id, &counters, readings_backfilled).await?;
+    queue_plan_attribution(
+        &txn,
+        plan_id,
+        progress.map(crate::routes::private::reprocessing_jobs::service::JobContext::job_id),
+    )
+    .await?;
     txn.commit().await?;
 
     // Attribution is what made these readings visit values; the calculations that read them at
@@ -4858,13 +4864,6 @@ pub async fn apply_plan(
     )
     .await?;
 
-    // Re-derive the paired readings by the deployment + calibration windows for each touched
-    // (site, parameter) slot, then a full refresh as a safety net. `backfill_plan_readings` only
-    // stamps site_id/parameter_id; the window-aware engine (same one ingest/reprocess use) assigns
-    // sensor_id/deployment_id/calibration_id and the per-window calibrated_value, while its recall
-    // guard leaves pre-deployment history attributed by the pairing. Runs post-commit because the
-    // reprocess opens its own transaction and refreshes continuous aggregates (which can't run
-    // inside one).
     let slots: Vec<(Uuid, Uuid)> = plan_slots(plan_id).into_tuple().all(db).await?;
     // History that ended before river-data held it did not go stale on river-data's watch, so the
     // first dispatcher tick after the apply announces none of it. Only the running service has the
@@ -4885,15 +4884,6 @@ pub async fn apply_plan(
         }
     }
 
-    // Re-derivation runs as one tracked job under the apply, so a failure is visible and the panel
-    // shows the plan's own progress rather than a row per slot (B418).
-    crate::routes::private::reprocessing_jobs::service::enqueue_child(
-        db,
-        "plan_attribution",
-        &serde_json::json!({ "plan_id": plan_id }),
-        progress.map(crate::routes::private::reprocessing_jobs::service::JobContext::job_id),
-    )
-    .await?;
     step(
         progress,
         &format!(
@@ -5655,6 +5645,45 @@ pub(super) async fn finalize_plan<C: ConnectionTrait>(
     plan_active.apply_result = Set(Some(result.clone()));
     plan_active.update(txn).await?;
     Ok(())
+}
+
+/// Queue the re-derivation a plan apply hands on: its paired readings, by the deployment and
+/// calibration windows of each slot. `backfill_plan_readings` stamps only site and parameter; the
+/// window-aware reprocess assigns instrument, deployment, calibration and calibrated value, and
+/// runs as its own job because it opens transactions and refreshes aggregates. Called on the
+/// apply's transaction, so an applied plan always has its attribution queued.
+pub async fn queue_plan_attribution<C: ConnectionTrait>(
+    db: &C,
+    plan_id: Uuid,
+    parent_job_id: Option<Uuid>,
+) -> Result<Option<Uuid>, sea_orm::DbErr> {
+    crate::routes::private::reprocessing_jobs::service::enqueue_child(
+        db,
+        "plan_attribution",
+        &serde_json::json!({ "plan_id": plan_id }),
+        parent_job_id,
+    )
+    .await
+}
+
+/// Whether any `plan_attribution` job, in whatever state, names this plan.
+pub async fn has_plan_attribution<C: ConnectionTrait>(
+    db: &C,
+    plan_id: Uuid,
+) -> Result<bool, sea_orm::DbErr> {
+    use crate::routes::private::reprocessing_jobs::models::job;
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+
+    Ok(job::Entity::find()
+        .filter(job::Column::TriggerType.eq("plan_attribution"))
+        .filter(
+            Expr::col(job::Column::Params)
+                .cast_json_field("plan_id")
+                .eq(plan_id.to_string()),
+        )
+        .one(db)
+        .await?
+        .is_some())
 }
 
 /// Revert a pairing plan: bulk unpair all streams that were paired by this plan.

@@ -125,6 +125,146 @@ async fn two_curves_sharing_an_opening_instant_are_refused() {
     assert_eq!(status, 201, "a distinct instant is accepted: {third}");
 }
 
+/// A curve fitted on one instrument is not a curve for another: moving it would leave the first
+/// instrument's readings naming a curve that is no longer theirs and could collide with a curve
+/// the second one already opens at that instant.
+#[tokio::test]
+#[serial]
+async fn a_curve_is_never_moved_to_another_instrument() {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+    let app = build_test_app(db.clone());
+    let token = seed_api_token(&db, full_permissions(), None).await;
+
+    let fitted_on = create_sensor(&db, "window-move-from", GLOBAL_PARAM_TEMP_ID).await;
+    let other = create_sensor(&db, "window-move-to", GLOBAL_PARAM_TEMP_ID).await;
+    let at = dt("2025-05-01T00:00:00Z");
+    let curve =
+        add_calibration_for_parameter(&db, fitted_on.id, GLOBAL_PARAM_TEMP_ID, 2.0, 0.0, at).await;
+    add_calibration_for_parameter(&db, other.id, GLOBAL_PARAM_TEMP_ID, 3.0, 0.0, at).await;
+
+    let (status, body) = put_json_with_token(
+        &app,
+        &format!("/api/sensor_calibrations/{curve}"),
+        &json!({ "sensor_id": other.id }),
+        &token,
+    )
+    .await;
+    assert!(
+        (400..500).contains(&status),
+        "an update naming another instrument is refused, not silently ignored ({status}): {body}"
+    );
+
+    let stayed = curves_of(&db, fitted_on.id).await;
+    assert!(
+        stayed.iter().any(|c| c.id == curve),
+        "the curve stays on the instrument it was fitted on"
+    );
+    for c in curves_of(&db, other.id).await {
+        assert_ne!(
+            c.valid_until,
+            Some(c.valid_from),
+            "the other instrument's timeline is untouched, with no empty window"
+        );
+    }
+}
+
+/// Moving a curve onto a channel that already opens a curve at the same instant is the collision
+/// creating one there would be, whether or not the request also moves its start.
+#[tokio::test]
+#[serial]
+async fn a_curve_patched_onto_a_channel_holding_its_instant_is_refused() {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+    let app = build_test_app(db.clone());
+    let token = seed_api_token(&db, full_permissions(), None).await;
+
+    let sensor_id = create_sensor_without_curve(&db, "window-channel-move").await;
+    let at = dt("2025-05-01T00:00:00Z");
+    add_calibration_for_parameter(&db, sensor_id, GLOBAL_PARAM_TEMP_ID, 2.0, 0.0, at).await;
+    let moving =
+        add_calibration_for_parameter(&db, sensor_id, GLOBAL_PARAM_DO_ID, 3.0, 0.0, at).await;
+
+    let (status, body) = put_json_with_token(
+        &app,
+        &format!("/api/sensor_calibrations/{moving}"),
+        &json!({ "parameter_id": GLOBAL_PARAM_TEMP_ID }),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "the temperature channel already opens a curve at that instant: {body}"
+    );
+
+    let curves = curves_of(&db, sensor_id).await;
+    assert_eq!(curves.len(), 2, "both curves are still stored");
+    for c in &curves {
+        assert_ne!(
+            c.valid_until,
+            Some(c.valid_from),
+            "no curve is left with an empty window"
+        );
+    }
+}
+
+/// The instant a channel's curve opens is unique in the schema itself, so a writer that bypasses
+/// the route (a merge, a restore, a hand edit) cannot leave a curve with an empty window either. A
+/// curve naming no parameter applies to every channel, and two of those at one instant collide too.
+#[tokio::test]
+#[serial]
+async fn the_schema_refuses_two_curves_opening_one_channel_at_one_instant() {
+    let db = setup_test_db().await;
+    cleanup_test_db(&db).await;
+    seed_base_entities(&db).await;
+
+    let sensor_id = create_sensor_without_curve(&db, "window-unique").await;
+    let insert = |parameter: &str| {
+        format!(
+            "INSERT INTO sensor_calibrations (id, sensor_id, parameter_id, slope, intercept, valid_from) \
+             VALUES ('{}', '{sensor_id}', {parameter}, 1.0, 0.0, '2025-05-01T00:00:00Z')",
+            Uuid::new_v4()
+        )
+    };
+    let temp = format!("'{GLOBAL_PARAM_TEMP_ID}'");
+    let run = |sql: String| {
+        let db = db.clone();
+        async move {
+            db.execute_raw(Statement::from_string(DatabaseBackend::Postgres, sql))
+                .await
+        }
+    };
+
+    run(insert(&temp))
+        .await
+        .expect("the first curve on the channel");
+    assert!(
+        run(insert(&temp)).await.is_err(),
+        "a second curve opening the same channel at the same instant is refused by the schema"
+    );
+    run(insert(&format!("'{GLOBAL_PARAM_DO_ID}'")))
+        .await
+        .expect("another channel at the same instant is a different curve");
+
+    let bare = create_sensor_without_curve(&db, "window-unique-bare").await;
+    let insert_bare = || {
+        format!(
+            "INSERT INTO sensor_calibrations (id, sensor_id, parameter_id, slope, intercept, valid_from) \
+             VALUES ('{}', '{bare}', NULL, 1.0, 0.0, '2025-05-01T00:00:00Z')",
+            Uuid::new_v4()
+        )
+    };
+    run(insert_bare())
+        .await
+        .expect("the first all-channel curve");
+    assert!(
+        run(insert_bare()).await.is_err(),
+        "a second all-channel curve at the same instant is refused by the schema"
+    );
+}
+
 /// The window is half-open: `[valid_from, next_valid_from)`. The instant a curve opens belongs to
 /// that curve, and the instant before it belongs to the previous one.
 #[tokio::test]

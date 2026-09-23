@@ -276,21 +276,11 @@ pub async fn retire_calibration(
             .filter(super::models::Column::Id.eq(id))
             .exec(txn)
             .await?;
+        // A retired curve no longer bounds its neighbours' windows, so the chain is rebuilt before
+        // the slots reprocess under it.
+        rechain_and_reprocess(txn, sensor_id, id, "calibration_retire").await?;
         Ok(set_id)
     })
-    .await?;
-
-    // A retired curve no longer bounds its neighbours' windows, so the chain is rebuilt before the
-    // slots reprocess under it.
-    super::service::recompute_valid_until(&state.db, sensor_id).await?;
-    crate::routes::private::reprocessing_jobs::service::enqueue(
-        &state.db,
-        "calibration_retire",
-        Some(sensor_id),
-        Some(id),
-        &serde_json::json!({ "sensor_id": sensor_id }),
-        None,
-    )
     .await?;
 
     let retired_at = load(&state.db, id).await?.1;
@@ -380,19 +370,9 @@ pub async fn unretire_calibration(
             .filter(super::models::Column::Id.eq(id))
             .exec(txn)
             .await?;
+        rechain_and_reprocess(txn, sensor_id, id, "calibration_unretire").await?;
         Ok(restored)
     })
-    .await?;
-
-    super::service::recompute_valid_until(&state.db, sensor_id).await?;
-    crate::routes::private::reprocessing_jobs::service::enqueue(
-        &state.db,
-        "calibration_unretire",
-        Some(sensor_id),
-        Some(id),
-        &serde_json::json!({ "sensor_id": sensor_id }),
-        None,
-    )
     .await?;
 
     Ok(Json(UnretireResponse {
@@ -401,6 +381,27 @@ pub async fn unretire_calibration(
         set_id: set,
         restored,
     }))
+}
+
+/// Rebuild the instrument's curve chain and queue the reprocess of its readings under it, on the
+/// transaction that retired or restored the curve.
+async fn rechain_and_reprocess<C: ConnectionTrait>(
+    txn: &C,
+    sensor_id: Uuid,
+    calibration_id: Uuid,
+    trigger_type: &str,
+) -> AppResult<()> {
+    super::service::recompute_valid_until(txn, sensor_id).await?;
+    crate::routes::private::reprocessing_jobs::service::enqueue(
+        txn,
+        trigger_type,
+        Some(sensor_id),
+        Some(calibration_id),
+        &serde_json::json!({ "sensor_id": sensor_id }),
+        None,
+    )
+    .await?;
+    Ok(())
 }
 
 /// A curve's instrument and whether it has been retired.

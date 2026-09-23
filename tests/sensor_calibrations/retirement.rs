@@ -364,3 +364,96 @@ async fn a_retired_curve_does_not_correct_a_reading_written_afterwards() {
         "March is inside the retired curve's window, and a retired curve corrects nothing"
     );
 }
+
+/// Scenario: the retirement's reprocess cannot be queued. Expected behaviour: the retirement is
+/// refused whole, so the curve stays in circulation and its reading keeps it.
+#[tokio::test]
+#[serial]
+async fn a_retirement_whose_reprocess_cannot_be_queued_retires_nothing() {
+    let f = crate::common::seeded_app().await;
+    let (db, app, token) = (f.db, f.app, f.token);
+    let (_sensor, early, _late) = two_curves(&db).await;
+
+    crate::common::jobs::refuse_enqueue(&db, "calibration_retire").await;
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/sensor_calibrations/{early}/retire"),
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    crate::common::jobs::restore_enqueue(&db).await;
+
+    assert_eq!(status, 500, "the retirement reports the failure: {body}");
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*)::bigint FROM sensor_calibrations \
+                  WHERE id = '{early}' AND retired_at IS NULL"
+            )
+        )
+        .await,
+        1,
+        "the curve is still in circulation"
+    );
+    assert_eq!(
+        value_at(&db, EARLY).await,
+        (Some(early), Some(10.0)),
+        "the reading still names the curve"
+    );
+}
+
+/// Scenario: the unretirement's reprocess cannot be queued. Expected behaviour: the unretirement
+/// is refused whole, so the curve stays retired and its readings stay where the retirement moved
+/// them.
+#[tokio::test]
+#[serial]
+async fn an_unretirement_whose_reprocess_cannot_be_queued_restores_nothing() {
+    let f = crate::common::seeded_app().await;
+    let (db, app, token) = (f.db, f.app, f.token);
+    let (_sensor, early, _late) = two_curves(&db).await;
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/sensor_calibrations/{early}/retire"),
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "retire: {body}");
+    crate::common::jobs::wait_for_triggered_job(
+        &db,
+        "calibration_retire",
+        Some(&early.to_string()),
+    )
+    .await;
+
+    crate::common::jobs::refuse_enqueue(&db, "calibration_unretire").await;
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/sensor_calibrations/{early}/unretire"),
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    crate::common::jobs::restore_enqueue(&db).await;
+
+    assert_eq!(status, 500, "the unretirement reports the failure: {body}");
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*)::bigint FROM sensor_calibrations \
+                  WHERE id = '{early}' AND retired_at IS NOT NULL"
+            )
+        )
+        .await,
+        1,
+        "the curve is still retired"
+    );
+    assert_eq!(
+        value_at(&db, EARLY).await,
+        (None, None),
+        "the reading stays uncorrected"
+    );
+}

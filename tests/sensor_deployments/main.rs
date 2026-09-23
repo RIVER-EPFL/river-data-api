@@ -9,6 +9,7 @@ mod common;
 mod api_serialization_and_filter;
 mod backfill_attribution;
 mod lifecycle_rules;
+mod patch_moves_instrument;
 mod rollback_reopens_previous;
 mod slot_and_recall;
 mod slot_boundaries;

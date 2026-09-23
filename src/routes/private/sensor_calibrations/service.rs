@@ -1936,8 +1936,19 @@ async fn record_derived_arrival<C: ConnectionTrait>(
 /// only far enough to keep windows non-overlapping, because the resolver depends on at most one
 /// curve covering an instant. `LEAST` ignores a NULL `next_from`, so an explicit bound on the
 /// newest curve survives. This is the same policy [`deployment_chain_statement`] applies to a
-/// deployment's end date.
+/// deployment's end date. The write is held to the rows whose bound moves, so a chain with nothing
+/// to change locks nothing.
 fn calibration_chain_statement(sensor_id: Uuid) -> UpdateStatement {
+    let sc = Alias::new("sc");
+    let current = Expr::col((sc.clone(), super::models::Column::ValidUntil));
+    let next_from = Expr::col((Alias::new("ordered"), Alias::new("next_from")));
+    let chained = Expr::case(
+        Expr::col((sc, super::models::Column::ValidUntilExplicit)),
+        Func::cust(Alias::new("LEAST"))
+            .arg(current.clone())
+            .arg(next_from.clone()),
+    )
+    .finally(next_from);
     let ordered = SeaQuery::select()
         .column(super::models::Column::Id)
         .column(super::models::Column::ValidFrom)
@@ -1959,14 +1970,7 @@ fn calibration_chain_statement(sensor_id: Uuid) -> UpdateStatement {
                 .into_table_ref()
                 .alias(Alias::new("sc")),
         )
-        .value(
-            super::models::Column::ValidUntil,
-            Expr::cust(
-                "CASE WHEN sc.valid_until_explicit \
-                      THEN LEAST(sc.valid_until, ordered.next_from) \
-                      ELSE ordered.next_from END",
-            ),
-        )
+        .value(super::models::Column::ValidUntil, chained.clone())
         .from(TableRef::SubQuery(
             Box::new(ordered),
             Alias::new("ordered").into_iden(),
@@ -1976,6 +1980,13 @@ fn calibration_chain_statement(sensor_id: Uuid) -> UpdateStatement {
         .and_where(Expr::cust(
             "(ordered.next_from IS NULL OR ordered.next_from > ordered.valid_from)",
         ))
+        // A NULL bound is open-ended, so a move to or from NULL is a move.
+        .and_where(
+            current
+                .clone()
+                .ne(chained.clone())
+                .or(current.is_null().ne(chained.is_null())),
+        )
         .take()
 }
 
@@ -2194,6 +2205,38 @@ impl Scope {
         }
     }
 
+    /// A reading naming a deployment that does not cover it: another instrument, another parameter,
+    /// or a window that no longer holds its instant. Step 1 re-points every row a window in the
+    /// scope covers, so what is left here is a row no window covers, which the recall's floor keeps
+    /// at its pairing's site but which no deployment accounts for.
+    fn released_predicate(self) -> Expr {
+        use readings::Column as R;
+        use sensor_deployments::Column as D;
+        let (r, d) = (Alias::new("r"), Alias::new("d"));
+        let backing = SeaQuery::select()
+            .expr(Expr::val(1))
+            .from_as(sensor_deployments::Entity, d.clone())
+            .and_where(Expr::col((d.clone(), D::Id)).equals((r.clone(), R::DeploymentId)))
+            .and_where(Expr::col((d.clone(), D::SensorId)).equals((r.clone(), R::SensorId)))
+            .cond_where(
+                Condition::any()
+                    .add(Expr::col((r.clone(), R::ParameterId)).is_null())
+                    .add(
+                        Expr::col((d.clone(), D::ParameterId)).equals((r.clone(), R::ParameterId)),
+                    ),
+            )
+            .and_where(Expr::col((r.clone(), R::Time)).gte(Expr::col((d.clone(), D::DeployedFrom))))
+            .cond_where(
+                Condition::any()
+                    .add(Expr::col((d.clone(), D::DeployedUntil)).is_null())
+                    .add(Expr::col((r.clone(), R::Time)).lt(Expr::col((d, D::DeployedUntil)))),
+            )
+            .take();
+        self.readings_predicate()
+            .and(Expr::col((r, R::DeploymentId)).is_not_null())
+            .and(Expr::exists(backing).not())
+    }
+
     /// The rows whose span the rollup refresh covers.
     fn refresh_condition(self) -> sea_orm::Condition {
         match self {
@@ -2208,6 +2251,16 @@ impl Scope {
                 .add(readings::Column::ParameterId.eq(parameter_id)),
         }
     }
+}
+
+/// The two aliases name the same reading, by its key.
+fn same_reading(a: &str, b: &str) -> Expr {
+    use readings::Column as R;
+    let (a, b) = (Alias::new(a), Alias::new(b));
+    Expr::col((a.clone(), R::StreamId))
+        .equals((b.clone(), R::StreamId))
+        .and(Expr::col((a.clone(), R::Time)).equals((b.clone(), R::Time)))
+        .and(Expr::col((a, R::ReplicateIndex)).equals((b, R::ReplicateIndex)))
 }
 
 /// The `was_`/`now_` pairs a recording statement returns for the columns it wrote, read from the
@@ -2307,13 +2360,14 @@ pub async fn reprocess_site_parameter_readings(
     .await
 }
 
-/// The four writes a reprocess run makes, in the order it runs them. Built without a database, so
+/// The five writes a reprocess run makes, in the order it runs them. Built without a database, so
 /// what each one selects and writes is readable on its own.
 struct ReprocessStatements {
     attribution: WithQuery,
     calibration: WithQuery,
     spot: WithQuery,
     recall: WithQuery,
+    release: WithQuery,
 }
 
 fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatements {
@@ -2346,9 +2400,7 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
                 Alias::new("dw").into_iden(),
             ))
             .from(readings::Entity.into_table_ref().alias(Alias::new("prev")))
-            .and_where(Expr::cust("prev.stream_id = r.stream_id"))
-            .and_where(Expr::cust("prev.time = r.time"))
-            .and_where(Expr::cust("prev.replicate_index = r.replicate_index"))
+            .and_where(same_reading("prev", "r"))
             .and_where(scope.attribution_scope())
             .and_where(attribution_derivable("r"))
             .and_where(Expr::cust("r.time >= dw.deployed_from"))
@@ -2418,9 +2470,7 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
                 Expr::val(Option::<Uuid>::None),
             )
             .from(readings::Entity.into_table_ref().alias(Alias::new("prev")))
-            .and_where(Expr::cust("prev.stream_id = r.stream_id"))
-            .and_where(Expr::cust("prev.time = r.time"))
-            .and_where(Expr::cust("prev.replicate_index = r.replicate_index"))
+            .and_where(same_reading("prev", "r"))
             .and_where(scope.recall_predicate())
             .returning(ReturningClause::Exprs(vec![Expr::cust(format!(
                 "r.stream_id, r.time, r.replicate_index, prev.site_id, r.parameter_id, {pairs}",
@@ -2431,11 +2481,36 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
         job_id,
     );
 
+    // Step 5, the release: a deployment reference no window in the scope backs is cleared, as a
+    // deleted deployment's are, so a reading never names a row that says another instrument,
+    // parameter or window measured it. The site stays where the recall left it.
+    let release_columns = ["deployment_id"];
+    let release = record_moved(
+        SeaQuery::update()
+            .table(readings::Entity.into_table_ref().alias(Alias::new("r")))
+            .value(
+                readings::Column::DeploymentId,
+                Expr::val(Option::<Uuid>::None),
+            )
+            .from(readings::Entity.into_table_ref().alias(Alias::new("prev")))
+            .and_where(same_reading("prev", "r"))
+            .and_where(scope.released_predicate())
+            .and_where(attribution_derivable("r"))
+            .returning(ReturningClause::Exprs(vec![Expr::cust(format!(
+                "r.stream_id, r.time, r.replicate_index, r.site_id, r.parameter_id, {pairs}",
+                pairs = moved_pairs("prev", "r", &release_columns),
+            ))]))
+            .take(),
+        &release_columns,
+        job_id,
+    );
+
     ReprocessStatements {
         attribution,
         calibration,
         spot,
         recall,
+        release,
     }
 }
 
@@ -2456,7 +2531,7 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
 /// alone. One a window does cover is recomputed from that curve like any other row, its old value
 /// on the `reading_decisions` row this step appends (Q114).
 ///
-/// Steps 1 to 4 run in one guarded transaction (`common::bulk_write`), which lifts TimescaleDB's
+/// Steps 1 to 5 run in one guarded transaction (`common::bulk_write`), which lifts TimescaleDB's
 /// per-statement decompression cap: a deep-historical reprocess rewrites rows in compressed
 /// (>30-day) chunks and would otherwise abort the job. The cascade and the rollup refresh run after
 /// the commit, since a continuous-aggregate refresh cannot run inside a transaction.
@@ -2488,6 +2563,14 @@ pub async fn reprocess(
         // The recall's rows are not part of `readings_updated`: it clears an attribution rather
         // than re-deriving one.
         write_and_collect(txn, &steps.recall, &mut touched, &mut changed).await?;
+        // Nothing served reads a deployment reference, so the release moves no instant.
+        write_and_collect(
+            txn,
+            &steps.release,
+            &mut Vec::new(),
+            &mut crate::common::SlotTally::default(),
+        )
+        .await?;
 
         touched.sort_unstable();
         touched.dedup();
@@ -2666,6 +2749,24 @@ async fn duplicate_instant_exists<C: ConnectionTrait>(
     Ok(found.is_some())
 }
 
+/// The channel and start an update lands a curve on, or `None` when it moves neither. A patched
+/// value wins over the stored one.
+fn patched_opening(
+    stored_parameter: Option<Uuid>,
+    stored_from: chrono::DateTime<chrono::Utc>,
+    parameter_id: Option<Option<Uuid>>,
+    valid_from: Option<Option<chrono::DateTime<chrono::Utc>>>,
+) -> Option<(Option<Uuid>, chrono::DateTime<chrono::Utc>)> {
+    let moved_from = valid_from.flatten();
+    if parameter_id.is_none() && moved_from.is_none() {
+        return None;
+    }
+    Some((
+        parameter_id.unwrap_or(stored_parameter),
+        moved_from.unwrap_or(stored_from),
+    ))
+}
+
 /// Whether an update's `valid_until` makes the row's end date an operator's or the chain's again.
 /// `None` when the update carried no end date at all, which leaves the provenance as it stands.
 fn valid_until_provenance(
@@ -2758,7 +2859,7 @@ impl CRUDOperations for SensorCalibrationOperations {
         id: Uuid,
         data: &<SensorCalibration as CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
-        if data.valid_from.is_none() && data.valid_until.is_none() {
+        if data.valid_from.is_none() && data.valid_until.is_none() && data.parameter_id.is_none() {
             return Ok(());
         }
         let Some(existing) = super::models::Entity::find_by_id(id)
@@ -2772,11 +2873,11 @@ impl CRUDOperations for SensorCalibrationOperations {
         // Nothing here writes: `perform_update` carries the provenance flag in the row's own UPDATE,
         // so a request this hook goes on to reject leaves the chain treating the row exactly as it
         // did before.
-        let stored_from = existing.valid_from;
+        let stored_from = existing.valid_from.with_timezone(&chrono::Utc);
         if let Some(Some(until)) = data.valid_until {
             let opens_at = match data.valid_from {
                 Some(Some(patched)) => patched,
-                _ => stored_from.with_timezone(&chrono::Utc),
+                _ => stored_from,
             };
             if until <= opens_at {
                 return Err(ApiError::bad_request(
@@ -2787,19 +2888,19 @@ impl CRUDOperations for SensorCalibrationOperations {
             }
         }
 
-        // Moving a curve's start onto another curve's start is the same collision as creating one
-        // there.
-        let Some(Some(new_from)) = data.valid_from else {
+        // Moving a curve's start or channel onto another curve's start is the same collision as
+        // creating one there.
+        let Some((parameter_id, opens_at)) = patched_opening(
+            existing.parameter_id,
+            stored_from,
+            data.parameter_id,
+            data.valid_from,
+        ) else {
             return Ok(());
         };
-        let sensor_id = existing.sensor_id;
-        let parameter_id = existing.parameter_id;
-        let parameter_id = match data.parameter_id {
-            Some(patched) => patched,
-            None => parameter_id,
-        };
-
-        if duplicate_instant_exists(db, sensor_id, parameter_id, new_from, Some(id)).await? {
+        if duplicate_instant_exists(db, existing.sensor_id, parameter_id, opens_at, Some(id))
+            .await?
+        {
             return Err(ApiError::bad_request(DUPLICATE_INSTANT.to_string()));
         }
         Ok(())

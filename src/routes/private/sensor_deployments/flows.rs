@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
-    Select, Statement,
+    ColumnTrait, Condition, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, QueryFilter,
+    QueryOrder, Select, Statement,
 };
 use uuid::Uuid;
 
@@ -131,6 +131,16 @@ pub fn conflict_message(occupant: &SlotOccupant, incoming_sensor: Uuid, remedy: 
     }
 }
 
+/// The sensor's open deployments on this channel that had begun by `at`: the rows a window starting
+/// at `at` may close without ending one before its own start.
+pub fn open_at(sensor_id: Uuid, parameter_id: Uuid, at: DateTime<Utc>) -> Condition {
+    Condition::all()
+        .add(super::models::Column::SensorId.eq(sensor_id))
+        .add(super::models::Column::ParameterId.eq(parameter_id))
+        .add(super::models::Column::DeployedUntil.is_null())
+        .add(super::models::Column::DeployedFrom.lte(at))
+}
+
 /// Close the sensor's open deployments on this channel at `at`, and report how many closed.
 ///
 /// The one recall. Scoped to the SAME parameter (channel): a multi-channel instrument holds one open
@@ -149,10 +159,7 @@ pub async fn recall_open_deployments<C: ConnectionTrait>(
 ) -> Result<u64, DbErr> {
     let mut update = super::models::Entity::update_many()
         .col_expr(super::models::Column::DeployedUntil, Expr::value(at))
-        .filter(super::models::Column::SensorId.eq(sensor_id))
-        .filter(super::models::Column::ParameterId.eq(parameter_id))
-        .filter(super::models::Column::DeployedUntil.is_null())
-        .filter(super::models::Column::DeployedFrom.lte(at));
+        .filter(open_at(sensor_id, parameter_id, at));
     if let Some(id) = except {
         update = update.filter(super::models::Column::Id.ne(id));
     }

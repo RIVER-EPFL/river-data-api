@@ -253,3 +253,51 @@ async fn backfill_is_bounded_by_a_prior_deployment() {
         "B bounded at gap, not into A"
     );
 }
+
+/// Scenario: the backfill's reprocess cannot be queued. Expected behaviour: the backfill is
+/// refused whole, so no deployment is left backdated over history nothing will attribute.
+#[tokio::test]
+#[serial]
+async fn a_backfill_whose_reprocess_cannot_be_queued_backdates_nothing() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    sl::seed_base_entities(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let sensor = sl::create_sensor(&db, "backfill-lost", crate::common::GLOBAL_PARAM_TEMP_ID).await;
+    let dep = sl::deploy_sensor(
+        &db,
+        sensor.id,
+        crate::common::SITE1_ID,
+        sl::dt("2025-06-01T00:00:00Z"),
+    )
+    .await;
+    let stream =
+        sl::create_paired_stream(&db, "backfill-lost", crate::common::PARAM_S1_TEMP_ID).await;
+    sl::insert_orphan_readings(
+        &db,
+        stream,
+        crate::common::SITE1_ID,
+        crate::common::GLOBAL_PARAM_TEMP_ID,
+        &[(sl::dt("2025-03-01T00:00:00Z"), 10.0)],
+    )
+    .await;
+
+    crate::common::jobs::refuse_enqueue(&db, "backfill_attribution").await;
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/actions/backfill_attribution",
+        &json!({ "all": true }),
+        &token,
+    )
+    .await;
+    crate::common::jobs::restore_enqueue(&db).await;
+
+    assert_eq!(status, 500, "the backfill reports the failure: {body}");
+    assert_eq!(
+        &deployed_from(&db, dep).await[..10],
+        "2025-06-01",
+        "the deployment keeps its start"
+    );
+}

@@ -132,3 +132,53 @@ async fn a_recalled_instrument_keeps_the_history_it_covered() {
         "the new deployment opens where the recalled one ended, not over it"
     );
 }
+
+/// Scenario: the pairing's window reprocess cannot be queued. Expected behaviour: the pairing is
+/// refused whole, so the stream is not left paired over readings no window resolved.
+#[tokio::test]
+#[serial]
+async fn a_pairing_whose_reprocess_cannot_be_queued_pairs_nothing() {
+    let (app, token, db) = setup().await;
+
+    let stream = create_unpaired_stream_with_device(&db, "pair-lost", "SB1-PAIR-LOST").await;
+    seed_readings(&db, stream, &["2024-03-01T00:00:00Z"]).await;
+
+    crate::common::jobs::refuse_enqueue(&db, "pairing_backfill").await;
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/streams/{stream}/pair"),
+        &json!({ "site_parameter_id": PARAM_S1_TEMP_ID }),
+        &token,
+    )
+    .await;
+    crate::common::jobs::restore_enqueue(&db).await;
+
+    assert_eq!(status, 500, "the pairing reports the failure: {body}");
+    let paired = crate::common::e2e::count(
+        &db,
+        &format!(
+            "SELECT COUNT(*)::bigint FROM data_streams \
+             WHERE id = '{stream}' AND site_parameter_id IS NOT NULL"
+        ),
+    )
+    .await;
+    assert_eq!(paired, 0, "the stream is still unpaired");
+    let attributed = crate::common::e2e::count(
+        &db,
+        &format!(
+            "SELECT COUNT(*)::bigint FROM readings \
+             WHERE stream_id = '{stream}' AND site_id IS NOT NULL"
+        ),
+    )
+    .await;
+    assert_eq!(attributed, 0, "no reading was attributed to the slot");
+    let deployments = crate::common::e2e::count(
+        &db,
+        &format!(
+            "SELECT COUNT(*)::bigint FROM sensor_deployments \
+             WHERE site_id = '{SITE1_ID}' AND parameter_id = '{GLOBAL_PARAM_TEMP_ID}'"
+        ),
+    )
+    .await;
+    assert_eq!(deployments, 0, "no deployment was opened");
+}

@@ -12,13 +12,15 @@ use super::service::SensorCalibrationOperations;
     name_singular = "sensor_calibration",
     name_plural = "sensor_calibrations",
     generate_router,
+    deny_unknown_fields,
     operations = SensorCalibrationOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     #[crudcrate(primary_key, exclude(update, create), on_create = Uuid::new_v4())]
     pub id: Uuid,
-    #[crudcrate(filterable)]
+    /// The instrument the curve was fitted on, fixed once created.
+    #[crudcrate(filterable, exclude(update))]
     pub sensor_id: Uuid,
     pub slope: f64,
     pub intercept: f64,

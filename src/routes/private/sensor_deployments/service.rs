@@ -26,6 +26,15 @@ fn reject_inverted_window(
     }
 }
 
+/// The instrument and site an edit moves this deployment away from, when it names another of
+/// either. Their readings still point at the row, so they are re-derived as well as the new pair.
+fn vacated(
+    (cur_sensor, cur_site): (Uuid, Uuid),
+    (new_sensor, new_site): (Uuid, Uuid),
+) -> Option<(Uuid, Uuid)> {
+    (cur_sensor != new_sensor || cur_site != new_site).then_some((cur_sensor, cur_site))
+}
+
 /// Spawn a tracked reprocess for a deployment change. Runs the **slot-scoped** reprocess first
 /// (`reprocess_site_parameter_readings`) so a backdated/edited window re-attributes the affected
 /// (site, parameter) by deployment timeline, stamping `sensor_id` onto previously unattributed
@@ -193,6 +202,16 @@ impl CRUDOperations for SensorDeploymentOperations {
         };
 
         reject_inverted_window(new_from, new_until)?;
+        // The create's guard, for an edit that hands the deployment to another instrument.
+        if new_sensor != cur_sensor {
+            crate::routes::private::sensors::service::require_measuring_instrument(
+                db,
+                new_sensor,
+                "deployed to a site",
+            )
+            .await
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        }
 
         let occupant = slots::find_occupant(
             db,
@@ -215,6 +234,22 @@ impl CRUDOperations for SensorDeploymentOperations {
                 new_sensor,
                 "move this deployment",
             )));
+        }
+
+        // The job runs after the edit commits, so it re-derives the old pair against the moved row.
+        if let Some((left_sensor, left_site)) =
+            vacated((cur_sensor, cur_site), (new_sensor, new_site))
+        {
+            spawn_slot_reprocess(
+                db,
+                left_sensor,
+                left_site,
+                cur_param,
+                "deployment_update",
+                id,
+            )
+            .await
+            .map_err(ApiError::database)?;
         }
 
         // A move date corrected forward hands the vacated period back to where the instrument

@@ -155,3 +155,55 @@ async fn rollback_reopens_previous_deployment() {
         .unwrap();
     assert_eq!(open_count, 1, "exactly one open deployment after rollback");
 }
+
+/// Scenario: the rollback's reprocess cannot be queued. Expected behaviour: the rollback is
+/// refused whole, so the rolled-back deployment is still there and its readings still name it.
+#[tokio::test]
+#[serial]
+async fn a_rollback_whose_reprocess_cannot_be_queued_changes_nothing() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    sl::seed_base_entities(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+
+    let sensor = sl::create_sensor(&db, "rollback-lost", crate::common::GLOBAL_PARAM_TEMP_ID).await;
+    let dep_a = sl::deploy_sensor(
+        &db,
+        sensor.id,
+        crate::common::SITE1_ID,
+        sl::dt("2025-06-01T00:00:00Z"),
+    )
+    .await;
+    sl::end_deployment(&db, dep_a, sl::dt("2025-06-01T02:00:00Z")).await;
+    let dep_b = sl::deploy_sensor(
+        &db,
+        sensor.id,
+        crate::common::SITE2_ID,
+        sl::dt("2025-06-01T02:00:00Z"),
+    )
+    .await;
+
+    crate::common::jobs::refuse_enqueue(&db, "manual_reprocess").await;
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/actions/rollback_deployment",
+        &serde_json::json!({ "deployment_id": dep_b }),
+        &token,
+    )
+    .await;
+    crate::common::jobs::restore_enqueue(&db).await;
+
+    assert_eq!(status, 500, "the rollback reports the failure: {body}");
+    let remaining = crate::common::e2e::count(
+        &db,
+        &format!("SELECT COUNT(*)::bigint FROM sensor_deployments WHERE id = '{dep_b}'"),
+    )
+    .await;
+    assert_eq!(remaining, 1, "the rolled-back deployment is still there");
+    assert_eq!(
+        deployed_until(&db, dep_a).await,
+        Some(sl::dt("2025-06-01T02:00:00Z")),
+        "the previous deployment was not reopened"
+    );
+}
