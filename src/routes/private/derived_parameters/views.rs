@@ -525,21 +525,34 @@ pub async fn step_dependents(
 
 /// Recompute every derived value for a given derived parameter definition. Backfills via
 /// joining source readings; tracked as a `reprocessing_jobs` row. Refreshes continuous
-/// aggregates on completion. Requires `write_metadata`.
+/// aggregates on completion. Requires `write_metadata`, and a caller confined to projects is
+/// refused a calculation active at any site outside them, since the job rewrites every one.
 #[utoipa::path(
     post,
     path = "/api/actions/derived_parameters/{id}/recompute",
     params(("id" = Uuid, Path, description = "Calculation UUID")),
     responses(
         (status = 200, description = "Background recompute job triggered", body = QueuedJobResponse),
+        (status = 403, description = "The calculation is active at a site outside the caller's projects"),
         (status = 404, description = "Calculation not found"),
     ),
     tag = "actions"
 )]
 pub async fn recompute_derived(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<QueuedJobResponse>> {
+    if scope.is_restricted() {
+        let sites: Vec<Uuid> =
+            crate::routes::private::tools::flows::calculation_sites(&state.db, None)
+                .await?
+                .into_iter()
+                .filter(|c| c.calculation_id == id)
+                .flat_map(|c| c.sites.into_iter().map(|s| s.id))
+                .collect();
+        require_sites_in_scope(&state.db, &scope, &sites).await?;
+    }
     let job_id = spawn_recompute_derived(&state.db, state.events.clone(), id).await?;
     Ok(Json(QueuedJobResponse::queued(Some(job_id))))
 }

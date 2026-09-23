@@ -226,9 +226,18 @@ fn natural_keys() -> Vec<(&'static str, String)> {
             "sensors",
             format!("SELECT n.id, {} AS k FROM public.sensors n", sensor("n")),
         ),
+        // One curve per channel may open at an instant (the channel-opening key), so the channel
+        // is part of the key; a curve for every channel carries an empty part.
         (
             "sensor_calibrations",
-            on_sensor("sensor_calibrations", "valid_from"),
+            format!(
+                "SELECT t.id, {} || '{SEP}' || coalesce(lower(p.code), '')
+                        || '{SEP}' || t.valid_from::text AS k
+                   FROM public.sensor_calibrations t
+                   JOIN public.sensors n ON n.id = t.sensor_id
+                   LEFT JOIN public.parameters p ON p.id = t.parameter_id",
+                sensor("n")
+            ),
         ),
         (
             "sensor_deployments",

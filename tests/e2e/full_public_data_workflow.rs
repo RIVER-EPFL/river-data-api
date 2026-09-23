@@ -3,7 +3,8 @@
 //! reproduce the data, including the dynamically derived parameter and the continuous aggregates.
 //!
 //! This mirrors the production migration/cutover: fresh schema → configure entities → ingest CSV →
-//! serve the public contract. No SQL seed; every entity is created via its real endpoint.
+//! serve the public contract. Every entity is created and exposed through its real endpoint; the
+//! calculation row alone is seeded (`seed_formula_calculation`).
 //!
 //! Run with: cargo test --test e2e
 
@@ -157,6 +158,7 @@ async fn test_full_public_data_workflow() {
     let temp_param_id = id_of(&temp_param);
 
     // Assign raw parameters to the site.
+    let mut slot_ids: Vec<String> = Vec::new();
     for (pid, name) in [(&do_param_id, "DO"), (&temp_param_id, "Temp")] {
         let (status, sp) = crate::common::post_json_with_token(
             &app,
@@ -172,6 +174,7 @@ async fn test_full_public_data_workflow() {
             (200..300).contains(&status),
             "assign {name} ({status}): {sp}"
         );
+        slot_ids.push(id_of(&serde_json::from_str(&sp).expect("a site parameter")));
     }
 
     // Sensor + its bench calibration (part of station setup).
@@ -235,16 +238,11 @@ async fn test_full_public_data_workflow() {
         (200..300).contains(&status),
         "assign derived ({status}): {sp}"
     );
+    slot_ids.push(id_of(&serde_json::from_str(&sp).expect("a site parameter")));
 
-    // Mark the site_parameters as public.
-    {
-        use sea_orm::{ConnectionTrait, Statement};
-        db.execute_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            format!("UPDATE site_parameters SET is_public = true WHERE site_id = '{site_id}'"),
-        ))
-        .await
-        .expect("mark site_parameters public");
+    // Mark the site_parameters as public, as an operator exposes them.
+    for id in &slot_ids {
+        crate::common::e2e::set_site_parameter_public(&app, &token, id).await;
     }
 
     // Ingest historical data via the CSV import endpoint (client wide-CSV format).

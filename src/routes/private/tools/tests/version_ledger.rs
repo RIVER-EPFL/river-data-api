@@ -3,7 +3,7 @@ use crate::routes::private::tools::service::{render, version_formulas, version_l
 
 fn version_ledger_sql() -> String {
     use sea_orm::sea_query::PostgresQueryBuilder;
-    version_ledger_query(uuid::Uuid::nil()).to_string(PostgresQueryBuilder)
+    version_ledger_query(uuid::Uuid::nil(), None).to_string(PostgresQueryBuilder)
 }
 
 fn pco2(expr: &str) -> PinnedFormula {
@@ -76,6 +76,30 @@ fn the_ledger_groups_computations_by_the_version_they_name() {
         sql.contains(r#"COUNT(DISTINCT (CASE WHEN ("d"."stream_id" IS NOT NULL) THEN ("d"."stream_id", "d"."time", "d"."replicate_index") END))"#),
         "a reading moved twice under one version is one reading: {sql}"
     );
+    assert!(
+        !sql.contains("data_streams"),
+        "an unconfined reader counts everything: {sql}"
+    );
+}
+
+/// Scenario: a caller granted one project reads the ledger of a calculation that also computes at
+/// another project's sites.
+///
+/// Expected behaviour: only decisions on streams serving the caller's slots are counted, and the
+/// confinement sits in the join, so a version with nothing in scope still lists at zero.
+#[test]
+fn a_confined_ledger_counts_only_streams_at_the_callers_sites() {
+    use sea_orm::sea_query::PostgresQueryBuilder;
+    let project = uuid::Uuid::from_u128(7);
+    let sql =
+        version_ledger_query(uuid::Uuid::nil(), Some(&[project])).to_string(PostgresQueryBuilder);
+    let join = sql.split(" WHERE ").next().expect("a statement");
+    assert!(
+        join.contains(r#"LEFT JOIN "reading_decisions" AS "d""#)
+            && join.contains(r#""d"."stream_id" IN (SELECT"#),
+        "the stream confinement is part of the join: {sql}"
+    );
+    assert!(sql.contains(&project.to_string()), "{sql}");
 }
 
 /// A version with no decision joins to a row of NULL columns, which is not itself NULL: counted

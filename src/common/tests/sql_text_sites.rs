@@ -19,7 +19,7 @@ const ALLOWED: &[(&str, usize, usize)] = &[
     // The advisory lock serialising migrations across replicas.
     ("src/main.rs", 2, 0),
     // The cutover binary's body.
-    ("src/restore.rs", 20, 0),
+    ("src/restore.rs", 21, 0),
     // The health probe's `SELECT 1`; its two fragments are still to be rebuilt.
     ("src/routes/mod.rs", 1, 2),
     ("src/routes/private/alarms/service.rs", 1, 37),
@@ -41,8 +41,8 @@ const ALLOWED: &[(&str, usize, usize)] = &[
     ("src/routes/private/parameter_groups/service.rs", 4, 0),
     ("src/routes/private/parameter_groups/views.rs", 1, 0),
     ("src/routes/private/readings/flows.rs", 0, 5),
-    ("src/routes/private/readings/service.rs", 11, 42),
-    ("src/routes/private/readings/views.rs", 0, 4),
+    ("src/routes/private/readings/service.rs", 11, 54),
+    ("src/routes/private/readings/views.rs", 0, 2),
     ("src/routes/private/reprocessing_jobs/service.rs", 1, 3),
     ("src/routes/private/reprocessing_jobs/views.rs", 1, 0),
     ("src/routes/private/sensor_calibrations/resolver.rs", 0, 9),
@@ -61,6 +61,7 @@ const ALLOWED: &[(&str, usize, usize)] = &[
     ("src/routes/private/sync/views.rs", 4, 2),
     ("src/routes/private/tools/flows.rs", 0, 5),
     ("src/routes/private/tools/models.rs", 0, 1),
+    ("src/routes/private/tools/service.rs", 0, 14),
     ("src/routes/public/service.rs", 1, 0),
     ("src/routes/public/views.rs", 1, 15),
 ];
@@ -79,12 +80,13 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// A token of Rust source as far as this scan needs one: a string literal's contents, or a run of
-/// identifier characters.
+/// A token of Rust source as far as this scan needs one: a string literal's contents, a run of
+/// identifier characters, or one of the marks that delimit an attribute and the item it applies to.
 #[derive(Debug, PartialEq)]
 enum Token {
     Literal(String),
     Word(String),
+    Mark(char),
 }
 
 /// Split source into words and string literals, dropping comments and character literals, so a
@@ -177,6 +179,9 @@ fn tokens(source: &str) -> Vec<Token> {
             }
             out.push(Token::Word(chars[start..i].iter().collect()));
         } else {
+            if matches!(c, '#' | '[' | ']' | '{' | '}' | ';') {
+                out.push(Token::Mark(c));
+            }
             i += 1;
         }
     }
@@ -219,11 +224,82 @@ fn is_sql(text: &str) -> bool {
         })
 }
 
+/// Whether `tokens` open with `#[cfg(test)]`.
+fn is_cfg_test(tokens: &[Token]) -> bool {
+    matches!(
+        tokens,
+        [Token::Mark('#'), Token::Mark('['), Token::Word(cfg), Token::Word(test), Token::Mark(']'), ..]
+            if cfg == "cfg" && test == "test"
+    )
+}
+
+/// How many tokens the attribute at the start of `tokens` spans, by bracket depth.
+fn attribute_len(tokens: &[Token]) -> usize {
+    let mut depth = 0;
+    for (i, token) in tokens.iter().enumerate().skip(1) {
+        match token {
+            Token::Mark('[') => depth += 1,
+            Token::Mark(']') => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    tokens.len()
+}
+
+/// How many tokens the item at the start of `tokens` spans: to a `;` before any brace (`mod x;`,
+/// `use …;`), or to the brace that closes its body.
+fn item_len(tokens: &[Token]) -> usize {
+    let mut depth = 0;
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            Token::Mark('{') => depth += 1,
+            Token::Mark('}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            Token::Mark(';') if depth == 0 => return i + 1,
+            _ => {}
+        }
+    }
+    tokens.len()
+}
+
+/// `tokens` with every item a `#[cfg(test)]` attribute applies to left out, along with its
+/// attributes. Only that item: what follows an inline test module is live code.
+fn live(tokens: Vec<Token>) -> Vec<Token> {
+    let mut keep = vec![true; tokens.len()];
+    let mut i = 0;
+    while i < tokens.len() {
+        if !is_cfg_test(&tokens[i..]) {
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while matches!(&tokens[end..], [Token::Mark('#'), Token::Mark('['), ..]) {
+            end += attribute_len(&tokens[end..]);
+        }
+        end += item_len(&tokens[end..]);
+        keep[i..end.min(tokens.len())].fill(false);
+        i = end;
+    }
+    tokens
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(token, kept)| kept.then_some(token))
+        .collect()
+}
+
 /// The SQL text in the non-test part of a source file: `(statements, fragments)`. A fragment is an
 /// `Expr::cust` call, whatever it holds; a statement is any other literal that reads as SQL.
 fn sql_sites(source: &str) -> (usize, usize) {
-    let live = source.split("#[cfg(test)]").next().unwrap_or("");
-    let tokens = tokens(live);
+    let tokens = live(tokens(source));
     let mut statements = 0;
     let mut fragments = 0;
     let mut after_cust = false;
@@ -241,6 +317,7 @@ fn sql_sites(source: &str) -> (usize, usize) {
             // `Expr::cust(format!("…"))` holds its text one macro further in.
             Token::Word(w) if w == "format" => {}
             Token::Word(_) => after_cust = false,
+            Token::Mark(_) => {}
             Token::Literal(text) => {
                 if !after_cust && is_sql(text) {
                     statements += 1;
@@ -283,6 +360,30 @@ fn test_sql_text_appears_only_at_allowlisted_sites() {
     assert_eq!(
         found, expected,
         "the SQL text sites moved; ALLOWED as the tree stands:\n{listing}"
+    );
+}
+
+#[test]
+fn test_sql_sites_skips_only_the_item_a_cfg_test_attribute_applies_to() {
+    let below_a_path_module = "#[cfg(test)]\n#[path = \"tests/x.rs\"]\nmod tests;\n\
+                               fn live() { Expr::cust(\"x IS NULL\"); }";
+    assert_eq!(
+        sql_sites(below_a_path_module),
+        (0, 1),
+        "text after the module is live"
+    );
+    let below_an_inline_module = "pub mod admission {\n    fn a() {}\n    #[cfg(test)]\n    \
+        mod tests { fn t() { let q = \"SELECT 1 FROM t\"; let b = '{'; } }\n}\n\
+        fn live() { let q = \"DELETE FROM t\"; }";
+    assert_eq!(
+        sql_sites(below_an_inline_module),
+        (1, 0),
+        "the inline module is skipped by its braces, and what follows it is counted"
+    );
+    assert_eq!(
+        sql_sites("#[cfg(test)]\nfn helper() { let q = \"SELECT 1 FROM t\"; }"),
+        (0, 0),
+        "a test-only function is skipped whole"
     );
 }
 

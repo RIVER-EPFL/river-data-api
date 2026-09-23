@@ -258,3 +258,108 @@ mod tool_link {
         assert!(!output_carries_value(&json!(null), 0.0));
     }
 }
+
+mod steps {
+    use chrono::{TimeZone, Utc};
+    use uuid::Uuid;
+
+    use super::super::{
+        ExistingGroup, GrabSampleReading, GrabWriteMode, grab_groups, grab_span, grab_writer,
+        refuse_intern_rewrite, refuse_unasked_replace,
+    };
+    use crate::common::authz::Role;
+    use crate::error::AppError;
+    use crate::routes::private::collection_events::flows::Writer;
+
+    fn at(hour: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 14, hour, 0, 0).unwrap()
+    }
+
+    fn reading(parameter: u128, hour: u32, value: f64) -> GrabSampleReading {
+        serde_json::from_value(serde_json::json!({
+            "parameter_id": Uuid::from_u128(parameter),
+            "value": value,
+            "time": at(hour),
+        }))
+        .expect("a grab reading")
+    }
+
+    fn stored(parameter: u128, hour: u32) -> ExistingGroup {
+        ExistingGroup {
+            parameter_id: Uuid::from_u128(parameter),
+            time: at(hour),
+            replicates: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_grab_groups_names_each_parameter_and_instant_once_in_order() {
+        let readings = [
+            reading(1, 9, 1.0),
+            reading(1, 9, 1.1),
+            reading(2, 9, 5.0),
+            reading(1, 10, 2.0),
+        ];
+        assert_eq!(
+            grab_groups(&readings),
+            vec![
+                (Uuid::from_u128(1), at(9)),
+                (Uuid::from_u128(2), at(9)),
+                (Uuid::from_u128(1), at(10)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_grab_span_covers_every_instant_and_is_none_for_nothing() {
+        let readings = [reading(1, 11, 1.0), reading(2, 8, 1.0), reading(1, 9, 1.0)];
+        assert_eq!(grab_span(&readings), Some((at(8), at(11))));
+        assert_eq!(grab_span(&[]), None);
+    }
+
+    #[test]
+    fn test_only_the_chains_own_save_is_the_chain() {
+        assert_eq!(grab_writer(Some("chain")), Writer::Chain);
+        assert_eq!(grab_writer(Some("interactive")), Writer::Person);
+        assert_eq!(grab_writer(None), Writer::Person);
+    }
+
+    #[test]
+    fn test_a_save_on_stored_groups_rewrites_them_only_when_it_says_replace() {
+        let existing = [stored(1, 9)];
+        assert!(matches!(
+            refuse_unasked_replace(None, &existing),
+            Err(AppError::ConflictDetail { .. })
+        ));
+        assert!(refuse_unasked_replace(Some(GrabWriteMode::Replace), &existing).is_ok());
+        assert!(
+            refuse_unasked_replace(None, &[]).is_ok(),
+            "nothing stored, nothing to refuse"
+        );
+    }
+
+    #[test]
+    fn test_only_an_intern_replace_is_held_to_the_stored_values() {
+        let carried = [(Uuid::from_u128(1), at(9), 0, 7.5)];
+        assert!(
+            refuse_intern_rewrite(
+                Some(&Role::Manager),
+                Some(GrabWriteMode::Replace),
+                &carried,
+                &[]
+            )
+            .is_ok()
+        );
+        assert!(refuse_intern_rewrite(Some(&Role::Intern), None, &carried, &[]).is_ok());
+        assert!(
+            refuse_intern_rewrite(
+                Some(&Role::Intern),
+                Some(GrabWriteMode::Replace),
+                &carried,
+                &[]
+            )
+            .is_ok(),
+            "an intern's replace that moves no stored value is an entry"
+        );
+    }
+}

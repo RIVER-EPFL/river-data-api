@@ -1272,3 +1272,22 @@ async fn a_station_feed_without_a_serial_still_opens_its_deployment() {
     .await;
     assert_eq!(open, 1, "the apply opens the station feed's deployment");
 }
+
+/// Expected behaviour: a plan generated over HTTP names the caller that generated it.
+#[tokio::test]
+#[serial]
+async fn a_generated_plan_names_its_caller() {
+    let (app, token, db) = setup().await;
+    seed_lab_stream(&db, Uuid::new_v4(), "authored-doc", "Upstream Station").await;
+    let plan = create_plan(&app, &token).await;
+    let plan_id = plan["id"].as_str().expect("plan id");
+    let authored = scalar_i64(
+        &db,
+        &format!(
+            "SELECT count(*)::bigint AS v FROM pairing_plans \
+             WHERE id = '{plan_id}' AND created_by LIKE 'token:%'"
+        ),
+    )
+    .await;
+    assert_eq!(authored, 1, "the plan records who generated it");
+}

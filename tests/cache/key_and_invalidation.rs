@@ -353,7 +353,7 @@ async fn a_write_invalidates_the_sites_public_cached_readings() {
     let jwt = kc::get_keycloak_jwt("admin", "admin").await;
 
     let slot = provision_slot(&app, &jwt, "public").await;
-    e2e::set_site_parameter_public(&db, &slot.site_parameter_id).await;
+    e2e::set_site_parameter_public(&app, &jwt, &slot.site_parameter_id).await;
 
     batch_one(&app, &jwt, &slot, "2025-06-05T00:00:00Z", 601.0).await;
     batch_one(&app, &jwt, &slot, "2025-06-05T01:00:00Z", 602.0).await;

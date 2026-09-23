@@ -110,7 +110,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     migrate_result.map_err(migration::startup_error)?;
     tracing::info!("Migrations completed");
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_tx = state.shutdown.clone();
+    let shutdown_rx = state.shutdown.subscribe();
     tokio::spawn(async move {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);

@@ -121,7 +121,7 @@ async fn provision_pair_ingest_and_expose_publicly() {
     );
 
     // Expose publicly and verify the public JSON + CSV surfaces reproduce the data.
-    e2e::set_site_parameter_public(&db, &sp_id).await;
+    e2e::set_site_parameter_public(&app, &token, &sp_id).await;
 
     let pub_uri =
         "/api/public/e2e_prov/sites/prov_station/readings?start=2025-06-01T00:00:00Z&end=2025-06-01T00:59:00Z"

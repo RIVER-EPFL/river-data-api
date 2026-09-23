@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Check the e2e traceability table in ../REFERENCE.md against the tree: every suite row names a
-# module tests/e2e/main.rs declares, every declared suite has a row, and each Functions cell lists
-# exactly the #[tokio::test] functions its file defines.
+# Check the traceability tables in ../REFERENCE.md against the tree: every suite row names a
+# module tests/e2e/main.rs declares, every declared suite has a row, each Functions cell lists
+# exactly the #[tokio::test] functions its file defines, every `path.rs::function` cited anywhere
+# in the file is defined at that path, and every "`path.rs` (N functions" count is that file's.
 # Usage: scripts/check_traceability.sh [path/to/REFERENCE.md]   (run from the repository root)
 #
 # Exits non-zero on the first mismatch, naming it. REFERENCE.md is outside every repository, so
@@ -40,4 +41,34 @@ while IFS= read -r suite; do
     fi
 done <<< "$declared"
 
-echo "traceability table matches $MAIN: $count suites"
+# --- Every cited test function exists where it is cited ---
+missing=0
+while IFS= read -r cite; do
+    path=${cite%%::*}
+    fn=${cite##*::}
+    if [ ! -f "$path" ] || ! grep -qE "fn $fn\b" "$path"; then
+        echo "cited but not defined: $path::$fn"
+        missing=1
+    fi
+done < <(grep -oE '`(tests|src)/[a-z_0-9/]+\.rs::[a-z_0-9]+`' "$REFERENCE" | tr -d '`' | sort -u)
+[ "$missing" -eq 0 ] || exit 1
+
+# --- Every stated function count is the file's ---
+number() {
+    case $1 in
+        one) echo 1 ;; two) echo 2 ;; three) echo 3 ;; four) echo 4 ;; five) echo 5 ;;
+        six) echo 6 ;; seven) echo 7 ;; eight) echo 8 ;; nine) echo 9 ;; ten) echo 10 ;;
+        eleven) echo 11 ;; twelve) echo 12 ;; *) echo "$1" ;;
+    esac
+}
+while IFS= read -r claim; do
+    path=$(printf '%s' "$claim" | grep -oE '(tests|src)/[a-z_0-9/]+\.rs')
+    stated=$(number "$(printf '%s' "$claim" | sed -E 's/.*\(([a-z0-9]+) functions?.*/\1/')")
+    actual=$(grep -c '#\[tokio::test\]' "$path")
+    if [ "$stated" != "$actual" ]; then
+        echo "$path: REFERENCE.md says $stated functions, the file defines $actual"
+        exit 1
+    fi
+done < <(grep -oE '`(tests|src)/[a-z_0-9/]+\.rs` \([a-z0-9]+ functions?' "$REFERENCE" | sort -u)
+
+echo "traceability table matches $MAIN: $count suites, and every cited function exists"

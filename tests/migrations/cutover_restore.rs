@@ -40,6 +40,16 @@ INSERT INTO data_streams (source_system, source_key, site_parameter_id, sensor_i
       WHERE sp.name = 'Martigny DOC' AND n.serial_number = 'SN-1';
 INSERT INTO collection_events (site_id, collected_at)
      SELECT id, '2024-06-01T09:00:00Z' FROM sites WHERE name = 'Martigny';
+INSERT INTO parameters (code, name, default_units) VALUES ('temp', 'Temperature', 'C');
+INSERT INTO site_parameters (site_id, parameter_id, name)
+     SELECT s.id, p.id, 'Martigny temperature' FROM sites s, parameters p
+      WHERE s.name = 'Martigny' AND p.code = 'temp';
+INSERT INTO sensor_calibrations (sensor_id, parameter_id, slope, intercept, valid_from)
+     SELECT n.id, p.id, 3, 0, '2024-01-01T00:00:00Z' FROM sensors n, parameters p
+      WHERE n.serial_number = 'SN-1' AND p.code = 'temp';
+INSERT INTO data_streams (source_system, source_key, site_parameter_id, sensor_id)
+     SELECT 'cnet', 'temp-1', sp.id, n.id FROM site_parameters sp, sensors n
+      WHERE sp.name = 'Martigny temperature' AND n.serial_number = 'SN-1';
 ";
 
 /// The state only the dump holds: the measurements, what was decided about them, the statistics
@@ -79,7 +89,7 @@ INSERT INTO readings (stream_id, time, replicate_index, site_id, parameter_id, r
             sensor_calibrations c, sensor_deployments dep, standard_curves sc,
             collection_events e
       WHERE d.source_key = 'doc-1' AND s.name = 'Martigny' AND p.code = 'doc'
-        AND n.serial_number = 'SN-1' AND sc.source_key = 'curve-7';
+        AND n.serial_number = 'SN-1' AND sc.source_key = 'curve-7' AND c.parameter_id = p.id;
 
 INSERT INTO readings (stream_id, time, site_id, parameter_id, raw_value, calibrated_value,
                       sensor_id, calibration_id, deployment_id, measurement_type)
@@ -87,7 +97,15 @@ INSERT INTO readings (stream_id, time, site_id, parameter_id, raw_value, calibra
        FROM data_streams d, sites s, parameters p, sensors n, sensor_calibrations c,
             sensor_deployments dep
       WHERE d.source_key = 'doc-1' AND s.name = 'Martigny' AND p.code = 'doc'
-        AND n.serial_number = 'SN-1';
+        AND n.serial_number = 'SN-1' AND c.parameter_id = p.id;
+
+-- The instrument's second channel, whose curve opens at the same instant as the first's.
+INSERT INTO readings (stream_id, time, site_id, parameter_id, raw_value, calibrated_value,
+                      sensor_id, calibration_id, measurement_type)
+     SELECT d.id, '2024-06-02T09:00:00Z', s.id, p.id, 4, 12, n.id, c.id, 'continuous'
+       FROM data_streams d, sites s, parameters p, sensors n, sensor_calibrations c
+      WHERE d.source_key = 'temp-1' AND s.name = 'Martigny' AND p.code = 'temp'
+        AND n.serial_number = 'SN-1' AND c.parameter_id = p.id;
 
 INSERT INTO reading_decisions (stream_id, time, replicate_index, kind, old, new, actor, origin,
                                reason)
@@ -164,7 +182,8 @@ const ROWS: &[(&str, &str)] = &[
                     || jsonb_build_object(
                          'stream', d.source_system || '/' || d.source_key,
                          'site', lower(s.name), 'parameter', lower(p.code),
-                         'sensor', n.serial_number, 'calibration', c.valid_from::text,
+                         'sensor', n.serial_number,
+                         'calibration', c.valid_from::text || '/' || coalesce(cp.code, ''),
                          'deployment', dep.deployed_from::text,
                          'curve', sc.source_key, 'visit', e.collected_at::text))::text AS row
               FROM readings r
@@ -173,6 +192,7 @@ const ROWS: &[(&str, &str)] = &[
               LEFT JOIN parameters p ON p.id = r.parameter_id
               LEFT JOIN sensors n ON n.id = r.sensor_id
               LEFT JOIN sensor_calibrations c ON c.id = r.calibration_id
+              LEFT JOIN parameters cp ON cp.id = c.parameter_id
               LEFT JOIN sensor_deployments dep ON dep.id = r.deployment_id
               LEFT JOIN standard_curves sc ON sc.id = r.standard_curve_id
               LEFT JOIN collection_events e ON e.id = r.collection_event_id",
@@ -370,7 +390,7 @@ async fn a_dump_and_a_rebuilt_database_hold_the_same_curated_state() {
         "carried readings name a tool run the rebuilt database does not hold"
     );
     assert_eq!(report.rows("tool_runs"), 1, "{counts}");
-    assert_eq!(report.rows("readings"), 4, "{counts}");
+    assert_eq!(report.rows("readings"), 5, "{counts}");
     assert_eq!(report.rows("reading_decisions"), 4, "{counts}");
     assert!(
         left_behind.contains(&"1 tool_scripts".to_string()),

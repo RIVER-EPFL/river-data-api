@@ -8,7 +8,6 @@ use axum::extract::State;
 use chrono::Utc;
 use sea_orm::ActiveModelTrait;
 use sea_orm::ColumnTrait;
-use sea_orm::Condition;
 use sea_orm::EntityTrait;
 use sea_orm::QueryFilter;
 use sea_orm::QueryOrder;
@@ -50,7 +49,6 @@ use crate::routes::private::readings::service::CurveClaim;
 use crate::routes::private::readings::service::Replace;
 use crate::routes::private::readings::service::admit_standard_curves;
 use crate::routes::private::readings::service::readings_on_conflict;
-use crate::routes::private::readings::service::readings_upsert;
 use crate::routes::private::readings::service::rows_at;
 use crate::routes::private::readings::service::run_id_of;
 use crate::routes::private::readings::status_events;
@@ -61,11 +59,8 @@ use crate::routes::private::sensor_calibrations::service::apply_curves;
 use crate::routes::private::sensors::models::ResolvedOwner;
 use crate::routes::private::sensors::service::resolve_slot_owner_for_times;
 use crate::routes::private::sensors::service::resolve_windows_for_times;
-use crate::routes::private::site_parameters;
-use crate::routes::private::sites;
 use crate::routes::private::standard_curves;
 use crate::routes::private::sync::models::GroupAudit;
-use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::private::sync::service as audit;
 use crate::routes::resolve_site_with_project;
 use crate::routes::service::ACTION_BODY_LIMIT;
@@ -2725,851 +2720,74 @@ pub async fn insert_grab_samples(
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<GrabSampleRequest>,
 ) -> AppResult<Json<GrabSampleResponse>> {
-    if payload.readings.is_empty() {
-        return Err(AppError::BadRequest("No readings provided".to_string()));
-    }
-
-    // A project-scoped token may only write to a site within its project.
-    enforce_project_scope_for_sites(&state.db, &scope, &[payload.site_id]).await?;
-
-    for r in &payload.readings {
-        crate::routes::private::readings::service::admission::admit(
-            r.time,
-            r.value,
-            Some(GRAB_MEASUREMENT_TYPE),
-        )?;
-    }
-
-    // Validate site exists
-    let site = sites::Entity::find_by_id(payload.site_id)
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("Site {} not found", payload.site_id)))?;
-
-    // Validate all parameter_ids exist for this site
-    let param_ids: Vec<Uuid> = payload.readings.iter().map(|r| r.parameter_id).collect();
-    let site_params = site_parameters::Entity::find()
-        .filter(site_parameters::Column::SiteId.eq(site.id))
-        .filter(site_parameters::Column::ParameterId.is_in(param_ids.clone()))
-        .all(&state.db)
-        .await?;
-
-    let valid_param_ids: std::collections::HashSet<Uuid> =
-        site_params.iter().map(|sp| sp.parameter_id).collect();
-    let sp_lookup: HashMap<Uuid, Uuid> = site_params
-        .iter()
-        .map(|sp| (sp.parameter_id, sp.id))
-        .collect();
-
-    // What each slot declares measures it. A slot that declares nothing is undeclared, not a
-    // reason to borrow another row's instrument.
-    let slot_instruments: HashMap<Uuid, Uuid> = site_params
-        .iter()
-        .filter_map(|sp| sp.instrument_sensor_id.map(|sid| (sp.parameter_id, sid)))
-        .collect();
-
-    // A hand save is held to the slots the site carries: one landing on a slot the site does not
-    // carry is refused rather than minting one, because a mint here would create the declaration
-    // it is meant to be checked against (Q98, kept by Q193). A publishing run is the other case,
-    // and mints its output slot where the site declares the inputs it read.
-    for r in &payload.readings {
-        if !valid_param_ids.contains(&r.parameter_id) {
-            return Err(AppError::BadRequest(format!(
-                "Parameter {} is not configured for site {}; add its parameter group to the site \
-                 first (POST /api/sites/{}/parameter_groups)",
-                r.parameter_id, site.name, site.id
-            )));
-        }
-    }
-
-    // A save that names a seasonal check is held to it: every (parameter, value) pair must have
-    // been screened by exactly that check.
-    if let Some(check_id) = payload.check_id {
-        let pairs: Vec<(Uuid, f64)> = payload
-            .readings
-            .iter()
-            .map(|r| (r.parameter_id, r.value))
-            .collect();
-        crate::routes::private::readings::service::validate_check_claim(
-            &state.db, check_id, site.id, &pairs,
-        )
-        .await?;
-    }
-
-    // Replicate indices, both curves and the served value are computed before anything is
-    // written, so the same numbers serve the dry-run preview, the conflict report and the write.
-    let indices = assign_replicate_indices(&payload.readings)?;
-
-    let provenance = resolve_tool_run_provenance(
-        &state.db,
-        payload.tool_run_id,
-        site.id,
-        &payload.readings,
-        &crate::common::actor::label(&auth),
-    )
-    .await?;
-
-    // What the operator picked, held to the same rule as a slot's declaration and a deployment:
-    // a bookkeeping row records that nothing was declared, and a retired instrument is not in the
-    // lab. The slot's own declaration is guarded where it is set, so only the request's pick is
-    // checked here.
-    let picked: Vec<Uuid> = payload
-        .readings
-        .iter()
-        .filter_map(|r| r.sensor_id)
-        .collect();
-    crate::routes::private::sensors::service::require_measuring_instruments(
-        &state.db,
-        &picked,
-        "named as what measured a grab sample",
-    )
-    .await?;
-
-    // The chosen standard curves, admitted by the one rule every writer of `standard_curve_id`
-    // uses. A grab is spot by construction, so the only claims this path can be refused for are an
-    // unknown id, a curve fitted on another instrument, and a curve on a grab that names no
-    // instrument at all.
-    let claims: Vec<CurveClaim<'_>> = payload
-        .readings
-        .iter()
-        .filter_map(|r| {
-            r.standard_curve_id.map(|id| CurveClaim {
-                standard_curve_id: id,
-                sensor_id: declared_instrument(
-                    r.sensor_id,
-                    slot_instruments.get(&r.parameter_id).copied(),
-                ),
-                measurement_type: GRAB_MEASUREMENT_TYPE,
-            })
-        })
-        .collect();
-    let standard_curves = admit_standard_curves(&state.db, &claims).await?;
-
-    // The base calibration covering each grab that names an instrument, ranked by the one resolver
-    // the ingest and reprocess paths use. Resolving it here is what lets the row carry both the id
-    // and the value that id produced: a stamped calibration the stored value was never corrected by
-    // is provenance that reads as true and is not.
-    let base_curves = {
-        let requests: Vec<(Uuid, Option<Uuid>, chrono::DateTime<chrono::Utc>)> = payload
-            .readings
-            .iter()
-            .filter_map(|r| {
-                declared_instrument(r.sensor_id, slot_instruments.get(&r.parameter_id).copied())
-                    .map(|sid| (sid, Some(r.parameter_id), r.time))
-            })
-            .collect();
-        sensor_calibrations::resolver::resolve_many(&state.db, &requests).await?
-    };
-
-    let preview: Vec<GrabPreview> = payload
-        .readings
-        .iter()
-        .zip(&indices)
-        .map(|(r, &replicate_index)| {
-            let base =
-                declared_instrument(r.sensor_id, slot_instruments.get(&r.parameter_id).copied())
-                    .and_then(|sid| base_curves.get(&(sid, Some(r.parameter_id), r.time)))
-                    .copied();
-            let standard = r.standard_curve_id.map(|cid| {
-                let c = &standard_curves[&cid];
-                sensor_calibrations::service::Curve {
-                    id: c.id,
-                    slope: c.slope,
-                    intercept: c.intercept,
-                }
-            });
-            // Both corrections, in the one order the arithmetic is defined in: the instrument's
-            // base calibration, then the operator's standard curve on that result. A grab that
-            // resolves neither is stored uncorrected, and `calibrated_value` stays NULL so a null
-            // still means "no curve was applied" rather than "a curve happened to be identity".
-            let calibrated_value = (base.is_some() || standard.is_some())
-                .then(|| sensor_calibrations::service::apply_curves(r.value, base, standard));
-            let composed_equation = match (base, standard) {
-                (Some(b), Some(s)) => Some(equation(
-                    s.slope * b.slope,
-                    s.slope * b.intercept + s.intercept,
-                )),
-                _ => None,
-            };
-            GrabPreview {
-                parameter_id: r.parameter_id,
-                time: r.time,
-                replicate_index,
-                raw_value: r.value,
-                base_calibration: base.map(|c| CurveApplication {
-                    id: c.id,
-                    name: None,
-                    slope: c.slope,
-                    intercept: c.intercept,
-                    equation: equation(c.slope, c.intercept),
-                }),
-                standard_curve: standard.map(|c| CurveApplication {
-                    id: c.id,
-                    name: standard_curves[&c.id].name.clone(),
-                    slope: c.slope,
-                    intercept: c.intercept,
-                    equation: equation(c.slope, c.intercept),
-                }),
-                composed_equation,
-                calibrated_value,
-            }
-        })
-        .collect();
-
-    let groups: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = {
-        let mut seen = std::collections::HashSet::new();
-        payload
-            .readings
-            .iter()
-            .filter(|r| seen.insert((r.parameter_id, r.time)))
-            .map(|r| (r.parameter_id, r.time))
-            .collect()
-    };
-    let existing_groups = fetch_existing_groups(&state.db, payload.site_id, &groups).await?;
-
-    // Which calculations this save feeds, known before anything is written. The chain's own save
-    // is the recompute: it reports nothing and enqueues nothing.
-    let run_source = tool_run_source(&state.db, payload.tool_run_id).await?;
-    let writer = match run_source.as_deref() {
-        Some("chain") => flows::Writer::Chain,
-        _ => flows::Writer::Person,
-    };
-    // Where these values come from. A save that names no run is a person typing a number.
-    let provenance_kind =
-        crate::routes::private::readings::service::provenance_kind_for_run(run_source.as_deref());
-    let calculations = if writer == flows::Writer::Chain {
-        Vec::new()
-    } else {
-        let mut touched: Vec<Uuid> = payload.readings.iter().map(|r| r.parameter_id).collect();
-        touched.sort_unstable();
-        touched.dedup();
-        crate::routes::private::tools::service::calculations_fed_by(&state.db, &touched).await?
-    };
-
+    let db = &state.db;
+    let readings = &payload.readings;
+    require_grab_readings(readings)?;
+    enforce_project_scope_for_sites(db, &scope, &[payload.site_id]).await?;
+    admit_grab_readings(readings)?;
+    let site = find_grab_site(db, payload.site_id).await?;
+    let slots = load_grab_slots(db, site.id, readings).await?;
+    slots.require_configured(&site, readings)?;
+    require_checked_values(db, payload.check_id, site.id, readings).await?;
+    let indices = assign_replicate_indices(readings)?;
+    let actor = label(&auth);
+    let provenance =
+        resolve_tool_run_provenance(db, payload.tool_run_id, site.id, readings, &actor).await?;
+    require_picked_instruments(db, readings).await?;
+    let standard_curves = admit_grab_curves(db, readings, &slots).await?;
+    let base_curves = resolve_grab_calibrations(db, readings, &slots).await?;
+    let preview = grab_preview(readings, &indices, &slots, &base_curves, &standard_curves);
+    let groups = grab_groups(readings);
+    let existing_groups = fetch_existing_groups(db, payload.site_id, &groups).await?;
+    let run_source = tool_run_source(db, payload.tool_run_id).await?;
+    let writer = grab_writer(run_source.as_deref());
+    let provenance_kind = provenance_kind_for_run(run_source.as_deref());
+    let calculations = calculations_fed_by_grab(db, writer, readings).await?;
     if payload.dry_run {
-        return Ok(Json(GrabSampleResponse {
-            inserted: 0,
-            samples_created: 0,
-            created_sample_ids: vec![],
-            dry_run: true,
-            replaced: 0,
-            kept_curated: 0,
-            withdrawn: 0,
-            preview,
-            existing_groups,
-            calculations,
-        }));
+        return Ok(Json(grab_dry_run(preview, existing_groups, calculations)));
     }
 
-    // An intern enters measurements; a stored value is someone else's to change (Q21). A replace
-    // that carries every stored replicate at the number it already holds changes none of them: the
-    // entry grid posts the whole group, so a repeat typed into an empty cell arrives this way.
-    let carried: Vec<(Uuid, chrono::DateTime<chrono::Utc>, i16, f64)> = payload
-        .readings
-        .iter()
-        .zip(&preview)
-        .map(|(r, p)| (r.parameter_id, r.time, p.replicate_index, r.value))
-        .collect();
-    if crate::routes::private::readings::service::entry_state(auth.highest_role().as_ref())
-        .is_some()
-        && payload.mode == Some(GrabWriteMode::Replace)
-    {
-        let moved = crate::routes::private::readings::service::stored_values_moved(
-            &carried,
-            &existing_groups,
-        );
-        if moved > 0 {
-            return Err(AppError::Forbidden(format!(
-                "An intern's entry cannot replace stored values; a manager rewrites them \
-                 ({moved} stored replicate(s) would move)"
-            )));
-        }
-    }
-    // A value computed from a pending measurement is pending too (M62): the chain says so.
-    let entry_state = crate::routes::private::readings::service::entry_kind(
-        payload.pending_inputs,
+    let carried = carried_replicates(readings, &preview);
+    refuse_intern_rewrite(
         auth.highest_role().as_ref(),
-    );
-
-    // A save built from a stale read would retract a repeat added under it, so a client that says
-    // what it read is refused when a group no longer holds that.
-    if let Some(expected) = &payload.expected_replicates {
-        let changed =
-            crate::routes::private::readings::service::groups_changed(expected, &existing_groups);
-        if !changed.is_empty() {
-            let detail = serde_json::to_value(&existing_groups)
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            return Err(AppError::ConflictDetail {
-                message: format!(
-                    "{} replicate group(s) changed since they were read; re-read the visit and \
-                     save again",
-                    changed.len()
-                ),
-                detail,
-            });
-        }
-    }
-
-    if !existing_groups.is_empty() && payload.mode != Some(GrabWriteMode::Replace) {
-        let detail = serde_json::to_value(&existing_groups)
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        return Err(AppError::ConflictDetail {
-            message: format!(
-                "{} replicate group(s) are already stored at the requested times; pass mode \
-                 \"replace\" to rewrite them",
-                existing_groups.len()
-            ),
-            detail,
-        });
-    }
-
-    // Resolve stream_ids for each unique (site_id, parameter_id)
-    let mut stream_cache: HashMap<Uuid, Uuid> = HashMap::new();
-    for r in &payload.readings {
-        if let std::collections::hash_map::Entry::Vacant(entry) = stream_cache.entry(r.parameter_id)
-        {
-            let sp_id = sp_lookup.get(&r.parameter_id).copied();
-            let stream_id =
-                get_or_create_grab_stream(&state.db, payload.site_id, r.parameter_id, sp_id)
-                    .await?;
-            entry.insert(stream_id);
-        }
-    }
-
-    // The channel instrument each parameter's grab stream carries, which a reading naming no
-    // instrument of its own is attributed to. A hand-entered value still records what produced it.
-    let stream_sensors: HashMap<Uuid, Uuid> = {
-        let ids: Vec<Uuid> = stream_cache.values().copied().collect();
-        let mut map = HashMap::new();
-        let streams = crate::routes::private::data_streams::models::Entity::find()
-            .filter(crate::routes::private::data_streams::models::Column::Id.is_in(ids))
-            .filter(crate::routes::private::data_streams::models::Column::SensorId.is_not_null())
-            .all(&state.db)
-            .await?;
-        for stream in streams {
-            if let Some(sensor_id) = stream.sensor_id {
-                map.insert(stream.id, sensor_id);
-            }
-        }
-        map
-    };
-
-    // Window-aware attribution for grabs that name a sensor: which deployment the instrument was on
-    // at the grab time (site-fixed to payload.site_id), instead of writing NULL. Grabs without a
-    // sensor_id keep NULL deployment (manual lab values with no instrument).
-    let grab_slots = {
-        use crate::routes::private::sensors::models::ResolvedSlot;
-        use crate::routes::private::sensors::service::resolve_windows_for_times;
-        let mut times_by_channel: HashMap<(Uuid, Uuid), Vec<chrono::DateTime<chrono::Utc>>> =
-            HashMap::new();
-        for r in &payload.readings {
-            if let Some(sid) =
-                declared_instrument(r.sensor_id, slot_instruments.get(&r.parameter_id).copied())
-            {
-                times_by_channel
-                    .entry((sid, r.parameter_id))
-                    .or_default()
-                    .push(r.time);
-            }
-        }
-        let mut slots: HashMap<(Uuid, Uuid, chrono::DateTime<chrono::Utc>), ResolvedSlot> =
-            HashMap::new();
-        for ((sid, pid), times) in &times_by_channel {
-            let resolved = resolve_windows_for_times(
-                &state.db,
-                *sid,
-                Some(payload.site_id),
-                Some(*pid),
-                times,
-            )
-            .await
-            .unwrap_or_default();
-            for (t, slot) in resolved {
-                slots.insert((*sid, *pid, t), slot);
-            }
-        }
-        slots
-    };
-
-    // Per-parameter time windows for the alarm episode reconstruction below.
-    let mut alarm_windows: HashMap<
-        Uuid,
-        (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
-    > = HashMap::new();
-    for r in &payload.readings {
-        alarm_windows
-            .entry(r.parameter_id)
-            .and_modify(|(lo, hi)| {
-                *lo = (*lo).min(r.time);
-                *hi = (*hi).max(r.time);
-            })
-            .or_insert((r.time, r.time));
-    }
-
-    let total = payload.readings.len();
+        payload.mode,
+        &carried,
+        &existing_groups,
+    )?;
+    let entry_state = entry_kind(payload.pending_inputs, auth.highest_role().as_ref());
+    refuse_stale_read(payload.expected_replicates.as_deref(), &existing_groups)?;
+    refuse_unasked_replace(payload.mode, &existing_groups)?;
+    let stream_cache = grab_streams(db, payload.site_id, readings, &slots).await?;
+    let stream_instruments = grab_stream_instruments(db, &stream_cache).await?;
+    let deployments = grab_deployments(db, payload.site_id, readings, &slots).await;
+    let total = readings.len();
 
     // One guarded transaction: a replace on a compressed chunk must not fail on the cap, and the
-    // delete, the sample rows and the insert land together or not at all.
-    let actor = crate::common::actor::label(&auth);
-    let (inserted, replaced, kept_curated, withdrawn, created_sample_ids, touched_events) =
-        crate::common::bulk_write::guarded(&state.db, async |txn| {
-            // A replace rewrites the rows carrying the group's label, notes, authorship and blob,
-            // so they are captured first and kept on the rewritten rows wherever the request does
-            // not carry its own.
-            let mut prior_facts: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), StoredFacts> =
-                HashMap::new();
-            let (replaced, kept_curated, withdrawn): (usize, usize, usize) =
-                if payload.mode == Some(GrabWriteMode::Replace) {
-                    // What the replace rewrites is decided before the rows go: a person's
-                    // correction of a stored value, or the chain superseding an output with a
-                    // fresh run (ADR 0008). Rows whose value does not change decide nothing.
-                    let (kind, origin, reason) = match writer {
-                        flows::Writer::Chain => (
-                            crate::routes::private::readings::models::Kind::Chain,
-                            crate::routes::private::readings::models::Origin::Chain,
-                            "superseded by a recompute",
-                        ),
-                        flows::Writer::Person => (
-                            crate::routes::private::readings::models::Kind::ValueCorrection,
-                            crate::routes::private::readings::models::Origin::Manual,
-                            "replaced by a new entry",
-                        ),
-                    };
-                    for (parameter_id, time) in &groups {
-                        let rows: Vec<(chrono::DateTime<chrono::Utc>, i16, serde_json::Value)> =
-                            payload
-                                .readings
-                                .iter()
-                                .zip(&preview)
-                                .filter(|(r, _)| r.parameter_id == *parameter_id && r.time == *time)
-                                .map(|(_, p)| {
-                                    let new = match (writer, payload.tool_run_id) {
-                                        (flows::Writer::Chain, Some(run_id)) => {
-                                            serde_json::json!({ "run_id": run_id })
-                                        }
-                                        _ => serde_json::json!({ "raw_value": p.raw_value }),
-                                    };
-                                    (*time, p.replicate_index, new)
-                                })
-                                .collect();
-                        // Only the rows the replace rewrites are decided: a flagged, withdrawn
-                        // or hand-curved row stays as it is (SB5) and gets a hold, not a
-                        // correction. The curve rule is the delete's own, per group.
-                        let supplies_curve = payload.readings.iter().zip(&preview).any(|(r, p)| {
-                            r.parameter_id == *parameter_id
-                                && r.time == *time
-                                && p.standard_curve.is_some()
-                        });
-                        let guard = if supplies_curve {
-                            "r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL"
-                        } else {
-                            "r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL \
-                             AND r.standard_curve_id IS NULL"
-                        };
-                        crate::routes::private::readings::service::record_keyed(
-                            txn,
-                            kind,
-                            stream_cache[parameter_id],
-                            &rows,
-                            &actor,
-                            Some(reason),
-                            origin,
-                            crate::routes::private::readings::service::Keyed::Changed,
-                            Some(guard),
-                            None,
-                        )
-                        .await?;
-                    }
-                    for (parameter_id, time) in &groups {
-                        if let Some(row) = readings::Entity::find()
-                            .select_only()
-                            .column(readings::Column::Label)
-                            .column(readings::Column::Notes)
-                            .column(readings::Column::CreatedBy)
-                            .column(readings::Column::Provenance)
-                            .column(readings::Column::ProvenanceKind)
-                            .filter(readings::Column::SiteId.eq(payload.site_id))
-                            .filter(readings::Column::ParameterId.eq(*parameter_id))
-                            .filter(readings::Column::Time.eq(*time))
-                            .filter(readings::Column::MeasurementType.eq("spot"))
-                            .filter(
-                                Condition::any()
-                                    .add(readings::Column::Label.is_not_null())
-                                    .add(readings::Column::Notes.is_not_null())
-                                    .add(readings::Column::CreatedBy.is_not_null())
-                                    .add(readings::Column::Provenance.is_not_null()),
-                            )
-                            .order_by_asc(readings::Column::ReplicateIndex)
-                            .into_model::<PriorFactsRow>()
-                            .one(txn)
-                            .await?
-                        {
-                            prior_facts.insert((*parameter_id, *time), row.into());
-                        }
-                    }
-                    // The rewrite is scoped to the grab stream: another source's rows at the same
-                    // instant are not this request's to rewrite. Curation wins, as in the windowed
-                    // diff: a flagged, withdrawn or hand-curved row stays and the disagreement
-                    // lands in the review queue.
-                    let mut removed: u64 = 0;
-                    let mut kept_total: usize = 0;
-                    let mut withdrawn: usize = 0;
-                    for (parameter_id, time) in &groups {
-                        let stream_id = stream_cache[parameter_id];
-                        let supplies_curve = payload.readings.iter().zip(&preview).any(|(r, p)| {
-                            r.parameter_id == *parameter_id
-                                && r.time == *time
-                                && p.standard_curve.is_some()
-                        });
-                        let kept = readings::Entity::find()
-                            .select_only()
-                            .column(readings::Column::ReplicateIndex)
-                            .column_as(kept_reason(), "reason")
-                            .filter(readings::Column::StreamId.eq(stream_id))
-                            .filter(readings::Column::Time.eq(*time))
-                            .filter(readings::Column::MeasurementType.eq("spot"))
-                            .filter(curated_or_curved(supplies_curve))
-                            .order_by_asc(readings::Column::ReplicateIndex)
-                            .into_model::<KeptRow>()
-                            .all(txn)
-                            .await?;
-                        if !kept.is_empty() {
-                            let entries = kept
-                                .iter()
-                                .map(|r| {
-                                    serde_json::json!({
-                                        "replicate_index": r.replicate_index,
-                                        "reason": r.reason,
-                                    })
-                                })
-                                .collect::<Vec<_>>();
-                            crate::routes::private::readings::service::upsert_source_modified_hold(
-                                txn,
-                                stream_id,
-                                *time,
-                                serde_json::json!({ "claim": "replaced", "kept": entries }),
-                                serde_json::json!({ "kept": true }),
-                                HoldStatus::Pending,
-                            )
-                            .await?;
-                            kept_total += kept.len();
-                        }
-                        // What the save carries is rewritten; what it leaves out is retracted,
-                        // never deleted. A cleared cell or a narrower pasted block is a person
-                        // saying the replicate is not part of the measurement any more, and the
-                        // stamp is reversible where a delete is not.
-                        let carried: Vec<i16> = payload
-                            .readings
-                            .iter()
-                            .zip(&preview)
-                            .filter(|(r, _)| r.parameter_id == *parameter_id && r.time == *time)
-                            .map(|(_, p)| p.replicate_index)
-                            .collect();
-                        let uncurved = |cond: Condition| {
-                            if supplies_curve {
-                                cond
-                            } else {
-                                cond.add(readings::Column::StandardCurveId.is_null())
-                            }
-                        };
-                        let dropped = crate::routes::private::readings::service::record_many(
-                            txn,
-                            crate::routes::private::readings::models::Kind::Withdraw,
-                            {
-                                use crate::routes::private::collection_events::flows::row;
-                                use crate::routes::private::readings::models::Column;
-                                use sea_orm::ExprTrait as _;
-                                let mut cond = Condition::all()
-                                    .add(row(Column::StreamId).eq(stream_id))
-                                    .add(row(Column::Time).eq(
-                                        sea_orm::prelude::DateTimeWithTimeZone::from(*time),
-                                    ))
-                                    .add(row(Column::MeasurementType).eq("spot"))
-                                    .add(row(Column::ReplicateIndex).is_not_in(carried.clone()))
-                                    .add(Expr::cust("r.is_flagged IS NOT TRUE"))
-                                    .add(row(Column::WithdrawnAt).is_null());
-                                if !supplies_curve {
-                                    cond = cond.add(row(Column::StandardCurveId).is_null());
-                                }
-                                cond
-                            },
-                            crate::routes::private::readings::service::NewValue::Literal(
-                                serde_json::json!({ "reason": "the save no longer carries this replicate" }),
-                            ),
-                            &actor,
-                            Some("dropped by a narrower entry"),
-                            crate::routes::private::readings::models::Origin::Manual,
-                            None,
-                        )
-                        .await?;
-                        withdrawn += usize::try_from(dropped.rows).unwrap_or(usize::MAX);
-                        // The carried rows are rewritten in place by the insert's conflict
-                        // clause, under the same guard, so what no entry sets stays on them.
-                        use sea_orm::PaginatorTrait as _;
-                        removed += readings::Entity::find()
-                            .filter(readings::Column::StreamId.eq(stream_id))
-                            .filter(readings::Column::Time.eq(*time))
-                            .filter(readings::Column::MeasurementType.eq("spot"))
-                            .filter(readings::Column::ReplicateIndex.is_in(carried))
-                            .filter(Expr::cust("is_flagged IS NOT TRUE"))
-                            .filter(readings::Column::WithdrawnAt.is_null())
-                            .filter(uncurved(Condition::all()))
-                            .count(txn)
-                            .await?;
-                    }
-                    (
-                        usize::try_from(removed).unwrap_or(usize::MAX),
-                        kept_total,
-                        withdrawn,
-                    )
-                } else {
-                    (0, 0, 0)
-                };
-
-            // What each row records about the measurement, request first and the rewritten group's
-            // own prior values where the request is silent.
-            let facts = GrabFacts {
-                created_by: Some(&actor),
-                label: payload.label.as_deref(),
-                notes: payload.notes.as_deref(),
-                provenance: provenance.as_ref(),
-                kind: provenance_kind,
-            };
-            let stored_facts: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), StoredFacts> = groups
-                .iter()
-                .map(|group| (*group, facts.over(prior_facts.get(group))))
-                .collect();
-
-            let models: Vec<readings::ActiveModel> = payload
-                .readings
-                .iter()
-                .zip(&preview)
-                .map(|(r, p)| readings::ActiveModel {
-                    standard_curve_id: Set(p.standard_curve.as_ref().map(|c| c.id)),
-                    site_id: Set(Some(payload.site_id)),
-                    parameter_id: Set(Some(r.parameter_id)),
-                    calibrated_value: Set(p.calibrated_value),
-                    sensor_id: Set(declared_instrument(
-                        r.sensor_id,
-                        slot_instruments.get(&r.parameter_id).copied(),
-                    )
-                    .or_else(|| stream_sensors.get(&stream_cache[&r.parameter_id]).copied())),
-                    calibration_id: Set(p.base_calibration.as_ref().map(|c| c.id)),
-                    deployment_id: Set(declared_instrument(
-                        r.sensor_id,
-                        slot_instruments.get(&r.parameter_id).copied(),
-                    )
-                    .and_then(|sid| {
-                        grab_slots
-                            .get(&(sid, r.parameter_id, r.time))
-                            .and_then(|s| s.deployment_id)
-                    })),
-                    measurement_type: Set(Some(GRAB_MEASUREMENT_TYPE.to_string())),
-                    label: Set(stored_facts[&(r.parameter_id, r.time)].label.clone()),
-                    notes: Set(stored_facts[&(r.parameter_id, r.time)].notes.clone()),
-                    created_by: Set(stored_facts[&(r.parameter_id, r.time)].created_by.clone()),
-                    provenance: Set(stored_facts[&(r.parameter_id, r.time)].provenance.clone()),
-                    provenance_kind: Set(stored_facts[&(r.parameter_id, r.time)].kind.clone()),
-                    ..readings::new(
-                        stream_cache[&r.parameter_id],
-                        r.time.into(),
-                        p.replicate_index,
-                        r.value,
-                    )
-                })
-                .collect();
-
-            // A replace rewrites each carried row in place, guarded per group by whether the
-            // save names a curve; any other save keeps the stored row.
-            let curved_groups: HashSet<(Uuid, chrono::DateTime<chrono::Utc>)> = payload
-                .readings
-                .iter()
-                .zip(&preview)
-                .filter(|(_, p)| p.standard_curve.is_some())
-                .map(|(r, _)| (r.parameter_id, r.time))
-                .collect();
-            let mut inserted = 0usize;
-            for curved in [false, true] {
-                let batch: Vec<readings::ActiveModel> = payload
-                    .readings
-                    .iter()
-                    .zip(&models)
-                    .filter(|(r, _)| curved_groups.contains(&(r.parameter_id, r.time)) == curved)
-                    .map(|(_, m)| m.clone())
-                    .collect();
-                if batch.is_empty() {
-                    continue;
-                }
-                let replace = if payload.mode == Some(GrabWriteMode::Replace) {
-                    Replace::Entry { curved }
-                } else {
-                    Replace::Nothing
-                };
-                inserted += match readings::Entity::insert_many(batch)
-                    .on_conflict(readings_upsert(replace))
-                    .exec_without_returning(txn)
-                    .await
-                {
-                    Ok(rows) => rows as usize,
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("None of the records") {
-                            0
-                        } else {
-                            return Err(AppError::Database(e));
-                        }
-                    }
-                };
-            }
-            // A curve chosen with the entry is a claim, recorded once (ADR 0008).
-            crate::routes::private::readings::service::record_curve_claims(
-                txn,
-                &models,
-                &actor,
-                crate::routes::private::readings::models::Origin::Manual,
-            )
-            .await?;
-
-            // An intern's entry lands pending: the record carries it, the columns project it and
-            // the review queue lists it until a manager verifies or rejects (Q21, M44).
-            // Only what the save entered is pending: a stored replicate the grid carried at its
-            // own number stays as a manager left it.
-            if entry_state == Some(crate::routes::private::readings::models::Kind::UnverifiedEntry)
-            {
-                let entered =
-                    crate::routes::private::readings::service::entered_rows(&carried, &existing_groups);
-                let entries: Vec<readings::ActiveModel> = models
-                    .iter()
-                    .zip(&entered)
-                    .filter(|(_, entered)| **entered)
-                    .map(|(m, _)| m.clone())
-                    .collect();
-                let entered_groups: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = groups
-                    .iter()
-                    .filter(|group| {
-                        carried
-                            .iter()
-                            .zip(&entered)
-                            .any(|((p, t, _, _), e)| *e && (*p, *t) == **group)
-                    })
-                    .copied()
-                    .collect();
-                crate::routes::private::readings::service::record_unverified_entries(
-                    txn,
-                    &entries,
-                    &actor,
-                    crate::routes::private::readings::models::Origin::Manual,
-                )
-                .await?;
-                open_unverified_holds(txn, payload.site_id, &entered_groups, &actor).await?;
-            }
-
-            // A re-post is the same measurement recorded again: the rows the insert skipped on
-            // conflict still take this request's story, so a second run's blob does not sit behind
-            // the value it produced. Keyed on the rows this request wrote, so a curated row a
-            // replace left in place keeps the provenance of the run that made it.
-            for (r, p) in payload.readings.iter().zip(&preview) {
-                let stored = &stored_facts[&(r.parameter_id, r.time)];
-                if stored.is_empty() {
-                    continue;
-                }
-                let keep = |column: readings::Column, value: sea_orm::Value| {
-                    Expr::expr(sea_orm::sea_query::Func::coalesce([
-                        Expr::val(value),
-                        Expr::col(column),
-                    ]))
-                };
-                readings::Entity::update_many()
-                    .col_expr(
-                        readings::Column::Label,
-                        keep(readings::Column::Label, stored.label.clone().into()),
-                    )
-                    .col_expr(
-                        readings::Column::Notes,
-                        keep(readings::Column::Notes, stored.notes.clone().into()),
-                    )
-                    .col_expr(
-                        readings::Column::CreatedBy,
-                        keep(
-                            readings::Column::CreatedBy,
-                            stored.created_by.clone().into(),
-                        ),
-                    )
-                    .col_expr(
-                        readings::Column::Provenance,
-                        keep(
-                            readings::Column::Provenance,
-                            stored.provenance.clone().into(),
-                        ),
-                    )
-                    .filter(readings::Column::StreamId.eq(stream_cache[&r.parameter_id]))
-                    .filter(readings::Column::Time.eq(r.time))
-                    .filter(readings::Column::ReplicateIndex.eq(p.replicate_index))
-                    .exec(txn)
-                    .await?;
-            }
-
-            // The statistics row, for the groups that now hold two or more replicates.
-            let created_sample_ids = materialise_grab_samples(
-                txn,
-                &groups,
-                payload.site_id,
-            )
-            .await?;
-
-            // Every attributed spot instant this request touched belongs to a collection event
-            // (D7); a hand-entered grab is a manual visit.
-            let mut touched_events = Vec::new();
-            if let (Some(lo), Some(hi)) = (
-                groups.iter().map(|(_, t)| *t).min(),
-                groups.iter().map(|(_, t)| *t).max(),
-            ) {
-                crate::routes::private::collection_events::service::attach_collection_events(
-                    txn,
-                    {
-                        use crate::routes::private::collection_events::flows::row;
-                        use crate::routes::private::readings::models::Column;
-                        use sea_orm::ExprTrait as _;
-                        sea_orm::Condition::all()
-                            .add(row(Column::SiteId).eq(payload.site_id))
-                            .add(
-                                row(Column::Time)
-                                    .gte(sea_orm::prelude::DateTimeWithTimeZone::from(lo)),
-                            )
-                            .add(
-                                row(Column::Time)
-                                    .lte(sea_orm::prelude::DateTimeWithTimeZone::from(hi)),
-                            )
-                    },
-                    crate::routes::private::collection_events::service::EventSource::Manual,
-                )
-                .await?;
-                let mut instants: Vec<sea_orm::prelude::DateTimeWithTimeZone> = groups
-                    .iter()
-                    .map(|(_, t)| sea_orm::prelude::DateTimeWithTimeZone::from(*t))
-                    .collect();
-                instants.sort_unstable();
-                instants.dedup();
-                touched_events = flows::touched_events(txn, {
-                    use crate::routes::private::readings::models::Column;
-                    use sea_orm::ExprTrait as _;
-                    sea_orm::Condition::all()
-                        .add(flows::row(Column::SiteId).eq(payload.site_id))
-                        .add(flows::row(Column::Time).is_in(instants))
-                })
-                .await?;
-            }
-
-            Ok((
-                inserted,
-                replaced,
-                kept_curated,
-                withdrawn,
-                created_sample_ids,
-                touched_events,
-            ))
-        })
-        .await?;
+    // decisions, the sample rows and the insert land together or not at all.
+    let write = GrabWrite {
+        payload: &payload,
+        preview: &preview,
+        groups: &groups,
+        existing_groups: &existing_groups,
+        carried: &carried,
+        slots: &slots,
+        streams: &stream_cache,
+        stream_instruments: &stream_instruments,
+        deployments: &deployments,
+        writer,
+        actor: &actor,
+        provenance: provenance.as_ref(),
+        provenance_kind,
+        entry_state,
+    };
+    let GrabWritten {
+        inserted,
+        replaced,
+        kept_curated,
+        withdrawn,
+        created_sample_ids,
+        touched_events,
+    } = crate::common::bulk_write::guarded(db, async |txn| write.run(txn).await).await?;
 
     // The value has landed: the calculations that read it run without anyone asking (ADR 0007),
     // the sampled slots are reconciled and their episodes rebuilt inline (one `reprocessing_jobs`
@@ -3583,12 +2801,7 @@ pub async fn insert_grab_samples(
     let written = crate::routes::private::readings::service::Written::new(
         u64::try_from(inserted + replaced).unwrap_or(u64::MAX),
     )
-    .over(
-        alarm_windows
-            .values()
-            .copied()
-            .reduce(|(lo, hi), (a, b)| (lo.min(a), hi.max(b))),
-    )
+    .over(grab_span(readings))
     .at(stream_cache
         .keys()
         .map(|pid| crate::routes::private::readings::service::Slot::paired(payload.site_id, *pid))

@@ -65,6 +65,8 @@ pub async fn event_stream(
     };
 
     let lens = Arc::new(lens);
+    // The stream ends when the process stops, else the graceful shutdown waits on it forever.
+    let mut stopping = state.shutdown.subscribe();
     let rx = state.events.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(move |result| {
         let lens = lens.clone();
@@ -77,6 +79,10 @@ pub async fn event_stream(
             let json = serde_json::to_string(&event).ok()?;
             Some(Ok(Event::default().event(event_type(&event)).data(json)))
         }
+    });
+
+    let stream = stream.take_until(async move {
+        let _ = stopping.wait_for(|stopped| *stopped).await;
     });
 
     Sse::new(stream).keep_alive(

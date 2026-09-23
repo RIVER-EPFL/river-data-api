@@ -178,7 +178,7 @@ async fn derived_assignment_backfills_and_publishes() {
     ))
     .await
     .unwrap();
-    e2e::set_site_parameter_public(&db, &sp_id).await;
+    e2e::set_site_parameter_public(&app, &token, &sp_id).await;
 
     let pub_uri = "/api/public/e2e_derived/sites/e2e_derived_site1/readings?start=2025-01-15T00:00:00Z&end=2025-01-15T01:00:00Z";
     let (status, pub_readings) = crate::common::get_json(&app, pub_uri).await;

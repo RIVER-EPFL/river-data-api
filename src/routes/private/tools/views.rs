@@ -1048,14 +1048,17 @@ pub async fn list_version_usage(
 ///
 /// The visit arm answers this with its runs; a stream pass mints none, so the history is read off
 /// the curation ledger. Requires `read_data`: it is a reading of what was computed, not of how the
-/// calculation is written.
+/// calculation is written, and a confined caller counts only what was computed at their own sites.
 #[utoipa::path(get, path = "/api/tool_scripts/{id}/version_ledger", params(("id" = Uuid, Path)),
     responses((status = 200, body = [VersionLedgerRow])), tag = "tool_scripts")]
 pub async fn list_version_ledger(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Vec<VersionLedgerRow>>> {
-    Ok(Json(super::service::version_ledger(&state.db, id).await?))
+    Ok(Json(
+        super::service::version_ledger(&state.db, &scope, id).await?,
+    ))
 }
 
 /// The script's activation history, newest first. Requires Administrator.

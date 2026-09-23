@@ -52,7 +52,7 @@ use crate::error::AppResult;
     path = "/api/tokens/{id}/revoke",
     params(("id" = Uuid, Path, description = "Token id")),
     responses(
-        (status = 200, description = "Token revoked", body = ApiToken),
+        (status = 200, description = "Token revoked", body = ApiTokenResponse),
         (status = 404, description = "Token not found"),
     ),
     tag = "tokens"
@@ -60,7 +60,7 @@ use crate::error::AppResult;
 pub async fn revoke_token(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<ApiToken>> {
+) -> AppResult<Json<ApiTokenResponse>> {
     let existing = model::Entity::find_by_id(id)
         .one(&state.db)
         .await?
@@ -71,7 +71,7 @@ pub async fn revoke_token(
     let updated = active.update(&state.db).await?;
 
     invalidate_token_cache(&state.token_cache).await;
-    Ok(Json(ApiToken::from(updated)))
+    Ok(Json(ApiTokenResponse::from(ApiToken::from(updated))))
 }
 
 /// Rotate an API token: mint a new secret while preserving all metadata (name, description,
@@ -82,7 +82,7 @@ pub async fn revoke_token(
     path = "/api/tokens/{id}/rotate",
     params(("id" = Uuid, Path, description = "Token id")),
     responses(
-        (status = 200, description = "Token rotated; new secret in `token`", body = ApiToken),
+        (status = 200, description = "Token rotated; new secret in `token`", body = ApiTokenResponse),
         (status = 404, description = "Token not found"),
     ),
     tag = "tokens"
@@ -90,7 +90,7 @@ pub async fn revoke_token(
 pub async fn rotate_token(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<ApiToken>> {
+) -> AppResult<Json<ApiTokenResponse>> {
     let existing = model::Entity::find_by_id(id)
         .one(&state.db)
         .await?
@@ -107,7 +107,7 @@ pub async fn rotate_token(
     invalidate_token_cache(&state.token_cache).await;
     let mut out = ApiToken::from(updated);
     out.token = Some(minted.raw_token);
-    Ok(Json(out))
+    Ok(Json(ApiTokenResponse::from(out)))
 }
 
 /// One recorded use of an API token from the forensic audit log.

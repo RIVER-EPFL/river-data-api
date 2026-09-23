@@ -3613,9 +3613,9 @@ dependencies = [
 
 [[package]]
 name = "river-data-core"
-version = "0.14.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0241c08e535d6a4cb626d60cd6ddc7fc9c38d712e862f3455d83b4ae935cf96"
+checksum = "99e2209a09e3cf2c2f31c94ef547f8f72f8220c4e91be5b2acf2fe256b36d5e7"
 dependencies = [
  "async-trait",
  "chrono",

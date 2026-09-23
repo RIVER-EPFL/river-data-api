@@ -744,3 +744,109 @@ async fn a_merge_leaves_one_entry_naming_both_sides() {
         "and the row that survived: {new_value}"
     );
 }
+
+/// An instrument carrying one curve per channel, both opening at the same instant.
+async fn curves_opening_together(
+    db: &DatabaseConnection,
+    parameters: &[Option<&str>],
+) -> uuid::Uuid {
+    let sensor = uuid::Uuid::new_v4();
+    crate::common::exec(
+        db,
+        &format!("INSERT INTO sensors (id, name) VALUES ('{sensor}', 'Two-channel probe')"),
+    )
+    .await;
+    for parameter in parameters {
+        let parameter = parameter.map_or("NULL".to_string(), |p| format!("'{p}'"));
+        crate::common::exec(
+            db,
+            &format!(
+                "INSERT INTO sensor_calibrations (sensor_id, parameter_id, slope, intercept, valid_from) \
+                 VALUES ('{sensor}', {parameter}, 1.0, 0.0, '2025-05-01T00:00:00Z')"
+            ),
+        )
+        .await;
+    }
+    sensor
+}
+
+// Scenario: an instrument holds a curve on DO and one on temperature, both from 2025-05-01, and DO
+// is merged into temperature.
+// Expected behaviour: a conflict naming the instrument and the instant, and nothing moved.
+#[tokio::test]
+#[serial]
+async fn test_merge_refuses_two_curves_landing_on_one_channel_at_one_instant() {
+    let (db, _, _) = setup().await;
+    let sensor = curves_opening_together(
+        &db,
+        &[
+            Some(crate::common::GLOBAL_PARAM_DO_ID),
+            Some(crate::common::GLOBAL_PARAM_TEMP_ID),
+        ],
+    )
+    .await;
+    let result = merge_parameters(
+        &db,
+        &merge_req(
+            crate::common::GLOBAL_PARAM_DO_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID,
+        ),
+        "tester",
+        river_db::routes::private::readings::models::Origin::Manual,
+    )
+    .await;
+    match result {
+        Err(river_db::error::AppError::Conflict(message)) => {
+            assert!(message.contains(&sensor.to_string()), "{message}");
+            assert!(message.contains("2025-05-01"), "{message}");
+        }
+        other => panic!("expected a named conflict, got {other:?}"),
+    }
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM sensor_calibrations \
+                 WHERE sensor_id = '{sensor}' AND parameter_id = '{}'",
+                crate::common::GLOBAL_PARAM_DO_ID
+            )
+        )
+        .await,
+        1,
+        "the DO curve stays where it was"
+    );
+}
+
+// Scenario: an instrument holds a curve on a parameter and an all-channel curve, both from
+// 2025-05-01, and the parameter is deleted, which would turn its curve into a second all-channel one.
+// Expected behaviour: 409 naming the instrument, and the parameter stays.
+#[tokio::test]
+#[serial]
+async fn test_delete_refuses_a_curve_that_would_land_on_an_all_channel_one() {
+    let (db, app, token) = setup().await;
+    let parameter = uuid::Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO parameters (id, code, name, default_units) \
+             VALUES ('{parameter}', 'chl_b', 'Chlorophyll b', 'ug/L')"
+        ),
+    )
+    .await;
+    // The all-channel curve first: a curve inserted naming no channel takes one the instrument
+    // already has (`trg_inherit_calibration_parameter_id`).
+    let sensor = curves_opening_together(&db, &[None, Some(&parameter.to_string())]).await;
+    let (status, body) =
+        crate::common::delete_with_token(&app, &format!("/api/parameters/{parameter}"), &token)
+            .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body.contains(&sensor.to_string()), "{body}");
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT count(*) AS c FROM parameters WHERE id = '{parameter}'")
+        )
+        .await,
+        1
+    );
+}

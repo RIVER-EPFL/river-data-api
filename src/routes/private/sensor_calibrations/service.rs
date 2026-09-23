@@ -2439,6 +2439,13 @@ pub async fn reprocess(
     Ok(readings_updated)
 }
 
+/// The parameters a reprocess moved at one site, and the span it moved them over.
+struct SiteSpan {
+    parameters: Vec<Uuid>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+}
+
 /// The instants a reprocess cascades to: every attributed instant it moved, plus the stream pulses
 /// that hold a parameter it moved at a site, up to that parameter's next measurement.
 async fn cascade_instants(
@@ -2447,22 +2454,26 @@ async fn cascade_instants(
 ) -> Result<Vec<(Uuid, DateTime<Utc>)>, sea_orm::DbErr> {
     let mut instants: std::collections::BTreeSet<(Uuid, DateTime<Utc>)> =
         moved.iter().map(|(site, time, _)| (*site, *time)).collect();
-    let mut spans: HashMap<Uuid, (Vec<Uuid>, DateTime<Utc>, DateTime<Utc>)> = HashMap::new();
+    let mut spans: HashMap<Uuid, SiteSpan> = HashMap::new();
     for (site, time, parameter) in moved {
         let Some(parameter) = parameter else { continue };
-        let span = spans.entry(*site).or_insert((Vec::new(), *time, *time));
-        if !span.0.contains(parameter) {
-            span.0.push(*parameter);
+        let span = spans.entry(*site).or_insert(SiteSpan {
+            parameters: Vec::new(),
+            start: *time,
+            end: *time,
+        });
+        if !span.parameters.contains(parameter) {
+            span.parameters.push(*parameter);
         }
-        span.1 = Ord::min(span.1, *time);
-        span.2 = Ord::max(span.2, *time);
+        span.start = Ord::min(span.start, *time);
+        span.end = Ord::max(span.end, *time);
     }
-    for (site, (parameters, start, end)) in spans {
+    for (site, span) in spans {
         let held = crate::routes::private::derived_parameters::flows::held_instants(
             &[site],
-            &parameters,
-            start,
-            end,
+            &span.parameters,
+            span.start,
+            span.end,
         );
         for row in db.query_all_raw(build(held)).await? {
             let at: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;

@@ -1487,100 +1487,6 @@
         ],
         "type": "object"
       },
-      "ApiToken": {
-        "properties": {
-          "created_at": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "created_by": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "description": {
-            "description": "Per-key allocation label, which external client/logger this key was issued to.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "expires_at": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "is_active": {
-            "type": "boolean"
-          },
-          "last_used_at": {
-            "format": "date-time",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "name": {
-            "type": "string"
-          },
-          "permissions": {},
-          "project_scope": {
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "rate_limit_per_second": {
-            "description": "Optional per-token request ceiling (requests/second). NULL = unlimited.",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "token": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "token_hash": {
-            "description": "Argon2id PHC hash of the token secret. Excluded from create/update (set on mint).",
-            "type": "string"
-          },
-          "token_prefix": {
-            "description": "Non-secret indexed lookup key (`rvd_<token_prefix>_<secret>`); set on mint.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "id",
-          "name",
-          "description",
-          "token_hash",
-          "token_prefix",
-          "project_scope",
-          "permissions",
-          "is_active",
-          "rate_limit_per_second",
-          "created_at",
-          "expires_at",
-          "last_used_at",
-          "created_by"
-        ],
-        "type": "object"
-      },
       "ApiTokenAuditLogList": {
         "properties": {
           "created_at": {
@@ -1878,10 +1784,6 @@
               "null"
             ]
           },
-          "token_hash": {
-            "description": "Argon2id PHC hash of the token secret. Excluded from create/update (set on mint).",
-            "type": "string"
-          },
           "token_prefix": {
             "description": "Non-secret indexed lookup key (`rvd_<token_prefix>_<secret>`); set on mint.",
             "type": "string"
@@ -1891,7 +1793,6 @@
           "id",
           "name",
           "description",
-          "token_hash",
           "token_prefix",
           "project_scope",
           "permissions",
@@ -27890,11 +27791,14 @@
             },
             "description": "Background recompute job triggered"
           },
+          "403": {
+            "description": "The calculation is active at a site outside the caller's projects"
+          },
           "404": {
             "description": "Calculation not found"
           }
         },
-        "summary": "Recompute every derived value for a given derived parameter definition. Backfills via\njoining source readings; tracked as a `reprocessing_jobs` row. Refreshes continuous\naggregates on completion. Requires `write_metadata`.",
+        "summary": "Recompute every derived value for a given derived parameter definition. Backfills via\njoining source readings; tracked as a `reprocessing_jobs` row. Refreshes continuous\naggregates on completion. Requires `write_metadata`, and a caller confined to projects is\nrefused a calculation active at any site outside them, since the job rewrites every one.",
         "tags": [
           "actions"
         ]
@@ -51278,7 +51182,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApiToken"
+                  "$ref": "#/components/schemas/ApiTokenResponse"
                 }
               }
             },
@@ -51314,7 +51218,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApiToken"
+                  "$ref": "#/components/schemas/ApiTokenResponse"
                 }
               }
             },
@@ -51974,7 +51878,7 @@
     },
     "/api/tool_scripts/{id}/version_ledger": {
       "get": {
-        "description": "The visit arm answers this with its runs; a stream pass mints none, so the history is read off\nthe curation ledger. Requires `read_data`: it is a reading of what was computed, not of how the\ncalculation is written.",
+        "description": "The visit arm answers this with its runs; a stream pass mints none, so the history is read off\nthe curation ledger. Requires `read_data`: it is a reading of what was computed, not of how the\ncalculation is written, and a confined caller counts only what was computed at their own sites.",
         "operationId": "list_version_ledger",
         "parameters": [
           {

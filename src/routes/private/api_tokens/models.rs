@@ -30,9 +30,9 @@ pub struct Model {
     /// Per-key allocation label, which external client/logger this key was issued to.
     #[crudcrate(filterable, fulltext)]
     pub description: Option<String>,
-    /// Argon2id PHC hash of the token secret. Excluded from create/update (set on mint).
+    /// Argon2id PHC hash of the token secret. Set on mint, and served by no response.
     #[sea_orm(unique)]
-    #[crudcrate(exclude(create, update, list))]
+    #[crudcrate(exclude(create, update, list, one))]
     pub token_hash: String,
     /// Non-secret indexed lookup key (`rvd_<token_prefix>_<secret>`); set on mint.
     #[crudcrate(exclude(create, update), sortable)]

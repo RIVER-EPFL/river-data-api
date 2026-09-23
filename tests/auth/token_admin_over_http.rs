@@ -143,6 +143,17 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
         created["permissions"]["write_metadata"], false,
         "the permissions object round-trips: {created}"
     );
+    assert!(
+        created.get("token_hash").is_none(),
+        "the create response never emits the hash: {created}"
+    );
+    let (status, one) =
+        crate::common::get_json_with_token(&app, &format!("/api/tokens/{token_id}"), &admin).await;
+    assert_eq!(status, 200, "an administrator opens the key: {one}");
+    assert!(
+        one.get("token_hash").is_none(),
+        "the single key never emits the hash: {one}"
+    );
 
     let (status, body) = crate::common::get_with_token(&app, "/api/sites", &secret).await;
     assert_eq!(
@@ -234,6 +245,10 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
     let (status, rotated) =
         crate::common::post_json_parse_with_token(&app, &rotate_path, &no_body, &admin).await;
     assert_eq!(status, 200, "an administrator rotates the key: {rotated}");
+    assert!(
+        rotated.get("token_hash").is_none(),
+        "rotation never emits the hash: {rotated}"
+    );
     let new_secret = rotated["token"]
         .as_str()
         .unwrap_or_else(|| panic!("rotation returns the new secret once: {rotated}"))
@@ -272,6 +287,10 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
     let (status, revoked) =
         crate::common::post_json_parse_with_token(&app, &revoke_path, &no_body, &admin).await;
     assert_eq!(status, 200, "an administrator revokes the key: {revoked}");
+    assert!(
+        revoked.get("token_hash").is_none(),
+        "revocation never emits the hash: {revoked}"
+    );
     assert_eq!(
         revoked["is_active"], false,
         "revocation deactivates the key: {revoked}"

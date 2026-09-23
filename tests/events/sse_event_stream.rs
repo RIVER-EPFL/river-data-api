@@ -411,3 +411,44 @@ async fn a_scoped_token_hears_only_its_own_projects_sites() {
     }
     panic!("the own site's frame never arrived. accumulated: {accumulated}");
 }
+
+/// Scenario: a browser holds `/api/events` open when the process is told to stop.
+///
+/// Expected behaviour: the stream ends with the rest of the server, so the graceful shutdown
+/// returns promptly instead of waiting out the pod's grace period for a response that never ends.
+#[tokio::test]
+#[serial]
+async fn an_open_event_stream_does_not_hold_the_graceful_shutdown() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let token = crate::common::seed_token_read_data_only(&db).await;
+    let (app, state) = crate::common::build_test_app_with_state(db.clone());
+    let mut stopped = state.shutdown.subscribe();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, river_db::routes::connected_service(app))
+            .with_graceful_shutdown(async move {
+                let _ = stopped.wait_for(|s| *s).await;
+            })
+            .await
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}/api/events"))
+        .bearer_auth(&token)
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .expect("the stream opens");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let _ = state.shutdown.send(true);
+    let served = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+    assert!(
+        served.is_ok(),
+        "the server was still serving the open event stream 5 s after shutdown"
+    );
+    drop(response);
+}

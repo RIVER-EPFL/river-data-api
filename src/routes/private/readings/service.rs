@@ -8657,6 +8657,980 @@ pub fn declared_instrument(explicit: Option<Uuid>, slot: Option<Uuid>) -> Option
     explicit.or(slot)
 }
 
+// --- The grab save, one step at a time ---
+
+/// A (parameter, instant) group a grab save writes.
+pub(super) type GrabGroup = (Uuid, DateTime<Utc>);
+
+/// A save carries at least one reading.
+pub(super) fn require_grab_readings(readings: &[GrabSampleReading]) -> AppResult<()> {
+    if readings.is_empty() {
+        return Err(AppError::BadRequest("No readings provided".to_string()));
+    }
+    Ok(())
+}
+
+/// Every reading is admitted as a spot value.
+pub(super) fn admit_grab_readings(readings: &[GrabSampleReading]) -> AppResult<()> {
+    for r in readings {
+        admission::admit(r.time, r.value, Some(GRAB_MEASUREMENT_TYPE))?;
+    }
+    Ok(())
+}
+
+/// The site a save names.
+pub(super) async fn find_grab_site(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+) -> AppResult<sites::Model> {
+    sites::Entity::find_by_id(site_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Site {site_id} not found")))
+}
+
+/// The site's slots for the parameters a save names: which slot each parameter is, and what each
+/// slot declares measures it.
+pub(super) struct GrabSlots {
+    configured: HashSet<Uuid>,
+    slot_ids: HashMap<Uuid, Uuid>,
+    /// A slot that declares nothing is undeclared, not a reason to borrow another row's instrument.
+    instruments: HashMap<Uuid, Uuid>,
+}
+
+impl GrabSlots {
+    pub(super) fn of(site_params: &[site_parameters::models::Model]) -> Self {
+        Self {
+            configured: site_params.iter().map(|sp| sp.parameter_id).collect(),
+            slot_ids: site_params
+                .iter()
+                .map(|sp| (sp.parameter_id, sp.id))
+                .collect(),
+            instruments: site_params
+                .iter()
+                .filter_map(|sp| sp.instrument_sensor_id.map(|sid| (sp.parameter_id, sid)))
+                .collect(),
+        }
+    }
+
+    /// The instrument a reading names, its own or its slot's.
+    pub(super) fn instrument_of(&self, r: &GrabSampleReading) -> Option<Uuid> {
+        declared_instrument(r.sensor_id, self.instruments.get(&r.parameter_id).copied())
+    }
+
+    /// A hand save is held to the slots the site carries: one landing on a slot the site does not
+    /// carry is refused rather than minting one, because a mint here would create the declaration
+    /// it is meant to be checked against (Q98, kept by Q193).
+    pub(super) fn require_configured(
+        &self,
+        site: &sites::Model,
+        readings: &[GrabSampleReading],
+    ) -> AppResult<()> {
+        match readings
+            .iter()
+            .find(|r| !self.configured.contains(&r.parameter_id))
+        {
+            Some(r) => Err(AppError::BadRequest(format!(
+                "Parameter {} is not configured for site {}; add its parameter group to the site \
+                 first (POST /api/sites/{}/parameter_groups)",
+                r.parameter_id, site.name, site.id
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The site's slots for the parameters a save names.
+pub(super) async fn load_grab_slots(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    readings: &[GrabSampleReading],
+) -> AppResult<GrabSlots> {
+    let param_ids: Vec<Uuid> = readings.iter().map(|r| r.parameter_id).collect();
+    let site_params = site_parameters::Entity::find()
+        .filter(site_parameters::Column::SiteId.eq(site_id))
+        .filter(site_parameters::Column::ParameterId.is_in(param_ids))
+        .all(db)
+        .await?;
+    Ok(GrabSlots::of(&site_params))
+}
+
+/// A save that names a seasonal check is held to it: every (parameter, value) pair must have been
+/// screened by exactly that check.
+pub(super) async fn require_checked_values(
+    db: &DatabaseConnection,
+    check_id: Option<Uuid>,
+    site_id: Uuid,
+    readings: &[GrabSampleReading],
+) -> AppResult<()> {
+    let Some(check_id) = check_id else {
+        return Ok(());
+    };
+    let pairs: Vec<(Uuid, f64)> = readings.iter().map(|r| (r.parameter_id, r.value)).collect();
+    validate_check_claim(db, check_id, site_id, &pairs).await
+}
+
+/// What the operator picked, held to the same rule as a slot's declaration and a deployment: a
+/// bookkeeping row records that nothing was declared, and a retired instrument is not in the lab.
+/// The slot's own declaration is guarded where it is set, so only the request's pick is checked.
+pub(super) async fn require_picked_instruments(
+    db: &DatabaseConnection,
+    readings: &[GrabSampleReading],
+) -> AppResult<()> {
+    let picked: Vec<Uuid> = readings.iter().filter_map(|r| r.sensor_id).collect();
+    sensors::service::require_measuring_instruments(
+        db,
+        &picked,
+        "named as what measured a grab sample",
+    )
+    .await
+}
+
+/// The chosen standard curves, admitted by the one rule every writer of `standard_curve_id` uses.
+/// A grab is spot by construction, so the only claims this path can be refused for are an unknown
+/// id, a curve fitted on another instrument, and a curve on a grab that names no instrument.
+pub(super) async fn admit_grab_curves(
+    db: &DatabaseConnection,
+    readings: &[GrabSampleReading],
+    slots: &GrabSlots,
+) -> AppResult<HashMap<Uuid, standard_curves::Model>> {
+    let claims: Vec<CurveClaim<'_>> = readings
+        .iter()
+        .filter_map(|r| {
+            r.standard_curve_id.map(|id| CurveClaim {
+                standard_curve_id: id,
+                sensor_id: slots.instrument_of(r),
+                measurement_type: GRAB_MEASUREMENT_TYPE,
+            })
+        })
+        .collect();
+    admit_standard_curves(db, &claims).await
+}
+
+/// The base calibration covering each grab that names an instrument, ranked by the one resolver
+/// the ingest and reprocess paths use. Resolving it here is what lets the row carry both the id
+/// and the value that id produced.
+pub(super) async fn resolve_grab_calibrations(
+    db: &DatabaseConnection,
+    readings: &[GrabSampleReading],
+    slots: &GrabSlots,
+) -> AppResult<HashMap<(Uuid, Option<Uuid>, DateTime<Utc>), sensor_calibrations::service::Curve>> {
+    let requests: Vec<(Uuid, Option<Uuid>, DateTime<Utc>)> = readings
+        .iter()
+        .filter_map(|r| {
+            slots
+                .instrument_of(r)
+                .map(|sid| (sid, Some(r.parameter_id), r.time))
+        })
+        .collect();
+    sensor_calibrations::resolver::resolve_many(db, &requests).await
+}
+
+/// Each reading as it would be stored: its replicate index, both curves and the value they serve.
+/// The same numbers serve the dry-run preview, the conflict report and the write.
+pub(super) fn grab_preview(
+    readings: &[GrabSampleReading],
+    indices: &[i16],
+    slots: &GrabSlots,
+    base_curves: &HashMap<(Uuid, Option<Uuid>, DateTime<Utc>), sensor_calibrations::service::Curve>,
+    standard_curves: &HashMap<Uuid, standard_curves::Model>,
+) -> Vec<GrabPreview> {
+    readings
+        .iter()
+        .zip(indices)
+        .map(|(r, &replicate_index)| {
+            let base = slots
+                .instrument_of(r)
+                .and_then(|sid| base_curves.get(&(sid, Some(r.parameter_id), r.time)))
+                .copied();
+            let standard = r.standard_curve_id.map(|cid| {
+                let c = &standard_curves[&cid];
+                sensor_calibrations::service::Curve {
+                    id: c.id,
+                    slope: c.slope,
+                    intercept: c.intercept,
+                }
+            });
+            // Both corrections, in the one order the arithmetic is defined in: the instrument's
+            // base calibration, then the operator's standard curve on that result. A grab that
+            // resolves neither is stored uncorrected, and `calibrated_value` stays NULL so a null
+            // still means "no curve was applied" rather than "a curve happened to be identity".
+            let calibrated_value = (base.is_some() || standard.is_some())
+                .then(|| sensor_calibrations::service::apply_curves(r.value, base, standard));
+            let composed_equation = match (base, standard) {
+                (Some(b), Some(s)) => Some(equation(
+                    s.slope * b.slope,
+                    s.slope * b.intercept + s.intercept,
+                )),
+                _ => None,
+            };
+            GrabPreview {
+                parameter_id: r.parameter_id,
+                time: r.time,
+                replicate_index,
+                raw_value: r.value,
+                base_calibration: base.map(|c| CurveApplication {
+                    id: c.id,
+                    name: None,
+                    slope: c.slope,
+                    intercept: c.intercept,
+                    equation: equation(c.slope, c.intercept),
+                }),
+                standard_curve: standard.map(|c| CurveApplication {
+                    id: c.id,
+                    name: standard_curves[&c.id].name.clone(),
+                    slope: c.slope,
+                    intercept: c.intercept,
+                    equation: equation(c.slope, c.intercept),
+                }),
+                composed_equation,
+                calibrated_value,
+            }
+        })
+        .collect()
+}
+
+/// The (parameter, instant) groups a save writes, once each, in the order they first appear.
+pub(super) fn grab_groups(readings: &[GrabSampleReading]) -> Vec<GrabGroup> {
+    let mut seen = HashSet::new();
+    readings
+        .iter()
+        .filter(|r| seen.insert((r.parameter_id, r.time)))
+        .map(|r| (r.parameter_id, r.time))
+        .collect()
+}
+
+/// Who is writing: the chain's own save is the recompute, anything else a person.
+pub(super) fn grab_writer(run_source: Option<&str>) -> flows::Writer {
+    match run_source {
+        Some("chain") => flows::Writer::Chain,
+        _ => flows::Writer::Person,
+    }
+}
+
+/// Which calculations this save feeds, known before anything is written. The chain's own save is
+/// the recompute: it reports nothing.
+pub(super) async fn calculations_fed_by_grab(
+    db: &DatabaseConnection,
+    writer: flows::Writer,
+    readings: &[GrabSampleReading],
+) -> AppResult<Vec<crate::routes::private::tools::models::CalculationImpact>> {
+    if writer == flows::Writer::Chain {
+        return Ok(Vec::new());
+    }
+    let mut touched: Vec<Uuid> = readings.iter().map(|r| r.parameter_id).collect();
+    touched.sort_unstable();
+    touched.dedup();
+    crate::routes::private::tools::service::calculations_fed_by(db, &touched).await
+}
+
+/// What a dry run answers: the preview and what is stored, with nothing written.
+pub(super) fn grab_dry_run(
+    preview: Vec<GrabPreview>,
+    existing_groups: Vec<ExistingGroup>,
+    calculations: Vec<crate::routes::private::tools::models::CalculationImpact>,
+) -> GrabSampleResponse {
+    GrabSampleResponse {
+        inserted: 0,
+        samples_created: 0,
+        created_sample_ids: vec![],
+        dry_run: true,
+        replaced: 0,
+        kept_curated: 0,
+        withdrawn: 0,
+        preview,
+        existing_groups,
+        calculations,
+    }
+}
+
+/// Each reading as `(parameter, instant, replicate index, value)`, the key the stored groups are
+/// compared on.
+pub(super) fn carried_replicates(
+    readings: &[GrabSampleReading],
+    preview: &[GrabPreview],
+) -> Vec<(Uuid, DateTime<Utc>, i16, f64)> {
+    readings
+        .iter()
+        .zip(preview)
+        .map(|(r, p)| (r.parameter_id, r.time, p.replicate_index, r.value))
+        .collect()
+}
+
+/// An intern enters measurements; a stored value is someone else's to change (Q21). A replace that
+/// carries every stored replicate at the number it already holds changes none of them: the entry
+/// grid posts the whole group, so a repeat typed into an empty cell arrives this way.
+pub(super) fn refuse_intern_rewrite(
+    role: Option<&crate::common::authz::Role>,
+    mode: Option<GrabWriteMode>,
+    carried: &[(Uuid, DateTime<Utc>, i16, f64)],
+    existing_groups: &[ExistingGroup],
+) -> AppResult<()> {
+    if entry_state(role).is_none() || mode != Some(GrabWriteMode::Replace) {
+        return Ok(());
+    }
+    let moved = stored_values_moved(carried, existing_groups);
+    if moved > 0 {
+        return Err(AppError::Forbidden(format!(
+            "An intern's entry cannot replace stored values; a manager rewrites them \
+             ({moved} stored replicate(s) would move)"
+        )));
+    }
+    Ok(())
+}
+
+/// A save built from a stale read would retract a repeat added under it, so a client that says
+/// what it read is refused when a group no longer holds that.
+pub(super) fn refuse_stale_read(
+    expected: Option<&[ExpectedGroup]>,
+    existing_groups: &[ExistingGroup],
+) -> AppResult<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let changed = groups_changed(expected, existing_groups);
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let detail =
+        serde_json::to_value(existing_groups).map_err(|e| AppError::Internal(e.to_string()))?;
+    Err(AppError::ConflictDetail {
+        message: format!(
+            "{} replicate group(s) changed since they were read; re-read the visit and save again",
+            changed.len()
+        ),
+        detail,
+    })
+}
+
+/// A save landing on stored groups rewrites them only when it says so.
+pub(super) fn refuse_unasked_replace(
+    mode: Option<GrabWriteMode>,
+    existing_groups: &[ExistingGroup],
+) -> AppResult<()> {
+    if existing_groups.is_empty() || mode == Some(GrabWriteMode::Replace) {
+        return Ok(());
+    }
+    let detail =
+        serde_json::to_value(existing_groups).map_err(|e| AppError::Internal(e.to_string()))?;
+    Err(AppError::ConflictDetail {
+        message: format!(
+            "{} replicate group(s) are already stored at the requested times; pass mode \
+             \"replace\" to rewrite them",
+            existing_groups.len()
+        ),
+        detail,
+    })
+}
+
+/// The grab stream each parameter's readings land on, created on first use.
+pub(super) async fn grab_streams(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    readings: &[GrabSampleReading],
+    slots: &GrabSlots,
+) -> AppResult<HashMap<Uuid, Uuid>> {
+    let mut streams: HashMap<Uuid, Uuid> = HashMap::new();
+    for r in readings {
+        if let Entry::Vacant(entry) = streams.entry(r.parameter_id) {
+            let sp_id = slots.slot_ids.get(&r.parameter_id).copied();
+            entry.insert(get_or_create_grab_stream(db, site_id, r.parameter_id, sp_id).await?);
+        }
+    }
+    Ok(streams)
+}
+
+/// The channel instrument each grab stream carries, which a reading naming no instrument of its
+/// own is attributed to. A hand-entered value still records what produced it.
+pub(super) async fn grab_stream_instruments(
+    db: &DatabaseConnection,
+    streams: &HashMap<Uuid, Uuid>,
+) -> AppResult<HashMap<Uuid, Uuid>> {
+    let ids: Vec<Uuid> = streams.values().copied().collect();
+    let rows = data_streams::models::Entity::find()
+        .filter(data_streams::models::Column::Id.is_in(ids))
+        .filter(data_streams::models::Column::SensorId.is_not_null())
+        .all(db)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|stream| stream.sensor_id.map(|sensor_id| (stream.id, sensor_id)))
+        .collect())
+}
+
+/// Window-aware attribution for grabs that name an instrument: the deployment it was on at the
+/// grab time, fixed to the save's site. A grab naming no instrument keeps no deployment.
+pub(super) async fn grab_deployments(
+    db: &DatabaseConnection,
+    site_id: Uuid,
+    readings: &[GrabSampleReading],
+    slots: &GrabSlots,
+) -> HashMap<(Uuid, Uuid, DateTime<Utc>), sensors::models::ResolvedSlot> {
+    let mut times_by_channel: HashMap<(Uuid, Uuid), Vec<DateTime<Utc>>> = HashMap::new();
+    for r in readings {
+        if let Some(sid) = slots.instrument_of(r) {
+            times_by_channel
+                .entry((sid, r.parameter_id))
+                .or_default()
+                .push(r.time);
+        }
+    }
+    let mut resolved_slots = HashMap::new();
+    for ((sid, pid), times) in &times_by_channel {
+        let resolved =
+            sensors::service::resolve_windows_for_times(db, *sid, Some(site_id), Some(*pid), times)
+                .await
+                .unwrap_or_default();
+        for (t, slot) in resolved {
+            resolved_slots.insert((*sid, *pid, t), slot);
+        }
+    }
+    resolved_slots
+}
+
+/// The span of instants a save wrote, for the alarm episodes it reconstructs.
+pub(super) fn grab_span(readings: &[GrabSampleReading]) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let lo = readings.iter().map(|r| r.time).min()?;
+    let hi = readings.iter().map(|r| r.time).max()?;
+    Some((lo, hi))
+}
+
+/// What a grab save's transaction writes, and what it returns.
+pub(super) struct GrabWrite<'a> {
+    pub(super) payload: &'a GrabSampleRequest,
+    pub(super) preview: &'a [GrabPreview],
+    pub(super) groups: &'a [GrabGroup],
+    pub(super) existing_groups: &'a [ExistingGroup],
+    pub(super) carried: &'a [(Uuid, DateTime<Utc>, i16, f64)],
+    pub(super) slots: &'a GrabSlots,
+    pub(super) streams: &'a HashMap<Uuid, Uuid>,
+    pub(super) stream_instruments: &'a HashMap<Uuid, Uuid>,
+    pub(super) deployments: &'a HashMap<(Uuid, Uuid, DateTime<Utc>), sensors::models::ResolvedSlot>,
+    pub(super) writer: flows::Writer,
+    pub(super) actor: &'a str,
+    pub(super) provenance: Option<&'a serde_json::Value>,
+    pub(super) provenance_kind: &'a str,
+    pub(super) entry_state: Option<Kind>,
+}
+
+/// What a grab save's transaction did.
+pub(super) struct GrabWritten {
+    pub(super) inserted: usize,
+    pub(super) replaced: usize,
+    pub(super) kept_curated: usize,
+    pub(super) withdrawn: usize,
+    pub(super) created_sample_ids: Vec<Uuid>,
+    pub(super) touched_events: Vec<TouchedEvent>,
+}
+
+/// What a replace does to the rows it rewrites.
+pub(super) struct ReplaceOutcome {
+    replaced: usize,
+    kept_curated: usize,
+    withdrawn: usize,
+}
+
+impl GrabWrite<'_> {
+    fn replaces(&self) -> bool {
+        self.payload.mode == Some(GrabWriteMode::Replace)
+    }
+
+    /// The readings of one group, with their preview.
+    fn in_group(
+        &self,
+        (parameter_id, time): GrabGroup,
+    ) -> impl Iterator<Item = (&GrabSampleReading, &GrabPreview)> {
+        self.payload
+            .readings
+            .iter()
+            .zip(self.preview)
+            .filter(move |(r, _)| r.parameter_id == parameter_id && r.time == time)
+    }
+
+    /// Whether the save names a curve for this group, which decides which stored rows it may
+    /// rewrite: a hand-curved row is the save's only when the save brings a curve of its own.
+    fn supplies_curve(&self, group: GrabGroup) -> bool {
+        self.in_group(group)
+            .any(|(_, p)| p.standard_curve.is_some())
+    }
+
+    /// The save, in one guarded transaction.
+    pub(super) async fn run(&self, txn: &sea_orm::DatabaseTransaction) -> AppResult<GrabWritten> {
+        let prior_facts = if self.replaces() {
+            self.record_replace_decisions(txn).await?;
+            self.prior_facts(txn).await?
+        } else {
+            HashMap::new()
+        };
+        let outcome = if self.replaces() {
+            self.hold_kept_and_withdraw_dropped(txn).await?
+        } else {
+            ReplaceOutcome {
+                replaced: 0,
+                kept_curated: 0,
+                withdrawn: 0,
+            }
+        };
+        let stored_facts = self.stored_facts(&prior_facts);
+        let models = self.models(&stored_facts);
+        let inserted = self.insert(txn, &models).await?;
+        record_curve_claims(txn, &models, self.actor, Origin::Manual).await?;
+        self.record_intern_entries(txn, &models).await?;
+        self.restamp_facts(txn, &stored_facts).await?;
+        let created_sample_ids =
+            materialise_grab_samples(txn, self.groups, self.payload.site_id).await?;
+        let touched_events = self.attach_visits(txn).await?;
+        Ok(GrabWritten {
+            inserted,
+            replaced: outcome.replaced,
+            kept_curated: outcome.kept_curated,
+            withdrawn: outcome.withdrawn,
+            created_sample_ids,
+            touched_events,
+        })
+    }
+
+    /// What the replace rewrites is decided before the rows go: a person's correction of a stored
+    /// value, or the chain superseding an output with a fresh run (ADR 0008). Rows whose value does
+    /// not change decide nothing, and a flagged, withdrawn or hand-curved row stays as it is (SB5)
+    /// and gets a hold, not a correction.
+    async fn record_replace_decisions(&self, txn: &sea_orm::DatabaseTransaction) -> AppResult<()> {
+        let (kind, origin, reason) = match self.writer {
+            flows::Writer::Chain => (Kind::Chain, Origin::Chain, "superseded by a recompute"),
+            flows::Writer::Person => (
+                Kind::ValueCorrection,
+                Origin::Manual,
+                "replaced by a new entry",
+            ),
+        };
+        for &group in self.groups {
+            let rows: Vec<(DateTime<Utc>, i16, serde_json::Value)> = self
+                .in_group(group)
+                .map(|(_, p)| {
+                    let new = match (self.writer, self.payload.tool_run_id) {
+                        (flows::Writer::Chain, Some(run_id)) => {
+                            serde_json::json!({ "run_id": run_id })
+                        }
+                        _ => serde_json::json!({ "raw_value": p.raw_value }),
+                    };
+                    (group.1, p.replicate_index, new)
+                })
+                .collect();
+            let guard = if self.supplies_curve(group) {
+                "r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL"
+            } else {
+                "r.is_flagged IS NOT TRUE AND r.withdrawn_at IS NULL \
+                 AND r.standard_curve_id IS NULL"
+            };
+            record_keyed(
+                txn,
+                kind,
+                self.streams[&group.0],
+                &rows,
+                self.actor,
+                Some(reason),
+                origin,
+                Keyed::Changed,
+                Some(guard),
+                None,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The label, notes, authorship and blob each rewritten group carries, kept on the rewritten
+    /// rows wherever the request does not carry its own.
+    async fn prior_facts(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+    ) -> AppResult<HashMap<GrabGroup, StoredFacts>> {
+        let mut prior = HashMap::new();
+        for &(parameter_id, time) in self.groups {
+            if let Some(row) = readings::Entity::find()
+                .select_only()
+                .column(readings::Column::Label)
+                .column(readings::Column::Notes)
+                .column(readings::Column::CreatedBy)
+                .column(readings::Column::Provenance)
+                .column(readings::Column::ProvenanceKind)
+                .filter(readings::Column::SiteId.eq(self.payload.site_id))
+                .filter(readings::Column::ParameterId.eq(parameter_id))
+                .filter(readings::Column::Time.eq(time))
+                .filter(readings::Column::MeasurementType.eq("spot"))
+                .filter(
+                    Condition::any()
+                        .add(readings::Column::Label.is_not_null())
+                        .add(readings::Column::Notes.is_not_null())
+                        .add(readings::Column::CreatedBy.is_not_null())
+                        .add(readings::Column::Provenance.is_not_null()),
+                )
+                .order_by_asc(readings::Column::ReplicateIndex)
+                .into_model::<PriorFactsRow>()
+                .one(txn)
+                .await?
+            {
+                prior.insert((parameter_id, time), row.into());
+            }
+        }
+        Ok(prior)
+    }
+
+    /// The rewrite is scoped to the grab stream: another source's rows at the same instant are not
+    /// this request's to rewrite. Curation wins, as in the windowed diff: a flagged, withdrawn or
+    /// hand-curved row stays and the disagreement lands in the review queue. What the save leaves
+    /// out is retracted, never deleted.
+    async fn hold_kept_and_withdraw_dropped(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+    ) -> AppResult<ReplaceOutcome> {
+        let mut removed: u64 = 0;
+        let mut kept_curated: usize = 0;
+        let mut withdrawn: usize = 0;
+        for &group in self.groups {
+            let (parameter_id, time) = group;
+            let stream_id = self.streams[&parameter_id];
+            let supplies_curve = self.supplies_curve(group);
+            kept_curated += hold_kept_rows(txn, stream_id, time, supplies_curve).await?;
+            let carried: Vec<i16> = self
+                .in_group(group)
+                .map(|(_, p)| p.replicate_index)
+                .collect();
+            withdrawn +=
+                withdraw_uncarried(txn, stream_id, time, &carried, supplies_curve, self.actor)
+                    .await?;
+            removed += count_rewritten(txn, stream_id, time, carried, supplies_curve).await?;
+        }
+        Ok(ReplaceOutcome {
+            replaced: usize::try_from(removed).unwrap_or(usize::MAX),
+            kept_curated,
+            withdrawn,
+        })
+    }
+
+    /// What each row records about the measurement, request first and the rewritten group's own
+    /// prior values where the request is silent.
+    fn stored_facts(
+        &self,
+        prior_facts: &HashMap<GrabGroup, StoredFacts>,
+    ) -> HashMap<GrabGroup, StoredFacts> {
+        let facts = GrabFacts {
+            created_by: Some(self.actor),
+            label: self.payload.label.as_deref(),
+            notes: self.payload.notes.as_deref(),
+            provenance: self.provenance,
+            kind: self.provenance_kind,
+        };
+        self.groups
+            .iter()
+            .map(|group| (*group, facts.over(prior_facts.get(group))))
+            .collect()
+    }
+
+    /// The row each reading is stored as.
+    fn models(&self, stored_facts: &HashMap<GrabGroup, StoredFacts>) -> Vec<readings::ActiveModel> {
+        self.payload
+            .readings
+            .iter()
+            .zip(self.preview)
+            .map(|(r, p)| {
+                let instrument = self.slots.instrument_of(r);
+                let stream_id = self.streams[&r.parameter_id];
+                let facts = &stored_facts[&(r.parameter_id, r.time)];
+                readings::ActiveModel {
+                    standard_curve_id: Set(p.standard_curve.as_ref().map(|c| c.id)),
+                    site_id: Set(Some(self.payload.site_id)),
+                    parameter_id: Set(Some(r.parameter_id)),
+                    calibrated_value: Set(p.calibrated_value),
+                    sensor_id: Set(
+                        instrument.or_else(|| self.stream_instruments.get(&stream_id).copied())
+                    ),
+                    calibration_id: Set(p.base_calibration.as_ref().map(|c| c.id)),
+                    deployment_id: Set(instrument.and_then(|sid| {
+                        self.deployments
+                            .get(&(sid, r.parameter_id, r.time))
+                            .and_then(|s| s.deployment_id)
+                    })),
+                    measurement_type: Set(Some(GRAB_MEASUREMENT_TYPE.to_string())),
+                    label: Set(facts.label.clone()),
+                    notes: Set(facts.notes.clone()),
+                    created_by: Set(facts.created_by.clone()),
+                    provenance: Set(facts.provenance.clone()),
+                    provenance_kind: Set(facts.kind.clone()),
+                    ..readings::new(stream_id, r.time.into(), p.replicate_index, r.value)
+                }
+            })
+            .collect()
+    }
+
+    /// A replace rewrites each carried row in place, guarded per group by whether the save names a
+    /// curve; any other save keeps the stored row.
+    async fn insert(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        models: &[readings::ActiveModel],
+    ) -> AppResult<usize> {
+        let curved_groups: HashSet<GrabGroup> = self
+            .payload
+            .readings
+            .iter()
+            .zip(self.preview)
+            .filter(|(_, p)| p.standard_curve.is_some())
+            .map(|(r, _)| (r.parameter_id, r.time))
+            .collect();
+        let mut inserted = 0usize;
+        for curved in [false, true] {
+            let batch: Vec<readings::ActiveModel> = self
+                .payload
+                .readings
+                .iter()
+                .zip(models)
+                .filter(|(r, _)| curved_groups.contains(&(r.parameter_id, r.time)) == curved)
+                .map(|(_, m)| m.clone())
+                .collect();
+            if batch.is_empty() {
+                continue;
+            }
+            let replace = if self.replaces() {
+                Replace::Entry { curved }
+            } else {
+                Replace::Nothing
+            };
+            inserted += match readings::Entity::insert_many(batch)
+                .on_conflict(readings_upsert(replace))
+                .exec_without_returning(txn)
+                .await
+            {
+                Ok(rows) => usize::try_from(rows).unwrap_or(usize::MAX),
+                Err(e) if e.to_string().contains("None of the records") => 0,
+                Err(e) => return Err(AppError::Database(e)),
+            };
+        }
+        Ok(inserted)
+    }
+
+    /// An intern's entry lands pending: the record carries it, the columns project it and the
+    /// review queue lists it until a manager verifies or rejects (Q21, M44). Only what the save
+    /// entered is pending: a stored replicate the grid carried at its own number stays as a
+    /// manager left it.
+    async fn record_intern_entries(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        models: &[readings::ActiveModel],
+    ) -> AppResult<()> {
+        if self.entry_state != Some(Kind::UnverifiedEntry) {
+            return Ok(());
+        }
+        let entered = entered_rows(self.carried, self.existing_groups);
+        let entries: Vec<readings::ActiveModel> = models
+            .iter()
+            .zip(&entered)
+            .filter(|(_, entered)| **entered)
+            .map(|(m, _)| m.clone())
+            .collect();
+        let entered_groups: Vec<GrabGroup> = self
+            .groups
+            .iter()
+            .filter(|group| {
+                self.carried
+                    .iter()
+                    .zip(&entered)
+                    .any(|((p, t, _, _), e)| *e && (*p, *t) == **group)
+            })
+            .copied()
+            .collect();
+        record_unverified_entries(txn, &entries, self.actor, Origin::Manual).await?;
+        open_unverified_holds(txn, self.payload.site_id, &entered_groups, self.actor).await
+    }
+
+    /// A re-post is the same measurement recorded again: the rows the insert skipped on conflict
+    /// still take this request's story, so a second run's blob does not sit behind the value it
+    /// produced. Keyed on the rows this request wrote, so a curated row a replace left in place
+    /// keeps the provenance of the run that made it.
+    async fn restamp_facts(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        stored_facts: &HashMap<GrabGroup, StoredFacts>,
+    ) -> AppResult<()> {
+        for (r, p) in self.payload.readings.iter().zip(self.preview) {
+            let stored = &stored_facts[&(r.parameter_id, r.time)];
+            if stored.is_empty() {
+                continue;
+            }
+            let keep = |column: readings::Column, value: sea_orm::Value| {
+                Expr::expr(Func::coalesce([Expr::val(value), Expr::col(column)]))
+            };
+            readings::Entity::update_many()
+                .col_expr(
+                    readings::Column::Label,
+                    keep(readings::Column::Label, stored.label.clone().into()),
+                )
+                .col_expr(
+                    readings::Column::Notes,
+                    keep(readings::Column::Notes, stored.notes.clone().into()),
+                )
+                .col_expr(
+                    readings::Column::CreatedBy,
+                    keep(
+                        readings::Column::CreatedBy,
+                        stored.created_by.clone().into(),
+                    ),
+                )
+                .col_expr(
+                    readings::Column::Provenance,
+                    keep(
+                        readings::Column::Provenance,
+                        stored.provenance.clone().into(),
+                    ),
+                )
+                .filter(readings::Column::StreamId.eq(self.streams[&r.parameter_id]))
+                .filter(readings::Column::Time.eq(r.time))
+                .filter(readings::Column::ReplicateIndex.eq(p.replicate_index))
+                .exec(txn)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Every attributed spot instant this request touched belongs to a collection event (D7); a
+    /// hand-entered grab is a manual visit.
+    async fn attach_visits(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+    ) -> AppResult<Vec<TouchedEvent>> {
+        let (Some(lo), Some(hi)) = (
+            self.groups.iter().map(|(_, t)| *t).min(),
+            self.groups.iter().map(|(_, t)| *t).max(),
+        ) else {
+            return Ok(Vec::new());
+        };
+        let site_id = self.payload.site_id;
+        collection_events::service::attach_collection_events(
+            txn,
+            Condition::all()
+                .add(flows::row(readings::Column::SiteId).eq(site_id))
+                .add(flows::row(readings::Column::Time).gte(DateTimeWithTimeZone::from(lo)))
+                .add(flows::row(readings::Column::Time).lte(DateTimeWithTimeZone::from(hi))),
+            collection_events::service::EventSource::Manual,
+        )
+        .await?;
+        let mut instants: Vec<DateTimeWithTimeZone> = self
+            .groups
+            .iter()
+            .map(|(_, t)| DateTimeWithTimeZone::from(*t))
+            .collect();
+        instants.sort_unstable();
+        instants.dedup();
+        flows::touched_events(
+            txn,
+            Condition::all()
+                .add(flows::row(readings::Column::SiteId).eq(site_id))
+                .add(flows::row(readings::Column::Time).is_in(instants)),
+        )
+        .await
+    }
+}
+
+/// Hold a group's curated rows on the grab stream in the review queue: a replace leaves them in
+/// place. Returns how many it kept.
+async fn hold_kept_rows(
+    txn: &sea_orm::DatabaseTransaction,
+    stream_id: Uuid,
+    time: DateTime<Utc>,
+    supplies_curve: bool,
+) -> AppResult<usize> {
+    let kept = readings::Entity::find()
+        .select_only()
+        .column(readings::Column::ReplicateIndex)
+        .column_as(kept_reason(), "reason")
+        .filter(readings::Column::StreamId.eq(stream_id))
+        .filter(readings::Column::Time.eq(time))
+        .filter(readings::Column::MeasurementType.eq("spot"))
+        .filter(curated_or_curved(supplies_curve))
+        .order_by_asc(readings::Column::ReplicateIndex)
+        .into_model::<KeptRow>()
+        .all(txn)
+        .await?;
+    if kept.is_empty() {
+        return Ok(0);
+    }
+    let entries = kept
+        .iter()
+        .map(|r| serde_json::json!({ "replicate_index": r.replicate_index, "reason": r.reason }))
+        .collect::<Vec<_>>();
+    upsert_source_modified_hold(
+        txn,
+        stream_id,
+        time,
+        serde_json::json!({ "claim": "replaced", "kept": entries }),
+        serde_json::json!({ "kept": true }),
+        HoldStatus::Pending,
+    )
+    .await?;
+    Ok(kept.len())
+}
+
+/// Withdraw a group's replicates the save no longer carries. A cleared cell or a narrower pasted
+/// block is a person saying the replicate is not part of the measurement any more, and the stamp
+/// is reversible where a delete is not. Returns how many it withdrew.
+async fn withdraw_uncarried(
+    txn: &sea_orm::DatabaseTransaction,
+    stream_id: Uuid,
+    time: DateTime<Utc>,
+    carried: &[i16],
+    supplies_curve: bool,
+    actor: &str,
+) -> AppResult<usize> {
+    use crate::routes::private::readings::models::Column;
+    let mut cond = Condition::all()
+        .add(flows::row(Column::StreamId).eq(stream_id))
+        .add(flows::row(Column::Time).eq(DateTimeWithTimeZone::from(time)))
+        .add(flows::row(Column::MeasurementType).eq("spot"))
+        .add(flows::row(Column::ReplicateIndex).is_not_in(carried.to_vec()))
+        .add(flows::row(Column::IsFlagged).is_not(sql_true()))
+        .add(flows::row(Column::WithdrawnAt).is_null());
+    if !supplies_curve {
+        cond = cond.add(flows::row(Column::StandardCurveId).is_null());
+    }
+    let dropped = record_many(
+        txn,
+        Kind::Withdraw,
+        cond,
+        NewValue::Literal(
+            serde_json::json!({ "reason": "the save no longer carries this replicate" }),
+        ),
+        actor,
+        Some("dropped by a narrower entry"),
+        Origin::Manual,
+        None,
+    )
+    .await?;
+    Ok(usize::try_from(dropped.rows).unwrap_or(usize::MAX))
+}
+
+/// The carried rows the insert's conflict clause rewrites in place, under the same guard, so what
+/// no entry sets stays on them.
+async fn count_rewritten(
+    txn: &sea_orm::DatabaseTransaction,
+    stream_id: Uuid,
+    time: DateTime<Utc>,
+    carried: Vec<i16>,
+    supplies_curve: bool,
+) -> AppResult<u64> {
+    use sea_orm::PaginatorTrait as _;
+    let mut query = readings::Entity::find()
+        .filter(readings::Column::StreamId.eq(stream_id))
+        .filter(readings::Column::Time.eq(time))
+        .filter(readings::Column::MeasurementType.eq("spot"))
+        .filter(readings::Column::ReplicateIndex.is_in(carried))
+        .filter(Expr::col(readings::Column::IsFlagged).is_not(sql_true()))
+        .filter(readings::Column::WithdrawnAt.is_null());
+    if !supplies_curve {
+        query = query.filter(readings::Column::StandardCurveId.is_null());
+    }
+    Ok(query.count(txn).await?)
+}
+
 /// Cap on the warning cells an import response lists.
 pub(super) const IMPORT_CHECK_FINDINGS_CAP: usize = 200;
 

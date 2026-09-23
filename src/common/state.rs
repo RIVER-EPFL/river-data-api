@@ -139,6 +139,9 @@ pub struct AppState {
     pub grants_cache: crate::common::grants::GrantsCache,
     pub token_rate_limiters: TokenRateLimiters,
     pub events: EventSender,
+    /// Set once the process is told to stop. What serves a response with no end of its own (the
+    /// event stream) ends on it, so the graceful shutdown is not held open by an idle browser tab.
+    pub shutdown: Arc<tokio::sync::watch::Sender<bool>>,
     /// Live role resolver for notification recipients (anti-backdoor). Shared so the
     /// user-management revoke path can invalidate a sub's cached role immediately.
     pub authorizer: Arc<Authorizer>,
@@ -201,6 +204,7 @@ impl AppState {
             grants_cache,
             token_rate_limiters,
             events,
+            shutdown: Arc::new(tokio::sync::watch::channel(false).0),
             authorizer: Arc::new(Authorizer::new()),
         };
         // Publish the serving state so worker-run scheduled Jobs can reach config + the shared

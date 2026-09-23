@@ -3716,7 +3716,10 @@ pub async fn version_usage(
 /// so `COUNT(DISTINCT ...)` over it counts one, and a version that computed nothing would report a
 /// reading it never made.
 #[must_use]
-pub fn version_ledger_query(script_id: Uuid) -> sea_orm::sea_query::SelectStatement {
+pub fn version_ledger_query(
+    script_id: Uuid,
+    projects: Option<&[Uuid]>,
+) -> sea_orm::sea_query::SelectStatement {
     use crate::routes::private::readings::decision_model as decisions;
     use sea_orm::sea_query::ExprTrait;
     use sea_orm::sea_query::extension::postgres::PgExpr as _;
@@ -3772,7 +3775,14 @@ pub fn version_ledger_query(script_id: Uuid) -> sea_orm::sea_query::SelectStatem
                     decision(decisions::Column::New)
                         .cast_json_field("derived_version_id")
                         .eq(Expr::col((v.clone(), version_entity::Column::Id)).cast_as("text")),
-                ),
+                )
+                .and(match projects {
+                    // Confined the way the ledger's own entity is: by the streams serving a slot
+                    // in the granted projects.
+                    Some(projects) => decision(decisions::Column::StreamId)
+                        .in_subquery(crate::common::middleware::scoped_stream_ids_query(projects)),
+                    None => Expr::value(true),
+                }),
         )
         .and_where(Expr::col((v.clone(), version_entity::Column::ToolScriptId)).eq(script_id))
         .group_by_col((v.clone(), version_entity::Column::Id))
@@ -3788,10 +3798,12 @@ pub fn version_ledger_query(script_id: Uuid) -> sea_orm::sea_query::SelectStatem
 /// the version that made it.
 pub async fn version_ledger(
     db: &DatabaseConnection,
+    scope: &crate::common::authz::AccessScope,
     script_id: Uuid,
 ) -> AppResult<Vec<crate::routes::private::tools::models::VersionLedgerRow>> {
+    let projects = scope.project_ids();
     let rows = db
-        .query_all_raw(build(&version_ledger_query(script_id)))
+        .query_all_raw(build(&version_ledger_query(script_id, projects.as_deref())))
         .await?;
     let instant = |row: &sea_orm::QueryResult,
                    column: &str|

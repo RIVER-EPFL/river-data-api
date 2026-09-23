@@ -228,7 +228,7 @@ async fn flagged_readings_are_served_consistently_by_count_series_and_aggregate(
     let site = e2e::create_site(&app, &jwt, &project, "RD045 Station", "rd045-station").await;
     let parameter = e2e::create_parameter(&app, &jwt, "Rd045Depth", "RD045 Depth", "mm").await;
     let sp = e2e::assign_site_parameter_minimal(&app, &jwt, &site, &parameter).await;
-    e2e::set_site_parameter_public(&db, &sp).await;
+    e2e::set_site_parameter_public(&app, &jwt, &sp).await;
 
     let stream = open_stream(&app, &jwt, "rd045-depth", &sp).await;
     let flagged_time = "2025-06-04T04:00:00Z";
@@ -683,7 +683,7 @@ async fn public_aggregates_list_only_the_requested_sites_parameters() {
     let sp_wide_extra = e2e::assign_site_parameter_minimal(&app, &jwt, &wide, &extra).await;
     let sp_narrow_shared = e2e::assign_site_parameter_minimal(&app, &jwt, &narrow, &shared).await;
     for sp in [&sp_wide_shared, &sp_wide_extra, &sp_narrow_shared] {
-        e2e::set_site_parameter_public(&db, sp).await;
+        e2e::set_site_parameter_public(&app, &jwt, sp).await;
     }
 
     let wide_shared_stream = open_stream(&app, &jwt, "rd053-wide-depth", &sp_wide_shared).await;
@@ -958,7 +958,7 @@ async fn empty_results_are_delivered_in_the_requested_format() {
     let bare = e2e::create_site(&app, &jwt, &project, "RD056 Bare", "rd056-bare").await;
     let parameter = e2e::create_parameter(&app, &jwt, "Rd056Depth", "RD056 Depth", "mm").await;
     let sp = e2e::assign_site_parameter_minimal(&app, &jwt, &stocked, &parameter).await;
-    e2e::set_site_parameter_public(&db, &sp).await;
+    e2e::set_site_parameter_public(&app, &jwt, &sp).await;
     create_threshold(&app, &jwt, &stocked, &parameter, 100.0, 1000.0).await;
 
     let stream = open_stream(&app, &jwt, "rd056-depth", &sp).await;

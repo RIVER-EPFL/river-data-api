@@ -1,4 +1,4 @@
-use super::{GivenUp, unpublished_by};
+use super::{GivenUp, curve_collisions, unpublished_by};
 use uuid::Uuid;
 
 fn given_up(parameter_id: Uuid, calculation: &str) -> GivenUp {
@@ -27,4 +27,18 @@ fn test_a_parameter_a_formula_gave_up_names_the_calculation() {
 #[test]
 fn test_nothing_given_up_leaves_every_parameter_ordinary() {
     assert_eq!(unpublished_by(Uuid::new_v4(), &[]), None);
+}
+
+/// Expected behaviour: a curve collides only where the same instrument already opens a curve at
+/// the same instant on the channel it would land on.
+#[test]
+fn test_curve_collisions_are_same_instrument_same_instant() {
+    let (x, y) = (Uuid::from_u128(1), Uuid::from_u128(2));
+    let may: chrono::DateTime<chrono::Utc> = "2025-05-01T00:00:00Z".parse().unwrap();
+    let june: chrono::DateTime<chrono::Utc> = "2025-06-01T00:00:00Z".parse().unwrap();
+    assert_eq!(
+        curve_collisions(&[(x, may), (x, june), (y, may)], &[(x, may), (y, june)]),
+        vec![(x, may)]
+    );
+    assert!(curve_collisions(&[(x, may)], &[]).is_empty());
 }

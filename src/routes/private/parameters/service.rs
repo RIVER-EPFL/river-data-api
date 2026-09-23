@@ -56,6 +56,21 @@ impl CRUDOperations for ParameterOperations {
             .map_err(ApiError::database)
     }
 
+    /// Deleting a parameter turns its curves into curves for every channel, so one that opens where
+    /// the instrument already has such a curve is refused by name rather than by the database.
+    async fn before_delete<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        db: &C,
+        id: Uuid,
+    ) -> Result<(), ApiError> {
+        refuse_curve_collisions(db, id, None)
+            .await
+            .map_err(|e| match e {
+                AppError::Conflict(message) => ApiError::conflict(message),
+                other => ApiError::internal(other.to_string(), None),
+            })
+    }
+
     async fn after_delete<C: ConnectionTrait + TransactionTrait>(
         &self,
         db: &C,
@@ -252,6 +267,65 @@ async fn refuse_derived_cycle<C: sea_orm::ConnectionTrait>(
     )))
 }
 
+/// The openings `moving` holds that `onto` already holds too: the same instrument opening a curve
+/// at the same instant, which one channel cannot carry twice.
+pub(super) fn curve_collisions(
+    moving: &[(Uuid, chrono::DateTime<chrono::Utc>)],
+    onto: &[(Uuid, chrono::DateTime<chrono::Utc>)],
+) -> Vec<(Uuid, chrono::DateTime<chrono::Utc>)> {
+    moving
+        .iter()
+        .filter(|opening| onto.contains(opening))
+        .copied()
+        .collect()
+}
+
+/// Where each curve on a channel opens: the instrument and the instant. `None` is the curves for
+/// every channel.
+async fn curve_openings<C: ConnectionTrait>(
+    conn: &C,
+    parameter_id: Option<Uuid>,
+) -> AppResult<Vec<(Uuid, chrono::DateTime<chrono::Utc>)>> {
+    let channel = match parameter_id {
+        Some(id) => sensor_calibrations::Column::ParameterId.eq(id),
+        None => sensor_calibrations::Column::ParameterId.is_null(),
+    };
+    Ok(sensor_calibrations::Entity::find()
+        .filter(channel)
+        .all(conn)
+        .await
+        .map_err(AppError::Database)?
+        .into_iter()
+        .map(|c| (c.sensor_id, c.valid_from.with_timezone(&chrono::Utc)))
+        .collect())
+}
+
+/// Refuse moving `source`'s curves onto `onto` (a parameter, or `None` for every channel) where the
+/// same instrument already opens a curve there at the same instant.
+async fn refuse_curve_collisions<C: ConnectionTrait>(
+    conn: &C,
+    source: Uuid,
+    onto: Option<Uuid>,
+) -> AppResult<()> {
+    let moving = curve_openings(conn, Some(source)).await?;
+    if moving.is_empty() {
+        return Ok(());
+    }
+    let collisions = curve_collisions(&moving, &curve_openings(conn, onto).await?);
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    let named: Vec<String> = collisions
+        .iter()
+        .map(|(sensor, at)| format!("instrument {sensor} at {}", at.to_rfc3339()))
+        .collect();
+    Err(AppError::Conflict(format!(
+        "The instrument already opens a curve on that channel at the same instant, and one channel \
+         cannot carry two: {}",
+        named.join(", ")
+    )))
+}
+
 pub async fn merge_parameters(
     db: &DatabaseConnection,
     req: &MergeParametersRequest,
@@ -270,6 +344,7 @@ pub async fn merge_parameters(
     let (response, touched, touched_events) = bulk_write::guarded(db, async |txn| {
         validate_both_parameters_exist(txn, source_id, target_id).await?;
         refuse_on_collision(txn, MoveScope::EverySite, source_id, target_id).await?;
+        refuse_curve_collisions(txn, source_id, Some(target_id)).await?;
         refuse_derived_cycle(txn, source_id, target_id).await?;
 
         let (sites_merged, sites_reassigned, moved) =

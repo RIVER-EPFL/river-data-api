@@ -412,16 +412,16 @@ pub async fn create_calibration(
     .await
 }
 
-/// Mark a site_parameter public. `is_public` is excluded from create and the CrudCrate update route
-/// is PUT-only, so tests set it with a direct UPDATE (matching `public_workflow_e2e_test`).
-pub async fn set_site_parameter_public(db: &sea_orm::DatabaseConnection, sp_id: &str) {
-    use sea_orm::{ConnectionTrait, Statement};
-    db.execute_raw(Statement::from_string(
-        sea_orm::DatabaseBackend::Postgres,
-        format!("UPDATE site_parameters SET is_public = true WHERE id = '{sp_id}'"),
-    ))
-    .await
-    .expect("mark site_parameter public");
+/// Mark a site_parameter public through its update route, as an operator exposes one.
+pub async fn set_site_parameter_public(app: &Router, token: &str, sp_id: &str) {
+    let (status, body) = crate::common::put_json_with_token(
+        app,
+        &format!("/api/site_parameters/{sp_id}"),
+        &serde_json::json!({ "is_public": true }),
+        token,
+    )
+    .await;
+    assert_eq!(status, 200, "mark site_parameter {sp_id} public: {body}");
 }
 
 /// Author, validate and activate one tool version as `admin`. Runner-backed: validation runs

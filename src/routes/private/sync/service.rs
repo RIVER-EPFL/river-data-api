@@ -3945,7 +3945,7 @@ pub async fn create_plan(
         id: Set(Uuid::new_v4()),
         source_system: Set(source_system.to_string()),
         status: Set("draft".to_string()),
-        created_by: Set(None),
+        created_by: Set(crate::common::actor::current()),
         summary: Set(summary),
         entries: Set(PlanEntries(entries)),
         curve_assignments: Set(PlanCurveIntents::default()),
