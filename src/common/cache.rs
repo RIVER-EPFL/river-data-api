@@ -12,7 +12,7 @@
 //!
 //! Three things reach [`invalidate_site`]:
 //!
-//! - Writers that call it (through [`invalidate_prefix`] until they are moved over).
+//! - Writers that call it directly.
 //! - The layer on the slot CRUD routes (`routes/service/mod.rs`), since a slot's decimal places
 //!   and active switch shape its site's series. A catalog parameter write drops everything instead.
 //! - [`spawn_write_invalidator`], an in-process subscriber to the `AppEvent` bus the writers
@@ -381,22 +381,6 @@ pub fn written_rows(method: &str, path: &str) -> WrittenRows {
     {
         Some(id) => WrittenRows::One(id),
         None => WrittenRows::Unnamed,
-    }
-}
-
-/// Drop a site's cached responses, named by a `{namespace}:{site}` prefix.
-///
-/// Kept for the writers that still spell invalidation as a pair of namespace prefixes; the
-/// namespace half is ignored, because a site's entries are dropped together. Call
-/// [`invalidate_site`] directly instead. A prefix that names no resolvable site drops everything,
-/// so a mistyped prefix cannot pass silently.
-pub async fn invalidate_prefix(state: &AppState, prefix: &str) {
-    match site_of_key(state, prefix).await {
-        Some(site_id) => invalidate_site(&state.response_cache, site_id),
-        None => invalidate_all(
-            &state.response_cache,
-            &format!("prefix names no site: {prefix}"),
-        ),
     }
 }
 

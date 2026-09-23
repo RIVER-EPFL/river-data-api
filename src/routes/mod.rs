@@ -174,7 +174,6 @@ pub fn validate_optional_time_range(
         private::api_tokens::views::distinct_status_codes,
         private::api_tokens::views::revoke_token,
         private::api_tokens::views::rotate_token,
-        private::api_tokens::views::token_usage,
         private::notifications::views::get_my_notifications,
         private::notifications::views::list_channels,
         private::notifications::views::update_my_notifications,

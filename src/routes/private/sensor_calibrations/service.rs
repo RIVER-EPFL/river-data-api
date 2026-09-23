@@ -201,32 +201,6 @@ pub fn orphaned_correction_rows(alias: &str) -> Expr {
         )))
 }
 
-/// Rewrite each spot reading's `calibrated_value` from the curves the row itself names.
-///
-/// This is the other half of [`window_resolved_rows`]. A grab keeps the curves it was entered
-/// against, but the value it serves is whatever those curves produce now: editing a base
-/// calibration's coefficients moves every grab that carries it, so the served value and the
-/// provenance beside it cannot drift apart. Both reprocess engines call this, differing only in
-/// `scope_sql`, which selects the readings (as `r`) and is written against `params`.
-///
-/// A grab naming neither curve is in scope too, and is written NULL: no window resolution will ever
-/// claim such a row, so this is the only statement that can reach the copy of the raw value the old
-/// writers left in `calibrated_value`. The one exception is [`orphaned_correction_rows`], a value
-/// that is not that copy and that no curve here can reproduce; those are left exactly as they are.
-pub async fn recompose_spot_readings<C: ConnectionTrait>(
-    db: &C,
-    scope_sql: &str,
-    params: Vec<sea_orm::Value>,
-) -> Result<u64, sea_orm::DbErr> {
-    recompose_from_own_curves(
-        db,
-        Expr::cust("r.measurement_type = 'spot'"),
-        scope_sql,
-        params,
-    )
-    .await
-}
-
 /// What the curves a row itself names produce from its raw value. Both the recompose and the drift
 /// sweep judge against this one expression, so what the sweep repairs is what the recompose writes.
 fn recomposed_own_curve_value() -> Expr {

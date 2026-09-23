@@ -167,10 +167,11 @@ fn test_the_rejection_kind_follows_the_order_the_message_does() {
 }
 
 #[test]
-fn test_the_rejection_kind_reads_the_clock_for_a_reading_of_now() {
-    assert_eq!(rejection_kind(Utc::now(), 1.0, Some("continuous")), None);
+fn test_the_rejection_kind_admits_now_and_refuses_before_the_floor() {
+    let now = Utc::now();
+    assert_eq!(rejection_kind_at(now, now, 1.0, Some("continuous")), None);
     assert_eq!(
-        rejection_kind(*MIN_TIME - chrono::Duration::days(1), 1.0, None),
+        rejection_kind_at(now, *MIN_TIME - chrono::Duration::days(1), 1.0, None),
         Some(RejectionKind::OutOfWindow)
     );
 }

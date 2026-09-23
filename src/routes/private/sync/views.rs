@@ -2458,10 +2458,6 @@ pub fn control_session_routes() -> Router<AppState> {
         .route("/events/{id}", patch(update_sync_event))
 }
 
-pub fn control_routes() -> Router<AppState> {
-    control_enroll_routes().merge(control_session_routes())
-}
-
 #[cfg(test)]
 #[path = "tests/views.rs"]
 mod tests;

@@ -812,7 +812,7 @@ fn a_value_computed_from_a_pending_measurement_is_pending_itself() {
 
 #[test]
 fn sync_owns_the_measurement_and_never_a_judgement() {
-    use super::{is_judgement, judgements_on};
+    use super::{is_judgement, judgement_kinds};
     for k in [
         Kind::Flag,
         Kind::Curve,
@@ -839,15 +839,23 @@ fn sync_owns_the_measurement_and_never_a_judgement() {
     ] {
         assert!(!is_judgement(k), "{k:?} is not a ruling sync must respect");
     }
-    assert!(judgements_on(&[]).is_empty(), "an untouched row is free");
-    assert!(
-        judgements_on(&[Kind::Withdraw, Kind::ValueCorrection]).is_empty(),
-        "a row sync has only corrected is still free"
-    );
+    let mut judged = judgement_kinds();
+    judged.sort_unstable();
+    let mut expected = [
+        Kind::Flag,
+        Kind::Curve,
+        Kind::CalibrationPin,
+        Kind::InstrumentPin,
+        Kind::UnverifiedEntry,
+        Kind::Verify,
+        Kind::Reject,
+    ]
+    .map(Kind::as_str)
+    .to_vec();
+    expected.sort_unstable();
     assert_eq!(
-        judgements_on(&[Kind::ValueCorrection, Kind::Flag, Kind::Curve]),
-        vec![Kind::Flag, Kind::Curve],
-        "the rulings are named in the order they stand"
+        judged, expected,
+        "the statement's kinds are the rulings and no other"
     );
 }
 

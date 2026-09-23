@@ -2093,34 +2093,6 @@ pub async fn record_curve_claims<C: ConnectionTrait>(
     Ok(all)
 }
 
-/// Before the chain rewrites an output: one `chain` decision per stored row a fresh run
-/// supersedes, naming the run it replaces and the run that replaces it.
-pub async fn record_chain_supersessions<C: ConnectionTrait>(
-    conn: &C,
-    models: &[Model],
-    run_id: Uuid,
-    actor: &str,
-) -> AppResult<Recorded> {
-    let mut all = Recorded::default();
-    for (stream, rows) in by_stream(models, |_| Some(serde_json::json!({ "run_id": run_id }))) {
-        let r = record_keyed(
-            conn,
-            Kind::Chain,
-            stream,
-            &rows,
-            actor,
-            Some("superseded by a recompute"),
-            Origin::Chain,
-            Keyed::Changed,
-            None,
-            None,
-        )
-        .await?;
-        all.rows += r.rows;
-    }
-    Ok(all)
-}
-
 /// The live decisions covering the `readings` row `alias` names, as a correlated subquery.
 /// `kind` confines it to one kind; `None` takes every kind.
 fn live_decisions(alias: &str, kind: Option<Kind>) -> sea_orm::sea_query::SelectStatement {
@@ -2183,17 +2155,6 @@ pub fn is_judgement(kind: Kind) -> bool {
             | Kind::Verify
             | Kind::Reject
     )
-}
-
-/// The judgements standing on a row, from its live decision kinds, newest first as given. Empty
-/// means a re-send may correct and retract the row without anyone ruling again.
-#[must_use]
-pub fn judgements_on(live_kinds: &[Kind]) -> Vec<Kind> {
-    live_kinds
-        .iter()
-        .copied()
-        .filter(|k| is_judgement(*k))
-        .collect()
 }
 
 /// Every kind [`is_judgement`] holds, so the statement and the function cannot disagree about
@@ -7179,7 +7140,7 @@ pub mod admission {
     /// Why a reading cannot be stored, as a closed set. The messages [`rejection`] returns carry
     /// the offending value and so cannot be grouped; a caller summarising a batch wants the kind.
     ///
-    /// `UnknownCalibration` needs the calibration rows, so [`rejection_kind`] cannot decide it.
+    /// `UnknownCalibration` needs the calibration rows, so [`rejection_kind_at`] cannot decide it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum RejectionKind {
         OutOfWindow,
@@ -7209,17 +7170,8 @@ pub mod admission {
         }
     }
 
-    /// Which kind of rejection applies, or `None` when the reading is admissible. Same order of
-    /// precedence as [`rejection`].
-    pub fn rejection_kind(
-        time: DateTime<Utc>,
-        raw_value: f64,
-        measurement_type: Option<&str>,
-    ) -> Option<RejectionKind> {
-        rejection_kind_at(Utc::now(), time, raw_value, measurement_type)
-    }
-
-    /// [`rejection_kind`] against a caller-supplied `now`.
+    /// Which kind of rejection applies against a caller-supplied `now`, or `None` when the reading
+    /// is admissible. Same order of precedence as [`rejection`].
     pub fn rejection_kind_at(
         now: DateTime<Utc>,
         time: DateTime<Utc>,

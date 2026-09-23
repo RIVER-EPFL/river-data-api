@@ -14,11 +14,7 @@ use sea_orm::QuerySelect;
 use sea_orm::Set;
 use sea_orm::Statement;
 use sea_orm::TransactionTrait;
-use sea_orm::sea_query::Alias;
 use sea_orm::sea_query::Expr;
-use sea_orm::sea_query::ExprTrait;
-use sea_orm::sea_query::Query;
-use sea_orm::sea_query::SimpleExpr;
 use serde::Deserialize;
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -38,14 +34,12 @@ use crate::common::bulk_write::TouchedRange;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::routes::private::alarms::models as alarm_thresholds;
-use crate::routes::private::data_streams;
 use crate::routes::private::data_streams::models::MoveScope;
 use crate::routes::private::data_streams::service::move_slot_rows;
 use crate::routes::private::data_streams::service::slot_move_collisions;
 use crate::routes::private::derived_parameters::models::definition as calculation_formulas;
 use crate::routes::private::parameters;
 use crate::routes::private::readings;
-use crate::routes::private::readings::samples;
 use crate::routes::private::readings::status_events::models as status_events;
 use crate::routes::private::sensors::service::require_measuring_instrument;
 use crate::routes::private::site_parameters;
@@ -387,17 +381,6 @@ impl SlotDescriptor {
             decimal_places: slot.decimal_places,
         }
     }
-
-    /// Resolve a batch of slots against one catalog map, preserving input order.
-    pub fn resolve_all(
-        slots: &[SiteParameterModel],
-        catalog: &HashMap<Uuid, CatalogParameter>,
-    ) -> Vec<Self> {
-        slots
-            .iter()
-            .map(|s| Self::resolve(s, catalog.get(&s.parameter_id)))
-            .collect()
-    }
 }
 
 /// The group's members and the site's slots, decided in one place so the route and its test agree
@@ -500,42 +483,6 @@ pub fn cadence_deciding<'a>(
                 .any(|held| held.eq_ignore_ascii_case(code))
         })
         .collect()
-}
-
-/// The `samples` rows a retag names: those whose slot is named by id, or reached through the
-/// pairing of a named stream. Written against the unaliased `samples` table, so it composes into
-/// `samples::Entity::find()` and `update_many()` alike.
-#[must_use]
-pub fn slot_scope(site_parameter_ids: &[Uuid], stream_ids: &[Uuid]) -> SimpleExpr {
-    let sp = Alias::new("sp");
-    let ds = Alias::new("ds");
-    let mut streams = Query::select();
-    streams
-        .expr(Expr::val(1))
-        .from_as(data_streams::Entity, ds.clone())
-        .and_where(Expr::col((ds.clone(), data_streams::Column::Id)).is_in(stream_ids.to_vec()))
-        .and_where(
-            Expr::col((ds, data_streams::Column::SiteParameterId)).equals((sp.clone(), Column::Id)),
-        );
-
-    let mut slots = Query::select();
-    slots
-        .expr(Expr::val(1))
-        .from_as(Entity, sp.clone())
-        .and_where(
-            Expr::col((sp.clone(), Column::SiteId))
-                .equals((samples::Entity, samples::Column::SiteId)),
-        )
-        .and_where(
-            Expr::col((sp.clone(), Column::ParameterId))
-                .equals((samples::Entity, samples::Column::ParameterId)),
-        )
-        .and_where(
-            Expr::col((sp, Column::Id))
-                .is_in(site_parameter_ids.to_vec())
-                .or(Expr::exists(streams)),
-        );
-    Expr::exists(slots)
 }
 
 // --- Absorbing one slot into another ---

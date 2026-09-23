@@ -225,11 +225,9 @@ async fn an_entry_naming_no_site_is_dropped_by_any_invalidation() {
     cleanup_test_db(&db).await;
 }
 
-// The writers still spell invalidation as a namespace prefix; the shim must reach the site's
-// entries in every namespace, not just the one named.
 #[tokio::test]
 #[serial]
-async fn a_namespace_prefix_invalidates_the_whole_site() {
+async fn invalidating_a_site_reaches_every_namespace() {
     let db = setup_test_db().await;
     seed_public_sites(&db).await;
     let (_app, state) = build_test_app_with_cache_and_state(db.clone());
@@ -243,19 +241,19 @@ async fn a_namespace_prefix_invalidates_the_whole_site() {
     store(&state, &public, "public").await;
     store(&state, &other_site, "other site").await;
 
-    cache::invalidate_prefix(&state, &format!("readings:{SITE1_ID}")).await;
+    cache::invalidate_site(&state.response_cache, site1());
 
     assert_eq!(cached(&state, &readings).await, None);
     assert_eq!(
         cached(&state, &aggregates).await,
         None,
-        "the namespace in the prefix does not narrow what is dropped"
+        "no namespace narrows what is dropped"
     );
     assert_eq!(cached(&state, &public).await, None);
     assert_eq!(
         cached(&state, &other_site).await.as_deref(),
         Some("other site"),
-        "the prefix still names one site"
+        "the call still names one site"
     );
 
     cleanup_test_db(&db).await;
@@ -263,23 +261,23 @@ async fn a_namespace_prefix_invalidates_the_whole_site() {
 
 #[tokio::test]
 #[serial]
-async fn a_prefix_naming_no_site_drops_everything() {
+async fn an_entry_naming_no_site_goes_without_taking_other_sites_with_it() {
     let db = setup_test_db().await;
     seed_public_sites(&db).await;
     let (_app, state) = build_test_app_with_cache_and_state(db.clone());
 
-    let one = private_key(SITE1_ID);
-    let two = private_key(SITE2_ID);
-    store(&state, &one, "one").await;
-    store(&state, &two, "two").await;
+    let unattributed = cache::cache_key("readings", &["not-a-uuid", "json"]);
+    let other_site = private_key(SITE2_ID);
+    store(&state, &unattributed, "unattributed").await;
+    store(&state, &other_site, "other site").await;
 
-    cache::invalidate_prefix(&state, "readings").await;
+    cache::invalidate_site(&state.response_cache, site1());
 
-    assert_eq!(cached(&state, &one).await, None);
+    assert_eq!(cached(&state, &unattributed).await, None);
     assert_eq!(
-        cached(&state, &two).await,
-        None,
-        "a prefix that resolves to no site cannot be applied precisely, so it applies bluntly"
+        cached(&state, &other_site).await.as_deref(),
+        Some("other site"),
+        "an unattributed entry is dropped on its own, not by falling back to dropping everything"
     );
 
     cleanup_test_db(&db).await;

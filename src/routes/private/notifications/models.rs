@@ -262,24 +262,6 @@ impl RoleResolution {
             Self::Revoked => None,
         }
     }
-
-    /// Read commands: any current riverdata user (Intern and up).
-    #[must_use]
-    pub fn allows_user(&self) -> bool {
-        matches!(self, Self::Active(_))
-    }
-
-    /// Operational commands (mutes): Administrator only.
-    #[must_use]
-    pub fn allows_admin(&self) -> bool {
-        matches!(self, Self::Active(Role::Administrator))
-    }
-
-    /// At least `min`'s access level.
-    #[must_use]
-    pub fn allows_level(&self, min: &Role) -> bool {
-        matches!(self, Self::Active(r) if r.level() >= min.level())
-    }
 }
 
 /// One breach/resolution to describe in a message, resolved to human-readable names.

@@ -797,10 +797,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             post(crate::routes::private::api_tokens::views::rotate_token),
         )
         .route(
-            "/tokens/{id}/usage",
-            get(crate::routes::private::api_tokens::views::token_usage),
-        )
-        .route(
             "/api_token_audit_logs/distinct/status_codes",
             get(crate::routes::private::api_tokens::views::distinct_status_codes),
         )

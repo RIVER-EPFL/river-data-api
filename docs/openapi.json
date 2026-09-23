@@ -25711,40 +25711,6 @@
         ],
         "type": "object"
       },
-      "TokenUsageEntry": {
-        "description": "One recorded use of an API token from the forensic audit log.",
-        "properties": {
-          "created_at": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "method": {
-            "type": "string"
-          },
-          "path": {
-            "type": "string"
-          },
-          "project_scope": {
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "status_code": {
-            "format": "int32",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "method",
-          "path",
-          "status_code",
-          "project_scope",
-          "created_at"
-        ],
-        "type": "object"
-      },
       "ToolCalculation": {
         "description": "A calculation's result as the runner returned it, stored nowhere.",
         "properties": {
@@ -51209,42 +51175,6 @@
           }
         },
         "summary": "Rotate an API token: mint a new secret while preserving all metadata (name, description,\nproject scope, permissions, rate limit, expiry). The previous secret stops working immediately\n(cache invalidated); the new secret is returned once in `token`. Admin-only.",
-        "tags": [
-          "tokens"
-        ]
-      }
-    },
-    "/api/tokens/{id}/usage": {
-      "get": {
-        "operationId": "token_usage",
-        "parameters": [
-          {
-            "description": "Token id",
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/TokenUsageEntry"
-                  },
-                  "type": "array"
-                }
-              }
-            },
-            "description": "Recent token usage"
-          }
-        },
-        "summary": "Recent usage of an API token (most recent first, capped at 200) from the forensic audit log.\nAdmin-only, like all token management. Empty when auditing is disabled or the token is unused.",
         "tags": [
           "tokens"
         ]

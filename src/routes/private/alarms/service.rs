@@ -248,12 +248,6 @@ pub fn latest_slot_values_query() -> SelectStatement {
         .to_owned()
 }
 
-/// Render [`latest_slot_values_query`] to a standalone SQL string, for splicing as a CTE body
-/// beside [`resolve_thresholds_query`].
-pub fn latest_slot_values_sql() -> String {
-    latest_slot_values_query().to_string(PostgresQueryBuilder)
-}
-
 /// Resolve the resolved threshold for one `(site, parameter)` slot, the per-slot wrapper over the
 /// single [`resolve_thresholds_query`] definition. Returns `None` when the slot has no threshold
 /// at any tier. An all-NULL row (the "Disabled" state) resolves to `Some(..)` with every bound

@@ -51,6 +51,13 @@ fn secret_half(raw: &str) -> String {
         .unwrap_or_else(|| panic!("api token must be rvd_<prefix>_<secret>, got {raw}"))
 }
 
+/// The audit-log list confined to one key, newest first, as the token dialog reads it.
+fn audit_log_path(token_id: &str) -> String {
+    let filter = crate::common::e2e::percent_encode(&format!(r#"{{"token_id":"{token_id}"}}"#));
+    let sort = crate::common::e2e::percent_encode(r#"["created_at","DESC"]"#);
+    format!("/api/api_token_audit_logs?filter={filter}&sort={sort}")
+}
+
 async fn seeded_db() -> sea_orm::DatabaseConnection {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
@@ -347,9 +354,9 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
 
 #[tokio::test]
 #[serial]
-async fn usage_view_and_audit_status_codes_over_http() {
+async fn audit_log_list_and_status_codes_over_http() {
     if !crate::common::profile::Service::Keycloak
-        .require("usage_view_and_audit_status_codes_over_http")
+        .require("audit_log_list_and_status_codes_over_http")
         .await
     {
         return;
@@ -394,8 +401,8 @@ async fn usage_view_and_audit_status_codes_over_http() {
     assert_eq!(status, 201, "mint a key that is never used: {idle}");
     let idle_id = idle["id"].as_str().expect("idle token id").to_string();
 
-    // The only two requests this key ever makes, one hit and one miss, so the usage view's
-    // contents are exactly known. Every later call in this test uses the admin JWT, which is not
+    // The only two requests this key ever makes, one hit and one miss, so its audit rows are
+    // exactly known. Every later call in this test uses the admin JWT, which is not
     // audited (auditing records API-token use only).
     let (status, body) =
         crate::common::get_with_token(&audit_app, "/api/sites", &used_secret).await;
@@ -405,13 +412,13 @@ async fn usage_view_and_audit_status_codes_over_http() {
         crate::common::get_with_token(&audit_app, &missing_sensor, &used_secret).await;
     assert_eq!(status, 404, "an unknown sensor is a recorded 404: {body}");
 
-    let usage_path = format!("/api/tokens/{used_id}/usage");
+    let usage_path = audit_log_path(&used_id);
     let mut usage = serde_json::Value::Null;
     for _ in 0..40 {
         let (status, body) = crate::common::get_json_with_token(&kc_app, &usage_path, &admin).await;
         assert_eq!(
             status, 200,
-            "the usage view answers an administrator: {body}"
+            "the audit log answers an administrator: {body}"
         );
         let settled = body.as_array().is_some_and(|entries| entries.len() >= 2);
         usage = body;
@@ -423,7 +430,7 @@ async fn usage_view_and_audit_status_codes_over_http() {
     }
     let entries = usage
         .as_array()
-        .unwrap_or_else(|| panic!("the usage view answers with an array, got {usage}"));
+        .unwrap_or_else(|| panic!("the audit log answers with an array, got {usage}"));
     assert_eq!(
         entries.len(),
         2,
@@ -471,28 +478,24 @@ async fn usage_view_and_audit_status_codes_over_http() {
         );
     }
 
-    let (status, idle_usage) = crate::common::get_json_with_token(
-        &kc_app,
-        &format!("/api/tokens/{idle_id}/usage"),
-        &admin,
-    )
-    .await;
+    let (status, idle_usage) =
+        crate::common::get_json_with_token(&kc_app, &audit_log_path(&idle_id), &admin).await;
     assert_eq!(
         status, 200,
-        "the usage view answers for an unused key: {idle_usage}"
+        "the audit log answers for an unused key: {idle_usage}"
     );
     assert_eq!(
         idle_usage.as_array().map(Vec::len),
         Some(0),
-        "usage is filtered to the requested key, not a global dump: {idle_usage}"
+        "the filter confines the log to the requested key, not a global dump: {idle_usage}"
     );
 
     let (status, body) = crate::common::get_with_token(&kc_app, &usage_path, &manager).await;
-    assert_eq!(status, 403, "the usage view is Administrator-only: {body}");
+    assert_eq!(status, 403, "the audit log is Administrator-only: {body}");
     let (status, body) = crate::common::get(&kc_app, &usage_path).await;
     assert_eq!(
         status, 401,
-        "the usage view refuses an anonymous caller: {body}"
+        "the audit log refuses an anonymous caller: {body}"
     );
 
     let codes_path = "/api/api_token_audit_logs/distinct/status_codes";

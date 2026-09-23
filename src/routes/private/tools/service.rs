@@ -2762,7 +2762,7 @@ pub fn parse_pinned(body: &str) -> Result<Vec<PinnedFormula>, String> {
 /// order, each fed forward under the parameter code it is stored as.
 ///
 /// This is [`evaluate_cells`] read as scalars. A calculation whose formulas walk replicates is
-/// evaluated through [`evaluate_over_replicates`], which keeps every index.
+/// evaluated through [`evaluate_with_trace`], which keeps every index.
 pub fn evaluate(
     formulas: &[PinnedFormula],
     inputs: &HashMap<String, f64>,
@@ -3259,27 +3259,6 @@ pub(super) fn family_width(
     family_width(producer, formulas, replicates)
 }
 
-/// Evaluate a calculation whose formulas may be per-replicate, running the whole set once per
-/// index and assembling one entry per output.
-///
-/// A scalar formula is evaluated at index 0 and reported once: it reads the replicate group's
-/// statistics or a scalar input, not one repeat. A per-replicate formula is reported as a vector
-/// the width of the family, holding `None` where that index had no value, so a gap at index 1
-/// stays at index 1.
-///
-/// `inputs` are the scalars, `replicates` the vectors keyed by the same variable names. A variable
-/// present in both takes its indexed value, because a formula that declared itself per-replicate
-/// asked for the repeat rather than the summary.
-pub fn evaluate_over_replicates(
-    formulas: &[PinnedFormula],
-    inputs: &HashMap<String, f64>,
-    replicates: &HashMap<String, Vec<Option<f64>>>,
-    constants: &HashMap<String, f64>,
-    curves: &HashMap<String, Curve>,
-) -> Result<Vec<Produced>, String> {
-    evaluate_with_trace(formulas, inputs, replicates, constants, curves).map(|(p, _)| p)
-}
-
 /// The numbers a name-keyed object binds, dropping whatever is not one.
 pub(crate) fn numbers_by_name(
     map: &serde_json::Map<String, serde_json::Value>,
@@ -3336,9 +3315,21 @@ pub(super) fn formula_bindings(
     (numbers_by_name(inputs), replicates)
 }
 
-/// [`evaluate_over_replicates`], also returning each formula as it was evaluated: its text and,
-/// per cell, the value, the variables it read and the families it reduced. A scalar formula is
-/// one cell with no index; a per-replicate one is a cell per index.
+/// Evaluate a calculation whose formulas may be per-replicate, running the whole set once per
+/// index and assembling one entry per output.
+///
+/// A scalar formula is evaluated at index 0 and reported once: it reads the replicate group's
+/// statistics or a scalar input, not one repeat. A per-replicate formula is reported as a vector
+/// the width of the family, holding `None` where that index had no value, so a gap at index 1
+/// stays at index 1.
+///
+/// `inputs` are the scalars, `replicates` the vectors keyed by the same variable names. A variable
+/// present in both takes its indexed value, because a formula that declared itself per-replicate
+/// asked for the repeat rather than the summary.
+///
+/// Each formula is also returned as it was evaluated: its text and, per cell, the value, the
+/// variables it read and the families it reduced. A scalar formula is one cell with no index; a
+/// per-replicate one is a cell per index.
 pub fn evaluate_with_trace(
     formulas: &[PinnedFormula],
     inputs: &HashMap<String, f64>,

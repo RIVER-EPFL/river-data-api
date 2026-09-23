@@ -142,7 +142,6 @@
 /streams/{id}/unpair => deny_scoped_token+require_admin_or_token_write_metadata
 /tokens/{id}/revoke => require_admin
 /tokens/{id}/rotate => require_admin
-/tokens/{id}/usage => require_admin
 /tool_runs/{id}/reload => require_read_data
 /tool_runs/{id}/trace => require_read_data
 /tool_scripts => require_admin

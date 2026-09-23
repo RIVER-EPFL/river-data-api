@@ -109,7 +109,7 @@ fn test_the_spot_alarm_arms_evaluate_only_live_replicates() {
 /// the recent chunks.
 #[test]
 fn test_the_latest_slot_value_is_one_recent_unflagged_row_per_slot() {
-    let sql = super::latest_slot_values_sql();
+    let sql = super::latest_slot_values_query().to_string(PostgresQueryBuilder);
     assert!(
         sql.contains(r#"DISTINCT ON ("r"."site_id", "r"."parameter_id")"#),
         "one row per slot: {sql}"

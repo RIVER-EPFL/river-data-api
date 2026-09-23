@@ -138,7 +138,7 @@ fn test_every_cnet_formula_set_reproduces_its_golden_visit() {
         for case in calculation["cases"].as_array().expect("cases") {
             let context = format!("{name}, {}", case["name"].as_str().unwrap_or(""));
             let tolerance = case["tolerance"].as_f64().unwrap_or(DEFAULT_TOLERANCE);
-            let produced = evaluate_over_replicates(
+            let (produced, _) = evaluate_with_trace(
                 &formulas,
                 &numbers(&case["inputs"]),
                 &replicates(&case["replicates"]),

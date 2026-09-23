@@ -943,7 +943,6 @@ fn table() -> Table {
         &[
             ("POST", "/api/tokens/{id}/revoke"),
             ("POST", "/api/tokens/{id}/rotate"),
-            ("GET", "/api/tokens/{id}/usage"),
             ("GET", "/api/api_token_audit_logs/distinct/status_codes"),
         ],
     );

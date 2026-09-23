@@ -758,7 +758,7 @@ fn test_a_non_finite_result_is_neither_stored_nor_cleared() {
         Some("suva"),
         &[("a254", "a254"), ("doc", "doc_avg_ppb")],
     )];
-    let produced = evaluate_over_replicates(
+    let (produced, _) = evaluate_with_trace(
         &suva,
         &inputs(&[("a254", 2.0), ("doc", 0.0)]),
         &replicates(&[]),
@@ -795,7 +795,7 @@ fn test_an_na_result_still_clears_the_stored_value() {
         Some("dom_c_a"),
         &[("c", "peak_c"), ("a", "peak_a")],
     )];
-    let produced = evaluate_over_replicates(
+    let (produced, _) = evaluate_with_trace(
         &ratio,
         &inputs(&[("c", 3.0), ("a", 0.0)]),
         &replicates(&[]),
@@ -940,7 +940,7 @@ fn test_per_replicate_formula_yields_one_value_per_index() {
         &[("peak", "Peak")],
         "peak",
     )];
-    let produced = evaluate_over_replicates(
+    let (produced, _) = evaluate_with_trace(
         &formulas,
         &HashMap::new(),
         &replicates(&[("peak", &[Some(1.0), Some(2.0), Some(3.0)])]),
@@ -970,7 +970,7 @@ fn test_a_gap_stays_at_its_own_index() {
         &[("peak", "Peak")],
         "peak",
     )];
-    let produced = evaluate_over_replicates(
+    let (produced, _) = evaluate_with_trace(
         &formulas,
         &HashMap::new(),
         &replicates(&[("peak", &[Some(1.0), None, Some(3.0)])]),
@@ -1004,7 +1004,7 @@ fn test_a_scalar_formula_beside_a_per_replicate_one_is_reported_once() {
         ),
         formula("stage2", 2, "mean + 1", Some("S2"), &[("mean", "Mean")]),
     ];
-    let produced = evaluate_over_replicates(
+    let (produced, _) = evaluate_with_trace(
         &formulas,
         &HashMap::from([("mean".to_string(), 10.0)]),
         &replicates(&[("peak", &[Some(1.0), Some(2.0)])]),
@@ -1035,7 +1035,7 @@ fn test_a_scalar_formula_beside_a_per_replicate_one_is_reported_once() {
 #[test]
 fn test_a_calculation_with_no_per_replicate_formula_runs_once() {
     let formulas = [formula("only", 1, "a + 1", Some("Only"), &[("a", "A")])];
-    let produced = evaluate_over_replicates(
+    let (produced, _) = evaluate_with_trace(
         &formulas,
         &HashMap::from([("a".to_string(), 1.0)]),
         &HashMap::new(),
@@ -1107,7 +1107,7 @@ fn test_a_scalar_formula_reads_a_per_replicate_output_from_the_store() {
     );
 
     // The stored mean of [2, 4, 6] is 4, so the second stage is 5 whatever the repeats do.
-    let produced = evaluate_over_replicates(
+    let (produced, _) = evaluate_with_trace(
         &formulas,
         &HashMap::from([("s1".to_string(), 4.0)]),
         &replicates(&[("peak", &[Some(1.0), Some(2.0), Some(3.0)])]),
@@ -1147,7 +1147,7 @@ fn test_a_per_replicate_formula_reads_an_earlier_one_at_its_own_index() {
         "the chained stage resolves inside the run, not from the store: {manifest:?}"
     );
 
-    let produced = evaluate_over_replicates(
+    let (produced, _) = evaluate_with_trace(
         &formulas,
         &HashMap::new(),
         &replicates(&[("peak", &[Some(1.0), None, Some(3.0)])]),
@@ -1266,7 +1266,7 @@ fn test_a_reducer_reads_a_vector_the_same_run_produced() {
         per_replicate("y", 2, "x / m", Some("Y"), &[("x", "X")], "x"),
         formula("spread", 3, "sd(y)", Some("Spread"), &[("y", "Y")]),
     ];
-    let produced = evaluate_over_replicates(
+    let (produced, _) = evaluate_with_trace(
         &formulas,
         &HashMap::new(),
         &replicates(&[("x", &[Some(2.0), Some(4.0), Some(6.0)])]),
@@ -1321,7 +1321,7 @@ fn test_one_member_gives_a_mean_and_no_sd() {
         formula("avg", 1, "mean(x)", Some("Avg"), &[("x", "X")]),
         formula("spread", 2, "sd(x)", Some("Spread"), &[("x", "X")]),
     ];
-    let produced = evaluate_over_replicates(
+    let (produced, _) = evaluate_with_trace(
         &formulas,
         &HashMap::new(),
         &replicates(&[("x", &[Some(7.0), None])]),
@@ -1344,7 +1344,7 @@ fn test_one_member_gives_a_mean_and_no_sd() {
 #[test]
 fn test_a_reduction_over_nothing_is_na() {
     let formulas = [formula("avg", 1, "mean(x)", Some("Avg"), &[("x", "X")])];
-    let produced = evaluate_over_replicates(
+    let (produced, _) = evaluate_with_trace(
         &formulas,
         &HashMap::new(),
         &replicates(&[("x", &[None, None])]),
@@ -1369,7 +1369,7 @@ fn test_a_guard_supplies_a_fallback_for_an_na_reduction() {
         Some("Spread"),
         &[("x", "X")],
     )];
-    let produced = evaluate_over_replicates(
+    let (produced, _) = evaluate_with_trace(
         &formulas,
         &HashMap::new(),
         &replicates(&[("x", &[Some(7.0)])]),
@@ -1410,7 +1410,7 @@ fn test_a_variable_read_inside_and_outside_a_reducer_is_bound_both_ways() {
         Some("Ratio"),
         &[("x", "X")],
     )];
-    let produced = evaluate_over_replicates(
+    let (produced, _) = evaluate_with_trace(
         &formulas,
         &HashMap::new(),
         &replicates(&[("x", &[Some(2.0), Some(4.0), Some(6.0)])]),
@@ -1436,7 +1436,7 @@ fn test_a_reducer_over_a_scalar_skips_the_formula() {
         Some("Ratio"),
         &[("x", "X")],
     )];
-    let produced = evaluate_over_replicates(
+    let (produced, _) = evaluate_with_trace(
         &formulas,
         &inputs(&[("x", 6.0)]),
         &HashMap::new(),
@@ -1466,7 +1466,7 @@ fn test_a_reducer_over_a_scalar_skips_the_formula() {
 fn test_a_reducer_over_an_expression_is_refused() {
     assert!(reducer_calls("mean(x + 1)").is_empty());
     let formulas = [formula("avg", 1, "mean(x + 1)", Some("Avg"), &[("x", "X")])];
-    let err = evaluate_over_replicates(
+    let err = evaluate_with_trace(
         &formulas,
         &inputs(&[("x", 1.0)]),
         &HashMap::new(),

@@ -84,7 +84,7 @@ fn test_each_lab_spreadsheet_column_is_reproduced_by_its_formula() {
             let context = format!("{name}, {}", case["name"].as_str().unwrap_or(""));
             let tolerance = calculation["tolerance"].as_f64().unwrap_or(EXACT);
             let mut worst = (0.0_f64, String::new());
-            let produced = evaluate_over_replicates(
+            let (produced, _) = evaluate_with_trace(
                 &formulas,
                 &numbers(&case["inputs"]),
                 &replicates(&case["replicates"]),
@@ -203,7 +203,7 @@ fn run(
         .unwrap_or_else(|| panic!("no set named {name}"));
     let formulas: Vec<PinnedFormula> =
         serde_json::from_value(calculation["formulas"].clone()).expect("a stored formula set");
-    let produced = evaluate_over_replicates(
+    let (produced, _) = evaluate_with_trace(
         &formulas,
         &numbers(&spec["inputs"]),
         &replicates(&spec["replicates"]),

@@ -12,19 +12,14 @@ use axum::extract::State;
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use chrono::DateTime;
-use chrono::Utc;
 use sea_orm::ActiveModelTrait;
 use sea_orm::ColumnTrait;
-use sea_orm::ConnectionTrait;
 use sea_orm::EntityTrait;
-use sea_orm::FromQueryResult;
 use sea_orm::IntoActiveModel;
 use sea_orm::QueryFilter;
 use sea_orm::QueryOrder;
 use sea_orm::QuerySelect;
 use sea_orm::Set;
-use sea_orm::Statement;
 use serde::Serialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -108,51 +103,6 @@ pub async fn rotate_token(
     let mut out = ApiToken::from(updated);
     out.token = Some(minted.raw_token);
     Ok(Json(ApiTokenResponse::from(out)))
-}
-
-/// One recorded use of an API token from the forensic audit log.
-#[derive(Debug, Serialize, ToSchema, sea_orm::FromQueryResult)]
-pub struct TokenUsageEntry {
-    pub method: String,
-    pub path: String,
-    pub status_code: i32,
-    #[schema(required)]
-    pub project_scope: Option<Uuid>,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Recent usage of an API token (most recent first, capped at 200) from the forensic audit log.
-/// Admin-only, like all token management. Empty when auditing is disabled or the token is unused.
-#[utoipa::path(
-    get,
-    path = "/api/tokens/{id}/usage",
-    params(("id" = Uuid, Path, description = "Token id")),
-    responses(
-        (status = 200, description = "Recent token usage", body = [TokenUsageEntry]),
-    ),
-    tag = "tokens"
-)]
-pub async fn token_usage(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> AppResult<Json<Vec<TokenUsageEntry>>> {
-    let rows = state
-        .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT method, path, status_code, project_scope, created_at \
-             FROM api_token_audit_log WHERE token_id = $1 \
-             ORDER BY created_at DESC LIMIT 200",
-            [id.into()],
-        ))
-        .await?;
-
-    let entries = rows
-        .iter()
-        .map(|r| Ok(TokenUsageEntry::from_query_result(r, "")?))
-        .collect::<AppResult<Vec<_>>>()?;
-
-    Ok(Json(entries))
 }
 
 /// Distinct HTTP status codes present in the audit log, used to populate the admin filter dropdown

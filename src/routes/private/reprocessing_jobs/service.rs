@@ -1169,18 +1169,6 @@ impl Schedule {
         }
     }
 
-    #[must_use]
-    pub fn with_overlap(mut self, overlap: OverlapPolicy) -> Self {
-        self.overlap = overlap;
-        self
-    }
-
-    #[must_use]
-    pub fn with_catchup(mut self, catchup: CatchupPolicy) -> Self {
-        self.catchup = catchup;
-        self
-    }
-
     /// Next run strictly after `now`, on the grid anchored at `anchor` (the schedule's current
     /// `next_run_at`), so cadence never drifts by a run's own duration. After a downtime gap the
     /// grid snaps forward to the first future slot, discarding the missed backlog (whether to *also*

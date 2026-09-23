@@ -7,7 +7,6 @@
 //! forensic audit log. Token *creation* is admin-only (Keycloak), so an admin-issued key is seeded
 //! directly, the same representation used by `e2e_api_token_lifecycle_test`.
 
-use axum::extract::{Path, State};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use serial_test::serial;
 use std::time::Duration;
@@ -329,7 +328,7 @@ async fn api_token_use_is_recorded_in_audit_log() {
     let db = crate::common::setup_test_db().await;
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
-    let (app, state) = crate::common::build_test_app_with_audit(db.clone());
+    let (app, _) = crate::common::build_test_app_with_audit(db.clone());
 
     let key = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
     let tid = token_id(&db, &key).await;
@@ -375,16 +374,4 @@ async fn api_token_use_is_recorded_in_audit_log() {
     assert_eq!(row.try_get::<String>("", "method").unwrap(), "GET");
     assert_eq!(row.try_get::<String>("", "path").unwrap(), "/sites");
     assert_eq!(row.try_get::<i32>("", "status_code").unwrap(), 200);
-
-    // The admin-only usage view (handler invoked against the shared state) surfaces the entry.
-    let usage = river_db::routes::private::api_tokens::views::token_usage(State(state), Path(tid))
-        .await
-        .expect("usage ok")
-        .0;
-    assert!(
-        usage
-            .iter()
-            .any(|e| e.path == "/sites" && e.method == "GET"),
-        "usage view must include the recorded request"
-    );
 }

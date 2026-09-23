@@ -144,8 +144,6 @@ async fn ingest_one(app: &Router, jwt: &str, stream_id: &str, time: &str, raw_va
     );
 }
 
-// cache::invalidate_prefix removes nothing (the moka cache is built without
-// support_invalidation_closures), so a bounded read keeps serving pre-write bytes.
 #[tokio::test]
 #[serial]
 async fn a_write_invalidates_the_written_sites_cached_readings() {
@@ -336,8 +334,8 @@ async fn an_unbounded_read_reflects_a_backfilled_reading() {
     );
 }
 
-// public entries are keyed `pub_readings:{project_code}:{site_code}:...`, a namespace no
-// invalidation prefix targets, so a write to the site leaves the public response stale.
+// Public entries are keyed `pub_readings:{project_code}:{site_code}:...`, by codes rather than
+// the site id, and a write to the site still reaches them.
 #[tokio::test]
 #[serial]
 async fn a_write_invalidates_the_sites_public_cached_readings() {

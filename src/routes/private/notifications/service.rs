@@ -1687,11 +1687,3 @@ pub async fn is_muted(
         .await?;
     Ok(found.is_some())
 }
-
-/// Every mute in force, newest slot ordering left to the caller.
-pub async fn in_force_all(db: &DatabaseConnection) -> Result<Vec<mutes::Model>, DbErr> {
-    mutes::Entity::find()
-        .filter(mutes::in_force())
-        .all(db)
-        .await
-}
