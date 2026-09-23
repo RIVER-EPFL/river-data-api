@@ -785,6 +785,25 @@ fn slot_move_tally(
     changed
 }
 
+/// The streams `streams` selects, locked `FOR UPDATE` in id order before a revert or retirement
+/// releases their rows. A pass holding one `FOR SHARE` commits first, so its rows are there to
+/// release, and a pass arriving later waits and then reads the stream released.
+pub async fn lock_released_streams<C: ConnectionTrait>(
+    conn: &C,
+    streams: Condition,
+) -> AppResult<()> {
+    models::Entity::find()
+        .select_only()
+        .column(models::Column::Id)
+        .filter(streams)
+        .order_by_asc(models::Column::Id)
+        .lock_exclusive()
+        .into_tuple::<Uuid>()
+        .all(conn)
+        .await?;
+    Ok(())
+}
+
 /// The rows one [`SlotScope`] addresses. The condition names columns every slot table carries,
 /// so one selection serves each of them.
 pub(super) struct RetireTarget {

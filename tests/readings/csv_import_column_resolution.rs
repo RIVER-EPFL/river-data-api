@@ -316,6 +316,102 @@ not-a-date,260,13.0\n\
     );
 }
 
+/// Scenario: a file maps a column to a parameter the site carries no slot for, the slot is added,
+/// and a second file is imported.
+/// Expected behaviour: the first import stores the column's rows unattributed on an unpaired
+/// channel; the second pairs the channel, with its backfill, so every row the channel holds agrees
+/// with its pairing.
+#[tokio::test]
+#[serial]
+async fn test_csv_import_stages_a_column_without_a_slot_until_its_channel_pairs() {
+    let (db, app, token) = setup().await;
+    let site = crate::common::SITE1_ID;
+    let param =
+        crate::common::e2e::create_parameter(&app, &token, "noslotcol", "No slot", "m").await;
+    let channel = format!("s.source_system = 'api' AND s.source_key = '{site}:{param}'");
+    let stored = format!(
+        "SELECT count(*) AS c FROM readings r JOIN data_streams s ON s.id = r.stream_id WHERE {channel}"
+    );
+    let unattributed = format!(
+        "{stored} AND r.site_id IS NULL AND r.parameter_id IS NULL AND r.sensor_id IS NULL \
+         AND r.deployment_id IS NULL AND r.calibration_id IS NULL"
+    );
+    let disagreeing =
+        format!("{stored} AND ((r.site_id IS NULL) <> (s.site_parameter_id IS NULL))");
+    let attributed = format!("{stored} AND r.site_id = '{site}' AND r.parameter_id = '{param}'");
+
+    let (status, resp) = import(
+        &app,
+        &token,
+        &serde_json::json!({"site": site, "csv": "DateTime,noslotcol\n2025-05-01 00:00:00,1.5\n"}),
+    )
+    .await;
+    assert_eq!(status, 200, "import without a slot ({status}): {resp}");
+    assert_eq!(poll_count(&db, &stored, 1).await, 1, "the row landed");
+    assert_eq!(
+        count(&db, &unattributed).await,
+        1,
+        "no slot, so the row is staged"
+    );
+
+    crate::common::e2e::assign_site_parameter_minimal(&app, &token, site, &param).await;
+    let (status, resp) = import(
+        &app,
+        &token,
+        &serde_json::json!({"site": site, "csv": "DateTime,noslotcol\n2025-05-01 00:10:00,2.5\n"}),
+    )
+    .await;
+    assert_eq!(status, 200, "import after the slot ({status}): {resp}");
+    assert_eq!(
+        poll_count(&db, &stored, 2).await,
+        2,
+        "the second row landed"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT count(*) AS c FROM data_streams s WHERE {channel} AND s.site_parameter_id IS NOT NULL")
+        )
+        .await,
+        1,
+        "the import paired its channel to the slot"
+    );
+    assert_eq!(
+        count(&db, &disagreeing).await,
+        0,
+        "rows agree with the pairing"
+    );
+    assert_eq!(
+        count(&db, &attributed).await,
+        2,
+        "the pairing backfilled the first row"
+    );
+}
+
+async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            sql.to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("row");
+    row.try_get::<i64>("", "c").expect("c")
+}
+
+/// The count `sql` returns once it reaches `want`, or what it stands at after ten seconds.
+async fn poll_count(db: &DatabaseConnection, sql: &str, want: i64) -> i64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let n = count(db, sql).await;
+        if n >= want || std::time::Instant::now() >= deadline {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
 async fn count_readings(db: &DatabaseConnection, parameter_id: &str, time_rfc3339: &str) -> i64 {
     let param = Uuid::parse_str(parameter_id).unwrap();
     let time: chrono::DateTime<chrono::Utc> = time_rfc3339.parse().unwrap();

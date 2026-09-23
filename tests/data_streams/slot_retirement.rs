@@ -70,14 +70,11 @@ async fn retiring_a_stream_counts_only_the_rows_it_releases() {
     unattributed_reading(&db, stream, 10, 40.0).await;
     unattributed_reading(&db, stream, 11, 50.0).await;
 
-    let touched = retire_slot(&db, SlotScope::Stream(stream))
+    let touched = retire_slot(&db, SlotScope::Stream(stream), "test")
         .await
         .expect("retiring a stream's rows");
 
-    assert_eq!(
-        touched.touched.rows, 3,
-        "only the attributed rows are released"
-    );
+    assert_eq!(touched.rows, 3, "only the attributed rows are released");
     assert_eq!(attributed_count(&db, stream).await, 0);
     assert_eq!(
         e2e::count(
@@ -89,7 +86,6 @@ async fn retiring_a_stream_counts_only_the_rows_it_releases() {
         "releasing a slot hides readings from the rollups, it does not delete them"
     );
     let (min_time, max_time) = touched
-        .touched
         .span()
         .expect("a non-empty release reports its span");
     assert_eq!(min_time.to_rfc3339(), format!("{HOUR}:00:00+00:00"));
@@ -109,21 +105,17 @@ async fn retiring_a_stream_a_second_time_releases_nothing() {
     attributed_reading(&db, stream, 0, 10.0).await;
 
     assert_eq!(
-        retire_slot(&db, SlotScope::Stream(stream))
+        retire_slot(&db, SlotScope::Stream(stream), "test")
             .await
             .expect("first release")
-            .touched
             .rows,
         1
     );
-    let again = retire_slot(&db, SlotScope::Stream(stream))
+    let again = retire_slot(&db, SlotScope::Stream(stream), "test")
         .await
         .expect("a second release is not an error");
-    assert!(again.touched.is_empty(), "nothing is left to release");
-    assert!(
-        again.touched.span().is_none(),
-        "and so no rollup window is implied"
-    );
+    assert!(again.is_empty(), "nothing is left to release");
+    assert!(again.span().is_none(), "and so no rollup window is implied");
 
     cleanup_test_db(&db).await;
 }
@@ -257,12 +249,13 @@ async fn retiring_a_slot_releases_every_stream_and_deletes_its_orphaned_samples(
     let touched = retire_slot(
         &db,
         SlotScope::SiteParameter(PARAM_S1_TEMP_ID.parse().unwrap()),
+        "test",
     )
     .await
     .expect("retiring the slot");
 
     assert_eq!(
-        touched.touched.rows, 3,
+        touched.rows, 3,
         "the slot owns every row attributed to it, whichever stream wrote it"
     );
     assert_eq!(attributed_count(&db, logger).await, 0);
@@ -317,6 +310,7 @@ async fn retiring_a_slot_leaves_its_neighbours_alone() {
     retire_slot(
         &db,
         SlotScope::SiteParameter(PARAM_S1_TEMP_ID.parse().unwrap()),
+        "test",
     )
     .await
     .expect("retiring the slot");
@@ -338,17 +332,16 @@ async fn retiring_a_slot_that_is_already_gone_is_not_an_error() {
     cleanup_test_db(&db).await;
     seed_base_entities(&db).await;
 
-    let touched = retire_slot(&db, SlotScope::SiteParameter(Uuid::new_v4()))
+    let touched = retire_slot(&db, SlotScope::SiteParameter(Uuid::new_v4()), "test")
         .await
         .expect("an unresolvable slot reports an empty range rather than failing");
-    assert!(touched.touched.is_empty());
+    assert!(touched.is_empty());
 
     let never_used = create_unpaired_stream(&db, "retire-empty").await;
     assert!(
-        retire_slot(&db, SlotScope::Stream(never_used))
+        retire_slot(&db, SlotScope::Stream(never_used), "test")
             .await
             .expect("a stream with no rows is not an error")
-            .touched
             .is_empty()
     );
 

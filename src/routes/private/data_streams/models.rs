@@ -457,6 +457,18 @@ pub enum SlotScope {
     SiteParameter(Uuid),
 }
 
+impl SlotScope {
+    /// The streams the teardown releases from the slot.
+    pub fn streams(self) -> sea_orm::Condition {
+        match self {
+            Self::Stream(id) => sea_orm::Condition::all().add(Column::Id.eq(id)),
+            Self::SiteParameter(id) => {
+                sea_orm::Condition::all().add(Column::SiteParameterId.eq(id))
+            }
+        }
+    }
+}
+
 /// Which sites a slot move covers.
 #[derive(Debug, Clone, Copy)]
 pub enum MoveScope {

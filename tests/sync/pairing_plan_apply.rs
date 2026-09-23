@@ -479,6 +479,86 @@ async fn an_apply_whose_attribution_cannot_be_queued_commits_nothing() {
     crate::common::cleanup_test_db(&db).await;
 }
 
+/// Scenario: the plan's stream holds a reading at a manual visit a calculation reads, and the
+/// visit's recompute cannot be queued.
+///
+/// Expected behaviour: the apply commits nothing, so the retry the failed job gets applies the plan
+/// whole and queues the recompute, rather than finding it applied and queueing only the attribution.
+#[tokio::test]
+#[serial]
+async fn an_apply_whose_visit_recompute_cannot_be_queued_commits_nothing() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+    // The plan names its parameter "Temperature", and the apply creates it under that code.
+    crate::common::seed_visit_calculation(&db, "plan_visit_input", "Temperature").await;
+
+    let (plan_id, stream_id) =
+        reviewed_single_stream_plan(&db, &app, &token, "loc-lost-recompute").await;
+    let event = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO collection_events (id, site_id, collected_at, source) \
+             VALUES ('{event}', '{}', '2025-02-01T00:00:00Z', 'manual')",
+            crate::common::SITE1_ID
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO readings \
+                 (stream_id, time, raw_value, replicate_index, measurement_type, collection_event_id) \
+             VALUES ('{stream_id}', '2025-02-01T00:00:00Z', 1.0, 0, 'spot', '{event}')"
+        ),
+    )
+    .await;
+
+    crate::common::jobs::refuse_enqueue(&db, "event_recompute").await;
+    let applied = river_db::routes::private::sync::service::apply_plan(&db, plan_id, None).await;
+    crate::common::jobs::restore_enqueue(&db).await;
+
+    assert!(applied.is_err(), "the apply reports the refused enqueue");
+    assert_eq!(
+        count(
+            &db,
+            &format!("pairing_plans WHERE id = '{plan_id}' AND status = 'draft'")
+        )
+        .await,
+        1,
+        "the plan is still a draft"
+    );
+    assert_eq!(
+        scalar_opt_uuid(
+            &db,
+            &format!("SELECT site_parameter_id AS v FROM data_streams WHERE id = '{stream_id}'")
+        )
+        .await,
+        None,
+        "the stream is still unpaired"
+    );
+
+    river_db::routes::private::sync::service::apply_plan(&db, plan_id, None)
+        .await
+        .expect("the retry applies the plan");
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "reprocessing_jobs WHERE trigger_type = 'event_recompute' AND trigger_id = '{event}'"
+            )
+        )
+        .await,
+        1,
+        "the retry queues the visit's recompute"
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
 /// Scenario: a plan was applied and its attribution job is gone (lost before this fix, or pruned),
 /// and the `plan_apply` row runs again.
 ///

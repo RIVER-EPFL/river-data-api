@@ -4938,6 +4938,8 @@ async fn step(
     }
 }
 
+/// Apply a pairing plan. `progress` is the job running it, which carries the timeline the steps
+/// are written to and the bus the attributed slots are announced on.
 pub async fn apply_plan(
     db: &sea_orm::DatabaseConnection,
     plan_id: Uuid,
@@ -5136,6 +5138,7 @@ pub async fn apply_plan(
 
     let backfilled = backfill_plan_readings(&txn, plan_id).await?;
     let readings_backfilled = backfilled.readings;
+    let changed = plan_slot_tally(&txn, plan_id).await?;
     step(
         progress,
         &format!(
@@ -5151,18 +5154,24 @@ pub async fn apply_plan(
         progress.map(crate::routes::private::reprocessing_jobs::service::JobContext::job_id),
     )
     .await?;
-    txn.commit().await?;
-
     // Attribution is what made these readings visit values; the calculations that read them at
-    // each manual visit run now (ADR 0007). The plan runs as a job, so the writer it records is
-    // the system rather than a person.
+    // each manual visit run now (ADR 0007), queued with the apply so a retry finds a draft rather
+    // than an applied plan whose visits were never recomputed. The plan runs as a job, so the
+    // writer it records is the system rather than a person.
     crate::routes::private::collection_events::flows::enqueue_for(
-        db,
+        &txn,
         &backfilled.touched_events,
         "system",
         crate::routes::private::collection_events::flows::Writer::Person,
     )
     .await?;
+    txn.commit().await?;
+
+    // The history the plan attributed is served at its sites from now on, and a site's cached
+    // responses go only when a write announces it (`common/cache.rs`).
+    if let Some(ctx) = progress {
+        changed.announce(ctx.events());
+    }
 
     let slots: Vec<(Uuid, Uuid)> = plan_slots(plan_id).into_tuple().all(db).await?;
     // History that ended before river-data held it did not go stale on river-data's watch, so the
@@ -5914,6 +5923,43 @@ pub(super) async fn backfill_plan_readings<C: ConnectionTrait>(
     crate::routes::private::data_streams::flows::backfill(txn, HoldScope::Plan(plan_id), None).await
 }
 
+/// The readings the plan's streams serve, counted per (site, parameter) slot: what an apply has
+/// just attributed, or what a revert is about to take away, and so what either owes a
+/// `DataIngested` for (`common/cache.rs`).
+async fn plan_slot_tally<C: ConnectionTrait>(
+    conn: &C,
+    plan_id: Uuid,
+) -> AppResult<crate::common::SlotTally> {
+    use sea_orm::RelationTrait as _;
+    let rows: Vec<(Option<Uuid>, Option<Uuid>, i64)> = readings::models::Entity::find()
+        .select_only()
+        .column(readings::models::Column::SiteId)
+        .column(readings::models::Column::ParameterId)
+        .expr_as(
+            Func::count(Expr::col((
+                readings::models::Entity,
+                readings::models::Column::Time,
+            ))),
+            "rows",
+        )
+        .join(
+            JoinType::InnerJoin,
+            readings::models::Relation::DataStream.def(),
+        )
+        .filter(data_streams::models::Column::PairingPlanId.eq(plan_id))
+        .filter(readings::models::Column::SiteId.is_not_null())
+        .group_by(readings::models::Column::SiteId)
+        .group_by(readings::models::Column::ParameterId)
+        .into_tuple()
+        .all(conn)
+        .await?;
+    let mut tally = crate::common::SlotTally::default();
+    for (site_id, parameter_id, count) in rows {
+        tally.add(site_id, parameter_id, usize::try_from(count).unwrap_or(0));
+    }
+    Ok(tally)
+}
+
 pub(super) async fn finalize_plan<C: ConnectionTrait>(
     txn: &C,
     plan_id: Uuid,
@@ -5986,8 +6032,13 @@ pub async fn has_plan_attribution<C: ConnectionTrait>(
         .is_some())
 }
 
-/// Revert a pairing plan: bulk unpair all streams that were paired by this plan.
-pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> AppResult<u32> {
+/// Revert a pairing plan: bulk unpair all streams that were paired by this plan, then announce on
+/// `events` every slot whose readings it took away.
+pub async fn revert_plan(
+    db: &sea_orm::DatabaseConnection,
+    plan_id: Uuid,
+    events: Option<&crate::common::EventSender>,
+) -> AppResult<u32> {
     let plan = pairing_plans::Entity::find_by_id(plan_id)
         .one(db)
         .await?
@@ -6001,6 +6052,11 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
     }
 
     let txn = db.begin().await?;
+    crate::routes::private::data_streams::service::lock_released_streams(
+        &txn,
+        Condition::all().add(data_streams::models::Column::PairingPlanId.eq(plan_id)),
+    )
+    .await?;
 
     // Atomic status claim: a concurrent revert of the same plan matches zero rows and bails.
     if !claim_plan_status(&txn, plan_id, "applied", "reverting").await? {
@@ -6021,6 +6077,7 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
     // never be re-attached when the stream is paired somewhere else.
     let event_ids =
         plan_reading_references(&txn, plan_id, readings::models::Column::CollectionEventId).await?;
+    let changed = plan_slot_tally(&txn, plan_id).await?;
 
     let unattributed = bulk_write::mutation(
         &txn,
@@ -6122,6 +6179,9 @@ pub async fn revert_plan(db: &sea_orm::DatabaseConnection, plan_id: Uuid) -> App
     // state now.
     if let Some(window) = crate::common::aggregates::Window::touched(&unattributed) {
         crate::common::aggregates::refresh(db, window).await?;
+    }
+    if let Some(events) = events {
+        changed.announce(events);
     }
 
     tracing::info!(plan_id = %plan_id, reverted, "Pairing plan reverted");

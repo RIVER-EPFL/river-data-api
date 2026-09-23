@@ -472,9 +472,9 @@ struct DriftSteps {
     derived: Result<(), String>,
 }
 
-/// Recompose drifted curve values, refresh the rollups over the span they moved, and enqueue the
-/// visits and the stream-arm calculations whose inputs moved. A part not reached because nothing
-/// moved reports `Ok`.
+/// Recompose drifted curve values, refresh the rollups over the span they moved, announce the slots
+/// they moved, and enqueue the visits and the stream-arm calculations whose inputs moved. A part
+/// not reached because nothing moved reports `Ok`.
 async fn recompose_curve_drift(db: &sea_orm::DatabaseConnection, ctx: &JobContext) -> DriftSteps {
     let mut steps = DriftSteps {
         moved: 0,
@@ -528,6 +528,9 @@ async fn recompose_curve_drift(db: &sea_orm::DatabaseConnection, ctx: &JobContex
             }
         }
     }
+    // A rewritten value is served stale from the response cache until its site is announced, the
+    // contract every writer of stored values keeps (`common/cache.rs`).
+    drift.changed.announce(ctx.events());
     // A rewritten spot value is an input somebody's calculation read, so the visits it moved
     // recompute in dependency order rather than being left stale (Q108).
     let enqueued = match crate::routes::private::collection_events::flows::events_from_pairs(

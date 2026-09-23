@@ -12,6 +12,7 @@ mod nomis_pairing_refused;
 mod pair_backfill_memory;
 mod pair_opens_at_history;
 mod pair_replicate_samples;
+mod pair_visit_recompute;
 mod register_declares_instrument;
 mod register_pair_stats;
 mod replicate_retag_guard;

@@ -131,8 +131,8 @@ impl ParameterCatalog {
 }
 
 /// Read every catalog row the given manifests could name, by id or by code.
-pub async fn load_parameter_catalog<'a>(
-    db: &DatabaseConnection,
+pub async fn load_parameter_catalog<'a, C: ConnectionTrait>(
+    db: &C,
     manifests: impl IntoIterator<Item = &'a Manifest>,
 ) -> AppResult<ParameterCatalog> {
     let mut ids: Vec<Uuid> = Vec::new();
@@ -565,7 +565,7 @@ async fn load_own_formulas<C: ConnectionTrait>(
 
 /// The calculation set: every enabled tool with an active version. A disabled tool is left out
 /// here, so the chain, the audit and the tools list do not see it.
-pub async fn list_active_tools(db: &DatabaseConnection) -> AppResult<Vec<ActiveTool>> {
+pub async fn list_active_tools<C: ConnectionTrait>(db: &C) -> AppResult<Vec<ActiveTool>> {
     use sea_orm::sea_query::ExprTrait;
     let s = Alias::new("s");
     let query = active_tool_query()
@@ -3830,8 +3830,8 @@ pub async fn calculations_fed_by_subject(
 /// Every enabled calculation that reads one of `parameter_ids` at a visit, directly or through a
 /// calculation downstream of it, in the order the chain would run them. Empty when no calculation
 /// reads any of them, which is the common case for a logger parameter.
-pub async fn calculations_fed_by(
-    db: &DatabaseConnection,
+pub async fn calculations_fed_by<C: ConnectionTrait>(
+    db: &C,
     parameter_ids: &[Uuid],
 ) -> AppResult<Vec<CalculationImpact>> {
     if parameter_ids.is_empty() {

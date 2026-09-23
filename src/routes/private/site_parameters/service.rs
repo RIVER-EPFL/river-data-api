@@ -102,22 +102,25 @@ impl CRUDOperations for SiteParameterOperations {
     /// requires, so the delete CrudCrate performs next succeeds.
     ///
     /// A slot that measured something is retired with its Active flag instead, so nothing here
-    /// unattributes a history (Q160).
+    /// unattributes a history (Q160). The streams feeding the slot are locked before the count, so
+    /// a pass in flight on one of them commits first and is counted.
     async fn before_delete<C: ConnectionTrait + TransactionTrait>(
         &self,
         db: &C,
         id: Uuid,
     ) -> Result<(), ApiError> {
+        let slot = crate::routes::private::data_streams::models::SlotScope::SiteParameter(id);
+        crate::routes::private::data_streams::service::lock_released_streams(db, slot.streams())
+            .await
+            .map_err(|e| ApiError::internal(e.to_string(), None))?;
         let held = readings_held(db, id).await.map_err(ApiError::database)?;
         if let Some(refusal) = refuse_delete_of_measured_slot(held) {
             return Err(ApiError::bad_request(refusal));
         }
-        crate::routes::private::data_streams::flows::retire_slot(
-            db,
-            crate::routes::private::data_streams::models::SlotScope::SiteParameter(id),
-        )
-        .await
-        .map_err(|e| ApiError::internal(e.to_string(), None))?;
+        let actor = crate::common::actor::current().unwrap_or_else(|| "system".to_string());
+        crate::routes::private::data_streams::flows::retire_slot(db, slot, &actor)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string(), None))?;
         Ok(())
     }
 

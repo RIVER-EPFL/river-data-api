@@ -1,4 +1,4 @@
-use super::{batch_instrument, ingest_instrument, slot_attribution};
+use super::{batch_instrument, ingest_instrument};
 use uuid::Uuid;
 
 const ROW: Option<Uuid> = Some(Uuid::from_u128(1));
@@ -65,16 +65,4 @@ fn test_the_two_orders_disagree_only_when_the_row_names_nothing() {
         ingest_instrument(None, STREAM, SLOT),
         "the middle rung is the whole difference between the two write paths"
     );
-}
-
-#[test]
-fn test_slot_attribution_names_the_request_pair_only_when_a_slot_backs_it() {
-    let site = Uuid::from_u128(10);
-    let parameter = Uuid::from_u128(11);
-    assert_eq!(
-        slot_attribution(site, parameter, SLOT),
-        (Some(site), Some(parameter))
-    );
-    // The site was never assigned the parameter: the row is stored unattributed.
-    assert_eq!(slot_attribution(site, parameter, None), (None, None));
 }

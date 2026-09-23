@@ -566,34 +566,72 @@ fn test_only_a_raw_file_claims_the_calibration() {
     let api = HashMap::from([(DEPTH, API_DEPTH)]);
     let empty = HashMap::new();
     let targets = WriteTargets::new(&empty, &api);
-    let channel_instruments = HashMap::from([(API_DEPTH, SENSOR)]);
+    let streams = HashMap::from([(
+        API_DEPTH,
+        TargetStream {
+            slot: Some((SITE_A, DEPTH)),
+            instrument: Some(SENSOR),
+        },
+    )]);
     let rows = vec![(DEPTH, t, 1.5, 2)];
 
-    let raw = staged_rows(
-        SITE_A,
-        &rows,
-        &owners,
-        &targets,
-        &channel_instruments,
-        CsvValueState::Raw,
-    );
+    let raw = staged_rows(&rows, &owners, &targets, &streams, CsvValueState::Raw);
     assert_eq!(raw[0].calibration_id, Some(calibration));
     assert_eq!(raw[0].deployment_id, Some(deployment));
     // The deployment names no sensor, so the channel's instrument is stamped.
     assert_eq!(raw[0].sensor_id, Some(SENSOR));
     assert_eq!(raw[0].stream_id, API_DEPTH);
-    assert_eq!(raw[0].site_id, SITE_A);
+    assert_eq!(raw[0].site_id, Some(SITE_A));
     assert!((raw[0].raw_value - 1.5).abs() < f64::EPSILON);
 
-    let corrected = staged_rows(
-        SITE_A,
-        &rows,
-        &owners,
-        &targets,
-        &channel_instruments,
-        CsvValueState::Corrected,
-    );
+    let corrected = staged_rows(&rows, &owners, &targets, &streams, CsvValueState::Corrected);
     assert_eq!(corrected[0].calibration_id, None);
+}
+
+#[test]
+fn test_a_row_on_an_unpaired_stream_is_staged_unattributed() {
+    let t = at("2026-01-01T00:00:00Z");
+    let owned = crate::routes::private::sensors::models::ResolvedOwner {
+        sensor_id: Some(SENSOR),
+        deployment_id: Some(Uuid::from_u128(0xde)),
+        calibration_id: Some(Uuid::from_u128(0xca)),
+    };
+    let owners = HashMap::from([((DEPTH, t), owned.clone()), ((TURBIDITY, t), owned)]);
+    let api = HashMap::from([(DEPTH, API_DEPTH), (TURBIDITY, API_TURBIDITY)]);
+    let empty = HashMap::new();
+    let targets = WriteTargets::new(&empty, &api);
+    // Turbidity has no slot at the site, so its channel is unpaired.
+    let streams = HashMap::from([
+        (
+            API_DEPTH,
+            TargetStream {
+                slot: Some((SITE_A, DEPTH)),
+                instrument: Some(SENSOR),
+            },
+        ),
+        (
+            API_TURBIDITY,
+            TargetStream {
+                slot: None,
+                instrument: Some(SENSOR),
+            },
+        ),
+    ]);
+    let rows = vec![(DEPTH, t, 1.0, 2), (TURBIDITY, t, 2.0, 2)];
+
+    let staged = staged_rows(&rows, &owners, &targets, &streams, CsvValueState::Raw);
+    assert_eq!(staged[0].site_id, Some(SITE_A));
+    assert_eq!(staged[0].parameter_id, Some(DEPTH));
+    assert_eq!(staged[0].sensor_id, Some(SENSOR));
+
+    let unpaired = &staged[1];
+    assert_eq!(unpaired.stream_id, API_TURBIDITY);
+    assert_eq!(unpaired.site_id, None);
+    assert_eq!(unpaired.parameter_id, None);
+    assert_eq!(unpaired.sensor_id, None);
+    assert_eq!(unpaired.deployment_id, None);
+    assert_eq!(unpaired.calibration_id, None);
+    assert!((unpaired.raw_value - 2.0).abs() < f64::EPSILON);
 }
 
 #[test]

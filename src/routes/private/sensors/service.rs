@@ -8,8 +8,8 @@ use sea_orm::sea_query::{
     Query, SelectStatement,
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
-    FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, FromQueryResult,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -1231,8 +1231,8 @@ pub async fn find_or_create_deployment<C: ConnectionTrait>(
 /// Scoped to the parameter because a multi-channel instrument holds one open deployment per
 /// parameter at a site (`find_or_create_deployment`), and every other lifecycle path recalls by
 /// parameter. Closing by (sensor, site) alone would end channels nothing asked about.
-pub async fn close_sensor_deployment(
-    db: &DatabaseConnection,
+pub async fn close_sensor_deployment<C: ConnectionTrait>(
+    db: &C,
     sensor_id: Uuid,
     site_id: Uuid,
     parameter_id: Uuid,

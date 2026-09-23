@@ -10,8 +10,7 @@ use sea_orm::sea_query::{
     Alias, Condition, Expr, JoinType, PostgresQueryBuilder, Query as SeaQuery,
 };
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, ExprTrait, FromQueryResult,
-    QueryFilter, Statement,
+    ColumnTrait, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, QueryFilter, Statement,
 };
 use uuid::Uuid;
 
@@ -134,8 +133,8 @@ pub async fn events_from_pairs<C: ConnectionTrait>(
 
 /// Enqueue `event_recompute` for every touched visit an enabled calculation reads. Returns the
 /// ids of the jobs this call queued; a visit with a job already queued adds none.
-pub async fn enqueue_for(
-    db: &DatabaseConnection,
+pub async fn enqueue_for<C: ConnectionTrait>(
+    db: &C,
     events: &[TouchedEvent],
     actor: &str,
     writer: Writer,

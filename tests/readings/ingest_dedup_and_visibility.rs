@@ -706,6 +706,118 @@ async fn batch_pairs_its_api_channel_once_the_slot_exists() {
     );
 }
 
+/// Scenario: status events are batched for a site and parameter before the site carries that slot,
+/// an admin adds the slot, and later unpairs the api channel.
+/// Expected behaviour: every batch after the slot exists pairs the channel to it, with the backfill
+/// a pairing owes, so the stored events and the channel's pairing agree at every step.
+#[tokio::test]
+#[serial]
+async fn batch_status_events_pair_their_api_channel_once_the_slot_exists() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+    let project = e2e::create_project(&app, &token, "Late Status", "late-status", false).await;
+    let site = e2e::create_site(&app, &token, &project, "Late Status Site", "late-status").await;
+    let param = e2e::create_parameter(&app, &token, "latestate", "Late state", "state").await;
+    let post = async |time: &str| {
+        let (status, body) = crate::common::post_json_parse_with_token(
+            &app,
+            "/api/status_events/batch",
+            &serde_json::json!({"events": [
+                {"site_id": site, "parameter_id": param, "time": time, "value": "ok"}
+            ]}),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "batch at {time} ({status}): {body}");
+    };
+    let channel = format!("s.source_system = 'api' AND s.source_key = '{site}:{param}'");
+    let disagreeing = format!(
+        "SELECT count(*) AS c FROM status_events e JOIN data_streams s ON s.id = e.stream_id \
+         WHERE {channel} AND ((e.site_id IS NULL) <> (s.site_parameter_id IS NULL))"
+    );
+    let attributed = format!(
+        "SELECT count(*) AS c FROM status_events e JOIN data_streams s ON s.id = e.stream_id \
+         WHERE {channel} AND e.site_id = '{site}' AND e.parameter_id = '{param}'"
+    );
+    let paired = format!(
+        "SELECT count(*) AS c FROM data_streams s WHERE {channel} AND s.site_parameter_id IS NOT NULL"
+    );
+
+    post("2025-03-01T00:00:00Z").await;
+    assert_eq!(
+        count(&db, &attributed).await,
+        0,
+        "no slot backs the first event"
+    );
+    assert_eq!(
+        count(&db, &disagreeing).await,
+        0,
+        "unpaired channel, unattributed event"
+    );
+
+    e2e::assign_site_parameter_minimal(&app, &token, &site, &param).await;
+    post("2025-03-02T00:00:00Z").await;
+    assert_eq!(
+        count(&db, &paired).await,
+        1,
+        "the batch paired its channel to the slot"
+    );
+    assert_eq!(
+        count(&db, &disagreeing).await,
+        0,
+        "events agree with the pairing"
+    );
+    assert_eq!(
+        count(&db, &attributed).await,
+        2,
+        "the pairing backfilled the first event"
+    );
+
+    let stream = {
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("SELECT s.id::text AS id FROM data_streams s WHERE {channel}"),
+            ))
+            .await
+            .expect("query")
+            .expect("row");
+        row.try_get::<String>("", "id").expect("id")
+    };
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/streams/{stream}/unpair"),
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "unpair ({status}): {body}");
+    assert_eq!(
+        count(&db, &disagreeing).await,
+        0,
+        "unpair released every event"
+    );
+
+    post("2025-03-03T00:00:00Z").await;
+    assert_eq!(
+        count(&db, &paired).await,
+        1,
+        "the batch re-paired its channel"
+    );
+    assert_eq!(
+        count(&db, &disagreeing).await,
+        0,
+        "events agree with the re-pairing"
+    );
+    assert_eq!(
+        count(&db, &attributed).await,
+        3,
+        "the re-pairing backfilled every event"
+    );
+}
+
 /// Status events on a stream that carry exactly the instrument that stream names.
 async fn attributed(db: &DatabaseConnection, stream: &str) -> i64 {
     count(

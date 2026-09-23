@@ -433,6 +433,7 @@ struct DriftRow {
     hi: Option<DateTime<Utc>>,
     touched: Option<serde_json::Value>,
     stream_slots: Option<serde_json::Value>,
+    slot_counts: Option<serde_json::Value>,
 }
 
 /// What a curve-drift sweep moved: the row count and the span those rows cover.
@@ -445,6 +446,9 @@ pub struct CurveDrift {
     /// The slots the sweep moved on rows no visit owns, each with its span, so the caller can
     /// recompute the stream-arm calculations that read them (Q108).
     pub stream_slots: Vec<DriftSlot>,
+    /// The rows the sweep moved per (site, parameter) slot, for the caller's announcement once
+    /// the rollups have caught up.
+    pub changed: crate::common::SlotTally,
 }
 
 /// One (site, parameter) slot a drift sweep moved outside any visit, and the span it moved.
@@ -467,6 +471,26 @@ impl DriftSlot {
             "end": self.end.to_rfc3339(),
         })
     }
+}
+
+/// One (site, parameter) slot the sweep moved and how many of its rows.
+#[derive(Debug, serde::Deserialize)]
+struct DriftCount {
+    site_id: Uuid,
+    parameter_id: Option<Uuid>,
+    rows: usize,
+}
+
+/// The summary's `slot_counts` aggregate as a tally; an empty set aggregates to NULL.
+fn slot_counts(value: Option<serde_json::Value>) -> crate::common::SlotTally {
+    let mut tally = crate::common::SlotTally::default();
+    for count in value
+        .and_then(|v| serde_json::from_value::<Vec<DriftCount>>(v).ok())
+        .unwrap_or_default()
+    {
+        tally.add(Some(count.site_id), count.parameter_id, count.rows);
+    }
+    tally
 }
 
 /// The summary's `stream_slots` aggregate as slots; an empty set aggregates to NULL.
@@ -549,7 +573,8 @@ fn with_ledger(
 /// Answers self-consistency only, so it needs no window resolution and reaches grabs. A row
 /// attributed to the wrong curve for its timestamp is consistent by this measure and is the
 /// reprocess engines' subject, not this one's. The span is returned for the caller's aggregate
-/// refresh, since a rewritten value leaves the rollups holding the old one.
+/// refresh, since a rewritten value leaves the rollups holding the old one, and the rows per slot
+/// for the `DataIngested` it then owes (`common/cache.rs`).
 ///
 /// Every moved row records the move as a `curve_recompose` decision naming the run (Q118), in the
 /// same statement, so a value the sweep changed is not a number the ledger cannot account for.
@@ -574,6 +599,7 @@ pub async fn sweep_curve_drift(
             span: None,
             touched: Vec::new(),
             stream_slots: Vec::new(),
+            changed: crate::common::SlotTally::default(),
         });
     };
     let row = DriftRow::from_query_result(&row, "")?;
@@ -588,7 +614,39 @@ pub async fn sweep_curve_drift(
         span: lo.zip(hi),
         touched,
         stream_slots: stream_slots(row.stream_slots),
+        changed: slot_counts(row.slot_counts),
     })
+}
+
+/// The rows the `drift` CTE moved per (site, parameter), as a json array of `DriftCount` objects
+/// (NULL when there are none). A row with no site reaches no site endpoint, so it is left out.
+fn drifted_slot_counts() -> Expr {
+    let (drift, slots, rows) = (Alias::new("drift"), Alias::new("slots"), Alias::new("rows"));
+    let per_slot = SeaQuery::select()
+        .column(readings::Column::SiteId)
+        .column(readings::Column::ParameterId)
+        .expr_as(Func::count(Expr::col(readings::Column::Time)), rows.clone())
+        .from(drift)
+        .and_where(Expr::col(readings::Column::SiteId).is_not_null())
+        .group_by_col(readings::Column::SiteId)
+        .group_by_col(readings::Column::ParameterId)
+        .take();
+    let object = PgFunc::json_build_object(vec![
+        (Expr::val("site_id"), Expr::col(readings::Column::SiteId)),
+        (
+            Expr::val("parameter_id"),
+            Expr::col(readings::Column::ParameterId),
+        ),
+        (Expr::val("rows"), Expr::col(rows)),
+    ]);
+    let aggregated = SeaQuery::select()
+        .expr(PgFunc::json_agg(object))
+        .from_subquery(per_slot, slots)
+        .take();
+    Expr::SubQuery(
+        None,
+        Box::new(SubQueryStatement::SelectStatement(aggregated)),
+    )
 }
 
 /// The (site, parameter) slots the `drift` CTE moved on rows no visit owns, each with the span it
@@ -628,7 +686,7 @@ fn drifted_stream_slots() -> Expr {
 }
 
 /// The drift sweep as one statement: the recompose, its ledger insert, and a summary row of what
-/// moved (the count, the span, the visit pairs and the stream slots).
+/// moved (the count, the span, the visit pairs, the stream slots and the rows per slot).
 fn curve_drift_statement(job_id: Option<Uuid>) -> WithQuery {
     let drifted = own_curve_rows(corrected_rows("r").and(Expr::cust_with_exprs(
         "tgt.calibrated_value IS DISTINCT FROM ($1)",
@@ -664,6 +722,7 @@ fn curve_drift_statement(job_id: Option<Uuid>) -> WithQuery {
             Alias::new("touched"),
         )
         .expr_as(drifted_stream_slots(), Alias::new("stream_slots"))
+        .expr_as(drifted_slot_counts(), Alias::new("slot_counts"))
         .from(Alias::new("drift"))
         .take()
         .with(with_ledger("drift", update, recorded))

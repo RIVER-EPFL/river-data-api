@@ -542,84 +542,92 @@ pub async fn pair_stream(
 ) -> AppResult<Json<PairStreamResponse>> {
     let db = &state.db;
     let now = Utc::now();
+    let actor = crate::common::actor::label(&auth);
 
     // Claim first, then work, all in one transaction with the decompression cap lifted: the claim
     // is what stops two concurrent pairings of one stream both succeeding, and the transaction is
     // what stops a failed backfill leaving the stream paired with unattributed readings.
-    let (sp_site_id, sp_parameter_id, backfilled, touched_events) =
-        bulk_write::guarded(db, async |txn| {
-            // A concurrent claim holds the row lock; wait a few seconds for it rather than either
-            // failing instantly or hanging, then re-evaluate the claim predicate against its outcome.
-            txn.execute_raw(Statement::from_string(
-                sea_orm::DatabaseBackend::Postgres,
-                "SET LOCAL lock_timeout = '5s'".to_owned(),
-            ))
-            .await?;
-
-            let sp = site_parameters::Entity::find_by_id(payload.site_parameter_id)
-                .one(txn)
-                .await?
-                .ok_or_else(|| AppError::NotFound("Site parameter not found".to_string()))?;
-
-            let existing = data_streams::Entity::find_by_id(stream_id)
-                .one(txn)
-                .await?
-                .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
-            if let Some(reason) = super::service::pairing_refusal(&existing.source_system) {
-                return Err(AppError::BadRequest(reason));
-            }
-
-            let claimed =
-                super::service::claim_stream(stream_id, payload.site_parameter_id, now.into())
-                    .exec(txn)
-                    .await
-                    .map_err(claim_error)?
-                    .rows_affected;
-
-            let stream = data_streams::Entity::find_by_id(stream_id)
-                .one(txn)
-                .await?
-                .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
-            if claimed == 0 {
-                return Err(AppError::BadRequest(
-                    "Stream is already paired. Unpair it first.".to_string(),
-                ));
-            }
-            super::service::declare_slot_decimal_places(
-                txn,
-                sp.id,
-                super::service::declared_decimal_places(&stream.metadata),
-            )
-            .await?;
-
-            // Create/reuse the sensor, then re-read the stream: it has gained a sensor_id. Pairing
-            // never completes without an instrument: a slot's readings must name what measured them.
-            let sensor_ctx =
-                create_sensor_for_stream(txn, &stream, sp.parameter_id, sp.site_id, None).await?;
-            let deployment_id = sensor_ctx.deployment_id;
-
-            // Everything a pairing owes the slot: readings and status events attributed,
-            // replicate groups materialised, spot instants attached as visits, deferred holds
-            // promoted. One helper, so a stream paired here and the same stream paired through a
-            // plan land in the same state.
-            let done = super::flows::backfill(
-                txn,
-                crate::routes::private::sync::service::HoldScope::Stream(stream_id),
-                deployment_id,
-            )
-            .await?;
-            let (backfilled, touched_events) = (done.readings, done.touched_events);
-            super::flows::enqueue_slot_reprocess(
-                txn,
-                stream_id,
-                (sp.site_id, sp.parameter_id),
-                backfilled,
-            )
-            .await?;
-
-            Ok((sp.site_id, sp.parameter_id, backfilled, touched_events))
-        })
+    let (sp_site_id, sp_parameter_id, backfilled) = bulk_write::guarded(db, async |txn| {
+        // A concurrent claim holds the row lock; wait a few seconds for it rather than either
+        // failing instantly or hanging, then re-evaluate the claim predicate against its outcome.
+        txn.execute_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SET LOCAL lock_timeout = '5s'".to_owned(),
+        ))
         .await?;
+
+        let sp = site_parameters::Entity::find_by_id(payload.site_parameter_id)
+            .one(txn)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Site parameter not found".to_string()))?;
+
+        let existing = data_streams::Entity::find_by_id(stream_id)
+            .one(txn)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
+        if let Some(reason) = super::service::pairing_refusal(&existing.source_system) {
+            return Err(AppError::BadRequest(reason));
+        }
+
+        let claimed =
+            super::service::claim_stream(stream_id, payload.site_parameter_id, now.into())
+                .exec(txn)
+                .await
+                .map_err(claim_error)?
+                .rows_affected;
+
+        let stream = data_streams::Entity::find_by_id(stream_id)
+            .one(txn)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
+        if claimed == 0 {
+            return Err(AppError::BadRequest(
+                "Stream is already paired. Unpair it first.".to_string(),
+            ));
+        }
+        super::service::declare_slot_decimal_places(
+            txn,
+            sp.id,
+            super::service::declared_decimal_places(&stream.metadata),
+        )
+        .await?;
+
+        // Create/reuse the sensor, then re-read the stream: it has gained a sensor_id. Pairing
+        // never completes without an instrument: a slot's readings must name what measured them.
+        let sensor_ctx =
+            create_sensor_for_stream(txn, &stream, sp.parameter_id, sp.site_id, None).await?;
+        let deployment_id = sensor_ctx.deployment_id;
+
+        // Everything a pairing owes the slot: readings and status events attributed,
+        // replicate groups materialised, spot instants attached as visits, deferred holds
+        // promoted. One helper, so a stream paired here and the same stream paired through a
+        // plan land in the same state.
+        let done = super::flows::backfill(
+            txn,
+            crate::routes::private::sync::service::HoldScope::Stream(stream_id),
+            deployment_id,
+        )
+        .await?;
+        super::flows::enqueue_slot_reprocess(
+            txn,
+            stream_id,
+            (sp.site_id, sp.parameter_id),
+            done.readings,
+        )
+        .await?;
+        // Attribution is what made these readings visit values; the calculations that read
+        // them at each manual visit run now (ADR 0007), queued with the pairing itself.
+        crate::routes::private::collection_events::flows::enqueue_for(
+            txn,
+            &done.touched_events,
+            &actor,
+            crate::routes::private::collection_events::flows::Writer::Person,
+        )
+        .await?;
+
+        Ok((sp.site_id, sp.parameter_id, done.readings))
+    })
+    .await?;
 
     // Attribution changed what the slot serves, so the pairing announces it like every other
     // path that changes stored reading values: `DataIngested` naming the site is what drops the
@@ -630,16 +638,6 @@ pub async fn pair_stream(
         stream_id: Some(stream_id),
         count: usize::try_from(backfilled).unwrap_or(usize::MAX),
     });
-
-    // Attribution is what made these readings visit values; the calculations that read them at
-    // each manual visit run now (ADR 0007).
-    crate::routes::private::collection_events::flows::enqueue_for(
-        db,
-        &touched_events,
-        &crate::common::actor::label(&auth),
-        crate::routes::private::collection_events::flows::Writer::Person,
-    )
-    .await?;
 
     // Re-fetch updated stream
     let updated = data_streams::Entity::find_by_id(stream_id)
@@ -671,52 +669,43 @@ pub async fn unpair_stream(
     Path(stream_id): Path<Uuid>,
 ) -> AppResult<Json<UnpairStreamResponse>> {
     let db = &state.db;
+    let actor = crate::common::actor::current().unwrap_or_else(|| "system".to_string());
 
-    let stream = data_streams::Entity::find_by_id(stream_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
-
-    let Some(sp_id) = stream.site_parameter_id else {
-        return Err(AppError::BadRequest("Stream is not paired".to_string()));
-    };
-
-    // Ahead of the teardown, and fatal rather than warn-logged: closing is idempotent (it matches
-    // only an open deployment), so a retry after any later failure closes nothing twice.
-    if let Some(sensor_id) = stream.sensor_id
-        && let Some(sp) = site_parameters::Entity::find_by_id(sp_id).one(db).await?
-    {
-        close_sensor_deployment(db, sensor_id, sp.site_id, sp.parameter_id).await?;
-    }
-
-    let now = Utc::now();
-
-    // Clear pairing on stream (keep sensor_id, sensor persists)
-    let mut active: data_streams::ActiveModel = stream.into();
-    active.site_parameter_id = Set(None);
-    active.paired_at = Set(None);
-    active.updated_at = Set(now.into());
-    active.update(db).await?;
-
-    // Release the stream's rows from the slot: one transaction, cap lifted, rollup rebuild queued
-    // as a tracked job. The slot itself survives; only this stream stops feeding it.
-    let retired = retire_slot(db, SlotScope::Stream(stream_id)).await?;
-    crate::routes::private::collection_events::flows::enqueue_for(
-        db,
-        &retired.touched_events,
-        &crate::common::actor::current().unwrap_or_else(|| "system".to_string()),
-        crate::routes::private::collection_events::flows::Writer::Person,
-    )
-    .await?;
-    let cleared = retired.touched.rows;
-
-    // Open reviews lose their reviewer along with the slot; they wait as deferred until the
-    // stream is paired again.
-    crate::routes::private::sync::service::repoint_holds(
-        db,
-        crate::routes::private::sync::service::HoldScope::Stream(stream_id),
-        false,
-    )
+    // One transaction with the cap lifted: a failure anywhere in the teardown, the recompute it owes
+    // the visits included, leaves the stream paired as it was, so the retry is an unpairing.
+    let cleared = bulk_write::guarded(db, async |txn| {
+        let scope = SlotScope::Stream(stream_id);
+        super::service::lock_released_streams(txn, scope.streams()).await?;
+        let stream = data_streams::Entity::find_by_id(stream_id)
+            .one(txn)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
+        let Some(sp_id) = stream.site_parameter_id else {
+            return Err(AppError::BadRequest("Stream is not paired".to_string()));
+        };
+        if let Some(sensor_id) = stream.sensor_id
+            && let Some(sp) = site_parameters::Entity::find_by_id(sp_id).one(txn).await?
+        {
+            close_sensor_deployment(txn, sensor_id, sp.site_id, sp.parameter_id).await?;
+        }
+        // The stream keeps its sensor_id: the instrument outlives the pairing.
+        let mut active: data_streams::ActiveModel = stream.into();
+        active.site_parameter_id = Set(None);
+        active.paired_at = Set(None);
+        active.updated_at = Set(Utc::now().into());
+        active.update(txn).await?;
+        // The slot survives; only this stream stops feeding it.
+        let released = retire_slot(txn, scope, &actor).await?;
+        // Open reviews lose their reviewer along with the slot; they wait as deferred until the
+        // stream is paired again.
+        crate::routes::private::sync::service::repoint_holds(
+            txn,
+            crate::routes::private::sync::service::HoldScope::Stream(stream_id),
+            false,
+        )
+        .await?;
+        Ok(released.rows)
+    })
     .await?;
 
     let updated = data_streams::Entity::find_by_id(stream_id)

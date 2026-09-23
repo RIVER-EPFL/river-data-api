@@ -229,21 +229,6 @@ pub fn batch_instrument(
     row.or(slot).or(stream)
 }
 
-/// The site and parameter a batch row keyed by (site, parameter) is attributed to: the request's
-/// pair when a `site_parameters` slot backs it, and neither when the site was never assigned the
-/// parameter, since attribution comes from a slot and never from the request alone.
-#[must_use]
-pub fn slot_attribution(
-    site_id: Uuid,
-    parameter_id: Uuid,
-    slot: Option<Uuid>,
-) -> (Option<Uuid>, Option<Uuid>) {
-    match slot {
-        Some(_) => (Some(site_id), Some(parameter_id)),
-        None => (None, None),
-    }
-}
-
 /// Relative distance within which a submitted `calibrated_value` is taken to be the one its
 /// calibration produces.
 const CORRECTION_REL_TOL: f64 = 1e-9;
@@ -7830,6 +7815,27 @@ pub(super) async fn lock_ingest_stream(
         .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))
 }
 
+/// The site and parameter each stream's pairing attributes its rows to, read with every stream
+/// locked `FOR SHARE` in the transaction that stores them, so a pairing or unpair of any of them
+/// either commits first and is read here or waits for those rows.
+pub(super) async fn lock_stream_attributions(
+    txn: &sea_orm::DatabaseTransaction,
+    stream_ids: impl IntoIterator<Item = Uuid>,
+) -> AppResult<HashMap<Uuid, (Option<Uuid>, Option<Uuid>)>> {
+    let mut ids: Vec<Uuid> = stream_ids.into_iter().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut attributions = HashMap::with_capacity(ids.len());
+    for id in ids {
+        let stream = lock_ingest_stream(txn, id).await?;
+        attributions.insert(
+            id,
+            resolve_stream_slot(txn, stream.site_parameter_id).await?,
+        );
+    }
+    Ok(attributions)
+}
+
 /// A completeness window is accepted only on a stream declared spot. Withdrawal is confined to
 /// spot rows by a database CHECK and the rollups exclude spot, which is what keeps a retraction
 /// out of every rollup, so a window elsewhere is refused rather than half-honoured.
@@ -10855,8 +10861,8 @@ pub(super) fn parse_datetime(
 /// One parsed CSV reading staged for the worker job, holding only the per-row fields.
 pub(super) struct StagedRow {
     pub(super) stream_id: Uuid,
-    pub(super) site_id: Uuid,
-    pub(super) parameter_id: Uuid,
+    pub(super) site_id: Option<Uuid>,
+    pub(super) parameter_id: Option<Uuid>,
     pub(super) time: chrono::DateTime<chrono::Utc>,
     pub(super) raw_value: f64,
     pub(super) sensor_id: Option<Uuid>,
@@ -10880,8 +10886,8 @@ pub(super) async fn stage_import_rows<C: ConnectionTrait>(
                 import_token: ActiveValue::Set(import_token),
                 seq: ActiveValue::Set((chunk_index * BATCH_SIZE + i) as i64),
                 stream_id: ActiveValue::Set(r.stream_id),
-                site_id: ActiveValue::Set(Some(r.site_id)),
-                parameter_id: ActiveValue::Set(Some(r.parameter_id)),
+                site_id: ActiveValue::Set(r.site_id),
+                parameter_id: ActiveValue::Set(r.parameter_id),
                 time: ActiveValue::Set(r.time.into()),
                 raw_value: ActiveValue::Set(r.raw_value),
                 sensor_id: ActiveValue::Set(r.sensor_id),
@@ -11465,34 +11471,54 @@ impl<'a> WriteTargets<'a> {
     }
 }
 
-/// The rows as staged for the worker. Sensor and deployment are physical facts about the slot at
-/// that time and are stamped either way, the channel's instrument standing in where no deployment
-/// names one; the calibration is a claim the value is uncorrected input, which only a raw file
-/// makes.
+/// What a stream a row may land on attributes it to: the slot the stream is paired to, and the
+/// instrument the stream carries.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct TargetStream {
+    pub(super) slot: Option<(Uuid, Uuid)>,
+    pub(super) instrument: Option<Uuid>,
+}
+
+/// The rows as staged for the worker, attributed from the pairing of the stream each lands on. A
+/// row on an unpaired stream is staged with no site, parameter, instrument, deployment or
+/// calibration, all of which the pairing backfill stamps. On a paired stream, sensor and
+/// deployment are physical facts about the slot at that time and are stamped either way, the
+/// channel's instrument standing in where no deployment names one; the calibration is a claim the
+/// value is uncorrected input, which only a raw file makes.
 pub(super) fn staged_rows(
-    site_id: Uuid,
     rows: &[ImportRow],
     owners: &HashMap<SlotInstant, ResolvedOwner>,
     targets: &WriteTargets,
-    channel_instruments: &HashMap<Uuid, Uuid>,
+    streams: &HashMap<Uuid, TargetStream>,
     values: CsvValueState,
 ) -> Vec<StagedRow> {
     rows.iter()
         .map(|(parameter_id, time, value, _)| {
+            let stream_id = targets.of(*parameter_id, *time);
+            let stream = streams.get(&stream_id).copied().unwrap_or_default();
+            let Some((site_id, slot_parameter_id)) = stream.slot else {
+                return StagedRow {
+                    stream_id,
+                    site_id: None,
+                    parameter_id: None,
+                    time: *time,
+                    raw_value: *value,
+                    sensor_id: None,
+                    calibration_id: None,
+                    deployment_id: None,
+                };
+            };
             let owner = owners
                 .get(&(*parameter_id, *time))
                 .cloned()
                 .unwrap_or_default();
-            let stream_id = targets.of(*parameter_id, *time);
             StagedRow {
                 stream_id,
-                site_id,
-                parameter_id: *parameter_id,
+                site_id: Some(site_id),
+                parameter_id: Some(slot_parameter_id),
                 time: *time,
                 raw_value: *value,
-                sensor_id: owner
-                    .sensor_id
-                    .or_else(|| channel_instruments.get(&stream_id).copied()),
+                sensor_id: owner.sensor_id.or(stream.instrument),
                 calibration_id: match values {
                     CsvValueState::Raw => owner.calibration_id,
                     CsvValueState::Corrected => None,

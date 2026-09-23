@@ -901,6 +901,7 @@ async fn walk_event(
         // An output the script computed as NA is a request to blank the column, so the stored
         // value is withdrawn rather than left standing beside a run that did not produce it. A
         // person's ruling on the row is not overridden: those keep their value and their hold.
+        let mut withdrawn_slots = crate::common::SlotTally::default();
         for (key, parameter_id) in &owned_outputs {
             if !calculation.cleared.iter().any(|c| c == key) {
                 continue;
@@ -945,8 +946,13 @@ async fn walk_event(
                 .await
             })
             .await?;
-            outcome.readings_withdrawn += usize::try_from(withdrawn.rows).unwrap_or(0);
+            let rows = usize::try_from(withdrawn.rows).unwrap_or(0);
+            outcome.readings_withdrawn += rows;
+            withdrawn_slots.add(Some(event.site_id), Some(*parameter_id), rows);
         }
+        // A withdrawal stops a value being served, and the save below, which drops its site's
+        // cached responses itself, is not reached when every output was cleared (`common/cache.rs`).
+        withdrawn_slots.announce(&state.events);
 
         let readings: Vec<GrabSampleReading> = owned_outputs
             .iter()

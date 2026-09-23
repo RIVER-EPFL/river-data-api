@@ -6,11 +6,13 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::common::AppState;
-use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
+use crate::common::actor::label;
+use crate::common::middleware::{AuthContext, ProjectScope, enforce_project_scope_for_sites};
 use crate::error::AppResult;
 use crate::routes::private::data_streams;
+use crate::routes::private::data_streams::flows::pair_entry_channel;
 use crate::routes::private::data_streams::service::{get_or_create_api_stream, site_parameter_of};
-use crate::routes::private::readings::service::slot_attribution;
+use crate::routes::private::readings::service::lock_stream_attributions;
 use crate::routes::private::readings::status_events;
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -33,8 +35,8 @@ pub struct BatchStatusEventsResponse {
 }
 
 /// Batch insert non-numeric device status events (e.g. "low_battery", "offline").
-/// Auto-creates "api" streams as needed. An event is attributed to its site and parameter only
-/// when the site carries that parameter; otherwise it is stored unattributed on its unpaired
+/// Auto-creates "api" streams as needed, and pairs one to the site's slot once the site carries
+/// it; an event is attributed from its stream's pairing and stored unattributed on an unpaired
 /// stream. 10MB body limit. Requires `write_data`.
 #[utoipa::path(
     post,
@@ -48,6 +50,7 @@ pub struct BatchStatusEventsResponse {
 )]
 pub async fn insert_batch_status_events(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<AuthContext>,
     ProjectScope(scope): ProjectScope,
     Json(payload): Json<BatchStatusEventsRequest>,
 ) -> AppResult<Json<BatchStatusEventsResponse>> {
@@ -55,17 +58,14 @@ pub async fn insert_batch_status_events(
     enforce_project_scope_for_sites(&state.db, &scope, &target_sites).await?;
 
     let mut stream_cache: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
-    let mut slots: HashMap<(Uuid, Uuid), Option<Uuid>> = HashMap::new();
-
+    let actor = label(&auth);
     for e in &payload.events {
         let key = (e.site_id, e.parameter_id);
         if let std::collections::hash_map::Entry::Vacant(entry) = stream_cache.entry(key) {
             let stream_id = get_or_create_api_stream(&state.db, e.site_id, e.parameter_id).await?;
+            let slot = site_parameter_of(&state.db, e.site_id, e.parameter_id).await?;
+            pair_entry_channel(&state.db, stream_id, slot, &actor).await?;
             entry.insert(stream_id);
-            slots.insert(
-                key,
-                site_parameter_of(&state.db, e.site_id, e.parameter_id).await?,
-            );
         }
     }
 
@@ -78,13 +78,14 @@ pub async fn insert_batch_status_events(
         .map(|s| (s.id, s.sensor_id))
         .collect();
 
+    let txn = sea_orm::TransactionTrait::begin(&state.db).await?;
+    let attributions = lock_stream_attributions(&txn, stream_cache.values().copied()).await?;
     let models: Vec<status_events::ActiveModel> = payload
         .events
         .into_iter()
         .map(|e| {
-            let key = (e.site_id, e.parameter_id);
-            let stream_id = stream_cache[&key];
-            let (site_id, parameter_id) = slot_attribution(e.site_id, e.parameter_id, slots[&key]);
+            let stream_id = stream_cache[&(e.site_id, e.parameter_id)];
+            let (site_id, parameter_id) = attributions[&stream_id];
             status_events::ActiveModel {
                 stream_id: Set(stream_id),
                 time: Set(e.time.into()),
@@ -99,7 +100,9 @@ pub async fn insert_batch_status_events(
         .collect();
 
     let total = models.len();
-    let inserted = status_events::service::insert_ignoring_duplicates(&state.db, models).await?;
+    let inserted = status_events::service::insert_ignoring_duplicates(&txn, models).await?;
+    txn.commit().await?;
+
     tracing::info!(total, inserted, "Batch status events insert complete");
     Ok(Json(BatchStatusEventsResponse { inserted }))
 }

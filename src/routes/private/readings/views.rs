@@ -1158,12 +1158,10 @@ pub async fn insert_batch_readings(
         }
     }
 
-    // Each (site_id, parameter_id) pair's api channel, paired to the site's slot once it exists,
-    // and the site and parameter that pairing attributes the pair's rows to.
+    // Each (site_id, parameter_id) pair's api channel, paired to the site's slot once it exists.
+    // What the rows are attributed to is read from that pairing in the transaction storing them.
     let mut stream_cache: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
-    let mut attributions: HashMap<(Uuid, Uuid), (Option<Uuid>, Option<Uuid>)> = HashMap::new();
-    let mut touched_by_pairing = Vec::new();
-
+    let actor = crate::common::actor::label(&auth);
     for r in &payload.readings {
         let key = (r.site_id, r.parameter_id);
         if let std::collections::hash_map::Entry::Vacant(entry) = stream_cache.entry(key) {
@@ -1174,24 +1172,13 @@ pub async fn insert_batch_readings(
                 r.parameter_id,
             )
             .await?;
-            let pairing = crate::routes::private::data_streams::flows::pair_entry_channel(
-                &state.db, stream_id, slot,
+            crate::routes::private::data_streams::flows::pair_entry_channel(
+                &state.db, stream_id, slot, &actor,
             )
             .await?;
-            touched_by_pairing.extend(pairing.touched_events);
-            attributions.insert(
-                key,
-                crate::routes::private::readings::service::resolve_stream_slot(
-                    &state.db,
-                    pairing.site_parameter_id,
-                )
-                .await?,
-            );
             entry.insert(stream_id);
         }
     }
-    let attributed_sites: Vec<Uuid> = attributions.values().filter_map(|(s, _)| *s).collect();
-    enforce_project_scope_for_sites(&state.db, &scope, &attributed_sites).await?;
 
     // Collect unique (site_id, time) pairs for derived auto-compute
     let site_timestamps_for_derived: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = {
@@ -1363,7 +1350,7 @@ pub async fn insert_batch_readings(
         )?;
     }
 
-    let models = payload
+    let mut models = payload
         .readings
         .into_iter()
         .zip(resolved)
@@ -1374,7 +1361,6 @@ pub async fn insert_batch_readings(
                 measurement_type,
             } = res;
             let calibration_id = r.calibration_id.or(owner.calibration_id);
-            let (site_id, parameter_id) = attributions[&(r.site_id, r.parameter_id)];
             let standard = r.standard_curve_id.map(|id| {
                 let c = &standard_curve_models[&id];
                 sensor_calibrations::service::Curve {
@@ -1395,8 +1381,6 @@ pub async fn insert_batch_readings(
             Ok(readings::ActiveModel {
                 standard_curve_id: Set(r.standard_curve_id),
                 provenance_kind: Set(Some("batch".to_string())),
-                site_id: Set(site_id),
-                parameter_id: Set(parameter_id),
                 calibrated_value: Set(correction.calibrated_value),
                 sensor_id: Set(batch_instrument(
                     r.sensor_id,
@@ -1431,7 +1415,21 @@ pub async fn insert_batch_readings(
     // one; a sync service reaching the same route is recorded as sync.
     let origin = auth.origin();
     let touched_events;
-    (inserted, overwritten, touched_events) = crate::common::bulk_write::guarded(&state.db, async |txn| {
+    let attributions;
+    (inserted, overwritten, touched_events, attributions) = crate::common::bulk_write::guarded(&state.db, async |txn| {
+        let attributions = crate::routes::private::readings::service::lock_stream_attributions(
+            txn,
+            stream_cache.values().copied(),
+        )
+        .await?;
+        let attributed_sites: Vec<Uuid> = attributions.values().filter_map(|(s, _)| *s).collect();
+        enforce_project_scope_for_sites(&state.db, &scope, &attributed_sites).await?;
+        for m in &mut models {
+            let (site_id, parameter_id) = attributions[m.stream_id.as_ref()];
+            m.site_id = Set(site_id);
+            m.parameter_id = Set(parameter_id);
+        }
+
         let mut inserted = 0usize;
         let mut overwritten = 0usize;
         for chunk in models.chunks(BATCH_SIZE) {
@@ -1545,7 +1543,7 @@ pub async fn insert_batch_readings(
                 .await?;
         }
 
-        Ok((inserted, overwritten, touched_events))
+        Ok((inserted, overwritten, touched_events, attributions))
     })
     .await?;
 
@@ -1645,9 +1643,9 @@ pub async fn insert_batch_readings(
     )
     .over(earliest.zip(latest))
     .at(stream_cache
-        .iter()
-        .map(|(key, stream_id)| {
-            let (site_id, parameter_id) = attributions[key];
+        .values()
+        .map(|stream_id| {
+            let (site_id, parameter_id) = attributions[stream_id];
             crate::routes::private::readings::service::Slot {
                 site_id,
                 parameter_id,
@@ -1655,12 +1653,7 @@ pub async fn insert_batch_readings(
             }
         })
         .collect())
-    .touching(
-        touched_events
-            .into_iter()
-            .chain(touched_by_pairing)
-            .collect(),
-    );
+    .touching(touched_events);
     crate::routes::private::readings::service::run(
         &state,
         &written,
@@ -1677,7 +1670,7 @@ pub async fn insert_batch_readings(
             recompute_derived: false,
             writer: crate::routes::private::collection_events::flows::Writer::Person,
         },
-        &crate::common::actor::label(&auth),
+        &actor,
     )
     .await?;
 
@@ -1833,16 +1826,10 @@ pub async fn ingest_status_events(
         }));
     }
 
-    let db = &state.db;
-
-    let stream = data_streams::Entity::find_by_id(payload.stream_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
-
-    let (site_id, parameter_id) = resolve_stream_slot(db, stream.site_parameter_id).await?;
+    let txn = sea_orm::TransactionTrait::begin(&state.db).await?;
+    let stream = lock_ingest_stream(&txn, payload.stream_id).await?;
+    let (site_id, parameter_id) = resolve_stream_slot(&txn, stream.site_parameter_id).await?;
     let paired = site_id.is_some();
-
     enforce_ingest_scope(&state.db, &scope, site_id).await?;
 
     // A status event carries no numeric value, so the timestamp bound is the whole of admission
@@ -1885,7 +1872,7 @@ pub async fn ingest_status_events(
         .filter(status_events::Column::StreamId.eq(payload.stream_id))
         .order_by_desc(status_events::Column::Time)
         .into_model::<StatusTip>()
-        .one(db)
+        .one(&txn)
         .await?;
     let tip_time: Option<chrono::DateTime<Utc>> = tip.as_ref().map(|t| t.time.with_timezone(&Utc));
     let mut last_value: Option<String> = tip.and_then(|t| t.value);
@@ -1928,7 +1915,8 @@ pub async fn ingest_status_events(
         .collect();
 
     let total = models.len();
-    let inserted = status_events::service::insert_ignoring_duplicates(db, models).await?;
+    let inserted = status_events::service::insert_ignoring_duplicates(&txn, models).await?;
+    txn.commit().await?;
 
     tracing::debug!(total, inserted, skipped, deduplicated, stream_id = %payload.stream_id, paired, "Status events ingest complete");
     Ok(Json(IngestStatusEventsResponse {
@@ -2541,15 +2529,14 @@ async fn import_one_site(
 
     require_columns(&analysis.plan)?;
     let api_streams = importer_streams(db, analysis.site_id, &analysis.plan.mappings).await?;
+    pair_importer_streams(db, analysis.site_id, &api_streams, &label(&auth)).await?;
     let targets = WriteTargets::new(&analysis.overlap.owning_stream, &api_streams);
-    let instruments =
-        channel_instruments(db, &api_streams, &analysis.overlap.owning_stream).await?;
+    let streams = target_streams(db, &api_streams, &analysis.overlap.owning_stream).await?;
     let staged = staged_rows(
-        analysis.site_id,
         &analysis.parsed.rows,
         &owners,
         &targets,
-        &instruments,
+        &streams,
         req.values,
     );
     let tally = import_tally(
@@ -2755,21 +2742,52 @@ async fn importer_streams(
     Ok(streams)
 }
 
-/// The instrument each candidate target stream carries, for the rows no deployment window
-/// attributes: an imported measurement names what produced it either way.
-async fn channel_instruments(
+/// Pair each importer channel to its slot once the site carries it, with the backfill and the
+/// visit recomputes every pairing owes.
+async fn pair_importer_streams(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    api_streams: &HashMap<Uuid, Uuid>,
+    actor: &str,
+) -> AppResult<()> {
+    for (&parameter_id, &stream_id) in api_streams {
+        let slot = data_streams::service::site_parameter_of(db, site_id, parameter_id).await?;
+        data_streams::flows::pair_entry_channel(db, stream_id, slot, actor).await?;
+    }
+    Ok(())
+}
+
+/// The slot each candidate target stream is paired to and the instrument it carries: a row is
+/// attributed from its stream's pairing, and the instrument stands in for a row no deployment
+/// window attributes.
+async fn target_streams(
     db: &sea_orm::DatabaseConnection,
     api_streams: &HashMap<Uuid, Uuid>,
     owning_stream: &HashMap<SlotInstant, Uuid>,
-) -> AppResult<HashMap<Uuid, Uuid>> {
+) -> AppResult<HashMap<Uuid, TargetStream>> {
     let ids = distinct_ids(api_streams.values().chain(owning_stream.values()).copied());
-    Ok(data_streams::Entity::find()
+    let rows = data_streams::Entity::find()
         .filter(data_streams::Column::Id.is_in(ids))
-        .filter(data_streams::Column::SensorId.is_not_null())
         .all(db)
-        .await?
+        .await?;
+    let slot_ids = distinct_ids(rows.iter().filter_map(|row| row.site_parameter_id));
+    let slots: HashMap<Uuid, (Uuid, Uuid)> =
+        crate::routes::private::site_parameters::models::Entity::find()
+            .filter(crate::routes::private::site_parameters::models::Column::Id.is_in(slot_ids))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|sp| (sp.id, (sp.site_id, sp.parameter_id)))
+            .collect();
+    Ok(rows
         .into_iter()
-        .filter_map(|row| row.sensor_id.map(|sensor_id| (row.id, sensor_id)))
+        .map(|row| {
+            let stream = TargetStream {
+                slot: row.site_parameter_id.and_then(|id| slots.get(&id).copied()),
+                instrument: row.sensor_id,
+            };
+            (row.id, stream)
+        })
         .collect())
 }
 

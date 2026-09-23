@@ -1008,6 +1008,78 @@ async fn a_zero_divisor_refuses_the_output_and_leaves_the_stored_value() {
     );
 }
 
+/// Scenario: a visit where the formula computes NA, so the recompute withdraws the output the slot
+/// served and saves nothing in its place.
+///
+/// Expected behaviour: the withdrawal is announced on the event bus for the output's slot, since
+/// that announcement is what drops the site's cached series; the save path, which announces on
+/// its own, is not reached.
+#[tokio::test]
+#[serial]
+async fn a_recompute_that_only_withdraws_announces_the_slot_it_moved() {
+    let group_id = "00000000-0000-4000-c000-000000000108";
+    let (db, app, token) = setup().await;
+    seed_calculation(&db, group_id).await;
+    let script_id = calculation_id(&db).await;
+    let (status, text) = add_formula(
+        &app,
+        &token,
+        &script_id,
+        "temp_ratio_out",
+        "if(lt(DO_Temperature, 0), na, DO_Temperature / Dissolved_O2)",
+        1,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create ({status}): {text}");
+    let output_id = minted_output(&db, "temp_ratio_out").await;
+    declare_slot(&db, &output_id).await;
+
+    let event_id = seed_visit(
+        &db,
+        &[
+            (crate::common::GLOBAL_PARAM_TEMP_ID, -1.0),
+            (crate::common::GLOBAL_PARAM_DO_ID, 2.0),
+            (output_id.as_str(), 4.0),
+        ],
+    )
+    .await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+    let mut bus = state.events.subscribe();
+
+    let outcome =
+        river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
+            .await
+            .expect("the recompute runs");
+    assert_eq!(outcome.readings_withdrawn, 1, "the NA blanks the column");
+    assert_eq!(
+        outcome.readings_written, 0,
+        "an NA writes no value of its own"
+    );
+    assert_eq!(
+        served(&db, &output_id).await,
+        Some((4.0, true)),
+        "the stored value is withdrawn"
+    );
+
+    let output = uuid::Uuid::parse_str(&output_id).expect("uuid");
+    let site = uuid::Uuid::parse_str(crate::common::SITE1_ID).expect("uuid");
+    let mut announced = Vec::new();
+    while let Ok(event) = bus.try_recv() {
+        if let river_db::common::AppEvent::DataIngested {
+            site_id,
+            parameter_id,
+            ..
+        } = event
+        {
+            announced.push((site_id, parameter_id));
+        }
+    }
+    assert!(
+        announced.contains(&(Some(site), Some(output))),
+        "the withdrawal names the output's slot on the bus: {announced:?}"
+    );
+}
+
 /// Scenario: an author edits a three-formula calculation and saves it.
 ///
 /// Expected behaviour: the set the save sent is the set the calculation holds, and the save

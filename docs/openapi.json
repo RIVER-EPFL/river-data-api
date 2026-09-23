@@ -46617,7 +46617,7 @@
             "description": "Body exceeds 10MB limit"
           }
         },
-        "summary": "Batch insert non-numeric device status events (e.g. \"low_battery\", \"offline\").\nAuto-creates \"api\" streams as needed. An event is attributed to its site and parameter only\nwhen the site carries that parameter; otherwise it is stored unattributed on its unpaired\nstream. 10MB body limit. Requires `write_data`.",
+        "summary": "Batch insert non-numeric device status events (e.g. \"low_battery\", \"offline\").\nAuto-creates \"api\" streams as needed, and pairs one to the site's slot once the site carries\nit; an event is attributed from its stream's pairing and stored unattributed on an unpaired\nstream. 10MB body limit. Requires `write_data`.",
         "tags": [
           "ingestion"
         ]

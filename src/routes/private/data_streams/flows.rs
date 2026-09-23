@@ -16,12 +16,12 @@ use sea_orm::{Condition, ConnectionTrait, DbErr, EntityTrait, Statement, Transac
 use uuid::Uuid;
 
 use super::models::{Backfilled, SlotScope};
-use super::service::{referenced_event_pairs, release_slot_rows, resolve_retire_target};
+use super::service::{
+    lock_released_streams, referenced_event_pairs, release_slot_rows, resolve_retire_target,
+};
 use crate::common::bulk_write::{self, TouchedRange};
 use crate::error::{AppError, AppResult};
-use crate::routes::private::collection_events::flows::{
-    TouchedEvent, events_from_pairs, touched_events,
-};
+use crate::routes::private::collection_events::flows::{events_from_pairs, touched_events};
 use crate::routes::private::collection_events::service::{EventSource, attach_collection_events};
 use crate::routes::private::data_streams::models as data_streams;
 use crate::routes::private::readings::models as readings;
@@ -220,15 +220,10 @@ pub async fn backfill<C: ConnectionTrait>(
     })
 }
 
-/// The pairing an entry channel attributes its writes from, and the visits pairing it touched.
-pub struct ChannelPairing {
-    pub site_parameter_id: Option<Uuid>,
-    pub touched_events: Vec<TouchedEvent>,
-}
-
 /// Pair an unpaired entry channel to the slot it was opened for, now that the slot exists, with
-/// the backfill every pairing owes. A channel already paired keeps its pairing, and one whose slot
-/// does not exist stays unpaired.
+/// the backfill every pairing owes and the recompute of every manual visit the backfill attributed
+/// readings at, queued under `actor` in the pairing's own transaction. A channel already paired
+/// keeps its pairing, and one whose slot does not exist stays unpaired.
 ///
 /// No deployment is opened: an entry channel's instrument is not stationed at the site, which is
 /// how the channel is paired when it is created with its slot already in place.
@@ -236,54 +231,41 @@ pub async fn pair_entry_channel(
     db: &sea_orm::DatabaseConnection,
     stream_id: Uuid,
     slot: Option<Uuid>,
-) -> AppResult<ChannelPairing> {
+    actor: &str,
+) -> AppResult<()> {
     let stream = data_streams::Entity::find_by_id(stream_id)
         .one(db)
         .await?
         .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
     let (None, Some(site_parameter_id)) = (stream.site_parameter_id, slot) else {
-        return Ok(ChannelPairing {
-            site_parameter_id: stream.site_parameter_id,
-            touched_events: Vec::new(),
-        });
+        return Ok(());
     };
     let sp = site_parameters::Entity::find_by_id(site_parameter_id)
         .one(db)
         .await?
         .ok_or_else(|| AppError::NotFound("Site parameter not found".to_string()))?;
-    let done = bulk_write::guarded(db, async |txn| {
+    bulk_write::guarded(db, async |txn| {
         let claimed =
             super::service::claim_stream(stream_id, site_parameter_id, chrono::Utc::now().into())
                 .exec(txn)
                 .await?
                 .rows_affected;
         if claimed == 0 {
-            return Ok(None);
+            return Ok(());
         }
         let done = backfill(txn, HoldScope::Stream(stream_id), None).await?;
         enqueue_slot_reprocess(txn, stream_id, (sp.site_id, sp.parameter_id), done.readings)
             .await?;
-        Ok(Some(done))
+        crate::routes::private::collection_events::flows::enqueue_for(
+            txn,
+            &done.touched_events,
+            actor,
+            crate::routes::private::collection_events::flows::Writer::Person,
+        )
+        .await?;
+        Ok(())
     })
-    .await?;
-    let Some(done) = done else {
-        return Ok(ChannelPairing {
-            site_parameter_id: paired_slot(db, stream_id).await?,
-            touched_events: Vec::new(),
-        });
-    };
-    Ok(ChannelPairing {
-        site_parameter_id: Some(site_parameter_id),
-        touched_events: done.touched_events,
-    })
-}
-
-/// The slot a stream is paired to, as committed.
-async fn paired_slot<C: ConnectionTrait>(db: &C, stream_id: Uuid) -> AppResult<Option<Uuid>> {
-    Ok(data_streams::Entity::find_by_id(stream_id)
-        .one(db)
-        .await?
-        .and_then(|s| s.site_parameter_id))
+    .await
 }
 
 /// Queue the window reprocess a newly paired stream's slot owes, on the pairing's own transaction:
@@ -323,23 +305,16 @@ pub async fn enqueue_slot_reprocess<C: ConnectionTrait>(
     Ok(())
 }
 
-/// What a slot teardown moved and which visits lost an input.
-pub struct RetiredSlot {
-    /// The reading span removed from the rollups.
-    pub touched: TouchedRange,
-    /// Visits to recompute after the teardown commits.
-    pub touched_events: Vec<TouchedEvent>,
-}
-
 /// Release everything a slot owns, in one transaction with the decompression cap lifted, and queue
-/// the rollup rebuild that has to follow it.
+/// the rollup rebuild that has to follow it. Returns the reading span removed from the rollups.
 ///
 /// This is the whole teardown, in the order that keeps it recoverable: the samples a scope
 /// references are collected before the readings lose their `sample_id`, the readings and status
 /// events are unattributed rather than deleted (the measurement outlives the slot), the samples
 /// nothing references any more are deleted, and a slot that is going away releases the streams
 /// pointing at it last. Unpair, and a `site_parameters` delete, are the same operation over
-/// different scopes.
+/// different scopes. The recompute of every manual visit that lost an input is queued in the same
+/// transaction, under `actor`, so a release never commits without it.
 ///
 /// The rollups are refreshed over what the teardown touched by a tracked `refresh_aggregates`
 /// job rather than inline: a teardown can span a stream's whole history, and a refresh that fails
@@ -351,25 +326,28 @@ pub struct RetiredSlot {
 pub async fn retire_slot<C: ConnectionTrait + TransactionTrait>(
     db: &C,
     scope: SlotScope,
-) -> AppResult<RetiredSlot> {
-    let retired = bulk_write::guarded(db, async |txn| {
+    actor: &str,
+) -> AppResult<TouchedRange> {
+    let touched = bulk_write::guarded(db, async |txn| {
+        lock_released_streams(txn, scope.streams()).await?;
         let Some(target) = resolve_retire_target(txn, scope).await? else {
-            return Ok(RetiredSlot {
-                touched: TouchedRange::default(),
-                touched_events: Vec::new(),
-            });
+            return Ok(TouchedRange::default());
         };
         let pairs = referenced_event_pairs(txn, &target).await?;
         let touched_events = events_from_pairs(txn, &pairs).await?;
         let touched = release_slot_rows(txn, &target).await?;
-        Ok(RetiredSlot {
-            touched,
-            touched_events,
-        })
+        crate::routes::private::collection_events::flows::enqueue_for(
+            txn,
+            &touched_events,
+            actor,
+            crate::routes::private::collection_events::flows::Writer::Person,
+        )
+        .await?;
+        Ok(touched)
     })
     .await?;
 
-    if let Some((from, until)) = retired.touched.span() {
+    if let Some((from, until)) = touched.span() {
         let trigger_id = match scope {
             SlotScope::Stream(id) | SlotScope::SiteParameter(id) => id,
         };
@@ -384,7 +362,7 @@ pub async fn retire_slot<C: ConnectionTrait + TransactionTrait>(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     }
-    Ok(retired)
+    Ok(touched)
 }
 
 /// The status a guarded plan job's work leaves behind, read before it runs.
@@ -482,9 +460,13 @@ impl Job for PlanRevert {
                 .await;
             return Ok(0);
         }
-        let reverted = crate::routes::private::sync::service::revert_plan(ctx.db(), plan_id)
-            .await
-            .map_err(|e| DbErr::Custom(e.to_string()))?;
+        let reverted = crate::routes::private::sync::service::revert_plan(
+            ctx.db(),
+            plan_id,
+            Some(ctx.events()),
+        )
+        .await
+        .map_err(|e| DbErr::Custom(e.to_string()))?;
         ctx.report(
             JobReport::new()
                 .scope("plan_id", plan_id.to_string())

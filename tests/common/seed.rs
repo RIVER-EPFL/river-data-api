@@ -636,3 +636,35 @@ pub async fn seed_labelled_formula_calculation(
     .await;
     id
 }
+
+/// An enabled calculation that reads `parameter_code` at a visit, active at its first version, so a
+/// write moving a value of that parameter at a manual visit owes the visit an `event_recompute`.
+/// Returns the calculation's id.
+pub async fn seed_visit_calculation(
+    db: &DatabaseConnection,
+    name: &str,
+    parameter_code: &str,
+) -> Uuid {
+    let calculation = Uuid::new_v4();
+    let version = Uuid::new_v4();
+    for statement in [
+        format!(
+            "INSERT INTO tool_scripts (id, name, label, created_by) \
+             VALUES ('{calculation}', '{name}', '{name}', 'test')"
+        ),
+        format!(
+            r#"INSERT INTO tool_script_versions
+                   (id, tool_script_id, version_no, script, entry_function, manifest, test_cases,
+                    content_hash, created_by, validated_at)
+               VALUES ('{version}', '{calculation}', 1, 'tool <- function(...) list()', 'tool',
+                       '{{"label":"{name}","params":[{{"name":"t","label":"Input","kind":"number","required":true}}],"event_inputs":[{{"param":"t","parameter_code":"{parameter_code}"}}],"outputs":[]}}'::jsonb,
+                       '{{}}'::jsonb, '{name}-v1', 'test', now())"#
+        ),
+        format!(
+            "UPDATE tool_scripts SET active_version_id = '{version}' WHERE id = '{calculation}'"
+        ),
+    ] {
+        exec(db, &statement).await;
+    }
+    calculation
+}
