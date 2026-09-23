@@ -9569,6 +9569,10 @@
             },
             "type": "array"
           },
+          "parameter_id": {
+            "format": "uuid",
+            "type": "string"
+          },
           "provenance": {
             "$ref": "#/components/schemas/RowProvenance"
           },
@@ -9579,6 +9583,11 @@
           "replicate_index": {
             "format": "int32",
             "type": "integer"
+          },
+          "site_id": {
+            "description": "The slot the row is paired to, which is what detaching or returning an output names.\nAbsent on an unpaired row.",
+            "format": "uuid",
+            "type": "string"
           },
           "stream_id": {
             "format": "uuid",
@@ -27461,12 +27470,33 @@
       "VisitReplicate": {
         "description": "One replicate of a listing's cell: enough to draw the expanded column and to seed the edit\nmodel, and no more. The curves, instruments and flag reasons behind it stay on\n`/collection_events/{id}/detail`, which is what the point record reads.",
         "properties": {
+          "calibration_id": {
+            "description": "The windowed calibration that corrected it, if one did.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "flagged": {
             "type": "boolean"
+          },
+          "raw_value": {
+            "description": "The measurement before any curve: what an entry into this replicate's group sends back\nfor it, since the save corrects what it is sent.",
+            "format": "double",
+            "type": "number"
           },
           "replicate_index": {
             "format": "int32",
             "type": "integer"
+          },
+          "standard_curve_id": {
+            "description": "The standard curve chosen for it, if one was.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "stream_id": {
             "description": "The feed this replicate came in on. With the instant and the index it is the key a\ncorrection is made against, so it sits on the replicate rather than on the cell: two\nstreams can serve one slot and a correction must name the right one.",
@@ -27490,6 +27520,9 @@
           "replicate_index",
           "stream_id",
           "value",
+          "raw_value",
+          "calibration_id",
+          "standard_curve_id",
           "flagged",
           "withdrawn",
           "unverified"

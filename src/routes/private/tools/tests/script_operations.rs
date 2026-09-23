@@ -69,6 +69,79 @@ mod activation_arm {
         assert!(migration_jobs(false, "pco2", Uuid::new_v4(), Some(Uuid::new_v4())).is_empty());
     }
 
+    /// Scenario: an admin edits constant k from 2.0 to 3.0, and one formula calculation reads it.
+    #[test]
+    fn a_constant_edit_repairs_the_visits_and_the_stream_values_computed_with_it() {
+        use crate::routes::private::tools::service::constant_edit_jobs;
+
+        let constant = Uuid::new_v4();
+        let calculation = Uuid::new_v4();
+        let jobs = constant_edit_jobs(constant, "k", 2.0, 3.0, &[calculation]);
+        let visit = jobs
+            .iter()
+            .find(|j| j.kind == "event_recompute")
+            .expect("the visit arm");
+        assert_eq!(visit.trigger_id, Some(constant));
+        assert_eq!(
+            visit.params,
+            serde_json::json!({ "constant": "k", "previous_value": 2.0, "value": 3.0 })
+        );
+        assert_eq!(visit.dedupe_key, "event_recompute:constant:k");
+        let stream = jobs
+            .iter()
+            .find(|j| j.kind == "derived_recompute")
+            .expect("the stream arm");
+        assert_eq!(stream.trigger_id, Some(calculation));
+        assert_eq!(
+            stream.params["calculation_id"],
+            serde_json::json!(calculation)
+        );
+        assert_eq!(
+            stream.dedupe_key,
+            format!("derived_recompute:constant:k:{calculation}")
+        );
+        assert_eq!(jobs.len(), 2);
+    }
+
+    #[test]
+    fn a_constant_no_formula_reads_repairs_the_visits_only() {
+        use crate::routes::private::tools::service::constant_edit_jobs;
+
+        let jobs = constant_edit_jobs(Uuid::new_v4(), "k", 2.0, 3.0, &[]);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].kind, "event_recompute");
+    }
+
+    #[test]
+    fn a_formula_reads_a_constant_only_where_no_source_variable_binds_the_name() {
+        use crate::routes::private::tools::models::PinnedFormula;
+        use crate::routes::private::tools::service::formulas_read_constant;
+
+        let formula = |expr: &str, sources: &[&str]| PinnedFormula {
+            code: "out".to_string(),
+            label: "Out".to_string(),
+            units: None,
+            formula: expr.to_string(),
+            ordinal: 0,
+            output_parameter_code: Some("Out".to_string()),
+            sources: sources
+                .iter()
+                .map(|v| ((*v).to_string(), "Source".to_string()))
+                .collect(),
+            held: Vec::new(),
+            site_sources: Vec::new(),
+            curve_slot: None,
+            per_replicate: None,
+            intermediate: false,
+        };
+        assert!(formulas_read_constant(&[formula("x * k", &["x"])], "k"));
+        assert!(!formulas_read_constant(&[formula("x * 2", &["x"])], "k"));
+        assert!(
+            !formulas_read_constant(&[formula("x * k", &["x", "k"])], "k"),
+            "a variable named k is a source, not the constant"
+        );
+    }
+
     /// A first activation replaces no version, so there is nothing to migrate however the author
     /// answered.
     #[test]

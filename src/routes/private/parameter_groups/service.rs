@@ -401,27 +401,24 @@ pub mod rules {
         Ok(())
     }
 
-    /// What a parameter is to the calculations (Q135).
+    /// What each parameter is to the calculations (Q135), from the parameters a formula reads and
+    /// the ones a formula writes.
     ///
     /// The role is read off the calculations, never stored: a parameter one writes is an output,
-    /// one a calculation reads is measured, and a parameter no calculation touches is entered and read
-    /// by nothing. A calculation may read any catalog parameter, so a group is a way to list many
-    /// parameters together, not a boundary a calculation is confined to.
+    /// one a calculation reads is measured, and a parameter no calculation touches is entered and
+    /// read by nothing, which the map leaves out. A calculation may read any catalog parameter, so
+    /// a group is a way to list many parameters together, not a boundary a calculation is confined
+    /// to.
     #[must_use]
-    pub fn derive_role(parameter_id: Uuid, calculations: &[Calculation]) -> Role {
-        if calculations
-            .iter()
-            .any(|c| c.outputs.contains(&parameter_id))
-        {
-            return Role::Output;
-        }
-        if calculations
-            .iter()
-            .any(|c| c.inputs.contains(&parameter_id))
-        {
-            return Role::Measured;
-        }
-        Role::EntryOnly
+    pub fn roles_of(
+        read: impl IntoIterator<Item = Uuid>,
+        written: impl IntoIterator<Item = Uuid>,
+    ) -> std::collections::HashMap<Uuid, Role> {
+        let mut roles: std::collections::HashMap<Uuid, Role> =
+            read.into_iter().map(|id| (id, Role::Measured)).collect();
+        // What a formula writes is what the parameter is, even where another reads it.
+        roles.extend(written.into_iter().map(|id| (id, Role::Output)));
+        roles
     }
 }
 
@@ -461,7 +458,6 @@ pub(super) async fn site_declarations(
 pub async fn calculation_roles(
     db: &sea_orm::DatabaseConnection,
 ) -> AppResult<std::collections::HashMap<Uuid, Role>> {
-    let mut roles = std::collections::HashMap::new();
     // A source naming a site property carries no parameter, so its NULL is skipped rather than
     // decoded.
     let read = source::Entity::find()
@@ -472,10 +468,6 @@ pub async fn calculation_roles(
         .all(db)
         .await
         .map_err(AppError::Database)?;
-    for id in read.into_iter().flatten() {
-        roles.insert(id, Role::Measured);
-    }
-    // Written last: what a formula writes is what the parameter is, even where another reads it.
     let written = definition::Entity::find()
         .select_only()
         .column(definition::Column::OutputParameterId)
@@ -485,10 +477,10 @@ pub async fn calculation_roles(
         .all(db)
         .await
         .map_err(AppError::Database)?;
-    for id in written.into_iter().flatten() {
-        roles.insert(id, Role::Output);
-    }
-    Ok(roles)
+    Ok(rules::roles_of(
+        read.into_iter().flatten(),
+        written.into_iter().flatten(),
+    ))
 }
 
 /// The section each of a group's columns renders under, read from the calculations that name them.

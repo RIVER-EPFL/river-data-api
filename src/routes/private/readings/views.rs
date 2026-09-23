@@ -3574,7 +3574,12 @@ pub async fn insert_grab_samples(
     // The value has landed: the calculations that read it run without anyone asking (ADR 0007),
     // the sampled slots are reconciled and their episodes rebuilt inline (one `reprocessing_jobs`
     // row per field campaign entry would be the noise), and the site's cached responses go. Grabs
-    // are excluded from the rollups, so there is nothing to refresh.
+    // are excluded from the rollups, so there is nothing to refresh. A stream calculation holding
+    // a saved parameter (Q230) is recomputed over the pulses that read it, as a job.
+    let saved: Vec<Uuid> = stream_cache.keys().copied().collect();
+    let holds =
+        crate::routes::private::derived_parameters::flows::held_by_a_calculation(&state.db, &saved)
+            .await?;
     let written = crate::routes::private::readings::service::Written::new(
         u64::try_from(inserted + replaced).unwrap_or(u64::MAX),
     )
@@ -3598,7 +3603,7 @@ pub async fn insert_grab_samples(
             announce: false,
             reconcile_alarms: true,
             episodes: crate::routes::private::readings::service::Episodes::Inline,
-            recompute_derived: false,
+            recompute_derived: holds,
             writer,
         },
         &crate::common::actor::label(&auth),

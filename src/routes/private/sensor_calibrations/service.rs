@@ -2182,6 +2182,7 @@ fn record_moved(write: UpdateStatement, columns: &[&str], job_id: Option<Uuid>) 
     );
     SeaQuery::select()
         .column(Alias::new("site_id"))
+        .column(Alias::new("parameter_id"))
         .column(Alias::new("time"))
         .from(Alias::new("moved"))
         .take()
@@ -2266,7 +2267,7 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
             .and_where(Expr::cust("r.time >= dw.deployed_from"))
             .and_where(Expr::cust("r.time < dw.deployed_until"))
             .returning(ReturningClause::Exprs(vec![Expr::cust(format!(
-                "r.stream_id, r.time, r.replicate_index, r.site_id, {pairs}",
+                "r.stream_id, r.time, r.replicate_index, r.site_id, r.parameter_id, {pairs}",
                 pairs = moved_pairs("prev", "r", scope.attribution_columns()),
             ))]))
             .take(),
@@ -2290,7 +2291,7 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
                         .not(),
                 ),
             Some(ReturningClause::Exprs(vec![Expr::cust(
-                "tgt.stream_id, tgt.time, tgt.replicate_index, tgt.site_id, \
+                "tgt.stream_id, tgt.time, tgt.replicate_index, tgt.site_id, tgt.parameter_id, \
                  picked.p_was_calibration_id AS was_calibration_id, \
                  tgt.calibration_id AS now_calibration_id, \
                  picked.p_was_calibrated_value AS was_calibrated_value, \
@@ -2308,7 +2309,7 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
             Expr::cust("r.measurement_type = 'spot'").and(scope.readings_predicate()),
         ))
         .returning(ReturningClause::Exprs(vec![Expr::cust(
-            "tgt.stream_id, tgt.time, tgt.replicate_index, tgt.site_id, \
+            "tgt.stream_id, tgt.time, tgt.replicate_index, tgt.site_id, tgt.parameter_id, \
              r.calibrated_value AS was_calibrated_value, \
              tgt.calibrated_value AS now_calibrated_value",
         )]))
@@ -2335,7 +2336,7 @@ fn reprocess_statements(scope: Scope, job_id: Option<Uuid>) -> ReprocessStatemen
             .and_where(Expr::cust("prev.replicate_index = r.replicate_index"))
             .and_where(scope.recall_predicate())
             .returning(ReturningClause::Exprs(vec![Expr::cust(format!(
-                "r.stream_id, r.time, r.replicate_index, prev.site_id, {pairs}",
+                "r.stream_id, r.time, r.replicate_index, prev.site_id, r.parameter_id, {pairs}",
                 pairs = moved_pairs("prev", "r", &recall_columns),
             ))]))
             .take(),
@@ -2384,8 +2385,8 @@ pub async fn reprocess(
 ) -> Result<usize, sea_orm::DbErr> {
     let steps = reprocess_statements(scope, job_id);
 
-    let (readings_updated, cascade) = crate::common::bulk_write::guarded(db, async |txn| {
-        let mut touched: Vec<(Uuid, DateTime<Utc>)> = Vec::new();
+    let (readings_updated, moved) = crate::common::bulk_write::guarded(db, async |txn| {
+        let mut touched: Vec<(Uuid, DateTime<Utc>, Option<Uuid>)> = Vec::new();
         let mut readings_updated = 0usize;
         for query in [&steps.attribution, &steps.calibration, &steps.spot] {
             readings_updated += write_and_collect(txn, query, &mut touched).await?;
@@ -2404,7 +2405,9 @@ pub async fn reprocess(
 
     // The cascade runs over what this run moved, not over every instant in the scope: a derived
     // value at (site, time) is a function of the served values, and those changed only where a
-    // statement above wrote. Costing a query per instant, the difference is the whole run.
+    // statement above wrote, and at the pulses that hold a value it moved (Q230). Costing a query
+    // per instant, the difference is the whole run.
+    let cascade = cascade_instants(db, &moved).await?;
     let mut refused = crate::routes::private::derived_parameters::service::DerivedPass::default();
     for (site_id, utc_time) in cascade {
         match recalculate_derived_at_timestamp(db, site_id, utc_time).await {
@@ -2436,6 +2439,39 @@ pub async fn reprocess(
     Ok(readings_updated)
 }
 
+/// The instants a reprocess cascades to: every attributed instant it moved, plus the stream pulses
+/// that hold a parameter it moved at a site, up to that parameter's next measurement.
+async fn cascade_instants(
+    db: &DatabaseConnection,
+    moved: &[(Uuid, DateTime<Utc>, Option<Uuid>)],
+) -> Result<Vec<(Uuid, DateTime<Utc>)>, sea_orm::DbErr> {
+    let mut instants: std::collections::BTreeSet<(Uuid, DateTime<Utc>)> =
+        moved.iter().map(|(site, time, _)| (*site, *time)).collect();
+    let mut spans: HashMap<Uuid, (Vec<Uuid>, DateTime<Utc>, DateTime<Utc>)> = HashMap::new();
+    for (site, time, parameter) in moved {
+        let Some(parameter) = parameter else { continue };
+        let span = spans.entry(*site).or_insert((Vec::new(), *time, *time));
+        if !span.0.contains(parameter) {
+            span.0.push(*parameter);
+        }
+        span.1 = Ord::min(span.1, *time);
+        span.2 = Ord::max(span.2, *time);
+    }
+    for (site, (parameters, start, end)) in spans {
+        let held = crate::routes::private::derived_parameters::flows::held_instants(
+            &[site],
+            &parameters,
+            start,
+            end,
+        );
+        for row in db.query_all_raw(build(held)).await? {
+            let at: chrono::DateTime<chrono::FixedOffset> = row.try_get("", "time")?;
+            instants.insert((site, at.with_timezone(&Utc)));
+        }
+    }
+    Ok(instants.into_iter().collect())
+}
+
 /// Run one of the engine's statements, collecting the attributed instants it wrote. Each is a
 /// [`record_moved`] wrapper returning `site_id` and `time` per row it touched; an unattributed row
 /// returns a NULL site and is not an instant anything derives from.
@@ -2443,20 +2479,21 @@ pub async fn reprocess(
 #[derive(FromQueryResult)]
 struct MovedReading {
     site_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
     time: chrono::DateTime<chrono::FixedOffset>,
 }
 
 async fn write_and_collect<C: ConnectionTrait>(
     conn: &C,
     query: &WithQuery,
-    touched: &mut Vec<(Uuid, DateTime<Utc>)>,
+    touched: &mut Vec<(Uuid, DateTime<Utc>, Option<Uuid>)>,
 ) -> Result<usize, sea_orm::DbErr> {
     let rows = conn.query_all_raw(build(query.clone())).await?;
     for row in &rows {
         // `site_id` is nullable on an unpaired reading, which has no slot to touch.
         let moved = MovedReading::from_query_result(row, "")?;
         if let Some(site_id) = moved.site_id {
-            touched.push((site_id, moved.time.with_timezone(&Utc)));
+            touched.push((site_id, moved.time.with_timezone(&Utc), moved.parameter_id));
         }
     }
     Ok(rows.len())

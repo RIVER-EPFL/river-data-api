@@ -56,3 +56,71 @@ fn test_an_assignment_computes_over_the_instants_read_at() {
         .to_string(sea_query::PostgresQueryBuilder);
     assert!(sql.contains(r#""dps"."alignment" = 'exact'"#), "{sql}");
 }
+
+/// Scenario: a parameter some calculation holds (Q230) is written or curated at a visit.
+///
+/// Expected behaviour: the instants to recompute are that calculation's own stream instants at the
+/// site, from the changed instant up to the next live measurement of the held parameter, because
+/// every pulse in between reads the changed value. A calculation that holds none of the
+/// parameters is not in scope.
+#[test]
+fn test_a_held_source_reaches_the_pulses_until_its_next_measurement() {
+    let at = chrono::DateTime::parse_from_rfc3339("2025-06-02T09:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let sql = held_instants(&[Uuid::nil()], &[Uuid::nil()], at, at)
+        .to_string(sea_query::PostgresQueryBuilder);
+    assert!(
+        sql.contains(r#""dps"."alignment" = 'exact'"#),
+        "a pulse is an instant of the stream the set reads: {sql}"
+    );
+    assert!(
+        sql.contains(r#""hs"."alignment" = 'hold'"#),
+        "only a calculation holding the parameter: {sql}"
+    );
+    assert!(
+        sql.contains(r#""hf"."tool_script_id" = "f"."tool_script_id""#),
+        "the next measurement is of the parameter this calculation holds: {sql}"
+    );
+    assert!(
+        sql.contains(r#""r"."time" >= '2025-06-02 09:00:00.000000 +00:00'"#),
+        "from the changed instant: {sql}"
+    );
+    assert!(
+        sql.contains(r#""h"."time" > '2025-06-02 09:00:00.000000 +00:00'"#),
+        "up to the next measurement after it: {sql}"
+    );
+    assert!(
+        sql.contains(r#""h"."withdrawn_at" IS NULL"#),
+        "a withdrawn row is no measurement to stop at: {sql}"
+    );
+    assert!(
+        sql.contains(r#""h"."is_flagged" <> TRUE OR "h"."is_flagged" IS NULL"#),
+        "nor is a flagged one: {sql}"
+    );
+}
+
+/// Expected behaviour: a window recompute runs both arms, the instants the written parameter is
+/// read at and the pulses that hold it.
+#[test]
+fn test_a_window_recompute_covers_the_held_pulses() {
+    let params = serde_json::json!({
+        "site_ids": [Uuid::nil().to_string()],
+        "parameter_ids": [Uuid::nil().to_string()],
+        "start": "2025-06-02T09:00:00Z",
+        "end": "2025-06-02T09:00:00Z",
+    });
+    let statements = derived_recompute_instants(&params).expect("a window builds");
+    assert_eq!(statements.len(), 2, "the exact arm and the held arm");
+    // Bound, `IS NOT $n` is a syntax error: a comparison takes a parameter, `IS` does not.
+    assert!(
+        !statements[1].sql.contains("IS NOT $"),
+        "{}",
+        statements[1].sql
+    );
+    assert!(
+        statements[1].sql.contains(r#""hs"."alignment""#),
+        "{}",
+        statements[1].sql
+    );
+}

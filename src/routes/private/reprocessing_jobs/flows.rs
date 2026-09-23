@@ -425,6 +425,16 @@ impl Job for JanitorRun {
                 }
             };
 
+        // Staged CSV rows no import will read: a job whose body never returned took nothing.
+        let staging_pruned =
+            match crate::routes::private::readings::flows::prune_orphaned_staging(db).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Janitor: pruning orphaned import staging failed");
+                    0
+                }
+            };
+
         // 4. Tiered tracked-job retention (cheap deletes; idempotent to run every tick).
         let pruned = janitor::prune_tracked_jobs(
             db,
@@ -441,6 +451,7 @@ impl Job for JanitorRun {
                 .scope("full_scan", do_full)
                 .count("recomposed", recomposed)
                 .count("import_sessions_pruned", sessions_pruned)
+                .count("import_staging_pruned", staging_pruned)
                 .count("pruned", pruned),
         )
         .await;

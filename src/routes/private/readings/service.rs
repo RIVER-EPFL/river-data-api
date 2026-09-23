@@ -1214,7 +1214,7 @@ pub async fn record<C: ConnectionTrait>(conn: &C, d: &Decision) -> AppResult<Uui
     }
     .insert(conn)
     .await?;
-    if d.kind == Kind::ValueCorrection {
+    if d.kind.recomposes() {
         recompose_corrected(
             conn,
             "r.stream_id = $1 AND r.time = $2 \
@@ -1316,7 +1316,7 @@ pub async fn rollback<C: ConnectionTrait>(
     }
     .update(conn)
     .await?;
-    if d.kind == Kind::ValueCorrection {
+    if d.kind.recomposes() {
         recompose_corrected(
             conn,
             "r.stream_id = $1 AND r.time = $2 \
@@ -2576,11 +2576,12 @@ pub async fn curation_drift_count<C: ConnectionTrait>(conn: &C) -> AppResult<i64
 
 /// Record one decision per reading a selection covers, as one set. Returns the set id and what
 /// was recorded.
-/// Put the corrected value back under the rows a value correction touched.
+/// Put the corrected value back under the rows a value correction or a curve edit touched.
 ///
-/// The projection writes `raw_value` and leaves `calibrated_value` NULL, because a corrected value
-/// is a claim about the curves the row itself names rather than a number a decision may record.
-/// This recomposes it from exactly those curves, so value and provenance move together.
+/// The projection writes `raw_value` (leaving `calibrated_value` NULL) or `standard_curve_id`, and
+/// never a corrected value, because that is a claim about the curves the row itself names rather
+/// than a number a decision may record. This recomposes it from exactly those curves, so value and
+/// provenance move together.
 pub(super) async fn recompose_corrected<C: ConnectionTrait>(
     conn: &C,
     scope_sql: &str,
@@ -2728,7 +2729,7 @@ pub async fn record_set<C: ConnectionTrait>(
         }
     };
     close_set(conn, set_id, recorded.rows).await?;
-    if kind == Kind::ValueCorrection && recorded.rows > 0 {
+    if kind.recomposes() && recorded.rows > 0 {
         recompose_corrected(
             conn,
             "EXISTS (SELECT 1 FROM reading_decisions d WHERE d.set_id = $1 \
@@ -3779,6 +3780,8 @@ pub(super) async fn inspect_rows<C: ConnectionTrait>(
         out.push(InspectedRow {
             stream_id: row.stream_id,
             time,
+            site_id: row.site_id,
+            parameter_id: row.parameter_id,
             replicate_index: row.replicate_index,
             raw_value: row.raw_value,
             options: edit_options(&provenance),

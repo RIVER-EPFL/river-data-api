@@ -304,8 +304,9 @@ fn every_reprocess_step_records_what_it_moved() {
                 "{name} records only the rows that moved: {sql}"
             );
             assert!(
-                sql.ends_with(r#"SELECT "site_id", "time" FROM "moved""#),
-                "{name} reports the instants the cascade follows: {sql}"
+                sql.ends_with(r#"SELECT "site_id", "parameter_id", "time" FROM "moved""#),
+                "{name} reports the instants the cascade follows, and the parameter a held pulse \
+                 reads: {sql}"
             );
         }
         assert!(

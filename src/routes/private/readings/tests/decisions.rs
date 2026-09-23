@@ -26,6 +26,25 @@ fn every_kind_round_trips_its_name() {
 }
 
 #[test]
+fn test_recomposes_a_value_or_curve_edit_and_nothing_else() {
+    assert!(Kind::ValueCorrection.recomposes());
+    assert!(Kind::Curve.recomposes());
+    for k in [
+        Kind::Flag,
+        Kind::Withdraw,
+        Kind::Verify,
+        Kind::CurveRetire,
+        Kind::Rollback,
+    ] {
+        assert!(
+            !k.recomposes(),
+            "{} moves no curve and no raw value",
+            k.as_str()
+        );
+    }
+}
+
+#[test]
 fn each_kind_projects_to_its_own_columns_and_ownership_kinds_project_nothing() {
     assert_eq!(
         Kind::Flag.projected_columns(),

@@ -131,3 +131,43 @@ async fn a_migrated_database_holds_the_twelve_portal_constants() {
         "the baseline seeds constants beyond the twelve the portal reads"
     );
 }
+
+/// Scenario: a reader learns what a formula carries from the schema.
+///
+/// Expected behaviour: every column of `calculation_formulas` is one its entity reads or writes,
+/// so the table claims nothing about a formula the code does not hold.
+#[tokio::test]
+#[serial]
+async fn calculation_formulas_holds_only_the_columns_its_entity_names() {
+    use river_db::routes::private::derived_parameters::models::definition::Column;
+    use sea_orm::{IdenStatic, Iterable};
+
+    dotenvy::dotenv().ok();
+    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
+    let name = format!("river_formula_columns_{}", std::process::id());
+    let server = scratch::server(&base).await;
+    let db = scratch::build(&base, &server, &name).await;
+
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT column_name::text AS name FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = 'calculation_formulas'",
+        ))
+        .await
+        .expect("read the columns");
+    let named: Vec<&str> = Column::iter().map(|c| c.as_str()).collect();
+    let unnamed: Vec<String> = rows
+        .iter()
+        .map(|r| r.try_get::<String>("", "name").expect("name"))
+        .filter(|c| !named.contains(&c.as_str()))
+        .collect();
+
+    db.close().await.expect("close the scratch connection");
+    scratch::discard(&server, &name).await;
+
+    assert!(
+        unnamed.is_empty(),
+        "columns of calculation_formulas no entity field names: {unnamed:?}"
+    );
+}

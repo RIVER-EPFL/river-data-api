@@ -240,6 +240,12 @@ async fn a_value_a_tool_run_produced_is_reopened_rather_than_corrected() {
         "a tool's number is not corrected here: {inspected}"
     );
     assert_eq!(inspected["rows"][0]["tool_run_id"], run_id.to_string());
+    for field in ["site_id", "parameter_id"] {
+        assert!(
+            inspected["rows"][0][field].is_string(),
+            "the row names the slot a detach addresses: {inspected}"
+        );
+    }
 
     // And the route refuses the in-place correction rather than quietly taking it.
     let (status, refused) = post(
@@ -555,5 +561,80 @@ async fn a_curve_edit_is_refused_a_curve_another_instrument_fitted() {
     assert_eq!(
         status, 200,
         "the reading's own instrument's curve is accepted: {body}"
+    );
+}
+
+/// Scenario: a grab of raw 120 is served as 60 under curve A (slope 0.5), and a manager moves it to
+/// curve B (slope 0.8).
+///
+/// Expected behaviour: the corrected value moves with the curve in the edit's own transaction, 96,
+/// and the rollback puts back 60 the same way, so no sweep is left to reconcile a row whose value
+/// and curve disagree.
+#[tokio::test]
+#[serial]
+async fn a_curve_edit_recomposes_the_value_and_its_rollback_restores_it() {
+    let f = setup(&[120.0]).await;
+    let (curve_a, curve_b) = (Uuid::new_v4(), Uuid::new_v4());
+    for sql in [
+        format!(
+            "INSERT INTO standard_curves (id, sensor_id, slope, intercept) \
+             SELECT '{curve_a}', sensor_id, 0.5, 0.0 FROM readings WHERE stream_id = '{}'",
+            f.stream
+        ),
+        format!(
+            "INSERT INTO standard_curves (id, sensor_id, slope, intercept) \
+             SELECT '{curve_b}', sensor_id, 0.8, 0.0 FROM readings WHERE stream_id = '{}'",
+            f.stream
+        ),
+        format!(
+            "UPDATE readings SET standard_curve_id = '{curve_a}', calibrated_value = 60.0 \
+             WHERE stream_id = '{}'",
+            f.stream
+        ),
+    ] {
+        crate::common::exec(&f.db, &sql).await;
+    }
+    let served = || async {
+        f.db.query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT calibrated_value FROM readings WHERE stream_id = '{}'",
+                f.stream
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the seeded reading")
+        .try_get::<Option<f64>>("", "calibrated_value")
+        .unwrap()
+    };
+
+    let mut edit = json!({
+        "selection": one_key(f.stream, 0),
+        "decision": { "kind": "curve", "target_id": curve_b }
+    });
+    let (status, preview) = post(&f, "/api/readings/edits/preview", &edit).await;
+    assert_eq!(status, 200, "{preview}");
+    assert_eq!(
+        preview["rows"][0]["after"]["calibrated_value"], 96.0,
+        "the preview shows the value the new curve composes: {preview}"
+    );
+    edit["preview_id"] = preview["preview_id"].clone();
+    let (status, recorded) = post(&f, "/api/readings/edits", &edit).await;
+    assert_eq!(status, 200, "{recorded}");
+    assert_eq!(served().await, Some(96.0), "120 × 0.8");
+
+    let set_id = recorded["set_id"].as_str().expect("a set").to_string();
+    let (status, body) = post(
+        &f,
+        &format!("/api/readings/edits/sets/{set_id}/rollback"),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        served().await,
+        Some(60.0),
+        "120 × 0.5, restored with the curve"
     );
 }

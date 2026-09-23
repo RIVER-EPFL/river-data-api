@@ -500,4 +500,120 @@ mod at_a_site {
             "the verify of its only pending input releases the output, on the record"
         );
     }
+    /// The output's served value at `time`, polled until `settled` holds of it or the deadline.
+    async fn poll_until(
+        db: &DatabaseConnection,
+        parameter_id: Uuid,
+        time: DateTime<Utc>,
+        settled: impl Fn(Option<f64>) -> bool,
+    ) -> Option<f64> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(DEADLINE_SECS);
+        loop {
+            let value = value_at(db, parameter_id, time).await;
+            if settled(value) || std::time::Instant::now() >= deadline {
+                return value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Scenario: the lab value a stream calculation holds is corrected at its visit, then flagged.
+    ///
+    /// Expected behaviour: the pulses that held it follow it, not only the visit's own instant:
+    /// the correction recomputes them with the new number, and the flag takes the value away, so a
+    /// pulse with no earlier measurement to fall back to stops serving one (Q108, Q230).
+    #[tokio::test]
+    #[serial]
+    async fn a_held_value_corrected_or_flagged_at_its_visit_moves_the_pulses_that_hold_it() {
+        let f = crate::common::seeded_app().await;
+        let (db, app, token) = (f.db, f.app, f.token);
+        let stamp = Uuid::new_v4().simple().to_string();
+        let lab_code = format!("alk_{stamp}");
+        let (lab_id, output) = held_calculation(&db, &app, &token, &lab_code, &stamp).await;
+
+        let visit = whole(Utc::now() - Duration::hours(40));
+        let enter = |value: f64| {
+            serde_json::json!({
+                "site_id": crate::common::SITE1_ID,
+                "mode": "replace",
+                "readings": [{
+                    "parameter_id": lab_id,
+                    "value": value,
+                    "time": visit.to_rfc3339(),
+                    "replicate_index": 0,
+                }],
+            })
+        };
+        let (status, text) = crate::common::post_json_with_token(
+            &app,
+            "/api/grab_samples",
+            &enter(ALKALINITY),
+            &token,
+        )
+        .await;
+        assert!((200..300).contains(&status), "{text}");
+
+        let pulse = whole(Utc::now() - Duration::hours(36));
+        let (status, text) = crate::common::post_json_with_token(
+            &app,
+            "/api/readings/batch",
+            &serde_json::json!({
+                "readings": [{
+                    "site_id": crate::common::SITE1_ID,
+                    "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
+                    "time": pulse.to_rfc3339(),
+                    "raw_value": OXYGEN,
+                }],
+            }),
+            &token,
+        )
+        .await;
+        assert!((200..300).contains(&status), "{text}");
+        let first = OXYGEN * 0.032 + ALKALINITY;
+        let at_pulse = poll_until(&db, output, pulse, |v| v.is_some()).await;
+        assert!(
+            at_pulse.is_some_and(|v| (v - first).abs() < 1e-6),
+            "the pulse holds the visit's value: expected {first}, got {at_pulse:?}"
+        );
+
+        let corrected = ALKALINITY + 1.0;
+        let (status, text) = crate::common::post_json_with_token(
+            &app,
+            "/api/grab_samples",
+            &enter(corrected),
+            &token,
+        )
+        .await;
+        assert!((200..300).contains(&status), "{text}");
+        let second = OXYGEN * 0.032 + corrected;
+        let at_pulse = poll_until(&db, output, pulse, |v| {
+            v.is_some_and(|v| (v - second).abs() < 1e-6)
+        })
+        .await;
+        assert!(
+            at_pulse.is_some_and(|v| (v - second).abs() < 1e-6),
+            "the correction reaches the pulse that holds it: expected {second}, got {at_pulse:?}"
+        );
+
+        let (status, body) = crate::common::patch_json_with_token(
+            &app,
+            "/api/readings/flag",
+            &serde_json::json!({
+                "readings": [{
+                    "site_id": crate::common::SITE1_ID,
+                    "parameter_id": lab_id,
+                    "time": visit.to_rfc3339(),
+                }],
+                "reason": "contaminated",
+            }),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "flag: {body}");
+        let at_pulse = poll_until(&db, output, pulse, |v| v.is_none()).await;
+        assert!(
+            at_pulse.is_none(),
+            "a flagged held value leaves the pulse nothing to hold, so it serves none: {at_pulse:?}"
+        );
+    }
 }

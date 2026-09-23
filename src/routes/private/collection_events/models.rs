@@ -307,6 +307,15 @@ pub struct VisitReplicate {
     pub stream_id: Uuid,
     /// The corrected value where the reading carries one, else the raw value.
     pub value: f64,
+    /// The measurement before any curve: what an entry into this replicate's group sends back
+    /// for it, since the save corrects what it is sent.
+    pub raw_value: f64,
+    /// The windowed calibration that corrected it, if one did.
+    #[schema(required)]
+    pub calibration_id: Option<Uuid>,
+    /// The standard curve chosen for it, if one was.
+    #[schema(required)]
+    pub standard_curve_id: Option<Uuid>,
     pub flagged: bool,
     pub withdrawn: bool,
     /// A pending entry: stored and shown, counted by no statistic and served nowhere.

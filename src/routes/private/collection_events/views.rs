@@ -786,6 +786,7 @@ pub async fn list_site_visits(
                 cell_values,
             ))
             .await?;
+        let measurements = replicate_measurements(&state.db, &event_ids).await?;
         let finding_rows = state
             .db
             .query_all_raw(Statement::from_sql_and_values(
@@ -832,7 +833,7 @@ pub async fn list_site_visits(
         let mut by_event: std::collections::HashMap<Uuid, Vec<VisitCell>> =
             std::collections::HashMap::new();
         for c in cell_rows {
-            let replicates = replicates_of(&c);
+            let replicates = replicates_of(&c, &measurements);
             let curves = cell_curves(
                 c.replicate_curves.as_deref().unwrap_or_default(),
                 &curve_names,
@@ -1136,20 +1137,82 @@ fn cell_curves(
     curves
 }
 
-/// The five parallel arrays one `ARRAY_AGG` group returns, read back as replicates. They come out
-/// of one group over one ordering, so position `i` is the same replicate in each.
-fn replicates_of(row: &CellRow) -> Vec<VisitReplicate> {
+/// A replicate's measurement before any curve, and the curves that correct it, as the page's one
+/// lookup selects it.
+#[derive(FromQueryResult)]
+struct Measurement {
+    collection_event_id: Option<Uuid>,
+    parameter_id: Option<Uuid>,
+    stream_id: Uuid,
+    replicate_index: i16,
+    raw_value: f64,
+    calibration_id: Option<Uuid>,
+    standard_curve_id: Option<Uuid>,
+}
+
+/// A listed replicate: its visit, parameter, stream and index.
+type ReplicateAt = (Uuid, Uuid, Uuid, i16);
+
+/// Every listed replicate's [`Measurement`].
+async fn replicate_measurements(
+    db: &sea_orm::DatabaseConnection,
+    event_ids: &[Uuid],
+) -> AppResult<std::collections::HashMap<ReplicateAt, Measurement>> {
+    use sea_orm::QuerySelect;
+    let rows = readings::Entity::find()
+        .select_only()
+        .columns([
+            readings::Column::CollectionEventId,
+            readings::Column::ParameterId,
+            readings::Column::StreamId,
+            readings::Column::ReplicateIndex,
+            readings::Column::RawValue,
+            readings::Column::CalibrationId,
+            readings::Column::StandardCurveId,
+        ])
+        .filter(readings::Column::CollectionEventId.is_in(event_ids.iter().copied()))
+        .into_model::<Measurement>()
+        .all(db)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|m| {
+            let at = (
+                m.collection_event_id?,
+                m.parameter_id?,
+                m.stream_id,
+                m.replicate_index,
+            );
+            Some((at, m))
+        })
+        .collect())
+}
+
+/// The parallel arrays one `ARRAY_AGG` group returns, read back as replicates. They come out of one
+/// group over one ordering, so position `i` is the same replicate in each.
+fn replicates_of(
+    row: &CellRow,
+    measurements: &std::collections::HashMap<ReplicateAt, Measurement>,
+) -> Vec<VisitReplicate> {
     row.replicate_indexes
         .iter()
         .zip(&row.replicate_values)
         .enumerate()
-        .map(|(i, (replicate_index, value))| VisitReplicate {
-            replicate_index: *replicate_index,
-            value: *value,
-            stream_id: row.replicate_streams.get(i).copied().unwrap_or_default(),
-            flagged: row.replicate_flagged.get(i).copied().unwrap_or(false),
-            withdrawn: row.replicate_withdrawn.get(i).copied().unwrap_or(false),
-            unverified: row.replicate_unverified.get(i).copied().unwrap_or(false),
+        .map(|(i, (replicate_index, value))| {
+            let stream_id = row.replicate_streams.get(i).copied().unwrap_or_default();
+            let measured =
+                measurements.get(&(row.event_id, row.parameter_id, stream_id, *replicate_index));
+            VisitReplicate {
+                replicate_index: *replicate_index,
+                value: *value,
+                raw_value: measured.map_or(*value, |m| m.raw_value),
+                calibration_id: measured.and_then(|m| m.calibration_id),
+                standard_curve_id: measured.and_then(|m| m.standard_curve_id),
+                stream_id,
+                flagged: row.replicate_flagged.get(i).copied().unwrap_or(false),
+                withdrawn: row.replicate_withdrawn.get(i).copied().unwrap_or(false),
+                unverified: row.replicate_unverified.get(i).copied().unwrap_or(false),
+            }
         })
         .collect()
 }

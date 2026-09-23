@@ -56,6 +56,23 @@ pub async fn site_has_active_derived(
     Ok(row.is_some())
 }
 
+/// Whether any calculation holds one of these parameters from the last visit (Q230), so a value
+/// written or curated at a visit moves stream pulses beside the instant it was written at.
+pub async fn held_by_a_calculation<C: ConnectionTrait>(
+    db: &C,
+    parameter_ids: &[Uuid],
+) -> Result<bool, sea_orm::DbErr> {
+    if parameter_ids.is_empty() {
+        return Ok(false);
+    }
+    Ok(source::Entity::find()
+        .filter(source::Column::ParameterId.is_in(parameter_ids.to_vec()))
+        .filter(source::Column::Alignment.eq(derived::HOLD))
+        .one(db)
+        .await?
+        .is_some())
+}
+
 /// The gap scan, as the statement it emits.
 ///
 /// A source read at the instant being computed rather than held from an earlier one (Q230). Only
@@ -528,6 +545,97 @@ fn derived_instants(
         .to_owned()
 }
 
+/// The pulses that read one of `parameter_ids` as a held source (Q230) after it changed at
+/// `start..=end`: each holding calculation's own stream instants at the site, from `start` up to
+/// the next live measurement of the parameter it holds. Every pulse in between binds the changed
+/// value, or, once it is gone, the one measured before it.
+pub(crate) fn held_instants(
+    site_ids: &[Uuid],
+    parameter_ids: &[Uuid],
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> sea_query::SelectStatement {
+    let r = sea_query::Alias::new("r");
+    let f = sea_query::Alias::new("f");
+    let h = sea_query::Alias::new("h");
+    let hs = sea_query::Alias::new("hs");
+    let hf = sea_query::Alias::new("hf");
+    let holds = |hs: &sea_query::Alias| {
+        sea_query::Condition::all()
+            .add(
+                sea_query::Expr::col((hs.clone(), source::Column::ParameterId))
+                    .is_in(parameter_ids.to_vec()),
+            )
+            .add(sea_query::Expr::col((hs.clone(), source::Column::Alignment)).eq(derived::HOLD))
+    };
+    let holding = sea_query::Query::select()
+        .column((hf.clone(), definition::Column::ToolScriptId))
+        .from_as(definition::Entity, hf.clone())
+        .join_as(
+            sea_query::JoinType::Join,
+            source::Entity,
+            hs.clone(),
+            sea_query::Expr::col((hs.clone(), source::Column::DerivedDefinitionId))
+                .equals((hf.clone(), definition::Column::Id)),
+        )
+        .cond_where(holds(&hs))
+        .to_owned();
+    let next = sea_query::SimpleExpr::SubQuery(
+        None,
+        Box::new(sea_query::SubQueryStatement::SelectStatement(
+            sea_query::Query::select()
+                .expr(Func::min(sea_query::Expr::col((
+                    h.clone(),
+                    readings::Column::Time,
+                ))))
+                .from_as(readings::Entity, h.clone())
+                .join_as(
+                    sea_query::JoinType::Join,
+                    source::Entity,
+                    hs.clone(),
+                    sea_query::Expr::col((hs.clone(), source::Column::ParameterId))
+                        .equals((h.clone(), readings::Column::ParameterId)),
+                )
+                .join_as(
+                    sea_query::JoinType::Join,
+                    definition::Entity,
+                    hf.clone(),
+                    sea_query::Expr::col((hf.clone(), definition::Column::Id))
+                        .equals((hs.clone(), source::Column::DerivedDefinitionId)),
+                )
+                .cond_where(holds(&hs))
+                .and_where(
+                    sea_query::Expr::col((hf, definition::Column::ToolScriptId))
+                        .equals((f.clone(), definition::Column::ToolScriptId)),
+                )
+                .and_where(
+                    sea_query::Expr::col((h.clone(), readings::Column::SiteId))
+                        .equals((r.clone(), readings::Column::SiteId)),
+                )
+                .and_where(sea_query::Expr::col((h.clone(), readings::Column::Time)).gt(end))
+                .and_where(
+                    sea_query::Expr::col((h.clone(), readings::Column::WithdrawnAt)).is_null(),
+                )
+                .and_where(
+                    sea_query::Expr::col((h.clone(), readings::Column::IsFlagged))
+                        .ne(true)
+                        .or(sea_query::Expr::col((h, readings::Column::IsFlagged)).is_null()),
+                )
+                .to_owned(),
+        )),
+    );
+    let scope = sea_query::Condition::all()
+        .add(sea_query::Expr::col((r.clone(), readings::Column::SiteId)).is_in(site_ids.to_vec()))
+        .add(sea_query::Expr::col((r.clone(), readings::Column::Time)).gte(start))
+        .add(sea_query::Expr::col((f, definition::Column::ToolScriptId)).in_subquery(holding))
+        .add(
+            sea_query::Condition::any()
+                .add(sea_query::Expr::expr(next.clone()).is_null())
+                .add(sea_query::Expr::col((r, readings::Column::Time)).lt(next)),
+        );
+    derived_instants(scope, None)
+}
+
 /// The instants at one site where a calculation's inputs were recorded. Every formula of the set
 /// counts, a step included: a step's source is an input the set reads.
 fn instants_a_calculation_reads(calculation_id: Uuid, site_id: Uuid) -> sea_query::SelectStatement {
@@ -562,14 +670,15 @@ fn instants_a_calculation_reads(calculation_id: Uuid, site_id: Uuid) -> sea_quer
         .to_owned()
 }
 
-/// The `(site, time)` instants a `derived_recompute` run must recompute, in either scope.
-fn derived_recompute_instants(params: &serde_json::Value) -> Result<Statement, DbErr> {
+/// The `(site, time)` instants a `derived_recompute` run must recompute, in either scope. A window
+/// is two statements: the instants its parameters are read at, and the pulses holding them.
+fn derived_recompute_instants(params: &serde_json::Value) -> Result<Vec<Statement>, DbErr> {
     if params.get("calculation_id").is_some() {
         let calculation_id = required_uuid(params, "calculation_id")?;
-        return Ok(build(&derived_instants(
+        return Ok(vec![build(&derived_instants(
             sea_query::Condition::all(),
             Some(calculation_id),
-        )));
+        ))]);
     }
 
     let uuids = |key: &str| -> Result<Vec<Uuid>, DbErr> {
@@ -593,16 +702,21 @@ fn derived_recompute_instants(params: &serde_json::Value) -> Result<Statement, D
             .ok_or_else(|| DbErr::Custom(format!("derived_recompute: missing {key}")))
     };
 
+    let (site_ids, parameter_ids) = (uuids("site_ids")?, uuids("parameter_ids")?);
+    let (start, end) = (time("start")?, time("end")?);
     let r = sea_query::Alias::new("r");
     let window = sea_query::Condition::all()
-        .add(sea_query::Expr::col((r.clone(), readings::Column::SiteId)).is_in(uuids("site_ids")?))
+        .add(sea_query::Expr::col((r.clone(), readings::Column::SiteId)).is_in(site_ids.clone()))
         .add(
             sea_query::Expr::col((r.clone(), readings::Column::ParameterId))
-                .is_in(uuids("parameter_ids")?),
+                .is_in(parameter_ids.clone()),
         )
-        .add(sea_query::Expr::col((r.clone(), readings::Column::Time)).gte(time("start")?))
-        .add(sea_query::Expr::col((r, readings::Column::Time)).lte(time("end")?));
-    Ok(build(&derived_instants(window, None)))
+        .add(sea_query::Expr::col((r.clone(), readings::Column::Time)).gte(start))
+        .add(sea_query::Expr::col((r, readings::Column::Time)).lte(end));
+    Ok(vec![
+        build(&derived_instants(window, None)),
+        build(&held_instants(&site_ids, &parameter_ids, start, end)),
+    ])
 }
 
 #[async_trait]
@@ -612,10 +726,17 @@ impl Job for DerivedRecompute {
     }
 
     async fn run(&self, ctx: JobContext) -> Result<i64, DbErr> {
-        let instants = derived_recompute_instants(ctx.params())?;
+        let statements = derived_recompute_instants(ctx.params())?;
         let work = async {
             tracing::info!(job_id = %ctx.job_id(), "Recomputing derived parameters");
-            let rows = ctx.db().query_all_raw(instants).await?;
+            let mut instants = std::collections::BTreeSet::new();
+            for statement in statements {
+                for row in ctx.db().query_all_raw(statement).await? {
+                    let instant = DerivedInstant::from_query_result(&row, "")?;
+                    instants.insert((instant.time.with_timezone(&chrono::Utc), instant.site_id));
+                }
+            }
+            let rows: Vec<(chrono::DateTime<chrono::Utc>, Uuid)> = instants.into_iter().collect();
 
             let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
             ctx.set_progress(0, Some(total)).await;
@@ -629,9 +750,7 @@ impl Job for DerivedRecompute {
                 if ctx.is_cancelled() {
                     break;
                 }
-                let instant = DerivedInstant::from_query_result(row, "")?;
-                let site_id = instant.site_id;
-                let utc_time = instant.time.with_timezone(&chrono::Utc);
+                let (utc_time, site_id) = *row;
                 match recalculate_derived_at_timestamp(ctx.db(), site_id, utc_time).await {
                     Ok(slots) => {
                         refused.record(&slots, utc_time);

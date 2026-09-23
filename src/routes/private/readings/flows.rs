@@ -36,8 +36,8 @@ pub(super) fn should_drop_staged(succeeded: bool, final_attempt: bool) -> bool {
     succeeded || final_attempt
 }
 
-/// Take an import's staged rows out of the way, once it finished or failed for the last time.
-/// There is no janitor for this table, so every such exit from the job goes through here.
+/// Take an import's staged rows out of the way, once it finished or failed for the last time. A run
+/// that never returns leaves them to the janitor's [`prune_orphaned_staging`].
 pub(super) async fn drop_staged<C: sea_orm::ConnectionTrait>(
     db: &C,
     import_token: Uuid,
@@ -47,6 +47,55 @@ pub(super) async fn drop_staged<C: sea_orm::ConnectionTrait>(
         .exec(db)
         .await?;
     Ok(())
+}
+
+/// The staged tokens no import will read: every one but those a job still in flight names.
+pub(super) fn orphaned_tokens(staged: &[Uuid], live: &[Uuid]) -> Vec<Uuid> {
+    staged
+        .iter()
+        .filter(|token| !live.contains(token))
+        .copied()
+        .collect()
+}
+
+/// Remove the staged rows of imports whose job finished without taking them: one whose worker died
+/// on every attempt, or whose row was pruned. Returns the rows removed.
+pub async fn prune_orphaned_staging<C: sea_orm::ConnectionTrait>(db: &C) -> Result<u64, DbErr> {
+    use crate::routes::private::reprocessing_jobs::models::job as jobs;
+    use crate::routes::private::reprocessing_jobs::service::IN_FLIGHT_STATES;
+    let staged: Vec<Uuid> = import_staging::Entity::find()
+        .select_only()
+        .column(import_staging::Column::ImportToken)
+        .distinct()
+        .into_tuple()
+        .all(db)
+        .await?;
+    if staged.is_empty() {
+        return Ok(0);
+    }
+    let live: Vec<Uuid> = jobs::Entity::find()
+        .filter(jobs::Column::TriggerType.eq("csv_import"))
+        .filter(jobs::Column::Status.is_in(IN_FLIGHT_STATES))
+        .all(db)
+        .await?
+        .iter()
+        .filter_map(|job| {
+            job.params
+                .get("import_token")?
+                .as_str()?
+                .parse::<Uuid>()
+                .ok()
+        })
+        .collect();
+    let orphaned = orphaned_tokens(&staged, &live);
+    if orphaned.is_empty() {
+        return Ok(0);
+    }
+    Ok(import_staging::Entity::delete_many()
+        .filter(import_staging::Column::ImportToken.is_in(orphaned))
+        .exec(db)
+        .await?
+        .rows_affected)
 }
 
 /// One staged row, as `csv_import_staging` holds it. The job reads the set four times, so the

@@ -117,22 +117,24 @@ fn test_may_delete_accepts_an_empty_group() {
 /// Expected behaviour: the role follows from the calculations. Nothing is refused for crossing
 /// a group, because a group is a filter and not a boundary (Q135).
 #[test]
-fn test_derive_role_reads_the_calculations_never_a_declaration() {
-    let pco2 = Calculation {
-        group_id: id(1),
-        name: "pco2".to_string(),
-        // 11 is a field_data member; 20 is written by stage 1 and read by stage 2.
-        inputs: vec![id(11), id(20)],
-        outputs: vec![id(20), id(21)],
-    };
-    let calculations = [pco2];
-    assert_eq!(derive_role(id(11), &calculations), Role::Measured);
-    assert_eq!(derive_role(id(21), &calculations), Role::Output);
+fn test_roles_of_reads_the_calculations_never_a_declaration() {
+    // 11 is a field_data member; 20 is written by stage 1 and read by stage 2.
+    let read = [id(11), id(20)];
+    let written = [id(20), id(21)];
+    let roles = roles_of(read, written);
+    assert_eq!(roles.get(&id(11)), Some(&Role::Measured));
+    assert_eq!(roles.get(&id(21)), Some(&Role::Output));
     // Written and read by the same calculation: what it writes is what it is.
-    assert_eq!(derive_role(id(20), &calculations), Role::Output);
-    // Touched by no calculation: entered at a visit and read by nothing.
-    assert_eq!(derive_role(id(99), &calculations), Role::EntryOnly);
-    assert_eq!(derive_role(id(11), &[]), Role::EntryOnly);
+    assert_eq!(roles.get(&id(20)), Some(&Role::Output));
+    // Touched by no calculation: entered at a visit and read by nothing, so carried by no entry.
+    assert_eq!(roles.get(&id(99)), None);
+    assert!(roles_of([], []).is_empty());
+}
+
+#[test]
+fn test_roles_of_lets_a_write_win_whichever_order_it_arrives_in() {
+    let roles = roles_of([id(20)], [id(20)]);
+    assert_eq!(roles.get(&id(20)), Some(&Role::Output));
 }
 
 #[test]

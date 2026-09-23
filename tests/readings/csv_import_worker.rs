@@ -1083,3 +1083,44 @@ async fn a_csv_import_that_fails_once_lands_its_rows_on_the_retry() {
         "and then drops the staged rows"
     );
 }
+
+/// Scenario: one import's job failed without its body ever dropping what it staged, another is
+/// still queued.
+/// Expected behaviour: the sweep takes the failed import's rows and leaves the queued one's.
+#[tokio::test]
+#[serial]
+async fn the_staging_sweep_takes_only_what_no_live_import_will_read() {
+    let (db, _app, _token) = setup().await;
+    crate::common::stop_test_workers().await;
+    let (dead, live) = (Uuid::new_v4(), Uuid::new_v4());
+    for (token, status) in [(dead, "failed"), (live, "queued")] {
+        for sql in [
+            format!(
+                "INSERT INTO reprocessing_jobs (id, trigger_type, status, params) \
+                 VALUES (gen_random_uuid(), 'csv_import', '{status}', \
+                         '{{\"import_token\": \"{token}\"}}'::jsonb)"
+            ),
+            format!(
+                "INSERT INTO csv_import_staging (import_token, seq, stream_id, time, raw_value) \
+                 VALUES ('{token}', 0, '{}', '2025-06-01T00:00:00Z', 1.0)",
+                crate::common::STREAM1_ID
+            ),
+        ] {
+            crate::common::exec(&db, &sql).await;
+        }
+    }
+
+    let swept = river_db::routes::private::readings::flows::prune_orphaned_staging(&db)
+        .await
+        .expect("the sweep runs");
+    assert_eq!(swept, 1, "the failed import's row goes");
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!("SELECT count(*) AS n FROM csv_import_staging WHERE import_token = '{live}'")
+        )
+        .await,
+        1,
+        "the queued import keeps what it will read"
+    );
+}

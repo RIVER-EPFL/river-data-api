@@ -483,6 +483,19 @@ async fn an_edited_constant_reads_as_changed_beside_the_value_it_now_holds() {
         Some(3.0),
         "what the catalog holds"
     );
+    let stream_repairs = crate::common::e2e::count(
+        &f.db,
+        &format!(
+            "SELECT COUNT(*) FROM reprocessing_jobs WHERE trigger_type = 'derived_recompute' \
+             AND params->>'calculation_id' = '{}'",
+            f.calculation
+        ),
+    )
+    .await;
+    assert_eq!(
+        stream_repairs, 1,
+        "the stream values computed with the old value are recomputed too"
+    );
 }
 
 #[tokio::test]

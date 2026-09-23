@@ -34,6 +34,10 @@ use super::models::schedule;
 /// config change (calibration/deployment/derived assignment) triggered it; `maintenance` = routine
 /// automatic plumbing (janitor, ingest-time derived, aggregate refresh, alarm backfill).
 pub const CATEGORY_OPERATOR: &str = "operator";
+/// The statuses of a job not yet finished, whoever holds it: it can still be cancelled, and it
+/// will still read what it was enqueued with. `pending` and `retrying` are historical and still on
+/// rows.
+pub const IN_FLIGHT_STATES: [&str; 4] = ["queued", "pending", "running", "retrying"];
 pub const CATEGORY_METADATA: &str = "metadata";
 pub const CATEGORY_MAINTENANCE: &str = "maintenance";
 

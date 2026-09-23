@@ -4835,6 +4835,8 @@ pub async fn audit_after_activation<C: ConnectionTrait>(db: &C, name: &str) {
 /// One job an activation enqueues to repair what the version it replaced produced.
 pub struct MigrationJob {
     pub kind: &'static str,
+    /// The row the job answers to: the edited constant, the recomputed calculation.
+    pub trigger_id: Option<Uuid>,
     pub params: serde_json::Value,
     pub dedupe_key: String,
 }
@@ -4865,15 +4867,79 @@ pub fn migration_jobs(
     vec![
         MigrationJob {
             kind: "event_recompute",
+            trigger_id: None,
             params: serde_json::json!({ "version": superseded, "calculation": name }),
             dedupe_key: format!("event_recompute:version:{superseded}"),
         },
         MigrationJob {
             kind: "derived_recompute",
+            trigger_id: None,
             params: serde_json::json!({ "calculation_id": script_id }),
             dedupe_key: format!("derived_recompute:version:{superseded}"),
         },
     ]
+}
+
+/// What a constant's value edit enqueues to repair what was computed with the old value (Q170):
+/// the visits whose provenance names the constant, and a stream pass of each formula calculation
+/// that reads it, since a stream value names no visit.
+#[must_use]
+pub fn constant_edit_jobs(
+    constant_id: Uuid,
+    name: &str,
+    previous: f64,
+    value: f64,
+    calculations: &[Uuid],
+) -> Vec<MigrationJob> {
+    // Both values travel on the visit job: the ledger rows the recompute writes name the run
+    // that moved them, so the run has to say what the move was.
+    let mut jobs = vec![MigrationJob {
+        kind: "event_recompute",
+        trigger_id: Some(constant_id),
+        params: serde_json::json!({ "constant": name, "previous_value": previous, "value": value }),
+        dedupe_key: crate::routes::private::constants::service::recompute_dedupe_key(name),
+    }];
+    jobs.extend(calculations.iter().map(|&calculation_id| MigrationJob {
+        kind: "derived_recompute",
+        trigger_id: Some(calculation_id),
+        params: serde_json::json!({ "calculation_id": calculation_id }),
+        dedupe_key: format!("derived_recompute:constant:{name}:{calculation_id}"),
+    }));
+    jobs
+}
+
+/// Whether a formula set reads the constant `name`: a free identifier of one of its formulas that
+/// no source variable binds, the way the stream engine resolves constants.
+#[must_use]
+pub fn formulas_read_constant(formulas: &[PinnedFormula], name: &str) -> bool {
+    formulas.iter().any(|f| {
+        !f.sources.iter().any(|(variable, _)| variable == name)
+            && free_identifiers(&f.formula).iter().any(|id| id == name)
+    })
+}
+
+/// The enabled formula calculations whose formula set, as it stands, reads the constant `name`.
+pub async fn calculations_reading_constant<C: ConnectionTrait>(
+    db: &C,
+    name: &str,
+) -> AppResult<Vec<Uuid>> {
+    let ids: Vec<Uuid> = script::Entity::find()
+        .filter(script::Column::Enabled.eq(true))
+        .filter(script::Column::Engine.eq("formula"))
+        .select_only()
+        .column(script::Column::Id)
+        .into_tuple()
+        .all(db)
+        .await?;
+    let mut reading = Vec::new();
+    for id in ids {
+        if let Some(calculation) = stream_calculation(db, id).await?
+            && formulas_read_constant(&calculation.formulas, name)
+        {
+            reading.push(id);
+        }
+    }
+    Ok(reading)
 }
 
 /// Enqueue what [`migration_jobs`] decided, if anything.
@@ -4889,7 +4955,7 @@ pub async fn recompute_after_activation<C: ConnectionTrait>(
             db,
             job.kind,
             None,
-            None,
+            job.trigger_id,
             &job.params,
             Some(&job.dedupe_key),
         )

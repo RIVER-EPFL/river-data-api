@@ -1179,9 +1179,11 @@ async fn every_kind_moves_exactly_the_columns_it_declares() {
             "withdrawn_at = NULL, withdrawn_reason = NULL, unverified = TRUE",
             json!({ "reason": "not a measurement" }),
         ),
+        // Arranged at the value the new curve recomposes (3.0 × 1.0 + 0.5), so the corrected value,
+        // which is derived from the row's own curves and never recorded, does not move.
         (
             Kind::Curve,
-            "standard_curve_id = NULL",
+            "raw_value = 1.0, calibration_id = NULL, standard_curve_id = NULL, calibrated_value = 3.5",
             json!({ "standard_curve_id": curve }),
         ),
         (

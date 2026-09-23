@@ -34,9 +34,7 @@ use crate::common::scope::Unowned;
 use crate::error::AppError;
 use crate::error::AppResult;
 
-/// The statuses a job can still be cancelled or found in flight from: not yet finished, whoever
-/// holds it. `pending` and `retrying` are historical and still on rows.
-const CANCELLABLE_STATES: [&str; 4] = ["queued", "pending", "running", "retrying"];
+use super::service::IN_FLIGHT_STATES as CANCELLABLE_STATES;
 
 /// A `status IN (...)` list for the statuses above, quoted for SQL.
 fn sql_list(states: &[&str]) -> String {

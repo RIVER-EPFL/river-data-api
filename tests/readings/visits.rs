@@ -143,6 +143,46 @@ async fn a_listed_cell_carries_its_replicates_and_what_a_correction_keys_on() {
     assert_eq!(single[0]["value"], 4.2);
 }
 
+/// Scenario: one repeat of a duplicate was corrected through a standard curve, the other was not.
+///
+/// Expected behaviour: each listed replicate carries its raw measurement and the curve beside the
+/// value served, so an entry into the group sends the measurement back rather than the correction.
+#[tokio::test]
+#[serial]
+async fn a_listed_replicate_carries_its_raw_measurement_and_its_curve() {
+    let (db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+    let sensor = Uuid::new_v4();
+    let curve = Uuid::new_v4();
+    for sql in [
+        format!("INSERT INTO sensors (id) VALUES ('{sensor}')"),
+        format!(
+            "INSERT INTO standard_curves (id, sensor_id, slope, intercept, name) \
+             VALUES ('{curve}', '{sensor}', 0.5, 0.0, 'Visits plate')"
+        ),
+        format!(
+            "UPDATE readings SET standard_curve_id = '{curve}', calibrated_value = raw_value * 0.5 \
+              WHERE site_id = '{SITE1_ID}' AND parameter_id = '{GLOBAL_PARAM_DO_ID}' \
+                AND time = '{T1}' AND replicate_index = 0"
+        ),
+    ] {
+        crate::common::exec(&db, &sql).await;
+    }
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let do_cell = cell(&body["visits"][1], GLOBAL_PARAM_DO_ID).expect("DO cell at T1");
+    let replicates = do_cell["replicates"].as_array().unwrap();
+    assert_eq!(replicates[0]["value"], 5.0, "served corrected: {do_cell}");
+    assert_eq!(replicates[0]["raw_value"], 10.0, "{do_cell}");
+    assert_eq!(replicates[0]["standard_curve_id"], curve.to_string());
+    assert_eq!(replicates[1]["raw_value"], 12.0);
+    assert!(replicates[1]["standard_curve_id"].is_null(), "{do_cell}");
+    assert!(replicates[1]["calibration_id"].is_null(), "{do_cell}");
+}
+
 #[tokio::test]
 #[serial]
 async fn the_detail_grid_shows_replicates_and_sample_stats() {

@@ -622,6 +622,15 @@ impl Kind {
         }
     }
 
+    /// Whether the kind moves what a row's corrected value is composed from, so the row is
+    /// recomposed from its own curves in the decision's transaction, and in its rollback's.
+    #[must_use]
+    pub fn recomposes(self) -> bool {
+        self.projected_columns()
+            .iter()
+            .any(|c| matches!(*c, "raw_value" | "standard_curve_id"))
+    }
+
     /// Whether a writer may still record this kind. Attribution pins are historical (Q117): the
     /// correction belongs on the deployment or the calibration window, and every reprocess carries
     /// it through, so a row is never stamped with one again.
@@ -1251,6 +1260,14 @@ pub struct InspectRequest {
 pub struct InspectedRow {
     pub stream_id: Uuid,
     pub time: chrono::DateTime<chrono::Utc>,
+    /// The slot the row is paired to, which is what detaching or returning an output names.
+    /// Absent on an unpaired row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub site_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub parameter_id: Option<Uuid>,
     pub replicate_index: i16,
     pub raw_value: f64,
     pub provenance: RowProvenance,

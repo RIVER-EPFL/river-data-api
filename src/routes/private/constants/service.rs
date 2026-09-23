@@ -4,11 +4,13 @@ use uuid::Uuid;
 
 use super::models::Constant;
 use crate::routes::private::reprocessing_jobs::service as jobs;
+use crate::routes::private::tools::service as tools;
 
 /// A constant is an input to every calculation that declares it, so changing its value changes what
 /// every stored output would produce today. A constant carries no versions, so there is no arm that
 /// leaves old readings on the old value: the edit enqueues `event_recompute` scoped to the constant
-/// (Q170), which repairs exactly the visits whose stored provenance names it.
+/// (Q170), which repairs exactly the visits whose stored provenance names it, and a
+/// `derived_recompute` of each formula calculation reading it, for the values a stream pass made.
 pub struct ConstantOperations;
 
 /// The stored value and name, for an update that has not happened yet.
@@ -58,24 +60,22 @@ impl CRUDOperations for ConstantOperations {
             return Ok(());
         }
         let name = data.name.clone().flatten().unwrap_or(stored_name);
-        let key = recompute_dedupe_key(&name);
-        // Both values travel on the job row: the ledger rows the recompute writes name the run
-        // that moved them, so the run has to say what the move was.
-        if let Err(e) = jobs::enqueue(
-            db,
-            "event_recompute",
-            None,
-            Some(id),
-            &serde_json::json!({
-                "constant": name,
-                "previous_value": previous,
-                "value": value,
-            }),
-            Some(&key),
-        )
-        .await
-        {
-            tracing::warn!(error = %e, constant = %name, "constants: failed to enqueue recompute");
+        let calculations = tools::calculations_reading_constant(db, &name)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string(), None))?;
+        for job in tools::constant_edit_jobs(id, &name, previous, value, &calculations) {
+            if let Err(e) = jobs::enqueue(
+                db,
+                job.kind,
+                None,
+                job.trigger_id,
+                &job.params,
+                Some(&job.dedupe_key),
+            )
+            .await
+            {
+                tracing::warn!(error = %e, constant = %name, kind = job.kind, "constants: failed to enqueue recompute");
+            }
         }
         Ok(())
     }
