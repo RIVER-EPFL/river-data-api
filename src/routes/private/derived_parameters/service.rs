@@ -1085,8 +1085,35 @@ impl CRUDOperations for CalculationFormulaOperations {
 
         entity.sources = written;
 
+        if entity.tool_script_id.is_none() {
+            remint_declaring_calculations(db, entity.id).await?;
+        }
+
         Ok(())
     }
+}
+
+/// A shared step is part of every set that declares it, so a correction to it re-pins each of
+/// those calculations to a version holding the corrected step.
+async fn remint_declaring_calculations<C: ConnectionTrait>(
+    db: &C,
+    formula_id: Uuid,
+) -> Result<(), ApiError> {
+    let declarations = super::models::shared_step::Entity::find()
+        .filter(super::models::shared_step::Column::FormulaId.eq(formula_id))
+        .all(db)
+        .await
+        .map_err(|e| ApiError::internal(format!("DB error: {e}"), None))?;
+    for declaration in declarations {
+        crate::routes::private::tools::service::mint_formula_version(
+            db,
+            declaration.tool_script_id,
+            None,
+        )
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// What one derived run did to each slot it touched: the refusals it must report, and the slots

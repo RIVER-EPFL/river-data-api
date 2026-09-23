@@ -91,7 +91,7 @@ fn a_switched_off_calculation_is_not_run_by_name() {
     }
 }
 
-use super::{FormulaWrite, codes_held_elsewhere, plan_formula_set};
+use super::{FormulaWrite, codes_held_elsewhere, plan_formula_set, steps_taken_back};
 
 fn id(n: u128) -> uuid::Uuid {
     uuid::Uuid::from_u128(n)
@@ -219,4 +219,33 @@ fn test_codes_held_elsewhere_names_each_taken_code_and_its_calculation() {
 #[test]
 fn test_codes_held_elsewhere_passes_a_set_no_other_calculation_holds() {
     assert_eq!(codes_held_elsewhere(&[]), Ok(()));
+}
+
+#[test]
+fn test_a_step_declared_here_and_named_by_the_set_is_taken_back() {
+    let declared = [(id(5), "this_set".to_string())];
+    assert_eq!(
+        steps_taken_back("this_set", &[id(1), id(5)], &declared).expect("taken back"),
+        vec![id(5)]
+    );
+}
+
+#[test]
+fn test_a_set_naming_no_declared_step_takes_nothing_back() {
+    let declared = [(id(5), "this_set".to_string())];
+    assert!(
+        steps_taken_back("this_set", &[id(1)], &declared)
+            .expect("nothing")
+            .is_empty()
+    );
+}
+
+#[test]
+fn test_a_step_another_calculation_still_reads_is_not_taken_back() {
+    let declared = [
+        (id(5), "this_set".to_string()),
+        (id(5), "other_set".to_string()),
+    ];
+    let err = steps_taken_back("this_set", &[id(5)], &declared).expect_err("refused");
+    assert!(err.contains("other_set"), "the error names the reader: {err}");
 }

@@ -2936,6 +2936,17 @@
             "format": "int64",
             "type": "integer"
           },
+          "repair": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CalculationRepair",
+                "description": "The calculation's latest `event_recompute` run, while it is queued or running and when it\nfailed. Null once it completed, or when none ran."
+              }
+            ]
+          },
           "skipped_outputs": {
             "format": "int64",
             "type": "integer"
@@ -3039,6 +3050,24 @@
           "tool_script_id",
           "code",
           "name"
+        ],
+        "type": "object"
+      },
+      "CalculationRepair": {
+        "description": "A calculation's latest recompute run, named so its logs can be opened.",
+        "properties": {
+          "job_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "state": {
+            "description": "`queued`, `running` or `failed`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "state"
         ],
         "type": "object"
       },

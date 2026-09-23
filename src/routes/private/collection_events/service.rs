@@ -470,6 +470,17 @@ pub fn visit_status(latest_job_status: Option<&str>, has_stale_finding: bool) ->
     }
 }
 
+/// The state a calculation's latest recompute puts on its health row: `queued`, `running` or
+/// `failed` while that run needs watching, `None` once it finished or when none ran, which leaves
+/// the open findings to say how the calculation stands.
+#[must_use]
+pub fn calculation_repair(latest_job_status: Option<&str>) -> Option<&'static str> {
+    match visit_status(latest_job_status, false) {
+        "current" => None,
+        state => Some(state),
+    }
+}
+
 /// The recompute state of each visit: `queued` | `running` | `failed` from its latest
 /// `event_recompute` job, else `stale` when an open stale-output or skipped-step finding names
 /// it, else `current`.

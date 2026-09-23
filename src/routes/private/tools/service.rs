@@ -23,7 +23,7 @@ use super::models::script::{self, ToolScript};
 use super::models::version as version_entity;
 use super::models::version::{ToolScriptVersion, ToolScriptVersionList};
 use super::models::{
-    ActiveTool, CalculationHealth, CalculationImpact, CaseResult, CatalogFindings, ClosureQuery,
+    ActiveTool, CalculationHealth, CalculationImpact, CalculationRepair, CaseResult, CatalogFindings, ClosureQuery,
     Curve, CurveSnapshot, Engine, Evaluated, ImpactParameter, LintFinding, Manifest, ManifestCurve,
     ManifestEventInput, ManifestOutput, ManifestSiteInput, MissingConstant, ParamWhen, ParseCheck,
     ParseError, PinnedFormula, Produced, ResolvedBy, ResolvedCurve, ResolvedParameter, RunOutcome,
@@ -317,32 +317,46 @@ pub(super) fn stored_manifest(name: &str, raw: &serde_json::Value) -> AppResult<
         .map_err(|e| AppError::Internal(format!("tool '{name}' has an unreadable manifest: {e}")))
 }
 
-pub(super) const ACTIVE_TOOL_SQL: &str = r"
-    SELECT s.id AS script_id, s.name, s.label, s.description, s.engine, s.enabled,
-           v.id AS version_id, v.version_no, v.script, v.entry_function, v.manifest,
-           v.content_hash
-    FROM tool_scripts s
-    JOIN tool_script_versions v ON v.id = s.active_version_id";
-
-/// One formula of a calculation as stored, before its `sources` blob is read into pairs.
-#[derive(FromQueryResult)]
-pub(super) struct StoredFormula {
-    tool_script_id: Uuid,
-    sources: serde_json::Value,
-    held: serde_json::Value,
-    site_sources: serde_json::Value,
-    code: String,
-    name: String,
-    units: Option<String>,
-    formula: String,
-    ordinal: i32,
-    output_parameter_code: Option<String>,
-    curve_slot: Option<String>,
-    per_replicate: Option<String>,
-    intermediate: bool,
+/// Every calculation joined to its active version, as the columns [`StoredActiveTool`] reads.
+/// A caller narrows it to the calculations it wants.
+pub(super) fn active_tool_query() -> sea_orm::sea_query::SelectStatement {
+    use sea_orm::sea_query::ExprTrait;
+    let s = Alias::new("s");
+    let v = Alias::new("v");
+    Query::select()
+        .expr_as(
+            Expr::col((s.clone(), script::Column::Id)),
+            Alias::new("script_id"),
+        )
+        .columns([
+            (s.clone(), script::Column::Name),
+            (s.clone(), script::Column::Label),
+            (s.clone(), script::Column::Description),
+            (s.clone(), script::Column::Engine),
+            (s.clone(), script::Column::Enabled),
+        ])
+        .expr_as(
+            Expr::col((v.clone(), version_entity::Column::Id)),
+            Alias::new("version_id"),
+        )
+        .columns([
+            (v.clone(), version_entity::Column::VersionNo),
+            (v.clone(), version_entity::Column::Script),
+            (v.clone(), version_entity::Column::EntryFunction),
+            (v.clone(), version_entity::Column::Manifest),
+            (v.clone(), version_entity::Column::ContentHash),
+        ])
+        .from_as(script::Entity, s.clone())
+        .join_as(
+            JoinType::InnerJoin,
+            version_entity::Entity,
+            v.clone(),
+            Expr::col((v, version_entity::Column::Id)).equals((s, script::Column::ActiveVersionId)),
+        )
+        .to_owned()
 }
 
-/// [`ACTIVE_TOOL_SQL`]'s row. The manifest and the engine stay parses over it: a stored manifest
+/// [`active_tool_query`]'s row. The manifest and the engine stay parses over it: a stored manifest
 /// that no longer reads is a corrupt row, not a decode failure, and it says so by name.
 #[derive(sea_orm::FromQueryResult)]
 pub(super) struct StoredActiveTool {
@@ -362,6 +376,8 @@ pub(super) struct StoredActiveTool {
 pub(super) fn row_to_active(row: &sea_orm::QueryResult) -> AppResult<ActiveTool> {
     let stored = StoredActiveTool::from_query_result(row, "")?;
     let manifest = stored_manifest(&stored.name, &stored.manifest)?;
+    let engine = Engine::parse(&stored.engine).unwrap_or(Engine::Script);
+    let formulas = version_formulas(&stored.name, engine, &stored.script)?;
     Ok(ActiveTool {
         script_id: stored.script_id,
         label: stored.label,
@@ -372,40 +388,23 @@ pub(super) fn row_to_active(row: &sea_orm::QueryResult) -> AppResult<ActiveTool>
         entry_function: stored.entry_function,
         content_hash: stored.content_hash,
         manifest,
-        engine: Engine::parse(&stored.engine).unwrap_or(Engine::Script),
-        formulas: Vec::new(),
+        engine,
+        formulas,
         name: stored.name,
     })
 }
 
-/// A jsonb array of `[name, name]` pairs as the pairs themselves. Both source lists are built the
-/// same way in SQL, so both are read the same way here.
-/// A jsonb array of names as a list of strings.
-pub(super) fn names(raw: &serde_json::Value) -> Vec<String> {
-    raw.as_array()
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-pub(super) fn name_pairs(raw: &serde_json::Value) -> Vec<(String, String)> {
-    raw.as_array()
-        .map(|pairs| {
-            pairs
-                .iter()
-                .filter_map(|pair| {
-                    Some((
-                        pair.get(0)?.as_str()?.to_string(),
-                        pair.get(1)?.as_str()?.to_string(),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// The formulas a run of this version evaluates: the set its body pins, never the rows as they
+/// stand, so the version a run stamps is the arithmetic it did. A script calculation has none.
+pub(super) fn version_formulas(
+    name: &str,
+    engine: Engine,
+    body: &str,
+) -> AppResult<Vec<PinnedFormula>> {
+    if engine != Engine::Formula {
+        return Ok(Vec::new());
+    }
+    parse_pinned(body).map_err(|e| AppError::Internal(format!("calculation '{name}' has an {e}")))
 }
 
 /// The formulas each calculation runs: the ones it owns, plus the shared steps it declares
@@ -420,41 +419,22 @@ pub async fn load_formulas<C: ConnectionTrait>(
     Ok(formulas)
 }
 
-/// A step's `(variable, parameter code)` readings and its `(variable, site column)` readings, the
-/// two shapes a `PinnedFormula` carries them in.
-/// A step's parameter sources, its site sources, and the variables among the first that are held
-/// rather than read at the instant (Q230).
+/// A formula's parameter sources, its site sources, and the variables among the first that are
+/// held rather than read at the instant (Q230).
 type StepSources = (Vec<(String, String)>, Vec<(String, String)>, Vec<String>);
 
-/// The steps the given calculations declare, as the same pairs their own formulas arrive in. One
-/// step declared by two calculations is one pair each.
-async fn load_declared_steps<C: ConnectionTrait>(
+/// The sources of each given formula, keyed by formula id, each list sorted by variable.
+async fn formula_sources<C: ConnectionTrait>(
     db: &C,
-    script_ids: &[Uuid],
-) -> AppResult<Vec<(Uuid, PinnedFormula)>> {
-    use crate::routes::private::derived_parameters::models::{definition, shared_step, source};
+    formula_ids: Vec<Uuid>,
+) -> AppResult<HashMap<Uuid, StepSources>> {
+    use crate::routes::private::derived_parameters::models::source;
 
-    if script_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let declarations = shared_step::Entity::find()
-        .filter(shared_step::Column::ToolScriptId.is_in(script_ids.to_vec()))
-        .all(db)
-        .await?;
-    if declarations.is_empty() {
-        return Ok(Vec::new());
-    }
-    let formula_ids: Vec<Uuid> = declarations.iter().map(|d| d.formula_id).collect();
-    let steps = definition::Entity::find()
-        .filter(definition::Column::Id.is_in(formula_ids.clone()))
-        .all(db)
-        .await?;
     let sources = source::Entity::find()
         .filter(source::Column::DerivedDefinitionId.is_in(formula_ids))
         .find_also_related(crate::routes::private::parameters::Entity)
         .all(db)
         .await?;
-
     let mut by_formula: HashMap<Uuid, StepSources> = HashMap::new();
     for (row, parameter) in sources {
         let entry = by_formula.entry(row.derived_definition_id).or_default();
@@ -473,35 +453,80 @@ async fn load_declared_steps<C: ConnectionTrait>(
         pairs.1.sort();
         pairs.2.sort();
     }
+    Ok(by_formula)
+}
+
+/// One stored formula row as the formula a run evaluates.
+fn pinned_formula(
+    row: &crate::routes::private::derived_parameters::models::definition::Model,
+    sources: Option<&StepSources>,
+    output_parameter_code: Option<String>,
+) -> PinnedFormula {
+    let (sources, site_sources, held) = sources.cloned().unwrap_or_default();
+    PinnedFormula {
+        code: row.code.clone(),
+        label: row.name.clone(),
+        units: Some(row.units.clone()).filter(|u| !u.is_empty()),
+        formula: row.formula.clone(),
+        ordinal: row.ordinal,
+        output_parameter_code,
+        sources,
+        held,
+        site_sources,
+        curve_slot: row.curve_slot.clone(),
+        per_replicate: row.per_replicate.clone(),
+        intermediate: row.intermediate,
+    }
+}
+
+/// The steps the given calculations declare, as the same pairs their own formulas arrive in. One
+/// step declared by two calculations is one pair each.
+async fn load_declared_steps<C: ConnectionTrait>(
+    db: &C,
+    script_ids: &[Uuid],
+) -> AppResult<Vec<(Uuid, PinnedFormula)>> {
+    use crate::routes::private::derived_parameters::models::{definition, shared_step};
+
+    if script_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let declarations = shared_step::Entity::find()
+        .filter(shared_step::Column::ToolScriptId.is_in(script_ids.to_vec()))
+        .all(db)
+        .await?;
+    if declarations.is_empty() {
+        return Ok(Vec::new());
+    }
+    let formula_ids: Vec<Uuid> = declarations.iter().map(|d| d.formula_id).collect();
+    let steps = definition::Entity::find()
+        .filter(definition::Column::Id.is_in(formula_ids.clone()))
+        .all(db)
+        .await?;
+    let sources = formula_sources(db, formula_ids).await?;
 
     let mut pairs = Vec::with_capacity(declarations.len());
     for declaration in declarations {
         let Some(step) = steps.iter().find(|s| s.id == declaration.formula_id) else {
             continue;
         };
-        let (sources, site_sources, held) = by_formula
-            .get(&step.id)
-            .cloned()
-            .unwrap_or_else(|| (Vec::new(), Vec::new(), Vec::new()));
         pairs.push((
             declaration.tool_script_id,
-            PinnedFormula {
-                code: step.code.clone(),
-                label: step.name.clone(),
-                units: Some(step.units.clone()).filter(|u| !u.is_empty()),
-                formula: step.formula.clone(),
-                ordinal: step.ordinal,
-                output_parameter_code: None,
-                sources,
-                held,
-                site_sources,
-                curve_slot: step.curve_slot.clone(),
-                per_replicate: step.per_replicate.clone(),
-                intermediate: step.intermediate,
-            },
+            pinned_formula(step, sources.get(&step.id), None),
         ));
     }
     Ok(pairs)
+}
+
+/// The formulas the given calculations own, in evaluation order, ties broken by code.
+pub(super) fn own_formulas_query(
+    script_ids: &[Uuid],
+) -> sea_orm::Select<crate::routes::private::derived_parameters::models::definition::Entity> {
+    use crate::routes::private::derived_parameters::models::definition;
+
+    definition::Entity::find()
+        .filter(definition::Column::ToolScriptId.is_in(script_ids.to_vec()))
+        .order_by_asc(definition::Column::Ordinal)
+        .order_by_asc(definition::Column::Code)
 }
 
 /// The formulas the given calculations own, as `(script_id, formula)` pairs.
@@ -512,96 +537,40 @@ async fn load_own_formulas<C: ConnectionTrait>(
     if script_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT d.tool_script_id, d.code, d.name, NULLIF(d.units, '') AS units, d.formula,
-                    d.ordinal, d.curve_slot, d.per_replicate, d.intermediate,
-                    out.code AS output_parameter_code,
-                    COALESCE(
-                        (SELECT jsonb_agg(jsonb_build_array(src.variable_name, p.code)
-                                            ORDER BY src.variable_name)
-                           FROM derived_parameter_sources src
-                           JOIN parameters p ON p.id = src.parameter_id
-                          WHERE src.derived_definition_id = d.id),
-                        '[]'::jsonb) AS sources,
-                    COALESCE(
-                        (SELECT jsonb_agg(src.variable_name ORDER BY src.variable_name)
-                           FROM derived_parameter_sources src
-                          WHERE src.derived_definition_id = d.id
-                            AND src.alignment = 'hold'),
-                        '[]'::jsonb) AS held,
-                    COALESCE(
-                        (SELECT jsonb_agg(jsonb_build_array(src.variable_name, src.site_property)
-                                            ORDER BY src.variable_name)
-                           FROM derived_parameter_sources src
-                          WHERE src.derived_definition_id = d.id
-                            AND src.site_property IS NOT NULL),
-                        '[]'::jsonb) AS site_sources
-               FROM calculation_formulas d
-               LEFT JOIN parameters out ON out.id = d.output_parameter_id
-              WHERE d.tool_script_id = ANY($1)
-              ORDER BY d.ordinal, d.code",
-            [script_ids.to_vec().into()],
-        ))
-        .await?;
-    let mut formulas = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let stored = StoredFormula::from_query_result(row, "")?;
-        let sources = name_pairs(&stored.sources);
-        let held = names(&stored.held);
-        let site_sources = name_pairs(&stored.site_sources);
-        formulas.push((
-            stored.tool_script_id,
-            PinnedFormula {
-                code: stored.code,
-                label: stored.name,
-                units: stored.units,
-                formula: stored.formula,
-                ordinal: stored.ordinal,
-                output_parameter_code: stored.output_parameter_code,
-                sources,
-                held,
-                site_sources,
-                curve_slot: stored.curve_slot,
-                per_replicate: stored.per_replicate,
-                intermediate: stored.intermediate,
-            },
-        ));
-    }
-    Ok(formulas)
-}
-
-/// Load the formulas of every formula calculation in the set. A script calculation is left alone.
-pub(super) async fn attach_formulas(
-    db: &DatabaseConnection,
-    tools: &mut [ActiveTool],
-) -> AppResult<()> {
-    let ids: Vec<Uuid> = tools
-        .iter()
-        .filter(|t| t.engine == Engine::Formula)
-        .map(|t| t.script_id)
+    let rows = own_formulas_query(script_ids).all(db).await?;
+    let sources = formula_sources(db, rows.iter().map(|f| f.id).collect()).await?;
+    let output_codes: HashMap<Uuid, String> = parameters::Entity::find()
+        .filter(parameters::Column::Id.is_in(rows.iter().filter_map(|f| f.output_parameter_id)))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|p| (p.id, p.code))
         .collect();
-    for (script_id, formula) in load_formulas(db, &ids).await? {
-        if let Some(tool) = tools.iter_mut().find(|t| t.script_id == script_id) {
-            tool.formulas.push(formula);
-        }
-    }
-    Ok(())
+    Ok(rows
+        .iter()
+        .filter_map(|formula| {
+            let output = formula
+                .output_parameter_id
+                .and_then(|id| output_codes.get(&id).cloned());
+            Some((
+                formula.tool_script_id?,
+                pinned_formula(formula, sources.get(&formula.id), output),
+            ))
+        })
+        .collect())
 }
 
 /// The calculation set: every enabled tool with an active version. A disabled tool is left out
 /// here, so the chain, the audit and the tools list do not see it.
 pub async fn list_active_tools(db: &DatabaseConnection) -> AppResult<Vec<ActiveTool>> {
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            format!("{ACTIVE_TOOL_SQL} WHERE s.enabled ORDER BY s.name"),
-        ))
-        .await?;
-    let mut tools: Vec<ActiveTool> = rows.iter().map(row_to_active).collect::<AppResult<_>>()?;
-    attach_formulas(db, &mut tools).await?;
-    Ok(tools)
+    use sea_orm::sea_query::ExprTrait;
+    let s = Alias::new("s");
+    let query = active_tool_query()
+        .and_where(Expr::col((s.clone(), script::Column::Enabled)).eq(true))
+        .order_by((s, script::Column::Name), Order::Asc)
+        .to_owned();
+    let rows = db.query_all_raw(build(&query)).await?;
+    rows.iter().map(row_to_active).collect()
 }
 
 /// The formula set a calculation computes on a stream with, as its formulas stand.
@@ -659,36 +628,38 @@ pub(super) fn admit_run(name: &str, enabled: bool) -> AppResult<()> {
 }
 
 pub async fn find_active_tool(db: &DatabaseConnection, name: &str) -> AppResult<ActiveTool> {
+    use sea_orm::sea_query::ExprTrait;
+    let query = active_tool_query()
+        .and_where(
+            Expr::expr(Func::lower(Expr::col((
+                Alias::new("s"),
+                script::Column::Name,
+            ))))
+            .eq(Func::lower(Expr::val(name))),
+        )
+        .to_owned();
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!("{ACTIVE_TOOL_SQL} WHERE LOWER(s.name) = LOWER($1)"),
-            [name.into()],
-        ))
+        .query_one_raw(build(&query))
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Unknown tool: {name}")))?;
     admit_run(name, row.try_get::<bool>("", "enabled")?)?;
-    let mut tools = vec![row_to_active(&row)?];
-    attach_formulas(db, &mut tools).await?;
-    Ok(tools.remove(0))
+    row_to_active(&row)
 }
 
 /// The active calculation a site-apply names by id. Same switch as a run by name: a calculation
 /// switched off is refused naming the switch (Q174).
 pub async fn find_active_tool_by_id(db: &DatabaseConnection, id: Uuid) -> AppResult<ActiveTool> {
+    use sea_orm::sea_query::ExprTrait;
+    let query = active_tool_query()
+        .and_where(Expr::col((Alias::new("s"), script::Column::Id)).eq(id))
+        .to_owned();
     let row = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!("{ACTIVE_TOOL_SQL} WHERE s.id = $1"),
-            [id.into()],
-        ))
+        .query_one_raw(build(&query))
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Calculation {id} not found")))?;
     let name: String = row.try_get("", "name")?;
     admit_run(&name, row.try_get::<bool>("", "enabled")?)?;
-    let mut tools = vec![row_to_active(&row)?];
-    attach_formulas(db, &mut tools).await?;
-    Ok(tools.remove(0))
+    row_to_active(&row)
 }
 
 pub(super) async fn resolve_curve(
@@ -3995,6 +3966,7 @@ pub async fn calculation_health(db: &DatabaseConnection) -> AppResult<Vec<Calcul
                 missing_outputs: 0,
                 stale_outputs: 0,
                 skipped_outputs: 0,
+                repair: None,
             })
     }
 
@@ -4011,8 +3983,52 @@ pub async fn calculation_health(db: &DatabaseConnection) -> AppResult<Vec<Calcul
     for row in &visits {
         entry(&mut by_tool, &row.tool).stale_visits += 1;
     }
+    for (tool, repair) in latest_repairs(db).await? {
+        entry(&mut by_tool, &tool).repair = Some(repair);
+    }
     let mut out: Vec<CalculationHealth> = by_tool.into_values().collect();
     out.sort_by(|a, b| a.tool.cmp(&b.tool));
+    Ok(out)
+}
+
+/// Each calculation's latest `event_recompute` run that still needs watching, keyed by the
+/// calculation name the Recompute action writes into the job's params.
+async fn latest_repairs(db: &DatabaseConnection) -> AppResult<Vec<(String, CalculationRepair)>> {
+    use crate::routes::private::reprocessing_jobs::models::job;
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    use sea_orm::sea_query::ExprTrait as _;
+
+    let calculation = || Expr::col(job::Column::Params).cast_json_field("calculation");
+    let runs = job::Entity::find()
+        .filter(job::Column::TriggerType.eq("event_recompute"))
+        .filter(calculation().is_not_null())
+        .order_by_desc(job::Column::CreatedAt)
+        .all(db)
+        .await?;
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for run in runs {
+        let Some(tool) = run.params.get("calculation").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if seen.iter().any(|s| s == tool) {
+            continue;
+        }
+        seen.push(tool.to_string());
+        if let Some(state) =
+            crate::routes::private::collection_events::service::calculation_repair(Some(
+                &run.status,
+            ))
+        {
+            out.push((
+                tool.to_string(),
+                CalculationRepair {
+                    job_id: run.id,
+                    state: state.to_string(),
+                },
+            ));
+        }
+    }
     Ok(out)
 }
 
@@ -4121,39 +4137,44 @@ pub async fn mint_formula_version<C: ConnectionTrait>(
 
     check_manifest_codes_resolve(db, &calculation.name, &manifest).await?;
 
-    if let Some(existing) = db
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT id FROM tool_script_versions \
-              WHERE tool_script_id = $1 AND content_hash = $2",
-            [script_id.into(), content_hash.clone().into()],
-        ))
+    if let Some(existing) = version_entity::Entity::find()
+        .filter(version_entity::Column::ToolScriptId.eq(script_id))
+        .filter(version_entity::Column::ContentHash.eq(content_hash.clone()))
+        .one(db)
         .await?
     {
-        let id: Uuid = existing.try_get("", "id")?;
-        if calculation.active_version_id != Some(id) {
-            activate(db, script_id, calculation.active_version_id, id, actor).await?;
+        if calculation.active_version_id != Some(existing.id) {
+            activate(
+                db,
+                script_id,
+                calculation.active_version_id,
+                existing.id,
+                actor,
+            )
+            .await?;
         }
-        return Ok(Some(id));
+        return Ok(Some(existing.id));
     }
 
+    let latest: Option<i32> = latest_version_no_query(script_id)
+        .into_tuple()
+        .one(db)
+        .await?
+        .flatten();
     let version_id = Uuid::new_v4();
-    db.execute_raw(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "INSERT INTO tool_script_versions \
-             (id, tool_script_id, version_no, script, entry_function, manifest, content_hash, \
-              created_by, validated_at) \
-         SELECT $1, $2, COALESCE(MAX(version_no), 0) + 1, $3, 'formula', $4, $5, $6, now() \
-           FROM tool_script_versions WHERE tool_script_id = $2",
-        [
-            version_id.into(),
-            script_id.into(),
-            body.into(),
-            manifest.into(),
-            content_hash.into(),
-            actor.map(str::to_string).into(),
-        ],
-    ))
+    version_entity::ActiveModel {
+        id: Set(version_id),
+        tool_script_id: Set(script_id),
+        version_no: Set(next_version_no(latest)),
+        script: Set(body),
+        entry_function: Set("formula".to_string()),
+        manifest: Set(manifest),
+        content_hash: Set(content_hash),
+        created_by: Set(actor.map(str::to_string)),
+        validated_at: Set(Some(chrono::Utc::now())),
+        ..Default::default()
+    }
+    .insert(db)
     .await?;
     activate(
         db,
@@ -4164,6 +4185,20 @@ pub async fn mint_formula_version<C: ConnectionTrait>(
     )
     .await?;
     Ok(Some(version_id))
+}
+
+/// The highest `version_no` a calculation holds, NULL when it holds none.
+pub(super) fn latest_version_no_query(script_id: Uuid) -> sea_orm::Select<version_entity::Entity> {
+    version_entity::Entity::find()
+        .select_only()
+        .column_as(version_entity::Column::VersionNo.max(), "latest")
+        .filter(version_entity::Column::ToolScriptId.eq(script_id))
+}
+
+/// The `version_no` a new version takes after the calculation's latest.
+#[must_use]
+pub fn next_version_no(latest: Option<i32>) -> i32 {
+    latest.unwrap_or(0) + 1
 }
 
 /// What a set-level save does to one formula of the set it was given.
@@ -4240,6 +4275,94 @@ pub fn plan_formula_set(
         }
     }));
     Ok(writes)
+}
+
+/// The shared steps a set save takes back as its own: each formula the payload names by id that
+/// this calculation declares. `declared` is (formula id, declaring calculation's name) for every
+/// declaration of a formula the payload names.
+///
+/// # Errors
+/// A step another calculation still declares, naming that calculation.
+pub fn steps_taken_back(
+    calculation: &str,
+    payload_ids: &[Uuid],
+    declared: &[(Uuid, String)],
+) -> Result<Vec<Uuid>, String> {
+    let mut taken = Vec::new();
+    for id in payload_ids {
+        let readers: Vec<&str> = declared
+            .iter()
+            .filter(|(formula_id, _)| formula_id == id)
+            .map(|(_, name)| name.as_str())
+            .collect();
+        if !readers.contains(&calculation) {
+            continue;
+        }
+        let others: Vec<&str> = readers.into_iter().filter(|r| *r != calculation).collect();
+        if !others.is_empty() {
+            return Err(format!(
+                "formula {id} is a shared step {} also reads; it stays shared until only this \
+                 calculation reads it",
+                others.join(", ")
+            ));
+        }
+        taken.push(*id);
+    }
+    Ok(taken)
+}
+
+/// Make each shared step the set names, and only this calculation declares, the calculation's own
+/// again: its owner is set and its declaration goes, so the save that follows updates it in place.
+///
+/// # Errors
+/// A step another calculation still reads, or a database error.
+pub async fn take_back_steps<C: ConnectionTrait>(
+    db: &C,
+    script_id: Uuid,
+    name: &str,
+    payload_ids: &[Uuid],
+) -> AppResult<()> {
+    use crate::routes::private::derived_parameters::models::{definition, shared_step};
+
+    if payload_ids.is_empty() {
+        return Ok(());
+    }
+    let declarations = shared_step::Entity::find()
+        .filter(shared_step::Column::FormulaId.is_in(payload_ids.to_vec()))
+        .all(db)
+        .await?;
+    if declarations.is_empty() {
+        return Ok(());
+    }
+    let names: HashMap<Uuid, String> = script::Entity::find()
+        .filter(script::Column::Id.is_in(declarations.iter().map(|d| d.tool_script_id)))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|s| (s.id, s.name))
+        .collect();
+    let declared: Vec<(Uuid, String)> = declarations
+        .iter()
+        .filter_map(|d| names.get(&d.tool_script_id).map(|n| (d.formula_id, n.clone())))
+        .collect();
+    let taken = steps_taken_back(name, payload_ids, &declared).map_err(AppError::BadRequest)?;
+    if taken.is_empty() {
+        return Ok(());
+    }
+    shared_step::Entity::delete_many()
+        .filter(shared_step::Column::ToolScriptId.eq(script_id))
+        .filter(shared_step::Column::FormulaId.is_in(taken.clone()))
+        .exec(db)
+        .await?;
+    definition::Entity::update_many()
+        .col_expr(
+            definition::Column::ToolScriptId,
+            sea_orm::sea_query::Expr::value(Some(script_id)),
+        )
+        .filter(definition::Column::Id.is_in(taken))
+        .exec(db)
+        .await?;
+    Ok(())
 }
 
 /// Refuse a set whose new codes other calculations already hold, naming each code and its holder.

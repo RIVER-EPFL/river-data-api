@@ -3982,7 +3982,7 @@ pub(super) fn authorise(auth: &AuthContext, option: EditOption) -> AppResult<()>
 
 /// What every edit owes after its transaction commits, forward or inverted: the rollups over the
 /// span it moved, and the calculations at the visits it touched.
-pub(super) async fn propagate(state: &AppState, recorded: &Recorded, actor: &str) -> AppResult<()> {
+pub(crate) async fn propagate(state: &AppState, recorded: &Recorded, actor: &str) -> AppResult<()> {
     if let Some((lo, hi)) = recorded.span
         && let Err(e) = crate::common::aggregates::refresh(
             &state.db,

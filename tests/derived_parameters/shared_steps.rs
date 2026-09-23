@@ -418,3 +418,139 @@ async fn a_step_shared_with_a_visit_calculation_computes_on_the_stream_too() {
         "the declared step evaluated inside the stream set"
     );
 }
+
+/// Correcting a shared step changes what every calculation that declares it computes, so each of
+/// them is re-pinned to a version holding the correction.
+#[tokio::test]
+#[serial]
+async fn correcting_a_shared_step_mints_a_version_for_each_declaring_calculation() {
+    let (db, app, token) = setup().await;
+    let first = calculation(&db, "corrected_first").await;
+    let second = calculation(&db, "corrected_second").await;
+
+    let step = post(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": "typo_step", "name": "Typo step", "units": "uM",
+            "formula": "Dissolved_O2 * 2", "tool_script_id": first,
+            "ordinal": 0, "intermediate": true,
+        }),
+        &token,
+    )
+    .await;
+    post(
+        &app,
+        "/api/calculation_shared_steps",
+        &json!({ "tool_script_id": second, "formula_id": id_of(&step) }),
+        &token,
+    )
+    .await;
+
+    let active = |calculation: String| {
+        let db = db.clone();
+        async move {
+            crate::common::e2e::scalar(
+                &db,
+                &format!(
+                    "SELECT COALESCE(active_version_id::text, 'none') \
+                       FROM tool_scripts WHERE id = '{calculation}'"
+                ),
+            )
+            .await
+        }
+    };
+    let before = (active(first.clone()).await, active(second.clone()).await);
+
+    let (status, raw) = put_json_with_token(
+        &app,
+        &format!("/api/derived_parameters/{}", id_of(&step)),
+        &json!({ "formula": "Dissolved_O2 * 3" }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "({status}): {raw}");
+
+    for (calculation, was) in [(first, before.0), (second, before.1)] {
+        let now = active(calculation.clone()).await;
+        assert_ne!(now, was, "{calculation} is re-pinned");
+        let body = crate::common::e2e::scalar(
+            &db,
+            &format!("SELECT script FROM tool_script_versions WHERE id::text = '{now}'"),
+        )
+        .await;
+        assert!(
+            body.contains("Dissolved_O2 * 3"),
+            "the version {calculation} runs holds the correction: {body}"
+        );
+    }
+}
+
+/// A shared step the other calculation stopped reading is saved back into the set of the one
+/// still reading it, as a step of its own; while another calculation reads it, it stays shared.
+#[tokio::test]
+#[serial]
+async fn a_shared_step_read_by_one_calculation_is_taken_back_into_its_set() {
+    let (db, app, token) = setup().await;
+    let first = calculation(&db, "keeping_set").await;
+    let second = calculation(&db, "leaving_set").await;
+
+    let step = post(
+        &app,
+        "/api/derived_parameters",
+        &json!({
+            "code": "water_k", "name": "Water K", "units": "K",
+            "formula": "Dissolved_O2 + 273.15", "tool_script_id": first,
+            "ordinal": 0, "intermediate": true,
+        }),
+        &token,
+    )
+    .await;
+    let step_id = id_of(&step);
+    let declaration = post(
+        &app,
+        "/api/calculation_shared_steps",
+        &json!({ "tool_script_id": second, "formula_id": step_id }),
+        &token,
+    )
+    .await;
+
+    let set = json!([
+        { "id": step_id, "code": "water_k", "units": "K",
+          "formula": "Dissolved_O2 + 273.15", "ordinal": 0, "intermediate": true },
+        { "code": "kept_out", "units": "K", "formula": "water_k * 2", "ordinal": 1 },
+    ]);
+    let (status, refused) =
+        crate::common::save_formula_set(&app, &token, &first, set.clone()).await;
+    assert_eq!(status, 400, "another calculation still reads it: {refused}");
+    assert!(refused.contains("leaving_set"), "{refused}");
+
+    let (status, raw) = crate::common::delete_with_token(
+        &app,
+        &format!("/api/calculation_shared_steps/{}", id_of(&declaration)),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "({status}): {raw}");
+
+    let (status, saved) = crate::common::save_formula_set(&app, &token, &first, set).await;
+    assert_eq!(status, 200, "{saved}");
+
+    let owner = crate::common::e2e::scalar(
+        &db,
+        &format!(
+            "SELECT COALESCE(tool_script_id::text, 'none') FROM calculation_formulas \
+              WHERE id = '{step_id}'"
+        ),
+    )
+    .await;
+    assert_eq!(owner, first, "the step is the calculation's own again, under its id");
+    let declared = crate::common::e2e::scalar(
+        &db,
+        &format!(
+            "SELECT count(*)::text FROM calculation_shared_steps WHERE formula_id = '{step_id}'"
+        ),
+    )
+    .await;
+    assert_eq!(declared, "0", "and nothing declares it");
+}

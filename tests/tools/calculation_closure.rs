@@ -489,6 +489,46 @@ async fn the_health_of_a_calculation_counts_its_open_findings_and_their_visits()
     let b = of("closure_b");
     assert_eq!(b["stale_visits"], 1);
     assert_eq!(b["skipped_outputs"], 1);
+    assert!(b["repair"].is_null(), "no recompute ran for it: {b}");
+
+    // closure_a's recompute failed after an earlier one completed; closure_c's failed after
+    // clearing every finding, so it has no finding to be listed by.
+    let job = |calculation: &str, status: &str, age: &str| {
+        let id = uuid::Uuid::new_v4();
+        (
+            id,
+            format!(
+                "INSERT INTO reprocessing_jobs \
+                   (id, trigger_type, status, category, params, created_at, next_attempt_at) \
+                 VALUES ('{id}', 'event_recompute', '{status}', 'operator', \
+                         '{{\"calculation\": \"{calculation}\"}}'::jsonb, \
+                         NOW() - interval '{age}', NOW())"
+            ),
+        )
+    };
+    let (_, earlier) = job("closure_a", "completed", "2 hours");
+    let (failed_a, latest) = job("closure_a", "failed", "1 hour");
+    let (failed_c, cleared) = job("closure_c", "failed", "1 hour");
+    for sql in [earlier, latest, cleared] {
+        crate::common::exec(&db, &sql).await;
+    }
+    let (status, body) =
+        crate::common::get_json_with_token(&app, "/api/calculations/health", &token).await;
+    assert_eq!(status, 200, "{body}");
+    let rows = body.as_array().expect("a list");
+    let of = |name: &str| {
+        rows.iter()
+            .find(|r| r["tool"] == name)
+            .unwrap_or_else(|| panic!("{name} is listed: {body}"))
+            .clone()
+    };
+    let a = of("closure_a");
+    assert_eq!(a["repair"]["state"], "failed", "{a}");
+    assert_eq!(a["repair"]["job_id"], failed_a.to_string(), "{a}");
+    let c = of("closure_c");
+    assert_eq!(c["stale_visits"], 0);
+    assert_eq!(c["repair"]["state"], "failed", "{c}");
+    assert_eq!(c["repair"]["job_id"], failed_c.to_string(), "{c}");
 }
 
 /// Scenario: an administrator is about to correct a molar weight and asks where it is used. The

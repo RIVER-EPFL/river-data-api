@@ -2232,7 +2232,7 @@ pub(super) async fn rule_on_entry(
             "remediated",
         )
     };
-    let decided = crate::common::bulk_write::guarded(&state.db, async |txn| {
+    let recorded = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let recorded = record_many(
             txn,
             kind,
@@ -2276,12 +2276,16 @@ pub(super) async fn rule_on_entry(
             .filter(hold_model::Column::Id.eq(id))
             .exec(txn)
             .await?;
-        Ok(recorded.rows)
+        Ok(recorded)
     })
     .await?;
+    // A ruling moves what the visit's calculations read and what the rollups hold, as any other
+    // curation decision does.
+    crate::routes::private::readings::service::propagate(state, &recorded, by).await?;
+    state.response_cache.invalidate_all();
     Ok(Json(ResolveHoldResponse {
         status: status.to_string(),
-        samples_affected: Some(i64::try_from(decided).unwrap_or(i64::MAX)),
+        samples_affected: Some(i64::try_from(recorded.rows).unwrap_or(i64::MAX)),
     }))
 }
 

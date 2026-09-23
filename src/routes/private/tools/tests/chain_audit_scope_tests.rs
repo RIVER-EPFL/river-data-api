@@ -1,5 +1,5 @@
 use crate::routes::private::collection_events::service::PORTAL_SYNC;
-use crate::routes::private::tools::flows::audit_event_set;
+use crate::routes::private::tools::flows::{audit_event_set, audit_report_scope};
 use uuid::Uuid;
 
 /// A synced visit is the portal's and the repair refuses one (Q41), so every scope excludes it
@@ -92,5 +92,23 @@ fn a_content_scope_correlates_the_subquery_to_the_visit() {
             .contains(r#""r"."collection_event_id" = "collection_events"."id""#),
         "{}",
         statement.sql
+    );
+}
+
+/// An audit an activation enqueues carries only the calculation, so the report says so rather than
+/// reading as an audit over every visit.
+#[test]
+fn an_audit_report_names_every_scope_it_ran_under() {
+    let only_calculation = audit_report_scope(None, None, None, Some("pco2")).to_value();
+    assert_eq!(
+        only_calculation["scope"],
+        serde_json::json!({ "calculation": "pco2" })
+    );
+
+    let site = Uuid::new_v4();
+    let both = audit_report_scope(None, Some(site), Some("xO2"), Some("pco2")).to_value();
+    assert_eq!(
+        both["scope"],
+        serde_json::json!({ "site_id": site.to_string(), "constant": "xO2", "calculation": "pco2" })
     );
 }

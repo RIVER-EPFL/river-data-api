@@ -143,3 +143,49 @@ mod the_arm_a_slot_is_filled_on {
         }
     }
 }
+
+/// Scenario: the audit reports on a visit whose calculation publishes to a detached slot, a
+/// high-cadence slot and a low-cadence one.
+///
+/// Expected behaviour: it compares only the slot the chain would write, so every finding it
+/// raises is one a recompute can act on.
+mod the_outputs_an_audit_compares {
+    use crate::routes::private::readings::models::Owner;
+    use crate::routes::private::tools::flows::outputs_audited;
+    use uuid::Uuid;
+
+    #[test]
+    fn the_audit_compares_what_the_chain_writes_and_nothing_else() {
+        let (detached, streamed, visit, minted) = (
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            Uuid::from_u128(3),
+            Uuid::from_u128(4),
+        );
+        let audited = outputs_audited(vec![
+            (
+                "a".to_string(),
+                detached,
+                Owner::Manual,
+                Some("low".to_string()),
+            ),
+            (
+                "b".to_string(),
+                streamed,
+                Owner::Tool,
+                Some("high".to_string()),
+            ),
+            ("c".to_string(), visit, Owner::Tool, Some("low".to_string())),
+            ("d".to_string(), minted, Owner::Tool, None),
+        ]);
+        assert_eq!(
+            audited,
+            vec![("c".to_string(), visit), ("d".to_string(), minted)]
+        );
+    }
+
+    #[test]
+    fn no_outputs_audit_nothing() {
+        assert!(outputs_audited(Vec::new()).is_empty());
+    }
+}

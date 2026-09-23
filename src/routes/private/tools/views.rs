@@ -36,7 +36,7 @@ use super::service::{
     find_active_tool, formula_codes_held_elsewhere, lint_script, list_active_tools,
     load_parameter_catalog, load_script, load_version, manifest_finding, manifest_json,
     mint_formula_version, normalise_name, plan_formula_set, render, replicated_for,
-    run_stored_cases, run_tool_body, runner_runtime, stored_version_content,
+    run_stored_cases, run_tool_body, runner_runtime, stored_version_content, take_back_steps,
 };
 use crate::common::AppState;
 use crate::common::middleware::AuthContext;
@@ -883,6 +883,9 @@ pub async fn save_formula_set(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Tool script {id} not found")))?;
     let superseded = current.active_version_id;
+
+    let payload_ids: Vec<Uuid> = payload.formulas.iter().filter_map(|f| f.id).collect();
+    take_back_steps(&txn, id, &script.name, &payload_ids).await?;
 
     let before = formula_entity::Entity::find()
         .filter(formula_entity::Column::ToolScriptId.eq(id))

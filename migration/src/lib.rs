@@ -29,6 +29,7 @@ mod m20260922_000004_site_parameter_cadence;
 mod m20260922_000005_decision_version_index;
 mod m20260922_000006_drop_slot_units;
 mod m20260922_000007_source_alignment;
+mod m20260923_000001_reraise_unverified_entries;
 
 pub struct Migrator;
 
@@ -78,6 +79,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260922_000005_decision_version_index::Migration),
             Box::new(m20260922_000006_drop_slot_units::Migration),
             Box::new(m20260922_000007_source_alignment::Migration),
+            Box::new(m20260923_000001_reraise_unverified_entries::Migration),
         ]
     }
 }

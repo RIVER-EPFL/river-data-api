@@ -599,7 +599,7 @@ async fn seed_group_calculation(db: &sea_orm::DatabaseConnection, name: &str) {
                (id, tool_script_id, version_no, script, entry_function, manifest, test_cases, \
                 content_hash, created_by) \
              VALUES ('00000000-0000-4000-d000-0000000000a2', \
-                     '00000000-0000-4000-d000-0000000000a1', 1, '', 'tool', \
+                     '00000000-0000-4000-d000-0000000000a1', 1, '[]', 'formula', \
                      '{manifest}'::jsonb, '[]'::jsonb, 'seed-{name}', 'test')"
         ),
     )

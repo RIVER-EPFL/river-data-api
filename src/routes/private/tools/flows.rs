@@ -247,6 +247,52 @@ pub fn output_skip_reason(
     None
 }
 
+/// The outputs an audit compares at a visit: the ones [`output_skip_reason`] lets the chain write,
+/// so every finding raised is one a recompute can act on.
+#[must_use]
+pub fn outputs_audited(
+    outputs: Vec<(
+        String,
+        Uuid,
+        crate::routes::private::readings::models::Owner,
+        Option<String>,
+    )>,
+) -> Vec<(String, Uuid)> {
+    outputs
+        .into_iter()
+        .filter(|(key, _, owner, cadence)| {
+            output_skip_reason(key, *owner, cadence.as_deref()).is_none()
+        })
+        .map(|(key, parameter_id, _, _)| (key, parameter_id))
+        .collect()
+}
+
+/// [`outputs_audited`] over what the store says of each slot at this visit.
+async fn outputs_audited_at(
+    db: &DatabaseConnection,
+    event: &EventContext,
+    outputs: &[(String, Uuid)],
+) -> AppResult<Vec<(String, Uuid)>> {
+    let mut judged = Vec::with_capacity(outputs.len());
+    for (key, parameter_id) in outputs {
+        let owner = crate::routes::private::readings::service::output_owner(
+            db,
+            event.site_id,
+            *parameter_id,
+            event.collected_at,
+        )
+        .await?;
+        let cadence = crate::routes::private::site_parameters::service::slot_cadence(
+            db,
+            event.site_id,
+            *parameter_id,
+        )
+        .await?;
+        judged.push((key.clone(), *parameter_id, owner, cadence));
+    }
+    Ok(outputs_audited(judged))
+}
+
 /// The catalog ids of the parameters a calculation reads at a visit, for the applicability test.
 /// A code the catalog does not hold resolves to nothing and is left out: it is a read the site
 /// cannot declare, and `resolve_run` reports it as the skip it is.
@@ -900,7 +946,7 @@ async fn walk_event(
         outcome.readings_written += saved.0.inserted;
         // The value the finding reported is gone: the finding is closed by the repair itself,
         // not left for the next audit to notice.
-        for (_, parameter_id) in &saved_outputs {
+        for (_, parameter_id) in &owned_outputs {
             outcome.findings_closed +=
                 supersede_findings(&state.db, &event, *parameter_id).await? as usize;
         }
@@ -1136,6 +1182,14 @@ async fn supersede(db: &DatabaseConnection, condition: sea_orm::Condition) -> Ap
     Ok(res.rows_affected)
 }
 
+/// The kinds a slot's value answers: what the audit and the chain report about a calculation's
+/// output. An entry awaiting a manager's ruling is not among them.
+const FINDING_KINDS: [HoldKind; 3] = [
+    HoldKind::MissingOutput,
+    HoldKind::StaleOutput,
+    HoldKind::SkippedOutput,
+];
+
 /// Close open findings for slots the current audit found in agreement (or now populated).
 pub(super) async fn supersede_findings(
     db: &DatabaseConnection,
@@ -1144,9 +1198,12 @@ pub(super) async fn supersede_findings(
 ) -> AppResult<u64> {
     supersede(
         db,
-        hold_model::in_status(
-            hold_model::slot(event.site_id, parameter_id, event.collected_at),
-            HoldStatus::Pending,
+        hold_model::of_kinds(
+            hold_model::in_status(
+                hold_model::slot(event.site_id, parameter_id, event.collected_at),
+                HoldStatus::Pending,
+            ),
+            &FINDING_KINDS,
         ),
     )
     .await
@@ -1384,6 +1441,9 @@ pub async fn audit_event(
         if !applies_at_site(&read_inputs(tool, catalog), &saved_outputs, &declared) {
             continue;
         }
+        // The report covers what the repair covers: a detached slot is the operator's and a
+        // high-cadence one the stream engine's, so neither is compared here.
+        let saved_outputs = outputs_audited_at(&state.db, event, &saved_outputs).await?;
 
         let prior = blob_at_event(&state.db, event, &tool.name).await?;
         if let Some(blob) = prior {
@@ -1398,7 +1458,24 @@ pub async fn audit_event(
             let outcome = match run_active_tool(state, &pinned, &body_bytes).await {
                 Ok(o) => o,
                 Err(e) => match skip_reason(&e) {
-                    Some(_) => continue,
+                    // What this run stored no longer resolves (an input rejected or withdrawn
+                    // since), so the stored value is reported as standing on a run that cannot
+                    // happen, never left unmentioned.
+                    Some(reason) => {
+                        for (output, parameter_id) in &saved_outputs {
+                            raise_skip(
+                                &state.db,
+                                event,
+                                &tool.name,
+                                output,
+                                *parameter_id,
+                                &reason,
+                            )
+                            .await?;
+                            counts.skipped += 1;
+                        }
+                        continue;
+                    }
                     None => return Err(e),
                 },
             };
@@ -1432,6 +1509,9 @@ pub async fn audit_event(
                 else {
                     continue;
                 };
+                if !saved_outputs.iter().any(|(_, p)| *p == parameter_id) {
+                    continue;
+                }
                 let stored =
                     served_spot_value(&state.db, event.site_id, parameter_id, event.collected_at)
                         .await?;
@@ -1510,7 +1590,19 @@ pub async fn audit_event(
                         )
                         .await?;
                     }
-                    _ => {}
+                    // The value stands on a run that no longer produces it (an input rejected or
+                    // withdrawn since), so it is reported rather than passed over.
+                    (Some(_), None) => {
+                        let reason =
+                            skipped_reason(&outcome.skipped, output).unwrap_or_else(|| {
+                                "the visit no longer holds what this output was computed from"
+                                    .to_string()
+                            });
+                        raise_skip(&state.db, event, &tool.name, output, parameter_id, &reason)
+                            .await?;
+                        counts.skipped += 1;
+                    }
+                    (None, None) => {}
                 }
             }
         } else if inputs_exist(state, tool, event).await? {
@@ -1716,6 +1808,21 @@ fn pending_inputs_at(site_id: Uuid, collected_at: chrono::DateTime<chrono::Utc>)
     )
 }
 
+/// What one audit run covered, as its job report states it: each scope it was given, in the order
+/// [`audit_event_set`] takes them.
+pub(super) fn audit_report_scope(
+    event_id: Option<Uuid>,
+    site_id: Option<Uuid>,
+    constant: Option<&str>,
+    calculation: Option<&str>,
+) -> JobReport {
+    JobReport::new()
+        .scope_opt("site_id", site_id.map(|id| id.to_string()))
+        .scope_opt("collection_event_id", event_id.map(|id| id.to_string()))
+        .scope_opt("constant", constant)
+        .scope_opt("calculation", calculation)
+}
+
 /// The events one audit run covers, most specific scope first. A `constant` or `calculation` scope
 /// narrows to the visits whose stored provenance names it, so editing one audits what that edit
 /// could have changed rather than every visit ever recorded; a visit where the tool never ran
@@ -1831,6 +1938,7 @@ impl Job for EventAudit {
             events_audited: 0,
             missing: 0,
             stale: 0,
+            skipped: 0,
             superseded: 0,
         };
         for (walked, row) in event_rows.iter().enumerate() {
@@ -1846,22 +1954,26 @@ impl Job for EventAudit {
         }
 
         ctx.info(&format!(
-            "Audited {} visits: {} missing outputs, {} stale, {} findings superseded",
-            counts.events_audited, counts.missing, counts.stale, counts.superseded
+            "Audited {} visits: {} missing outputs, {} stale, {} that no longer run, {} findings \
+             superseded",
+            counts.events_audited, counts.missing, counts.stale, counts.skipped, counts.superseded
         ))
         .await;
         ctx.report(
-            JobReport::new()
-                .scope_opt("site_id", site_id.map(|id| id.to_string()))
-                .scope_opt("collection_event_id", event_id.map(|id| id.to_string()))
-                .scope_opt("constant", constant.clone())
-                .count("events_audited", counts.events_audited)
-                .count("missing_findings", counts.missing)
-                .count("stale_findings", counts.stale)
-                .count("superseded", counts.superseded),
+            audit_report_scope(
+                event_id,
+                site_id,
+                constant.as_deref(),
+                calculation.as_deref(),
+            )
+            .count("events_audited", counts.events_audited)
+            .count("missing_findings", counts.missing)
+            .count("stale_findings", counts.stale)
+            .count("skipped_findings", counts.skipped)
+            .count("superseded", counts.superseded),
         )
         .await;
-        Ok(i64::try_from(counts.missing + counts.stale).unwrap_or(i64::MAX))
+        Ok(i64::try_from(counts.missing + counts.stale + counts.skipped).unwrap_or(i64::MAX))
     }
 }
 

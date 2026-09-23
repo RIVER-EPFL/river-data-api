@@ -106,12 +106,14 @@ async fn seed_visit(db: &DatabaseConnection) -> Uuid {
     event_id
 }
 
-async fn declare_output_slot(db: &DatabaseConnection) {
+/// The output slot, on the arm `cadence` names: `low` is written at a visit, `high` by the stream
+/// engine.
+async fn declare_output_slot(db: &DatabaseConnection, cadence: &str) {
     exec(
         db,
-        "INSERT INTO site_parameters (site_id, parameter_id, name)
-         VALUES ($1::uuid, $2::uuid, 'Audit probe out')",
-        vec![SITE1_ID.into(), OUTPUT_PARAM_ID.into()],
+        "INSERT INTO site_parameters (site_id, parameter_id, name, cadence)
+         VALUES ($1::uuid, $2::uuid, 'Audit probe out', $3)",
+        vec![SITE1_ID.into(), OUTPUT_PARAM_ID.into(), cadence.into()],
     )
     .await;
 }
@@ -153,6 +155,7 @@ async fn audit(state: &river_db::common::AppState, event_id: Uuid) {
         events_audited: 0,
         missing: 0,
         stale: 0,
+        skipped: 0,
         superseded: 0,
     };
     flows::audit_event(state, &event, &tools, &catalog, &order, &mut counts)
@@ -216,11 +219,65 @@ async fn a_calculation_whose_inputs_the_site_lacks_raises_no_finding() {
 #[serial]
 async fn the_same_calculation_reports_its_absent_output_where_the_site_declared_the_slot() {
     let (db, state, event_id) = setup().await;
-    declare_output_slot(&db).await;
+    declare_output_slot(&db, "low").await;
     audit(&state, event_id).await;
     assert_eq!(
         findings_on_output(&db).await,
         1,
         "the input is there and the output is not, which is the finding"
     );
+}
+
+/// Scenario: the site declares the output slot high cadence, so its stream fills it and the chain
+/// never writes it at a visit.
+///
+/// Expected behaviour: the audit reports nothing a recompute would refuse to act on.
+#[tokio::test]
+#[serial]
+async fn an_output_on_a_high_cadence_slot_raises_no_finding() {
+    let (db, state, event_id) = setup().await;
+    declare_output_slot(&db, "high").await;
+    audit(&state, event_id).await;
+    assert_eq!(findings_on_output(&db).await, 0);
+}
+
+/// Scenario: an admin detached the output slot at the visit, so the value there is the
+/// operator's.
+///
+/// Expected behaviour: the audit reports nothing on it.
+#[tokio::test]
+#[serial]
+async fn an_output_on_a_detached_slot_raises_no_finding() {
+    let (db, state, event_id) = setup().await;
+    declare_output_slot(&db, "low").await;
+    let stream_id = Uuid::new_v4();
+    exec(
+        &db,
+        "INSERT INTO data_streams (id, source_system, source_key, is_active)
+         VALUES ($1, 'grab_sample', $2, true)",
+        vec![stream_id.into(), format!("{SITE1_ID}:out").into()],
+    )
+    .await;
+    exec(
+        &db,
+        "INSERT INTO readings (stream_id, site_id, parameter_id, time, replicate_index,
+             raw_value, measurement_type)
+         VALUES ($1, $2::uuid, $3::uuid, $4::timestamptz, 0, 7.0, 'derived')",
+        vec![
+            stream_id.into(),
+            SITE1_ID.into(),
+            OUTPUT_PARAM_ID.into(),
+            EVENT_TIME.into(),
+        ],
+    )
+    .await;
+    exec(
+        &db,
+        "INSERT INTO reading_decisions (stream_id, time, replicate_index, kind, actor, origin)
+         VALUES ($1, $2::timestamptz, 0, 'detach', 'test', 'manual')",
+        vec![stream_id.into(), EVENT_TIME.into()],
+    )
+    .await;
+    audit(&state, event_id).await;
+    assert_eq!(findings_on_output(&db).await, 0);
 }

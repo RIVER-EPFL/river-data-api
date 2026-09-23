@@ -57,3 +57,18 @@ fn a_synced_visit_is_the_one_source_the_chain_stays_out_of() {
     // A source nobody writes today is not a reason to withhold the chain.
     assert!(chain_may_run("csv_import"));
 }
+
+#[test]
+fn test_a_calculation_shows_its_repair_while_it_runs_and_when_it_failed() {
+    assert_eq!(calculation_repair(Some("queued")), Some("queued"));
+    assert_eq!(calculation_repair(Some("retrying")), Some("queued"));
+    assert_eq!(calculation_repair(Some("running")), Some("running"));
+    assert_eq!(calculation_repair(Some("failed")), Some("failed"));
+}
+
+#[test]
+fn test_a_finished_or_absent_repair_leaves_the_findings_to_speak() {
+    assert_eq!(calculation_repair(Some("completed")), None);
+    assert_eq!(calculation_repair(Some("cancelled")), None);
+    assert_eq!(calculation_repair(None), None);
+}

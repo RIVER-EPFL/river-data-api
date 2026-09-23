@@ -1918,6 +1918,17 @@ pub struct CalculationHealth {
     pub missing_outputs: i64,
     pub stale_outputs: i64,
     pub skipped_outputs: i64,
+    /// The calculation's latest `event_recompute` run, while it is queued or running and when it
+    /// failed. Null once it completed, or when none ran.
+    pub repair: Option<CalculationRepair>,
+}
+
+/// A calculation's latest recompute run, named so its logs can be opened.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CalculationRepair {
+    pub job_id: Uuid,
+    /// `queued`, `running` or `failed`.
+    pub state: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2489,6 +2500,8 @@ pub struct AuditCounts {
     pub events_audited: usize,
     pub missing: usize,
     pub stale: usize,
+    /// Outputs stored by a run that no longer resolves.
+    pub skipped: usize,
     pub superseded: usize,
 }
 
