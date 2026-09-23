@@ -513,6 +513,25 @@ async fn verifying_the_last_pending_input_releases_the_output() {
         .try_get("", "c")
         .expect("count");
     assert_eq!(verified, 1, "the release is a decision on the record");
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sync/replicate_audit_holds/{hold}/reopen"),
+        &json!({}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        output_state(&db, &output_id).await,
+        vec![(8.0, true, false)],
+        "reopening the ruling returns the output to pending with its input"
+    );
+    assert_eq!(
+        pending_entry_holds(&db, &output_id).await,
+        1,
+        "and the output is back in the review queue"
+    );
 }
 
 /// The open review-queue row for the pending output.
@@ -648,5 +667,24 @@ async fn rejecting_an_input_withdraws_the_output_computed_from_it() {
         pending_entry_holds(&db, &output_id).await,
         0,
         "the withdrawn output leaves the review queue"
+    );
+
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sync/replicate_audit_holds/{hold}/reopen"),
+        &json!({}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        output_state(&db, &output_id).await,
+        vec![(8.0, true, false)],
+        "reopening the reject restores the output it withdrew, pending"
+    );
+    assert_eq!(
+        pending_entry_holds(&db, &output_id).await,
+        1,
+        "and the output is back in the review queue"
     );
 }

@@ -29,3 +29,4 @@ mod plan_review_progress;
 mod replicate_audit;
 mod replicate_flag_indexes;
 mod routes_surface;
+mod verification_reopen;

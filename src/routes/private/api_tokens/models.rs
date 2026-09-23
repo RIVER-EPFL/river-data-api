@@ -51,6 +51,8 @@ pub struct Model {
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     #[crudcrate(exclude(create, update), sortable)]
     pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The caller who created the row, stamped from the request; an update naming it is refused.
+    #[crudcrate(exclude(create), on_create = crate::common::actor::current().unwrap_or_default())]
     pub created_by: Option<String>,
     /// The one-time secret, populated only in the create/rotate response. Never stored.
     #[sea_orm(ignore)]

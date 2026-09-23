@@ -687,13 +687,24 @@ async fn the_export_carries_both_curve_references_in_json_and_csv() {
     );
 }
 
-/// `created_by` records who fitted the curve, so it is supplied on create like every other entity
-/// that carries it, and `r_squared` is the fit provenance of a value that has been published, so it
-/// is frozen alongside the coefficients once a reading references the curve.
+/// `created_by` is the caller who entered the curve, whatever the body names, and `r_squared` is
+/// the fit provenance of a value that has been published, so it is frozen alongside the
+/// coefficients once a reading references the curve.
 #[tokio::test]
 #[serial]
-async fn attribution_is_stored_on_create_and_the_fit_quality_freezes_with_the_coefficients() {
+async fn attribution_is_the_caller_and_the_fit_quality_freezes_with_the_coefficients() {
     let fx = setup().await;
+    let caller: String = fx
+        .db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT 'token:' || id::text AS caller FROM api_tokens",
+        ))
+        .await
+        .unwrap()
+        .expect("the seeded token")
+        .try_get("", "caller")
+        .unwrap();
     let sensor = create_sensor(&fx.db, "Microplate-06", GLOBAL_PARAM_TEMP_ID).await;
 
     let (status, created) = post_json_parse_with_token(
@@ -716,8 +727,8 @@ async fn attribution_is_stored_on_create_and_the_fit_quality_freezes_with_the_co
     );
     assert_eq!(
         created["created_by"].as_str(),
-        Some("lab.tech@epfl.ch"),
-        "the caller's attribution is stored, not dropped: {created}"
+        Some(caller.as_str()),
+        "the author is the caller, not the one the body named: {created}"
     );
     let curve: Uuid = created["id"]
         .as_str()
@@ -771,7 +782,7 @@ async fn attribution_is_stored_on_create_and_the_fit_quality_freezes_with_the_co
     .await;
     assert_eq!(
         status, 400,
-        "reassigning the attribution of an applied curve is refused: {body}"
+        "reassigning the attribution of a curve is refused: {body}"
     );
 
     let (status, served) =
@@ -784,7 +795,7 @@ async fn attribution_is_stored_on_create_and_the_fit_quality_freezes_with_the_co
     );
     assert_eq!(
         served["created_by"].as_str(),
-        Some("lab.tech@epfl.ch"),
+        Some(caller.as_str()),
         "the attribution is unchanged: {served}"
     );
 

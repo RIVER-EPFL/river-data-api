@@ -1,10 +1,12 @@
-//! The site lookup `/notes/register` makes before it upserts.
+//! The site lookup `/notes/register` makes before it upserts, and the hook the CRUD routes run.
 
+use crudcrate::{ApiError, CRUDOperations, CRUDResource};
 use sea_orm::sea_query::{Expr, ExprTrait, Func};
-use sea_orm::{ConnectionTrait, EntityTrait, QueryFilter};
+use sea_orm::{ConnectionTrait, EntityTrait, QueryFilter, TransactionTrait};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use super::models::Note;
 use crate::error::AppResult;
 use crate::routes::private::sites::models as sites;
 use crate::routes::private::sites::source_links;
@@ -39,4 +41,19 @@ pub async fn sites_by_station<C: ConnectionTrait>(
         }
     }
     Ok(resolved)
+}
+
+pub struct NoteOperations;
+
+impl CRUDOperations for NoteOperations {
+    type Resource = Note;
+
+    async fn before_update<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        _db: &C,
+        _id: Uuid,
+        data: &<Note as CRUDResource>::UpdateModel,
+    ) -> Result<(), ApiError> {
+        crate::common::actor::refuse_reattribution(data.created_by.is_some())
+    }
 }

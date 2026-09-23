@@ -22,15 +22,24 @@
 //! `pg_restore --disable-triggers` loads rows: the projection trigger on `reading_decisions` and
 //! the sample-statistics triggers on `readings` stay off and the columns they maintain are carried
 //! verbatim, so what the rebuilt database serves is what production served rather than a replay.
-//! It needs a role that may set that, which in practice means a superuser on the target.
+//! The exception is a sample whose readings did not all arrive: it is recomputed over the ones
+//! that did, and removed when none did, because its statistics describe replicates the rebuilt
+//! database does not hold. It needs a role that may set `session_replication_role`, which in
+//! practice means a superuser on the target.
 
 use std::collections::HashMap;
 
+use sea_orm::sea_query::{
+    Alias, Expr, Func, IntoIden, PostgresQueryBuilder, Query, SelectStatement, TableRef,
+};
 use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbErr, FromQueryResult, Statement,
-    TransactionTrait, Value,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait,
+    FromQueryResult, QueryFilter, QuerySelect, Statement, TransactionTrait, Value,
 };
 use uuid::Uuid;
+
+use crate::routes::private::readings::models as readings;
+use crate::routes::private::readings::samples::models as samples;
 
 /// Rows carried per statement. Each batch travels as one `jsonb` document.
 const BATCH: usize = 500;
@@ -289,10 +298,12 @@ pub struct Restored {
     pub projects_configured: usize,
     pub slots_exposed: usize,
     /// Rows the target has nowhere to put, because a reference it cannot do without does not
-    /// resolve there: by table, with the column that failed.
+    /// resolve there: by table, with the column that failed. A sample none of whose readings
+    /// arrived is removed and counted here too.
     pub refused: Vec<String>,
     /// One line per natural key the source holds and the target does not, per reference dropped,
-    /// and per id column this file does not know where to point.
+    /// per id column this file does not know where to point, and per sample recomputed because
+    /// only some of its readings arrived.
     pub unmatched: Vec<String>,
     /// Tables the source holds rows in that this cutover does not carry, with their row counts.
     /// The rebuild mints its own sites, parameters, streams and instruments, and the calculation
@@ -648,6 +659,125 @@ async fn move_public_settings<S: ConnectionTrait>(
 }
 
 #[derive(FromQueryResult)]
+struct Tally {
+    id: Uuid,
+    n: i64,
+}
+
+/// The carried samples whose readings did not all follow them, as target ids in order.
+#[derive(Debug, Default)]
+struct Unsettled {
+    /// None of its readings arrived.
+    empty: Vec<Uuid>,
+    /// Some of its readings arrived and some did not.
+    short: Vec<Uuid>,
+}
+
+/// Which of the `carried` samples (source id to target id) the readings left behind, from the
+/// readings each names in the source (`dumped`, by source id) and in the target (`landed`, by
+/// target id).
+fn unsettled(
+    carried: &HashMap<Uuid, Uuid>,
+    dumped: &HashMap<Uuid, i64>,
+    landed: &HashMap<Uuid, i64>,
+) -> Unsettled {
+    let mut found = Unsettled::default();
+    for (source, target) in carried {
+        let arrived = landed.get(target).copied().unwrap_or(0);
+        if arrived == 0 {
+            found.empty.push(*target);
+        } else if arrived != dumped.get(source).copied().unwrap_or(0) {
+            found.short.push(*target);
+        }
+    }
+    found.empty.sort_unstable();
+    found.short.sort_unstable();
+    found
+}
+
+/// Readings per sample id.
+async fn tally<T: ConnectionTrait>(db: &T) -> Result<HashMap<Uuid, i64>, DbErr> {
+    Ok(readings::Entity::find()
+        .select_only()
+        .column_as(readings::Column::SampleId, "id")
+        .column_as(readings::Column::SampleId.count(), "n")
+        .filter(readings::Column::SampleId.is_not_null())
+        .group_by(readings::Column::SampleId)
+        .into_model::<Tally>()
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| (row.id, row.n))
+        .collect())
+}
+
+/// The sample trigger's own recompute, run over each of `ids`.
+fn recompute_samples(ids: &[Uuid]) -> SelectStatement {
+    let id = Alias::new("id");
+    Query::select()
+        .expr(
+            Func::cust(Alias::new("refresh_sample_aggregate"))
+                .arg(Expr::col((id.clone(), id.clone()))),
+        )
+        .from(TableRef::FunctionCall(
+            Func::cust(Alias::new("unnest")).arg(Expr::val(ids.to_vec())),
+            id.into_iden(),
+        ))
+        .to_owned()
+}
+
+/// Bring every carried sample whose readings did not all arrive back to what the carried readings
+/// compute to: removed when none arrived, recomputed by the sample trigger's own function when
+/// some did. A sample whose readings all arrived keeps the statistics production served.
+async fn settle_samples<S: ConnectionTrait>(
+    source: &S,
+    target: &DatabaseTransaction,
+    carried: &HashMap<Uuid, Uuid>,
+    report: &mut Restored,
+) -> Result<(), DbErr> {
+    let dumped = tally(source).await?;
+    let landed = tally(target).await?;
+    let found = unsettled(carried, &dumped, &landed);
+    let mut removed = 0;
+    for chunk in found.empty.chunks(BATCH) {
+        let deleted = samples::Entity::delete_many()
+            .filter(samples::Column::Id.is_in(chunk.to_vec()))
+            .exec(target)
+            .await?
+            .rows_affected;
+        removed += usize::try_from(deleted).unwrap_or(0);
+    }
+    for _ in 0..removed {
+        report
+            .refused
+            .push("samples without a carried reading".to_string());
+    }
+    if let Some((_, rows)) = report
+        .carried
+        .iter_mut()
+        .find(|(name, _)| name == "samples")
+    {
+        *rows = rows.saturating_sub(removed);
+    }
+    if !found.short.is_empty() {
+        let (sql, values) = recompute_samples(&found.short).build(PostgresQueryBuilder);
+        target
+            .execute_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                sql,
+                values,
+            ))
+            .await?;
+        for id in &found.short {
+            report
+                .unmatched
+                .push(format!("samples.{id} recomputed over the readings carried"));
+        }
+    }
+    Ok(())
+}
+
+#[derive(FromQueryResult)]
 struct Named {
     name: String,
 }
@@ -747,6 +877,9 @@ pub async fn restore(
             .await?;
             maps.insert(table.table, map);
         }
+    }
+    if let Some(carried) = maps.get("samples") {
+        settle_samples(source, &transaction, carried, &mut report).await?;
     }
     report.not_carried = not_carried(source).await?;
     transaction.commit().await?;

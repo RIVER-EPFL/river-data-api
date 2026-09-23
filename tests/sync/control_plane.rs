@@ -5,9 +5,10 @@
 //! session token; the admin issue-command/revoke/list endpoints take an API token.
 //!
 //! Out of scope here: `POST /api/sync/credentials` and `/credentials/{id}/revoke` are `require_admin`
-//! (Keycloak Administrator only, no API token can pass, and the harness has no Keycloak), so
-//! credential minting is exercised via the `seed_sync_credentials` helper and the
-//! `revoke_service` path instead. The Keycloak-gated routes live in `e2e_keycloak_test.rs`.
+//! (Keycloak Administrator only, no API token can pass), so credential minting is exercised via
+//! the `seed_sync_credentials` helper and the `revoke_service` path instead. The one
+//! administrator route driven here is `PUT /api/sync_services/{id}`, under a profile covering
+//! Keycloak.
 //!
 //! Run: cargo test --test sync -- --test-threads=1
 
@@ -16,7 +17,7 @@ use river_db::routes::private::sync::models::events::SyncEvent;
 use river_db::routes::private::sync::models::services::SyncServiceUpdate;
 use river_db::routes::private::sync::models::services::{self, SyncService};
 use river_db::routes::private::sync::service::SyncServiceOperations;
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, Statement};
 use serial_test::serial;
 
 async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
@@ -184,7 +185,7 @@ async fn the_sync_cadence_is_set_by_an_operator_and_carried_on_the_heartbeat() {
     let (token, service_id) = crate::common::seed_sync_session_token(&db).await;
     let app = crate::common::build_test_app(db.clone());
 
-    // The cadence is set through the one URL the table has, `PATCH /api/sync_services/{id}`,
+    // The cadence is set through the one URL the table has, `PUT /api/sync_services/{id}`,
     // which is Keycloak-administrator only; the update is driven here so the floor and the
     // heartbeat that carries it are asserted without Keycloak.
     let set_cadence = async |secs: Option<i32>| {
@@ -255,6 +256,99 @@ async fn the_sync_cadence_is_set_by_an_operator_and_carried_on_the_heartbeat() {
         hb["sync_interval_secs"].is_null(),
         "clearing returns the service to its own configuration: {hb}"
     );
+}
+
+async fn heartbeat_interval(
+    app: &axum::Router,
+    token: &str,
+    service_id: uuid::Uuid,
+) -> serde_json::Value {
+    let (status, hb) = crate::common::post_json_parse_with_token(
+        app,
+        "/api/sync/heartbeat",
+        &serde_json::json!({"service_id": service_id, "status": "idle"}),
+        token,
+    )
+    .await;
+    assert_eq!(status, 200, "heartbeat ({status}): {hb}");
+    hb["sync_interval_secs"].clone()
+}
+
+#[tokio::test]
+#[serial]
+async fn an_administrator_sets_the_cadence_and_full_reassert_over_http() {
+    if !crate::common::profile::Service::Keycloak
+        .require("an_administrator_sets_the_cadence_and_full_reassert_over_http")
+        .await
+    {
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let (token, service_id) = crate::common::seed_sync_session_token(&db).await;
+    let app = crate::common::keycloak::build_test_app_with_keycloak(db.clone()).await;
+    let admin = crate::common::keycloak::get_keycloak_jwt("admin", "admin").await;
+    let uri = format!("/api/sync_services/{service_id}");
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &uri,
+        &serde_json::json!({"sync_interval_secs": 10}),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 400, "a cadence under the floor is refused: {body}");
+    assert!(
+        body.contains("at least 30"),
+        "the refusal names the floor: {body}"
+    );
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &uri,
+        &serde_json::json!({"sync_interval_secs": 3600}),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "set cadence ({status}): {body}");
+    assert_eq!(heartbeat_interval(&app, &token, service_id).await, 3600);
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &uri,
+        &serde_json::json!({"sync_interval_secs": null}),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "clear cadence ({status}): {body}");
+    assert!(heartbeat_interval(&app, &token, service_id).await.is_null());
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &uri,
+        &serde_json::json!({"full_reassert_enabled": false}),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "switch full re-assert ({status}): {body}");
+    let stored = services::Entity::find_by_id(service_id)
+        .one(&db)
+        .await
+        .expect("query")
+        .expect("service row");
+    assert!(
+        !stored.full_reassert_enabled,
+        "the switch is stored: {body}"
+    );
+
+    let (status, body) = crate::common::patch_json_with_token(
+        &app,
+        &uri,
+        &serde_json::json!({"sync_interval_secs": 3600}),
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 405, "the row route has no PATCH ({status}): {body}");
 }
 
 #[tokio::test]

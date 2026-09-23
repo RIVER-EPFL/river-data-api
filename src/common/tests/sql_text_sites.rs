@@ -18,15 +18,16 @@ const ALLOWED: &[(&str, usize, usize)] = &[
     ("src/common/served.rs", 4, 5),
     // The advisory lock serialising migrations across replicas.
     ("src/main.rs", 2, 0),
-    // The cutover binary's body.
-    ("src/restore.rs", 21, 0),
+    // The cutover binary's body, and the two function names its sample recompute calls
+    // (`refresh_sample_aggregate` over `unnest`).
+    ("src/restore.rs", 21, 2),
     // The health probe's `SELECT 1`; its two fragments are still to be rebuilt.
     ("src/routes/mod.rs", 1, 2),
     ("src/routes/private/alarms/service.rs", 1, 37),
     ("src/routes/private/alarms/views.rs", 1, 0),
     ("src/routes/private/api_tokens/views.rs", 1, 0),
     ("src/routes/private/collection_events/flows.rs", 0, 2),
-    ("src/routes/private/collection_events/service.rs", 4, 2),
+    ("src/routes/private/collection_events/service.rs", 2, 2),
     ("src/routes/private/collection_events/views.rs", 17, 5),
     ("src/routes/private/data_streams/service.rs", 1, 16),
     ("src/routes/private/data_streams/views.rs", 4, 0),
@@ -57,7 +58,7 @@ const ALLOWED: &[(&str, usize, usize)] = &[
     ("src/routes/private/sites/service.rs", 5, 9),
     ("src/routes/private/sites/views.rs", 3, 33),
     ("src/routes/private/standard_curves/views.rs", 1, 0),
-    ("src/routes/private/sync/service.rs", 6, 28),
+    ("src/routes/private/sync/service.rs", 6, 23),
     ("src/routes/private/sync/views.rs", 4, 2),
     ("src/routes/private/tools/flows.rs", 0, 5),
     ("src/routes/private/tools/models.rs", 0, 1),

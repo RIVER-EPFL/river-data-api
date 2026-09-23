@@ -2059,6 +2059,7 @@ async fn withdraw_visit_readings<C: sea_orm::ConnectionTrait>(
     visit_id: Uuid,
     by: &str,
     reason: &str,
+    set_id: Uuid,
 ) -> AppResult<u64> {
     use crate::routes::private::collection_events::flows::row;
     use crate::routes::private::readings::models::{Column, Kind, Origin};
@@ -2073,7 +2074,7 @@ async fn withdraw_visit_readings<C: sea_orm::ConnectionTrait>(
         by,
         Some(reason),
         Origin::Audit,
-        None,
+        Some(set_id),
     )
     .await?;
     Ok(rejected.rows)
@@ -2091,14 +2092,38 @@ async fn withdraw_visit<C: sea_orm::ConnectionTrait>(conn: &C, visit_id: Uuid) -
 }
 
 /// Close every measurement's hold at a visit with the visit's own ruling: once the field day is
-/// withdrawn, its entries have nothing left to rule on.
+/// withdrawn, its entries have nothing left to rule on. Returns the holds it closed.
 async fn close_entry_holds_at<C: sea_orm::ConnectionTrait>(
     conn: &C,
     site_id: Uuid,
     at: sea_orm::prelude::DateTimeWithTimeZone,
     status: &str,
     by: &str,
+) -> AppResult<Vec<Uuid>> {
+    let open: Vec<Uuid> = hold_model::Entity::find()
+        .select_only()
+        .column(hold_model::Column::Id)
+        .filter(hold_model::Column::Kind.eq(HoldKind::UnverifiedEntry.as_str()))
+        .filter(hold_model::Column::Status.is_in(HoldStatus::OPEN.map(HoldStatus::as_str)))
+        .filter(hold_model::Column::SiteId.eq(site_id))
+        .filter(hold_model::Column::GroupTime.eq(at))
+        .into_tuple()
+        .all(conn)
+        .await?;
+    close_holds(conn, &open, status, by).await?;
+    Ok(open)
+}
+
+/// Close the named holds with a ruling taken elsewhere.
+async fn close_holds<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    ids: &[Uuid],
+    status: &str,
+    by: &str,
 ) -> AppResult<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
     hold_model::Entity::update_many()
         .col_expr(hold_model::Column::Status, Expr::val(status))
         .col_expr(hold_model::Column::AcknowledgedBy, Expr::val(by))
@@ -2106,47 +2131,74 @@ async fn close_entry_holds_at<C: sea_orm::ConnectionTrait>(
             hold_model::Column::AcknowledgedAt,
             Expr::current_timestamp(),
         )
-        .filter(hold_model::Column::Kind.eq(HoldKind::UnverifiedEntry.as_str()))
-        .filter(hold_model::Column::Status.is_in(HoldStatus::OPEN.map(HoldStatus::as_str)))
-        .filter(hold_model::Column::SiteId.eq(site_id))
-        .filter(hold_model::Column::GroupTime.eq(at))
+        .filter(hold_model::Column::Id.is_in(ids.to_vec()))
         .exec(conn)
         .await?;
     Ok(())
 }
 
-/// Record the ruling on the hold, naming the visit it was about and how many readings moved with
-/// it.
-async fn decide_visit_hold<C: sea_orm::ConnectionTrait>(
+/// What a ruling on an intern's entry or field day recorded on its hold, which is what a reopen
+/// reverts: the decision set its readings moved under and the other holds it closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ruling {
+    pub mode: String,
+    pub by: String,
+    pub rows: u64,
+    pub set_id: Uuid,
+    #[serde(default)]
+    pub closed: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visit_id: Option<Uuid>,
+}
+
+impl Ruling {
+    /// The ruling a hold's resolution records, or `None` when it names no decision set (a ruling
+    /// taken before rulings recorded one, or a resolution that is not a ruling), which a reopen
+    /// cannot revert.
+    #[must_use]
+    pub fn read(resolution: Option<&serde_json::Value>) -> Option<Self> {
+        serde_json::from_value(resolution?.clone()).ok()
+    }
+}
+
+/// Record the ruling on its hold, stamped with the time it was taken.
+async fn decide_ruling<C: sea_orm::ConnectionTrait>(
     conn: &C,
     id: Uuid,
-    mode: &str,
     status: &str,
-    by: &str,
-    visit_id: Uuid,
-    withdrawn: u64,
+    ruling: &Ruling,
 ) -> AppResult<()> {
+    let mut record = serde_json::to_value(ruling).map_err(|e| AppError::Internal(e.to_string()))?;
+    record["at"] = Utc::now().to_rfc3339().into();
     hold_model::Entity::update_many()
         .col_expr(hold_model::Column::Status, Expr::val(status))
-        .col_expr(hold_model::Column::AcknowledgedBy, Expr::val(by))
-        .col_expr(hold_model::Column::AcknowledgedAt, Expr::cust("NOW()"))
         .col_expr(
-            hold_model::Column::Resolution,
-            Expr::cust_with_values(
-                "jsonb_build_object('mode', $1::text, 'by', $2::text, \
-                 'at', to_jsonb(NOW()), 'visit_id', $3::text, 'rows', $4::bigint)",
-                [
-                    sea_orm::Value::from(mode),
-                    sea_orm::Value::from(by),
-                    sea_orm::Value::from(visit_id.to_string()),
-                    sea_orm::Value::from(i64::try_from(withdrawn).unwrap_or(i64::MAX)),
-                ],
-            ),
+            hold_model::Column::AcknowledgedBy,
+            Expr::val(ruling.by.as_str()),
         )
+        .col_expr(
+            hold_model::Column::AcknowledgedAt,
+            Expr::current_timestamp(),
+        )
+        .col_expr(hold_model::Column::Resolution, Expr::value(record))
         .filter(hold_model::Column::Id.eq(id))
         .exec(conn)
         .await?;
     Ok(())
+}
+
+/// Open the decision set a ruling's readings move under, so a reopen can roll back exactly them.
+async fn open_ruling_set<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    verify: bool,
+    selection: &readings::models::Selection,
+    new: &serde_json::Value,
+    by: &str,
+    reason: &str,
+) -> AppResult<Uuid> {
+    use crate::routes::private::readings::models::Kind;
+    let kind = if verify { Kind::Verify } else { Kind::Reject };
+    readings::service::open_set(conn, kind, selection, new.clone(), by, Some(reason)).await
 }
 
 /// Rule on an intern's field day (Q177): `verify` says the visit should exist, `reject` withdraws
@@ -2187,16 +2239,35 @@ pub(super) async fn rule_on_visit(
     let verify = mode == "verify";
     let status = if verify { "acknowledged" } else { "remediated" };
     let withdrawn = crate::common::bulk_write::guarded(&state.db, async |txn| {
-        let withdrawn = if verify {
-            accept_visit(txn, visit.id).await?;
-            0
-        } else {
-            let rows = withdraw_visit_readings(txn, visit.id, by, &reason).await?;
-            withdraw_visit(txn, visit.id).await?;
-            close_entry_holds_at(txn, site_id, hold.group_time, status, by).await?;
-            rows
+        let selection = readings::models::Selection {
+            collection_event_id: Some(visit.id),
+            ..Default::default()
         };
-        decide_visit_hold(txn, id, mode, status, by, visit.id, withdrawn).await?;
+        let new = if verify {
+            serde_json::json!({ "unverified": false })
+        } else {
+            serde_json::json!({ "reason": reason.clone() })
+        };
+        let set_id = open_ruling_set(txn, verify, &selection, &new, by, &reason).await?;
+        let (withdrawn, closed) = if verify {
+            accept_visit(txn, visit.id).await?;
+            (0, Vec::new())
+        } else {
+            let rows = withdraw_visit_readings(txn, visit.id, by, &reason, set_id).await?;
+            withdraw_visit(txn, visit.id).await?;
+            let closed = close_entry_holds_at(txn, site_id, hold.group_time, status, by).await?;
+            (rows, closed)
+        };
+        readings::service::close_set(txn, set_id, withdrawn).await?;
+        let ruling = Ruling {
+            mode: mode.to_string(),
+            by: by.to_string(),
+            rows: withdrawn,
+            set_id,
+            closed,
+            visit_id: Some(visit.id),
+        };
+        decide_ruling(txn, id, status, &ruling).await?;
         Ok(withdrawn)
     })
     .await?;
@@ -2208,8 +2279,8 @@ pub(super) async fn rule_on_visit(
 }
 
 /// Rule on an intern's entry (Q21, M44): `verify` accepts it as it stands, `reject` withdraws it.
-/// Both are decisions on the record, so both are reversible: a rejected entry is re-asserted, and
-/// reopen returns the hold to review.
+/// Both are decisions on the record, recorded as one set with the outputs that follow them, so a
+/// reopen rolls the ruling back and returns the hold to review.
 pub(super) async fn rule_on_entry(
     state: &AppState,
     id: Uuid,
@@ -2264,6 +2335,14 @@ pub(super) async fn rule_on_entry(
         if mode == "verify" {
             refuse_before_inputs(txn, site_id, at, &ruled).await?;
         }
+        let selection = readings::models::Selection {
+            site_id: Some(site_id),
+            parameter_id: Some(parameter_id),
+            from: Some(at),
+            to: Some(at),
+            ..Default::default()
+        };
+        let set_id = open_ruling_set(txn, mode == "verify", &selection, &new, by, &reason).await?;
         let mut recorded = record_many(
             txn,
             kind,
@@ -2281,35 +2360,35 @@ pub(super) async fn rule_on_entry(
                         ),
                     )
             },
-            NewValue::Literal(new),
+            NewValue::Literal(new.clone()),
             by,
             Some(&reason),
             Origin::Audit,
-            None,
+            Some(set_id),
         )
         .await?;
-        recorded.absorb(
-            outputs_follow_ruling(txn, site_id, at, &ruled, mode == "verify", status, by).await?,
-        );
-        hold_model::Entity::update_many()
-            .col_expr(hold_model::Column::Status, Expr::val(status))
-            .col_expr(hold_model::Column::AcknowledgedBy, Expr::val(by))
-            .col_expr(hold_model::Column::AcknowledgedAt, Expr::cust("NOW()"))
-            .col_expr(
-                hold_model::Column::Resolution,
-                Expr::cust_with_values(
-                    "jsonb_build_object('mode', $1::text, 'by', $2::text, \
-                     'at', to_jsonb(NOW()), 'rows', $3::bigint)",
-                    [
-                        sea_orm::Value::from(mode),
-                        sea_orm::Value::from(by),
-                        sea_orm::Value::from(i64::try_from(recorded.rows).unwrap_or(i64::MAX)),
-                    ],
-                ),
-            )
-            .filter(hold_model::Column::Id.eq(id))
-            .exec(txn)
-            .await?;
+        let (outputs, closed) = outputs_follow_ruling(
+            txn,
+            site_id,
+            at,
+            &ruled,
+            mode == "verify",
+            status,
+            by,
+            set_id,
+        )
+        .await?;
+        recorded.absorb(outputs);
+        readings::service::close_set(txn, set_id, recorded.rows).await?;
+        let ruling = Ruling {
+            mode: mode.to_string(),
+            by: by.to_string(),
+            rows: recorded.rows,
+            set_id,
+            closed,
+            visit_id: None,
+        };
+        decide_ruling(txn, id, status, &ruling).await?;
         Ok(recorded)
     })
     .await?;
@@ -2321,6 +2400,220 @@ pub(super) async fn rule_on_entry(
         status: status.to_string(),
         samples_affected: Some(i64::try_from(recorded.rows).unwrap_or(i64::MAX)),
     }))
+}
+
+/// Whether a hold records a manager's ruling on an intern's entry or field day, which a reopen
+/// rolls back whole rather than unflagging.
+pub(super) async fn is_ruling_hold<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<bool> {
+    let hold = hold_model::Entity::find_by_id(id)
+        .one(conn)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("no decided replicate audit hold {id}")))?;
+    Ok(hold.kind == HoldKind::UnverifiedEntry.as_str()
+        || hold.kind == HoldKind::UnverifiedVisit.as_str())
+}
+
+/// Reopen a ruling on an intern's entry or field day: every decision the ruling recorded is rolled
+/// back, the visit and the holds it closed return to what they were, and the hold is pending again,
+/// so the next ruling acts on the entry as it stood before.
+pub(super) async fn reopen_ruling(
+    state: &AppState,
+    id: Uuid,
+    by: &str,
+) -> AppResult<Json<ResolveHoldResponse>> {
+    let recorded = crate::common::bulk_write::guarded(&state.db, async |txn| {
+        let hold = decided_ruling(txn, id).await?;
+        let ruling = Ruling::read(hold.resolution.as_ref()).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "hold {id} was ruled on before a ruling recorded its decisions as one set, so a \
+                 reopen cannot tell which to revert; roll each back through \
+                 POST /api/readings/edits/{{decision_id}}/rollback"
+            ))
+        })?;
+        let mut reopening = ruling.closed.clone();
+        reopening.push(id);
+        refuse_held_again(txn, &reopening).await?;
+        if hold.kind == HoldKind::UnverifiedVisit.as_str() {
+            refuse_ruled_since(txn, &hold, &ruling.closed).await?;
+        }
+        refuse_decided_since(txn, ruling.set_id).await?;
+        let (_, recorded) =
+            readings::service::rollback_set(txn, ruling.set_id, by, Some("reopened")).await?;
+        if let Some(visit_id) = ruling.visit_id {
+            reopen_visit(txn, visit_id).await?;
+        }
+        reopen_holds(txn, &ruling.closed, None).await?;
+        let resolution = merged_resolution(
+            hold.resolution.clone(),
+            serde_json::json!({ "action": "reopened" }),
+            by,
+        );
+        reopen_holds(txn, &[id], Some(resolution)).await?;
+        Ok(recorded)
+    })
+    .await?;
+    crate::routes::private::readings::service::propagate(state, &recorded, by).await?;
+    state.response_cache.invalidate_all();
+    Ok(Json(ResolveHoldResponse {
+        status: HoldStatus::Pending.as_str().to_string(),
+        samples_affected: Some(i64::try_from(recorded.rows).unwrap_or(i64::MAX)),
+    }))
+}
+
+/// The decided hold a reopen acts on, locked for the reopen's transaction.
+async fn decided_ruling<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<hold_model::Model> {
+    hold_model::Entity::find_by_id(id)
+        .filter(hold_model::Column::Status.is_in(HoldStatus::REOPENABLE.map(HoldStatus::as_str)))
+        .lock_exclusive()
+        .one(conn)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("no decided replicate audit hold {id}")))
+}
+
+/// Refuse a reopen when one of the holds it would return to the queue already has a successor
+/// there: the slot or visit is under review again and is ruled on through that hold.
+async fn refuse_held_again<C: ConnectionTrait>(conn: &C, reopening: &[Uuid]) -> AppResult<()> {
+    let holds = hold_model::Entity::find()
+        .filter(hold_model::Column::Id.is_in(reopening.to_vec()))
+        .all(conn)
+        .await?;
+    for hold in holds {
+        let parameter = match hold.parameter_id {
+            Some(parameter_id) => hold_model::Column::ParameterId.eq(parameter_id),
+            None => hold_model::Column::ParameterId.is_null(),
+        };
+        let successor = hold_model::Entity::find()
+            .filter(hold_model::Column::Kind.eq(hold.kind.clone()))
+            .filter(hold_model::Column::StreamId.is_null())
+            .filter(hold_model::Column::SiteId.eq(hold.site_id))
+            .filter(parameter)
+            .filter(hold_model::Column::GroupTime.eq(hold.group_time))
+            .filter(hold_model::Column::Status.eq(HoldStatus::Pending.as_str()))
+            .filter(hold_model::Column::Id.is_not_in(reopening.to_vec()))
+            .one(conn)
+            .await?;
+        if let Some(successor) = successor {
+            return Err(AppError::Conflict(format!(
+                "hold {} is pending for the same {} at {}; rule on it rather than reopening \
+                 hold {}",
+                successor.id, hold.kind, hold.group_time, hold.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse to reopen a field day's ruling once a measurement at it has been ruled on since: a
+/// pending field day cannot hold a ruled measurement, so that ruling is reopened first.
+async fn refuse_ruled_since<C: ConnectionTrait>(
+    conn: &C,
+    hold: &hold_model::Model,
+    closed: &[Uuid],
+) -> AppResult<()> {
+    let Some(ruled_at) = hold.acknowledged_at else {
+        return Ok(());
+    };
+    let since: Vec<Uuid> = hold_model::Entity::find()
+        .select_only()
+        .column(hold_model::Column::Id)
+        .filter(hold_model::Column::Kind.eq(HoldKind::UnverifiedEntry.as_str()))
+        .filter(hold_model::Column::SiteId.eq(hold.site_id))
+        .filter(hold_model::Column::GroupTime.eq(hold.group_time))
+        .filter(hold_model::Column::Status.is_in(HoldStatus::REOPENABLE.map(HoldStatus::as_str)))
+        .filter(hold_model::Column::AcknowledgedAt.gte(ruled_at))
+        .filter(hold_model::Column::Id.is_not_in(closed.to_vec()))
+        .into_tuple()
+        .all(conn)
+        .await?;
+    if since.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::Conflict(format!(
+        "measurement hold {} at this field day was ruled on after it; reopen that ruling before \
+         the field day's",
+        since
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
+/// Refuse a reopen when a reading the ruling decided has been decided again since: rolling the
+/// ruling back would restore the state from before that later decision.
+async fn refuse_decided_since<C: ConnectionTrait>(conn: &C, set_id: Uuid) -> AppResult<()> {
+    use crate::routes::private::readings::decision_model::{Column, Entity};
+    let members: Vec<Uuid> = Entity::find()
+        .select_only()
+        .column(Column::Id)
+        .filter(Column::SetId.eq(set_id))
+        .filter(Column::RolledBackBy.is_null())
+        .into_tuple()
+        .all(conn)
+        .await?;
+    if members.is_empty() {
+        return Ok(());
+    }
+    let Some(later) = Entity::find()
+        .filter(Column::Supersedes.is_in(members))
+        .filter(Column::RolledBackBy.is_null())
+        .one(conn)
+        .await?
+    else {
+        return Ok(());
+    };
+    Err(AppError::Conflict(format!(
+        "the reading at stream {} / {} / replicate {:?} was decided again since the ruling \
+         ({} decision {}); roll that back before reopening",
+        later.stream_id, later.time, later.replicate_index, later.kind, later.id
+    )))
+}
+
+/// A field day whose ruling is reopened awaits a ruling again, and carries no rejection.
+async fn reopen_visit<C: ConnectionTrait>(conn: &C, visit_id: Uuid) -> AppResult<()> {
+    collection_events::Entity::update_many()
+        .col_expr(collection_events::Column::Unverified, Expr::val(true))
+        .col_expr(
+            collection_events::Column::WithdrawnAt,
+            Expr::value(Option::<sea_orm::prelude::DateTimeWithTimeZone>::None),
+        )
+        .filter(collection_events::Column::Id.eq(visit_id))
+        .exec(conn)
+        .await?;
+    Ok(())
+}
+
+/// Return decided holds to the queue, pending, with a new resolution where one is given.
+async fn reopen_holds<C: ConnectionTrait>(
+    conn: &C,
+    ids: &[Uuid],
+    resolution: Option<serde_json::Value>,
+) -> AppResult<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut update = hold_model::Entity::update_many()
+        .col_expr(
+            hold_model::Column::Status,
+            Expr::val(HoldStatus::Pending.as_str()),
+        )
+        .col_expr(
+            hold_model::Column::AcknowledgedBy,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            hold_model::Column::AcknowledgedAt,
+            Expr::value(Option::<sea_orm::prelude::DateTimeWithTimeZone>::None),
+        );
+    if let Some(resolution) = resolution {
+        update = update.col_expr(hold_model::Column::Resolution, Expr::value(resolution));
+    }
+    update
+        .filter(hold_model::Column::Id.is_in(ids.to_vec()))
+        .filter(hold_model::Column::Status.is_in(HoldStatus::REOPENABLE.map(HoldStatus::as_str)))
+        .exec(conn)
+        .await?;
+    Ok(())
 }
 
 /// The keys of the pending readings an entry ruling is about to decide on.
@@ -2553,7 +2846,9 @@ pub(super) async fn reject_takes(state: &AppState, id: Uuid) -> AppResult<Reject
 
 /// Carry an entry ruling to the values computed from it (Q257): a verify releases each output whose
 /// inputs are all verified now, a reject withdraws each output computed from what it withdrew. Each
-/// is a decision on the record, and each output's own review-queue row is closed with the ruling.
+/// is a decision on the record in the ruling's set, and each output's own review-queue row is
+/// closed with the ruling. Returns what was recorded and the holds it closed.
+#[allow(clippy::too_many_arguments)]
 async fn outputs_follow_ruling<C: ConnectionTrait>(
     conn: &C,
     site_id: Uuid,
@@ -2562,14 +2857,18 @@ async fn outputs_follow_ruling<C: ConnectionTrait>(
     verify: bool,
     status: &str,
     by: &str,
-) -> AppResult<crate::routes::private::readings::service::Recorded> {
+    set_id: Uuid,
+) -> AppResult<(
+    crate::routes::private::readings::service::Recorded,
+    Vec<Uuid>,
+)> {
     use crate::routes::private::collection_events::flows::row;
     use crate::routes::private::readings::models::{Column, Kind, Origin};
     use crate::routes::private::readings::service::{NewValue, Recorded, record_many};
 
     let (followed, computed) = ruling_follows(conn, site_id, at, ruled, verify).await?;
     if followed.is_empty() {
-        return Ok(Recorded::default());
+        return Ok((Recorded::default(), Vec::new()));
     }
     let keys = followed.iter().fold(
         sea_orm::Condition::any(),
@@ -2603,25 +2902,26 @@ async fn outputs_follow_ruling<C: ConnectionTrait>(
         by,
         Some(reason),
         Origin::Audit,
-        None,
+        Some(set_id),
     )
     .await?;
     let parameters: HashSet<Uuid> = followed
         .iter()
         .filter_map(|key| computed.parameters.get(key).copied())
         .collect();
-    hold_model::Entity::update_many()
-        .col_expr(hold_model::Column::Status, Expr::val(status))
-        .col_expr(hold_model::Column::AcknowledgedBy, Expr::val(by))
-        .col_expr(hold_model::Column::AcknowledgedAt, Expr::cust("NOW()"))
+    let open: Vec<Uuid> = hold_model::Entity::find()
+        .select_only()
+        .column(hold_model::Column::Id)
         .filter(hold_model::Column::Kind.eq(HoldKind::UnverifiedEntry.as_str()))
         .filter(hold_model::Column::Status.is_in(HoldStatus::OPEN.map(HoldStatus::as_str)))
         .filter(hold_model::Column::SiteId.eq(site_id))
         .filter(hold_model::Column::GroupTime.eq(at))
         .filter(hold_model::Column::ParameterId.is_in(parameters))
-        .exec(conn)
+        .into_tuple()
+        .all(conn)
         .await?;
-    Ok(recorded)
+    close_holds(conn, &open, status, by).await?;
+    Ok((recorded, open))
 }
 
 /// How many plan entries an apply pairs between progress reports.

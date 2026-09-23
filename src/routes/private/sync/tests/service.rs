@@ -1420,3 +1420,41 @@ fn test_holds_in_scope_with_no_projects_confines_to_nothing() {
     let sql = holds_sql(&scope).expect("a condition");
     assert!(sql.contains("1 = 2"), "{sql}");
 }
+
+#[test]
+fn test_ruling_read_names_the_set_and_the_holds_it_closed() {
+    let set_id = Uuid::new_v4();
+    let closed = Uuid::new_v4();
+    let visit_id = Uuid::new_v4();
+    let ruling = super::Ruling::read(Some(&serde_json::json!({
+        "mode": "reject",
+        "by": "manager",
+        "at": "2026-09-23T10:00:00Z",
+        "rows": 2,
+        "set_id": set_id,
+        "closed": [closed],
+        "visit_id": visit_id,
+    })))
+    .expect("a ruling");
+    assert_eq!(ruling.set_id, set_id);
+    assert_eq!(ruling.closed, vec![closed]);
+    assert_eq!(ruling.visit_id, Some(visit_id));
+}
+
+#[test]
+fn test_ruling_read_refuses_a_resolution_with_no_set() {
+    // A ruling recorded before its decisions carried a set, and a reopen's own record.
+    assert_eq!(
+        super::Ruling::read(Some(&serde_json::json!({
+            "mode": "verify", "by": "manager", "rows": 3
+        }))),
+        None
+    );
+    assert_eq!(
+        super::Ruling::read(Some(
+            &serde_json::json!({ "action": "reopened", "by": "manager" })
+        )),
+        None
+    );
+    assert_eq!(super::Ruling::read(None), None);
+}

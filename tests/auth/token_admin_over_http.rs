@@ -83,7 +83,6 @@ async fn create_use_rotate_and_revoke_a_key_over_http() {
             "write_data": true
         },
         "project_scope": PROJECT_ID,
-        "created_by": "admin",
     });
 
     let (status, body) =

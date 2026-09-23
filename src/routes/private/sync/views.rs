@@ -1206,15 +1206,22 @@ pub async fn reject_preview(
     Ok(Json(reject_takes(&state, id).await?))
 }
 
-/// Revert a decision: a remediation's flags are removed (only the readings that resolution
+/// Revert a decision. A remediation's flags are removed (only the readings that resolution
 /// flagged, identified by the recorded reason) and the hold returns to review, `pending` or
-/// `deferred` per the stream's current pairing.
+/// `deferred` per the stream's current pairing. A ruling on an intern's entry or field day is rolled
+/// back whole: its decisions, the outputs that followed them, the visit and the holds it closed
+/// return to what they were, and the hold is `pending`.
 #[utoipa::path(
     post,
     path = "/api/sync/replicate_audit_holds/{id}/reopen",
     responses(
         (status = 200, body = ResolveHoldResponse),
+        (status = 400, description = "A ruling that recorded no decision set, which names the \
+                                      per-decision rollback route instead"),
         (status = 404, description = "No decided hold with this id"),
+        (status = 409, description = "The slot or visit has a pending hold again, a measurement \
+                                      at a field day was ruled on after it, or a reading the \
+                                      ruling decided has been decided again since"),
     ),
     tag = "sync"
 )]
@@ -1226,6 +1233,9 @@ pub async fn reopen_hold(
 ) -> AppResult<Json<ResolveHoldResponse>> {
     enforce_hold_scope(&state.db, &scope, id).await?;
     let by = crate::common::actor::label(&auth);
+    if is_ruling_hold(&state.db, id).await? {
+        return reopen_ruling(&state, id, &by).await;
+    }
     let reopened = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let hold = txn
             .query_one_raw(built(

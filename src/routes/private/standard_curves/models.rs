@@ -41,8 +41,9 @@ pub struct Model {
     pub notes: Option<String>,
     #[crudcrate(exclude(create, update), sortable)]
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// Who fitted the curve, supplied by the caller as on notes, annotations, samples and pairing
-    /// plans. Writable, otherwise the column could never hold anything.
+    /// Who entered the curve, stamped from the request that created it; an update naming it is
+    /// refused.
+    #[crudcrate(exclude(create), on_create = crate::common::actor::current().unwrap_or_default())]
     pub created_by: Option<String>,
     /// Sync provenance: the source a replicated curve came from (e.g. "cnet"). NULL on
     /// hand-entered curves. Written only by `/standard_curves/register`, never through CRUD.

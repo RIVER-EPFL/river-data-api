@@ -8,10 +8,10 @@
 //! fixture database.
 //!
 //! Four beats: the source registers and pushes; the operator pairs the discovered streams
-//! through a pairing plan and the readings become a served value with sample statistics; a second
-//! cycle over unchanged content sends nothing, which is the digest handshake; and a historical
-//! value edited at source travels the whole loop to a proposal an operator decides (Q84), which
-//! is what moves the served number.
+//! through a pairing plan and the readings become a served value with sample statistics; once the
+//! cycle after the pairing has re-asserted each window, a cycle over unchanged content sends
+//! nothing, which is the digest handshake; and a historical value edited at source travels the
+//! whole loop to a proposal an operator decides (Q84), which is what moves the served number.
 //!
 //! Run: cargo test --test e2e portal_loop -- --test-threads=1
 
@@ -45,6 +45,19 @@ async fn served_sample(db: &sea_orm::DatabaseConnection) -> (i32, f64) {
         row.try_get::<i32>("", "n").expect("n"),
         row.try_get::<f64>("", "mean").expect("mean"),
     )
+}
+
+/// The ingest receipts the portal source's streams have committed, one per pass the server applied.
+async fn receipts(db: &sea_orm::DatabaseConnection) -> i64 {
+    count(
+        db,
+        &format!(
+            "SELECT COUNT(*)::bigint FROM ingest_receipts ir \
+             JOIN data_streams s ON s.id = ir.stream_id \
+             WHERE s.source_system = '{SOURCE_SYSTEM}'"
+        ),
+    )
+    .await
 }
 
 /// The first visit both stations were seeded at.
@@ -107,17 +120,40 @@ async fn a_portal_source_reaches_a_served_value_and_changes_only_when_decided() 
         "the served mean is the replicates' own: {mean}"
     );
 
-    // A second cycle re-reads the same content. The digest the server echoed matches what the
-    // backend would send, so nothing is sent at all.
-    let ingested_before = count(
+    // The pairing forgets each paired stream's digest, since what the source sent while unpaired
+    // was not all applied (annotations are refused on an unpaired stream). The next cycle
+    // therefore re-asserts every paired window once: a receipt each, and nothing new.
+    let paired_streams = count(
         &db,
         &format!(
-            "SELECT COUNT(*)::bigint FROM ingest_receipts ir \
-             JOIN data_streams s ON s.id = ir.stream_id \
-             WHERE s.source_system = '{SOURCE_SYSTEM}'"
+            "SELECT COUNT(*)::bigint FROM data_streams \
+             WHERE source_system = '{SOURCE_SYSTEM}' AND site_parameter_id IS NOT NULL"
         ),
     )
     .await;
+    let before_reassert = receipts(&db).await;
+    let reassert = driver
+        .sync(false)
+        .await
+        .expect("the cycle after the pairing");
+    assert!(
+        reassert.errors.is_empty(),
+        "the cycle after the pairing reported errors: {:?}",
+        reassert.errors
+    );
+    assert_eq!(
+        reassert.readings_synced, 0,
+        "the re-asserted windows hold nothing new: {reassert:?}"
+    );
+    assert_eq!(
+        receipts(&db).await,
+        before_reassert + paired_streams,
+        "every paired stream re-asserted its window once"
+    );
+
+    // A further cycle re-reads the same content. The digest the server stored for each clean pass
+    // matches what the backend would send, so nothing is sent at all.
+    let ingested_before = receipts(&db).await;
     let second = driver.sync(false).await.expect("the second cycle");
     assert!(
         second.errors.is_empty(),
@@ -129,20 +165,12 @@ async fn a_portal_source_reaches_a_served_value_and_changes_only_when_decided() 
         "unchanged content is not re-sent: {second:?}"
     );
     assert_eq!(
-        count(
-            &db,
-            &format!(
-                "SELECT COUNT(*)::bigint FROM ingest_receipts ir \
-                 JOIN data_streams s ON s.id = ir.stream_id \
-                 WHERE s.source_system = '{SOURCE_SYSTEM}'"
-            )
-        )
-        .await,
+        receipts(&db).await,
         ingested_before,
         "a cycle that sent nothing committed no receipt"
     );
 
-    // The lab corrects a replicate of a visit synced two cycles ago. The source is re-read whole,
+    // The lab corrects a replicate of a visit synced three cycles ago. The source is re-read whole,
     // so the edit travels as a correction rather than an append, and the digest is what decides
     // the pass is sent at all.
     portal.edit(
@@ -159,15 +187,7 @@ async fn a_portal_source_reaches_a_served_value_and_changes_only_when_decided() 
         third.errors
     );
     assert_eq!(
-        count(
-            &db,
-            &format!(
-                "SELECT COUNT(*)::bigint FROM ingest_receipts ir \
-                 JOIN data_streams s ON s.id = ir.stream_id \
-                 WHERE s.source_system = '{SOURCE_SYSTEM}'"
-            )
-        )
-        .await,
+        receipts(&db).await,
         ingested_before + 1,
         "an edited source no longer matches the stored digest, so the pass is sent and receipted"
     );

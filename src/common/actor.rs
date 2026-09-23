@@ -7,6 +7,7 @@
 //! it on the way in. A write with no request behind it (a job, a sync sweep, a migration) declares
 //! nothing, and the trail records that as an absent actor rather than a wrong one.
 
+use crudcrate::ApiError;
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
 use crate::common::middleware::AuthContext;
@@ -44,6 +45,17 @@ pub async fn declare<C: ConnectionTrait>(conn: &C) -> Result<(), sea_orm::DbErr>
             [actor.into()],
         ))
         .await?;
+    }
+    Ok(())
+}
+
+/// Refuse an update that names a row's author. `created_by` is stamped from [`current`] when the
+/// row is created, and no request reattributes it afterwards.
+pub fn refuse_reattribution(named: bool) -> Result<(), ApiError> {
+    if named {
+        return Err(ApiError::bad_request(
+            "created_by is the caller who created the row and cannot be changed".to_string(),
+        ));
     }
     Ok(())
 }

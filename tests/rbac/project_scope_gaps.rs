@@ -70,7 +70,6 @@ async fn mint_token(
         "name": name,
         "description": "project scope suite",
         "permissions": permissions,
-        "created_by": "admin",
     });
     if let Some(scope) = project_scope {
         payload["project_scope"] = json!(scope);

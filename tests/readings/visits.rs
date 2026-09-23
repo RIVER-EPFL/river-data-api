@@ -765,18 +765,31 @@ async fn the_csv_download_reproduces_the_grid() {
 /// Scenario: the cross-site visits list, the way into a site's grid.
 ///
 /// Expected behaviour: each row carries the same fill and open-finding counts the site-scoped
-/// list computes, the site's name, and can be narrowed to one site and ordered by findings.
+/// list computes, the site's name, and can be narrowed to one site and ordered by findings. A
+/// visit's recompute state is its newest recompute run's.
 #[tokio::test]
 #[serial]
 async fn the_cross_site_list_reports_fill_and_findings() {
     let (db, app, token) = setup().await;
     save_two_visits(&app, &token).await;
+    let other = Uuid::new_v4();
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO collection_events (site_id, collected_at, source) \
-             VALUES ('{}', '2025-06-03T08:00:00Z', 'portal_sync')",
+            "INSERT INTO collection_events (id, site_id, collected_at, source) \
+             VALUES ('{other}', '{}', '2025-06-03T08:00:00Z', 'portal_sync')",
             crate::common::SITE2_ID
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO reprocessing_jobs (trigger_type, status, category, params, created_at) \
+             VALUES ('event_recompute', 'completed', 'maintenance', \
+                     '{{\"collection_event_id\": \"{other}\"}}', now() - interval '2 hours'), \
+                    ('event_recompute', 'failed', 'maintenance', \
+                     '{{\"collection_event_id\": \"{other}\"}}', now() - interval '1 hour')"
         ),
     )
     .await;
@@ -804,6 +817,11 @@ async fn the_cross_site_list_reports_fill_and_findings() {
     assert_eq!(first["parameters_filled"], 2, "{first}");
     assert_eq!(first["findings_open"], 1, "{first}");
     assert_eq!(first["recompute"], "stale", "{first}");
+    let second = visits
+        .iter()
+        .find(|v| v["id"] == other.to_string())
+        .expect("the portal visit is listed");
+    assert_eq!(second["recompute"], "failed", "{second}");
 
     let (status, body) = crate::common::get_json_with_token(
         &app,

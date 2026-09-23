@@ -293,6 +293,15 @@ pub struct ApiTokenOperations;
 impl CRUDOperations for ApiTokenOperations {
     type Resource = ApiToken;
 
+    async fn before_update<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        _db: &C,
+        _id: uuid::Uuid,
+        data: &<ApiToken as CRUDResource>::UpdateModel,
+    ) -> Result<(), ApiError> {
+        crate::common::actor::refuse_reattribution(data.created_by.is_some())
+    }
+
     async fn perform_create<C: ConnectionTrait + TransactionTrait>(
         &self,
         db: &C,

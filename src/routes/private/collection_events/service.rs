@@ -12,7 +12,7 @@ use sea_orm::sea_query::{
 };
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, QuerySelect, Statement, TransactionTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
 use uuid::Uuid;
 
@@ -50,6 +50,8 @@ impl CRUDOperations for CollectionEventOperations {
         data: &<CollectionEvent as CRUDResource>::UpdateModel,
     ) -> Result<(), ApiError> {
         use super::models::{Column, Entity};
+
+        crate::common::actor::refuse_reattribution(data.created_by.is_some())?;
 
         let current = Entity::find_by_id(id)
             .lock_exclusive()
@@ -276,31 +278,77 @@ pub async fn stage_visit<C: ConnectionTrait>(
     notes: Option<&str>,
     unverified: bool,
 ) -> AppResult<StagedEvent> {
-    let collected_at = sea_orm::prelude::DateTimeWithTimeZone::from(collected_at);
-    // `DO UPDATE` rather than `DO NOTHING`: the insert then waits on the transaction it conflicts
-    // with and returns the row that won, where a second statement would still be reading the
-    // snapshot taken before that transaction committed and would find nothing. `xmax = 0` is true
-    // only of the tuple this statement inserted, which is what tells the two apart.
     let row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO collection_events (site_id, collected_at, source, created_by, notes, \
-                                            unverified)
-             VALUES ($1, $2, 'manual', $3, $4, $5)
-             ON CONFLICT (site_id, collected_at) DO UPDATE SET site_id = EXCLUDED.site_id
-             RETURNING id, site_id, collected_at, source, created_by, notes, unverified, \
-                       (xmax = 0) AS created",
-            vec![
-                site_id.into(),
-                collected_at.into(),
-                actor.into(),
-                notes.into(),
-                unverified.into(),
-            ],
+        .query_one(&stage_visit_statement(
+            site_id,
+            collected_at,
+            actor,
+            notes,
+            unverified,
         ))
         .await?
         .ok_or_else(|| AppError::Internal("Staging returned no visit".to_string()))?;
-    Ok(StagedEvent::from_query_result(&row, "")?)
+    Ok(StagedEvent {
+        id: row.try_get("", "id")?,
+        site_id: row.try_get("", "site_id")?,
+        collected_at: row.try_get("", "collected_at")?,
+        source: row.try_get("", "source")?,
+        created_by: row.try_get("", "created_by")?,
+        notes: row.try_get("", "notes")?,
+        unverified: row.try_get("", "unverified")?,
+        created: row.try_get_by_index(STAGED_CREATED_INDEX)?,
+    })
+}
+
+/// Where `stage_visit_statement` returns whether it inserted; the column carries no name.
+const STAGED_CREATED_INDEX: usize = 7;
+
+/// The insert behind `stage_visit`. `DO UPDATE` rather than `DO NOTHING`: the insert then waits on
+/// the transaction it conflicts with and returns the row that won, where a second statement would
+/// still read the snapshot taken before that transaction committed. `xmax = 0` holds only of a
+/// tuple this statement inserted.
+fn stage_visit_statement(
+    site_id: Uuid,
+    collected_at: DateTime<Utc>,
+    actor: &str,
+    notes: Option<&str>,
+    unverified: bool,
+) -> sea_orm::sea_query::InsertStatement {
+    use super::Column;
+    SeaQuery::insert()
+        .into_table(super::Entity)
+        .columns([
+            Column::SiteId,
+            Column::CollectedAt,
+            Column::Source,
+            Column::CreatedBy,
+            Column::Notes,
+            Column::Unverified,
+        ])
+        .values_panic([
+            site_id.into(),
+            collected_at.into(),
+            "manual".into(),
+            actor.into(),
+            notes.map(str::to_string).into(),
+            unverified.into(),
+        ])
+        .on_conflict(
+            OnConflict::columns([Column::SiteId, Column::CollectedAt])
+                .update_column(Column::SiteId)
+                .to_owned(),
+        )
+        .returning(SeaQuery::returning().exprs([
+            Expr::col(Column::Id),
+            Expr::col(Column::SiteId),
+            Expr::col(Column::CollectedAt),
+            Expr::col(Column::Source),
+            Expr::col(Column::CreatedBy),
+            Expr::col(Column::Notes),
+            Expr::col(Column::Unverified),
+            Expr::col(Alias::new("xmax")).eq(0),
+        ]))
+        .to_owned()
 }
 
 /// One review-queue row per field day an intern opened, so a manager rules on the visit beside
@@ -441,9 +489,10 @@ pub(super) fn visit_list_order(sort: Option<&str>, order: Option<&str>) -> AppRe
 }
 
 #[derive(FromQueryResult)]
-struct LatestJobRow {
-    event_id: String,
+struct RecomputeJobRow {
+    event_id: Option<String>,
     status: String,
+    created_at: sea_orm::prelude::DateTimeWithTimeZone,
 }
 
 #[derive(FromQueryResult)]
@@ -500,6 +549,49 @@ pub fn calculation_repair(latest_job_status: Option<&str>) -> Option<&'static st
     }
 }
 
+/// Every `event_recompute` run naming one of `event_ids`, newest first.
+async fn recompute_jobs_for(
+    db: &DatabaseConnection,
+    event_ids: &[Uuid],
+) -> AppResult<Vec<RecomputeJobRow>> {
+    use crate::routes::private::reprocessing_jobs::{Column, Entity};
+    use sea_orm::sea_query::extension::postgres::PgExpr as _;
+    let event_id = Expr::col(Column::Params).cast_json_field("collection_event_id");
+    let ids: Vec<String> = event_ids.iter().map(ToString::to_string).collect();
+    Ok(Entity::find()
+        .select_only()
+        .column_as(event_id.clone(), "event_id")
+        .column(Column::Status)
+        .column(Column::CreatedAt)
+        .filter(Column::TriggerType.eq("event_recompute"))
+        .filter(event_id.is_in(ids))
+        .order_by_desc(Column::CreatedAt)
+        .into_model::<RecomputeJobRow>()
+        .all(db)
+        .await?)
+}
+
+/// The status of each visit's newest recompute run. The id is `params ->> 'collection_event_id'`,
+/// text, so a run whose params name no uuid belongs to no visit.
+fn newest_job_per_visit(rows: impl IntoIterator<Item = RecomputeJobRow>) -> HashMap<Uuid, String> {
+    let mut newest: HashMap<Uuid, RecomputeJobRow> = HashMap::new();
+    for row in rows {
+        let Some(id) = row.event_id.as_deref().and_then(|s| s.parse::<Uuid>().ok()) else {
+            continue;
+        };
+        match newest.get(&id) {
+            Some(kept) if kept.created_at >= row.created_at => {}
+            _ => {
+                newest.insert(id, row);
+            }
+        }
+    }
+    newest
+        .into_iter()
+        .map(|(id, row)| (id, row.status))
+        .collect()
+}
+
 /// The recompute state of each visit: `queued` | `running` | `failed` from its latest
 /// `event_recompute` job, else `stale` when an open stale-output or skipped-step finding names
 /// it, else `current`.
@@ -511,28 +603,7 @@ pub async fn status_for(
     if event_ids.is_empty() {
         return Ok(out);
     }
-    let ids: Vec<String> = event_ids.iter().map(ToString::to_string).collect();
-    let jobs = LatestJobRow::find_by_statement(Statement::from_sql_and_values(
-        sea_orm::DatabaseBackend::Postgres,
-        "SELECT DISTINCT ON (params ->> 'collection_event_id')
-                    params ->> 'collection_event_id' AS event_id, status
-             FROM reprocessing_jobs
-             WHERE trigger_type = 'event_recompute'
-               AND params ->> 'collection_event_id' = ANY($1)
-             ORDER BY params ->> 'collection_event_id', created_at DESC",
-        [ids.into()],
-    ))
-    .all(db)
-    .await?;
-    let mut latest_job: HashMap<Uuid, String> = HashMap::new();
-    for row in jobs {
-        // `params ->> ...` is text, so the id is parsed rather than decoded; a row whose params
-        // carry something that is not a uuid belongs to no visit here.
-        let Ok(id) = row.event_id.parse::<Uuid>() else {
-            continue;
-        };
-        latest_job.insert(id, row.status);
-    }
+    let latest_job = newest_job_per_visit(recompute_jobs_for(db, event_ids).await?);
     let stale = EventIdRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DatabaseBackend::Postgres,
         format!(

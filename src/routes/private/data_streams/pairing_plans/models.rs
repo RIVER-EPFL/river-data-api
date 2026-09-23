@@ -2,6 +2,7 @@ use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use super::service::PairingPlanOperations;
 use crate::routes::private::sync::service::{
     ApplyResult, PlanAcceptedObjects, PlanCurveAttachments, PlanCurveIntents, PlanEntries,
     PlanInstrumentProposals, PlanSummary,
@@ -13,7 +14,8 @@ use crate::routes::private::sync::service::{
     api_struct = "PairingPlan",
     name_singular = "pairing_plan",
     name_plural = "pairing_plans",
-    generate_router
+    generate_router,
+    operations = PairingPlanOperations
 )]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
@@ -23,6 +25,8 @@ pub struct Model {
     pub source_system: String,
     #[crudcrate(filterable, on_create = String::from("draft"))]
     pub status: String,
+    /// The caller who created the row, stamped from the request; an update naming it is refused.
+    #[crudcrate(exclude(create), on_create = crate::common::actor::current().unwrap_or_default())]
     pub created_by: Option<String>,
     #[sea_orm(column_type = "JsonBinary")]
     pub summary: PlanSummary,

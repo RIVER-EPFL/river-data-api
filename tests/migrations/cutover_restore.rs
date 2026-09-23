@@ -412,3 +412,114 @@ async fn a_dump_and_a_rebuilt_database_hold_the_same_curated_state() {
         assert_eq!(report.rows(table), 1, "{table} was not carried");
     }
 }
+
+/// A stream the dump holds and the rebuild never registers, carrying one sample whole and one
+/// sample beside a replicate on a stream the rebuild does hold.
+const UNREGISTERED: &str = r"
+INSERT INTO data_streams (source_system, source_key, site_parameter_id, sensor_id)
+     SELECT 'cnet', 'doc-2', sp.id, n.id FROM site_parameters sp, sensors n
+      WHERE sp.name = 'Martigny DOC' AND n.serial_number = 'SN-1';
+
+INSERT INTO samples (id, site_id, parameter_id, collected_at)
+     SELECT '33333333-3333-3333-3333-333333333333', s.id, p.id, '2024-07-01T09:00:00Z'
+       FROM sites s, parameters p WHERE s.name = 'Martigny' AND p.code = 'doc';
+INSERT INTO samples (id, site_id, parameter_id, collected_at)
+     SELECT '44444444-4444-4444-4444-444444444444', s.id, p.id, '2024-08-01T09:00:00Z'
+       FROM sites s, parameters p WHERE s.name = 'Martigny' AND p.code = 'doc';
+
+INSERT INTO readings (stream_id, time, replicate_index, site_id, parameter_id, raw_value,
+                      sensor_id, measurement_type, sample_id)
+     SELECT d.id, '2024-07-01T09:00:00Z', r.i, s.id, p.id, 1.5 + 0.5 * r.i, n.id, 'spot',
+            '33333333-3333-3333-3333-333333333333'
+       FROM generate_series(0, 2) AS r(i), data_streams d, sites s, parameters p, sensors n
+      WHERE d.source_key = 'doc-2' AND s.name = 'Martigny' AND p.code = 'doc'
+        AND n.serial_number = 'SN-1';
+INSERT INTO readings (stream_id, time, replicate_index, site_id, parameter_id, raw_value,
+                      sensor_id, measurement_type, sample_id)
+     SELECT d.id, '2024-08-01T09:00:00Z', r.i, s.id, p.id, 4 + 4 * r.i, n.id, 'spot',
+            '44444444-4444-4444-4444-444444444444'
+       FROM generate_series(0, 1) AS r(i), data_streams d, sites s, parameters p, sensors n
+      WHERE d.source_key = CASE WHEN r.i = 0 THEN 'doc-1' ELSE 'doc-2' END
+        AND s.name = 'Martigny' AND p.code = 'doc' AND n.serial_number = 'SN-1';
+";
+
+#[derive(Debug, PartialEq)]
+struct Statistics {
+    n: i32,
+    mean: Option<f64>,
+}
+
+async fn statistics(db: &DatabaseConnection, collected_at: &str) -> Option<Statistics> {
+    db.query_one_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT n, mean FROM samples WHERE collected_at = $1::timestamptz",
+        [collected_at.into()],
+    ))
+    .await
+    .expect("the samples query runs")
+    .map(|row| Statistics {
+        n: row.try_get("", "n").expect("n"),
+        mean: row.try_get("", "mean").expect("mean"),
+    })
+}
+
+#[tokio::test]
+#[serial]
+async fn a_sample_keeps_only_the_statistics_its_carried_readings_compute_to() {
+    dotenvy::dotenv().ok();
+    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
+    let pid = std::process::id();
+    let (source_name, target_name) = (
+        format!("river_cutover_unreg_src_{pid}"),
+        format!("river_cutover_unreg_dst_{pid}"),
+    );
+
+    let server = scratch::server(&base).await;
+    let source = build(&base, &server, &source_name).await;
+    let target = build(&base, &server, &target_name).await;
+    source
+        .execute_unprepared(UNREGISTERED)
+        .await
+        .expect("the dump");
+
+    let whole_before = statistics(&source, "2024-07-01T09:00:00Z").await;
+    let report = river_db::restore::restore(&source, &target)
+        .await
+        .expect("the cutover runs");
+    let whole = statistics(&target, "2024-07-01T09:00:00Z").await;
+    let split = statistics(&target, "2024-08-01T09:00:00Z").await;
+    let refused = report.refused.join(", ");
+
+    source.close().await.expect("close the source");
+    target.close().await.expect("close the target");
+    for name in [&source_name, &target_name] {
+        scratch::discard(&server, name).await;
+    }
+
+    assert_eq!(
+        whole_before,
+        Some(Statistics {
+            n: 3,
+            mean: Some(2.0)
+        }),
+        "the dump computes its statistics from its replicates"
+    );
+    assert_eq!(
+        whole, None,
+        "none of the sample's readings were carried, so no statistic may stand for them"
+    );
+    assert_eq!(
+        split,
+        Some(Statistics {
+            n: 1,
+            mean: Some(4.0)
+        }),
+        "the sample is recomputed over the one replicate that arrived"
+    );
+    assert_eq!(report.rows("readings"), 1, "refused: {refused}");
+    assert_eq!(report.rows("samples"), 1, "refused: {refused}");
+    assert!(
+        refused.contains("samples without a carried reading"),
+        "the run names the sample it removed: {refused}"
+    );
+}

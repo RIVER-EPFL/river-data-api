@@ -32,6 +32,8 @@ pub struct Model {
     /// attach path writes `portal_sync` rows directly.
     #[crudcrate(filterable, exclude(create, update), on_create = "manual".to_string())]
     pub source: String,
+    /// The caller who created the row, stamped from the request; an update naming it is refused.
+    #[crudcrate(exclude(create), on_create = crate::common::actor::current().unwrap_or_default())]
     pub created_by: Option<String>,
     pub notes: Option<String>,
     /// The field day itself is pending: staged by an intern, and nobody has ruled on whether it
@@ -117,7 +119,7 @@ pub struct StageEventsRequest {
     pub notes: Option<String>,
 }
 
-#[derive(Debug, Serialize, ToSchema, sea_orm::FromQueryResult)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct StagedEvent {
     pub id: Uuid,
     pub site_id: Uuid,

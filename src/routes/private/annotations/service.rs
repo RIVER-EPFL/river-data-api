@@ -1,11 +1,12 @@
-//! The two lookups `/annotations/register` makes before it upserts: the slot behind each stream,
-//! and the rows the pass re-asserts.
+//! The two lookups `/annotations/register` makes before it upserts (the slot behind each stream,
+//! and the rows the pass re-asserts), and the hook the CRUD routes run.
 
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
+use crudcrate::{ApiError, CRUDOperations, CRUDResource};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, TransactionTrait};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use super::models::{Column, Entity, Model};
+use super::models::{Annotation, Column, Entity, Model};
 use crate::error::AppResult;
 use crate::routes::private::{data_streams, site_parameters};
 
@@ -61,4 +62,19 @@ pub async fn stored_by_source_key<C: ConnectionTrait>(
         .into_iter()
         .filter_map(|a| a.source_key.clone().map(|key| (key, a)))
         .collect())
+}
+
+pub struct AnnotationOperations;
+
+impl CRUDOperations for AnnotationOperations {
+    type Resource = Annotation;
+
+    async fn before_update<C: ConnectionTrait + TransactionTrait>(
+        &self,
+        _db: &C,
+        _id: Uuid,
+        data: &<Annotation as CRUDResource>::UpdateModel,
+    ) -> Result<(), ApiError> {
+        crate::common::actor::refuse_reattribution(data.created_by.is_some())
+    }
 }

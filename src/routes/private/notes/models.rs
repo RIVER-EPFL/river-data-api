@@ -1,6 +1,8 @@
 use crudcrate::EntityToModels;
 use sea_orm::entity::prelude::*;
 
+use super::service::NoteOperations;
+
 #[derive(
     Clone, Debug, PartialEq, DeriveEntityModel, serde::Serialize, serde::Deserialize, EntityToModels,
 )]
@@ -10,6 +12,7 @@ use sea_orm::entity::prelude::*;
     name_singular = "note",
     name_plural = "notes",
     generate_router,
+    operations = NoteOperations,
     upsert_key(source_system, source_key)
 )]
 pub struct Model {
@@ -22,6 +25,8 @@ pub struct Model {
     pub text: String,
     #[crudcrate(on_create = false)]
     pub verified: bool,
+    /// The caller who created the row, stamped from the request; an update naming it is refused.
+    #[crudcrate(exclude(create), on_create = crate::common::actor::current().unwrap_or_default())]
     pub created_by: Option<String>,
     /// Where a source-authored note came from, written only by `/notes/register` so a CRUD caller
     /// cannot claim sync provenance. NULL on hand-entered notes.

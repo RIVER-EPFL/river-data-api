@@ -1,4 +1,4 @@
-use super::{current, label, scoped};
+use super::{current, label, refuse_reattribution, scoped};
 use crate::common::middleware::AuthContext;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -62,4 +62,16 @@ async fn the_actor_is_readable_below_the_handler_and_nowhere_else() {
     let seen = scoped("evan@epfl.ch".to_string(), async { current() }).await;
     assert_eq!(seen.as_deref(), Some("evan@epfl.ch"));
     assert_eq!(current(), None, "and the scope ends with the request");
+}
+
+/// A row's author is the caller who created it, so an update that names one is refused whatever
+/// it names, and an update that leaves it alone passes.
+#[test]
+fn an_update_naming_the_author_is_refused() {
+    assert!(refuse_reattribution(false).is_ok());
+    let refusal = refuse_reattribution(true).expect_err("naming the author is refused");
+    assert!(
+        matches!(refusal, crudcrate::ApiError::BadRequest { .. }),
+        "refused as a bad request, not an internal error: {refusal:?}"
+    );
 }

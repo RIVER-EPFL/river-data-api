@@ -1087,6 +1087,7 @@
             ]
           },
           "created_by": {
+            "description": "The caller who created the row, stamped from the request; an update naming it is refused.",
             "type": [
               "string",
               "null"
@@ -1159,12 +1160,6 @@
           "category": {
             "type": "string"
           },
-          "created_by": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "end_time": {
             "format": "date-time",
             "type": "string"
@@ -1216,6 +1211,7 @@
             ]
           },
           "created_by": {
+            "description": "The caller who created the row, stamped from the request; an update naming it is refused.",
             "type": [
               "string",
               "null"
@@ -1329,6 +1325,7 @@
             ]
           },
           "created_by": {
+            "description": "The caller who created the row, stamped from the request; an update naming it is refused.",
             "type": [
               "string",
               "null"
@@ -1575,12 +1572,6 @@
       },
       "ApiTokenCreate": {
         "properties": {
-          "created_by": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "description": {
             "type": [
               "string",
@@ -1635,6 +1626,7 @@
             ]
           },
           "created_by": {
+            "description": "The caller who created the row, stamped from the request; an update naming it is refused.",
             "type": [
               "string",
               "null"
@@ -1725,6 +1717,7 @@
             ]
           },
           "created_by": {
+            "description": "The caller who created the row, stamped from the request; an update naming it is refused.",
             "type": [
               "string",
               "null"
@@ -3814,12 +3807,6 @@
             "format": "date-time",
             "type": "string"
           },
-          "created_by": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "notes": {
             "type": [
               "string",
@@ -3848,6 +3835,7 @@
             "type": "string"
           },
           "created_by": {
+            "description": "The caller who created the row, stamped from the request; an update naming it is refused.",
             "type": [
               "string",
               "null"
@@ -3916,6 +3904,7 @@
             "type": "string"
           },
           "created_by": {
+            "description": "The caller who created the row, stamped from the request; an update naming it is refused.",
             "type": [
               "string",
               "null"
@@ -11100,12 +11089,6 @@
       },
       "NoteCreate": {
         "properties": {
-          "created_by": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "site_id": {
             "format": "uuid",
             "type": "string"
@@ -11137,6 +11120,7 @@
             "type": "string"
           },
           "created_by": {
+            "description": "The caller who created the row, stamped from the request; an update naming it is refused.",
             "type": [
               "string",
               "null"
@@ -11219,6 +11203,7 @@
             "type": "string"
           },
           "created_by": {
+            "description": "The caller who created the row, stamped from the request; an update naming it is refused.",
             "type": [
               "string",
               "null"
@@ -12231,6 +12216,7 @@
             "type": "string"
           },
           "created_by": {
+            "description": "The caller who created the row, stamped from the request; an update naming it is refused.",
             "type": [
               "string",
               "null"
@@ -12290,12 +12276,6 @@
       },
       "PairingPlanCreate": {
         "properties": {
-          "created_by": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "entries": {
             "$ref": "#/components/schemas/PlanEntries"
           },
@@ -12347,6 +12327,7 @@
             "type": "string"
           },
           "created_by": {
+            "description": "The caller who created the row, stamped from the request; an update naming it is refused.",
             "type": [
               "string",
               "null"
@@ -12432,6 +12413,7 @@
             "type": "string"
           },
           "created_by": {
+            "description": "The caller who created the row, stamped from the request; an update naming it is refused.",
             "type": [
               "string",
               "null"
@@ -23712,12 +23694,6 @@
               "null"
             ]
           },
-          "created_by": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "fitted_on": {
             "format": "date",
             "type": [
@@ -23779,7 +23755,7 @@
             "type": "string"
           },
           "created_by": {
-            "description": "Who fitted the curve, supplied by the caller as on notes, annotations, samples and pairing\nplans. Writable, otherwise the column could never hold anything.",
+            "description": "Who entered the curve, stamped from the request that created it; an update naming it is\nrefused.",
             "type": [
               "string",
               "null"
@@ -23900,7 +23876,7 @@
             "type": "string"
           },
           "created_by": {
-            "description": "Who fitted the curve, supplied by the caller as on notes, annotations, samples and pairing\nplans. Writable, otherwise the column could never hold anything.",
+            "description": "Who entered the curve, stamped from the request that created it; an update naming it is\nrefused.",
             "type": [
               "string",
               "null"
@@ -48555,11 +48531,17 @@
             },
             "description": ""
           },
+          "400": {
+            "description": "A ruling that recorded no decision set, which names the per-decision rollback route instead"
+          },
           "404": {
             "description": "No decided hold with this id"
+          },
+          "409": {
+            "description": "The slot or visit has a pending hold again, a measurement at a field day was ruled on after it, or a reading the ruling decided has been decided again since"
           }
         },
-        "summary": "Revert a decision: a remediation's flags are removed (only the readings that resolution\nflagged, identified by the recorded reason) and the hold returns to review, `pending` or\n`deferred` per the stream's current pairing.",
+        "summary": "Revert a decision. A remediation's flags are removed (only the readings that resolution\nflagged, identified by the recorded reason) and the hold returns to review, `pending` or\n`deferred` per the stream's current pairing. A ruling on an intern's entry or field day is rolled\nback whole: its decisions, the outputs that followed them, the visit and the holds it closed\nreturn to what they were, and the hold is `pending`.",
         "tags": [
           "sync"
         ]

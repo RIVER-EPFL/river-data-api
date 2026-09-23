@@ -106,3 +106,53 @@ fn test_a_parameter_names_every_calculation_reading_it_and_the_one_writing_it() 
         (vec![], None)
     );
 }
+
+#[test]
+fn test_stage_visit_statement_upserts_on_the_slot_and_returns_whether_it_inserted() {
+    let site = Uuid::from_u128(1);
+    let at = DateTime::parse_from_rfc3339("2026-06-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let (sql, _) = stage_visit_statement(site, at, "alice", None, true).build(PostgresQueryBuilder);
+    assert!(sql.starts_with(r#"INSERT INTO "collection_events" ("site_id", "collected_at", "source", "created_by", "notes", "unverified")"#), "{sql}");
+    assert!(
+        sql.contains(r#"ON CONFLICT ("site_id", "collected_at") DO UPDATE SET "site_id" = "excluded"."site_id""#),
+        "{sql}"
+    );
+    assert!(
+        sql.ends_with(r#"RETURNING "id", "site_id", "collected_at", "source", "created_by", "notes", "unverified", "xmax" = $7"#),
+        "{sql}"
+    );
+}
+
+#[test]
+fn test_newest_job_per_visit_keeps_the_latest_run_of_each() {
+    let a = Uuid::from_u128(1);
+    let b = Uuid::from_u128(2);
+    let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap();
+    let row = |id: &str, status: &str, when: &str| RecomputeJobRow {
+        event_id: Some(id.to_string()),
+        status: status.to_string(),
+        created_at: at(when),
+    };
+    let latest = newest_job_per_visit([
+        row(&a.to_string(), "completed", "2026-06-01T10:00:00Z"),
+        row(&b.to_string(), "failed", "2026-06-01T09:00:00Z"),
+        row(&a.to_string(), "failed", "2026-06-01T08:00:00Z"),
+        row(&a.to_string(), "running", "2026-06-01T11:00:00Z"),
+        row("not-a-uuid", "queued", "2026-06-01T12:00:00Z"),
+        RecomputeJobRow {
+            event_id: None,
+            status: "queued".to_string(),
+            created_at: at("2026-06-01T12:00:00Z"),
+        },
+    ]);
+    assert_eq!(latest.len(), 2);
+    assert_eq!(latest[&a], "running");
+    assert_eq!(latest[&b], "failed");
+}
+
+#[test]
+fn test_newest_job_per_visit_of_no_runs_is_empty() {
+    assert!(newest_job_per_visit([]).is_empty());
+}

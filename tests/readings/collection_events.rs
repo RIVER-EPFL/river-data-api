@@ -1147,7 +1147,7 @@ async fn staging_blocked(db: &DatabaseConnection) -> bool {
             db,
             "SELECT COUNT(*) AS n FROM pg_stat_activity \
               WHERE state = 'active' AND wait_event_type = 'Lock' \
-                AND query LIKE '%INSERT INTO collection_events%'",
+                AND query LIKE '%INSERT INTO \"collection_events\"%'",
         )
         .await;
         if waiting > 0 {
