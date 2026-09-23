@@ -339,6 +339,17 @@ async fn a_batch_racing_an_unpair_stores_its_rows_unattributed() {
         .expect("the batch opened its api channel")
         .id;
 
+    let sensor =
+        crate::common::sensor_lifecycle::create_sensor(&fx.db, "Deployed", parameter).await;
+    crate::common::sensor_lifecycle::deploy_sensor_for_parameter(
+        &fx.db,
+        sensor.id,
+        site,
+        parameter,
+        crate::common::sensor_lifecycle::dt("2025-06-01T00:00:00Z"),
+    )
+    .await;
+
     let unpair = unpair_uncommitted(&fx.db, stream_id).await;
 
     let (app, token) = (fx.app.clone(), fx.token.clone());
@@ -360,6 +371,20 @@ async fn a_batch_racing_an_unpair_stores_its_rows_unattributed() {
         .await,
         0,
         "no row on the unpaired channel is attributed: {body}"
+    );
+    assert_eq!(
+        scalar(
+            &fx.db,
+            &format!(
+                "SELECT count(*) AS c FROM readings \
+                 WHERE stream_id = '{stream_id}' AND time = '{T1}' AND sensor_id IS NULL \
+                 AND deployment_id IS NULL AND calibration_id IS NULL \
+                 AND calibrated_value IS NULL"
+            ),
+        )
+        .await,
+        1,
+        "the row names no instrument, deployment or curve the slot's deployment would give it"
     );
 }
 

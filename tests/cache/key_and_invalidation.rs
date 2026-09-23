@@ -766,3 +766,101 @@ async fn deactivating_a_slot_drops_it_from_its_sites_cached_readings() {
         after.body
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn renaming_a_site_invalidates_its_cached_readings() {
+    if !crate::common::profile::Service::Keycloak
+        .require("renaming_a_site_invalidates_its_cached_readings")
+        .await
+    {
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let app = kc::build_test_app_with_keycloak_and_cache(db.clone()).await;
+    let jwt = kc::get_keycloak_jwt("admin", "admin").await;
+
+    let slot = provision_slot(&app, &jwt, "siterename").await;
+    batch_one(&app, &jwt, &slot, "2025-06-09T00:00:00Z", 31.0).await;
+
+    let site_uri = format!(
+        "/api/sites/{}/readings?start=2025-06-09T00:00:00Z&end=2025-06-09T06:00:00Z",
+        slot.site_id
+    );
+    let before = prime(&app, &site_uri, Some(&jwt)).await;
+    assert_eq!(
+        before.json["site"]["name"], "Cache site siterename",
+        "{}",
+        before.body
+    );
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/sites/{}", slot.site_id),
+        &json!({ "name": "Renamed site" }),
+        &jwt,
+    )
+    .await;
+    assert_eq!(status, 200, "rename site: {body}");
+
+    let after = probe(&app, &site_uri, Some(&jwt)).await;
+    assert_eq!(after.status, 200, "{}", after.body);
+    assert_ne!(
+        after.cache, "HIT",
+        "a site rename drops its entries: {}",
+        after.body
+    );
+    assert_eq!(after.json["site"]["name"], "Renamed site", "{}", after.body);
+}
+
+#[tokio::test]
+#[serial]
+async fn renaming_a_project_invalidates_its_sites_cached_readings() {
+    if !crate::common::profile::Service::Keycloak
+        .require("renaming_a_project_invalidates_its_sites_cached_readings")
+        .await
+    {
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let app = kc::build_test_app_with_keycloak_and_cache(db.clone()).await;
+    let jwt = kc::get_keycloak_jwt("admin", "admin").await;
+
+    let slot = provision_slot(&app, &jwt, "projectrename").await;
+    batch_one(&app, &jwt, &slot, "2025-06-10T00:00:00Z", 41.0).await;
+
+    let site_uri = format!(
+        "/api/sites/{}/readings?start=2025-06-10T00:00:00Z&end=2025-06-10T06:00:00Z",
+        slot.site_id
+    );
+    let before = prime(&app, &site_uri, Some(&jwt)).await;
+    assert_eq!(
+        before.json["project"]["name"], "Cache project projectrename",
+        "{}",
+        before.body
+    );
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/projects/{}", slot.project_id),
+        &json!({ "name": "Renamed project" }),
+        &jwt,
+    )
+    .await;
+    assert_eq!(status, 200, "rename project: {body}");
+
+    let after = probe(&app, &site_uri, Some(&jwt)).await;
+    assert_eq!(after.status, 200, "{}", after.body);
+    assert_ne!(
+        after.cache, "HIT",
+        "a project rename drops its sites' entries: {}",
+        after.body
+    );
+    assert_eq!(
+        after.json["project"]["name"], "Renamed project",
+        "{}",
+        after.body
+    );
+}

@@ -124,6 +124,12 @@ pub fn build_test_app(db: DatabaseConnection) -> axum::Router {
     river_db::routes::build_router(state)
 }
 
+/// A router with no job worker, so a job a test enqueues or inserts stays in the state it was
+/// written in until the test itself moves it.
+pub fn build_test_app_without_worker(db: DatabaseConnection) -> axum::Router {
+    river_db::routes::build_router(AppState::new(db, test_config(), None))
+}
+
 /// Build an `AppState` (and a router that shares it) so tests can both drive HTTP requests and
 /// call admin-only handlers (e.g. token revoke/rotate) directly against the same caches.
 pub fn build_test_app_with_state(db: DatabaseConnection) -> (axum::Router, AppState) {

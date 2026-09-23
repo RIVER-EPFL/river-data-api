@@ -265,3 +265,47 @@ async fn accepting_a_correction_reapplies_the_curve_the_reading_names() {
 
     crate::common::cleanup_test_db(&db).await;
 }
+
+/// Scenario: a manager accepts a correction to a continuous reading while the rollup refresh
+/// fails.
+///
+/// Expected behaviour: the accept answers 200, because the decision is committed and the hourly
+/// policy rematerialises the span regardless; a 500 would have the manager decide it again.
+#[tokio::test]
+#[serial]
+async fn an_accept_whose_rollup_refresh_fails_answers_the_decision_it_recorded() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app_without_worker(db.clone());
+
+    let proposal = proposal_on(&db, PARAM_S1_TEMP_ID, "refresh-refused").await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO readings \
+                 (stream_id, time, replicate_index, raw_value, site_id, parameter_id) \
+             SELECT stream_id, time, 0, 10.0, \
+                    (SELECT site_id FROM site_parameters WHERE id = '{PARAM_S1_TEMP_ID}'), \
+                    '{GLOBAL_PARAM_TEMP_ID}' \
+             FROM reading_change_proposals WHERE id = '{proposal}'"
+        ),
+    )
+    .await;
+
+    crate::common::jobs::refuse_refresh(&db).await;
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        "/api/sync/change_proposals/decide",
+        &json!({ "ids": [proposal], "decision": "accept" }),
+        &token,
+    )
+    .await;
+    crate::common::jobs::restore_refresh(&db).await;
+
+    assert_eq!(status, 200, "the accept is committed ({status}): {body}");
+    assert_eq!(status_of(&db, proposal).await, "accepted");
+
+    crate::common::cleanup_test_db(&db).await;
+}

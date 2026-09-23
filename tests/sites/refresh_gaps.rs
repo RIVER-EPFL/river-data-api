@@ -279,6 +279,10 @@ async fn merging_site_parameters_moves_the_rollups_with_the_readings() {
     )
     .await;
     assert_eq!(job["status"], "completed", "the merge job completes: {job}");
+    assert!(
+        jobs_settled(&db, 60).await,
+        "the rollup refresh the merge queued settles"
+    );
 
     let served = site_readings(
         &app,

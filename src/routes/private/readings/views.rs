@@ -704,11 +704,14 @@ pub async fn commit(
     refuse_unrouted(&state.db, &req.selection, option).await?;
 
     let (set_id, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
-        apply(txn, &req.selection, &req.decision, &actor, auth.origin()).await
+        let (set_id, recorded) =
+            apply(txn, &req.selection, &req.decision, &actor, auth.origin()).await?;
+        queue_visit_recomputes(txn, &recorded, &actor).await?;
+        Ok((set_id, recorded))
     })
     .await?;
 
-    propagate(&state, &recorded, &actor).await?;
+    refresh_edited_rollups(&state, &recorded).await;
 
     let ids = decisions_recorded(&state.db, &req.selection, kind, recorded.rows).await?;
     Ok(Json(EditResponse {
@@ -726,7 +729,7 @@ pub async fn commit(
     responses(
         (status = 200, description = "Inverted", body = RollbackResponse),
         (status = 404, description = "No such decision"),
-        (status = 409, description = "Already rolled back, or a decision that projects nothing"),
+        (status = 409, description = "Already rolled back, a decision that projects nothing, or a verification ruling's, which its hold's reopen undoes"),
     ),
     tag = "readings"
 )]
@@ -740,20 +743,24 @@ pub async fn rollback(
     let sites = decided_sites(&state.db, decision_model::Column::Id, id).await?;
     require_edit_in_scope(&state.db, &scope, &sites).await?;
     let (rollback_id, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
-        crate::routes::private::readings::service::rollback(
+        let decision = load(txn, id).await?;
+        refuse_ruling_rollback(txn, decision.set_id).await?;
+        let (rollback_id, recorded) = crate::routes::private::readings::service::rollback(
             txn,
             id,
             &actor,
             Some("edit rolled back"),
         )
-        .await
+        .await?;
+        queue_visit_recomputes(txn, &recorded, &actor).await?;
+        // Inverting a pin changes what the window resolves for that reading, and only the
+        // reprocess writes it.
+        crate::routes::private::readings::service::enqueue_pin_reprocess_for_decision(txn, id)
+            .await?;
+        Ok((rollback_id, recorded))
     })
     .await?;
-    propagate(&state, &recorded, &actor).await?;
-    // Inverting a pin changes what the window resolves for that reading, and only the reprocess
-    // writes it. The forward path enqueues the same job.
-    crate::routes::private::readings::service::enqueue_pin_reprocess_for_decision(&state.db, id)
-        .await?;
+    refresh_edited_rollups(&state, &recorded).await;
     Ok(Json(RollbackResponse { rollback_id }))
 }
 
@@ -766,7 +773,7 @@ pub async fn rollback(
     responses(
         (status = 200, description = "Inverted", body = RollbackSetResponse),
         (status = 404, description = "No such set"),
-        (status = 409, description = "Already rolled back"),
+        (status = 409, description = "Already rolled back, or a verification ruling's set, which its hold's reopen undoes"),
     ),
     tag = "readings"
 )]
@@ -780,18 +787,21 @@ pub async fn rollback_edit_set(
     let sites = decided_sites(&state.db, decision_model::Column::SetId, set_id).await?;
     require_edit_in_scope(&state.db, &scope, &sites).await?;
     let (rolled_back, recorded) = crate::common::bulk_write::guarded(&state.db, async |txn| {
-        crate::routes::private::readings::service::rollback_set(
+        refuse_ruling_rollback(txn, Some(set_id)).await?;
+        let (rolled_back, recorded) = crate::routes::private::readings::service::rollback_set(
             txn,
             set_id,
             &actor,
             Some("edit set rolled back"),
         )
-        .await
+        .await?;
+        queue_visit_recomputes(txn, &recorded, &actor).await?;
+        crate::routes::private::readings::service::enqueue_pin_reprocess_for_set(txn, set_id)
+            .await?;
+        Ok((rolled_back, recorded))
     })
     .await?;
-    propagate(&state, &recorded, &actor).await?;
-    crate::routes::private::readings::service::enqueue_pin_reprocess_for_set(&state.db, set_id)
-        .await?;
+    refresh_edited_rollups(&state, &recorded).await;
     Ok(Json(RollbackSetResponse {
         set_id,
         rolled_back,
@@ -856,8 +866,16 @@ pub async fn decide_proposals(
     let accept = parse_decision(&req.decision)?;
     let actor = crate::common::actor::label(&auth);
     let projects = scope.project_ids();
+    // An accepted correction rewrites a served value, so it takes the same tail every other
+    // curation write takes: the rollups over the span it moved, the cache, and the visits whose
+    // calculations read it.
+    let tail = |written: &crate::routes::private::readings::service::Recorded| {
+        crate::routes::private::readings::service::Written::new(written.rows)
+            .over(written.span)
+            .touching(written.touched_events.clone())
+    };
     let (response, written) = crate::common::bulk_write::guarded(&state.db, async |txn| {
-        decide(
+        let (response, written) = decide(
             txn,
             &req.ids,
             accept,
@@ -865,21 +883,14 @@ pub async fn decide_proposals(
             req.reason.as_deref(),
             projects.as_deref(),
         )
-        .await
+        .await?;
+        crate::routes::private::readings::service::queue(txn, &tail(&written), &ACCEPT_TAIL)
+            .await?;
+        Ok((response, written))
     })
     .await?;
-    // An accepted correction rewrites a served value, so it takes the same tail every other
-    // curation write takes: the rollups over the span it moved, the cache, and the visits whose
-    // calculations read it.
-    crate::routes::private::readings::service::run(
-        &state,
-        &crate::routes::private::readings::service::Written::new(written.rows)
-            .over(written.span)
-            .touching(written.touched_events.clone()),
-        &ACCEPT_TAIL,
-        &actor,
-    )
-    .await?;
+    crate::routes::private::readings::service::run(&state, &tail(&written), &ACCEPT_TAIL, &actor)
+        .await?;
     Ok(axum::Json(response))
 }
 
@@ -1193,8 +1204,8 @@ pub async fn insert_batch_readings(
         map
     };
 
-    // For rows that don't carry an explicit sensor, resolve it from the deployment window covering
-    // the time so batch-inserted data lands attributed. Explicit payload values always win.
+    // For rows that don't carry an explicit sensor, the deployment covering the time at the slot:
+    // what a row on a paired stream is attributed to where it declares nothing of its own.
     let mut owner_map: HashMap<(Uuid, Uuid, chrono::DateTime<chrono::Utc>), ResolvedOwner> =
         HashMap::new();
     {
@@ -1237,14 +1248,15 @@ pub async fn insert_batch_readings(
         map
     };
 
-    // Sensor-frequency defaults for readings that don't declare a measurement_type: explicit
-    // payload sensors plus slot-owner-resolved ones, one query.
+    // Sensor-frequency defaults for readings that don't declare a measurement_type: every
+    // instrument a row could be stored against or classified by, one query.
     let sensor_types = {
         let mut candidate_sensors: Vec<Uuid> = payload
             .readings
             .iter()
             .filter_map(|r| r.sensor_id)
             .chain(owner_map.values().filter_map(|o| o.sensor_id))
+            .chain(stream_sensors.values().copied())
             .collect();
         candidate_sensors.sort_unstable();
         candidate_sensors.dedup();
@@ -1255,13 +1267,11 @@ pub async fn insert_batch_readings(
         .await?
     };
 
-    // Per-reading context, resolved before the models are built: which stream the row lands on,
-    // which instrument it inherits when it names none, and what it classifies as. The standard
-    // curve rules below are stated over these resolved values rather than the submitted ones.
+    // Per-reading context, resolved before the transaction: which stream the row lands on and
+    // which instrument the slot's deployment would give it when it names none.
     struct Resolved {
         stream_id: Uuid,
         owner: ResolvedOwner,
-        measurement_type: String,
     }
     let resolved: Vec<Resolved> = payload
         .readings
@@ -1276,37 +1286,9 @@ pub async fn insert_batch_readings(
             } else {
                 ResolvedOwner::default()
             };
-            let measurement_type =
-                crate::routes::private::readings::service::resolve_measurement_type(
-                    r.measurement_type.as_deref(),
-                    stream_defaults.get(&stream_id).and_then(|d| d.as_deref()),
-                    batch_instrument(r.sensor_id, owner.sensor_id, None),
-                    &sensor_types,
-                );
-            Resolved {
-                stream_id,
-                owner,
-                measurement_type,
-            }
+            Resolved { stream_id, owner }
         })
         .collect();
-
-    // A caller-supplied standard curve is held to the same rule as a grab entry: the reading must
-    // be that instrument's own spot measurement, and the corrected value is computed here from the
-    // curve rather than taken from the request.
-    let claims: Vec<CurveClaim<'_>> = payload
-        .readings
-        .iter()
-        .zip(&resolved)
-        .filter_map(|(r, res)| {
-            r.standard_curve_id.map(|id| CurveClaim {
-                standard_curve_id: id,
-                sensor_id: batch_instrument(r.sensor_id, res.owner.sensor_id, None),
-                measurement_type: &res.measurement_type,
-            })
-        })
-        .collect();
-    let standard_curve_models = admit_standard_curves(&state.db, &claims).await?;
 
     // The base calibration every row sits on, so the stored value is the one its recorded curves
     // produce: instrument correction first, hand-picked curve on its result.
@@ -1341,26 +1323,47 @@ pub async fn insert_batch_readings(
         }
     };
 
-    // The cadence a reading is stored under is resolved, not declared, so the replicate index is
-    // judged against the resolved value rather than the request's.
-    for (r, res) in payload.readings.iter().zip(&resolved) {
-        crate::routes::private::readings::service::admission::admit_replicate_index(
-            Some(res.measurement_type.as_str()),
-            r.replicate_index.unwrap_or(0),
-        )?;
+    // What a row is stored against is decided in the transaction storing it, from the pairing its
+    // stream reads there: a row on an unpaired stream keeps only what it declared. Its cadence and
+    // its curve claim are judged against that same attribution, never an instrument it does not
+    // name.
+    let rows: Vec<(ReadingInput, Resolved)> = payload.readings.into_iter().zip(resolved).collect();
+    struct Decided {
+        attribution: crate::routes::private::readings::service::BatchAttribution,
+        measurement_type: String,
     }
-
-    let mut models = payload
-        .readings
-        .into_iter()
-        .zip(resolved)
-        .map(|(r, res)| -> AppResult<readings::ActiveModel> {
-            let Resolved {
-                stream_id,
-                owner,
-                measurement_type,
-            } = res;
-            let calibration_id = r.calibration_id.or(owner.calibration_id);
+    let decide = |r: &ReadingInput, res: &Resolved, paired: bool| {
+        let channel = stream_sensors.get(&res.stream_id).copied();
+        let attribution = crate::routes::private::readings::service::batch_attribution(
+            crate::routes::private::readings::service::BatchAttribution {
+                sensor_id: r.sensor_id,
+                deployment_id: r.deployment_id,
+                calibration_id: r.calibration_id,
+            },
+            &res.owner,
+            channel,
+            paired,
+        );
+        let measurement_type = crate::routes::private::readings::service::resolve_measurement_type(
+            r.measurement_type.as_deref(),
+            stream_defaults
+                .get(&res.stream_id)
+                .and_then(|d| d.as_deref()),
+            attribution.cadence_instrument(channel),
+            &sensor_types,
+        );
+        Decided {
+            attribution,
+            measurement_type,
+        }
+    };
+    let model_of =
+        |r: &ReadingInput,
+         res: &Resolved,
+         decided: &Decided,
+         standard_curve_models: &HashMap<Uuid, crate::routes::private::standard_curves::Model>|
+         -> AppResult<readings::ActiveModel> {
+            let attribution = decided.attribution;
             let standard = r.standard_curve_id.map(|id| {
                 let c = &standard_curve_models[&id];
                 sensor_calibrations::service::Curve {
@@ -1369,11 +1372,13 @@ pub async fn insert_batch_readings(
                     intercept: c.intercept,
                 }
             });
-            let base = calibration_id.and_then(|id| base_calibrations.get(&id).copied());
+            let base = attribution
+                .calibration_id
+                .and_then(|id| base_calibrations.get(&id).copied());
             let correction = crate::routes::private::readings::service::batch_correction(
                 r.raw_value,
                 r.calibrated_value,
-                calibration_id,
+                attribution.calibration_id,
                 base,
                 standard,
             )
@@ -1382,26 +1387,21 @@ pub async fn insert_batch_readings(
                 standard_curve_id: Set(r.standard_curve_id),
                 provenance_kind: Set(Some("batch".to_string())),
                 calibrated_value: Set(correction.calibrated_value),
-                sensor_id: Set(batch_instrument(
-                    r.sensor_id,
-                    owner.sensor_id,
-                    stream_sensors.get(&stream_id).copied(),
-                )),
+                sensor_id: Set(attribution.sensor_id),
                 calibration_id: Set(correction.calibration_id),
-                deployment_id: Set(r.deployment_id.or(owner.deployment_id)),
-                measurement_type: Set(Some(measurement_type)),
+                deployment_id: Set(attribution.deployment_id),
+                measurement_type: Set(Some(decided.measurement_type.clone())),
                 sample_id: Set(r.sample_id),
                 ..readings::new(
-                    stream_id,
+                    res.stream_id,
                     r.time.into(),
                     r.replicate_index.unwrap_or(0),
                     r.raw_value,
                 )
             })
-        })
-        .collect::<AppResult<Vec<_>>>()?;
+        };
 
-    let total = models.len();
+    let total = rows.len();
     let inserted: usize;
     let overwritten: usize;
     let conflict = payload.conflict;
@@ -1414,9 +1414,11 @@ pub async fn insert_batch_readings(
     // A correction is recorded as what made it. A batch is usually a person or a script acting for
     // one; a sync service reaching the same route is recorded as sync.
     let origin = auth.origin();
+    let span = batch_span(&site_timestamps_for_derived);
     let touched_events;
-    let attributions;
-    (inserted, overwritten, touched_events, attributions) = crate::common::bulk_write::guarded(&state.db, async |txn| {
+    let tail;
+    let models;
+    (inserted, overwritten, touched_events, tail, models) = crate::common::bulk_write::guarded(&state.db, async |txn| {
         let attributions = crate::routes::private::readings::service::lock_stream_attributions(
             txn,
             stream_cache.values().copied(),
@@ -1424,10 +1426,40 @@ pub async fn insert_batch_readings(
         .await?;
         let attributed_sites: Vec<Uuid> = attributions.values().filter_map(|(s, _)| *s).collect();
         enforce_project_scope_for_sites(&state.db, &scope, &attributed_sites).await?;
-        for m in &mut models {
-            let (site_id, parameter_id) = attributions[m.stream_id.as_ref()];
+        let decisions: Vec<_> = rows
+            .iter()
+            .map(|(r, res)| decide(r, res, attributions[&res.stream_id].0.is_some()))
+            .collect();
+        // The cadence a reading is stored under is resolved, not declared, so the replicate index
+        // is judged against the resolved value rather than the request's.
+        for ((r, _), decided) in rows.iter().zip(&decisions) {
+            crate::routes::private::readings::service::admission::admit_replicate_index(
+                Some(decided.measurement_type.as_str()),
+                r.replicate_index.unwrap_or(0),
+            )?;
+        }
+        // A caller-supplied standard curve is held to the same rule as a grab entry: the reading
+        // must be that instrument's own spot measurement, and the corrected value is computed here
+        // from the curve rather than taken from the request.
+        let claims: Vec<CurveClaim<'_>> = rows
+            .iter()
+            .zip(&decisions)
+            .filter_map(|((r, _), decided)| {
+                r.standard_curve_id.map(|id| CurveClaim {
+                    standard_curve_id: id,
+                    sensor_id: decided.attribution.sensor_id,
+                    measurement_type: &decided.measurement_type,
+                })
+            })
+            .collect();
+        let standard_curve_models = admit_standard_curves(txn, &claims).await?;
+        let mut models = Vec::with_capacity(rows.len());
+        for ((r, res), decided) in rows.iter().zip(&decisions) {
+            let (site_id, parameter_id) = attributions[&res.stream_id];
+            let mut m = model_of(r, res, decided, &standard_curve_models)?;
             m.site_id = Set(site_id);
             m.parameter_id = Set(parameter_id);
+            models.push(m);
         }
 
         let mut inserted = 0usize;
@@ -1543,7 +1575,16 @@ pub async fn insert_batch_readings(
                 .await?;
         }
 
-        Ok((inserted, overwritten, touched_events, attributions))
+        let tail = batch_tail(
+            inserted + overwritten,
+            overwritten,
+            span,
+            &stream_cache,
+            &attributions,
+            touched_events.clone(),
+        );
+        crate::routes::private::readings::service::queue(txn, &tail.0, &tail.1).await?;
+        Ok((inserted, overwritten, touched_events, tail, models))
     })
     .await?;
 
@@ -1590,17 +1631,6 @@ pub async fn insert_batch_readings(
         "Batch readings insert complete"
     );
 
-    let earliest = site_timestamps_for_derived
-        .values()
-        .flatten()
-        .min()
-        .copied();
-    let latest = site_timestamps_for_derived
-        .values()
-        .flatten()
-        .max()
-        .copied();
-
     // Auto-compute derived values for affected sites, tracked as a job. Spawn-guard: keep only
     // sites with an active derived parameter, others would compute nothing.
     if inserted > 0 || overwritten > 0 {
@@ -1634,51 +1664,71 @@ pub async fn insert_batch_readings(
         }
     }
 
-    // An overwrite replaced values the rollups have already materialised; an insert appended past
-    // them, which the next scheduled refresh covers. Best-effort: the rows are committed, so a
-    // refresh losing a lock to the janitor must not report a write that happened as one that did
-    // not. Episodes go to the `alarm_backfill` job because a batch can span a long window.
-    let written = crate::routes::private::readings::service::Written::new(
-        u64::try_from(inserted + overwritten).unwrap_or(u64::MAX),
-    )
-    .over(earliest.zip(latest))
-    .at(stream_cache
-        .values()
-        .map(|stream_id| {
-            let (site_id, parameter_id) = attributions[stream_id];
-            crate::routes::private::readings::service::Slot {
-                site_id,
-                parameter_id,
-                stream_id: Some(*stream_id),
-            }
-        })
-        .collect())
-    .touching(touched_events);
-    crate::routes::private::readings::service::run(
-        &state,
-        &written,
-        &crate::routes::private::readings::service::Axes {
-            cache: crate::routes::private::readings::service::Cache::Sites,
-            refresh: if overwritten > 0 {
-                crate::routes::private::readings::service::Refresh::Range { fatal: false }
-            } else {
-                crate::routes::private::readings::service::Refresh::Skip
-            },
-            announce: true,
-            reconcile_alarms: true,
-            episodes: crate::routes::private::readings::service::Episodes::Job,
-            recompute_derived: false,
-            writer: crate::routes::private::collection_events::flows::Writer::Person,
-        },
-        &actor,
-    )
-    .await?;
+    crate::routes::private::readings::service::run(&state, &tail.0, &tail.1, &actor).await?;
 
     Ok(Json(BatchReadingsResponse {
         inserted,
         overwritten,
         calculations,
     }))
+}
+
+/// The instants a batch landed at, earliest and latest.
+fn batch_span(
+    site_timestamps: &HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>>,
+) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    let instants = || site_timestamps.values().flatten().copied();
+    instants().min().zip(instants().max())
+}
+
+/// What a batch landed, in the shape the shared tail reads, and the tail it takes.
+///
+/// An overwrite replaced values the rollups have already materialised; an insert appended past
+/// them, which the next scheduled refresh covers. Best-effort: the rows are committed, so a
+/// refresh losing a lock to the janitor must not report a write that happened as one that did
+/// not. Episodes go to the `alarm_backfill` job because a batch can span a long window.
+fn batch_tail(
+    moved: usize,
+    overwritten: usize,
+    span: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    streams: &HashMap<(Uuid, Uuid), Uuid>,
+    attributions: &HashMap<Uuid, (Option<Uuid>, Option<Uuid>)>,
+    touched_events: Vec<crate::routes::private::collection_events::flows::TouchedEvent>,
+) -> (
+    crate::routes::private::readings::service::Written,
+    crate::routes::private::readings::service::Axes,
+) {
+    use crate::routes::private::readings::service::{
+        Axes, Cache, Episodes, Refresh, Slot, Written,
+    };
+    let written = Written::new(u64::try_from(moved).unwrap_or(u64::MAX))
+        .over(span)
+        .at(streams
+            .values()
+            .map(|stream_id| {
+                let (site_id, parameter_id) = attributions[stream_id];
+                Slot {
+                    site_id,
+                    parameter_id,
+                    stream_id: Some(*stream_id),
+                }
+            })
+            .collect())
+        .touching(touched_events);
+    let axes = Axes {
+        cache: Cache::Sites,
+        refresh: if overwritten > 0 {
+            Refresh::Range { fatal: false }
+        } else {
+            Refresh::Skip
+        },
+        announce: true,
+        reconcile_alarms: true,
+        episodes: Episodes::Job,
+        recompute_derived: false,
+        writer: crate::routes::private::collection_events::flows::Writer::Person,
+    };
+    (written, axes)
 }
 
 /// Stream-based data ingestion. Inserts readings keyed by `stream_id`. If the stream is
@@ -2007,48 +2057,22 @@ pub async fn insert_grab_samples(
         provenance_kind,
         entry_state,
     };
+    let (written, tail) = crate::common::bulk_write::guarded(db, async |txn| {
+        let written = write.run(txn).await?;
+        let tail = write.tail(txn, &written).await?;
+        crate::routes::private::readings::service::queue(txn, &tail.0, &tail.1).await?;
+        Ok((written, tail))
+    })
+    .await?;
+    crate::routes::private::readings::service::run(&state, &tail.0, &tail.1, &actor).await?;
     let GrabWritten {
         inserted,
         replaced,
         kept_curated,
         withdrawn,
         created_sample_ids,
-        touched_events,
-    } = crate::common::bulk_write::guarded(db, async |txn| write.run(txn).await).await?;
-
-    // The value has landed: the calculations that read it run without anyone asking (ADR 0007),
-    // the sampled slots are reconciled and their episodes rebuilt inline (one `reprocessing_jobs`
-    // row per field campaign entry would be the noise), and the site's cached responses go. Grabs
-    // are excluded from the rollups, so there is nothing to refresh. A stream calculation holding
-    // a saved parameter (Q230) is recomputed over the pulses that read it, as a job.
-    let saved: Vec<Uuid> = stream_cache.keys().copied().collect();
-    let holds =
-        crate::routes::private::derived_parameters::flows::held_by_a_calculation(&state.db, &saved)
-            .await?;
-    let written = crate::routes::private::readings::service::Written::new(
-        u64::try_from(inserted + replaced).unwrap_or(u64::MAX),
-    )
-    .over(grab_span(readings))
-    .at(stream_cache
-        .keys()
-        .map(|pid| crate::routes::private::readings::service::Slot::paired(payload.site_id, *pid))
-        .collect())
-    .touching(touched_events);
-    crate::routes::private::readings::service::run(
-        &state,
-        &written,
-        &crate::routes::private::readings::service::Axes {
-            cache: crate::routes::private::readings::service::Cache::Sites,
-            refresh: crate::routes::private::readings::service::Refresh::Skip,
-            announce: false,
-            reconcile_alarms: true,
-            episodes: crate::routes::private::readings::service::Episodes::Inline,
-            recompute_derived: holds,
-            writer,
-        },
-        &crate::common::actor::label(&auth),
-    )
-    .await?;
+        ..
+    } = written;
 
     let samples_created = created_sample_ids.len();
     tracing::info!(total, inserted, replaced, kept_curated, withdrawn, samples_created, site = %site.name, "Grab samples inserted");

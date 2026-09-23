@@ -127,6 +127,171 @@ impl From<import_staging::Model> for StagedRow {
     }
 }
 
+/// A staged row as its stream's pairing stands in the transaction storing it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Attributed {
+    pub(super) row: StagedRow,
+    /// The slot the stream was paired to after the row was staged, whose reprocess resolves the
+    /// row's deployment and curve.
+    pub(super) slot_since_staging: Option<(Uuid, Uuid)>,
+}
+
+/// Attribute a staged row from the pairing its stream holds as the write transaction locked it,
+/// not the one it was staged under. An unpaired stream stores the row with no site, parameter,
+/// instrument, deployment or curve. A stream paired since staging stamps its slot and instrument,
+/// the way the pairing backfill would have, and leaves the deployment and curve to its reprocess.
+pub(super) fn attribute_staged(
+    row: StagedRow,
+    stream: readings::service::TargetStream,
+) -> Attributed {
+    let Some((site_id, parameter_id)) = stream.slot else {
+        return Attributed {
+            row: StagedRow {
+                site_id: None,
+                parameter_id: None,
+                sensor_id: None,
+                calibration_id: None,
+                deployment_id: None,
+                ..row
+            },
+            slot_since_staging: None,
+        };
+    };
+    if row.site_id == Some(site_id) && row.parameter_id == Some(parameter_id) {
+        return Attributed {
+            row,
+            slot_since_staging: None,
+        };
+    }
+    Attributed {
+        row: StagedRow {
+            site_id: Some(site_id),
+            parameter_id: Some(parameter_id),
+            sensor_id: stream.instrument.or(row.sensor_id),
+            calibration_id: None,
+            deployment_id: None,
+            ..row
+        },
+        slot_since_staging: Some((site_id, parameter_id)),
+    }
+}
+
+/// The readings an import stores from its attributed rows, with the request-level
+/// measurement_type re-applied (or each row's resolved from its stream and instrument), and rows
+/// sharing (stream_id, time) numbered replicate_index 0..n-1 in staging seq order.
+async fn import_models<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    rows: &[StagedRow],
+    request_measurement_type: Option<&str>,
+) -> Result<Vec<readings::ActiveModel>, DbErr> {
+    let curves = import_curves(conn, rows).await?;
+    let (stream_defaults, sensor_types) = if request_measurement_type.is_none() {
+        let mut stream_ids: Vec<Uuid> = rows.iter().map(|row| row.stream_id).collect();
+        stream_ids.sort_unstable();
+        stream_ids.dedup();
+        let mut sensor_ids: Vec<Uuid> = rows.iter().filter_map(|row| row.sensor_id).collect();
+        sensor_ids.sort_unstable();
+        sensor_ids.dedup();
+        let defaults: std::collections::HashMap<Uuid, Option<String>> =
+            data_streams::Entity::find()
+                .filter(data_streams::Column::Id.is_in(stream_ids))
+                .all(conn)
+                .await?
+                .into_iter()
+                .map(|stream| (stream.id, stream.measurement_type))
+                .collect();
+        let types = readings::service::measurement_types_for_sensors(conn, &sensor_ids).await?;
+        (defaults, types)
+    } else {
+        Default::default()
+    };
+
+    let mut group_counts: std::collections::HashMap<(Uuid, chrono::DateTime<chrono::Utc>), i16> =
+        std::collections::HashMap::with_capacity(rows.len());
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let measurement_type = readings::service::resolve_measurement_type(
+                request_measurement_type,
+                stream_defaults
+                    .get(&row.stream_id)
+                    .and_then(|d| d.as_deref()),
+                row.sensor_id,
+                &sensor_types,
+            );
+            // A value is only ever what a curve produced: with none resolved the column stays
+            // NULL, the same as an entry through `/grab_samples` or `/ingest`, so an uncorrected
+            // measurement is never mistaken for a corrected one. Consumers read
+            // COALESCE(calibrated_value, raw_value), so the raw value is still what is served.
+            let base = row.calibration_id.and_then(|id| curves.get(&id)).copied();
+            let counter = group_counts
+                .entry((row.stream_id, row.time.with_timezone(&chrono::Utc)))
+                .or_insert(0);
+            let replicate_index = *counter;
+            *counter += 1;
+            readings::ActiveModel {
+                provenance_kind: Set(Some("csv_import".to_string())),
+                site_id: Set(row.site_id),
+                parameter_id: Set(row.parameter_id),
+                calibrated_value: Set(base.map(|c| apply_curves(row.raw_value, Some(c), None))),
+                sensor_id: Set(row.sensor_id),
+                calibration_id: Set(row.calibration_id),
+                deployment_id: Set(row.deployment_id),
+                logged: Set(Some(false)),
+                measurement_type: Set(Some(measurement_type)),
+                ..readings::new(row.stream_id, row.time, replicate_index, row.raw_value)
+            }
+        })
+        .collect())
+}
+
+/// The coefficients of each calibration the rows name, read back so the stored value is the one
+/// that calibration produces: a row that names a curve and carries the uncorrected number claims a
+/// correction it never had.
+async fn import_curves<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    rows: &[StagedRow],
+) -> Result<std::collections::HashMap<Uuid, Curve>, DbErr> {
+    let mut ids: Vec<Uuid> = rows.iter().filter_map(|row| row.calibration_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    Ok(sensor_calibrations::models::Entity::find()
+        .filter(sensor_calibrations::models::Column::Id.is_in(ids))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|curve| {
+            let c = Curve {
+                id: curve.id,
+                slope: curve.slope,
+                intercept: curve.intercept,
+            };
+            (curve.id, c)
+        })
+        .collect())
+}
+
+/// How many spot rows each (stream, instant) group carries.
+fn spot_group_sizes(
+    models: &[readings::ActiveModel],
+) -> std::collections::HashMap<(Uuid, chrono::DateTime<chrono::Utc>), i16> {
+    let mut sizes = std::collections::HashMap::new();
+    for m in models {
+        if m.measurement_type.as_ref().as_deref() == Some(readings::service::SPOT) {
+            *sizes
+                .entry((
+                    *m.stream_id.as_ref(),
+                    m.time.as_ref().with_timezone(&chrono::Utc),
+                ))
+                .or_default() += 1;
+        }
+    }
+    sizes
+}
+
 /// A curated replicate an overwrite is about to displace, and what makes it curated.
 #[derive(FromQueryResult)]
 pub(super) struct CuratedRow {
@@ -260,6 +425,56 @@ impl Job for CsvImport {
     }
 }
 
+/// An import is a person entering visits after the fact, so the rollups are refreshed from the
+/// earliest instant it landed, and a failure there fails the job: a swallowed refresh reports an
+/// import as complete while the rollups still serve the old numbers. The window can be long, so
+/// episodes are rebuilt by the `alarm_backfill` job.
+const IMPORT_TAIL: crate::routes::private::readings::service::Axes =
+    crate::routes::private::readings::service::Axes {
+        cache: crate::routes::private::readings::service::Cache::Sites,
+        refresh: crate::routes::private::readings::service::Refresh::Since { fatal: true },
+        announce: true,
+        reconcile_alarms: false,
+        episodes: crate::routes::private::readings::service::Episodes::Job,
+        recompute_derived: false,
+        writer: crate::routes::private::collection_events::flows::Writer::Person,
+    };
+
+/// The rows an import inserted and the rows it corrected. The rows a correction was recorded for
+/// are the rows the write moved, so the run reports the same number the decision record holds
+/// rather than the staged estimate.
+fn import_counts(
+    conflict: ConflictMode,
+    affected: usize,
+    overlapping: usize,
+    corrected: usize,
+) -> (usize, usize) {
+    match conflict {
+        ConflictMode::Skip => (affected, 0),
+        ConflictMode::Overwrite => (affected.saturating_sub(overlapping), corrected),
+    }
+}
+
+/// What an import landed at one site, in the shape the shared tail reads.
+fn import_written(
+    site_id: Uuid,
+    span: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    param_streams: &[(Uuid, Uuid)],
+    moved: usize,
+) -> crate::routes::private::readings::service::Written {
+    crate::routes::private::readings::service::Written::new(
+        u64::try_from(moved).unwrap_or(u64::MAX),
+    )
+    .over(span)
+    .at(param_streams
+        .iter()
+        .map(|(parameter_id, stream_id)| {
+            crate::routes::private::readings::service::Slot::paired(site_id, *parameter_id)
+                .through(*stream_id)
+        })
+        .collect())
+}
+
 impl CsvImport {
     pub(super) async fn run_import(ctx: &JobContext, import_token: Uuid) -> Result<i64, DbErr> {
         let params = ctx.params();
@@ -334,190 +549,50 @@ impl CsvImport {
             }
         }
 
-        // Staging carries the calibration each row resolved at upload time. The coefficients are
-        // read back here so the stored value is the one that calibration produces: a row that names
-        // a curve and carries the uncorrected number claims a correction it never had.
-        let staged_curves = {
-            let mut ids: Vec<Uuid> = staged.iter().filter_map(|row| row.calibration_id).collect();
-            ids.sort_unstable();
-            ids.dedup();
-            let mut curves: std::collections::HashMap<Uuid, Curve> =
-                std::collections::HashMap::new();
-            if !ids.is_empty() {
-                for curve in sensor_calibrations::models::Entity::find()
-                    .filter(sensor_calibrations::models::Column::Id.is_in(ids))
-                    .all(ctx.db())
-                    .await?
-                {
-                    curves.insert(
-                        curve.id,
-                        Curve {
-                            id: curve.id,
-                            slope: curve.slope,
-                            intercept: curve.intercept,
-                        },
-                    );
-                }
-            }
-            curves
-        };
-
-        let (stream_defaults, sensor_types) = if request_measurement_type.is_none() {
-            let mut stream_ids: Vec<Uuid> = Vec::new();
-            let mut sensor_ids: Vec<Uuid> = Vec::new();
-            for row in &staged {
-                stream_ids.push(row.stream_id);
-                if let Some(sid) = row.sensor_id {
-                    sensor_ids.push(sid);
-                }
-            }
-            stream_ids.sort_unstable();
-            stream_ids.dedup();
-            sensor_ids.sort_unstable();
-            sensor_ids.dedup();
-
-            let mut defaults: std::collections::HashMap<Uuid, Option<String>> =
-                std::collections::HashMap::new();
-            for stream in data_streams::Entity::find()
-                .filter(data_streams::Column::Id.is_in(stream_ids))
-                .all(ctx.db())
-                .await?
-            {
-                defaults.insert(stream.id, stream.measurement_type);
-            }
-            let types = crate::routes::private::readings::service::measurement_types_for_sensors(
-                ctx.db(),
-                &sensor_ids,
-            )
-            .await?;
-            (defaults, types)
-        } else {
-            (
-                std::collections::HashMap::new(),
-                std::collections::HashMap::new(),
-            )
-        };
-
-        let mut models: Vec<readings::ActiveModel> = Vec::with_capacity(staged.len());
-        let mut distinct_ts: Vec<chrono::DateTime<chrono::Utc>> = Vec::new();
-        for row in &staged {
-            let &StagedRow {
-                stream_id,
-                site_id: row_site_id,
-                parameter_id,
-                time,
-                raw_value,
-                sensor_id,
-                calibration_id,
-                deployment_id,
-            } = row;
-            distinct_ts.push(time.with_timezone(&chrono::Utc));
-            let measurement_type =
-                crate::routes::private::readings::service::resolve_measurement_type(
-                    request_measurement_type.as_deref(),
-                    stream_defaults.get(&stream_id).and_then(|d| d.as_deref()),
-                    sensor_id,
-                    &sensor_types,
-                );
-            // A value is only ever what a curve produced: with none resolved the column stays
-            // NULL, the same as an entry through `/grab_samples` or `/ingest`, so an uncorrected
-            // measurement is never mistaken for a corrected one. Consumers read
-            // COALESCE(calibrated_value, raw_value), so the raw value is still what is served.
-            let base = calibration_id
-                .and_then(|id| staged_curves.get(&id))
-                .copied();
-            let calibrated_value = base.map(|c| apply_curves(raw_value, Some(c), None));
-            models.push(readings::ActiveModel {
-                provenance_kind: Set(Some("csv_import".to_string())),
-                site_id: Set(row_site_id),
-                parameter_id: Set(parameter_id),
-                calibrated_value: Set(calibrated_value),
-                sensor_id: Set(sensor_id),
-                calibration_id: Set(calibration_id),
-                deployment_id: Set(deployment_id),
-                logged: Set(Some(false)),
-                measurement_type: Set(Some(measurement_type)),
-                ..readings::new(stream_id, time, 0, raw_value)
-            });
-        }
+        let total = i32::try_from(staged.len()).unwrap_or(i32::MAX);
+        ctx.set_progress(0, Some(total)).await;
+        let mut distinct_ts: Vec<chrono::DateTime<chrono::Utc>> = staged
+            .iter()
+            .map(|row| row.time.with_timezone(&chrono::Utc))
+            .collect();
         distinct_ts.sort_unstable();
         distinct_ts.dedup();
 
-        // Rows sharing (stream_id, time) are numbered replicate_index 0..n-1 in staging seq order.
-        let mut group_counts: std::collections::HashMap<
-            (Uuid, chrono::DateTime<chrono::Utc>),
-            i16,
-        > = std::collections::HashMap::with_capacity(models.len());
-        for m in &mut models {
-            let key = (
-                *m.stream_id.as_ref(),
-                m.time.as_ref().with_timezone(&chrono::Utc),
-            );
-            let counter = group_counts.entry(key).or_insert(0);
-            m.replicate_index = Set(*counter);
-            *counter += 1;
-        }
-
-        // Whether a group is a sample is not decided here: `crate::routes::private::readings::service::forms_sample` is the
-        // one answer, two or more rows classified spot sharing a slot instant.
-        let mut spot_groups: std::collections::HashMap<
-            (Uuid, Uuid, chrono::DateTime<chrono::Utc>),
-            usize,
-        > = std::collections::HashMap::new();
-        for m in &models {
-            if m.measurement_type.as_ref().as_deref()
-                != Some(crate::routes::private::readings::service::SPOT)
-            {
-                continue;
-            }
-            if let (Some(sid), Some(pid)) = (*m.site_id.as_ref(), *m.parameter_id.as_ref()) {
-                *spot_groups
-                    .entry((sid, pid, m.time.as_ref().with_timezone(&chrono::Utc)))
-                    .or_default() += 1;
-            }
-        }
-        let replicate_groups = spot_groups
-            .values()
-            .filter(|count| crate::routes::private::readings::service::forms_sample(**count))
-            .count();
-
-        let total = i32::try_from(models.len()).unwrap_or(i32::MAX);
-        ctx.set_progress(0, Some(total)).await;
-        ctx.info(&format!(
-            "Staged {} readings at {site_name} over {} instants, {replicate_groups} of them replicate groups",
-            models.len(),
-            distinct_ts.len()
-        ))
-        .await;
-
-        // An overwrite replaces the whole replicate set, not the Nth row by the Nth: stored spot
-        // replicates beyond the incoming count would survive a positional upsert and keep
-        // double-counting the group, so the tail leaves the group before the insert.
-        let mut spot_group_sizes: std::collections::HashMap<
-            (Uuid, chrono::DateTime<chrono::Utc>),
-            i16,
-        > = std::collections::HashMap::new();
-        if conflict == ConflictMode::Overwrite {
-            for m in &models {
-                if m.measurement_type.as_ref().as_deref()
-                    == Some(crate::routes::private::readings::service::SPOT)
-                {
-                    *spot_group_sizes
-                        .entry((
-                            *m.stream_id.as_ref(),
-                            m.time.as_ref().with_timezone(&chrono::Utc),
-                        ))
-                        .or_default() += 1;
-                }
-            }
-        }
-
-        // Phase 1: displace the tail and insert, in one transaction. A crash between the two
-        // would otherwise leave the group short of both its old rows and its new ones.
+        // Phase 1: attribute, displace the tail and insert, in one transaction. The rows take the
+        // pairing their streams hold with those streams locked, so a pairing or unpair committed
+        // since staging is what they land under, and one arriving now waits for them. A crash
+        // between the displacement and the insert would otherwise leave the group short of both
+        // its old rows and its new ones.
         let mut inserted_so_far = 0usize;
-        let (affected_total, corrected) = crate::common::bulk_write::guarded(ctx.db(), async |txn| {
-            for ((stream_id, time), count) in &spot_group_sizes {
-                displace_spot_tail(txn, *stream_id, *time, *count).await?;
+        let (affected_total, corrected, models) = crate::common::bulk_write::guarded(ctx.db(), async |txn| {
+            let streams = readings::service::lock_target_streams(
+                txn,
+                staged.iter().map(|row| row.stream_id),
+            )
+            .await?;
+            let mut since_staging: std::collections::HashMap<Uuid, ((Uuid, Uuid), u64)> =
+                std::collections::HashMap::new();
+            let attributed: Vec<StagedRow> = staged
+                .iter()
+                .map(|row| {
+                    let stream = streams.get(&row.stream_id).copied().unwrap_or_default();
+                    let attributed = attribute_staged(*row, stream);
+                    if let Some(slot) = attributed.slot_since_staging {
+                        since_staging.entry(row.stream_id).or_insert((slot, 0)).1 += 1;
+                    }
+                    attributed.row
+                })
+                .collect();
+            let models =
+                import_models(txn, &attributed, request_measurement_type.as_deref()).await?;
+
+            // An overwrite replaces the whole replicate set, not the Nth row by the Nth: stored
+            // spot replicates beyond the incoming count would survive a positional upsert and keep
+            // double-counting the group, so the tail leaves the group before the insert.
+            if conflict == ConflictMode::Overwrite {
+                for ((stream_id, time), count) in spot_group_sizes(&models) {
+                    displace_spot_tail(txn, stream_id, time, count).await?;
+                }
             }
 
             let mut affected_total = 0usize;
@@ -560,10 +635,51 @@ impl CsvImport {
                     .await;
                 }
             }
-            Ok((affected_total, corrected))
+
+            // A stream paired since staging landed its rows under the slot alone: the reprocess
+            // the pairing owes resolves their deployment and curve, as it would have had they
+            // been stored before the pairing.
+            for (stream_id, (slot, rows)) in since_staging {
+                data_streams::flows::enqueue_slot_reprocess(txn, stream_id, slot, rows).await?;
+            }
+            let (inserted, overwritten) =
+                import_counts(conflict, affected_total, overlapping, corrected);
+            let landed =
+                import_written(site_id, since.zip(latest), &param_streams, inserted + overwritten);
+            crate::routes::private::readings::service::queue(txn, &landed, &IMPORT_TAIL).await?;
+            Ok((affected_total, corrected, models))
         })
         .await
         .map_err(as_db_err)?;
+
+        // Whether a group is a sample is not decided here: `crate::routes::private::readings::service::forms_sample` is the
+        // one answer, two or more rows classified spot sharing a slot instant.
+        let mut spot_groups: std::collections::HashMap<
+            (Uuid, Uuid, chrono::DateTime<chrono::Utc>),
+            usize,
+        > = std::collections::HashMap::new();
+        for m in &models {
+            if m.measurement_type.as_ref().as_deref()
+                != Some(crate::routes::private::readings::service::SPOT)
+            {
+                continue;
+            }
+            if let (Some(sid), Some(pid)) = (*m.site_id.as_ref(), *m.parameter_id.as_ref()) {
+                *spot_groups
+                    .entry((sid, pid, m.time.as_ref().with_timezone(&chrono::Utc)))
+                    .or_default() += 1;
+            }
+        }
+        let replicate_groups = spot_groups
+            .values()
+            .filter(|count| crate::routes::private::readings::service::forms_sample(**count))
+            .count();
+        ctx.info(&format!(
+            "Imported {} readings at {site_name} over {} instants, {replicate_groups} of them replicate groups",
+            models.len(),
+            distinct_ts.len()
+        ))
+        .await;
 
         // An overwrite replaces the measurement, not the correction: an import never decides which
         // curve applies, so the corrected raw value goes back through the curves already on the row.
@@ -639,12 +755,8 @@ impl CsvImport {
             .map_err(as_db_err)?;
         }
 
-        let (inserted_total, overwritten) = match conflict {
-            ConflictMode::Skip => (affected_total, 0),
-            // The rows a correction was recorded for are the rows the write moved, so the run
-            // reports the same number the decision record holds rather than the staged estimate.
-            ConflictMode::Overwrite => (affected_total.saturating_sub(overlapping), corrected),
-        };
+        let (inserted_total, overwritten) =
+            import_counts(conflict, affected_total, overlapping, corrected);
         tracing::info!(site = %site_name, inserted_total, overwritten, "CSV import inserted readings");
         ctx.info(&format!(
             "Wrote {inserted_total} readings and corrected {overwritten}"
@@ -681,41 +793,21 @@ impl CsvImport {
             ))
             .await;
 
-            // An import is a person entering visits after the fact, so the rollups are refreshed
-            // from the earliest instant it landed, and a failure there fails the job: a swallowed
-            // refresh reports an import as complete while the rollups still serve the old numbers.
-            // The window can be long, so episodes are rebuilt by the `alarm_backfill` job.
             let app = crate::common::global_app_state();
-            let written = crate::routes::private::readings::service::Written::new(
-                u64::try_from(inserted_total + overwritten).unwrap_or(u64::MAX),
-            )
-            .over(since.zip(latest))
-            .at(param_streams
-                .iter()
-                .map(|(parameter_id, stream_id)| {
-                    crate::routes::private::readings::service::Slot::paired(site_id, *parameter_id)
-                        .through(*stream_id)
-                })
-                .collect())
-            .touching(touched_visits);
             crate::routes::private::readings::service::run(
                 crate::routes::private::readings::service::Sink {
                     db: ctx.db(),
                     events: ctx.events(),
                     cache: app.as_ref().map(|a| &a.response_cache),
                 },
-                &written,
-                &crate::routes::private::readings::service::Axes {
-                    cache: crate::routes::private::readings::service::Cache::Sites,
-                    refresh: crate::routes::private::readings::service::Refresh::Since {
-                        fatal: true,
-                    },
-                    announce: true,
-                    reconcile_alarms: false,
-                    episodes: crate::routes::private::readings::service::Episodes::Job,
-                    recompute_derived: false,
-                    writer: crate::routes::private::collection_events::flows::Writer::Person,
-                },
+                &import_written(
+                    site_id,
+                    since.zip(latest),
+                    &param_streams,
+                    inserted_total + overwritten,
+                )
+                .touching(touched_visits),
+                &IMPORT_TAIL,
                 "csv_import",
             )
             .await

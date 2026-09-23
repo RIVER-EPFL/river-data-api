@@ -17,7 +17,7 @@ async fn cancel_endpoint_rejects_non_cancellable_and_unknown() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
-    let app = crate::common::build_test_app(db.clone());
+    let app = crate::common::build_test_app_without_worker(db.clone());
 
     // Non-cancellable type (single-statement refresh) -> 409.
     let refresh = Uuid::new_v4();
@@ -114,7 +114,7 @@ async fn cancelling_a_queued_job_lets_its_key_enqueue_again() {
     crate::common::cleanup_test_db(&db).await;
     crate::common::seed_test_data(&db).await;
     let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
-    let app = crate::common::build_test_app(db.clone());
+    let app = crate::common::build_test_app_without_worker(db.clone());
     let params = serde_json::json!({});
     let enqueue = || {
         river_db::routes::private::reprocessing_jobs::service::enqueue(

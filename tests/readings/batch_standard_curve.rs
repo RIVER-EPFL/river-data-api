@@ -420,3 +420,87 @@ async fn a_submitted_value_its_calibration_does_not_produce_is_refused() {
         Some((Some(20.0), Some(calibration)))
     );
 }
+
+/// Scenario: a low-frequency instrument is deployed at a site and parameter the site carries no
+/// slot for, and batch rows there name a curve fitted on it.
+/// Expected behaviour: the rows land on an unpaired channel and store only the instrument they
+/// declare, so a row naming none has its curve refused and is not classified by the deployed
+/// instrument's cadence, and a row declaring the instrument is judged against it.
+#[tokio::test]
+#[serial]
+async fn a_row_on_an_unpaired_channel_is_judged_by_the_instrument_it_declares() {
+    use crate::common::sensor_lifecycle::{
+        create_sensor_without_curve, deploy_sensor_for_parameter, dt,
+    };
+    let fx = setup().await;
+    let param =
+        crate::common::e2e::create_parameter(&fx.app, &fx.token, "noslotcurve", "No slot", "m")
+            .await;
+    let sensor = create_sensor_without_curve(&fx.db, "Batch-Plate-Unslotted").await;
+    fx.db
+        .execute_unprepared(&format!(
+            "UPDATE sensors SET data_frequency = 'low' WHERE id = '{sensor}'"
+        ))
+        .await
+        .expect("mark the instrument low-frequency");
+    deploy_sensor_for_parameter(&fx.db, sensor, SITE1_ID, &param, dt("2025-01-01T00:00:00Z")).await;
+    let curve = create_curve(&fx, sensor, "Batch Plate Unslotted", 2.0, 1.0).await;
+    let row = |time: &str| {
+        json!({
+            "site_id": SITE1_ID,
+            "parameter_id": param,
+            "time": time,
+            "raw_value": 10.0,
+        })
+    };
+    let stored = async |time: &str| {
+        fx.db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "SELECT r.measurement_type, r.sensor_id, r.standard_curve_id \
+                     FROM readings r JOIN data_streams s ON s.id = r.stream_id \
+                     WHERE s.source_system = 'api' \
+                     AND s.source_key = '{SITE1_ID}:{param}' AND r.time = '{time}'"
+                ),
+            ))
+            .await
+            .expect("query readings")
+            .map(|r| {
+                (
+                    r.try_get::<Option<String>>("", "measurement_type").unwrap(),
+                    r.try_get::<Option<Uuid>>("", "sensor_id").unwrap(),
+                    r.try_get::<Option<Uuid>>("", "standard_curve_id").unwrap(),
+                )
+            })
+    };
+
+    let mut claimed = row("2025-03-01T00:00:00Z");
+    claimed["standard_curve_id"] = json!(curve);
+    let (status, body) = post_batch(&fx, claimed).await;
+    assert_eq!(
+        status, 400,
+        "a curve on a row naming no instrument is refused ({status}): {body}"
+    );
+
+    let (status, body) = post_batch(&fx, row("2025-03-02T00:00:00Z")).await;
+    assert_eq!(status, 200, "a plain row is staged ({status}): {body}");
+    assert_eq!(
+        stored("2025-03-02T00:00:00Z").await,
+        Some((Some("continuous".to_string()), None, None)),
+        "the deployed instrument's cadence does not classify a row that does not name it"
+    );
+
+    let mut declared = row("2025-03-03T00:00:00Z");
+    declared["sensor_id"] = json!(sensor);
+    declared["standard_curve_id"] = json!(curve);
+    let (status, body) = post_batch(&fx, declared).await;
+    assert_eq!(
+        status, 200,
+        "a row declaring the curve's instrument is admitted ({status}): {body}"
+    );
+    assert_eq!(
+        stored("2025-03-03T00:00:00Z").await,
+        Some((Some("spot".to_string()), Some(sensor), Some(curve))),
+    );
+}

@@ -2161,6 +2161,36 @@ impl Ruling {
     }
 }
 
+/// The verification hold whose standing ruling recorded each of these decision sets, keyed by
+/// set. Such a set is undone only by reopening its hold, which restores the hold, the visit and the
+/// holds the ruling closed with it.
+pub async fn standing_rulings<C: ConnectionTrait>(
+    conn: &C,
+    set_ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, Uuid>> {
+    use sea_orm::sea_query::extension::postgres::PgBinOper;
+    if set_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let holds = hold_model::Entity::find()
+        .filter(hold_model::Column::Kind.is_in([
+            HoldKind::UnverifiedEntry.as_str(),
+            HoldKind::UnverifiedVisit.as_str(),
+        ]))
+        .filter(hold_model::Column::Status.is_in(HoldStatus::REOPENABLE.map(HoldStatus::as_str)))
+        .filter(
+            Expr::col(hold_model::Column::Resolution)
+                .binary(PgBinOper::CastJsonField, Expr::val("set_id"))
+                .is_in(set_ids.iter().map(Uuid::to_string)),
+        )
+        .all(conn)
+        .await?;
+    Ok(holds
+        .into_iter()
+        .filter_map(|h| Ruling::read(h.resolution.as_ref()).map(|r| (r.set_id, h.id)))
+        .collect())
+}
+
 /// Record the ruling on its hold, stamped with the time it was taken.
 async fn decide_ruling<C: sea_orm::ConnectionTrait>(
     conn: &C,
@@ -2389,12 +2419,12 @@ pub(super) async fn rule_on_entry(
             visit_id: None,
         };
         decide_ruling(txn, id, status, &ruling).await?;
+        // A ruling moves what the visit's calculations read, as any other curation decision does.
+        readings::service::queue_visit_recomputes(txn, &recorded, by).await?;
         Ok(recorded)
     })
     .await?;
-    // A ruling moves what the visit's calculations read and what the rollups hold, as any other
-    // curation decision does.
-    crate::routes::private::readings::service::propagate(state, &recorded, by).await?;
+    readings::service::refresh_edited_rollups(state, &recorded).await;
     state.response_cache.invalidate_all();
     Ok(Json(ResolveHoldResponse {
         status: status.to_string(),
@@ -2449,10 +2479,11 @@ pub(super) async fn reopen_ruling(
             by,
         );
         reopen_holds(txn, &[id], Some(resolution)).await?;
+        readings::service::queue_visit_recomputes(txn, &recorded, by).await?;
         Ok(recorded)
     })
     .await?;
-    crate::routes::private::readings::service::propagate(state, &recorded, by).await?;
+    readings::service::refresh_edited_rollups(state, &recorded).await;
     state.response_cache.invalidate_all();
     Ok(Json(ResolveHoldResponse {
         status: HoldStatus::Pending.as_str().to_string(),
@@ -5913,6 +5944,21 @@ pub(super) async fn plan_reading_references<C: ConnectionTrait>(
         .collect::<Result<_, _>>()?)
 }
 
+/// The visits the plan's attributed readings sit at, with the parameters each holds there.
+async fn plan_touched_events<C: ConnectionTrait>(
+    conn: &C,
+    plan_id: Uuid,
+) -> AppResult<Vec<crate::routes::private::collection_events::flows::TouchedEvent>> {
+    use crate::routes::private::collection_events::flows::{row, touched_events};
+    use sea_orm::sea_query::ExprTrait as _;
+    touched_events(
+        conn,
+        crate::routes::private::data_streams::flows::predicate(HoldScope::Plan(plan_id))
+            .add(row(readings::models::Column::ParameterId).is_not_null()),
+    )
+    .await
+}
+
 /// Attribute everything the plan's newly paired streams already hold, through the helper every
 /// pairing path runs. Deployment attribution is left to the slot reprocess the caller enqueues:
 /// a plan pairs many streams, and each reading's deployment is the one covering its own time.
@@ -6077,6 +6123,7 @@ pub async fn revert_plan(
     // never be re-attached when the stream is paired somewhere else.
     let event_ids =
         plan_reading_references(&txn, plan_id, readings::models::Column::CollectionEventId).await?;
+    let touched_events = plan_touched_events(&txn, plan_id).await?;
     let changed = plan_slot_tally(&txn, plan_id).await?;
 
     let unattributed = bulk_write::mutation(
@@ -6172,6 +6219,15 @@ pub async fn revert_plan(
     plan_active.status = Set("reverted".to_string());
     plan_active.update(&txn).await?;
 
+    // The calculations at each manual visit lost an input the plan attributed, so they run again,
+    // queued with the revert so it never commits without them.
+    crate::routes::private::collection_events::flows::enqueue_for(
+        &txn,
+        &touched_events,
+        "system",
+        crate::routes::private::collection_events::flows::Writer::Person,
+    )
+    .await?;
     txn.commit().await?;
 
     // The readings that left the rollups did so over the span the unattribution touched, and the

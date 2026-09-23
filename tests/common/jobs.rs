@@ -170,3 +170,23 @@ pub async fn restore_enqueue(db: &sea_orm::DatabaseConnection) {
         crate::common::exec(db, sql).await;
     }
 }
+
+/// Make every rollup refresh fail, which is what a refresh losing its lock looks like to the
+/// writer making it: the monthly view is renamed away from the name the refresh calls it by.
+/// [`restore_refresh`] undoes it.
+pub async fn refuse_refresh(db: &sea_orm::DatabaseConnection) {
+    restore_refresh(db).await;
+    crate::common::exec(
+        db,
+        "ALTER MATERIALIZED VIEW readings_monthly RENAME TO readings_monthly_refused",
+    )
+    .await;
+}
+
+pub async fn restore_refresh(db: &sea_orm::DatabaseConnection) {
+    crate::common::exec(
+        db,
+        "ALTER MATERIALIZED VIEW IF EXISTS readings_monthly_refused RENAME TO readings_monthly",
+    )
+    .await;
+}

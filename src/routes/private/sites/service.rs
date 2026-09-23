@@ -363,10 +363,10 @@ impl ReadingsRequest {
     }
 
     /// Whether the window's fully withdrawn spot instants are counted: a retracted visit is a fact
-    /// about the window whether or not its points are drawn, so on every collapsed view but the
-    /// continuous one.
+    /// about the window whether or not its points are drawn, so on every collapsed view that
+    /// reaches the spot arm.
     pub(super) fn counts_withdrawn(&self) -> bool {
-        !self.replicates && self.measurement_type != "continuous"
+        !self.replicates && series_arms(&self.measurement_type).spot
     }
 }
 

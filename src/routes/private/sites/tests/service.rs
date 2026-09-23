@@ -539,8 +539,8 @@ fn test_readings_request_annotations_default_to_flags_only() {
     assert!(!plain.flag_columns);
 }
 
-/// Expected behaviour: the withdrawn count is served on the collapsed view unless the filter
-/// names the continuous arm alone.
+/// Expected behaviour: the withdrawn count is served on the collapsed view exactly when the
+/// filter reaches the spot arm.
 #[test]
 fn test_readings_request_counts_withdrawn_off_the_replicate_and_continuous_views() {
     assert!(request(&readings_query()).counts_withdrawn());
@@ -554,6 +554,11 @@ fn test_readings_request_counts_withdrawn_off_the_replicate_and_continuous_views
         ..readings_query()
     };
     assert!(!request(&continuous).counts_withdrawn());
+    let derived = super::SiteReadingsQuery {
+        measurement_type: Some("derived".to_string()),
+        ..readings_query()
+    };
+    assert!(!request(&derived).counts_withdrawn());
     let replicates = super::SiteReadingsQuery {
         include_replicates: Some(true),
         ..readings_query()

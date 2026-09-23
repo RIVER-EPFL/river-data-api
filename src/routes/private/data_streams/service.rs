@@ -696,7 +696,7 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
             Some(Uuid::new_v4()),
         )
         .await?;
-        moved.touched_events = recorded.touched_events;
+        moved.touched_events = naming_target(recorded.touched_events, target_param);
     }
 
     moved.changed = readings_per_site(conn, site, source_param, target_param).await?;
@@ -744,6 +744,20 @@ pub async fn move_slot_rows<C: ConnectionTrait>(
     }
 
     Ok(moved)
+}
+
+/// The visits a slot move touched, naming the target beside the source parameter they were
+/// recorded under, since after the move each holds a value of the target.
+fn naming_target(
+    mut events: Vec<crate::routes::private::collection_events::flows::TouchedEvent>,
+    target_param: Uuid,
+) -> Vec<crate::routes::private::collection_events::flows::TouchedEvent> {
+    for event in &mut events {
+        if !event.parameter_ids.contains(&target_param) {
+            event.parameter_ids.push(target_param);
+        }
+    }
+    events
 }
 
 /// The readings a slot move is about to carry, counted per site at both parameters.

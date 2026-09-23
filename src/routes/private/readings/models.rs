@@ -812,6 +812,10 @@ pub struct DecisionRow {
     /// Whether `rollback` accepts this kind at all. A kind that projects no column has nothing to
     /// restore, so the reader offers no undo for it rather than learning that from a 409.
     pub reversible: bool,
+    /// The verification hold whose standing ruling recorded this decision's set. Such a decision
+    /// is undone by reopening that hold, never by a rollback.
+    #[schema(required)]
+    pub ruling_hold_id: Option<Uuid>,
 }
 
 /// The row every write of a decision set returns: how many landed and the span they cover.

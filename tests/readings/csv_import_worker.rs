@@ -1124,3 +1124,165 @@ async fn the_staging_sweep_takes_only_what_no_live_import_will_read() {
         "the queued import keeps what it will read"
     );
 }
+
+/// Run every queued job on this thread until none is left, the worker pool being stopped.
+async fn run_queued_jobs(db: &DatabaseConnection) {
+    use river_db::routes::private::reprocessing_jobs::service as jobs;
+    let registry = jobs::build_registry();
+    let events = tokio::sync::broadcast::channel::<river_db::common::AppEvent>(16).0;
+    let worker = jobs::worker_id();
+    while jobs::run_one_with_policy(
+        db,
+        &events,
+        &registry,
+        &worker,
+        jobs::RetryPolicy::default(),
+    )
+    .await
+    .unwrap()
+    {}
+}
+
+/// The importer's channel for `param` at `site`, and the counts that say whether its rows agree
+/// with its pairing.
+struct Channel {
+    stream_id: String,
+    stored: String,
+}
+
+impl Channel {
+    async fn of(db: &DatabaseConnection, site: &str, param: &str) -> Self {
+        let row = db
+            .query_one_raw(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT id::text AS id FROM data_streams \
+                     WHERE source_system = 'api' AND source_key = '{site}:{param}'"
+                ),
+            ))
+            .await
+            .unwrap()
+            .expect("the import opened the channel");
+        let stream_id: String = row.try_get("", "id").unwrap();
+        let stored =
+            format!("SELECT count(*) AS n FROM readings r WHERE r.stream_id = '{stream_id}'");
+        Self { stream_id, stored }
+    }
+
+    async fn stored(&self, db: &DatabaseConnection, filter: &str) -> i64 {
+        scalar_i64(db, &format!("{} AND {filter}", self.stored)).await
+    }
+}
+
+async fn import_column(app: &axum::Router, token: &str, code: &str) {
+    let (status, resp) = crate::common::post_json_parse_with_token(
+        app,
+        "/api/readings/import_csv",
+        &serde_json::json!({
+            "site": crate::common::SITE1_ID,
+            "csv": format!("DateTime,{code}\n2025-06-01 00:00:00,1.5\n2025-06-01 00:10:00,2.5\n"),
+        }),
+        token,
+    )
+    .await;
+    assert_eq!(status, 200, "import ({status}): {resp}");
+    assert!(
+        resp["derived_job_id"].is_string(),
+        "the rows wait for the worker: {resp}"
+    );
+}
+
+/// Scenario: a file is imported against a column whose channel is unpaired, and the channel is
+/// paired before the import's job runs.
+/// Expected behaviour: the rows land attributed to the slot the channel is paired to, and the slot
+/// reprocess that resolves their deployment and curve is queued and runs.
+#[tokio::test]
+#[serial]
+async fn a_channel_paired_before_the_import_runs_attributes_its_rows() {
+    let (db, app, token) = setup().await;
+    crate::common::stop_test_workers().await;
+    let site = crate::common::SITE1_ID;
+    let param =
+        crate::common::e2e::create_parameter(&app, &token, "pairedlater", "Paired later", "m")
+            .await;
+
+    import_column(&app, &token, "pairedlater").await;
+    let channel = Channel::of(&db, site, &param).await;
+    let slot = crate::common::e2e::assign_site_parameter_minimal(&app, &token, site, &param).await;
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/streams/{}/pair", channel.stream_id),
+        &serde_json::json!({ "site_parameter_id": slot }),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "pair it: {status} {text}");
+
+    run_queued_jobs(&db).await;
+
+    assert_eq!(channel.stored(&db, "TRUE").await, 2, "both rows landed");
+    assert_eq!(
+        channel
+            .stored(
+                &db,
+                &format!("r.site_id = '{site}' AND r.parameter_id = '{param}' AND r.sensor_id IS NOT NULL")
+            )
+            .await,
+        2,
+        "the rows agree with the pairing the channel holds when they land"
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT count(*) AS n FROM reprocessing_jobs WHERE trigger_type = 'pairing_backfill' \
+                 AND trigger_id = '{}' AND status = 'completed'",
+                channel.stream_id
+            )
+        )
+        .await,
+        1,
+        "the slot reprocess ran over the rows"
+    );
+}
+
+/// Scenario: a file is imported against a paired channel, and the channel is unpaired before the
+/// import's job runs.
+/// Expected behaviour: the rows land with no site, parameter, instrument, deployment or curve.
+#[tokio::test]
+#[serial]
+async fn a_channel_unpaired_before_the_import_runs_stages_its_rows() {
+    let (db, app, token) = setup().await;
+    crate::common::stop_test_workers().await;
+    let site = crate::common::SITE1_ID;
+    let param =
+        crate::common::e2e::create_parameter(&app, &token, "unpairedlater", "Unpaired later", "m")
+            .await;
+    crate::common::e2e::assign_site_parameter_minimal(&app, &token, site, &param).await;
+
+    import_column(&app, &token, "unpairedlater").await;
+    let channel = Channel::of(&db, site, &param).await;
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/streams/{}/unpair", channel.stream_id),
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    assert!((200..300).contains(&status), "unpair it: {status} {text}");
+
+    run_queued_jobs(&db).await;
+
+    assert_eq!(channel.stored(&db, "TRUE").await, 2, "both rows landed");
+    assert_eq!(
+        channel
+            .stored(
+                &db,
+                "r.site_id IS NULL AND r.parameter_id IS NULL AND r.sensor_id IS NULL \
+                 AND r.deployment_id IS NULL AND r.calibration_id IS NULL"
+            )
+            .await,
+        2,
+        "rows on an unpaired channel are staged, not attributed"
+    );
+}

@@ -5633,6 +5633,14 @@
               "null"
             ]
           },
+          "ruling_hold_id": {
+            "description": "The verification hold whose standing ruling recorded this decision's set. Such a decision\nis undone by reopening that hold, never by a rollback.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "set_id": {
             "format": "uuid",
             "type": [
@@ -5672,7 +5680,8 @@
           "rolled_back_by",
           "set_id",
           "job_id",
-          "reversible"
+          "reversible",
+          "ruling_hold_id"
         ],
         "type": "object"
       },
@@ -39419,7 +39428,7 @@
             "description": "No such set"
           },
           "409": {
-            "description": "Already rolled back"
+            "description": "Already rolled back, or a verification ruling's set, which its hold's reopen undoes"
           }
         },
         "summary": "Invert every live decision an edit's set recorded, restoring exactly the state each one\nrecorded. This is how a visit retracted whole is put back. Requires `write_data`.",
@@ -39458,7 +39467,7 @@
             "description": "No such decision"
           },
           "409": {
-            "description": "Already rolled back, or a decision that projects nothing"
+            "description": "Already rolled back, a decision that projects nothing, or a verification ruling's, which its hold's reopen undoes"
           }
         },
         "summary": "Invert one edit, restoring exactly the state its decision recorded. Requires `write_data`.",

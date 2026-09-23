@@ -120,9 +120,32 @@ async fn invalidate_slot_site_on_mutation(
     response
 }
 
-/// Drop every cached response after a successful catalog write: a parameter's code, name and units
-/// label the series of every site that carries it.
-async fn invalidate_responses_on_catalog_mutation(
+/// Drop the cached series a successful site write can have relabelled: a site's name is served in
+/// every one of its readings and aggregates. A write naming one site drops that site; a write
+/// naming none drops everything.
+async fn invalidate_site_on_mutation(
+    State(state): State<AppState>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    use crate::common::cache::{self, WrittenRows};
+
+    let written = cache::written_rows(request.method().as_str(), request.uri().path());
+    let response = next.run(request).await;
+    if !response.status().is_success() {
+        return response;
+    }
+    match written {
+        WrittenRows::Nothing => {}
+        WrittenRows::Unnamed => cache::invalidate_all(&state.response_cache, "site write"),
+        WrittenRows::One(site_id) => cache::invalidate_site(&state.response_cache, site_id),
+    }
+    response
+}
+
+/// Drop every cached response after a successful write to an entity that labels many sites'
+/// series: a parameter's code, name and units, or a project's name.
+async fn invalidate_responses_on_mutation(
     State(state): State<AppState>,
     request: Request,
     next: middleware::Next,
@@ -130,7 +153,7 @@ async fn invalidate_responses_on_catalog_mutation(
     let is_mutation = !matches!(request.method().as_str(), "GET" | "HEAD" | "OPTIONS");
     let response = next.run(request).await;
     if is_mutation && response.status().is_success() {
-        crate::common::cache::invalidate_all(&state.response_cache, "catalog parameter write");
+        crate::common::cache::invalidate_all(&state.response_cache, "catalog or project write");
     }
     response
 }
@@ -224,21 +247,24 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     let (entity_router, entity_api): (Router<()>, utoipa::openapi::OpenApi) = OpenApiRouter::new()
         .nest(
             "/projects",
-            invalidate_public_config(crate::routes::private::projects::views::service_router(
-                state,
-            )),
+            invalidate_public_config(
+                crate::routes::private::projects::views::service_router(state).layer(
+                    middleware::from_fn_with_state(state.clone(), invalidate_responses_on_mutation),
+                ),
+            ),
         )
         .nest(
             "/sites",
-            invalidate_public_config(crate::routes::private::sites::views::service_router(state)),
+            invalidate_public_config(
+                crate::routes::private::sites::views::service_router(state).layer(
+                    middleware::from_fn_with_state(state.clone(), invalidate_site_on_mutation),
+                ),
+            ),
         )
         .nest(
             "/parameters",
             invalidate_public_config(catalog_inventory_crud(Parameter::router(db).layer(
-                middleware::from_fn_with_state(
-                    state.clone(),
-                    invalidate_responses_on_catalog_mutation,
-                ),
+                middleware::from_fn_with_state(state.clone(), invalidate_responses_on_mutation),
             ))),
         )
         .nest(

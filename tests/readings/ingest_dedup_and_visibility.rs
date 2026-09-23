@@ -706,6 +706,96 @@ async fn batch_pairs_its_api_channel_once_the_slot_exists() {
     );
 }
 
+/// Scenario: an instrument is deployed at a site and parameter the site carries no slot for, a
+/// batch writes a reading there, and an admin later adds the slot.
+/// Expected behaviour: the reading lands on the unpaired api channel with no instrument,
+/// deployment, curve or corrected value, since no pairing decided any of them, and the pairing the
+/// next batch makes stamps all four from the deployment.
+#[tokio::test]
+#[serial]
+async fn batch_on_an_unpaired_channel_derives_no_attribution() {
+    use crate::common::sensor_lifecycle::{
+        add_calibration_for_parameter, create_sensor_without_curve, deploy_sensor_for_parameter, dt,
+    };
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+    let project = e2e::create_project(&app, &token, "No Slot", "no-slot", false).await;
+    let site = e2e::create_site(&app, &token, &project, "No Slot Site", "no-slot").await;
+    let param = e2e::create_parameter(&app, &token, "noslot", "No slot", "m").await;
+    let sensor = create_sensor_without_curve(&db, "Deployed without a slot").await;
+    let calibration =
+        add_calibration_for_parameter(&db, sensor, &param, 2.0, 0.0, dt("2025-01-01T00:00:00Z"))
+            .await;
+    let deployment =
+        deploy_sensor_for_parameter(&db, sensor, &site, &param, dt("2025-01-01T00:00:00Z")).await;
+    let post = async |time: &str| {
+        let (status, body) = crate::common::post_json_parse_with_token(
+            &app,
+            "/api/readings/batch",
+            &serde_json::json!({"readings": [
+                {"site_id": site, "parameter_id": param, "time": time, "raw_value": 1.0}
+            ]}),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "batch at {time} ({status}): {body}");
+    };
+    let channel = format!("s.source_system = 'api' AND s.source_key = '{site}:{param}'");
+    let first = |predicate: &str| {
+        format!(
+            "SELECT count(*) AS c FROM readings r JOIN data_streams s ON s.id = r.stream_id \
+             WHERE {channel} AND r.time = '2025-03-01T00:00:00Z' AND {predicate}"
+        )
+    };
+
+    post("2025-03-01T00:00:00Z").await;
+    assert_eq!(
+        count(
+            &db,
+            &first(
+                "r.site_id IS NULL AND r.sensor_id IS NULL AND r.deployment_id IS NULL \
+                 AND r.calibration_id IS NULL AND r.calibrated_value IS NULL"
+            )
+        )
+        .await,
+        1,
+        "the row on the unpaired channel is staged with nothing derived"
+    );
+
+    e2e::assign_site_parameter_minimal(&app, &token, &site, &param).await;
+    post("2025-03-02T00:00:00Z").await;
+    let stream = {
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("SELECT s.id::text AS id FROM data_streams s WHERE {channel}"),
+            ))
+            .await
+            .expect("query")
+            .expect("row");
+        row.try_get::<String>("", "id").expect("id")
+    };
+    assert_eq!(
+        crate::common::jobs::wait_for_triggered_job(&db, "pairing_backfill", Some(&stream)).await,
+        "completed"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &first(&format!(
+                "r.site_id = '{site}' AND r.sensor_id = '{sensor}' \
+                 AND r.deployment_id = '{deployment}' AND r.calibration_id = '{calibration}' \
+                 AND r.calibrated_value = 2.0"
+            ))
+        )
+        .await,
+        1,
+        "the pairing stamps the instrument, deployment and curve the slot's deployment names"
+    );
+}
+
 /// Scenario: status events are batched for a site and parameter before the site carries that slot,
 /// an admin adds the slot, and later unpairs the api channel.
 /// Expected behaviour: every batch after the slot exists pairs the channel to it, with the backfill

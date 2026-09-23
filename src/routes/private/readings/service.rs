@@ -229,6 +229,47 @@ pub fn batch_instrument(
     row.or(slot).or(stream)
 }
 
+/// The instrument, deployment and curve a `/readings/batch` row names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BatchAttribution {
+    pub sensor_id: Option<Uuid>,
+    pub deployment_id: Option<Uuid>,
+    pub calibration_id: Option<Uuid>,
+}
+
+impl BatchAttribution {
+    /// The instrument a row's cadence falls back to: the one it is stored against, else the
+    /// channel's own, since which device a feed comes through is a fact about the channel.
+    #[must_use]
+    pub fn cadence_instrument(&self, channel_instrument: Option<Uuid>) -> Option<Uuid> {
+        self.sensor_id.or(channel_instrument)
+    }
+}
+
+/// What a `/readings/batch` row is stored against, decided from the pairing its stream reads in
+/// the transaction storing it.
+///
+/// A row on a paired stream keeps what it declared and takes the rest from the slot's deployment
+/// at its time, the channel's own instrument standing in where no deployment names one. A row on
+/// an unpaired stream is staged: it keeps only what it declared, and the pairing backfill and its
+/// slot reprocess stamp the rest.
+#[must_use]
+pub fn batch_attribution(
+    declared: BatchAttribution,
+    slot: &ResolvedOwner,
+    channel_instrument: Option<Uuid>,
+    paired: bool,
+) -> BatchAttribution {
+    if !paired {
+        return declared;
+    }
+    BatchAttribution {
+        sensor_id: batch_instrument(declared.sensor_id, slot.sensor_id, channel_instrument),
+        deployment_id: declared.deployment_id.or(slot.deployment_id),
+        calibration_id: declared.calibration_id.or(slot.calibration_id),
+    }
+}
+
 /// Relative distance within which a submitted `calibrated_value` is taken to be the one its
 /// calibration produces.
 const CORRECTION_REL_TOL: f64 = 1e-9;
@@ -1101,6 +1142,7 @@ pub(super) fn row_from(stored: decision_model::Model) -> AppResult<DecisionRow> 
         replicate_index: stored.replicate_index,
         kind: parsed,
         reversible: parsed.reversible(),
+        ruling_hold_id: None,
         old: stored.old,
         new: stored.new,
         actor: stored.actor,
@@ -2819,6 +2861,28 @@ pub async fn rollback_set<C: ConnectionTrait>(
     Ok((n, recorded))
 }
 
+/// Refuse to roll back a decision set a standing verification ruling recorded: the ruling's hold,
+/// visit and closed holds move with it, which only the hold's reopen does.
+pub async fn refuse_ruling_rollback<C: ConnectionTrait>(
+    conn: &C,
+    set_id: Option<Uuid>,
+) -> AppResult<()> {
+    let Some(set_id) = set_id else {
+        return Ok(());
+    };
+    let Some(hold) = audit::standing_rulings(conn, &[set_id])
+        .await?
+        .remove(&set_id)
+    else {
+        return Ok(());
+    };
+    Err(AppError::Conflict(format!(
+        "decision set {set_id} is the ruling on verification hold {hold}; undo it with \
+         POST /api/sync/replicate_audit_holds/{hold}/reopen, which returns the hold to the \
+         review queue with it"
+    )))
+}
+
 /// The slots a predicate's readings belong to, for the reprocess a pin enqueues.
 pub(super) async fn slots_of<C: ConnectionTrait>(
     conn: &C,
@@ -2853,8 +2917,8 @@ pub(super) async fn slots_of<C: ConnectionTrait>(
 /// attribution, which is what makes the pinned rows' corrections follow the pin rather than the
 /// window. Both surfaces that record a pin call this, so a pin cannot be recorded on one of them
 /// and left inert.
-pub async fn enqueue_attribution_pin(
-    db: &sea_orm::DatabaseConnection,
+pub async fn enqueue_attribution_pin<C: ConnectionTrait>(
+    db: &C,
     kind: Kind,
     sensor_id: Option<Uuid>,
     set_id: Uuid,
@@ -2884,8 +2948,8 @@ pub async fn enqueue_attribution_pin(
 /// The reprocess an inverted pin owes, for a whole set. Clearing a pin changes what the window
 /// resolves, so the slots have to be re-derived exactly as they were when it was recorded; a set
 /// that recorded no pin enqueues nothing.
-pub async fn enqueue_pin_reprocess_for_set(
-    db: &sea_orm::DatabaseConnection,
+pub async fn enqueue_pin_reprocess_for_set<C: ConnectionTrait>(
+    db: &C,
     set_id: Uuid,
 ) -> AppResult<Vec<Uuid>> {
     let Some(row) = decision_set::Entity::find_by_id(set_id).one(db).await? else {
@@ -2900,8 +2964,8 @@ pub async fn enqueue_pin_reprocess_for_set(
 }
 
 /// The same, for one decision rolled back on its own: the slot it names re-derives.
-pub async fn enqueue_pin_reprocess_for_decision(
-    db: &sea_orm::DatabaseConnection,
+pub async fn enqueue_pin_reprocess_for_decision<C: ConnectionTrait>(
+    db: &C,
     decision_id: Uuid,
 ) -> AppResult<Vec<Uuid>> {
     let d = load(db, decision_id).await?;
@@ -3118,7 +3182,15 @@ pub async fn history<C: ConnectionTrait>(
         .order_by_desc(decision_model::Column::Id)
         .all(conn)
         .await?;
-    rows.into_iter().map(row_from).collect()
+    let sets: Vec<Uuid> = rows.iter().filter_map(|r| r.set_id).collect();
+    let rulings = audit::standing_rulings(conn, &sets).await?;
+    rows.into_iter()
+        .map(|stored| {
+            let mut row = row_from(stored)?;
+            row.ruling_hold_id = row.set_id.and_then(|s| rulings.get(&s).copied());
+            Ok(row)
+        })
+        .collect()
 }
 
 /// A derived value's recorded arithmetic, run again over the values it consumed.
@@ -4189,9 +4261,26 @@ async fn sites_of<C: ConnectionTrait>(
     .collect())
 }
 
+/// Queue the calculations at the visits an edit touched, forward or inverted, on the edit's own
+/// transaction: an edit whose recompute cannot be queued is not recorded either.
+pub(crate) async fn queue_visit_recomputes<C: ConnectionTrait>(
+    txn: &C,
+    recorded: &Recorded,
+    actor: &str,
+) -> AppResult<()> {
+    crate::routes::private::collection_events::flows::enqueue_for(
+        txn,
+        &recorded.touched_events,
+        actor,
+        crate::routes::private::collection_events::flows::Writer::Person,
+    )
+    .await?;
+    Ok(())
+}
+
 /// What every edit owes after its transaction commits, forward or inverted: the rollups over the
-/// span it moved, and the calculations at the visits it touched.
-pub(crate) async fn propagate(state: &AppState, recorded: &Recorded, actor: &str) -> AppResult<()> {
+/// span it moved. The edit is committed, so a failure is reported rather than returned.
+pub(crate) async fn refresh_edited_rollups(state: &AppState, recorded: &Recorded) {
     if let Some((lo, hi)) = recorded.span
         && let Err(e) = crate::common::aggregates::refresh(
             &state.db,
@@ -4201,14 +4290,6 @@ pub(crate) async fn propagate(state: &AppState, recorded: &Recorded, actor: &str
     {
         tracing::warn!(error = %e, "edit: aggregate refresh failed");
     }
-    crate::routes::private::collection_events::flows::enqueue_for(
-        &state.db,
-        &recorded.touched_events,
-        actor,
-        crate::routes::private::collection_events::flows::Writer::Person,
-    )
-    .await?;
-    Ok(())
 }
 
 /// Record what the source now asserts at a key whose stored value differs.
@@ -4599,7 +4680,7 @@ pub fn parse_decision(decision: &str) -> AppResult<bool> {
 /// the value moved, so everything computed from it moves with it.
 pub(super) const ACCEPT_TAIL: Axes = Axes {
     cache: Cache::All,
-    refresh: Refresh::Range { fatal: true },
+    refresh: Refresh::Range { fatal: false },
     announce: false,
     reconcile_alarms: false,
     episodes: Episodes::None,
@@ -6373,13 +6454,14 @@ pub async fn prune_import_sessions<C: ConnectionTrait>(db: &C) -> AppResult<u64>
 pub(super) const KEYS_PER_STATEMENT: usize = 500;
 
 /// Curation moves values already served, at instants a bounded query may hold cached anywhere, and
-/// the rollups exclude what a flag hides, so the refresh is the write's own span and its failure is
-/// the caller's. Nothing arrives here, so no slot is announced and no alarm is re-evaluated. A
-/// derived value computed from a flagged input is one the flag has just contradicted, so the slots
-/// the write named are recomputed over the same span.
+/// the rollups exclude what a flag hides, so the refresh is the write's own span. The flag is
+/// committed by then, so a failed refresh is reported and left to the hourly policy. Nothing
+/// arrives here, so no slot is announced and no alarm is re-evaluated. A derived value computed
+/// from a flagged input is one the flag has just contradicted, so the slots the write named are
+/// recomputed over the same span.
 pub(super) const CURATION_TAIL: Axes = Axes {
     cache: Cache::All,
-    refresh: Refresh::Range { fatal: true },
+    refresh: Refresh::Range { fatal: false },
     announce: false,
     reconcile_alarms: false,
     episodes: Episodes::None,
@@ -6506,6 +6588,7 @@ pub(super) async fn apply_flags(
             };
             all.touched_events.extend(recorded.touched_events);
         }
+        queue(txn, &written(&all, keys), &CURATION_TAIL).await?;
         Ok(all)
     })
     .await?;
@@ -6592,7 +6675,7 @@ pub(super) async fn apply_flags_over_range(
     range.admit(state, scope).await?;
     let rows = range.rows(write);
     let recorded = bulk_write::guarded(&state.db, async |txn| {
-        record_many(
+        let recorded = record_many(
             txn,
             write.kind(),
             rows.clone(),
@@ -6602,7 +6685,9 @@ pub(super) async fn apply_flags_over_range(
             origin,
             Some(Uuid::new_v4()),
         )
-        .await
+        .await?;
+        queue(txn, &written(&recorded, &range.key()), &CURATION_TAIL).await?;
+        Ok(recorded)
     })
     .await?;
 
@@ -6881,8 +6966,58 @@ impl<'a> From<&'a AppState> for Sink<'a> {
     }
 }
 
-/// Run the tail. Call it after the guarded write has committed: an aggregate refresh is a
-/// procedure with its own transaction control, and so are the jobs the reactive hook enqueues.
+/// Queue the follow-up jobs the tail names (`alarm_backfill`, `derived_recompute`) on the writer's
+/// own transaction, so a write whose follow-up cannot be queued is not committed either.
+pub async fn queue<C: ConnectionTrait>(txn: &C, written: &Written, axes: &Axes) -> AppResult<()> {
+    let plan = plan(written, axes);
+    let Some((lo, hi)) = plan.episode_span else {
+        return Ok(());
+    };
+    if plan.episodes == Episodes::Job {
+        let slots: Vec<serde_json::Value> = written
+            .slots
+            .iter()
+            .filter_map(|s| s.slot())
+            .map(|(site_id, parameter_id)| serde_json::json!([site_id, parameter_id]))
+            .collect();
+        crate::routes::private::reprocessing_jobs::service::enqueue(
+            txn,
+            "alarm_backfill",
+            None,
+            None,
+            &serde_json::json!({
+                "slots": slots,
+                "start": lo.to_rfc3339(),
+                "end": hi.to_rfc3339(),
+            }),
+            None,
+        )
+        .await?;
+    }
+    if !plan.recompute_derived.is_empty() {
+        let sites: BTreeSet<Uuid> = plan.recompute_derived.iter().map(|(s, _)| *s).collect();
+        let parameters: BTreeSet<Uuid> = plan.recompute_derived.iter().map(|(_, p)| *p).collect();
+        crate::routes::private::reprocessing_jobs::service::enqueue(
+            txn,
+            "derived_recompute",
+            None,
+            None,
+            &serde_json::json!({
+                "site_ids": sites.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "parameter_ids": parameters.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "start": lo.to_rfc3339(),
+                "end": hi.to_rfc3339(),
+            }),
+            None,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Run the tail. Call it after the guarded write has committed, having called [`queue`] inside
+/// it: an aggregate refresh is a procedure with its own transaction control, and so are the jobs
+/// the reactive hook enqueues.
 pub async fn run<'a>(
     sink: impl Into<Sink<'a>>,
     written: &Written,
@@ -6938,65 +7073,20 @@ pub async fn run<'a>(
         .await;
     }
 
-    if let Some((lo, hi)) = plan.episode_span {
-        match plan.episodes {
-            Episodes::Inline => {
-                for (site_id, parameter_id) in written.slots.iter().filter_map(|s| s.slot()) {
-                    if let Err(e) = crate::routes::private::alarms::flows::evaluate_alarm_episodes(
-                        sink.db,
-                        site_id,
-                        parameter_id,
-                        lo,
-                        hi,
-                    )
-                    .await
-                    {
-                        tracing::warn!(error = %e, %site_id, %parameter_id, "alarm episode reconstruction failed");
-                    }
-                }
+    if let (Episodes::Inline, Some((lo, hi))) = (plan.episodes, plan.episode_span) {
+        for (site_id, parameter_id) in written.slots.iter().filter_map(|s| s.slot()) {
+            if let Err(e) = crate::routes::private::alarms::flows::evaluate_alarm_episodes(
+                sink.db,
+                site_id,
+                parameter_id,
+                lo,
+                hi,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, %site_id, %parameter_id, "alarm episode reconstruction failed");
             }
-            Episodes::Job => {
-                let slots: Vec<serde_json::Value> = written
-                    .slots
-                    .iter()
-                    .filter_map(|s| s.slot())
-                    .map(|(site_id, parameter_id)| serde_json::json!([site_id, parameter_id]))
-                    .collect();
-                crate::routes::private::reprocessing_jobs::service::enqueue(
-                    sink.db,
-                    "alarm_backfill",
-                    None,
-                    None,
-                    &serde_json::json!({
-                        "slots": slots,
-                        "start": lo.to_rfc3339(),
-                        "end": hi.to_rfc3339(),
-                    }),
-                    None,
-                )
-                .await?;
-            }
-            Episodes::None => {}
         }
-    }
-
-    if let (false, Some((lo, hi))) = (plan.recompute_derived.is_empty(), plan.episode_span) {
-        let sites: BTreeSet<Uuid> = plan.recompute_derived.iter().map(|(s, _)| *s).collect();
-        let parameters: BTreeSet<Uuid> = plan.recompute_derived.iter().map(|(_, p)| *p).collect();
-        crate::routes::private::reprocessing_jobs::service::enqueue(
-            sink.db,
-            "derived_recompute",
-            None,
-            None,
-            &serde_json::json!({
-                "site_ids": sites.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                "parameter_ids": parameters.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                "start": lo.to_rfc3339(),
-                "end": hi.to_rfc3339(),
-            }),
-            None,
-        )
-        .await?;
     }
 
     Ok(plan)
@@ -7252,8 +7342,8 @@ pub(super) const CURVE_MEASUREMENT_TYPE: &str =
 /// Returns the curves so the caller computes the corrected value from the coefficients. A submitted
 /// `calibrated_value` cannot be checked against a curve, only recomputed from it, so no path trusts
 /// one alongside a curve reference.
-pub async fn admit_standard_curves(
-    db: &DatabaseConnection,
+pub async fn admit_standard_curves<C: ConnectionTrait>(
+    db: &C,
     claims: &[CurveClaim<'_>],
 ) -> AppResult<HashMap<Uuid, standard_curves::Model>> {
     if claims.is_empty() {
@@ -7822,18 +7912,35 @@ pub(super) async fn lock_stream_attributions(
     txn: &sea_orm::DatabaseTransaction,
     stream_ids: impl IntoIterator<Item = Uuid>,
 ) -> AppResult<HashMap<Uuid, (Option<Uuid>, Option<Uuid>)>> {
+    Ok(lock_target_streams(txn, stream_ids)
+        .await?
+        .into_iter()
+        .map(|(id, stream)| (id, stream.slot.unzip()))
+        .collect())
+}
+
+/// Each stream's slot and instrument, read under the same `FOR SHARE` lock as
+/// [`lock_stream_attributions`], taken in stream id order.
+pub(super) async fn lock_target_streams(
+    txn: &sea_orm::DatabaseTransaction,
+    stream_ids: impl IntoIterator<Item = Uuid>,
+) -> AppResult<HashMap<Uuid, TargetStream>> {
     let mut ids: Vec<Uuid> = stream_ids.into_iter().collect();
     ids.sort_unstable();
     ids.dedup();
-    let mut attributions = HashMap::with_capacity(ids.len());
+    let mut streams = HashMap::with_capacity(ids.len());
     for id in ids {
         let stream = lock_ingest_stream(txn, id).await?;
-        attributions.insert(
+        let (site_id, parameter_id) = resolve_stream_slot(txn, stream.site_parameter_id).await?;
+        streams.insert(
             id,
-            resolve_stream_slot(txn, stream.site_parameter_id).await?,
+            TargetStream {
+                slot: site_id.zip(parameter_id),
+                instrument: stream.sensor_id,
+            },
         );
     }
-    Ok(attributions)
+    Ok(streams)
 }
 
 /// A completeness window is accepted only on a stream declared spot. Withdrawal is confined to
@@ -10195,6 +10302,41 @@ pub(super) struct ReplaceOutcome {
 }
 
 impl GrabWrite<'_> {
+    /// What the save landed, in the shape the shared tail reads, and the tail it takes: the
+    /// calculations that read it run without anyone asking (ADR 0007), the sampled slots are
+    /// reconciled and their episodes rebuilt inline (one `reprocessing_jobs` row per field
+    /// campaign entry would be the noise), and the site's cached responses go. Grabs are excluded
+    /// from the rollups, so there is nothing to refresh. A stream calculation holding a saved
+    /// parameter (Q230) is recomputed over the pulses that read it, as a job.
+    pub(super) async fn tail<C: ConnectionTrait>(
+        &self,
+        txn: &C,
+        written: &GrabWritten,
+    ) -> AppResult<(Written, Axes)> {
+        let saved: Vec<Uuid> = self.streams.keys().copied().collect();
+        let holds =
+            crate::routes::private::derived_parameters::flows::held_by_a_calculation(txn, &saved)
+                .await?;
+        let tail =
+            Written::new(u64::try_from(written.inserted + written.replaced).unwrap_or(u64::MAX))
+                .over(grab_span(&self.payload.readings))
+                .at(saved
+                    .iter()
+                    .map(|pid| Slot::paired(self.payload.site_id, *pid))
+                    .collect())
+                .touching(written.touched_events.clone());
+        let axes = Axes {
+            cache: Cache::Sites,
+            refresh: Refresh::Skip,
+            announce: false,
+            reconcile_alarms: true,
+            episodes: Episodes::Inline,
+            recompute_derived: holds,
+            writer: self.writer,
+        };
+        Ok((tail, axes))
+    }
+
     fn replaces(&self) -> bool {
         self.payload.mode == Some(GrabWriteMode::Replace)
     }

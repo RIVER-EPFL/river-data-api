@@ -27,8 +27,6 @@ use super::models::GroupMember;
 use super::models::Model as SiteParameterModel;
 use super::models::SiteParameter;
 use super::models::SlotDescriptor;
-use crate::common::aggregates;
-use crate::common::aggregates::Window;
 use crate::common::bulk_write;
 use crate::common::bulk_write::TouchedRange;
 use crate::error::AppError;
@@ -526,13 +524,6 @@ pub(crate) async fn refuse_on_collision<C: ConnectionTrait>(
     )))
 }
 
-/// Merge two site_parameters: absorb source into target.
-///
-/// Moves every slot-keyed table's rows (readings, status events, samples, annotations) plus the
-/// data streams onto the target, then deletes the source. One transaction with the decompression
-/// cap lifted, so it applies whole or not at all even when the readings sit in compressed chunks;
-/// the rollup refresh follows the commit, since `refresh_continuous_aggregate` cannot run inside a
-/// transaction block.
 /// The row as it stands, for the trail to keep after the merge deletes it.
 pub(crate) async fn row_snapshot<C: ConnectionTrait>(
     txn: &C,
@@ -583,6 +574,13 @@ pub(crate) async fn record_merge<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Merge two site_parameters: absorb source into target.
+///
+/// Moves every slot-keyed table's rows (readings, status events, samples, annotations) plus the
+/// data streams onto the target, then deletes the source. One transaction with the decompression
+/// cap lifted, so it applies whole or not at all even when the readings sit in compressed chunks.
+/// `refresh_continuous_aggregate` cannot run inside a transaction block, so the rollup refresh is
+/// a `refresh_aggregates` job queued in it.
 pub async fn merge_site_parameters(
     db: &DatabaseConnection,
     req: &MergeSiteParametersRequest,
@@ -599,7 +597,7 @@ pub async fn merge_site_parameters(
         ));
     }
 
-    let (response, touched, touched_events, changed) = bulk_write::guarded(db, async |txn| {
+    let (response, changed) = bulk_write::guarded(db, async |txn| {
         let (source_site_id, source_param_id, target_site_id, target_param_id) =
             validate_merge_candidates(txn, source_id, target_id).await?;
         if source_site_id != target_site_id {
@@ -612,6 +610,14 @@ pub async fn merge_site_parameters(
         refuse_on_collision(txn, scope, source_param_id, target_param_id).await?;
         let moved =
             move_slot_rows(txn, scope, source_param_id, target_param_id, actor, origin).await?;
+        queue_moved_rollups(txn, &moved.touched, target_id).await?;
+        crate::routes::private::collection_events::flows::enqueue_for(
+            txn,
+            &moved.touched_events,
+            actor,
+            crate::routes::private::collection_events::flows::Writer::Person,
+        )
+        .await?;
         let streams_updated = update_data_streams(txn, source_id, target_id).await?;
         let source_row = row_snapshot(txn, "site_parameters", source_id).await?;
         delete_source(
@@ -645,36 +651,38 @@ pub async fn merge_site_parameters(
                 deployments_moved: 0,
                 source_deleted: true,
             },
-            moved.touched,
-            moved.touched_events,
             moved.changed,
         ))
     })
     .await?;
 
-    refresh_moved_rollups(db, touched).await?;
-    crate::routes::private::collection_events::flows::enqueue_for(
-        db,
-        &touched_events,
-        actor,
-        crate::routes::private::collection_events::flows::Writer::Person,
-    )
-    .await?;
     if let Some(events) = events {
         changed.announce(events);
     }
     Ok(response)
 }
 
-/// The rollups group by `parameter_id`, so recomputing the buckets the moved readings occupy
-/// rebuilds both the survivor's series and the absorbed one's in the same pass.
-pub(crate) async fn refresh_moved_rollups(
-    db: &DatabaseConnection,
-    touched: TouchedRange,
+/// Queue the refresh of the buckets the moved readings occupy, on the merge's own transaction. The
+/// rollups group by `parameter_id`, so the one pass rebuilds both the survivor's series and the
+/// absorbed one's, and a refresh that fails is the job's to retry rather than the committed
+/// merge's.
+pub(crate) async fn queue_moved_rollups<C: ConnectionTrait>(
+    txn: &C,
+    touched: &TouchedRange,
+    target_id: Uuid,
 ) -> AppResult<()> {
-    if let Some(window) = Window::touched(&touched) {
-        aggregates::refresh(db, window).await?;
-    }
+    let Some((from, until)) = touched.span() else {
+        return Ok(());
+    };
+    crate::routes::private::reprocessing_jobs::service::enqueue(
+        txn,
+        "refresh_aggregates",
+        None,
+        Some(target_id),
+        &serde_json::json!({ "from": from.to_rfc3339(), "until": until.to_rfc3339() }),
+        None,
+    )
+    .await?;
     Ok(())
 }
 

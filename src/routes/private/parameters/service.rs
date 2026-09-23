@@ -30,8 +30,8 @@ use crate::routes::private::sensor_calibrations::models as sensor_calibrations;
 use crate::routes::private::sensor_deployments::models as sensor_deployments;
 use crate::routes::private::site_parameters;
 use crate::routes::private::site_parameters::service::delete_source;
+use crate::routes::private::site_parameters::service::queue_moved_rollups;
 use crate::routes::private::site_parameters::service::record_merge;
-use crate::routes::private::site_parameters::service::refresh_moved_rollups;
 use crate::routes::private::site_parameters::service::refuse_on_collision;
 use crate::routes::private::site_parameters::service::row_snapshot;
 use crate::routes::private::site_parameters::service::update_data_streams;
@@ -179,9 +179,6 @@ pub struct MergeParametersResponse {
     pub source_deleted: bool,
 }
 
-/// Merge two catalog parameters: absorb source into target at every site, then delete the source
-/// row. Same guarantees as [`merge_site_parameters`]: one guarded transaction, rollups refreshed
-/// after the commit.
 /// Refuse a merge that would make a derived definition read what it produces.
 ///
 /// The merge re-points `derived_parameter_sources.parameter_id` from the source onto the target
@@ -326,6 +323,9 @@ async fn refuse_curve_collisions<C: ConnectionTrait>(
     )))
 }
 
+/// Merge two catalog parameters: absorb source into target at every site, then delete the source
+/// row. Same guarantees as [`merge_site_parameters`]: one guarded transaction, which queues the
+/// rollup refresh.
 pub async fn merge_parameters(
     db: &DatabaseConnection,
     req: &MergeParametersRequest,
@@ -342,7 +342,7 @@ pub async fn merge_parameters(
         ));
     }
 
-    let (response, touched, touched_events, changed) = bulk_write::guarded(db, async |txn| {
+    let (response, changed) = bulk_write::guarded(db, async |txn| {
         validate_both_parameters_exist(txn, source_id, target_id).await?;
         refuse_on_collision(txn, MoveScope::EverySite, source_id, target_id).await?;
         refuse_curve_collisions(txn, source_id, Some(target_id)).await?;
@@ -352,6 +352,16 @@ pub async fn merge_parameters(
             merge_site_parameters_per_site(txn, source_id, target_id, actor, origin).await?;
 
         let swept = reassign_parameter_references(txn, source_id, target_id, actor, origin).await?;
+        let mut touched_events = moved.touched_events;
+        touched_events.extend(swept.touched_events);
+        // Queued before the source is deleted: the visits name the parameter they held.
+        crate::routes::private::collection_events::flows::enqueue_for(
+            txn,
+            &touched_events,
+            actor,
+            crate::routes::private::collection_events::flows::Writer::Person,
+        )
+        .await?;
         let source_row = row_snapshot(txn, "parameters", source_id).await?;
         delete_parameter(txn, source_id).await?;
         record_merge(
@@ -369,9 +379,7 @@ pub async fn merge_parameters(
         )
         .await?;
 
-        let touched = moved.touched.merge(swept.touched);
-        let mut touched_events = moved.touched_events;
-        touched_events.extend(swept.touched_events);
+        queue_moved_rollups(txn, &moved.touched.merge(swept.touched), target_id).await?;
         let mut changed = moved.changed;
         changed.merge(swept.changed);
         Ok((
@@ -382,21 +390,11 @@ pub async fn merge_parameters(
                 streams_updated: moved.streams,
                 source_deleted: true,
             },
-            touched,
-            touched_events,
             changed,
         ))
     })
     .await?;
 
-    refresh_moved_rollups(db, touched).await?;
-    crate::routes::private::collection_events::flows::enqueue_for(
-        db,
-        &touched_events,
-        actor,
-        crate::routes::private::collection_events::flows::Writer::Person,
-    )
-    .await?;
     if let Some(events) = events {
         changed.announce(events);
     }

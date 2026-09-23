@@ -425,3 +425,34 @@ fn test_slot_move_tally_announces_the_source_and_the_target_slot() {
         "a site with nothing to move announces nothing"
     );
 }
+
+fn touched(
+    parameter_ids: Vec<Uuid>,
+) -> crate::routes::private::collection_events::flows::TouchedEvent {
+    crate::routes::private::collection_events::flows::TouchedEvent {
+        id: Uuid::new_v4(),
+        source: "manual".to_string(),
+        parameter_ids,
+    }
+}
+
+#[test]
+fn test_naming_target_adds_the_target_to_each_visit() {
+    let (source, target) = (Uuid::new_v4(), Uuid::new_v4());
+    let named = naming_target(vec![touched(vec![source]), touched(vec![source])], target);
+    for event in named {
+        assert_eq!(event.parameter_ids, vec![source, target]);
+    }
+}
+
+#[test]
+fn test_naming_target_names_a_target_once() {
+    let (source, target) = (Uuid::new_v4(), Uuid::new_v4());
+    let named = naming_target(vec![touched(vec![source, target])], target);
+    assert_eq!(named[0].parameter_ids, vec![source, target]);
+}
+
+#[test]
+fn test_naming_target_empty() {
+    assert!(naming_target(Vec::new(), Uuid::new_v4()).is_empty());
+}

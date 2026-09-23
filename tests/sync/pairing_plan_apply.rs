@@ -559,6 +559,106 @@ async fn an_apply_whose_visit_recompute_cannot_be_queued_commits_nothing() {
     crate::common::cleanup_test_db(&db).await;
 }
 
+/// Scenario: the plan's stream holds the input a calculation reads at a manual visit, and the
+/// visit also holds the calculation's stored output on another stream, so the revert leaves the
+/// visit in place with its input gone.
+///
+/// Expected behaviour: the revert queues the visit's recompute in its own transaction, and a revert
+/// that cannot queue it commits nothing, leaving the plan applied and its stream paired.
+#[tokio::test]
+#[serial]
+async fn a_revert_queues_the_recompute_of_the_visits_it_empties() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_api_token(&db, crate::common::full_permissions(), None).await;
+    let app = crate::common::build_test_app(db.clone());
+    // The plan names its parameter "Temperature", and the apply creates it under that code.
+    crate::common::seed_visit_calculation(&db, "plan_revert_input", "Temperature").await;
+
+    let (plan_id, stream_id) =
+        reviewed_single_stream_plan(&db, &app, &token, "loc-revert-recompute").await;
+    let event = Uuid::new_v4();
+    let output_stream = Uuid::new_v4();
+    for statement in [
+        format!(
+            "INSERT INTO collection_events (id, site_id, collected_at, source) \
+             VALUES ('{event}', '{}', '2025-02-01T00:00:00Z', 'manual')",
+            crate::common::SITE1_ID
+        ),
+        format!(
+            "INSERT INTO readings \
+                 (stream_id, time, raw_value, replicate_index, measurement_type, collection_event_id) \
+             VALUES ('{stream_id}', '2025-02-01T00:00:00Z', 1.0, 0, 'spot', '{event}')"
+        ),
+        format!(
+            "INSERT INTO data_streams (id, source_system, source_key, source_name, is_active) \
+             VALUES ('{output_stream}', 'test', 'plan-revert-output', 'plan-revert-output', true)"
+        ),
+        format!(
+            "INSERT INTO readings \
+                 (stream_id, time, raw_value, replicate_index, measurement_type, collection_event_id) \
+             VALUES ('{output_stream}', '2025-02-01T00:00:00Z', 2.0, 0, 'spot', '{event}')"
+        ),
+    ] {
+        crate::common::exec(&db, &statement).await;
+    }
+    river_db::routes::private::sync::service::apply_plan(&db, plan_id, None)
+        .await
+        .expect("the plan applies");
+    crate::common::exec(
+        &db,
+        "DELETE FROM reprocessing_jobs WHERE trigger_type = 'event_recompute'",
+    )
+    .await;
+
+    crate::common::jobs::refuse_enqueue(&db, "event_recompute").await;
+    let refused = river_db::routes::private::sync::service::revert_plan(&db, plan_id, None).await;
+    crate::common::jobs::restore_enqueue(&db).await;
+
+    assert!(refused.is_err(), "the revert reports the refused enqueue");
+    assert_eq!(
+        count(
+            &db,
+            &format!("pairing_plans WHERE id = '{plan_id}' AND status = 'applied'")
+        )
+        .await,
+        1,
+        "the plan is still applied"
+    );
+    assert!(
+        scalar_opt_uuid(
+            &db,
+            &format!("SELECT site_parameter_id AS v FROM data_streams WHERE id = '{stream_id}'")
+        )
+        .await
+        .is_some(),
+        "the stream is still paired"
+    );
+
+    river_db::routes::private::sync::service::revert_plan(&db, plan_id, None)
+        .await
+        .expect("the retry reverts the plan");
+    assert_eq!(
+        count(&db, &format!("collection_events WHERE id = '{event}'")).await,
+        1,
+        "the stored output keeps the visit"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "reprocessing_jobs WHERE trigger_type = 'event_recompute' AND trigger_id = '{event}'"
+            )
+        )
+        .await,
+        1,
+        "the revert queues the visit's recompute"
+    );
+
+    crate::common::cleanup_test_db(&db).await;
+}
+
 /// Scenario: a plan was applied and its attribution job is gone (lost before this fix, or pruned),
 /// and the `plan_apply` row runs again.
 ///

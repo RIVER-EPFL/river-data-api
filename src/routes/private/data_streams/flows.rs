@@ -36,7 +36,7 @@ use crate::routes::private::sync::service::{
 
 /// The scope as a predicate over `data_streams ds`, which is the one table all four statements
 /// and the three shared helpers join.
-fn predicate(scope: HoldScope) -> Condition {
+pub(crate) fn predicate(scope: HoldScope) -> Condition {
     use sea_orm::sea_query::ExprTrait;
 
     // The shared helpers join the streams table as `ds`.
