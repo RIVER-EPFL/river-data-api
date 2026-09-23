@@ -23,6 +23,7 @@ mod pairing_backfill_parity;
 mod pairing_plan_apply;
 mod pairing_plan_hardening;
 mod pairing_plan_resolution;
+mod pairing_plan_scope;
 mod plan_instrument_decisions;
 mod plan_review_progress;
 mod replicate_audit;

@@ -456,6 +456,25 @@ pub fn dedupe_key(event_id: Uuid) -> String {
     format!("event_recompute:{event_id}")
 }
 
+/// What a parameter is to the calculations that touch it: the ones reading it, by name, and the
+/// one writing it. A grid column and a detail cell carry both, so a typed value says what it feeds.
+#[must_use]
+pub fn parameter_roles(
+    impacts: &[crate::routes::private::tools::models::CalculationImpact],
+    parameter_id: Uuid,
+) -> (Vec<String>, Option<String>) {
+    let read_by = impacts
+        .iter()
+        .filter(|i| i.reads.iter().any(|r| r.parameter_id == parameter_id))
+        .map(|i| i.tool.clone())
+        .collect();
+    let written_by = impacts
+        .iter()
+        .find(|i| i.outputs.iter().any(|o| o.parameter_id == parameter_id))
+        .map(|i| i.tool.clone());
+    (read_by, written_by)
+}
+
 /// The visit's recompute state from what its latest job and its open findings say: an active
 /// job is the state whatever the findings (it is being repaired), a failed job outranks a stale
 /// finding (the repair itself needs attention), a stale finding outranks nothing else.

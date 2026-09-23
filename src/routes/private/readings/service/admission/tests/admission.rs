@@ -118,3 +118,59 @@ fn the_classification_vocabulary_is_closed() {
     }
     assert!(admit(now, 1.0, Some("grab")).is_err());
 }
+
+#[test]
+fn test_index_zero_is_admitted_whatever_the_cadence() {
+    for cadence in [None, Some("continuous"), Some("spot"), Some("derived")] {
+        assert_eq!(replicate_index_rejection(cadence, 0), None, "{cadence:?}");
+        assert!(admit_replicate_index(cadence, 0).is_ok(), "{cadence:?}");
+    }
+}
+
+#[test]
+fn test_only_a_spot_reading_carries_a_replicate_beyond_zero() {
+    assert_eq!(replicate_index_rejection(Some("spot"), 3), None);
+    for cadence in [None, Some("continuous"), Some("derived")] {
+        assert!(
+            replicate_index_rejection(cadence, 1).is_some(),
+            "{cadence:?}"
+        );
+        assert!(admit_replicate_index(cadence, 1).is_err(), "{cadence:?}");
+    }
+}
+
+#[test]
+fn test_an_unstated_cadence_is_named_continuous_in_the_refusal() {
+    let reason = replicate_index_rejection(None, 2).expect("refused");
+    assert!(reason.contains("Replicate index 2"), "{reason}");
+    assert!(reason.contains("continuous readings"), "{reason}");
+}
+
+#[test]
+fn test_the_rejection_kind_follows_the_order_the_message_does() {
+    let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 6, 1, 0, 0, 0).unwrap();
+    let inside = now - chrono::Duration::days(1);
+    let outside = now + chrono::Duration::days(MAX_LEAD_DAYS + 1);
+    assert_eq!(rejection_kind_at(now, inside, 1.0, None), None);
+    assert_eq!(
+        rejection_kind_at(now, outside, f64::NAN, Some("hourly")),
+        Some(RejectionKind::UnknownMeasurementType)
+    );
+    assert_eq!(
+        rejection_kind_at(now, outside, f64::NAN, Some("spot")),
+        Some(RejectionKind::OutOfWindow)
+    );
+    assert_eq!(
+        rejection_kind_at(now, inside, f64::INFINITY, Some("spot")),
+        Some(RejectionKind::NonFinite)
+    );
+}
+
+#[test]
+fn test_the_rejection_kind_reads_the_clock_for_a_reading_of_now() {
+    assert_eq!(rejection_kind(Utc::now(), 1.0, Some("continuous")), None);
+    assert_eq!(
+        rejection_kind(*MIN_TIME - chrono::Duration::days(1), 1.0, None),
+        Some(RejectionKind::OutOfWindow)
+    );
+}

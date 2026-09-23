@@ -377,3 +377,7 @@ impl CRUDOperations for SensorDeploymentOperations {
         Ok(id)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/service.rs"]
+mod tests;

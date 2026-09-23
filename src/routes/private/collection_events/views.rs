@@ -507,8 +507,8 @@ pub async fn list_site_visits(
     }
     let total = i64::try_from(count_query.count(&state.db).await?).unwrap_or(i64::MAX);
 
-    // The column set is every parameter this site can hold a spot value for: the ones its visits
-    // carry, plus the spot-capable slots configured on it. The first arm reads the readings through
+    // The column set is every parameter the site's visits carry, plus every active slot configured
+    // on it, at any cadence. The first arm reads the readings through
     // `collection_events` rather than by an unbounded DISTINCT over the hypertable, which pays a
     // planning cost proportional to the chunk count on every page load; `samples` cannot speak for
     // it, since a measurement taken once forms no row there. Taking the union means a parameter
@@ -581,20 +581,15 @@ pub async fn list_site_visits(
             units: r.units,
             decimal_places: r.decimal_places,
             written_by: None,
+            read_by: Vec::new(),
         });
     }
     let columns: Vec<Uuid> = expected_parameters.iter().map(|p| p.parameter_id).collect();
     let impacts =
         crate::routes::private::tools::service::calculations_fed_by(&state.db, &columns).await?;
     for column in &mut expected_parameters {
-        column.written_by = impacts
-            .iter()
-            .find(|i| {
-                i.outputs
-                    .iter()
-                    .any(|o| o.parameter_id == column.parameter_id)
-            })
-            .map(|i| i.tool.clone());
+        (column.read_by, column.written_by) =
+            service::parameter_roles(&impacts, column.parameter_id);
     }
 
     let mut page_binds = binds;
@@ -1416,19 +1411,7 @@ pub async fn get_event_detail(
     let impacts =
         crate::routes::private::tools::service::calculations_fed_by(&state.db, &touched).await?;
     for cell in &mut cells {
-        cell.read_by = impacts
-            .iter()
-            .filter(|i| i.reads.iter().any(|r| r.parameter_id == cell.parameter_id))
-            .map(|i| i.tool.clone())
-            .collect();
-        cell.written_by = impacts
-            .iter()
-            .find(|i| {
-                i.outputs
-                    .iter()
-                    .any(|o| o.parameter_id == cell.parameter_id)
-            })
-            .map(|i| i.tool.clone());
+        (cell.read_by, cell.written_by) = service::parameter_roles(&impacts, cell.parameter_id);
     }
 
     let recompute = service::status_for(&state.db, &[event.id])

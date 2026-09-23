@@ -15,7 +15,7 @@ command = ["cargo", "test", "--color", "always"]
 need_stdout = true
 
 [jobs.test-integration]
-command = ["cargo", "nextest", "run", "--tests", "--color", "always", "--test-threads=1", "--hide-progress-bar", "--failure-output", "final", "--status-level", "fail"]
+command = ["cargo", "nextest", "run", "--tests", "--no-fail-fast", "--color", "always", "--test-threads=1", "--hide-progress-bar", "--failure-output", "final", "--status-level", "fail"]
 need_stdout = true
 
 [jobs.test-unit]

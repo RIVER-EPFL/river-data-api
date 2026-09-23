@@ -53,3 +53,45 @@ fn test_brake_verdict_an_empty_window_has_no_row_fraction() {
     // Nothing stored is nothing to reshape; only new rows can be in such a pass.
     assert_eq!(brake_verdict(0, 9, &[]), None);
 }
+
+mod dishonest_window {
+    use super::super::refuse_dishonest_window;
+    use river_data_core::models::SourceWindow;
+
+    fn window(source_rows_read: u64) -> SourceWindow {
+        SourceWindow {
+            from: chrono::Utc::now() - chrono::Duration::days(1),
+            to: chrono::Utc::now(),
+            source_rows_read,
+            dropped_times: Vec::new(),
+            content_digest: None,
+        }
+    }
+
+    #[test]
+    fn test_a_window_the_store_holds_nothing_for_is_never_refused() {
+        assert!(refuse_dishonest_window(&window(0), 0, 0).is_ok());
+        assert!(refuse_dishonest_window(&window(12), 0, 0).is_ok());
+    }
+
+    #[test]
+    fn test_an_empty_payload_claiming_source_rows_is_not_read_as_a_deletion() {
+        let err = refuse_dishonest_window(&window(12), 0, 30).expect_err("refused");
+        assert!(
+            err.to_string().contains("never read as a deletion"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_a_window_claiming_no_source_rows_over_stored_readings_is_refused() {
+        let err = refuse_dishonest_window(&window(0), 0, 30).expect_err("refused");
+        assert!(err.to_string().contains("zero source rows"), "{err}");
+    }
+
+    #[test]
+    fn test_a_window_asserting_its_content_passes_however_little_it_admits() {
+        assert!(refuse_dishonest_window(&window(12), 1, 30).is_ok());
+        assert!(refuse_dishonest_window(&window(12), 12, 3).is_ok());
+    }
+}

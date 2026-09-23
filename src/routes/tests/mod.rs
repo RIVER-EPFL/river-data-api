@@ -115,7 +115,7 @@ fn test_the_document_says_which_optional_fields_are_sent_and_which_are_omitted()
 fn optional_fields_the_document_misdescribes() -> (usize, Vec<String>) {
     let mut checked = 0;
     let mut wrong = Vec::new();
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let root = crate::test_crate_root().join("src");
     for path in rust_sources(root) {
         let src = std::fs::read_to_string(&path).expect("a source file reads");
         let (c, m) = scan(&src);

@@ -962,8 +962,8 @@ async fn a_single_measurement_counts_as_one() {
 /// Scenario: a site whose grid carries a plain measurement beside a parameter a calculation writes.
 ///
 /// Expected behaviour: the column of the computed parameter names the calculation that writes it,
-/// and the measured one names none. The grid decides from this whether a cell takes a keystroke,
-/// so a listing that does not carry it offers an edit on a computed value.
+/// and the measured one names none but names the calculation reading it. The grid decides from
+/// this whether a cell takes a keystroke, and says what a typed value feeds before it is saved.
 #[tokio::test]
 #[serial]
 async fn a_computed_column_names_the_calculation_that_writes_it() {
@@ -1054,6 +1054,15 @@ async fn a_computed_column_names_the_calculation_that_writes_it() {
     assert!(
         column(GLOBAL_PARAM_DO_ID)["written_by"].is_null(),
         "a measured column names none: {body}"
+    );
+    assert_eq!(
+        column(GLOBAL_PARAM_DO_ID)["read_by"],
+        json!(["visit_roles"]),
+        "the measured column names what reads it: {body}"
+    );
+    assert!(
+        column(&output_id.to_string())["read_by"].is_null(),
+        "nothing reads the output: {body}"
     );
 }
 

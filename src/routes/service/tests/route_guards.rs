@@ -39,7 +39,7 @@ const EXPECTED: &str = include_str!("route_guards.txt");
 /// The source files that declare routers. A component that starts owning its routes is added here,
 /// which is a deliberate edit at the moment the ownership moves.
 fn router_sources() -> Vec<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes");
+    let root = crate::test_crate_root().join("src/routes");
     let mut files = Vec::new();
     collect(&root, &mut files);
     files.sort();
@@ -207,7 +207,7 @@ fn every_route_carries_the_authorization_it_always_carried() {
     let actual = table();
     if std::env::var_os("ROUTE_GUARDS_OVERWRITE").is_some() {
         std::fs::write(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/service/tests/route_guards.txt"),
+            crate::test_crate_root().join("src/routes/service/tests/route_guards.txt"),
             format!("{actual}\n"),
         )
         .expect("write the table");

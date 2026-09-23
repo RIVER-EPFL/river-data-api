@@ -202,3 +202,119 @@ fn test_a_key_computed_once_reports_that_computation() {
     assert_eq!(reported[0].revision, Some(826));
     assert_eq!(reported[0].value.as_f64(), Some(2.0));
 }
+
+mod resolve {
+    use std::collections::HashMap;
+
+    use chrono::{TimeZone, Utc};
+    use uuid::Uuid;
+
+    use super::super::super::models::{ConsumedInput, ConsumedReading};
+    use super::super::{CHANGED, CurrentReading, UNCHANGED, UNKNOWN, mark_of, resolve_one};
+
+    fn input(members: Vec<ConsumedReading>, subject: Option<&str>) -> ConsumedInput {
+        ConsumedInput {
+            variable: "doc".to_string(),
+            kind: "parameter".to_string(),
+            subject: subject.map(str::to_string),
+            property: None,
+            revision: Some(4),
+            alignment: None,
+            members,
+            value: serde_json::json!(2.0),
+        }
+    }
+
+    fn member(index: i16, revision: i64) -> ConsumedReading {
+        ConsumedReading {
+            stream_id: Uuid::nil(),
+            time: Utc.with_ymd_and_hms(2025, 6, 1, 8, 0, 0).unwrap(),
+            replicate_index: index,
+            revision: Some(revision),
+            value: Some(2.0),
+        }
+    }
+
+    fn standing(revision: i64, value: f64) -> CurrentReading {
+        CurrentReading {
+            revision: Some(revision),
+            value: Some(value),
+            point: None,
+        }
+    }
+
+    #[test]
+    fn test_a_single_member_carries_its_current_value() {
+        let m = member(0, 4);
+        let current = HashMap::from([((m.stream_id, m.time, 0), standing(4, 2.0))]);
+        let r = resolve_one(
+            &input(vec![m], None),
+            &current,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(r.state, UNCHANGED);
+        assert_eq!(r.current_value, Some(serde_json::json!(2.0)));
+    }
+
+    #[test]
+    fn test_a_statistic_over_several_members_carries_no_current_number() {
+        let (a, b) = (member(0, 4), member(1, 4));
+        let current = HashMap::from([
+            ((a.stream_id, a.time, 0), standing(4, 2.0)),
+            ((b.stream_id, b.time, 1), standing(5, 9.0)),
+        ]);
+        let r = resolve_one(
+            &input(vec![a, b], None),
+            &current,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(r.state, CHANGED, "one member moved");
+        assert_eq!(r.current_value, None);
+        assert_eq!(r.members[1].current_value, Some(9.0));
+    }
+
+    #[test]
+    fn test_an_input_with_no_members_and_no_subject_is_unknown() {
+        let r = resolve_one(
+            &input(vec![], None),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(r.state, UNKNOWN);
+    }
+
+    #[test]
+    fn test_a_subject_the_catalog_no_longer_holds_is_changed() {
+        let r = resolve_one(
+            &input(vec![], Some("constants:1")),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(r.state, CHANGED);
+        assert_eq!(r.current_revision, None);
+    }
+
+    #[test]
+    fn test_a_subject_at_the_revision_consumed_is_unchanged() {
+        let revisions = HashMap::from([("constants:1".to_string(), 4)]);
+        let r = resolve_one(
+            &input(vec![], Some("constants:1")),
+            &HashMap::new(),
+            &revisions,
+            &HashMap::new(),
+        );
+        assert_eq!(r.state, UNCHANGED);
+    }
+
+    #[test]
+    fn test_a_mark_read_back_is_one_of_the_three() {
+        assert_eq!(mark_of("changed"), CHANGED);
+        assert_eq!(mark_of("unchanged"), UNCHANGED);
+        assert_eq!(mark_of("unknown"), UNKNOWN);
+        assert_eq!(mark_of("stale"), UNKNOWN);
+    }
+}

@@ -61,6 +61,23 @@ async fn seeded_constants_match_the_portal_dump() {
         );
     }
 
+    // Exactly these twelve: a formula that names a constant the seed does not carry (a molar
+    // weight, a mole fraction) needs somebody to create it first.
+    let mut seeded: Vec<String> = db
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT name FROM constants",
+        ))
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.try_get::<String>("", "name").unwrap())
+        .collect();
+    seeded.sort();
+    let mut expected: Vec<&str> = PORTAL_CONSTANTS.iter().map(|(name, _, _)| *name).collect();
+    expected.sort_unstable();
+    assert_eq!(seeded, expected, "the seed holds the portal's twelve and nothing else");
+
     for retired in ["kh_co2", "kh_ch4", "ch4_temp_const"] {
         assert!(
             constant_row(&db, retired).await.is_none(),

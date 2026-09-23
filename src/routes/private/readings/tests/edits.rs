@@ -124,3 +124,61 @@ fn attribution_needs_more_than_curation_does() {
     }
     assert_eq!(EditOption::Detach.capability(), Capability::Admin);
 }
+
+mod authorise {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use super::super::authorise;
+    use crate::common::authz::Role;
+    use crate::common::middleware::AuthContext;
+    use crate::routes::private::readings::models::EditOption;
+
+    fn member(role: Role) -> AuthContext {
+        AuthContext::Keycloak {
+            roles: vec![role],
+            sub: "sub-1".to_string(),
+            email: None,
+            email_verified: false,
+            grants: Arc::new(HashSet::new()),
+        }
+    }
+
+    #[test]
+    fn test_a_river_member_corrects_a_measurement_and_not_its_attribution() {
+        assert!(authorise(&member(Role::River), EditOption::ValueCorrection).is_ok());
+        assert!(authorise(&member(Role::River), EditOption::Flag).is_ok());
+        assert!(authorise(&member(Role::River), EditOption::Curve).is_err());
+        assert!(authorise(&member(Role::River), EditOption::EditDeployment).is_err());
+    }
+
+    #[test]
+    fn test_a_manager_corrects_attribution_and_does_not_detach_a_slot() {
+        assert!(authorise(&member(Role::Manager), EditOption::EditCalibration).is_ok());
+        assert!(authorise(&member(Role::Manager), EditOption::Detach).is_err());
+        assert!(authorise(&member(Role::Manager), EditOption::Return).is_err());
+    }
+
+    #[test]
+    fn test_the_refusal_names_the_capability_the_edit_needs() {
+        let err = authorise(&member(Role::Intern), EditOption::Curve).expect_err("refused");
+        assert!(err.to_string().contains("that edit requires"), "{err}");
+    }
+}
+
+mod cadence_filter {
+    use super::super::sanitize_cadence;
+
+    #[test]
+    fn test_spot_and_derived_filter_on_the_column() {
+        assert_eq!(sanitize_cadence("spot").expect("spot"), "spot");
+        assert_eq!(sanitize_cadence("derived").expect("derived"), "derived");
+    }
+
+    #[test]
+    fn test_any_other_word_is_refused_rather_than_bound_into_the_filter() {
+        for value in ["hourly", "SPOT", "", "spot'; --"] {
+            assert!(sanitize_cadence(value).is_err(), "{value:?}");
+        }
+    }
+}

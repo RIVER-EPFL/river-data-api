@@ -1920,6 +1920,7 @@ pub struct CalculationHealth {
     pub skipped_outputs: i64,
     /// The calculation's latest `event_recompute` run, while it is queued or running and when it
     /// failed. Null once it completed, or when none ran.
+    #[schema(required)]
     pub repair: Option<CalculationRepair>,
 }
 

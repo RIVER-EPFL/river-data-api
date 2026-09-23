@@ -130,3 +130,83 @@ fn test_a_row_resolves_its_own_site_by_name_or_id() {
     let err = resolve_row_site(&Uuid::nil().to_string(), &sites, SITE_B).unwrap_err();
     assert!(err.contains(&Uuid::nil().to_string()), "{err}");
 }
+
+mod csv_cells {
+    use super::super::{parse_datetime, replicate_column};
+    use crate::routes::private::tools::models::ManifestParam;
+    use chrono::{Duration, TimeZone, Utc};
+
+    fn param(name: &str, kind: &str) -> ManifestParam {
+        ManifestParam {
+            name: name.to_string(),
+            label: name.to_string(),
+            kind: kind.to_string(),
+            units: None,
+            required: false,
+            default: None,
+            when: None,
+            structure: None,
+            description: None,
+            section: None,
+            parameter_code: None,
+            suggested: None,
+            curve: None,
+            parameter: None,
+        }
+    }
+
+    #[test]
+    fn test_a_naive_timestamp_takes_the_declared_zone() {
+        // 10:00 at UTC+2 is 08:00 UTC
+        assert_eq!(
+            parse_datetime("2025-06-01 10:00:00", Duration::hours(2)),
+            Some(Utc.with_ymd_and_hms(2025, 6, 1, 8, 0, 0).unwrap())
+        );
+        assert_eq!(
+            parse_datetime(" 2025-06-01 10:00 ", Duration::hours(2)),
+            Some(Utc.with_ymd_and_hms(2025, 6, 1, 8, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_an_rfc3339_timestamp_keeps_its_own_offset() {
+        assert_eq!(
+            parse_datetime("2025-06-01T10:00:00+02:00", Duration::hours(5)),
+            Some(Utc.with_ymd_and_hms(2025, 6, 1, 8, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_an_unreadable_timestamp_is_none() {
+        for cell in ["", "01/06/2025", "2025-06-01", "yesterday"] {
+            assert_eq!(parse_datetime(cell, Duration::zero()), None, "{cell:?}");
+        }
+    }
+
+    #[test]
+    fn test_a_replicate_header_names_its_param_and_position() {
+        let params = [param("absorbance", "replicates"), param("volume", "number")];
+        assert_eq!(
+            replicate_column(&params, "absorbance_rep_1"),
+            Some(("absorbance".to_string(), Some(0)))
+        );
+        assert_eq!(
+            replicate_column(&params, "Absorbance_3"),
+            Some(("absorbance".to_string(), Some(2)))
+        );
+    }
+
+    #[test]
+    fn test_a_header_that_is_not_a_replicate_position_is_none() {
+        let params = [param("absorbance", "replicates"), param("volume", "number")];
+        for header in [
+            "absorbance",
+            "absorbance_rep_0",
+            "absorbance_0",
+            "absorbance_x",
+            "volume_1",
+        ] {
+            assert_eq!(replicate_column(&params, header), None, "{header}");
+        }
+    }
+}

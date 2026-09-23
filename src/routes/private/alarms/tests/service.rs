@@ -240,3 +240,66 @@ mod instrument_range {
         );
     }
 }
+
+mod severity {
+    use super::super::severity_of;
+    use crate::routes::private::alarms::models::ResolvedThreshold;
+
+    fn bounds(
+        wmin: Option<f64>,
+        wmax: Option<f64>,
+        amin: Option<f64>,
+        amax: Option<f64>,
+    ) -> ResolvedThreshold {
+        ResolvedThreshold {
+            warning_min: wmin,
+            warning_max: wmax,
+            alarm_min: amin,
+            alarm_max: amax,
+        }
+    }
+
+    #[test]
+    fn test_a_value_inside_every_bound_is_ok() {
+        let t = bounds(Some(2.0), Some(8.0), Some(1.0), Some(9.0));
+        assert_eq!(severity_of(5.0, &t), 0);
+    }
+
+    #[test]
+    fn test_a_value_equal_to_a_bound_is_inside_it() {
+        let t = bounds(Some(2.0), Some(8.0), Some(1.0), Some(9.0));
+        assert_eq!(severity_of(2.0, &t), 0);
+        assert_eq!(
+            severity_of(9.0, &t),
+            1,
+            "past the warning bound, on the alarm one"
+        );
+    }
+
+    #[test]
+    fn test_an_alarm_bound_outranks_a_warning_bound() {
+        let t = bounds(Some(2.0), Some(8.0), Some(1.0), Some(9.0));
+        assert_eq!(severity_of(0.5, &t), 2);
+        assert_eq!(severity_of(9.5, &t), 2);
+        assert_eq!(severity_of(8.5, &t), 1);
+    }
+
+    #[test]
+    fn test_a_value_below_the_alarm_minimum_is_an_alarm_whatever_the_warning_maximum_says() {
+        // below alarm_min and above warning_max at once, when the bounds are crossed
+        let t = bounds(None, Some(0.0), Some(1.0), None);
+        assert_eq!(severity_of(0.5, &t), 2);
+    }
+
+    #[test]
+    fn test_warning_bounds_alone_warn_and_never_alarm() {
+        let t = bounds(Some(2.0), Some(8.0), None, None);
+        assert_eq!(severity_of(-100.0, &t), 1);
+        assert_eq!(severity_of(100.0, &t), 1);
+    }
+
+    #[test]
+    fn test_no_bound_at_all_raises_nothing() {
+        assert_eq!(severity_of(1e9, &bounds(None, None, None, None)), 0);
+    }
+}

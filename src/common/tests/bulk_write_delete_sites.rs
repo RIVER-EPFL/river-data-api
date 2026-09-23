@@ -50,7 +50,7 @@ fn delete_statements(source: &str) -> usize {
 
 #[test]
 fn test_delete_from_readings_appears_only_at_allowlisted_sites() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = &crate::test_crate_root();
     let mut files = Vec::new();
     rust_files(&root.join("src"), &mut files);
     files.sort();

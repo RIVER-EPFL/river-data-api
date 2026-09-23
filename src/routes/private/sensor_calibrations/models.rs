@@ -112,3 +112,7 @@ fn slope_is_usable(slope: Option<f64>) -> Result<(), crudcrate::validation::Vali
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tests/models.rs"]
+mod tests;

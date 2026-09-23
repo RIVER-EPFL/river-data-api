@@ -212,3 +212,28 @@ mod staleness {
         assert!(groups_changed(&[read(doc, &[2, 0, 1])], &[stored(doc, &[0, 1, 2])]).is_empty());
     }
 }
+
+mod tool_link {
+    use super::super::output_carries_value;
+    use serde_json::json;
+
+    #[test]
+    fn test_a_scalar_output_carries_exactly_its_value() {
+        assert!(output_carries_value(&json!(1.25), 1.25));
+        assert!(!output_carries_value(&json!(1.25), 1.250_000_1));
+    }
+
+    #[test]
+    fn test_a_replicate_shaped_output_carries_any_of_its_leaves() {
+        let output = json!({ "values": [1.0, null, 3.5], "mean": 2.25 });
+        assert!(output_carries_value(&output, 3.5));
+        assert!(output_carries_value(&output, 2.25));
+        assert!(!output_carries_value(&output, 2.0));
+    }
+
+    #[test]
+    fn test_a_non_numeric_output_carries_no_value() {
+        assert!(!output_carries_value(&json!("1.25"), 1.25));
+        assert!(!output_carries_value(&json!(null), 0.0));
+    }
+}

@@ -302,3 +302,25 @@ mod alignment {
         assert_eq!(alignment_of(&held, "alkalinity_avg"), EXACT);
     }
 }
+
+mod formula_syntax {
+    use super::super::validate_formula;
+
+    #[test]
+    fn test_an_expression_that_parses_is_accepted() {
+        for formula in ["a + b", "exp(lab_temp / 100) * 2", "(DOC - blank) / 1.05"] {
+            assert!(validate_formula(formula).is_ok(), "{formula}");
+        }
+    }
+
+    #[test]
+    fn test_an_expression_that_does_not_parse_is_refused_as_invalid() {
+        for formula in ["a +", "(a + b", "a b", ""] {
+            let err = validate_formula(formula).expect_err(formula);
+            assert!(
+                err.to_string().contains("Invalid formula"),
+                "{formula}: {err}"
+            );
+        }
+    }
+}

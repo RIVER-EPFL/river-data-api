@@ -311,6 +311,10 @@ pub struct ExpectedParameter {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub written_by: Option<String>,
+    /// The calculations that read this parameter, by tool name, so every cell of the column says
+    /// what a typed value feeds whichever visit it is typed at.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub read_by: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

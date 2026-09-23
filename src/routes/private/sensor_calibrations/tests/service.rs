@@ -648,3 +648,121 @@ mod held_sources {
         }
     }
 }
+
+/// The order a site's calculations evaluate in, from what each set reads and produces.
+mod evaluation_order {
+    use super::super::{DerivedWork, build_evaluation_order};
+    use crate::routes::private::tools::models::PinnedFormula;
+    use crate::routes::private::tools::service::StreamCalculation;
+    use uuid::Uuid;
+
+    fn formula(code: &str, output: Option<&str>, sources: &[&str]) -> PinnedFormula {
+        PinnedFormula {
+            code: code.to_string(),
+            label: code.to_string(),
+            units: None,
+            formula: sources.join(" + "),
+            ordinal: 0,
+            output_parameter_code: output.map(str::to_string),
+            sources: sources
+                .iter()
+                .map(|s| ((*s).to_string(), (*s).to_string()))
+                .collect(),
+            held: Vec::new(),
+            site_sources: Vec::new(),
+            curve_slot: None,
+            per_replicate: None,
+            intermediate: output.is_none(),
+        }
+    }
+
+    fn work(name: &str, formulas: Vec<PinnedFormula>) -> DerivedWork {
+        DerivedWork {
+            calculation: StreamCalculation {
+                id: Uuid::nil(),
+                name: name.to_string(),
+                active_version_id: None,
+                formulas,
+            },
+            derived_site_id: Uuid::nil(),
+            outputs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_a_set_reads_only_what_it_does_not_produce_itself() {
+        let item = work(
+            "carbonate",
+            vec![
+                formula("dic", Some("DIC"), &["Alk", "pH"]),
+                formula("co2", Some("CO2"), &["DIC", "pH"]),
+            ],
+        );
+        assert_eq!(item.source_codes(), vec!["alk", "ph"]);
+        assert_eq!(item.output_codes(), vec!["dic", "co2"]);
+    }
+
+    #[test]
+    fn test_a_calculation_reading_another_ones_output_runs_after_it() {
+        let items = [
+            work("flux", vec![formula("flux", Some("Flux"), &["CO2"])]),
+            work("carbonate", vec![formula("co2", Some("CO2"), &["Alk"])]),
+        ];
+        assert_eq!(build_evaluation_order(&items).expect("ordered"), vec![1, 0]);
+    }
+
+    #[test]
+    fn test_a_source_matches_an_output_code_whatever_its_case() {
+        let items = [
+            work("flux", vec![formula("flux", Some("Flux"), &["co2"])]),
+            work("carbonate", vec![formula("co2", Some("CO2"), &["Alk"])]),
+        ];
+        assert_eq!(build_evaluation_order(&items).expect("ordered"), vec![1, 0]);
+    }
+
+    #[test]
+    fn test_a_calculation_reading_its_own_output_is_no_cycle() {
+        let items = [work(
+            "smooth",
+            vec![
+                formula("raw", Some("Raw"), &["Level"]),
+                formula("smoothed", Some("Smoothed"), &["Raw", "Smoothed"]),
+            ],
+        )];
+        assert_eq!(build_evaluation_order(&items).expect("ordered"), vec![0]);
+    }
+
+    #[test]
+    fn test_two_calculations_reading_each_other_are_refused_naming_both() {
+        let items = [
+            work("left", vec![formula("a", Some("A"), &["B"])]),
+            work("right", vec![formula("b", Some("B"), &["A"])]),
+        ];
+        let err = build_evaluation_order(&items)
+            .expect_err("a cycle")
+            .to_string();
+        assert!(err.contains("left") && err.contains("right"), "{err}");
+    }
+}
+
+mod end_date_provenance {
+    use super::super::valid_until_provenance;
+
+    #[test]
+    fn test_an_end_date_set_by_hand_is_the_operators() {
+        assert_eq!(
+            valid_until_provenance(Some(Some(chrono::Utc::now()))),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_a_cleared_end_date_goes_back_to_the_chain() {
+        assert_eq!(valid_until_provenance(Some(None)), Some(false));
+    }
+
+    #[test]
+    fn test_an_update_naming_no_end_date_leaves_the_provenance() {
+        assert_eq!(valid_until_provenance(None), None);
+    }
+}

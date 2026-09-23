@@ -229,3 +229,141 @@ fn test_declared_instrument_granularity_reads_both_shapes() {
         None
     );
 }
+
+mod pinning {
+    use super::super::pin_assignments;
+    use super::spec;
+    use crate::routes::private::data_streams::models::{ColumnAssignment, ReplicateSpec};
+
+    fn columns(names: &[&str]) -> Vec<String> {
+        names.iter().map(ToString::to_string).collect()
+    }
+
+    fn pinned(names: &[&str]) -> ReplicateSpec {
+        let mut prior = spec(names);
+        prior.assignments = pin_assignments(None, &columns(names)).expect("first registration");
+        prior
+    }
+
+    fn index_of(assignments: &[ColumnAssignment], column: &str) -> (i16, bool) {
+        let a = assignments
+            .iter()
+            .find(|a| a.column == column)
+            .unwrap_or_else(|| panic!("{column} is assigned: {assignments:?}"));
+        (a.index, a.retired)
+    }
+
+    #[test]
+    fn test_a_first_registration_numbers_the_columns_in_order() {
+        let assigned =
+            pin_assignments(None, &columns(&["DOC_1", "DOC_2", "DOC_3"])).expect("pinned");
+        assert_eq!(index_of(&assigned, "DOC_1"), (0, false));
+        assert_eq!(index_of(&assigned, "DOC_3"), (2, false));
+    }
+
+    #[test]
+    fn test_a_reordered_family_keeps_each_column_on_its_index() {
+        let prior = pinned(&["DOC_1", "DOC_2", "DOC_3"]);
+        let assigned =
+            pin_assignments(Some(&prior), &columns(&["DOC_3", "DOC_1", "DOC_2"])).expect("pinned");
+        assert_eq!(index_of(&assigned, "DOC_1"), (0, false));
+        assert_eq!(index_of(&assigned, "DOC_2"), (1, false));
+        assert_eq!(index_of(&assigned, "DOC_3"), (2, false));
+    }
+
+    #[test]
+    fn test_an_added_column_takes_the_next_index() {
+        let prior = pinned(&["DOC_1", "DOC_2"]);
+        let assigned =
+            pin_assignments(Some(&prior), &columns(&["DOC_4", "DOC_1", "DOC_2"])).expect("pinned");
+        assert_eq!(index_of(&assigned, "DOC_4"), (2, false));
+        assert_eq!(assigned.len(), 3);
+    }
+
+    #[test]
+    fn test_a_dropped_column_is_retired_on_its_index_and_returns_to_it() {
+        let prior = pinned(&["DOC_1", "DOC_2", "DOC_3"]);
+        let dropped = pin_assignments(Some(&prior), &columns(&["DOC_1", "DOC_3"])).expect("pinned");
+        assert_eq!(index_of(&dropped, "DOC_2"), (1, true));
+
+        let mut retired = spec(&["DOC_1", "DOC_3"]);
+        retired.assignments = dropped;
+        let back = pin_assignments(Some(&retired), &columns(&["DOC_1", "DOC_2", "DOC_3"]))
+            .expect("pinned");
+        assert_eq!(index_of(&back, "DOC_2"), (1, false));
+        assert_eq!(back.len(), 3, "a returning column is not added twice");
+    }
+
+    #[test]
+    fn test_a_retired_index_is_never_reused() {
+        let prior = pinned(&["DOC_1", "DOC_2", "DOC_3"]);
+        let mut retired = spec(&["DOC_1", "DOC_2"]);
+        retired.assignments =
+            pin_assignments(Some(&prior), &columns(&["DOC_1", "DOC_2"])).expect("pinned");
+        let assigned = pin_assignments(Some(&retired), &columns(&["DOC_1", "DOC_2", "DOC_9"]))
+            .expect("pinned");
+        // DOC_3 keeps 2 while retired, so the new column takes 3
+        assert_eq!(index_of(&assigned, "DOC_3"), (2, true));
+        assert_eq!(index_of(&assigned, "DOC_9"), (3, false));
+    }
+
+    #[test]
+    fn test_a_removal_and_an_addition_in_one_step_is_refused_as_an_ambiguous_rename() {
+        let prior = pinned(&["DOC_1", "DOC_2"]);
+        let err =
+            pin_assignments(Some(&prior), &columns(&["DOC_1", "DOC_X"])).expect_err("refused");
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn test_a_column_named_twice_is_assigned_once_when_already_known() {
+        let prior = pinned(&["DOC_1", "DOC_2"]);
+        let assigned =
+            pin_assignments(Some(&prior), &columns(&["DOC_1", "DOC_1", "DOC_2"])).expect("pinned");
+        assert_eq!(assigned.len(), 2);
+    }
+}
+
+mod family_retag {
+    use super::super::refuse_family_retag;
+
+    #[test]
+    fn test_a_retag_touching_no_family_is_allowed() {
+        assert!(refuse_family_retag(&[], "continuous").is_ok());
+    }
+
+    #[test]
+    fn test_a_retag_touching_a_family_is_refused_naming_it() {
+        let err =
+            refuse_family_retag(&["S01:DOC:reps".to_string()], "continuous").expect_err("refused");
+        assert!(err.to_string().contains("S01:DOC:reps"), "{err}");
+        assert!(err.to_string().contains("'continuous'"), "{err}");
+    }
+}
+
+mod decimal_places {
+    use super::super::declared_decimal_places;
+    use serde_json::json;
+
+    #[test]
+    fn test_the_declared_places_are_read_from_metadata() {
+        assert_eq!(
+            declared_decimal_places(&json!({ "decimal_places": 2 })),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_no_declaration_or_an_unreadable_one_is_none() {
+        assert_eq!(declared_decimal_places(&json!({})), None);
+        assert_eq!(declared_decimal_places(&json!(null)), None);
+        assert_eq!(
+            declared_decimal_places(&json!({ "decimal_places": "2" })),
+            None
+        );
+        assert_eq!(
+            declared_decimal_places(&json!({ "decimal_places": 70000 })),
+            None
+        );
+    }
+}

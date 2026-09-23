@@ -85,3 +85,35 @@ fn no_upsert_touches_flag_state() {
         );
     }
 }
+
+mod ingest_response {
+    use super::super::{admission::RejectionKind, ingest_outcome};
+
+    #[test]
+    fn test_the_skipped_count_is_the_sum_of_the_kinds_and_each_is_named() {
+        let counts = [
+            (RejectionKind::OutOfWindow, 2),
+            (RejectionKind::NonFinite, 1),
+        ];
+        let response = ingest_outcome(uuid::Uuid::nil(), true, 10, 7, &counts);
+        // 2 + 1
+        assert_eq!(response.skipped, 3);
+        assert_eq!(response.inserted, 7);
+        assert_eq!(
+            response.skipped_reasons,
+            vec![
+                "timestamp outside the admissible window (2)".to_string(),
+                "value is not a finite number (1)".to_string(),
+            ]
+        );
+        assert!(response.paired);
+    }
+
+    #[test]
+    fn test_a_clean_batch_reports_nothing_skipped() {
+        let response = ingest_outcome(uuid::Uuid::nil(), false, 4, 4, &[]);
+        assert_eq!(response.skipped, 0);
+        assert!(response.skipped_reasons.is_empty());
+        assert!(!response.paired);
+    }
+}

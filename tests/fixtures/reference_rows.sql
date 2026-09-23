@@ -1,11 +1,13 @@
 -- The reference rows the migration chain used to seed, kept here so the suite that reads them
--- (the tool runner's `doc` script) still has them on a database that starts blank. Applied once
--- per process by `setup_test_db`, after the migrations. The calculators' constants are not here:
+-- (the tool runner's `doc` script) still has them on a database that starts blank. Applied by
+-- every `setup_test_db` call, after the migrations. The calculators' constants are not here:
 -- the baseline seeds those (Q102).
 --
--- Dumped from a migrated database rather than written by hand, so the script text, its normalised
--- manifest and test-case jsonb and its content hash are exact. The script row goes in naming no
--- version, because the version it names is inserted after it.
+-- Hand-maintained, and the only stored definition of the `doc` script, its normalised manifest,
+-- its test cases and its content hash: nothing regenerates this file. `tests/tools/
+-- seeded_version_hashes.rs` re-derives the hash from the stored content on every run, so an edit
+-- that leaves the hash behind fails there. The script row goes in naming no version, because the
+-- version it names is inserted after it.
 
 INSERT INTO public.tool_scripts (id, name, label, description, active_version_id, created_by, created_at, updated_at, enabled, engine) VALUES ('8183564e-05b4-4956-89d4-c8013cca066f', 'doc', 'DOC', 'Dissolved organic carbon: the analyser replicates are stored as readings, corrected through the chosen standard curve, and their mean and standard deviation are the served DOC.', NULL, 'seed', '2026-09-04 12:10:27.924083+00', '2026-09-04 12:10:27.924083+00', true, 'script') ON CONFLICT DO NOTHING;
 

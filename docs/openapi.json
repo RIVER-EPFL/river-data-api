@@ -2970,7 +2970,8 @@
           "stale_visits",
           "missing_outputs",
           "stale_outputs",
-          "skipped_outputs"
+          "skipped_outputs",
+          "repair"
         ],
         "type": "object"
       },
@@ -7111,6 +7112,13 @@
           "parameter_id": {
             "format": "uuid",
             "type": "string"
+          },
+          "read_by": {
+            "description": "The calculations that read this parameter, by tool name, so every cell of the column says\nwhat a typed value feeds whichever visit it is typed at.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "units": {
             "description": "The unit the column's numbers are in, from the site's slot when it declares one and the\ncatalog default otherwise. A grid of bare numbers cannot be read without it.",

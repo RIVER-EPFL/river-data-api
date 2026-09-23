@@ -31,7 +31,7 @@ fn lift_literals(source: &str) -> usize {
 
 #[test]
 fn test_the_decompression_lift_is_spelled_once() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = &crate::test_crate_root();
     let mut files = Vec::new();
     rust_files(&root.join("src"), &mut files);
     files.sort();

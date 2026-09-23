@@ -72,3 +72,37 @@ fn test_a_finished_or_absent_repair_leaves_the_findings_to_speak() {
     assert_eq!(calculation_repair(Some("cancelled")), None);
     assert_eq!(calculation_repair(None), None);
 }
+
+#[test]
+fn test_a_parameter_names_every_calculation_reading_it_and_the_one_writing_it() {
+    use crate::routes::private::tools::models::{CalculationImpact, ImpactParameter};
+
+    let dic = Uuid::from_u128(1);
+    let pco2 = Uuid::from_u128(2);
+    let param = |id: Uuid| ImpactParameter {
+        parameter_id: id,
+        parameter_code: String::new(),
+    };
+    let impact = |tool: &str, reads: Vec<Uuid>, outputs: Vec<Uuid>| CalculationImpact {
+        tool: tool.to_string(),
+        label: tool.to_string(),
+        reads: reads.into_iter().map(param).collect(),
+        outputs: outputs.into_iter().map(param).collect(),
+    };
+    let impacts = [
+        impact("carbonate", vec![dic], vec![pco2]),
+        impact("flux", vec![dic, pco2], vec![]),
+    ];
+    assert_eq!(
+        parameter_roles(&impacts, dic),
+        (vec!["carbonate".to_string(), "flux".to_string()], None)
+    );
+    assert_eq!(
+        parameter_roles(&impacts, pco2),
+        (vec!["flux".to_string()], Some("carbonate".to_string()))
+    );
+    assert_eq!(
+        parameter_roles(&impacts, Uuid::from_u128(3)),
+        (vec![], None)
+    );
+}
