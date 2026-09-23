@@ -192,9 +192,8 @@ impl CRUDOperations for SiteParameterOperations {
     ) -> Result<(), ApiError> {
         // `is_active` and `is_public` defaults live in the model's `on_create`, so an omitted
         // field is already resolved by the time this hook runs and an explicit null stays null.
-        // NOTE: alarm thresholds are intentionally NOT auto-created from parameter defaults.
-        // Alarm evaluation already falls back to the parameter's `default_*` columns when no
-        // `alarm_thresholds` row exists, so a default-valued row is redundant, and worse, a
+        // No alarm threshold is created for the new slot. Alarm evaluation falls back to the
+        // parameter's own row (the one with no `site_id`), so a copy here is redundant, and a
         // site-specific copy would silently shadow a global threshold an operator set. A
         // site-specific row is created only when a user explicitly overrides via the editor.
 

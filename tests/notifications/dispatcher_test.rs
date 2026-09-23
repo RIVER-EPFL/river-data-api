@@ -32,16 +32,53 @@ impl NotificationChannel for MockChannel {
         Ok("mock healthy".to_string())
     }
 
-    async fn deliver(&self, _state: &AppState, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
+    async fn deliver(
+        &self,
+        _state: &AppState,
+        msg: &OutgoingMessage,
+    ) -> Result<Vec<DeliveryResult>, String> {
         self.sent.lock().unwrap().push(msg.clone());
-        vec![DeliveryResult {
+        Ok(vec![DeliveryResult {
             recipient: "mock".to_string(),
             outcome: if self.fail {
                 Err("boom".to_string())
             } else {
                 Ok(())
             },
-        }]
+        }])
+    }
+}
+
+/// A channel whose recipient lookup fails on its first call, as a pool timeout on the
+/// subscription query does, and delivers on every call after.
+struct LookupFailsOnce {
+    calls: Arc<Mutex<usize>>,
+}
+
+#[async_trait::async_trait]
+impl NotificationChannel for LookupFailsOnce {
+    fn name(&self) -> &'static str {
+        "mock"
+    }
+
+    async fn check_health(&self) -> Result<String, String> {
+        Ok("mock healthy".to_string())
+    }
+
+    async fn deliver(
+        &self,
+        _state: &AppState,
+        _msg: &OutgoingMessage,
+    ) -> Result<Vec<DeliveryResult>, String> {
+        let mut calls = self.calls.lock().unwrap();
+        *calls += 1;
+        if *calls == 1 {
+            return Err("pool timed out".to_string());
+        }
+        Ok(vec![DeliveryResult {
+            recipient: "mock".to_string(),
+            outcome: Ok(()),
+        }])
     }
 }
 
@@ -308,4 +345,59 @@ async fn an_alarm_with_no_channel_configured_is_stamped_undeliverable() {
         1,
         "and the attempt that reached nobody is on the record"
     );
+}
+
+/// Scenario: the subscription lookup fails while an alarm is dispatched.
+///
+/// Expected behaviour: the attempt is logged as failed, not skipped, and the claim is released, so
+/// the next tick delivers the alarm rather than leaving it stamped with nobody told.
+#[tokio::test]
+#[serial]
+async fn a_failed_recipient_lookup_is_retried_on_the_next_tick() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let (_app, state) = crate::common::build_test_app_with_state(db.clone());
+    insert_open_event(&db).await;
+
+    let calls = Arc::new(Mutex::new(0));
+    let channels: Vec<Box<dyn NotificationChannel>> = vec![Box::new(LookupFailsOnce {
+        calls: calls.clone(),
+    })];
+    flows::dispatch_once(&state, &channels).await;
+    assert_eq!(
+        log_count(&db, "failed").await,
+        1,
+        "the failed lookup is logged as failed"
+    );
+    assert_eq!(
+        log_count(&db, "skipped").await,
+        0,
+        "a failed lookup is not an empty audience"
+    );
+    assert_eq!(
+        count(&db, "notified_at IS NULL AND resolved_at IS NULL").await,
+        1,
+        "the claim is released for the next tick"
+    );
+
+    flows::dispatch_once(&state, &channels).await;
+    assert_eq!(
+        count(&db, "notified_at IS NULL AND resolved_at IS NULL").await,
+        0,
+        "the next tick delivers and stamps it"
+    );
+    let sent: i64 = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT COUNT(*) AS c FROM notification_log \
+             WHERE status = 'sent' AND alarm_event_id IS NOT NULL"
+                .to_string(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "c")
+        .unwrap();
+    assert_eq!(sent, 1, "the alarm itself is sent once");
 }

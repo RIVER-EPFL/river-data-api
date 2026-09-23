@@ -148,8 +148,8 @@ pub struct Config {
     // primary; this bounds a missed event) and the push subscription reconciliation sweep cadence.
     pub notify_poll_interval_seconds: u64,
     pub identity_reconcile_interval_seconds: u64,
-    // How often the background health probe checks each configured channel (getMe / SMTP NOOP /
-    // Graph token) and records each channel's health in notification_state.
+    // How often the background health probe checks the Web Push channel (that its VAPID keypair
+    // parses and its public key matches) and records the result in notification_state.
     pub notify_health_interval_seconds: u64,
     // Battery depletion forecast: cutoff voltage and the days-to-cutoff threshold that raises an alert.
     pub battery_cutoff_volts: f64,
@@ -241,10 +241,12 @@ impl Config {
         }
     }
 
-    /// Whether Web Push is configured (a VAPID private key and subject are present).
+    /// Whether Web Push is configured (a VAPID keypair and subject are present).
     #[must_use]
     pub fn web_push_configured(&self) -> bool {
-        self.vapid_private_key_pem.is_some() && self.vapid_subject.is_some()
+        self.vapid_private_key_pem.is_some()
+            && self.vapid_public_key.is_some()
+            && self.vapid_subject.is_some()
     }
 
     /// Load configuration from environment variables.

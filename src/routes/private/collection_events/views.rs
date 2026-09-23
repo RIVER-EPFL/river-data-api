@@ -1261,7 +1261,7 @@ async fn open_findings_at(
 }
 
 /// One visit's grid row: every parameter measured at the event with its replicates, sample
-/// statistics, tool provenance presence, and any open finding — plus findings for parameters
+/// statistics, tool provenance presence, and any open finding, plus findings for parameters
 /// the audit says are missing entirely. Requires `read_data`.
 #[utoipa::path(
     get,

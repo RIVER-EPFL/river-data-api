@@ -48,8 +48,8 @@ pub fn find_entry<'a>(plan: &'a serde_json::Value, stream_id: &str) -> &'a serde
         .unwrap_or_else(|| panic!("entry for stream {stream_id} missing: {plan}"))
 }
 
-/// Tick every entry of a plan and accept its instrument suggestions, which is what the review does
-/// before an apply is allowed.
+/// Tick every entry of a plan, accept its instrument suggestions and name an instrument for each lab
+/// row with none, which is what the review does before an apply is allowed.
 ///
 /// Q133 gated the apply on `needs_checking == 0`, and Q195 on every suggested instrument being
 /// confirmed, so an untouched plan is refused. A test whose subject is what the apply then does
@@ -66,10 +66,21 @@ pub async fn acknowledge_plan(app: &Router, token: &str, plan_id: &str) {
         .map(|entries| {
             entries
                 .iter()
-                .filter(|e| e["acknowledged"] != json!(true) || is_suggestion(e))
+                .filter(|e| {
+                    e["acknowledged"] != json!(true) || is_suggestion(e) || is_unassigned(e)
+                })
                 .map(|e| {
                     let mut update = json!({ "stream_id": e["stream_id"], "acknowledged": true });
                     if is_suggestion(e) {
+                        update["instrument_confirmed"] = json!(true);
+                    }
+                    if is_unassigned(e) {
+                        let name = e["parameter"]["name"].as_str().unwrap_or_default();
+                        update["instrument_name"] = if name.trim().is_empty() {
+                            e["source_key"].clone()
+                        } else {
+                            json!(name)
+                        };
                         update["instrument_confirmed"] = json!(true);
                     }
                     update
@@ -88,6 +99,15 @@ pub async fn acknowledge_plan(app: &Router, token: &str, plan_id: &str) {
     )
     .await;
     assert_eq!(status, 200, "ticking the plan's rows: {text}");
+}
+
+/// A lab row the plan pairs with nothing attached, which the review answers by naming the
+/// instrument after its parameter (its source key when the parameter has no name), as its bulk
+/// accept does.
+fn is_unassigned(entry: &serde_json::Value) -> bool {
+    entry["action"] == json!("pair")
+        && entry["instrument"].is_null()
+        && entry["is_device"] != json!(true)
 }
 
 /// An instrument the plan suggests, to create or to attach, that nobody has confirmed, no existing

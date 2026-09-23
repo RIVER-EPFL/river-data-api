@@ -21,7 +21,7 @@ use crate::common::{GLOBAL_PARAM_DO_ID, SITE1_ID};
 /// few ulps of disagreement are expected and exact equality is the wrong assertion. At these
 /// magnitudes an ulp is around 1e-14, while the convention error this test exists to catch, an
 /// n-divisor standard deviation where the sample (n-1) one is meant, is a factor of
-/// sqrt(2/3) ~= 0.816 on three replicates: for the values below that is a gap of about 10, i.e.
+/// sqrt(2/3) ~= 0.816 on three replicates: for the values below that is a gap of about 10, ie.
 /// ten orders of magnitude larger than this bound.
 const TOL: f64 = 1e-9;
 

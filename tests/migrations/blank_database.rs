@@ -1,9 +1,9 @@
 //! Scenario: an operator installs river-data and opens it before validating anything.
 //!
 //! Expected behaviour: the database the migrations build is blank. Every parameter, group,
-//! tool script and instrument arrives through a plan or a form somebody at this lab agreed to
-//! (Q134), so a migration that seeds one puts rows nobody reviewed in front of them with nothing
-//! on the page saying where they came from.
+//! calculation, formula, curve and instrument arrives through a plan or a form somebody at this
+//! lab agreed to (Q134), so a migration that seeds one puts rows nobody reviewed in front of them
+//! with nothing on the page saying where they came from.
 //!
 //! The twelve portal constants are Q102's exception: they are physical values the formula palette
 //! offers by name, identical at every deployment, so the baseline seeds them and this suite holds
@@ -23,6 +23,9 @@ const MUST_BE_EMPTY: &[&str] = &[
     "parameter_group_members",
     "tool_scripts",
     "tool_script_versions",
+    "calculation_formulas",
+    "calculation_shared_steps",
+    "standard_curves",
     "sensors",
     "projects",
     "sites",

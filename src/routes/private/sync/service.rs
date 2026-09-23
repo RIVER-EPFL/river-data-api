@@ -4414,13 +4414,17 @@ pub(super) struct ApplyCounters {
     pub(super) curves_created: u32,
 }
 
-/// The streams whose instrument nobody has agreed to: a creation, or an attachment the plan
-/// suggested from a curve label.
+/// The streams whose instrument nobody has agreed to: a creation, an attachment the plan suggested
+/// from a curve label, or a lab row with nothing attached, which the apply would otherwise mint one
+/// for. A device feed drafted without one is its own channel instrument.
 pub fn unconfirmed_instruments(entries: &[PlanEntry]) -> Vec<&str> {
     entries
         .iter()
         .filter(|e| e.action == "pair")
-        .filter(|e| e.instrument.as_ref().is_some_and(|i| !i.confirmed))
+        .filter(|e| match &e.instrument {
+            Some(i) => !i.confirmed,
+            None => !e.is_device,
+        })
         .map(|e| e.source_key.as_str())
         .collect()
 }
@@ -5456,9 +5460,9 @@ pub(super) async fn pair_entry_stream<C: ConnectionTrait>(
         Uuid::nil()
     };
 
-    // An entry the review left without an instrument takes the one its own source and parameter
-    // resolve, minted here. The apply fails rather than pairing a slot whose readings would name
-    // nothing that measured them.
+    // A device feed the plan drafted without an instrument takes its channel's, minted here; a lab
+    // row reaches the apply only once someone named one (`refuse_unconfirmed_instruments`). The
+    // apply fails rather than pairing a slot whose readings would name nothing that measured them.
     if needs_sensor {
         create_sensor_for_stream(txn, &stream, parameter_id, site_id, device_name).await?;
     } else if device && let Some(sensor_id) = stream.sensor_id.or(from_plan) {

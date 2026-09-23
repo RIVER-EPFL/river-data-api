@@ -3,7 +3,7 @@
 //! Scenario: a member enters a value that is an outlier for the season. Check screens it against
 //! the site's multi-year distribution (entry month ±2 across all years, replicates pooled,
 //! min/Q10/Q90/max) and answers with an advisory warning and the distribution payload. The save
-//! proceeds — the warning gates nothing by force — but it is held to the check it names: values
+//! proceeds (the warning gates nothing by force), but it is held to the check it names: values
 //! edited after the check are refused until re-checked. Authorization follows the documented
 //! layers: an intern may check and may enter a field measurement, which lands unverified, but may
 //! not replace a stored one (Q21, M44).
@@ -159,7 +159,7 @@ async fn an_outlier_warns_and_the_save_is_held_to_its_check() {
         "both repeats are the intern's, so both are unverified"
     );
 
-    // An edit after the check must re-check — the gate.
+    // An edit after the check must re-check: the gate.
     let mut edited = save.clone();
     edited["readings"][0]["value"] = json!(260.0);
     let (status, body) =

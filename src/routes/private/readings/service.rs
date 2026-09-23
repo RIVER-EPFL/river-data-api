@@ -8024,7 +8024,7 @@ pub(super) fn output_carries_value(output: &serde_json::Value, value: f64) -> bo
 /// Fail-closed on the link itself: every reading must name one of the run's outputs and carry
 /// that output's value, so a save cannot claim a run it did not use. A run that consumed a
 /// standard curve produced corrected outputs, so any reading carrying `standard_curve_id` is
-/// refused (ADR 0003: a stored curve id means raw in, curve out — stamping one here would apply
+/// refused (ADR 0003: a stored curve id means raw in, curve out, so stamping one here would apply
 /// the correction twice).
 /// The manifest of the tool version a run was executed under. A save reads what the run meant,
 /// never the tool's current active manifest. `None` when there is no run, no matching version, or

@@ -506,6 +506,7 @@ async fn stale_data(
                 if claim_insert(db, "stale_data", &key).await? {
                     let msg = OutgoingMessage {
                         kind: "stale_data",
+                        key: None,
                         subject: format!("RIVER Data: no {noun} from {site_name}"),
                         body: format!(
                             "⏳ No {noun} from {site_name} / {param_name} for ~{}h (expected within ~{}h).",
@@ -523,8 +524,9 @@ async fn stale_data(
                 if claim_clear(db, "stale_data", &key).await? {
                     let msg = OutgoingMessage {
                         kind: "stale_data",
+                        key: None,
                         subject: format!("RIVER Data: {noun} resumed from {site_name}"),
-                        body: format!("✅ {noun} flowing again from {site_name} / {param_name}."),
+                        body: format!("{noun} flowing again from {site_name} / {param_name}."),
                         slot,
                     };
                     if !deliver(state, channels, &msg, None).await {
@@ -659,9 +661,10 @@ async fn battery_forecast(
         }
         let msg = OutgoingMessage {
             kind: "battery_forecast",
+            key: None,
             subject: format!("RIVER Data: battery low at {site_name}"),
             body: format!(
-                "🔋 {site_name}: {latest:.2}V, trend {slope:+.3}V/day, ~{days:.0}d to {cutoff:.1}V."
+                "{site_name}: {latest:.2}V, trend {slope:+.3}V/day, ~{days:.0}d to {cutoff:.1}V."
             ),
             slot: Some(Slot {
                 project_id,
@@ -680,9 +683,8 @@ const SYNC_STALE_RENOTIFY_HOURS: i64 = 12;
 /// Hours between repeat alerts while the review queue still holds an open decision.
 const HOLDS_RENOTIFY_HOURS: i64 = SYNC_STALE_RENOTIFY_HOURS;
 
-/// A sync service whose heartbeat has stopped. `sync_failures` cannot see this — it counts
-/// `sync_events` rows and a dead service writes none (the three portal services were once
-/// heartbeat-dead for two days with zero notifications) — so the expectation is judged from the
+/// A sync service whose heartbeat has stopped. `sync_failures` cannot see this: it counts
+/// `sync_events` rows and a dead service writes none, so the expectation is judged from the
 /// heartbeat itself, with the same thresholds the operator health view uses.
 async fn sync_staleness(
     state: &AppState,
@@ -713,9 +715,10 @@ async fn sync_staleness(
         }
         let msg = OutgoingMessage {
             kind: "sync_stale",
+            key: Some(format!("{service_type}/{instance}")),
             subject: format!("RIVER Data: {service_type} sync service is silent"),
             body: format!(
-                "🔌 {service_type}/{instance} last heartbeat {} ({} hours ago). Its source is                  not being synced; check the service.",
+                "{service_type}/{instance} last heartbeat {} ({} hours ago). Its source is not being synced; check the service.",
                 hb.to_rfc3339(),
                 age.num_hours()
             ),
@@ -806,9 +809,10 @@ async fn streams_unpaired(
         };
         let msg = OutgoingMessage {
             kind: "streams_unpaired",
+            key: Some(source_system.to_string()),
             subject: format!("RIVER Data: {n} unpaired stream(s) on {source_system}"),
             body: format!(
-                "🔗 {n} {source_system} stream(s) are storing readings with no site parameter, so \
+                "{n} {source_system} stream(s) are storing readings with no site parameter, so \
                  nothing is attributed: {listed}{more}. Pair them from Data Streams."
             ),
             // Which slot they belong to is the question being asked, so there is none yet.
@@ -858,6 +862,7 @@ async fn holds_open(
     }
     let msg = OutgoingMessage {
         kind: "holds_open",
+        key: None,
         subject,
         body,
         // The work spans sites and streams alike, so it carries no single scope.
@@ -910,7 +915,7 @@ fn owed_holds_message(counts: &[(HoldKind, i64)]) -> Option<(String, String)> {
     }
     Some((
         format!("RIVER Data: {total} item(s) waiting for a manager"),
-        format!("📋 {}.", lines.join("; ")),
+        format!("{}.", lines.join("; ")),
     ))
 }
 
@@ -979,19 +984,20 @@ async fn changes_pending(
     let mut body = String::new();
     if arrived > 0 {
         body.push_str(&format!(
-            "📥 {arrived} new value(s) synced ({}). ",
+            "{arrived} new value(s) synced ({}). ",
             by_source(&arrivals)
         ));
     }
     if total > 0 {
         body.push_str(&format!(
-            "✏️ {total} stored value(s) have been changed at source and are awaiting a decision \
+            "{total} stored value(s) have been changed at source and are awaiting a decision \
              ({}). Accept or reject them under Data Streams, Audits.",
             by_source(&counts)
         ));
     }
     let msg = OutgoingMessage {
         kind: "changes_pending",
+        key: None,
         subject: if total > 0 {
             format!("RIVER Data: {total} stored value(s) changed at source")
         } else {
@@ -1030,9 +1036,10 @@ async fn curve_drift(
     }
     let msg = OutgoingMessage {
         kind: "curve_drift",
+        key: None,
         subject: format!("RIVER Data: {moved} corrected value(s) recomposed"),
         body: format!(
-            "🧮 {moved} stored value(s) no longer matched the curves their readings name and were \
+            "{moved} stored value(s) no longer matched the curves their readings name and were \
              recomposed from them. Each move is recorded on the reading and can be rolled back \
              from its history."
         ),
@@ -1063,9 +1070,10 @@ async fn derived_computed(
     }
     let msg = OutgoingMessage {
         kind: "derived_computed",
+        key: None,
         subject: format!("RIVER Data: {computed} derived value(s) computed"),
         body: format!(
-            "🧮 {computed} derived value(s) were computed where none was stored. Each one names \
+            "{computed} derived value(s) were computed where none was stored. Each one names \
              the formula version it was made with, on the reading."
         ),
         // The fill spans every slot with a gap, so it carries no single scope.
@@ -1098,9 +1106,10 @@ async fn steps_skipped(
     }
     let msg = OutgoingMessage {
         kind: "steps_skipped",
+        key: None,
         subject: format!("RIVER Data: {raised} calculation step(s) skipped"),
         body: format!(
-            "⚠️ {raised} calculation step(s) did not run at a visit, so their outputs are absent. \
+            "{raised} calculation step(s) did not run at a visit, so their outputs are absent. \
              Each one is a finding under Data Streams, Audits, naming the step and why it stopped."
         ),
         // The runs span every visit the scope covered, so the alert carries no single slot.
@@ -1169,8 +1178,9 @@ async fn operational_digests(
         }
         let msg = OutgoingMessage {
             kind,
+            key: None,
             subject: format!("RIVER Data: {n} {noun}"),
-            body: format!("🧹 {n} {noun}. The run that did it is in the job timeline."),
+            body: format!("{n} {noun}. The run that did it is in the job timeline."),
             // Upkeep spans the whole deployment, so it carries no slot.
             slot: None,
         };
@@ -1217,7 +1227,7 @@ async fn jobs_failed(
             continue;
         }
         let mut body = format!(
-            "🛠 {n} {trigger_type} job(s) failed in the last 24 hours and will not be retried again."
+            "{n} {trigger_type} job(s) failed in the last 24 hours and will not be retried again."
         );
         if let Some(scope) = scope.filter(|s| !s.is_null()) {
             body.push_str(&format!("\nScope: {scope}"));
@@ -1229,6 +1239,7 @@ async fn jobs_failed(
         body.push_str("\nOpen it under System, Jobs.");
         let msg = OutgoingMessage {
             kind: "job_failed",
+            key: Some(trigger_type.to_string()),
             subject: format!("RIVER Data: {trigger_type} job failed"),
             body,
             // A job kind spans whatever it was run over, so the digest carries no single slot.
@@ -1297,7 +1308,7 @@ async fn sync_failures(
         }
 
         let mut body = format!(
-            "⚠️ {n_failed} failed and {n_partial} partial sync cycle(s) on \
+            "{n_failed} failed and {n_partial} partial sync cycle(s) on \
              {service_type}/{instance} since the last alert."
         );
         if let Some(err) = sample_error {
@@ -1306,6 +1317,7 @@ async fn sync_failures(
         }
         let msg = OutgoingMessage {
             kind: "sync_failure",
+            key: Some(format!("{service_type}/{instance}")),
             subject: format!("RIVER Data: sync failures on {service_type}"),
             body,
             // System-wide infrastructure alert, no per-site scope, every enabled recipient gets it.

@@ -1180,7 +1180,7 @@ pub struct VisitContext<'a> {
 
 /// Fill the params the manifest's `event_inputs` declare from the collection event's stored
 /// readings, where the request did not carry them. The value is the served spot value: the sample
-/// mean, else the lowest unflagged replicate. Absence is not an error here — the param's own
+/// mean, else the lowest unflagged replicate. Absence is not an error here: the param's own
 /// requiredness decides whether the run can proceed without it.
 pub async fn resolve_event_inputs(
     db: &DatabaseConnection,

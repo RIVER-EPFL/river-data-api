@@ -29,12 +29,16 @@ impl NotificationChannel for MockChannel {
         Ok("mock healthy".to_string())
     }
 
-    async fn deliver(&self, _state: &AppState, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
+    async fn deliver(
+        &self,
+        _state: &AppState,
+        msg: &OutgoingMessage,
+    ) -> Result<Vec<DeliveryResult>, String> {
         self.sent.lock().unwrap().push(msg.clone());
-        vec![DeliveryResult {
+        Ok(vec![DeliveryResult {
             recipient: "mock".to_string(),
             outcome: Ok(()),
-        }]
+        }])
     }
 }
 

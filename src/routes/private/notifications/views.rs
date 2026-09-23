@@ -53,17 +53,20 @@ pub async fn test_send(
             })?;
             let msg = OutgoingMessage {
                 kind: "test",
+                key: None,
                 subject: "RIVER Data test notification".to_string(),
-                body: "✅ This is a test notification from RIVER Data.".to_string(),
+                body: "This is a test notification from RIVER Data.".to_string(),
                 slot: None,
             };
-            let results = channel.deliver(&state, &msg).await;
-            if results.is_empty() {
-                Err("no subscriptions found for this user".to_string())
-            } else if let Some(err) = results.iter().find_map(|r| r.outcome.as_ref().err()) {
-                Err(err.clone())
-            } else {
-                Ok(())
+            match channel.deliver(&state, &msg).await {
+                Err(e) => Err(e),
+                Ok(results) if results.is_empty() => {
+                    Err("no subscriptions found for this user".to_string())
+                }
+                Ok(results) => results
+                    .iter()
+                    .find_map(|r| r.outcome.as_ref().err())
+                    .map_or(Ok(()), |err| Err(err.clone())),
             }
         }
         other => {

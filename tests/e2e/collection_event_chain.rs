@@ -530,8 +530,8 @@ async fn two_tools_share_an_event_and_the_audit_and_executor_close_the_gap() {
 }
 
 /// Expected behaviour: an upstream correction landing while the downstream calculations are
-/// switched off leaves their outputs demonstrably stale — the audit recomputes each saved output
-/// under its pinned version with the event's current values and reports the disagreement — and
+/// switched off leaves their outputs demonstrably stale (the audit recomputes each saved output
+/// under its pinned version with the event's current values and reports the disagreement), and
 /// the chain executor converges the event, after which the audit finds nothing. (Switched on, the
 /// correction itself would have re-run them: ADR 0007.)
 #[tokio::test]

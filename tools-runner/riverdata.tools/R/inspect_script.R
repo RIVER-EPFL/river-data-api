@@ -5,7 +5,7 @@
 # the portal inspects while an author types, long before the script is runnable.
 
 # Call heads that are syntax rather than a dependency: reporting them as "functions this script
-# calls" would bury the two prelude functions a wrapper actually uses.
+# calls" would bury the carried portal functions the entry function actually uses.
 INSPECT_SYNTAX_CALLS <- c(
   "+", "-", "*", "/", "^", "%%", "%/%", "%*%", "%in%", "%o%", "%>%",
   "==", "!=", "<", ">", "<=", ">=", "!", "&", "&&", "|", "||",
@@ -20,8 +20,9 @@ INSPECT_SOURCES <- c("inputs", "constants", "curves")
 
 #' Report what a tool script reads and what it looks like it returns, without running it.
 #'
-#' `script` is the complete R source of one tool (the shared prelude plus a wrapper) and `entry`
-#' names the function the API would call. The result is the raw material for a tool manifest:
+#' `script` is the complete R source of one tool, authored as one document whose top-level
+#' functions may include portal functions carried under a `# Source: cnet-data-portal` header, and
+#' `entry` names the function the API would call. The result is the raw material for a tool manifest:
 #' the `inputs$`/`constants$`/`curves$` names the script reads, the keys its entry function
 #' returns, the functions it depends on, and the `library()` calls the API lints.
 #'
@@ -194,8 +195,9 @@ literal_name <- function(index, operator) {
 # ---- definitions, calls, libraries -------------------------------------------------------
 
 # Two sets, because they answer different questions. `all` (top level and nested) is what
-# `functions_called` subtracts, so a wrapper's own `num()` helper is not reported as a
-# dependency; `top_level` is the prelude's catalogue, which is what a tool depends *on*.
+# `functions_called` subtracts, so the entry function's own `num()` helper is not reported as a
+# dependency; `top_level` is the script's catalogue of functions, which is what a tool depends
+# *on*.
 collect_defined_functions <- function(nodes, top_exprs) {
   all <- character(0)
   for (node in nodes) {

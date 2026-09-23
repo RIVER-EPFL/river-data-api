@@ -216,6 +216,7 @@ async fn apply_attaches_collection_events_for_spot_readings() {
         "project": { "id": crate::common::PROJECT_ID, "name": "Test Project", "create": false },
         "site": { "id": crate::common::SITE1_ID, "name": "Site 1", "create": false, "latitude": null, "longitude": null, "altitude_m": null },
         "parameter": { "id": crate::common::GLOBAL_PARAM_TEMP_ID, "name": "Temperature", "create": false, "units": "C", "group_key": null, "original_names": [] },
+        "instrument": { "id": null, "name": "DOC analyser", "source_key": "cnet:DOC", "resolved_by": "placeholder", "create": true, "confirmed": true, "stamps_readings": false },
         "confidence": "exact",
         "warnings": [],
         "acknowledged": true,

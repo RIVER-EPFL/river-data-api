@@ -2439,8 +2439,8 @@ pub fn control_enroll_routes() -> Router<AppState> {
 }
 
 /// Session-token routes. Deliberately unthrottled: the callers are vetted internal services and
-/// the events route is their observability record — a 429 here once lost METALP's cycle record
-/// while its data synced fully.
+/// the events route is their observability record, and a 429 here loses a cycle's record while
+/// its data syncs fully.
 pub fn control_session_routes() -> Router<AppState> {
     Router::new()
         .route("/heartbeat", post(heartbeat))

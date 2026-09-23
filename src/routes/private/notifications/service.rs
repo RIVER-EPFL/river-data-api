@@ -160,7 +160,7 @@ pub(super) fn unit_suffix(units: Option<&str>) -> String {
 #[must_use]
 pub fn render_opened(events: &[PendingEvent], dashboard_base: Option<&str>) -> OutgoingMessage {
     let subject = format!("RIVER Data alarm: {} active", events.len());
-    let mut body = format!("🔴 Alarm, {} active\n", events.len());
+    let mut body = format!("Alarm, {} active\n", events.len());
     for e in events {
         let _ = writeln!(
             body,
@@ -177,6 +177,7 @@ pub fn render_opened(events: &[PendingEvent], dashboard_base: Option<&str>) -> O
     }
     OutgoingMessage {
         kind: "alarm_opened",
+        key: None,
         subject,
         body,
         slot: None,
@@ -186,7 +187,7 @@ pub fn render_opened(events: &[PendingEvent], dashboard_base: Option<&str>) -> O
 #[must_use]
 pub fn render_resolved(events: &[PendingEvent], dashboard_base: Option<&str>) -> OutgoingMessage {
     let subject = format!("RIVER Data resolved: {}", events.len());
-    let mut body = format!("✅ Resolved, {}\n", events.len());
+    let mut body = format!("Resolved, {}\n", events.len());
     for e in events {
         let _ = writeln!(
             body,
@@ -199,6 +200,7 @@ pub fn render_resolved(events: &[PendingEvent], dashboard_base: Option<&str>) ->
     }
     OutgoingMessage {
         kind: "alarm_resolved",
+        key: None,
         subject,
         body,
         slot: None,
@@ -496,20 +498,48 @@ pub(super) async fn attach_recipients(
 
 pub struct WebPushChannel {
     client: reqwest::Client,
-    vapid_pem: Vec<u8>,
+    /// The signing key, or why the configured keypair cannot sign.
+    key: Result<::web_push::PartialVapidSignatureBuilder, String>,
     vapid_subject: String,
 }
 
 impl WebPushChannel {
+    /// The channel, when a VAPID keypair and subject are configured. A keypair that is configured
+    /// but unusable still builds one, so the health probe reports why and every send fails with it.
     pub fn new(config: &Config) -> Option<Self> {
-        let pem = config.vapid_private_key_pem.as_ref()?;
+        let key = web_push_key(config)?;
         let subject = config.vapid_subject.as_ref()?;
         Some(Self {
             client: reqwest::Client::new(),
-            vapid_pem: pem.as_bytes().to_vec(),
+            key,
             vapid_subject: subject.clone(),
         })
     }
+}
+
+/// The configured VAPID signing key, `None` when no keypair is configured.
+pub fn web_push_key(
+    config: &Config,
+) -> Option<Result<::web_push::PartialVapidSignatureBuilder, String>> {
+    let pem = config.vapid_private_key_pem.as_deref()?;
+    let public_key = config.vapid_public_key.as_deref()?;
+    Some(vapid_key(pem, public_key))
+}
+
+/// The signing key in `pem`, refused unless `public_key` (base64url, as browsers are handed it) is
+/// its public half: a browser subscribed with any other key has every push refused.
+pub fn vapid_key(
+    pem: &str,
+    public_key: &str,
+) -> Result<::web_push::PartialVapidSignatureBuilder, String> {
+    use base64::Engine;
+    let key = ::web_push::VapidSignatureBuilder::from_pem_no_sub(std::io::Cursor::new(pem))
+        .map_err(|e| format!("VAPID_PRIVATE_KEY_PEM is not an EC private key: {e}"))?;
+    let derived = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.get_public_key());
+    if derived != public_key.trim().trim_end_matches('=') {
+        return Err("VAPID_PUBLIC_KEY is not the public half of VAPID_PRIVATE_KEY_PEM".to_string());
+    }
+    Ok(key)
 }
 
 #[derive(sea_orm::FromQueryResult)]
@@ -553,6 +583,17 @@ const DASHBOARD_PATH: &str = "/admin";
 /// `path` in the dashboard at `base`.
 fn dashboard_link(base: &str, path: &str) -> String {
     format!("{}{DASHBOARD_PATH}{path}", base.trim_end_matches('/'))
+}
+
+/// The tag a device collapses notifications by: a later message with the same tag replaces the
+/// earlier one. A slot-scoped message is one per kind and slot, a keyed one per kind and key, and
+/// a digest one per kind.
+pub(super) fn push_tag(msg: &OutgoingMessage) -> String {
+    match (&msg.slot, &msg.key) {
+        (Some(s), _) => format!("{}:{}:{}", msg.kind, s.site_id, s.parameter_id),
+        (None, Some(key)) => format!("{}:{key}", msg.kind),
+        (None, None) => msg.kind.to_string(),
+    }
 }
 
 pub(super) fn deep_link_url(base: Option<&str>, slot: &Option<Slot>) -> Option<String> {
@@ -668,16 +709,17 @@ pub(super) async fn stamp_success(db: &DatabaseConnection, id: Uuid) {
 
 pub async fn send_push(
     client: &reqwest::Client,
-    vapid_pem: &[u8],
+    key: &Result<::web_push::PartialVapidSignatureBuilder, String>,
     vapid_subject: &str,
     sub: &Subscription,
     payload: &[u8],
 ) -> Result<(), String> {
     let info = ::web_push::SubscriptionInfo::new(&sub.endpoint, &sub.p256dh, &sub.auth);
 
-    let mut sig_builder =
-        ::web_push::VapidSignatureBuilder::from_pem(std::io::Cursor::new(vapid_pem), &info)
-            .map_err(|e| format!("VAPID build: {e}"))?;
+    let mut sig_builder = key
+        .clone()
+        .map_err(|e| format!("VAPID key: {e}"))?
+        .add_sub_info(&info);
     sig_builder.add_claim("sub", serde_json::Value::String(vapid_subject.to_string()));
     let sig = sig_builder
         .build()
@@ -724,18 +766,21 @@ impl NotificationChannel for WebPushChannel {
     }
 
     async fn check_health(&self) -> Result<String, String> {
-        Ok("VAPID key loaded".to_string())
+        match &self.key {
+            Ok(_) => Ok("VAPID keypair valid".to_string()),
+            Err(e) => Err(e.clone()),
+        }
     }
 
-    async fn deliver(&self, state: &AppState, msg: &OutgoingMessage) -> Vec<DeliveryResult> {
+    async fn deliver(
+        &self,
+        state: &AppState,
+        msg: &OutgoingMessage,
+    ) -> Result<Vec<DeliveryResult>, String> {
         let db = &state.db;
-        let subscriptions = match slot_subscriptions(db, &msg.slot, msg.kind).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "web_push: failed to load subscriptions");
-                return Vec::new();
-            }
-        };
+        let subscriptions = slot_subscriptions(db, &msg.slot, msg.kind)
+            .await
+            .map_err(|e| format!("failed to load subscriptions: {e}"))?;
 
         let (subscriptions, refused) = within_audience(state, msg.kind, subscriptions).await;
         for recipient in &refused {
@@ -759,7 +804,7 @@ impl NotificationChannel for WebPushChannel {
             "title": msg.subject,
             "body": msg.body,
             "url": url,
-            "tag": msg.kind,
+            "tag": push_tag(msg),
         });
         let payload_bytes = payload.to_string().into_bytes();
 
@@ -773,7 +818,7 @@ impl NotificationChannel for WebPushChannel {
 
             let outcome = send_push(
                 &self.client,
-                &self.vapid_pem,
+                &self.key,
                 &self.vapid_subject,
                 sub,
                 &payload_bytes,
@@ -796,7 +841,7 @@ impl NotificationChannel for WebPushChannel {
                 outcome: outcome.map_err(|e| e.to_string()),
             });
         }
-        results
+        Ok(results)
     }
 }
 
@@ -948,7 +993,26 @@ pub(super) async fn deliver(
     let mut attempted = 0usize;
     let mut any_success = false;
     for ch in channels {
-        let results = ch.deliver(state, msg).await;
+        // A channel that could not say who to tell has failed everyone it would have told, so it
+        // counts as a failed attempt and, alone, leaves the message for the next tick.
+        let results = match ch.deliver(state, msg).await {
+            Ok(results) => results,
+            Err(e) => {
+                tracing::warn!(channel = ch.name(), error = %e, "recipient lookup failed");
+                attempted += 1;
+                log_delivery(
+                    db,
+                    single_event_id,
+                    msg.kind,
+                    ch.name(),
+                    "-",
+                    "failed",
+                    Some(&e),
+                )
+                .await;
+                continue;
+            }
+        };
         if results.is_empty() {
             log_delivery(
                 db,
@@ -1225,13 +1289,8 @@ pub(super) async fn send_to_user(
         ));
     }
 
-    let Some(pem) = &state.config.vapid_private_key_pem else {
+    let Some(channel) = WebPushChannel::new(&state.config) else {
         return Err(AppError::Internal("VAPID not configured".to_string()));
-    };
-    let Some(vapid_subject) = &state.config.vapid_subject else {
-        return Err(AppError::Internal(
-            "VAPID subject not configured".to_string(),
-        ));
     };
 
     // A unique tag per send: notifications sharing a tag replace each other, so a fixed
@@ -1243,7 +1302,6 @@ pub(super) async fn send_to_user(
     })
     .to_string();
 
-    let client = reqwest::Client::new();
     let mut attempts = Vec::with_capacity(rows.len());
 
     for row in rows {
@@ -1267,9 +1325,9 @@ pub(super) async fn send_to_user(
         };
 
         let attempt = match send_push(
-            &client,
-            pem.as_bytes(),
-            vapid_subject,
+            &channel.client,
+            &channel.key,
+            &channel.vapid_subject,
             &sub,
             payload.as_bytes(),
         )
@@ -1597,9 +1655,10 @@ pub fn render_import_tags(counts: &[(Option<String>, String, i64)]) -> Option<Ou
         .join(", ");
     Some(OutgoingMessage {
         kind: "import_tags",
+        key: None,
         subject: format!("RIVER Data: {total} discrepancy tag(s) recorded at import"),
         body: format!(
-            "🏷️ Synced data did not match itself where it was imported: {listed}. The values are \
+            "Synced data did not match itself where it was imported: {listed}. The values are \
              stored as the source sent them, tagged for reading under Data Streams, Audits."
         ),
         // Tags span every stream a sync touched, so the digest carries no single scope.

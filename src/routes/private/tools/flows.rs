@@ -37,8 +37,8 @@ use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::private::sync::service as audit;
 
 /// Run a tool and store the `tool_runs` row that a later save references. Every path that
-/// executes a tool for keeps goes through here — the interactive calculate endpoint, the CSV
-/// tool-entry import, the chain executor — so the stored record has one shape.
+/// executes a tool for keeps goes through here (the interactive calculate endpoint, the CSV
+/// tool-entry import, the chain executor), so the stored record has one shape.
 ///
 /// The run row is written before the results are handed out: a save references the row, the
 /// provenance blob is built from it, and every claim in the blob predates the save. The stored
@@ -1530,7 +1530,7 @@ pub async fn audit_event(
         let prior = blob_at_event(&state.db, event, &tool.name).await?;
         if let Some(blob) = prior {
             // Stale check under the pinned version, with the stored inputs and freshly resolved
-            // context — an upstream correction shows up as a disagreement here.
+            // context: an upstream correction shows up as a disagreement here.
             let Some(pinned) = pinned_tool(&state.db, &tool.name, &blob).await? else {
                 continue;
             };

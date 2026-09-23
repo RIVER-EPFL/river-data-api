@@ -899,6 +899,20 @@ fn test_an_unconfirmed_label_suggestion_holds_the_apply() {
     assert_eq!(super::unconfirmed_instruments(&[entry]), [source_key]);
 }
 
+/// Expected behaviour: a lab row with nothing attached holds the apply, which would otherwise mint
+/// a `{source}:{parameter}` instrument nobody named. A device feed drafted without one is its own
+/// channel instrument and does not.
+#[test]
+fn test_a_pairing_row_with_no_instrument_holds_the_apply() {
+    let lab = with_instrument("DOC", None);
+    let source_key = lab.source_key.clone();
+    let mut device = with_instrument("Water Depth", None);
+    device.is_device = true;
+    let entries = vec![lab, device];
+    assert_eq!(super::unconfirmed_instruments(&entries), [source_key]);
+    assert!(super::refuse_unconfirmed_instruments(&entries).is_err());
+}
+
 fn catalog_param(code: &str, units: &str) -> super::CatalogParam {
     super::CatalogParam {
         id: Uuid::new_v4(),

@@ -320,7 +320,7 @@ pub fn missing_params(offer: &ManualRun, supplied: &serde_json::Value) -> Vec<&'
         .collect()
 }
 
-/// Whether a running job of this `trigger_type` can be cooperatively cancelled, i.e. it iterates a
+/// Whether a running job of this `trigger_type` can be cooperatively cancelled, ie. it iterates a
 /// loop and checks `JobContext::is_cancelled` at its batch checkpoints. Single-statement jobs
 /// (aggregate refresh, pairing backfill) have no checkpoint and report 409 on a cancel attempt.
 #[must_use]
@@ -1690,7 +1690,7 @@ async fn heartbeat(
 }
 
 /// Mark a finished job terminal, **ownership-guarded** so a reaped-out worker's late write is a no-op.
-/// Returns whether this worker still owned the row (i.e. whether the write took effect).
+/// Returns whether this worker still owned the row (ie. whether the write took effect).
 async fn commit_terminal(
     db: &DatabaseConnection,
     claimed: &Claimed,

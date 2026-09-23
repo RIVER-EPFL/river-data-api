@@ -5,8 +5,9 @@ SCRIPT_PACKAGES <- c("dplyr", "tidyr", "magrittr")
 
 #' Execute a tool script against JSON-shaped inputs.
 #'
-#' `script` is the complete R source of one tool (the shared portal calculation functions plus a
-#' wrapper); `entry` names the function inside it to call. The entry function receives the three
+#' `script` is the complete R source of one tool, authored as one document whose top-level
+#' functions may include portal functions carried under a `# Source: cnet-data-portal` header;
+#' `entry` names the function inside it to call. The entry function receives the three
 #' lists exactly as they arrived in the request and returns a named list, which OpenCPU
 #' serialises back to JSON.
 #'

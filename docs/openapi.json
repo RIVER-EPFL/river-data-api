@@ -7719,7 +7719,7 @@
         "additionalProperties": false,
         "properties": {
           "check_id": {
-            "description": "A `seasonal_checks` row (from `/readings/seasonal_check`) covering this save's values.\nWhen present, every reading's (parameter, value) must have been screened by that check —\nthe portal's \"any edit resets Check\", enforced server-side. The check itself is advisory;\nnaming a check that does not cover the values is refused.",
+            "description": "A `seasonal_checks` row (from `/readings/seasonal_check`) covering this save's values.\nWhen present, every reading's (parameter, value) must have been screened by that check:\nthe portal's \"any edit resets Check\", enforced server-side. The check itself is advisory;\nnaming a check that does not cover the values is refused.",
             "format": "uuid",
             "type": [
               "string",
@@ -9020,7 +9020,7 @@
               },
               {
                 "$ref": "#/components/schemas/SourceWindow",
-                "description": "A completeness claim: these readings are the source's complete content for this stream\nover `[from, to)`. The server diffs stored content against the payload and converges —\nnew rows insert, changed values correct in place, rows absent at source are stamped\nwithdrawn (never deleted). Sync-service callers only; spot streams only. Without it the\nrequest is a bare append, exactly the old semantics."
+                "description": "A completeness claim: these readings are the source's complete content for this stream\nover `[from, to)`. The server diffs stored content against the payload and converges:\nnew rows insert, changed values correct in place, rows absent at source are stamped\nwithdrawn (never deleted). Sync-service callers only; spot streams only. Without it the\nrequest is a bare append, exactly the old semantics."
               }
             ]
           }
@@ -10232,7 +10232,7 @@
       },
       "ManifestEventInput": {
         "additionalProperties": false,
-        "description": "A same-event parameter read: when the request does not carry `param`, its value is resolved\nfrom the collection event's stored readings (the served spot value: the sample mean, else the\nlowest unflagged replicate). This is the portal's cross-tool prefill — pCO2 pulling field\ntemperature, DOM pulling the DOC average — as a declaration instead of R code.",
+        "description": "A same-event parameter read: when the request does not carry `param`, its value is resolved\nfrom the collection event's stored readings (the served spot value: the sample mean, else the\nlowest unflagged replicate). This is the portal's cross-tool prefill (pCO2 pulling field\ntemperature, DOM pulling the DOC average) as a declaration instead of R code.",
         "properties": {
           "alignment": {
             "description": "How the value is reached (Q230): `exact` at the instant being computed, `hold` for the\nlast value measured at or before it. Absent is `exact`, which is what every manifest\nwritten before this meant.",
@@ -10306,7 +10306,7 @@
       },
       "ManifestOutput": {
         "additionalProperties": false,
-        "description": "An output that may be saved names the catalog parameter it is saved to twice over.\n\n`parameter_id` is authoritative when present, `suggested_parameter_code` is the fallback, and\nresolution is id first then code. Both halves exist because a manifest has to survive leaving\nthe database it was authored in: the seeded tools are inserted into a fresh database where no\nparameter UUID exists yet, and dev and production give the same analyte different UUIDs, so a\ncode-only output has to keep working exactly as it did.",
+        "description": "An output that may be saved names the catalog parameter it is saved to twice over.\n\n`parameter_id` is authoritative when present, `suggested_parameter_code` is the fallback, and\nresolution is id first then code. Both halves exist because a manifest has to survive leaving\nthe database it was authored in: dev and production give the same analyte different UUIDs, so a\nmanifest carried between them resolves by code where its id names nothing.",
         "properties": {
           "aggregate": {
             "description": "`mean` or `sd`: the engine computes this output over the curve-applied values of the\n`replicates` param `aggregate_of` names, so the preview a technician sees is the number\nthe database will later serve. The script never computes it; a script\nvalue under the same key is discarded.",
@@ -31254,7 +31254,7 @@
             "description": "Unknown collection event"
           }
         },
-        "summary": "One visit's grid row: every parameter measured at the event with its replicates, sample\nstatistics, tool provenance presence, and any open finding — plus findings for parameters\nthe audit says are missing entirely. Requires `read_data`.",
+        "summary": "One visit's grid row: every parameter measured at the event with its replicates, sample\nstatistics, tool provenance presence, and any open finding, plus findings for parameters\nthe audit says are missing entirely. Requires `read_data`.",
         "tags": [
           "collection_events"
         ]

@@ -108,3 +108,106 @@ fn test_render_import_tags_groups_by_source_and_kind() {
 fn test_render_import_tags_empty_sends_nothing() {
     assert!(render_import_tags(&[]).is_none());
 }
+
+fn message(kind: &'static str, slot: Option<Slot>, key: Option<&str>) -> OutgoingMessage {
+    OutgoingMessage {
+        kind,
+        key: key.map(str::to_string),
+        subject: String::new(),
+        body: String::new(),
+        slot,
+    }
+}
+
+fn slot(site: u128, parameter: u128) -> Option<Slot> {
+    Some(Slot {
+        project_id: None,
+        site_id: Uuid::from_u128(site),
+        parameter_id: Uuid::from_u128(parameter),
+    })
+}
+
+#[test]
+fn test_push_tag_keeps_two_slots_apart() {
+    let martigny = push_tag(&message("alarm_opened", slot(1, 2), None));
+    let saxon = push_tag(&message("alarm_opened", slot(3, 4), None));
+    assert_ne!(martigny, saxon);
+    assert_eq!(
+        martigny,
+        push_tag(&message("alarm_opened", slot(1, 2), None)),
+        "a repeat for the same slot replaces the earlier one"
+    );
+    assert_ne!(
+        push_tag(&message("stale_data", slot(1, 2), None)),
+        push_tag(&message("stale_data", slot(3, 2), None))
+    );
+}
+
+#[test]
+fn test_push_tag_keeps_a_system_wide_kind_apart_by_its_key() {
+    assert_ne!(
+        push_tag(&message("job_failed", None, Some("csv_import"))),
+        push_tag(&message("job_failed", None, Some("reprocess")))
+    );
+    assert_eq!(
+        push_tag(&message("holds_open", None, None)),
+        "holds_open",
+        "a digest with no key replaces the previous digest of its kind"
+    );
+}
+
+const VAPID_PEM: &str = "-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIFIDkW07GbdXLEk+WYBSLCxOPqERyJhe5GaQ0l5+cHVroAoGCCqGSM49
+AwEHoUQDQgAEs7xIexoeDMgSdTnUZo2llWmbVprDGe3oaTDOqUHVIjXGirsD1LP7
+6Dg2DoqE4mu64mwJX3FFt3usr4fIr+HpLg==
+-----END EC PRIVATE KEY-----
+";
+const VAPID_PUBLIC: &str =
+    "BLO8SHsaHgzIEnU51GaNpZVpm1aawxnt6GkwzqlB1SI1xoq7A9Sz--g4Ng6KhOJruuJsCV9xRbd7rK-HyK_h6S4";
+const OTHER_PUBLIC: &str =
+    "BOepCtGG1gIV-EseUVZcq785P7H5A2XbFxKHr62ijdyz0pTlZGimNjg3pQ65BR213VQGgV8hi4g5Lw4kvbHbX5k";
+
+fn vapid_config(pem: &str, public_key: &str) -> Config {
+    Config {
+        vapid_private_key_pem: Some(pem.to_string()),
+        vapid_public_key: Some(public_key.to_string()),
+        vapid_subject: Some("mailto:river@example.org".to_string()),
+        ..Config::for_openapi_document()
+    }
+}
+
+#[test]
+fn test_vapid_key_accepts_the_public_half_of_its_pem() {
+    assert!(vapid_key(VAPID_PEM, VAPID_PUBLIC).is_ok());
+    assert!(
+        vapid_key(VAPID_PEM, &format!("{VAPID_PUBLIC}=")).is_ok(),
+        "padding is not part of the key"
+    );
+}
+
+#[test]
+fn test_vapid_key_refuses_a_public_key_from_another_keypair() {
+    let err = vapid_key(VAPID_PEM, OTHER_PUBLIC)
+        .err()
+        .expect("mismatch refused");
+    assert!(err.contains("VAPID_PUBLIC_KEY"), "{err}");
+}
+
+#[test]
+fn test_vapid_key_refuses_a_mangled_pem() {
+    let mangled = VAPID_PEM.replace('\n', "\\n");
+    let err = vapid_key(&mangled, VAPID_PUBLIC)
+        .err()
+        .expect("mangled PEM refused");
+    assert!(err.contains("VAPID_PRIVATE_KEY_PEM"), "{err}");
+}
+
+#[tokio::test]
+async fn test_web_push_health_reports_an_unusable_keypair() {
+    let healthy = WebPushChannel::new(&vapid_config(VAPID_PEM, VAPID_PUBLIC)).expect("configured");
+    assert!(healthy.check_health().await.is_ok());
+    let mismatched =
+        WebPushChannel::new(&vapid_config(VAPID_PEM, OTHER_PUBLIC)).expect("configured");
+    let err = mismatched.check_health().await.expect_err("unhealthy");
+    assert!(err.contains("VAPID_PUBLIC_KEY"), "{err}");
+}

@@ -214,6 +214,11 @@ pub const UNADDRESSED_KIND: &str = "test";
 #[derive(Clone, Debug)]
 pub struct OutgoingMessage {
     pub kind: &'static str,
+    /// What tells two system-wide messages of one kind apart (the sync instance, the source
+    /// system, the job type), so that one does not replace the other on a device. `None` for a
+    /// slot-scoped message, whose slot does that, and for a digest, of which only the latest
+    /// matters.
+    pub key: Option<String>,
     pub subject: String,
     pub body: String,
     /// The alert's scope, for per-subscriber fan-out. `None` = system-wide.
@@ -227,11 +232,16 @@ pub struct DeliveryResult {
 }
 
 /// A delivery channel. Each channel resolves its own recipients, so the dispatcher only renders
-/// the message once and hands it to every enabled channel.
+/// the message once and hands it to every enabled channel. `Err` is a channel that could not
+/// resolve who to tell, which is a failure to retry rather than an empty audience.
 #[async_trait::async_trait]
 pub trait NotificationChannel: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn deliver(&self, state: &AppState, msg: &OutgoingMessage) -> Vec<DeliveryResult>;
+    async fn deliver(
+        &self,
+        state: &AppState,
+        msg: &OutgoingMessage,
+    ) -> Result<Vec<DeliveryResult>, String>;
     async fn check_health(&self) -> Result<String, String>;
 }
 

@@ -2233,7 +2233,7 @@ pub struct IngestReadingsRequest {
     #[serde(default)]
     pub audit: Option<Vec<crate::routes::private::sync::models::GroupAudit>>,
     /// A completeness claim: these readings are the source's complete content for this stream
-    /// over `[from, to)`. The server diffs stored content against the payload and converges —
+    /// over `[from, to)`. The server diffs stored content against the payload and converges:
     /// new rows insert, changed values correct in place, rows absent at source are stamped
     /// withdrawn (never deleted). Sync-service callers only; spot streams only. Without it the
     /// request is a bare append, exactly the old semantics.
@@ -2351,7 +2351,7 @@ pub struct GrabSampleRequest {
     #[serde(default)]
     pub tool_run_id: Option<Uuid>,
     /// A `seasonal_checks` row (from `/readings/seasonal_check`) covering this save's values.
-    /// When present, every reading's (parameter, value) must have been screened by that check —
+    /// When present, every reading's (parameter, value) must have been screened by that check:
     /// the portal's "any edit resets Check", enforced server-side. The check itself is advisory;
     /// naming a check that does not cover the values is refused.
     #[serde(default)]

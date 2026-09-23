@@ -48,7 +48,11 @@ pub async fn get_notifications_config(State(state): State<AppState>) -> impl Int
     let config = &state.config;
     Json(NotificationsConfig {
         web_push: WebPushCapability {
-            available: config.web_push_configured(),
+            // A browser subscribes with the advertised key, so a keypair that cannot sign is not
+            // offered.
+            available: config.web_push_configured()
+                && crate::routes::private::notifications::service::web_push_key(config)
+                    .is_some_and(|key| key.is_ok()),
             vapid_public_key: config.vapid_public_key.clone(),
         },
     })

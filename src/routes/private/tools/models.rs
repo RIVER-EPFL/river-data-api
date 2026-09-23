@@ -828,9 +828,8 @@ impl<'de> Deserialize<'de> for ManifestParam {
 ///
 /// `parameter_id` is authoritative when present, `suggested_parameter_code` is the fallback, and
 /// resolution is id first then code. Both halves exist because a manifest has to survive leaving
-/// the database it was authored in: the seeded tools are inserted into a fresh database where no
-/// parameter UUID exists yet, and dev and production give the same analyte different UUIDs, so a
-/// code-only output has to keep working exactly as it did.
+/// the database it was authored in: dev and production give the same analyte different UUIDs, so a
+/// manifest carried between them resolves by code where its id names nothing.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestOutput {
@@ -966,8 +965,8 @@ impl ManifestSiteInput {
 
 /// A same-event parameter read: when the request does not carry `param`, its value is resolved
 /// from the collection event's stored readings (the served spot value: the sample mean, else the
-/// lowest unflagged replicate). This is the portal's cross-tool prefill — pCO2 pulling field
-/// temperature, DOM pulling the DOC average — as a declaration instead of R code.
+/// lowest unflagged replicate). This is the portal's cross-tool prefill (pCO2 pulling field
+/// temperature, DOM pulling the DOC average) as a declaration instead of R code.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestEventInput {
@@ -1253,7 +1252,8 @@ pub struct ResolvedParameter {
 ///
 /// An id that names no row is a refusal: it can only be a mistake, since nothing else could have
 /// produced it. A code that names no row is reported instead, because an author may legitimately
-/// declare an analyte before a manager creates it, and the seeded tools ship that way.
+/// declare an analyte before a manager creates it, and a manifest carried from another database
+/// names its analytes by code.
 #[derive(Debug, Default)]
 pub struct CatalogFindings {
     pub errors: Vec<String>,

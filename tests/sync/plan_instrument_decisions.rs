@@ -1083,6 +1083,50 @@ async fn an_untouched_plan_is_refused_until_its_suggestions_are_accepted() {
     assert_eq!(after - before, 2, "each accepted suggestion is minted once");
 }
 
+/// Scenario: the reviewer picks "no instrument" for a lab feed's proposal and applies.
+/// Expected behaviour: the row is back to asking and the apply refuses it, rather than minting a
+/// `{source}:{parameter}` instrument nobody named.
+#[tokio::test]
+#[serial]
+async fn a_lab_row_cleared_of_its_instrument_holds_the_apply() {
+    let (app, token, db) = setup().await;
+    let doc = Uuid::new_v4();
+    seed_lab_stream(&db, doc, "cleared-doc", "Upstream Station").await;
+    let plan = create_plan(&app, &token).await;
+    let plan_id = plan["id"].as_str().expect("plan id").to_string();
+
+    let (status, body) = patch_entry(
+        &app,
+        &token,
+        &plan_id,
+        serde_json::json!({ "stream_id": doc, "instrument_clear": true }),
+    )
+    .await;
+    assert_eq!(status, 200, "a lab row's proposal can be cleared: {body}");
+    let (status, body) = patch_entry(
+        &app,
+        &token,
+        &plan_id,
+        serde_json::json!({ "stream_id": doc, "acknowledged": true }),
+    )
+    .await;
+    assert_eq!(status, 200, "the row is ticked: {body}");
+
+    let before = scalar_i64(&db, "SELECT count(*)::bigint AS v FROM sensors").await;
+    let (status, refused) =
+        crate::common::post_plan_action_with_token(&app, &plan_id, "apply", &token).await;
+    assert_eq!(
+        status, 400,
+        "a row with no instrument holds the apply: {refused}"
+    );
+    assert!(
+        refused.contains("cleared-doc"),
+        "the refusal names the feed: {refused}"
+    );
+    let after = scalar_i64(&db, "SELECT count(*)::bigint AS v FROM sensors").await;
+    assert_eq!(after, before, "nothing is minted");
+}
+
 /// Scenario: the source's `toc` column is measured by the same analyser as `doc`, so the reviewer
 /// names toc's instrument `DOC`, after the one the plan proposes for doc.
 /// Expected behaviour: the plan lists one instrument covering both parameters, and the apply
