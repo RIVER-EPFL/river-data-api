@@ -13,7 +13,6 @@ use axum::{
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::{
     Alias, Condition, Expr, Func, JoinType, PostgresQueryBuilder, Query as SeaQuery,
-    SelectStatement, UnionType,
 };
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, Order, PaginatorTrait,
@@ -24,7 +23,7 @@ use uuid::Uuid;
 
 use super::models::*;
 use super::service::*;
-use crate::common::authz::{Capability, TokenAccess};
+use crate::common::authz::{AccessScope, Capability, TokenAccess};
 use crate::common::csv::field as csv_field;
 use crate::common::middleware::{
     ProjectScope, require_crud, require_read_data, require_read_metadata,
@@ -69,12 +68,7 @@ pub async fn list_site_parameters(
 ) -> AppResult<Json<Vec<ParameterResponse>>> {
     let site = resolve_site(&state.db, &site_id).await?;
 
-    // Enforce project scope
-    if !scope.allows_project_opt(site.project_id) {
-        return Err(AppError::Forbidden(
-            "Token is scoped to a different project".to_string(),
-        ));
-    }
+    require_site_in_scope(&scope, &site)?;
 
     let params_list = site_parameters::Entity::find()
         .filter(site_parameters::Column::SiteId.eq(site.id))
@@ -116,12 +110,7 @@ pub async fn get_site_detail(
 ) -> AppResult<Json<SiteDetailResponse>> {
     let (site, project) = resolve_site_with_project(&state.db, &site_id).await?;
 
-    // Enforce project scope
-    if !scope.allows_project_opt(site.project_id) {
-        return Err(AppError::Forbidden(
-            "Token is scoped to a different project".to_string(),
-        ));
-    }
+    require_site_in_scope(&scope, &site)?;
 
     // Query active parameters
     let params_list = site_parameters::Entity::find()
@@ -198,644 +187,324 @@ pub async fn get_site_readings(
     ProjectScope(scope): ProjectScope,
     headers: HeaderMap,
 ) -> AppResult<Response> {
-    let (site, project) = resolve_site_with_project(&state.db, &site_id).await?;
-
-    // Enforce project scope
-    if !scope.allows_project_opt(site.project_id) {
-        return Err(AppError::Forbidden(
-            "Token is scoped to a different project".to_string(),
-        ));
-    }
-
-    let project_ref = project.map(|p| ProjectRef {
-        id: p.id,
-        name: p.name,
-    });
-
-    let site_ref = SiteRef {
-        id: site.id,
-        name: site.name.clone(),
-    };
-
-    let effective_start = query.start.unwrap_or_else(|| {
-        chrono::Utc::now() - chrono::Duration::days(state.config.default_readings_lookback_days)
-    });
-    let effective_end = query.end;
-    validate_optional_time_range(Some(effective_start), effective_end)?;
-
-    // Determine format from query or Accept header
+    let db = &state.db;
+    let (site, project) = resolve_site_with_project(db, &site_id).await?;
+    require_site_in_scope(&scope, &site)?;
+    let request = ReadingsRequest::from_query(
+        &query,
+        state.config.default_readings_lookback_days,
+        Utc::now(),
+    )?;
     let format = bulk::determine_format(&query.format, &headers);
-
-    // Build site_parameter query for this site only
-    let mut param_query = site_parameters::Entity::find()
-        .filter(site_parameters::Column::IsActive.eq(true))
-        .filter(site_parameters::Column::SiteId.eq(site.id));
-
-    if let Some(ref types) = query.sensor_types {
-        let type_list: Vec<String> = types.split(',').map(|s| s.trim().to_string()).collect();
-        if !type_list.is_empty() {
-            param_query = param_query.filter(site_parameters::Column::SensorType.is_in(type_list));
-        }
-    }
-
-    if let Some(ref ids) = query.parameter_ids {
-        let parsed: Vec<Uuid> = ids
-            .split(',')
-            .filter_map(|s| Uuid::parse_str(s.trim()).ok())
-            .collect();
-        if parsed.is_empty() {
-            return Err(AppError::BadRequest(
-                "parameter_ids was provided but no UUIDs could be parsed".to_string(),
-            ));
-        }
-        param_query = param_query.filter(site_parameters::Column::ParameterId.is_in(parsed));
-    }
-
-    // Get matching site_parameters (needed for cache key validation)
-    let params_list = param_query
-        .order_by_asc(site_parameters::Column::Name)
-        .all(&state.db)
-        .await?;
-
-    // Global parameter IDs from site_parameters (readings table uses global parameter_id)
-    let param_ids: Vec<Uuid> = params_list.iter().map(|p| p.parameter_id).collect();
-
-    // The catalog rows behind these slots. One resolver decides code, names, sensor_type and
-    // units for every series endpoint, so a slot reports the catalog units here exactly as the
-    // site detail does.
-    let catalog = site_parameters::catalog_map(&state.db, param_ids.iter().copied()).await?;
-
-    let include_replicates = query.include_replicates.unwrap_or(false) || query.sample_id.is_some();
-    // Replicates and statistics never share one file (Q32): one is a row per replicate, the other
-    // a row per instant, and a file carrying both is neither. Asking for both was silently served
-    // as replicates alone, which reads as "this window has no sample statistics".
-    if include_replicates && query.include_sample_stats.unwrap_or(false) {
-        return Err(AppError::BadRequest(
-            "include_sample_stats and include_replicates cannot be combined: the replicate rows \
-             and the per-instant statistics are separate files. Request the statistics here, and \
-             the replicates as their own download."
-                .to_string(),
-        ));
-    }
-    let annotations = Annotations {
-        alarms: query.alarms.unwrap_or(false),
-        flagged: query.include_flagged.unwrap_or(true),
-        measurement_type: query.include_measurement_type.unwrap_or(false),
-        sample_stats: query.include_sample_stats.unwrap_or(false),
-        curves: query.include_curves.unwrap_or(false),
-        origin: query.include_origin.unwrap_or(false),
-        withdrawn: query.include_withdrawn.unwrap_or(false),
-    };
-    let include_flags = query.include_flags.unwrap_or(false);
-
-    if let Some(mt) = query.measurement_type.as_deref()
-        && !mt.is_empty()
-    {
-        crate::routes::private::readings::service::validate_measurement_type(Some(mt))?;
-    }
-    let measurement_type_filter = query.measurement_type.as_deref().unwrap_or("");
-
-    // The site id leads the key so a per-site invalidation can find every entry it owns.
-    let cache_key = cache_key::key_for(
-        &format!("readings:{}", site.id),
-        &ReadingsCacheKey {
-            effective_start,
-            effective_end,
-            resolved_format: &format,
-            query: &query,
-        },
-    );
-
-    // Check cache with freshness validation (JSON only)
+    let slots = requested_slots(db, site.id, &query).await?;
+    let param_ids: Vec<Uuid> = slots.iter().map(|sp| sp.parameter_id).collect();
+    let cache_key = readings_cache_key(site.id, &request, &format, &query);
     if format == "json"
-        && let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, effective_end).await
+        && let Some(cached) = cache::get_cached(&state, &cache_key, &param_ids, request.end).await
     {
         return cache::json_response((*cached).clone(), true);
     }
-
     let _permit = bulk::acquire_bulk_permit(&format, &state.bulk_semaphore)?;
-
-    if params_list.is_empty() {
-        let empty: (Vec<DateTime<Utc>>, Vec<ParameterData>) = (Vec::new(), Vec::new());
-        return series::respond(
-            &format,
-            empty,
-            |(times, params)| readings_table(times, params, include_flags, None),
-            |(times, parameters)| async move {
-                Ok(Json(ReadingsResponse {
-                    project: project_ref,
-                    site: site_ref,
-                    start: None,
-                    end: None,
-                    times,
-                    replicate_indices: None,
-                    parameters,
-                })
-                .into_response())
-            },
-        )
-        .await;
+    let (project, site_ref) = readings_owner(&site, project);
+    if slots.is_empty() {
+        let empty = empty_readings_response(project, site_ref);
+        return respond_readings(&state, &format, None, empty, request.flag_columns).await;
     }
-
-    let num_params = params_list.len();
-
-    let r_ = served::r();
-    let t = Alias::new("t");
-    let sv = Alias::new("sv");
-
-    // Severity comes from the one shared ladder (alarms engine). NULL when the slot has no
-    // threshold at any tier (no `t` row); otherwise the ladder treats all-NULL bounds as 0
-    // (disabled).
-    let severity_expr = |value_expr: &str| -> Expr {
-        if annotations.alarms {
-            let sev = crate::routes::private::alarms::service::severity_case(
-                value_expr,
-                "t.warning_min",
-                "t.warning_max",
-                "t.alarm_min",
-                "t.alarm_max",
-            );
-            Expr::cust(format!(
-                "CASE WHEN t.parameter_id IS NULL THEN NULL ELSE ({sev})::smallint END"
-            ))
-        } else {
-            Expr::cust("NULL::smallint")
-        }
-    };
-    // The 3-tier threshold per slot via the single engine definition (site → global → parameter
-    // default), scoped to this site and LEFT JOINed, so a parameter with only defaults still gets
-    // a severity (the old direct join to alarm_thresholds did not).
-    let thresholds = || {
-        crate::routes::private::alarms::service::resolve_thresholds_query(
-            Some(site.id),
-            Some(param_ids.to_vec()),
-        )
-    };
-
-    let in_window = |alias: &Alias| {
-        let mut cond = Condition::all()
-            .add(Expr::col((alias.clone(), readings::Column::Time)).gte(effective_start));
-        if let Some(end) = effective_end {
-            cond = cond.add(Expr::col((alias.clone(), readings::Column::Time)).lte(end));
-        }
-        cond
-    };
-    let slot = |alias: &Alias| {
-        let mut cond = Condition::all()
-            .add(Expr::col((alias.clone(), readings::Column::SiteId)).eq(site.id))
-            .add(
-                Expr::col((alias.clone(), readings::Column::ParameterId)).is_in(param_ids.to_vec()),
-            )
-            .add(in_window(alias));
-        if !annotations.flagged {
-            cond = cond.add(Expr::cust("(r.is_flagged IS NOT TRUE)"));
-        }
-        if let Some(sid) = query.sample_id {
-            cond = cond.add(Expr::col((alias.clone(), readings::Column::SampleId)).eq(sid));
-        }
-        cond
-    };
-
-    let query_statement = if include_replicates {
-        // Every stored row, one per replicate; the caller reconstructs the groups.
-        // "continuous" means everything that is not a grab: derived rows plot on the continuous
-        // line (matching the continuous aggregates, which exclude only 'spot'), and legacy NULL
-        // rows predate the measurement_type column.
-        let mut rows = slot(&r_);
-        match measurement_type_filter {
-            "" => {}
-            "continuous" => {
-                rows = rows.add(Expr::cust("(r.measurement_type IS DISTINCT FROM 'spot')"));
-            }
-            other => {
-                rows = rows.add(
-                    Expr::col((r_.clone(), readings::Column::MeasurementType))
-                        .eq(other.to_string()),
-                );
-            }
-        }
-        // The collapsed spot arm excludes withdrawn rows; the replicate view was exporting them
-        // as ordinary values, which publishes a number the source has taken back.
-        if !query.include_withdrawn.unwrap_or(false) {
-            rows = rows.add(Expr::col((r_.clone(), readings::Column::WithdrawnAt)).is_null());
-        }
-        let mut replicates = SeaQuery::select();
-        replicates
-            .column((r_.clone(), readings::Column::ParameterId))
-            .column((r_.clone(), readings::Column::Time))
-            .column((r_.clone(), readings::Column::ReplicateIndex))
-            .expr_as(served::continuous_value(), Alias::new("value"))
-            .expr_as(
-                severity_expr("COALESCE(r.calibrated_value, r.raw_value)"),
-                Alias::new("severity"),
-            )
-            .column((r_.clone(), readings::Column::IsFlagged))
-            .column((r_.clone(), readings::Column::FlagReason))
-            .column((r_.clone(), readings::Column::MeasurementType))
-            .column((r_.clone(), readings::Column::Unverified))
-            .column((r_.clone(), readings::Column::SampleId))
-            .column((r_.clone(), readings::Column::CalibrationId))
-            .column((r_.clone(), readings::Column::StandardCurveId))
-            .expr_as(
-                Expr::col((r_.clone(), readings::Column::WithdrawnAt)).is_not_null(),
-                Alias::new("withdrawn"),
-            )
-            .from_as(readings::Entity, r_.clone());
-        if annotations.alarms {
-            replicates.join_subquery(
-                JoinType::LeftJoin,
-                thresholds(),
-                t.clone(),
-                Condition::all()
-                    .add(
-                        Expr::col((t.clone(), Alias::new("parameter_id")))
-                            .equals((r_.clone(), readings::Column::ParameterId)),
-                    )
-                    .add(
-                        Expr::col((t.clone(), Alias::new("site_id")))
-                            .equals((r_.clone(), readings::Column::SiteId)),
-                    ),
-            );
-        }
-        replicates
-            .cond_where(rows)
-            .order_by((r_.clone(), readings::Column::ParameterId), Order::Asc)
-            .order_by((r_.clone(), readings::Column::Time), Order::Asc)
-            .order_by((r_.clone(), readings::Column::ReplicateIndex), Order::Asc);
-        replicates.take()
-    } else {
-        // Continuous and derived rows live at replicate_index 0 (every continuous writer defaults
-        // to it), so the plain equality keeps the ordered scan. A spot instant is the replicate
-        // group `(stream_id, time)`, served at the sample mean over its unflagged replicates with
-        // the lowest unflagged replicate's own value as the no-sample fallback; the DISTINCT ON
-        // is confined to the spot subset, whose row counts are small. "continuous" folds in
-        // derived and legacy NULL rows (matching the continuous aggregates, which exclude only
-        // 'spot'); any other named type is continuous-shaped and narrows the continuous arm.
-        let (include_continuous_arm, include_spot_arm, continuous_extra) =
-            match measurement_type_filter {
-                "" => (true, true, None),
-                "continuous" => (true, false, None),
-                "spot" => (false, true, None),
-                other => (true, false, Some(other.to_string())),
-            };
-        let base_cols = |q: &mut SelectStatement| {
-            q.column((r_.clone(), readings::Column::ParameterId))
-                .column((r_.clone(), readings::Column::Time))
-                .column((r_.clone(), readings::Column::SiteId))
-                .column((r_.clone(), readings::Column::IsFlagged))
-                .column((r_.clone(), readings::Column::FlagReason))
-                .column((r_.clone(), readings::Column::MeasurementType))
-                .column((r_.clone(), readings::Column::SampleId))
-                .column((r_.clone(), readings::Column::CalibrationId))
-                .column((r_.clone(), readings::Column::StandardCurveId))
-                .expr_as(
-                    Expr::col((r_.clone(), readings::Column::WithdrawnAt)).is_not_null(),
-                    Alias::new("withdrawn"),
-                )
-                .column((r_.clone(), readings::Column::Unverified));
-        };
-        let served_cols = [
-            Alias::new("value"),
-            Alias::new("parameter_id"),
-            Alias::new("time"),
-            Alias::new("site_id"),
-            Alias::new("is_flagged"),
-            Alias::new("flag_reason"),
-            Alias::new("measurement_type"),
-            Alias::new("sample_id"),
-            Alias::new("calibration_id"),
-            Alias::new("standard_curve_id"),
-            Alias::new("withdrawn"),
-            Alias::new("unverified"),
-        ];
-        let mut arms: Vec<SelectStatement> = Vec::new();
-        if include_continuous_arm {
-            let mut cond = slot(&r_).add(served::continuous_rows());
-            if let Some(other) = &continuous_extra {
-                cond = cond.add(
-                    Expr::col((r_.clone(), readings::Column::MeasurementType)).eq(other.clone()),
-                );
-            }
-            let mut arm = SeaQuery::select();
-            arm.expr_as(served::continuous_value(), Alias::new("value"));
-            base_cols(&mut arm);
-            arm.from_as(readings::Entity, r_.clone()).cond_where(cond);
-            arms.push(arm.take());
-        }
-        if include_spot_arm {
-            // A retracted instant is served only when asked for, and then the ordering below
-            // prefers a live replicate, so `withdrawn` on the served row means the whole group is
-            // retracted.
-            let mut cond = slot(&r_)
-                .add(Expr::col((r_.clone(), readings::Column::MeasurementType)).eq("spot"));
-            if !annotations.withdrawn {
-                cond = cond.add(Expr::col((r_.clone(), readings::Column::WithdrawnAt)).is_null());
-            }
-            // One row per slot instant, not per stream; the key and its ordering are
-            // `common::served`, shared with the public arm and the alarm evaluator.
-            let smp = Alias::new("smp");
-            let mut group = SeaQuery::select();
-            group
-                .distinct_on(served::spot_instant_key())
-                .expr_as(served::spot_value(), Alias::new("value"));
-            base_cols(&mut group);
-            group
-                .from_as(readings::Entity, r_.clone())
-                .join_as(
-                    JoinType::LeftJoin,
-                    samples::Entity,
-                    smp.clone(),
-                    Expr::col((smp, samples::Column::Id))
-                        .equals((r_.clone(), readings::Column::SampleId)),
-                )
-                .cond_where(cond);
-            for (expr, order) in served::spot_instant_order() {
-                group.order_by_expr(expr, order);
-            }
-            let sp = Alias::new("sp");
-            arms.push(
-                SeaQuery::select()
-                    .columns(served_cols.map(|c| (sp.clone(), c)))
-                    .from_subquery(group.take(), sp.clone())
-                    .take(),
-            );
-        }
-        let mut arms = arms.into_iter();
-        let first = arms.next().unwrap_or_default();
-        let inner = arms.fold(first, |mut acc, arm| acc.union(UnionType::All, arm).take());
-
-        let mut series = SeaQuery::select();
-        series
-            .column((sv.clone(), Alias::new("parameter_id")))
-            .column((sv.clone(), Alias::new("time")))
-            .expr_as(Expr::cust("NULL::smallint"), Alias::new("replicate_index"))
-            .column((sv.clone(), Alias::new("value")))
-            .expr_as(severity_expr("sv.value"), Alias::new("severity"))
-            .column((sv.clone(), Alias::new("is_flagged")))
-            .column((sv.clone(), Alias::new("flag_reason")))
-            .column((sv.clone(), Alias::new("measurement_type")))
-            .column((sv.clone(), Alias::new("sample_id")))
-            .column((sv.clone(), Alias::new("calibration_id")))
-            .column((sv.clone(), Alias::new("standard_curve_id")))
-            .column((sv.clone(), Alias::new("withdrawn")))
-            .column((sv.clone(), Alias::new("unverified")))
-            .from_subquery(inner, sv.clone());
-        if annotations.alarms {
-            series.join_subquery(
-                JoinType::LeftJoin,
-                thresholds(),
-                t.clone(),
-                Condition::all()
-                    .add(
-                        Expr::col((t.clone(), Alias::new("parameter_id")))
-                            .equals((sv.clone(), Alias::new("parameter_id"))),
-                    )
-                    .add(
-                        Expr::col((t.clone(), Alias::new("site_id")))
-                            .equals((sv.clone(), Alias::new("site_id"))),
-                    ),
-            );
-        }
-        series
-            .order_by((sv.clone(), Alias::new("parameter_id")), Order::Asc)
-            .order_by((sv.clone(), Alias::new("time")), Order::Asc);
-        series.take()
-    };
-    let (sql, values) = query_statement.build(PostgresQueryBuilder);
-
-    let query_result = state
-        .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-            values,
-        ))
-        .await?;
-
-    let estimated_times = query_result.len() / num_params.max(1);
-
-    let mut param_rows: HashMap<Uuid, Vec<ReadingRow>> = HashMap::with_capacity(num_params);
-    for row in &query_result {
-        if let Ok(r) = ReadingRow::from_query_result(row, "") {
-            param_rows
-                .entry(r.parameter_id)
-                .or_insert_with(|| Vec::with_capacity(estimated_times))
-                .push(r);
-        }
-    }
-
-    // One derivation of the row axis, and the row-to-column mapping that goes with it. Replicates
-    // share timestamps, so that view's axis is `(time, replicate_index)` pairs; every other view is
-    // keyed by time alone.
-    let mut replicate_keys: Vec<(DateTime<Utc>, i16)> = Vec::new();
-    let times: Vec<DateTime<Utc>> = if include_replicates {
-        // The union of every parameter's `(time, replicate_index)` pairs, sorted. Taking the
-        // longest parameter's timestamps and filling by position dated one parameter's values to
-        // another parameter's instants whenever the two had different row counts.
-        let mut set: HashSet<(DateTime<Utc>, i16)> = HashSet::with_capacity(estimated_times);
-        for rows in param_rows.values() {
-            for r in rows {
-                set.insert((r.time.with_timezone(&Utc), r.replicate_index.unwrap_or(0)));
-            }
-        }
-        let mut keys: Vec<(DateTime<Utc>, i16)> = set.into_iter().collect();
-        keys.sort_unstable();
-        replicate_keys = keys;
-        replicate_keys.iter().map(|(t, _)| *t).collect()
-    } else {
-        let mut set: HashSet<DateTime<Utc>> = HashSet::with_capacity(estimated_times);
-        for rows in param_rows.values() {
-            for r in rows {
-                set.insert(r.time.with_timezone(&Utc));
-            }
-        }
-        let mut times: Vec<DateTime<Utc>> = set.into_iter().collect();
-        times.sort_unstable();
-        times
-    };
-
-    let time_index: HashMap<DateTime<Utc>, usize> =
-        times.iter().enumerate().map(|(i, t)| (*t, i)).collect();
-    let replicate_index_map: HashMap<(DateTime<Utc>, i16), usize> = replicate_keys
-        .iter()
-        .enumerate()
-        .map(|(i, k)| (*k, i))
-        .collect();
-    let index = if include_replicates {
-        RowIndex::ByReplicate(&replicate_index_map)
-    } else {
-        RowIndex::ByTime(&time_index)
-    };
-
-    // One batched lookup resolves every referenced sample and its replicate readings
-    let sample_stats: HashMap<Uuid, SampleStatOut> = if annotations.sample_stats {
-        let ids: Vec<Uuid> = param_rows
-            .values()
-            .flat_map(|rows| rows.iter().filter_map(|r| r.sample_id))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        fetch_sample_stats(&state.db, &ids, effective_start, effective_end).await?
-    } else {
-        HashMap::new()
-    };
-
-    let origin_map: HashMap<Uuid, Vec<OriginRef>> = if annotations.origin {
-        use crate::routes::private::data_streams;
-        let sp_ids: Vec<Uuid> = params_list.iter().map(|sp| sp.id).collect();
-        let mut map: HashMap<Uuid, Vec<OriginRef>> = HashMap::new();
-        for stream in data_streams::Entity::find()
-            .filter(data_streams::Column::SiteParameterId.is_in(sp_ids))
-            .all(&state.db)
-            .await?
-        {
-            if let Some(sp_id) = stream.site_parameter_id {
-                map.entry(sp_id).or_default().push(OriginRef {
-                    stream_id: stream.id,
-                    source_system: stream.source_system,
-                    source_key: stream.source_key,
-                });
-            }
-        }
-        map
-    } else {
-        HashMap::new()
-    };
-
-    // A retracted visit is a fact about the window whether or not its points are drawn, so the
-    // count is served whenever the request covers the spot arm. Only instants no live replicate
-    // survives on are counted: one retracted replicate is not a retracted visit.
-    let withdrawn_counts: Option<HashMap<Uuid, i64>> =
-        if include_replicates || measurement_type_filter == "continuous" {
-            None
-        } else {
-            Some(
-                count_withdrawn_instants(
-                    &state.db,
-                    site.id,
-                    &params_list
-                        .iter()
-                        .map(|sp| sp.parameter_id)
-                        .collect::<Vec<_>>(),
-                    effective_start,
-                    effective_end,
-                )
-                .await?,
-            )
-        };
-
-    let param_data: Vec<ParameterData> = params_list
-        .iter()
-        .map(|sp| {
-            let len = times.len();
-            let mut values: Vec<Option<f64>> = vec![None; len];
-            let mut severities = annotations.alarms.then(|| vec![None; len]);
-            let mut flagged = annotations.flagged.then(|| vec![None; len]);
-            let mut flag_reasons = annotations.flagged.then(|| vec![None; len]);
-            let mut measurement_types = annotations.measurement_type.then(|| vec![None; len]);
-            let mut calibration_ids = annotations.curves.then(|| vec![None; len]);
-            let mut standard_curve_ids = annotations.curves.then(|| vec![None; len]);
-            let mut samples = annotations.sample_stats.then(|| vec![None; len]);
-            let mut withdrawn = annotations.withdrawn.then(|| vec![None; len]);
-            let mut unverified = vec![None; len];
-
-            if let Some(rows) = param_rows.get(&sp.parameter_id) {
-                for row in rows {
-                    let Some(i) = index.of(row.time.with_timezone(&Utc), row.replicate_index)
-                    else {
-                        continue;
-                    };
-                    if i >= len {
-                        continue;
-                    }
-                    values[i] = Some(row.value);
-                    if let Some(v) = severities.as_mut() {
-                        v[i] = row.severity;
-                    }
-                    if let Some(v) = flagged.as_mut() {
-                        v[i] = row.is_flagged;
-                    }
-                    if let Some(v) = flag_reasons.as_mut() {
-                        v[i] = row.flag_reason.clone();
-                    }
-                    if let Some(v) = measurement_types.as_mut() {
-                        v[i] = row.measurement_type.clone();
-                    }
-                    if let Some(v) = calibration_ids.as_mut() {
-                        v[i] = row.calibration_id;
-                    }
-                    if let Some(v) = standard_curve_ids.as_mut() {
-                        v[i] = row.standard_curve_id;
-                    }
-                    if let Some(v) = samples.as_mut() {
-                        v[i] = row
-                            .sample_id
-                            .and_then(|sid| sample_stats.get(&sid).cloned());
-                    }
-                    if let Some(v) = withdrawn.as_mut() {
-                        v[i] = row.withdrawn;
-                    }
-                    unverified[i] = row.unverified;
-                }
-            }
-
-            let descriptor =
-                site_parameters::SlotDescriptor::resolve(sp, catalog.get(&sp.parameter_id));
-            ParameterData {
-                id: sp.id,
-                parameter_id: sp.parameter_id,
-                code: descriptor.code,
-                name: descriptor.slot_name,
-                display_name: descriptor.catalog_name,
-                sensor_type: descriptor.sensor_type,
-                units: descriptor.units,
-                decimal_places: descriptor.decimal_places,
-                values,
-                severities,
-                flagged,
-                flag_reasons,
-                measurement_types,
-                calibration_ids,
-                standard_curve_ids,
-                samples,
-                origins: annotations
-                    .origin
-                    .then(|| origin_map.get(&sp.id).cloned().unwrap_or_default()),
-                withdrawn,
-                unverified: Some(unverified),
-                withdrawn_count: withdrawn_counts
-                    .as_ref()
-                    .map(|counts| counts.get(&sp.parameter_id).copied().unwrap_or(0)),
-            }
-        })
-        .collect();
-
-    let actual_start = times.first().copied();
-    let actual_end = times.last().copied();
-
-    let indices: Option<Vec<i16>> =
-        include_replicates.then(|| replicate_keys.iter().map(|(_, i)| *i).collect());
-    let table_indices = indices.clone();
-    series::respond(
+    let catalog = site_parameters::catalog_map(db, param_ids.iter().copied()).await?;
+    let rows = served_rows(db, site.id, &param_ids, &request).await?;
+    let axis = RowAxis::over(&rows, request.replicates);
+    let context = series_context(db, site.id, &slots, &rows, &request).await?;
+    let parameters = slot_series(&slots, &catalog, rows, &axis, request.annotations, &context);
+    let response = readings_response(project, site_ref, &axis, parameters);
+    respond_readings(
+        &state,
         &format,
-        (times, param_data),
-        move |(times, params)| {
-            readings_table(times, params, include_flags, table_indices.as_deref())
+        Some(cache_key),
+        response,
+        request.flag_columns,
+    )
+    .await
+}
+
+/// The project and site a readings body names.
+fn readings_owner(
+    site: &Model,
+    project: Option<crate::routes::private::projects::Model>,
+) -> (Option<ProjectRef>, SiteRef) {
+    let project = project.map(|p| ProjectRef {
+        id: p.id,
+        name: p.name,
+    });
+    let site = SiteRef {
+        id: site.id,
+        name: site.name.clone(),
+    };
+    (project, site)
+}
+
+/// Refuses a caller whose scope does not reach the site's project.
+fn require_site_in_scope(scope: &AccessScope, site: &Model) -> AppResult<()> {
+    if scope.allows_project_opt(site.project_id) {
+        return Ok(());
+    }
+    Err(AppError::Forbidden(
+        "Token is scoped to a different project".to_string(),
+    ))
+}
+
+/// The site's active slots the query's sensor-type and parameter filters select, by name.
+async fn requested_slots(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    query: &SiteReadingsQuery,
+) -> AppResult<Vec<site_parameters::Model>> {
+    let mut slots = site_parameters::Entity::find()
+        .filter(site_parameters::Column::IsActive.eq(true))
+        .filter(site_parameters::Column::SiteId.eq(site_id));
+    if let Some(types) = sensor_type_filter(query.sensor_types.as_deref()) {
+        slots = slots.filter(site_parameters::Column::SensorType.is_in(types));
+    }
+    if let Some(ids) = parameter_id_filter(query.parameter_ids.as_deref())? {
+        slots = slots.filter(site_parameters::Column::ParameterId.is_in(ids));
+    }
+    Ok(slots
+        .order_by_asc(site_parameters::Column::Name)
+        .all(db)
+        .await?)
+}
+
+/// The cache key of a readings body. The site id leads it so a per-site invalidation can find
+/// every entry it owns.
+fn readings_cache_key(
+    site_id: Uuid,
+    request: &ReadingsRequest,
+    format: &str,
+    query: &SiteReadingsQuery,
+) -> String {
+    cache_key::key_for(
+        &format!("readings:{site_id}"),
+        &ReadingsCacheKey {
+            effective_start: request.start,
+            effective_end: request.end,
+            resolved_format: format,
+            query,
         },
-        |(times, parameters)| async move {
-            let response = ReadingsResponse {
-                project: project_ref,
-                site: site_ref,
-                start: actual_start,
-                end: actual_end,
-                times,
-                replicate_indices: indices,
-                parameters,
-            };
-            cache::cache_and_respond(&state, cache_key, &response, actual_end).await
+    )
+}
+
+/// The rows the request serves: one per replicate, or one per continuous instant and per spot
+/// instant.
+async fn served_rows(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    param_ids: &[Uuid],
+    request: &ReadingsRequest,
+) -> AppResult<Vec<ReadingRow>> {
+    let statement = if request.replicates {
+        replicate_rows_query(site_id, param_ids, request)
+    } else {
+        served_series_query(site_id, param_ids, request)
+    };
+    let rows: Vec<ReadingRow> = db
+        .query_all_raw(sea_orm::DatabaseBackend::Postgres.build(&statement))
+        .await?
+        .iter()
+        .filter_map(|row| ReadingRow::from_query_result(row, "").ok())
+        .collect();
+    if request.replicates {
+        return Ok(rows);
+    }
+    one_row_per_continuous_instant(db, site_id, param_ids, rows, request.annotations.alarms).await
+}
+
+/// The sample statistics, stream origins and withdrawn counts the request asked for.
+async fn series_context(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    slots: &[site_parameters::Model],
+    rows: &[ReadingRow],
+    request: &ReadingsRequest,
+) -> AppResult<SeriesContext> {
+    Ok(SeriesContext {
+        sample_stats: sample_stats_of(db, rows, request).await?,
+        origins: slot_origins(db, slots, request.annotations.origin).await?,
+        withdrawn_counts: withdrawn_counts_of(db, site_id, slots, request).await?,
+    })
+}
+
+/// Every sample the rows reference with its replicate readings, in one batched lookup, when the
+/// request asked for them.
+async fn sample_stats_of(
+    db: &sea_orm::DatabaseConnection,
+    rows: &[ReadingRow],
+    request: &ReadingsRequest,
+) -> AppResult<HashMap<Uuid, SampleStatOut>> {
+    if !request.annotations.sample_stats {
+        return Ok(HashMap::new());
+    }
+    let ids: Vec<Uuid> = rows
+        .iter()
+        .filter_map(|r| r.sample_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    fetch_sample_stats(db, &ids, request.start, request.end).await
+}
+
+/// The streams paired into each slot, keyed by site-parameter id, when the request asked for them.
+async fn slot_origins(
+    db: &sea_orm::DatabaseConnection,
+    slots: &[site_parameters::Model],
+    asked: bool,
+) -> AppResult<Option<HashMap<Uuid, Vec<OriginRef>>>> {
+    if !asked {
+        return Ok(None);
+    }
+    let slot_ids: Vec<Uuid> = slots.iter().map(|sp| sp.id).collect();
+    let mut origins: HashMap<Uuid, Vec<OriginRef>> = HashMap::new();
+    for stream in data_streams::Entity::find()
+        .filter(data_streams::Column::SiteParameterId.is_in(slot_ids))
+        .all(db)
+        .await?
+    {
+        if let Some(slot_id) = stream.site_parameter_id {
+            origins.entry(slot_id).or_default().push(OriginRef {
+                stream_id: stream.id,
+                source_system: stream.source_system,
+                source_key: stream.source_key,
+            });
+        }
+    }
+    Ok(Some(origins))
+}
+
+/// Each parameter's fully withdrawn spot instants in the window, when the request covers them.
+/// Only instants no live replicate survives on are counted: one retracted replicate is not a
+/// retracted visit.
+async fn withdrawn_counts_of(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    slots: &[site_parameters::Model],
+    request: &ReadingsRequest,
+) -> AppResult<Option<HashMap<Uuid, i64>>> {
+    if !request.counts_withdrawn() {
+        return Ok(None);
+    }
+    let parameter_ids: Vec<Uuid> = slots.iter().map(|sp| sp.parameter_id).collect();
+    let counts =
+        count_withdrawn_instants(db, site_id, &parameter_ids, request.start, request.end).await?;
+    Ok(Some(counts))
+}
+
+/// The body as JSON, CSV or NDJSON. A JSON body under a cache key is cached until its last
+/// instant is superseded; CSV and NDJSON are one column set built from the same series.
+async fn respond_readings(
+    state: &AppState,
+    format: &str,
+    cache_key: Option<String>,
+    response: ReadingsResponse,
+    flag_columns: bool,
+) -> AppResult<Response> {
+    series::respond(
+        format,
+        response,
+        |r| {
+            readings_table(
+                &r.times,
+                &r.parameters,
+                flag_columns,
+                r.replicate_indices.as_deref(),
+            )
+        },
+        |r| async move {
+            match cache_key {
+                Some(key) => cache::cache_and_respond(state, key, &r, r.end).await,
+                None => Ok(Json(r).into_response()),
+            }
         },
     )
     .await
+}
+
+/// The site chart's rows with each continuous instant several streams feed served once, at the
+/// mean of what it pools (`common::served`). A pooled value is a value the query never saw, so
+/// its severity is classified here against the same thresholds.
+async fn one_row_per_continuous_instant(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    param_ids: &[Uuid],
+    rows: Vec<ReadingRow>,
+    alarms: bool,
+) -> AppResult<Vec<ReadingRow>> {
+    let mut pooled_at: HashSet<(Uuid, DateTime<chrono::FixedOffset>)> = HashSet::new();
+    let mut rows = served::one_row_per_continuous_instant(
+        rows,
+        |row| {
+            (row.measurement_type.as_deref() != Some("spot")).then_some((
+                (row.parameter_id, row.time),
+                served::InstantMember {
+                    value: row.value,
+                    flagged: row.is_flagged == Some(true),
+                    unverified: row.unverified == Some(true),
+                    stream_id: row.stream_id,
+                },
+            ))
+        },
+        |row, pool| {
+            row.value = pool.value;
+            pooled_at.insert((row.parameter_id, row.time));
+        },
+    );
+    if alarms && !pooled_at.is_empty() {
+        let thresholds = resolved_thresholds(db, site_id, param_ids).await?;
+        for row in &mut rows {
+            if pooled_at.contains(&(row.parameter_id, row.time))
+                && row.measurement_type.as_deref() != Some("spot")
+            {
+                row.severity = thresholds
+                    .get(&row.parameter_id)
+                    .map(|t| crate::routes::private::alarms::service::severity_of(row.value, t));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// Each parameter's threshold at this site, through the single engine definition (site, then
+/// global, then the parameter default).
+async fn resolved_thresholds(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    param_ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, crate::routes::private::alarms::models::ResolvedThreshold>> {
+    use crate::routes::private::alarms::models as alarm_models;
+    let (sql, values) = crate::routes::private::alarms::service::resolve_thresholds_query(
+        Some(site_id),
+        Some(param_ids.to_vec()),
+    )
+    .build(PostgresQueryBuilder);
+    let mut map = HashMap::new();
+    for row in db
+        .query_all_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            sql,
+            values.0,
+        ))
+        .await?
+    {
+        if let Ok(tr) = alarm_models::ThresholdRow::from_query_result(&row, "") {
+            map.insert(
+                tr.parameter_id,
+                alarm_models::ResolvedThreshold {
+                    warning_min: tr.warning_min,
+                    warning_max: tr.warning_max,
+                    alarm_min: tr.alarm_min,
+                    alarm_max: tr.alarm_max,
+                },
+            );
+        }
+    }
+    Ok(map)
 }
 
 // --- Aggregates ---
@@ -870,12 +539,7 @@ pub async fn get_site_aggregates(
 ) -> AppResult<Response> {
     let (site, project) = resolve_site_with_project(&state.db, &site_id).await?;
 
-    // Enforce project scope
-    if !scope.allows_project_opt(site.project_id) {
-        return Err(AppError::Forbidden(
-            "Token is scoped to a different project".to_string(),
-        ));
-    }
+    require_site_in_scope(&scope, &site)?;
 
     let project_ref = project.map(|p| ProjectRef {
         id: p.id,
@@ -964,127 +628,35 @@ pub async fn get_site_aggregates(
         .await;
     }
 
-    // Resolve thresholds via the single engine definition (site → global → parameter default),
-    // scoped to this site. Replaces the old ORM fetch that ignored the parameter-default tier.
-    use crate::routes::private::alarms::models as alarm_models;
     use crate::routes::private::alarms::service as alarm_engine;
-    let threshold_map: HashMap<Uuid, alarm_models::ResolvedThreshold> = if include_alarms {
-        let (sql, values) =
-            alarm_engine::resolve_thresholds_query(Some(site.id), Some(param_ids.clone()))
-                .build(sea_orm::sea_query::PostgresQueryBuilder);
-        let mut map = HashMap::new();
-        for row in state
-            .db
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                sql,
-                values.0,
-            ))
-            .await?
-        {
-            if let Ok(tr) = alarm_models::ThresholdRow::from_query_result(&row, "") {
-                map.insert(
-                    tr.parameter_id,
-                    alarm_models::ResolvedThreshold {
-                        warning_min: tr.warning_min,
-                        warning_max: tr.warning_max,
-                        alarm_min: tr.alarm_min,
-                        alarm_max: tr.alarm_max,
-                    },
-                );
-            }
-        }
-        map
+    let threshold_map = if include_alarms {
+        resolved_thresholds(&state.db, site.id, &param_ids).await?
     } else {
         HashMap::new()
     };
 
-    // $1 = site_id, $2 = the parameter ids as one array, $3 start, $4 end.
-    let base_values: Vec<sea_orm::Value> = vec![site.id.into(), param_ids.to_vec().into()];
-    let start_param = 3;
-    let end_param = 4;
-
-    let bind = |extra: &[sea_orm::Value]| -> Vec<sea_orm::Value> {
-        let mut values = base_values.clone();
-        values.extend_from_slice(extra);
-        values
-    };
-    let window: Vec<sea_orm::Value> = vec![query.start.into(), query.end.into()];
-
-    // The CAGG is grouped by (bucket, site_id, parameter_id, sensor_id) since m20260603_000007.
-    // The default read collapses the sensor dimension (count-weighted avg = SUM(sum_value)/SUM(count),
-    // MIN/MAX, SUM(count)) and selects a NULL sensor_id; `split_by_sensor` keeps it. One query text
-    // either way, so the two reads cannot drift.
-    let (sensor_select, sensor_group) = if split {
-        ("sensor_id", ", sensor_id")
-    } else {
-        ("NULL::uuid AS sensor_id", "")
-    };
-    let sql = format!(
-        r"
-        SELECT
-            bucket,
-            parameter_id,
-            {sensor_select},
-            CASE WHEN SUM(count) > 0 THEN SUM(sum_value) / SUM(count) ELSE NULL END AS avg_value,
-            MIN(min_value) AS min_value,
-            MAX(max_value) AS max_value,
-            SUM(count)::bigint AS count
-        FROM {view}
-        WHERE site_id = $1
-          AND parameter_id = ANY($2)
-          AND bucket >= ${start_param}
-          AND bucket <= ${end_param}
-        GROUP BY bucket, parameter_id{sensor_group}
-        ORDER BY bucket ASC, parameter_id ASC{sensor_group}
-        ",
-        view = rollup.view(),
-    );
+    let bounds: Vec<sea_orm::Value> = vec![
+        site.id.into(),
+        param_ids.to_vec().into(),
+        query.start.into(),
+        query.end.into(),
+    ];
 
     let rows: Vec<AggregateRow> = state
         .db
         .query_all_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
-            &sql,
-            bind(&window),
+            aggregate_buckets_sql(rollup, split),
+            bounds,
         ))
         .await?
         .into_iter()
         .filter_map(|row| AggregateRow::from_query_result(&row, "").ok())
         .collect();
 
-    let mut flagged = SeaQuery::select();
-    flagged.expr_as(
-        Expr::cust_with_values(
-            "time_bucket($1::interval, time)",
-            [bucket_interval(rollup).to_string()],
-        ),
-        Alias::new("bucket"),
-    );
-    flagged.column(readings::Column::ParameterId);
-    if split {
-        flagged.column(readings::Column::SensorId);
-    } else {
-        flagged.expr_as(Expr::cust("NULL::uuid"), Alias::new("sensor_id"));
-    }
-    flagged
-        .expr_as(Expr::cust("COUNT(*)::bigint"), Alias::new("flagged_count"))
-        .from(readings::Entity)
-        .and_where(Expr::col(readings::Column::SiteId).eq(site.id))
-        .and_where(Expr::col(readings::Column::ParameterId).is_in(param_ids.to_vec()))
-        .and_where(Expr::col(readings::Column::Time).gte(query.start))
-        .and_where(Expr::col(readings::Column::Time).lte(query.end))
-        .and_where(Expr::col(readings::Column::IsFlagged).eq(true))
-        .and_where(Expr::col(readings::Column::ReplicateIndex).eq(0))
-        .and_where(Expr::cust("measurement_type IS DISTINCT FROM 'spot'"))
-        .add_group_by([
-            Expr::col(Alias::new("bucket")),
-            Expr::col(readings::Column::ParameterId),
-        ]);
-    if split {
-        flagged.add_group_by([Expr::col(readings::Column::SensorId)]);
-    }
-    let (flagged_sql, flagged_values) = flagged.take().build(PostgresQueryBuilder);
+    let (flagged_sql, flagged_values) =
+        flagged_buckets_query(rollup, site.id, &param_ids, split, query.start, query.end)
+            .build(PostgresQueryBuilder);
 
     let flagged_rows: Vec<FlaggedBucketRow> = state
         .db
@@ -1243,12 +815,7 @@ pub async fn get_site_status_events(
 ) -> AppResult<Response> {
     let site = resolve_site(&state.db, &site_id).await?;
 
-    // Enforce project scope
-    if !scope.allows_project_opt(site.project_id) {
-        return Err(AppError::Forbidden(
-            "Token is scoped to a different project".to_string(),
-        ));
-    }
+    require_site_in_scope(&scope, &site)?;
 
     let site_ref = SiteRef {
         id: site.id,
@@ -1365,12 +932,7 @@ pub async fn get_site_annotations(
 ) -> AppResult<Response> {
     let site = resolve_site(&state.db, &site_id).await?;
 
-    // Enforce project scope
-    if !scope.allows_project_opt(site.project_id) {
-        return Err(AppError::Forbidden(
-            "Token is scoped to a different project".to_string(),
-        ));
-    }
+    require_site_in_scope(&scope, &site)?;
 
     validate_optional_time_range(query.start, query.end)?;
 
@@ -1462,11 +1024,7 @@ pub async fn get_site_export_summary(
     ProjectScope(scope): ProjectScope,
 ) -> AppResult<Json<ExportSummaryResponse>> {
     let site = resolve_site(&state.db, &site_id).await?;
-    if !scope.allows_project_opt(site.project_id) {
-        return Err(AppError::Forbidden(
-            "Token is scoped to a different project".to_string(),
-        ));
-    }
+    require_site_in_scope(&scope, &site)?;
     if query.end <= query.start {
         return Err(AppError::BadRequest("end must be after start".to_string()));
     }
@@ -1639,11 +1197,7 @@ pub async fn get_site_statistics(
     ProjectScope(scope): ProjectScope,
 ) -> AppResult<Response> {
     let (site, _project) = resolve_site_with_project(&state.db, &site_id).await?;
-    if !scope.allows_project_opt(site.project_id) {
-        return Err(AppError::Forbidden(
-            "Token is scoped to a different project".to_string(),
-        ));
-    }
+    require_site_in_scope(&scope, &site)?;
 
     let measurement_type = match query.measurement_type.as_deref() {
         None | Some("continuous") => "continuous",
@@ -1833,32 +1387,14 @@ pub async fn get_site_replicates(
     ProjectScope(scope): ProjectScope,
 ) -> AppResult<Response> {
     let (site, _project) = resolve_site_with_project(&state.db, &site_id).await?;
-    if !scope.allows_project_opt(site.project_id) {
-        return Err(AppError::Forbidden(
-            "Token is scoped to a different project".to_string(),
-        ));
-    }
+    require_site_in_scope(&scope, &site)?;
 
     let effective_start = query.start.unwrap_or_else(|| {
         Utc::now() - chrono::Duration::days(state.config.default_readings_lookback_days)
     });
     validate_optional_time_range(Some(effective_start), query.end)?;
 
-    let parameter_ids = match query.parameter_ids.as_deref() {
-        Some(list) => {
-            let parsed: Vec<Uuid> = list
-                .split(',')
-                .filter_map(|s| Uuid::parse_str(s.trim()).ok())
-                .collect();
-            if parsed.is_empty() {
-                return Err(AppError::BadRequest(
-                    "parameter_ids was provided but no UUIDs could be parsed".to_string(),
-                ));
-            }
-            Some(parsed)
-        }
-        None => None,
-    };
+    let parameter_ids = parameter_id_filter(query.parameter_ids.as_deref())?;
 
     let r_ = Alias::new("r");
     let p = Alias::new("p");
@@ -2008,11 +1544,7 @@ pub async fn get_sensor_vs_grab(
 ) -> AppResult<Response> {
     let (site, _project) = resolve_site_with_project(&state.db, &site_id).await?;
 
-    if !scope.allows_project_opt(site.project_id) {
-        return Err(AppError::Forbidden(
-            "Token is scoped to a different project".to_string(),
-        ));
-    }
+    require_site_in_scope(&scope, &site)?;
 
     if query.window_end_hours <= query.window_start_hours {
         return Err(AppError::BadRequest(
@@ -2228,11 +1760,7 @@ pub async fn get_site_sensor_identity(
 ) -> AppResult<Json<SensorIdentityResponse>> {
     let db = &state.db;
     let site = resolve_site(db, &site_id).await?;
-    if !scope.allows_project_opt(site.project_id) {
-        return Err(AppError::Forbidden(
-            "Token is scoped to a different project".to_string(),
-        ));
-    }
+    require_site_in_scope(&scope, &site)?;
     validate_time_range(query.start, query.end)?;
 
     let param_filter = query.parameter_ids.as_deref().map(parse_uuid_csv);

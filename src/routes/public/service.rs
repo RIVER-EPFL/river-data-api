@@ -23,10 +23,14 @@ use crate::routes::private::{projects, sites};
 /// 3.0.0: the sd is the sample sd (n-1), published for every instant under `sd_sample`
 /// (`{code}_sd_sample` in CSV and NDJSON), and the divisor field and its column are gone.
 ///
+/// 3.1.0: a continuous instant several streams feed on one slot is one served point at the mean
+/// of their readings, with `include_sample_stats` giving the pool's n, mean, sd, min and max, and
+/// the site detail counts a spot instant once however many streams feed it.
+///
 /// A slot declaring none is served as stored, and that is a decision rather than an omission
 /// (Q124): the platform default of two places belongs to the forms, and the public arm never
 /// rounds a value nobody declared a precision for.
-pub const SERVING_CONTRACT_VERSION: &str = "3.0.0";
+pub const SERVING_CONTRACT_VERSION: &str = "3.1.0";
 
 /// Cache for public project configurations
 pub type PublicConfigCache = Cache<String, Arc<PublicProjectConfig>>;

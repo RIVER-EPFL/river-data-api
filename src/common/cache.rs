@@ -10,9 +10,11 @@
 //! resolves to no site is dropped by any site invalidation: a missing attribution costs a
 //! recomputation, a wrong one would serve stale bytes.
 //!
-//! Two things reach [`invalidate_site`]:
+//! Three things reach [`invalidate_site`]:
 //!
 //! - Writers that call it (through [`invalidate_prefix`] until they are moved over).
+//! - The layer on the slot CRUD routes (`routes/service/mod.rs`), since a slot's decimal places
+//!   and active switch shape its site's series. A catalog parameter write drops everything instead.
 //! - [`spawn_write_invalidator`], an in-process subscriber to the `AppEvent` bus the writers
 //!   already use for SSE: an `AppEvent::DataIngested` naming a site invalidates that site, so a
 //!   writer that announces its write needs no cache call of its own. That announcement is the
@@ -354,6 +356,32 @@ pub fn invalidate_site(cache: &ResponseCache, site_id: Uuid) {
 pub fn invalidate_all(cache: &ResponseCache, reason: &str) {
     cache.invalidate_all();
     tracing::debug!(reason = %reason, "cache_all_invalidated");
+}
+
+/// The rows a request to an entity's CRUD routes writes, read from its method and path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WrittenRows {
+    Nothing,
+    /// A write to `/{id}`.
+    One(Uuid),
+    /// A create, or a batch update or delete: which rows it reached is not in the request line.
+    Unnamed,
+}
+
+/// Which rows a request writes: none for a read, the row whose id ends the path, or rows it does
+/// not name.
+pub fn written_rows(method: &str, path: &str) -> WrittenRows {
+    if matches!(method, "GET" | "HEAD" | "OPTIONS") {
+        return WrittenRows::Nothing;
+    }
+    match path
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .and_then(|segment| Uuid::parse_str(segment).ok())
+    {
+        Some(id) => WrittenRows::One(id),
+        None => WrittenRows::Unnamed,
+    }
 }
 
 /// Drop a site's cached responses, named by a `{namespace}:{site}` prefix.

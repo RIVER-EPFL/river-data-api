@@ -325,7 +325,7 @@ pub async fn get_site(
             .join_subquery(
                 JoinType::InnerJoin,
                 extent(
-                    Expr::cust("COUNT(DISTINCT (r.stream_id, r.time))"),
+                    Expr::cust("COUNT(DISTINCT (r.parameter_id, r.time))"),
                     served::served_spot(),
                 ),
                 Alias::new("sp"),
@@ -513,12 +513,14 @@ fn readings_table(times: &[String], params: &[ParameterData]) -> Table {
 
 #[derive(Debug, FromQueryResult)]
 struct ReadingRow {
-    param_id: String,
+    param_id: Uuid,
+    stream_id: Uuid,
     time: chrono::DateTime<chrono::FixedOffset>,
     value: f64,
     measurement_type: Option<String>,
-    /// The sample row behind a spot instant; all null for a continuous or derived reading and
-    /// for a spot instant served from its fallback replicate.
+    /// The sample row behind a spot instant, or the readings a continuous instant several streams
+    /// feed pools; all null for a single continuous or derived reading and for a spot instant
+    /// served from its fallback replicate.
     n: Option<i64>,
     mean: Option<f64>,
     sd: Option<f64>,
@@ -1096,7 +1098,11 @@ pub(crate) fn readings_query(
     if let Some(extra) = continuous_extra {
         arms.push(
             SeaQuery::select()
-                .expr_as(Expr::cust("r.parameter_id::TEXT"), Alias::new("param_id"))
+                .expr_as(
+                    Expr::col((r.clone(), readings::Column::ParameterId)),
+                    Alias::new("param_id"),
+                )
+                .column((r.clone(), readings::Column::StreamId))
                 .column((r.clone(), readings::Column::Time))
                 .expr_as(served::continuous_value(), Alias::new("value"))
                 .column((r.clone(), readings::Column::MeasurementType))
@@ -1115,7 +1121,11 @@ pub(crate) fn readings_query(
         let mut group = SeaQuery::select();
         group
             .distinct_on(served::spot_instant_key())
-            .expr_as(Expr::cust("r.parameter_id::TEXT"), Alias::new("param_id"))
+            .expr_as(
+                Expr::col((r.clone(), readings::Column::ParameterId)),
+                Alias::new("param_id"),
+            )
+            .column((r.clone(), readings::Column::StreamId))
             .column((r.clone(), readings::Column::Time))
             .expr_as(served::spot_value(), Alias::new("value"))
             .column((r.clone(), readings::Column::MeasurementType))
@@ -1150,6 +1160,7 @@ pub(crate) fn readings_query(
             SeaQuery::select()
                 .columns([
                     (sp.clone(), Alias::new("param_id")),
+                    (sp.clone(), Alias::new("stream_id")),
                     (sp.clone(), Alias::new("time")),
                     (sp.clone(), Alias::new("value")),
                     (sp.clone(), Alias::new("measurement_type")),
@@ -1233,13 +1244,36 @@ async fn fetch_readings(
     let (sql, values) = query.build(PostgresQueryBuilder);
     let stmt = Statement::from_sql_and_values(sea_orm::DatabaseBackend::Postgres, sql, values);
 
-    let rows: Vec<ReadingRow> = state
+    let mut rows: Vec<ReadingRow> = state
         .db
         .query_all_raw(stmt)
         .await?
         .into_iter()
         .filter_map(|row| ReadingRow::from_query_result(&row, "").ok())
         .collect();
+    rows.sort_by_key(|row| (row.param_id, row.time));
+    let rows = served::one_row_per_continuous_instant(
+        rows,
+        |row| {
+            (row.measurement_type.as_deref() != Some("spot")).then_some((
+                (row.param_id, row.time),
+                served::InstantMember {
+                    value: row.value,
+                    flagged: false,
+                    unverified: false,
+                    stream_id: row.stream_id,
+                },
+            ))
+        },
+        |row, pool| {
+            row.value = pool.value;
+            row.n = Some(pool.n);
+            row.mean = Some(pool.value);
+            row.sd = pool.sd;
+            row.min = Some(pool.min);
+            row.max = Some(pool.max);
+        },
+    );
 
     let mut times_ordered: Vec<DateTime<Utc>> = Vec::new();
     let mut time_set: std::collections::HashSet<DateTime<Utc>> = std::collections::HashSet::new();
@@ -1252,8 +1286,7 @@ async fn fetch_readings(
             times_ordered.push(time);
         }
 
-        let param_uuid = row.param_id.parse::<Uuid>().ok();
-        if let Some(configs) = param_uuid.and_then(|uuid| id_to_publics.get(&uuid)) {
+        if let Some(configs) = id_to_publics.get(&row.param_id) {
             for (name, _units) in configs {
                 param_values
                     .entry(name.to_string())

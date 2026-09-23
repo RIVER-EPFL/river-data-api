@@ -76,6 +76,16 @@ fn refuse_delete_of_measured_slot(held: u64) -> Option<String> {
     })
 }
 
+/// The site a slot belongs to, or None where no slot has that id.
+pub async fn site_of<C: ConnectionTrait>(db: &C, id: Uuid) -> Result<Option<Uuid>, sea_orm::DbErr> {
+    Entity::find_by_id(id)
+        .select_only()
+        .column(Column::SiteId)
+        .into_tuple()
+        .one(db)
+        .await
+}
+
 pub struct SiteParameterOperations;
 
 impl CRUDOperations for SiteParameterOperations {

@@ -593,3 +593,178 @@ async fn pairing_a_stream_with_history_invalidates_the_slots_cached_readings() {
         after.body
     );
 }
+
+/// Two probes of the same URI, the second asserted to come out of the cache, so a later MISS is
+/// the write's doing and not a cold cache.
+async fn prime(app: &Router, uri: &str, jwt: Option<&str>) -> Probe {
+    let first = probe(app, uri, jwt).await;
+    assert_eq!(first.status, 200, "{uri}: {}", first.body);
+    let second = probe(app, uri, jwt).await;
+    assert_eq!(
+        second.cache, "HIT",
+        "{uri} is served from the cache once primed"
+    );
+    second
+}
+
+fn public_values(probe: &Probe) -> Vec<f64> {
+    probe.json["parameters"][0]["values"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no values in {}", probe.body))
+        .iter()
+        .map(|v| v.as_f64().unwrap_or(f64::NAN))
+        .collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn editing_a_slots_decimal_places_invalidates_its_sites_public_readings() {
+    if !crate::common::profile::Service::Keycloak
+        .require("editing_a_slots_decimal_places_invalidates_its_sites_public_readings")
+        .await
+    {
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let app = kc::build_test_app_with_keycloak_and_cache(db.clone()).await;
+    let jwt = kc::get_keycloak_jwt("admin", "admin").await;
+
+    let slot = provision_slot(&app, &jwt, "decimals").await;
+    e2e::set_site_parameter_public(&app, &jwt, &slot.site_parameter_id).await;
+    batch_one(&app, &jwt, &slot, "2025-06-06T00:00:00Z", 601.237).await;
+    batch_one(&app, &jwt, &slot, "2025-06-06T01:00:00Z", 602.891).await;
+
+    let public_uri = "/api/public/cache-decimals/sites/cache-site-decimals/readings\
+         ?start=2025-06-06T00:00:00Z&end=2025-06-06T06:00:00Z";
+    let before = prime(&app, public_uri, None).await;
+    assert_eq!(
+        public_values(&before),
+        vec![601.237, 602.891],
+        "{}",
+        before.body
+    );
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/site_parameters/{}", slot.site_parameter_id),
+        &json!({ "decimal_places": 1 }),
+        &jwt,
+    )
+    .await;
+    assert_eq!(status, 200, "put decimal_places: {body}");
+
+    let after = probe(&app, public_uri, None).await;
+    assert_eq!(
+        after.cache, "MISS",
+        "the slot edit drops its site's public entries: {}",
+        after.body
+    );
+    assert_eq!(public_values(&after), vec![601.2, 602.9], "{}", after.body);
+}
+
+#[tokio::test]
+#[serial]
+async fn renaming_a_catalog_parameter_invalidates_the_public_readings_it_labels() {
+    if !crate::common::profile::Service::Keycloak
+        .require("renaming_a_catalog_parameter_invalidates_the_public_readings_it_labels")
+        .await
+    {
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let app = kc::build_test_app_with_keycloak_and_cache(db.clone()).await;
+    let jwt = kc::get_keycloak_jwt("admin", "admin").await;
+
+    let slot = provision_slot(&app, &jwt, "label").await;
+    e2e::set_site_parameter_public(&app, &jwt, &slot.site_parameter_id).await;
+    batch_one(&app, &jwt, &slot, "2025-06-07T00:00:00Z", 11.0).await;
+
+    let public_uri = "/api/public/cache-label/sites/cache-site-label/readings\
+         ?start=2025-06-07T00:00:00Z&end=2025-06-07T06:00:00Z";
+    let before = prime(&app, public_uri, None).await;
+    assert_eq!(
+        before.json["parameters"][0]["name"], "Cache depth label",
+        "{}",
+        before.body
+    );
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/parameters/{}", slot.parameter_id),
+        &json!({ "name": "Renamed depth" }),
+        &jwt,
+    )
+    .await;
+    assert_eq!(status, 200, "put catalog name: {body}");
+
+    let after = probe(&app, public_uri, None).await;
+    assert_eq!(
+        after.cache, "MISS",
+        "a catalog edit drops the entries it labels: {}",
+        after.body
+    );
+    assert_eq!(
+        after.json["parameters"][0]["name"], "Renamed depth",
+        "{}",
+        after.body
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn deactivating_a_slot_drops_it_from_its_sites_cached_readings() {
+    if !crate::common::profile::Service::Keycloak
+        .require("deactivating_a_slot_drops_it_from_its_sites_cached_readings")
+        .await
+    {
+        return;
+    }
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let app = kc::build_test_app_with_keycloak_and_cache(db.clone()).await;
+    let jwt = kc::get_keycloak_jwt("admin", "admin").await;
+
+    let slot = provision_slot(&app, &jwt, "active").await;
+    batch_one(&app, &jwt, &slot, "2025-06-08T00:00:00Z", 21.0).await;
+
+    let site_uri = format!(
+        "/api/sites/{}/readings?start=2025-06-08T00:00:00Z&end=2025-06-08T06:00:00Z",
+        slot.site_id
+    );
+    let before = prime(&app, &site_uri, Some(&jwt)).await;
+    assert_eq!(
+        e2e::values_for(&before.json, &slot.parameter_id),
+        vec![21.0],
+        "{}",
+        before.body
+    );
+
+    let (status, body) = crate::common::put_json_with_token(
+        &app,
+        &format!("/api/site_parameters/{}", slot.site_parameter_id),
+        &json!({ "is_active": false }),
+        &jwt,
+    )
+    .await;
+    assert_eq!(status, 200, "deactivate slot: {body}");
+
+    let after = probe(&app, &site_uri, Some(&jwt)).await;
+    assert_eq!(after.status, 200, "{}", after.body);
+    assert_ne!(
+        after.cache, "HIT",
+        "the slot edit drops its site's entries: {}",
+        after.body
+    );
+    let served = after.json["parameters"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no parameters in {}", after.body));
+    assert!(
+        served
+            .iter()
+            .all(|p| p["parameter_id"] != slot.parameter_id.as_str()),
+        "an inactive slot is not served: {}",
+        after.body
+    );
+}

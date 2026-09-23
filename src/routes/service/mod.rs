@@ -63,7 +63,7 @@ pub(crate) const IMPORT_BODY_LIMIT: usize = 50 * 1024 * 1024; // 50 MB, CSV impo
 
 /// Clear the public API config cache after a successful mutating request.
 ///
-/// Layered onto the projects/sites/site_parameters CRUD routers, the entities the
+/// Layered onto the projects/sites/parameters/site_parameters CRUD routers, the entities the
 /// public config (`public_config_cache`) is built from. Deliberately coarse: it drops
 /// the whole cache rather than resolving the affected project code, since the cache is
 /// a read-through convenience that rebuilds on the next public request, not a source of
@@ -78,6 +78,59 @@ async fn invalidate_public_config_on_mutation(
     if is_mutation && response.status().is_success() {
         state.public_config_cache.invalidate_all();
         tracing::debug!("Public API config cache cleared after entity mutation");
+    }
+    response
+}
+
+/// Drop the cached series a successful slot write can have reshaped: a slot's decimal places,
+/// active switch and publicity decide what its site's readings and aggregates serve.
+///
+/// A write naming one slot drops its site as it stood before and after the write, since a PUT may
+/// move it. A write naming no single slot, or one whose site cannot be read, drops everything.
+async fn invalidate_slot_site_on_mutation(
+    State(state): State<AppState>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    use crate::common::cache::{self, WrittenRows};
+    use crate::routes::private::site_parameters::service::site_of;
+
+    let written = cache::written_rows(request.method().as_str(), request.uri().path());
+    let before = match written {
+        WrittenRows::One(id) => site_of(&state.db, id).await.ok().flatten(),
+        _ => None,
+    };
+    let response = next.run(request).await;
+    if !response.status().is_success() {
+        return response;
+    }
+    match written {
+        WrittenRows::Nothing => {}
+        WrittenRows::Unnamed => cache::invalidate_all(&state.response_cache, "slot write"),
+        WrittenRows::One(id) => {
+            let after = site_of(&state.db, id).await.ok().flatten();
+            if before.is_none() && after.is_none() {
+                cache::invalidate_all(&state.response_cache, "slot write with no site");
+            }
+            for site_id in before.into_iter().chain(after) {
+                cache::invalidate_site(&state.response_cache, site_id);
+            }
+        }
+    }
+    response
+}
+
+/// Drop every cached response after a successful catalog write: a parameter's code, name and units
+/// label the series of every site that carries it.
+async fn invalidate_responses_on_catalog_mutation(
+    State(state): State<AppState>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    let is_mutation = !matches!(request.method().as_str(), "GET" | "HEAD" | "OPTIONS");
+    let response = next.run(request).await;
+    if is_mutation && response.status().is_success() {
+        crate::common::cache::invalidate_all(&state.response_cache, "catalog parameter write");
     }
     response
 }
@@ -159,7 +212,7 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         // can't enumerate credentials. See plan: defense in depth.
         r.layer(middleware::from_fn(require_admin))
     };
-    // Clear the public API config cache whenever a project/site/site_parameter is
+    // Clear the public API config cache whenever a project/site/parameter/site_parameter is
     // created, updated, or deleted. Coarse and best-effort, see the middleware doc.
     let invalidate_public_config = |r: OpenApiRouter| -> OpenApiRouter {
         r.layer(middleware::from_fn_with_state(
@@ -179,10 +232,20 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             "/sites",
             invalidate_public_config(crate::routes::private::sites::views::service_router(state)),
         )
-        .nest("/parameters", catalog_inventory_crud(Parameter::router(db)))
+        .nest(
+            "/parameters",
+            invalidate_public_config(catalog_inventory_crud(Parameter::router(db).layer(
+                middleware::from_fn_with_state(
+                    state.clone(),
+                    invalidate_responses_on_catalog_mutation,
+                ),
+            ))),
+        )
         .nest(
             "/site_parameters",
-            invalidate_public_config(catalog_crud(SiteParameter::router(db))),
+            invalidate_public_config(catalog_crud(SiteParameter::router(db).layer(
+                middleware::from_fn_with_state(state.clone(), invalidate_slot_site_on_mutation),
+            ))),
         )
         .nest("/sensors", catalog_inventory_crud(Sensor::router(db)))
         .nest(

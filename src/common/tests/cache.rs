@@ -101,3 +101,41 @@ fn test_latest_time_query_maxes_time_over_the_named_parameters() {
         "{sql}"
     );
 }
+
+#[test]
+fn test_written_rows_a_read_writes_nothing() {
+    for method in ["GET", "HEAD", "OPTIONS"] {
+        assert_eq!(
+            written_rows(method, &format!("/{SITE}")),
+            WrittenRows::Nothing,
+            "{method}"
+        );
+    }
+}
+
+#[test]
+fn test_written_rows_a_write_by_id_names_that_row() {
+    for method in ["PATCH", "PUT", "DELETE"] {
+        assert_eq!(
+            written_rows(method, &format!("/{SITE}")),
+            WrittenRows::One(site()),
+            "{method}"
+        );
+    }
+    assert_eq!(
+        written_rows("PATCH", &format!("/site_parameters/{SITE}/")),
+        WrittenRows::One(site()),
+        "an unstripped prefix and a trailing slash still name the row"
+    );
+}
+
+#[test]
+fn test_written_rows_a_write_to_the_collection_names_no_row() {
+    assert_eq!(written_rows("POST", "/"), WrittenRows::Unnamed);
+    assert_eq!(written_rows("POST", ""), WrittenRows::Unnamed);
+    assert_eq!(written_rows("PATCH", "/batch"), WrittenRows::Unnamed);
+    assert_eq!(
+        written_rows("DELETE", "/site_parameters"),
+        WrittenRows::Unnamed
+    );
+}

@@ -533,8 +533,13 @@ async fn csv_and_ndjson_exports_honour_the_readings_opt_ins() {
     );
     assert_eq!(
         plain_header,
-        vec!["time".to_string(), "Rd046Turb".to_string()],
-        "the export without opt-ins is time plus one column per parameter code: {plain_header:?}"
+        vec![
+            "time".to_string(),
+            "Rd046Turb".to_string(),
+            "Rd046Turb_unverified".to_string()
+        ],
+        "the export without opt-ins is time plus a value and a pending mark per parameter code: \
+         {plain_header:?}"
     );
 }
 

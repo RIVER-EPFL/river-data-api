@@ -23,6 +23,7 @@
 
 use sea_orm::Order;
 use sea_orm::sea_query::{Alias, Condition, Expr, ExprTrait, Func};
+use uuid::Uuid;
 
 use crate::routes::private::readings::models as readings;
 
@@ -185,6 +186,109 @@ pub fn continuous_value_of(alias: Alias) -> Expr {
         Expr::col((alias.clone(), readings::Column::CalibratedValue)),
         Expr::col((alias, readings::Column::RawValue)),
     ]))
+}
+
+// --- The continuous instant ---
+//
+// A slot two streams feed holds two continuous rows at one instant. The instant is still one
+// served point, keyed on `(parameter_id, time)` as the spot arm's is, and its value is the mean of
+// the readings pooled into it, which is how the rollups (`SUM(sum_value) / SUM(count)`) and the
+// period statistics already collapse the same instant. The collapse runs over the fetched rows
+// rather than in the arm, so the continuous arm keeps its unsorted scan.
+
+/// One continuous or derived row, as the collapse of its instant sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct InstantMember {
+    pub value: f64,
+    pub flagged: bool,
+    pub unverified: bool,
+    pub stream_id: Uuid,
+}
+
+/// The readings one continuous instant pools: their mean, count, extremes and sample sd.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PooledInstant {
+    pub value: f64,
+    pub n: i64,
+    pub min: f64,
+    pub max: f64,
+    /// n-1, as every sd the platform serves; None for a single reading.
+    pub sd: Option<f64>,
+}
+
+impl PooledInstant {
+    fn of(values: &[f64]) -> Self {
+        let n = values.len();
+        #[allow(clippy::cast_precision_loss)]
+        let mean = values.iter().sum::<f64>() / n as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let sd = (n > 1).then(|| {
+            (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt()
+        });
+        Self {
+            value: mean,
+            n: i64::try_from(n).unwrap_or(i64::MAX),
+            min: values.iter().copied().fold(f64::INFINITY, f64::min),
+            max: values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            sd,
+        }
+    }
+}
+
+/// Collapses the continuous rows sharing an instant to one row each, the survivor, handed to
+/// `serve` with what its instant pools. `member` names a row's instant, or None for a row the
+/// collapse passes through (a spot replicate, already one per instant). Rows sharing an instant
+/// must be adjacent apart from passed-through rows, as a query ordered by parameter and time
+/// returns them.
+///
+/// The survivor is a served row over a flagged one, a verified row over an unverified one, then
+/// the lowest stream id, so it is stable across requests. The pool is the rows marked as the
+/// survivor is, so the marks a surface draws on the point are true of every reading behind it.
+pub fn one_row_per_continuous_instant<T, K: PartialEq>(
+    rows: Vec<T>,
+    member: impl Fn(&T) -> Option<(K, InstantMember)>,
+    mut serve: impl FnMut(&mut T, &PooledInstant),
+) -> Vec<T> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut run: Vec<(T, InstantMember)> = Vec::new();
+    let mut run_key: Option<K> = None;
+    for row in rows {
+        let Some((key, m)) = member(&row) else {
+            out.push(row);
+            continue;
+        };
+        if run_key.as_ref() != Some(&key) {
+            flush_instant(&mut run, &mut out, &mut serve);
+            run_key = Some(key);
+        }
+        run.push((row, m));
+    }
+    flush_instant(&mut run, &mut out, &mut serve);
+    out
+}
+
+fn flush_instant<T>(
+    run: &mut Vec<(T, InstantMember)>,
+    out: &mut Vec<T>,
+    serve: &mut impl FnMut(&mut T, &PooledInstant),
+) {
+    if run.len() < 2 {
+        out.extend(run.drain(..).map(|(row, _)| row));
+        return;
+    }
+    let rank = |m: &InstantMember| (m.flagged, m.unverified, m.stream_id);
+    let survivor = (0..run.len()).min_by_key(|&i| rank(&run[i].1)).unwrap_or(0);
+    let marks = (run[survivor].1.flagged, run[survivor].1.unverified);
+    let pooled: Vec<f64> = run
+        .iter()
+        .filter(|(_, m)| (m.flagged, m.unverified) == marks)
+        .map(|(_, m)| m.value)
+        .collect();
+    let pool = PooledInstant::of(&pooled);
+    let (mut row, _) = run.swap_remove(survivor);
+    run.clear();
+    serve(&mut row, &pool);
+    out.push(row);
 }
 
 #[cfg(test)]

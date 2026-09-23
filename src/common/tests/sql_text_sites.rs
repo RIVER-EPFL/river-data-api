@@ -55,8 +55,8 @@ const ALLOWED: &[(&str, usize, usize)] = &[
     ("src/routes/private/sensors/service.rs", 7, 3),
     ("src/routes/private/sensors/views.rs", 5, 13),
     ("src/routes/private/site_parameters/service.rs", 2, 0),
-    ("src/routes/private/sites/service.rs", 5, 9),
-    ("src/routes/private/sites/views.rs", 3, 33),
+    ("src/routes/private/sites/service.rs", 6, 17),
+    ("src/routes/private/sites/views.rs", 1, 24),
     ("src/routes/private/standard_curves/views.rs", 1, 0),
     ("src/routes/private/sync/service.rs", 6, 23),
     ("src/routes/private/sync/views.rs", 4, 2),
@@ -64,7 +64,7 @@ const ALLOWED: &[(&str, usize, usize)] = &[
     ("src/routes/private/tools/models.rs", 0, 1),
     ("src/routes/private/tools/service.rs", 0, 14),
     ("src/routes/public/service.rs", 1, 0),
-    ("src/routes/public/views.rs", 1, 15),
+    ("src/routes/public/views.rs", 1, 13),
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {

@@ -260,6 +260,7 @@ pub(super) struct ReadingRow {
     /// NULL on the collapsed view, which serves one row per instant. On the replicate view it is
     /// half the row's key: replicates share a timestamp, so time alone does not identify a row.
     pub(super) replicate_index: Option<i16>,
+    pub(super) stream_id: Uuid,
     pub(super) value: f64,
     pub(super) severity: Option<i16>,
     pub(super) is_flagged: Option<bool>,
