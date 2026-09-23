@@ -528,3 +528,38 @@ async fn a_scoped_token_cannot_read_another_projects_reading_history() {
         assert_ne!(s, 404, "the unscoped key reaches the run's {route}");
     }
 }
+
+/// A calculation's `site_id` is the site its site and visit inputs are read from, so a key scoped
+/// to project A cannot calculate or preview at project B's site and read B's inputs back.
+#[tokio::test]
+#[serial]
+async fn a_scoped_token_cannot_calculate_at_another_projects_site() {
+    let (db, app) = setup().await;
+    let scoped =
+        crate::common::seed_api_token(&db, crate::common::full_permissions(), Some(PROJECT_ID))
+            .await;
+
+    for route in ["calculate", "preview"] {
+        let path = format!("/api/tools/doc/{route}");
+        let (s, body) = crate::common::post_json_with_token(
+            &app,
+            &path,
+            &serde_json::json!({ "site_id": SITE_B_ID, "collected_at": "2026-01-01T00:00:00Z" }),
+            &scoped,
+        )
+        .await;
+        assert_eq!(s, 403, "{route} at another project's site: {body}");
+
+        let (s, body) = crate::common::post_json_with_token(
+            &app,
+            &path,
+            &serde_json::json!({ "site_id": SITE1_ID, "collected_at": "2026-01-01T00:00:00Z" }),
+            &scoped,
+        )
+        .await;
+        assert_ne!(
+            s, 403,
+            "{route} at its own project's site passes the scope: {body}"
+        );
+    }
+}

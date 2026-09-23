@@ -156,7 +156,8 @@ pub struct Config {
     pub battery_forecast_alert_days: i64,
     // A paired slot with no reading newer than this many hours raises a stale-data alert.
     pub stale_data_threshold_hours: i64,
-    // Dashboard base URL used to build deep links in notification messages.
+    // The dashboard's origin, without its `/admin` path, used to build deep links in notification
+    // messages.
     pub dashboard_base_url: Option<String>,
 
     // Web Push (VAPID). The private key PEM signs each push; the public key goes to browsers at

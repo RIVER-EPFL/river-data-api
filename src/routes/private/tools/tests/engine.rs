@@ -753,7 +753,7 @@ mod golden_matching {
 /// What a request body and a stored run are read into before a formula set runs.
 mod run_bindings {
     use crate::routes::private::tools::service::{
-        formula_bindings, read_curve, stored_curves, take_context,
+        context_site, formula_bindings, read_curve, stored_curves, take_context,
     };
     use serde_json::json;
 
@@ -786,6 +786,16 @@ mod run_bindings {
             .unwrap()
             .clone();
         assert!(take_context(&mut body).is_err());
+    }
+
+    #[test]
+    fn test_context_site_reads_the_named_site_only() {
+        let site = uuid::Uuid::new_v4();
+        let body = json!({ "site_id": site, "x": 1 }).to_string();
+        assert_eq!(context_site(body.as_bytes()).unwrap(), Some(site));
+        assert_eq!(context_site(br#"{"x": 1}"#).unwrap(), None);
+        assert_eq!(context_site(b"not json").unwrap(), None);
+        assert!(context_site(br#"{"site_id": "not-a-uuid"}"#).is_err());
     }
 
     #[test]

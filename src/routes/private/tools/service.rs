@@ -35,6 +35,7 @@ use super::models::{
 };
 use super::staged::StagedVisit;
 use crate::common::AppState;
+use crate::common::authz::AccessScope;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::change_audit::service::{entity_revision, entity_revisions};
 use crate::routes::private::constants::models as constants;
@@ -809,6 +810,27 @@ pub(super) fn take_context(
         ),
     };
     Ok((site_id, collected_at))
+}
+
+/// The site a request body names as its calculation context, if it names one.
+pub(super) fn context_site(body: &[u8]) -> AppResult<Option<Uuid>> {
+    let Ok(serde_json::Value::Object(mut body)) = serde_json::from_slice(body) else {
+        return Ok(None);
+    };
+    Ok(take_context(&mut body)?.0)
+}
+
+/// Refuse a calculation context at a site outside the caller's projects: the site and visit inputs
+/// are read from it.
+pub async fn require_context_in_scope(
+    db: &DatabaseConnection,
+    scope: &AccessScope,
+    body: &[u8],
+) -> AppResult<()> {
+    let Some(site_id) = context_site(body)? else {
+        return Ok(());
+    };
+    crate::common::scope::require_sites_in_scope(db, scope, &[site_id]).await
 }
 
 /// Fill the params the manifest's `site_inputs` declare from the `sites` row, where the request

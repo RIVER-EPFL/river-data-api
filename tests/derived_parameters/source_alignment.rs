@@ -177,17 +177,19 @@ mod at_a_site {
         at - Duration::nanoseconds(i64::from(at.timestamp_subsec_nanos()))
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn a_held_source_stands_at_the_stream_s_instants_and_mints_none_of_its_own() {
-        let f = crate::common::seeded_app().await;
-        let (db, app, token) = (f.db, f.app, f.token);
-        let stamp = Uuid::new_v4().simple().to_string();
-        let lab_code = format!("alk_{stamp}");
-
+    /// A calculation on the site's stream reading the oxygen series at the instant and a lab value
+    /// held from the last visit, and the site's slots for both. Returns the lab parameter and the
+    /// output.
+    async fn held_calculation(
+        db: &DatabaseConnection,
+        app: &axum::Router,
+        token: &str,
+        lab_code: &str,
+        stamp: &str,
+    ) -> (String, Uuid) {
         // The value the lab measures at a visit, and the slot it is recorded at: the visit arm.
         let (status, lab) = crate::common::post_json_parse_with_token(
-            &app,
+            app,
             "/api/parameters",
             &serde_json::json!({
                 "code": lab_code,
@@ -195,13 +197,13 @@ mod at_a_site {
                 "category": "measurement",
                 "aliases": [],
             }),
-            &token,
+            token,
         )
         .await;
         assert!((200..300).contains(&status), "{lab}");
         let lab_id = lab["id"].as_str().expect("an id").to_string();
         let (status, text) = crate::common::post_json_with_token(
-            &app,
+            app,
             "/api/site_parameters",
             &serde_json::json!({
                 "site_id": crate::common::SITE1_ID,
@@ -209,17 +211,16 @@ mod at_a_site {
                 "name": lab_code,
                 "cadence": "low",
             }),
-            &token,
+            token,
         )
         .await;
         assert!((200..300).contains(&status), "{text}");
 
         // The calculation: the oxygen series read at the instant, the lab value held.
         let code = format!("held_out_{stamp}");
-        let calculation =
-            crate::common::seed_formula_calculation(&db, &format!("{code}_set")).await;
+        let calculation = crate::common::seed_formula_calculation(db, &format!("{code}_set")).await;
         let (status, definition) = crate::common::post_json_parse_with_token(
-            &app,
+            app,
             "/api/derived_parameters",
             &serde_json::json!({
                 "code": code,
@@ -228,7 +229,7 @@ mod at_a_site {
                 "formula": format!("Dissolved_O2 * 0.032 + {lab_code}"),
                 "tool_script_id": calculation,
             }),
-            &token,
+            token,
         )
         .await;
         assert!((200..300).contains(&status), "{definition}");
@@ -241,23 +242,23 @@ mod at_a_site {
             .as_array()
             .expect("the sources it resolved")
             .iter()
-            .find(|s| s["variable_name"] == lab_code.as_str())
+            .find(|s| s["variable_name"] == lab_code)
             .expect("the lab value is one of them")["id"]
             .as_str()
             .expect("an id")
             .to_string();
         let (status, text) = crate::common::put_json_with_token(
-            &app,
+            app,
             &format!("/api/derived_parameter_sources/{source}"),
             &serde_json::json!({ "alignment": "hold" }),
-            &token,
+            token,
         )
         .await;
         assert!((200..300).contains(&status), "{status}: {text}");
 
         // The output is the stream's to compute, which is the slot's own declaration.
         let (status, text) = crate::common::post_json_with_token(
-            &app,
+            app,
             "/api/site_parameters",
             &serde_json::json!({
                 "site_id": crate::common::SITE1_ID,
@@ -267,10 +268,22 @@ mod at_a_site {
                 "entry_mode": "tool",
                 "cadence": "high",
             }),
-            &token,
+            token,
         )
         .await;
         assert!((200..300).contains(&status), "{text}");
+
+        (lab_id, output)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_held_source_stands_at_the_stream_s_instants_and_mints_none_of_its_own() {
+        let f = crate::common::seeded_app().await;
+        let (db, app, token) = (f.db, f.app, f.token);
+        let stamp = Uuid::new_v4().simple().to_string();
+        let lab_code = format!("alk_{stamp}");
+        let (lab_id, output) = held_calculation(&db, &app, &token, &lab_code, &stamp).await;
 
         // The visit, four hours before the pulse.
         let visit = whole(Utc::now() - Duration::hours(40));
@@ -366,6 +379,125 @@ mod at_a_site {
         assert!(
             findings.is_empty(),
             "the visit's instant was never the set's to compute, so nothing is held for review"
+        );
+    }
+    /// The output's pending state at `time`, and the decisions of `kind` on it.
+    async fn output_state(
+        db: &DatabaseConnection,
+        output: Uuid,
+        time: DateTime<Utc>,
+        kind: &str,
+    ) -> (bool, i64) {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT r.unverified, (SELECT count(*) FROM reading_decisions d \
+                   WHERE d.stream_id = r.stream_id AND d.time = r.time AND d.kind = $3) AS n \
+                 FROM readings r WHERE r.parameter_id = $1 AND r.time = $2",
+                [output.into(), time.into(), kind.into()],
+            ))
+            .await
+            .expect("the row reads")
+            .expect("the output stands");
+        (
+            row.try_get("", "unverified").expect("unverified"),
+            row.try_get("", "n").expect("count"),
+        )
+    }
+
+    /// Scenario: the lab value a continuous calculation holds was entered by an intern and awaits
+    /// verification.
+    ///
+    /// Expected behaviour: the output is computed and held pending, on the record, so nothing
+    /// serves it; a manager's verify of the entry releases it (Q257).
+    #[tokio::test]
+    #[serial]
+    async fn a_value_held_from_a_pending_entry_is_pending_until_the_entry_is_verified() {
+        let f = crate::common::seeded_app().await;
+        let (db, app, token) = (f.db, f.app, f.token);
+        let stamp = Uuid::new_v4().simple().to_string();
+        let lab_code = format!("alk_{stamp}");
+        let (lab_id, output) = held_calculation(&db, &app, &token, &lab_code, &stamp).await;
+
+        let visit = whole(Utc::now() - Duration::hours(40));
+        let (status, text) = crate::common::post_json_with_token(
+            &app,
+            "/api/grab_samples",
+            &serde_json::json!({
+                "site_id": crate::common::SITE1_ID,
+                "mode": "replace",
+                "readings": [{
+                    "parameter_id": lab_id,
+                    "value": ALKALINITY,
+                    "time": visit.to_rfc3339(),
+                    "replicate_index": 0,
+                }],
+            }),
+            &token,
+        )
+        .await;
+        assert!((200..300).contains(&status), "{text}");
+        // The entry lands pending, as an intern's does.
+        crate::common::exec(
+            &db,
+            &format!(
+                "UPDATE readings SET unverified = true \
+                 WHERE parameter_id = '{lab_id}' AND time = '{}'",
+                visit.to_rfc3339()
+            ),
+        )
+        .await;
+
+        let pulse = whole(Utc::now() - Duration::hours(36));
+        let (status, text) = crate::common::post_json_with_token(
+            &app,
+            "/api/readings/batch",
+            &serde_json::json!({
+                "readings": [{
+                    "site_id": crate::common::SITE1_ID,
+                    "parameter_id": crate::common::GLOBAL_PARAM_DO_ID,
+                    "time": pulse.to_rfc3339(),
+                    "raw_value": OXYGEN,
+                }],
+            }),
+            &token,
+        )
+        .await;
+        assert!((200..300).contains(&status), "{text}");
+        poll_for(&db, output, pulse)
+            .await
+            .unwrap_or_else(|| panic!("no output at the pulse within {DEADLINE_SECS}s"));
+        assert_eq!(
+            output_state(&db, output, pulse, "unverified_entry").await,
+            (true, 1),
+            "the output computed from a pending entry is pending itself, on the record"
+        );
+
+        let hold = Uuid::new_v4();
+        crate::common::exec(
+            &db,
+            &format!(
+                "INSERT INTO replicate_audit_holds (id, site_id, parameter_id, group_time, kind, \
+                     expected, computed, delta, status) \
+                 VALUES ('{hold}', '{}', '{lab_id}', '{}', 'unverified_entry', '{{}}', '{{}}', \
+                         '{{}}', 'pending')",
+                crate::common::SITE1_ID,
+                visit.to_rfc3339()
+            ),
+        )
+        .await;
+        let (status, body) = crate::common::post_json_with_token(
+            &app,
+            &format!("/api/sync/replicate_audit_holds/{hold}/resolve"),
+            &serde_json::json!({ "mode": "verify" }),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            output_state(&db, output, pulse, "verify").await,
+            (false, 1),
+            "the verify of its only pending input releases the output, on the record"
         );
     }
 }

@@ -27,6 +27,8 @@ use crate::common::keycloak::{
     keycloak_reachable, keycloak_user_id,
 };
 
+mod outside;
+
 /// A project the fixture callers are never granted, for the denial half of every project-bound row.
 const OTHER_PROJECT_ID: &str = "00000000-0000-4000-a000-000000000099";
 const OTHER_SITE_ID: &str = "00000000-0000-4000-a000-000000000098";
@@ -568,6 +570,7 @@ fn table() -> Table {
             ("GET", "/api/sensors/{id}/deployment_bands"),
             ("GET", "/api/sensor_calibrations/{id}/window"),
             ("GET", "/api/sensors/{id}/curve_usage"),
+            ("GET", "/api/sensors/last_used"),
             ("GET", "/api/standard_curves/{id}/usage"),
         ],
     );
@@ -736,6 +739,7 @@ fn table() -> Table {
             ("GET", "/api/readings/provenance"),
             ("GET", "/api/readings/ledger"),
             ("GET", "/api/readings/decisions"),
+            ("GET", "/api/readings/replay"),
             ("POST", "/api/readings/edits/inspect"),
             ("GET", "/api/tool_runs/{id}/reload"),
             ("GET", "/api/tool_runs/{id}/trace"),
@@ -1232,32 +1236,6 @@ async fn scope_confinement_denies_another_projects_row() {
         crate::common::seed_api_token(&db, crate::common::full_permissions(), Some(PROJECT_ID))
             .await;
 
-    // Two rows per route: the granted project answers, the other one does not.
-    let reads = [
-        "/api/sites/{site}/readings",
-        "/api/sites/{site}/aggregates/hourly?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z",
-        "/api/sites/{site}/status_events",
-        "/api/sites/{site}/parameters",
-        "/api/sites/{site}/detail",
-        "/api/sites/{site}/visits",
-    ];
-    for template in reads {
-        for (label, token) in [("granted member", &member), ("scoped token", &scoped)] {
-            let inside = template.replace("{site}", SITE1_ID);
-            let outside = template.replace("{site}", OTHER_SITE_ID);
-            let s = status_of(&app, "GET", &inside, None, Some(token)).await;
-            assert!(
-                !(401..=403).contains(&s),
-                "[{label}] {inside} is inside the grant, got {s}"
-            );
-            let s = status_of(&app, "GET", &outside, None, Some(token)).await;
-            assert!(
-                s == 403 || s == 404,
-                "[{label}] {outside} is outside the grant, got {s}"
-            );
-        }
-    }
-
     // A write into another project's row, through the CRUD scope guard.
     for (label, token) in [("granted member", &member), ("scoped token", &scoped)] {
         let outside = serde_json::json!({ "site_id": OTHER_SITE_ID, "text": "not mine" });
@@ -1505,14 +1483,65 @@ fn every_row_names_a_route_that_still_exists() {
 
 /// The source files whose `.route("…")` literals the two coverage scans read, each with the prefix
 /// it is mounted under. A component collapse that moves the literals moves the entry here too.
-const ROUTE_SOURCES: [(&str, &str); 6] = [
+const ROUTE_SOURCES: [(&str, &str); 11] = [
     ("src/routes/service/mod.rs", "/api"),
     ("src/routes/private/sync/views.rs", "/api/sync"),
     ("src/routes/private/projects/views.rs", "/api/projects"),
     ("src/routes/private/sites/views.rs", "/api/sites"),
     ("src/routes/private/api_tokens/views.rs", "/api"),
     ("src/routes/private/tools/views.rs", "/api"),
+    ("src/routes/private/alarms/views.rs", "/api"),
+    ("src/routes/private/data_streams/views.rs", "/api"),
+    ("src/routes/private/notifications/views.rs", "/api"),
+    ("src/routes/private/readings/views.rs", "/api"),
+    ("src/routes/private/sensors/views.rs", "/api"),
 ];
+
+/// Files that declare `.route(` literals outside the authenticated `/api/` surface this table covers.
+const NON_API_ROUTE_SOURCES: [&str; 3] = [
+    // The top-level router: the health probe, the docs and the nests themselves.
+    "src/routes/mod.rs",
+    // The public API, which has no capability gate to probe.
+    "src/routes/public_api/mod.rs",
+    // Unit tests building throwaway routers.
+    "src/routes/service/tests/route_guards.rs",
+];
+
+/// Every source file under `src/routes` that declares a route is either scanned or named above,
+/// so a new domain router cannot add routes the coverage scans never read.
+#[test]
+fn every_router_file_is_scanned() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read routes directory") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read route source");
+                if !route_literals(&text).is_empty() {
+                    out.push(path.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    let mut declaring = Vec::new();
+    walk(std::path::Path::new("src/routes"), &mut declaring);
+    let listed: std::collections::HashSet<&str> = ROUTE_SOURCES
+        .iter()
+        .map(|(file, _)| *file)
+        .chain(NON_API_ROUTE_SOURCES)
+        .collect();
+    let mut unlisted: Vec<String> = declaring
+        .into_iter()
+        .filter(|file| !listed.contains(file.as_str()))
+        .collect();
+    unlisted.sort();
+    assert!(
+        unlisted.is_empty(),
+        "router files the permission matrix does not scan:\n  {}",
+        unlisted.join("\n  ")
+    );
+}
 
 /// Every route [`ROUTE_SOURCES`] declares, paired with the file it came from, and the entries that
 /// could not be read. A moved file is drift in this test's own data, so it is returned as a finding

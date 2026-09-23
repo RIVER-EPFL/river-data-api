@@ -463,9 +463,9 @@ pub fn follow_ruling(
     followed
 }
 
-/// Whether any reading a run consumed is still awaiting verification.
-pub async fn any_pending<C: ConnectionTrait>(db: &C, inputs: &[ConsumedInput]) -> AppResult<bool> {
-    let keys: HashSet<ReadingKey> = inputs
+/// The readings a run consumed, by key.
+fn member_keys(inputs: &[ConsumedInput]) -> Vec<ReadingKey> {
+    inputs
         .iter()
         .flat_map(|input| {
             input
@@ -473,9 +473,16 @@ pub async fn any_pending<C: ConnectionTrait>(db: &C, inputs: &[ConsumedInput]) -
                 .iter()
                 .map(|m| (m.stream_id, m.time, m.replicate_index))
         })
-        .collect();
+        .collect()
+}
+
+/// Which of `keys` are awaiting verification.
+async fn pending_among<C: ConnectionTrait>(
+    db: &C,
+    keys: &HashSet<ReadingKey>,
+) -> AppResult<HashSet<ReadingKey>> {
     if keys.is_empty() {
-        return Ok(false);
+        return Ok(HashSet::new());
     }
     let streams: Vec<Uuid> = keys.iter().map(|(s, _, _)| *s).collect();
     let times: Vec<DateTime<Utc>> = keys.iter().map(|(_, t, _)| *t).collect();
@@ -486,7 +493,100 @@ pub async fn any_pending<C: ConnectionTrait>(db: &C, inputs: &[ConsumedInput]) -
         .all(db)
         .await?
         .iter()
-        .any(|r| keys.contains(&(r.stream_id, r.time.with_timezone(&Utc), r.replicate_index))))
+        .map(|r| (r.stream_id, r.time.with_timezone(&Utc), r.replicate_index))
+        .filter(|key| keys.contains(key))
+        .collect())
+}
+
+/// Whether any reading a run consumed is still awaiting verification.
+pub async fn any_pending<C: ConnectionTrait>(db: &C, inputs: &[ConsumedInput]) -> AppResult<bool> {
+    let keys: HashSet<ReadingKey> = member_keys(inputs).into_iter().collect();
+    Ok(!pending_among(db, &keys).await?.is_empty())
+}
+
+/// The pending values the continuous engine stored at a site, each with the readings its latest
+/// capture consumed (the `consumed` of the newest arrival or formula transition at its key), and
+/// which of those are pending. A verify releases them as it releases the chain's outputs (Q257).
+pub async fn continuous_pending<C: ConnectionTrait>(
+    db: &C,
+    site_id: Uuid,
+) -> AppResult<VisitComputed> {
+    use super::decision_model;
+    use super::models::Kind;
+    use sea_orm::QueryOrder;
+    let rows = readings::Entity::find()
+        .filter(readings::Column::SiteId.eq(site_id))
+        .filter(readings::Column::MeasurementType.eq("derived"))
+        .filter(readings::Column::Unverified.eq(true))
+        .all(db)
+        .await?;
+    if rows.is_empty() {
+        return Ok(VisitComputed::default());
+    }
+    let keys: HashSet<ReadingKey> = rows
+        .iter()
+        .map(|r| (r.stream_id, r.time.with_timezone(&Utc), r.replicate_index))
+        .collect();
+    let streams: Vec<Uuid> = keys.iter().map(|(s, _, _)| *s).collect();
+    let times: Vec<DateTime<Utc>> = keys.iter().map(|(_, t, _)| *t).collect();
+    let mut outputs: HashMap<ReadingKey, Vec<ReadingKey>> = HashMap::new();
+    for decision in decision_model::Entity::find()
+        .filter(decision_model::Column::StreamId.is_in(streams))
+        .filter(decision_model::Column::Time.is_in(times))
+        .filter(decision_model::Column::Kind.is_in([
+            Kind::DerivedComputed.as_str(),
+            Kind::FormulaTransition.as_str(),
+        ]))
+        .filter(decision_model::Column::RolledBackBy.is_null())
+        .order_by_desc(decision_model::Column::Seq)
+        .all(db)
+        .await?
+    {
+        let key = (
+            decision.stream_id,
+            decision.time.with_timezone(&Utc),
+            decision.replicate_index.unwrap_or(0),
+        );
+        if !keys.contains(&key) || outputs.contains_key(&key) {
+            continue;
+        }
+        let inputs: Vec<ConsumedInput> = decision
+            .new
+            .get("consumed")
+            .cloned()
+            .and_then(|c| serde_json::from_value(c).ok())
+            .unwrap_or_default();
+        outputs.insert(key, member_keys(&inputs));
+    }
+    let members: HashSet<ReadingKey> = outputs.values().flatten().copied().collect();
+    let mut pending = pending_among(db, &members).await?;
+    pending.extend(keys);
+    let parameters = rows
+        .iter()
+        .filter_map(|r| {
+            r.parameter_id.map(|p| {
+                (
+                    (r.stream_id, r.time.with_timezone(&Utc), r.replicate_index),
+                    p,
+                )
+            })
+        })
+        .collect();
+    let values = rows
+        .iter()
+        .map(|r| {
+            (
+                (r.stream_id, r.time.with_timezone(&Utc), r.replicate_index),
+                r.calibrated_value.unwrap_or(r.raw_value),
+            )
+        })
+        .collect();
+    Ok(VisitComputed {
+        outputs,
+        pending,
+        parameters,
+        values,
+    })
 }
 
 /// The standing computed readings at one visit instant.
@@ -563,28 +663,13 @@ pub async fn computed_at<C: ConnectionTrait>(
         .map(|r| (r.stream_id, r.time.with_timezone(&Utc), r.replicate_index))
         .collect();
     // An input held from an earlier visit is not among this instant's rows.
-    let elsewhere: Vec<ReadingKey> = outputs
+    let elsewhere: HashSet<ReadingKey> = outputs
         .values()
         .flatten()
         .filter(|(_, at, _)| *at != time)
         .copied()
         .collect();
-    if !elsewhere.is_empty() {
-        let streams: Vec<Uuid> = elsewhere.iter().map(|(s, _, _)| *s).collect();
-        let times: Vec<DateTime<Utc>> = elsewhere.iter().map(|(_, t, _)| *t).collect();
-        for r in readings::Entity::find()
-            .filter(readings::Column::StreamId.is_in(streams))
-            .filter(readings::Column::Time.is_in(times))
-            .filter(readings::Column::Unverified.eq(true))
-            .all(db)
-            .await?
-        {
-            let key = (r.stream_id, r.time.with_timezone(&Utc), r.replicate_index);
-            if elsewhere.contains(&key) {
-                pending.insert(key);
-            }
-        }
-    }
+    pending.extend(pending_among(db, &elsewhere).await?);
     let parameters = rows
         .iter()
         .filter_map(|r| {

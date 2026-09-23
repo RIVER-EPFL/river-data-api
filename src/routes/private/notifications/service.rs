@@ -173,7 +173,7 @@ pub fn render_opened(events: &[PendingEvent], dashboard_base: Option<&str>) -> O
         );
     }
     if let Some(base) = dashboard_base {
-        let _ = write!(body, "View: {}/alarms", base.trim_end_matches('/'));
+        let _ = write!(body, "View: {}", dashboard_link(base, "/alarms"));
     }
     OutgoingMessage {
         kind: "alarm_opened",
@@ -195,7 +195,7 @@ pub fn render_resolved(events: &[PendingEvent], dashboard_base: Option<&str>) ->
         );
     }
     if let Some(base) = dashboard_base {
-        let _ = write!(body, "View: {}/alarms", base.trim_end_matches('/'));
+        let _ = write!(body, "View: {}", dashboard_link(base, "/alarms"));
     }
     OutgoingMessage {
         kind: "alarm_resolved",
@@ -545,15 +545,25 @@ pub async fn within_audience(
     (admitted, refused)
 }
 
+/// The path the dashboard is served under, `paths.base` in `river-data-ui/svelte.config.js`.
+/// `DASHBOARD_BASE_URL` is the origin alone, so every link a message carries is built through
+/// [`dashboard_link`].
+const DASHBOARD_PATH: &str = "/admin";
+
+/// `path` in the dashboard at `base`.
+fn dashboard_link(base: &str, path: &str) -> String {
+    format!("{}{DASHBOARD_PATH}{path}", base.trim_end_matches('/'))
+}
+
 pub(super) fn deep_link_url(base: Option<&str>, slot: &Option<Slot>) -> Option<String> {
-    let base = base?.trim_end_matches('/');
-    match slot {
-        Some(s) => Some(format!(
-            "{}/sites/{}?focus={}",
-            base, s.site_id, s.parameter_id
-        )),
-        None => Some(format!("{}/alarms", base)),
-    }
+    let base = base?;
+    Some(match slot {
+        Some(s) => dashboard_link(
+            base,
+            &format!("/sites/{}?focus={}", s.site_id, s.parameter_id),
+        ),
+        None => dashboard_link(base, "/alarms"),
+    })
 }
 
 /// The push subscriptions a message reaches: subscribers who have the channel on, are in the

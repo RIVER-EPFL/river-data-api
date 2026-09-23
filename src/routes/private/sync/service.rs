@@ -2332,9 +2332,20 @@ async fn ruling_follows<C: ConnectionTrait>(
     Vec<crate::routes::private::readings::consumed::ReadingKey>,
     crate::routes::private::readings::consumed::VisitComputed,
 )> {
-    use crate::routes::private::readings::consumed::{computed_at, follow_ruling};
+    use crate::routes::private::readings::consumed::{
+        computed_at, continuous_pending, follow_ruling,
+    };
     let computed = computed_at(conn, site_id, at).await?;
-    let followed = follow_ruling(&computed.outputs, &computed.pending, ruled, verify);
+    let mut outputs = computed.outputs.clone();
+    let mut pending = computed.pending.clone();
+    // A verify also releases what the continuous engine computed from the entry. Only the visit's
+    // own outputs follow a reject, because a withdrawal is confined to spot rows.
+    if verify {
+        let continuous = continuous_pending(conn, site_id).await?;
+        outputs.extend(continuous.outputs);
+        pending.extend(continuous.pending);
+    }
+    let followed = follow_ruling(&outputs, &pending, ruled, verify);
     Ok((followed, computed))
 }
 

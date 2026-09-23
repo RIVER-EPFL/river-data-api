@@ -36,8 +36,8 @@ use super::service::{
     find_active_tool, find_run_in_scope, formula_codes_held_elsewhere, insert_version, lint_script,
     list_active_tools, load_parameter_catalog, load_script, load_version, manifest_finding,
     manifest_json, mint_formula_version, normalise_name, normalised_json, plan_formula_set, render,
-    replicated_for, run_stored_cases, run_tool_body, runner_runtime, stored_version_content,
-    take_back_steps,
+    replicated_for, require_context_in_scope, run_stored_cases, run_tool_body, runner_runtime,
+    stored_version_content, take_back_steps,
 };
 use crate::common::AppState;
 use crate::common::middleware::{AuthContext, ProjectScope, scope_site_ids};
@@ -79,6 +79,7 @@ pub async fn list_tools(State(state): State<AppState>) -> AppResult<Json<Vec<Too
     request_body(content = Object, description = "Per-tool request body (see GET /tools for schemas)"),
     responses(
         (status = 200, description = "Calculation result with `inputs_used` / `inputs_ignored` accounting", body = ToolResult),
+        (status = 403, description = "The context `site_id` is outside the caller's projects"),
         (status = 404, description = "Unknown tool name"),
         (status = 409, description = "The calculation is switched off"),
         (status = 400, description = "Invalid input for this tool, or a script error"),
@@ -89,9 +90,11 @@ pub async fn list_tools(State(state): State<AppState>) -> AppResult<Json<Vec<Too
 pub async fn calculate_tool(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
+    ProjectScope(scope): ProjectScope,
     Path(tool_name): Path<String>,
     body: axum::body::Bytes,
 ) -> AppResult<Json<ToolResult>> {
+    require_context_in_scope(&state.db, &scope, &body).await?;
     let tool = find_active_tool(&state.db, &tool_name).await?;
     let result = execute_and_store_run(
         &state,
@@ -114,6 +117,7 @@ pub async fn calculate_tool(
     request_body(content = Object, description = "Per-tool request body (see GET /tools for schemas)"),
     responses(
         (status = 200, description = "The calculation, stored nowhere", body = ToolCalculation),
+        (status = 403, description = "The context `site_id` is outside the caller's projects"),
         (status = 404, description = "Unknown tool name"),
         (status = 409, description = "The calculation is switched off"),
         (status = 400, description = "Invalid input for this tool, or a script error"),
@@ -123,9 +127,11 @@ pub async fn calculate_tool(
 )]
 pub async fn preview_tool(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(tool_name): Path<String>,
     body: axum::body::Bytes,
 ) -> AppResult<Json<ToolCalculation>> {
+    require_context_in_scope(&state.db, &scope, &body).await?;
     let tool = find_active_tool(&state.db, &tool_name).await?;
     Ok(Json(preview_run(&state, &tool, &body).await?))
 }

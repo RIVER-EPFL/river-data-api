@@ -30478,7 +30478,7 @@
             "description": "Changes, newest first"
           }
         },
-        "summary": "The change trail of one subject, newest first. Requires `read_metadata`.",
+        "summary": "The change trail of one subject, newest first, confined to the caller's projects the way\n`/change_audit_entries` is. Requires `read_metadata`.",
         "tags": [
           "admin"
         ]
@@ -52069,6 +52069,9 @@
           "400": {
             "description": "Invalid input for this tool, or a script error"
           },
+          "403": {
+            "description": "The context `site_id` is outside the caller's projects"
+          },
           "404": {
             "description": "Unknown tool name"
           },
@@ -52123,6 +52126,9 @@
           },
           "400": {
             "description": "Invalid input for this tool, or a script error"
+          },
+          "403": {
+            "description": "The context `site_id` is outside the caller's projects"
           },
           "404": {
             "description": "Unknown tool name"

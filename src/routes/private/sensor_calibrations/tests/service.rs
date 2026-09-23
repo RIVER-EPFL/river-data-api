@@ -766,3 +766,17 @@ mod end_date_provenance {
         assert_eq!(valid_until_provenance(None), None);
     }
 }
+
+/// Scenario: a continuous value is written over a row whose pending state may differ from its
+/// inputs'.
+///
+/// Expected behaviour: only a change of state is a decision, pending while any input is and
+/// released once none is (Q257).
+#[test]
+fn test_pending_follow_moves_only_a_changed_state() {
+    use crate::routes::private::readings::models::Kind;
+    assert_eq!(pending_follow(false, true), Some(Kind::UnverifiedEntry));
+    assert_eq!(pending_follow(true, false), Some(Kind::Verify));
+    assert_eq!(pending_follow(true, true), None);
+    assert_eq!(pending_follow(false, false), None);
+}

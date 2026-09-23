@@ -29,7 +29,34 @@ fn test_render_opened_lists_each_event_and_links() {
     assert!(msg.body.contains("Martigny / Depth: 2150.00 mm (ALARM)"));
     assert!(msg.body.contains("Saxon / CDOM: 140.00 mm (WARNING)"));
     // Trailing slash on the base is normalized.
-    assert!(msg.body.contains("View: https://dash.example/alarms"));
+    assert!(msg.body.contains("View: https://dash.example/admin/alarms"));
+}
+
+#[test]
+fn test_deep_link_url_is_under_the_ui_base() {
+    let site = Uuid::from_u128(1);
+    let parameter = Uuid::from_u128(2);
+    let slot = Some(Slot {
+        project_id: None,
+        site_id: site,
+        parameter_id: parameter,
+    });
+    assert_eq!(
+        deep_link_url(Some("https://dash.example/"), &slot).as_deref(),
+        Some(format!("https://dash.example/admin/sites/{site}?focus={parameter}").as_str())
+    );
+    assert_eq!(
+        deep_link_url(Some("https://dash.example"), &None).as_deref(),
+        Some("https://dash.example/admin/alarms")
+    );
+    assert_eq!(deep_link_url(None, &slot), None);
+}
+
+#[test]
+fn test_render_resolved_links_under_the_ui_base() {
+    let events = vec![event("Verbier", "Dissolved_O2", 2, 5.0)];
+    let msg = render_resolved(&events, Some("https://dash.example"));
+    assert!(msg.body.contains("View: https://dash.example/admin/alarms"));
 }
 
 #[test]

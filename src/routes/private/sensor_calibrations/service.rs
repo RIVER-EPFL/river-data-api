@@ -1713,6 +1713,7 @@ async fn evaluate_set_and_upsert(
                     .await
                     .map_err(crate::error::AppError::from)?;
             }
+            follow_inputs_pending(txn, stream_id, time, &consumed).await?;
             Ok(())
         })
         .await
@@ -1751,6 +1752,70 @@ async fn formula_ids_by_code<C: ConnectionTrait>(
         .into_iter()
         .map(|(id, code)| (code.to_lowercase(), id))
         .collect())
+}
+
+/// The decision that brings a stored value's pending state to its inputs': pending while any input
+/// it was computed from is, released once none is (Q257). `None` where the state already agrees.
+#[must_use]
+pub fn pending_follow(
+    stored: bool,
+    pending: bool,
+) -> Option<crate::routes::private::readings::models::Kind> {
+    use crate::routes::private::readings::models::Kind;
+    match (stored, pending) {
+        (false, true) => Some(Kind::UnverifiedEntry),
+        (true, false) => Some(Kind::Verify),
+        _ => None,
+    }
+}
+
+/// Hold a continuous value pending while an input it was computed from awaits verification, and
+/// release it once none does. The state moves by a decision, so the record says why it is held.
+async fn follow_inputs_pending<C: ConnectionTrait>(
+    db: &C,
+    stream_id: Uuid,
+    time: chrono::DateTime<chrono::Utc>,
+    consumed: &[ConsumedInput],
+) -> crate::error::AppResult<()> {
+    use crate::routes::private::readings::service::{Decision, DecisionKey, record};
+    let pending = crate::routes::private::readings::consumed::any_pending(db, consumed).await?;
+    let stored = readings::Entity::find()
+        .filter(readings::Column::StreamId.eq(stream_id))
+        .filter(readings::Column::Time.eq(time))
+        .filter(readings::Column::ReplicateIndex.eq(0_i16))
+        .select_only()
+        .column(readings::Column::Unverified)
+        .into_tuple::<bool>()
+        .one(db)
+        .await?;
+    let Some(kind) = pending_follow(stored.unwrap_or(false), pending) else {
+        return Ok(());
+    };
+    record(
+        db,
+        &Decision {
+            key: DecisionKey {
+                stream_id,
+                time,
+                replicate_index: Some(0),
+            },
+            kind,
+            new: serde_json::json!({ "unverified": pending }),
+            actor: "system".to_string(),
+            reason: Some(
+                if pending {
+                    "computed from an input awaiting verification"
+                } else {
+                    "every input it was computed from is verified"
+                }
+                .to_string(),
+            ),
+            origin: crate::routes::private::readings::models::Origin::System,
+            set_id: None,
+        },
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Record the arrival of a derived value, the state it arrived in read from the row itself.
