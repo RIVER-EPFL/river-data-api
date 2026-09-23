@@ -32,6 +32,7 @@ mod grab_save_survives_enqueue_failure;
 mod guarded_bulk_write;
 mod ingest_dedup_and_visibility;
 mod ingest_forms_samples;
+mod ingest_pairing_race;
 mod ingest_standard_curves;
 mod ingest_validation;
 mod ingested_at_restamp;

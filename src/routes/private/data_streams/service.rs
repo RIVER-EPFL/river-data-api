@@ -1041,6 +1041,31 @@ pub fn advance_cursor(stream_id: Uuid, newest: DateTimeWithTimeZone) -> UpdateMa
         .filter(models::Column::Id.eq(stream_id))
 }
 
+/// Record what an ingest pass leaves on its stream: the cursor moved forward to `newest` and the
+/// handshake digest of a cleanly applied window. Written only while the stream's pairing is still
+/// `attributed_under`, the one the pass attributed its rows against, so a pairing or unpairing
+/// committed in between wins and the digest it cleared stays cleared.
+pub fn record_pass(
+    stream_id: Uuid,
+    attributed_under: Option<Uuid>,
+    newest: Option<DateTimeWithTimeZone>,
+    digest: Option<String>,
+) -> UpdateMany<models::Entity> {
+    let mut update = match newest {
+        Some(newest) => advance_cursor(stream_id, newest),
+        None => models::Entity::update_many()
+            .col_expr(models::Column::UpdatedAt, Expr::current_timestamp())
+            .filter(models::Column::Id.eq(stream_id)),
+    };
+    if let Some(digest) = digest {
+        update = update.col_expr(models::Column::LastWindowDigest, Expr::value(Some(digest)));
+    }
+    match attributed_under {
+        Some(slot) => update.filter(models::Column::SiteParameterId.eq(slot)),
+        None => update.filter(models::Column::SiteParameterId.is_null()),
+    }
+}
+
 #[cfg(test)]
 #[path = "tests/service.rs"]
 mod tests;

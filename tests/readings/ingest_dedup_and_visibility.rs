@@ -521,6 +521,191 @@ async fn ingest_status_event_takes_the_stream_instrument() {
     );
 }
 
+/// Expected behaviour: a batch status event names a site and parameter, and is attributed to them
+/// only when the site carries that slot, as a batch reading is. A parameter the site was never
+/// assigned leaves the event on its unpaired api channel with no site and no parameter.
+#[tokio::test]
+#[serial]
+async fn batch_status_event_without_a_slot_is_stored_unattributed() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+    let project = e2e::create_project(&app, &token, "Status Slot", "status-slot", false).await;
+    let site = e2e::create_site(&app, &token, &project, "Slot Site", "slot-site").await;
+    let assigned = e2e::create_parameter(&app, &token, "SlotOn", "Slot assigned", "state").await;
+    let unassigned = e2e::create_parameter(&app, &token, "SlotOff", "Slot missing", "state").await;
+    e2e::assign_site_parameter_minimal(&app, &token, &site, &assigned).await;
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        "/api/status_events/batch",
+        &serde_json::json!({"events": [
+            {"site_id": site, "parameter_id": assigned,
+             "time": "2025-02-01T00:00:00Z", "value": "ok"},
+            {"site_id": site, "parameter_id": unassigned,
+             "time": "2025-02-01T00:00:00Z", "value": "offline"}
+        ]}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "batch status events ({status}): {body}");
+
+    let attributed_on = |parameter: &str| {
+        format!(
+            "SELECT count(*) AS c FROM status_events e JOIN data_streams s ON s.id = e.stream_id \
+             WHERE s.source_system = 'api' AND s.source_key = '{site}:{parameter}' \
+             AND e.site_id IS NOT NULL AND e.parameter_id IS NOT NULL"
+        )
+    };
+    assert_eq!(
+        count(&db, &attributed_on(&assigned)).await,
+        1,
+        "the slot backs the event"
+    );
+    assert_eq!(
+        count(&db, &attributed_on(&unassigned)).await,
+        0,
+        "no slot backs the event"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM status_events e JOIN data_streams s ON s.id = e.stream_id \
+                 WHERE s.source_key = '{site}:{unassigned}' AND s.site_parameter_id IS NULL \
+                 AND e.site_id IS NULL AND e.parameter_id IS NULL"
+            )
+        )
+        .await,
+        1,
+        "the event is stored on its unpaired channel"
+    );
+}
+
+/// Scenario: a batch writes a site and parameter before the site carries that slot, an admin adds
+/// the slot, and later unpairs the api channel.
+/// Expected behaviour: every batch after the slot exists pairs the channel to it, with the backfill
+/// a pairing owes, so the stored readings and the channel's pairing agree at every step.
+#[tokio::test]
+#[serial]
+async fn batch_pairs_its_api_channel_once_the_slot_exists() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let app = crate::common::build_test_app(db.clone());
+    let project = e2e::create_project(&app, &token, "Late Slot", "late-slot", false).await;
+    let site = e2e::create_site(&app, &token, &project, "Late Site", "late-site").await;
+    let param = e2e::create_parameter(&app, &token, "lateslot", "Late slot", "m").await;
+    let batch = |time: &str| {
+        serde_json::json!({"readings": [
+            {"site_id": site, "parameter_id": param, "time": time, "raw_value": 1.0}
+        ]})
+    };
+    let post = async |time: &str| {
+        let (status, body) = crate::common::post_json_parse_with_token(
+            &app,
+            "/api/readings/batch",
+            &batch(time),
+            &token,
+        )
+        .await;
+        assert_eq!(status, 200, "batch at {time} ({status}): {body}");
+    };
+    let channel = format!("s.source_system = 'api' AND s.source_key = '{site}:{param}'");
+    let disagreeing = format!(
+        "SELECT count(*) AS c FROM readings r JOIN data_streams s ON s.id = r.stream_id \
+         WHERE {channel} AND ((r.site_id IS NULL) <> (s.site_parameter_id IS NULL))"
+    );
+    let attributed = format!(
+        "SELECT count(*) AS c FROM readings r JOIN data_streams s ON s.id = r.stream_id \
+         WHERE {channel} AND r.site_id = '{site}' AND r.parameter_id = '{param}'"
+    );
+
+    post("2025-03-01T00:00:00Z").await;
+    assert_eq!(
+        count(&db, &attributed).await,
+        0,
+        "no slot backs the first row"
+    );
+    assert_eq!(
+        count(&db, &disagreeing).await,
+        0,
+        "unpaired channel, unattributed row"
+    );
+
+    e2e::assign_site_parameter_minimal(&app, &token, &site, &param).await;
+    post("2025-03-02T00:00:00Z").await;
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT count(*) AS c FROM data_streams s WHERE {channel} AND s.site_parameter_id IS NOT NULL")
+        )
+        .await,
+        1,
+        "the batch paired its channel to the slot"
+    );
+    assert_eq!(
+        count(&db, &disagreeing).await,
+        0,
+        "rows agree with the pairing"
+    );
+    assert_eq!(
+        count(&db, &attributed).await,
+        2,
+        "the pairing backfilled the first row"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT count(*) AS c FROM reprocessing_jobs j JOIN data_streams s ON s.id = j.trigger_id \
+                 WHERE {channel} AND j.trigger_type = 'pairing_backfill'"
+            )
+        )
+        .await,
+        1,
+        "the pairing queued the slot reprocess"
+    );
+
+    let stream = {
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("SELECT s.id::text AS id FROM data_streams s WHERE {channel}"),
+            ))
+            .await
+            .expect("query")
+            .expect("row");
+        row.try_get::<String>("", "id").expect("id")
+    };
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &app,
+        &format!("/api/streams/{stream}/unpair"),
+        &serde_json::json!({}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "unpair ({status}): {body}");
+    assert_eq!(
+        count(&db, &disagreeing).await,
+        0,
+        "unpair released every row"
+    );
+
+    post("2025-03-03T00:00:00Z").await;
+    assert_eq!(
+        count(&db, &disagreeing).await,
+        0,
+        "rows agree with the re-pairing"
+    );
+    assert_eq!(
+        count(&db, &attributed).await,
+        3,
+        "the re-pairing backfilled every row"
+    );
+}
+
 /// Status events on a stream that carry exactly the instrument that stream names.
 async fn attributed(db: &DatabaseConnection, stream: &str) -> i64 {
     count(

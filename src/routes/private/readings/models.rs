@@ -2238,6 +2238,9 @@ pub struct ReadingInput {
     pub parameter_id: Uuid,
     pub time: chrono::DateTime<chrono::Utc>,
     pub raw_value: f64,
+    /// The corrected value. Where a calibration covers the reading the server computes it from
+    /// that calibration, and a submitted value that differs is refused with 400. With no
+    /// calibration a submitted value is stored as given.
     pub calibrated_value: Option<f64>,
     pub sensor_id: Option<Uuid>,
     pub calibration_id: Option<Uuid>,
@@ -2280,9 +2283,9 @@ pub struct IngestReadingsRequest {
     /// flag state and sample links on the existing row are preserved.
     #[serde(default)]
     pub overwrite: bool,
-    /// The writer declaring these readings collection events: spot replicate groups sharing an
-    /// instant form a `samples` row from the first reading, like `/grab_samples`. Sync-service
-    /// callers only; without it a group still forms a sample once it carries two replicates.
+    /// Ignored: a spot group sharing an instant forms a `samples` row once it carries two
+    /// replicates, whatever the writer declares. Accepted so sync services built on
+    /// river-data-core 0.14 and earlier are not refused. Sync-service callers only.
     #[serde(default)]
     pub collection: bool,
     /// Per-instant expectations from the source portal's own precomputed statistics. Each audited

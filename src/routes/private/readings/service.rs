@@ -77,6 +77,7 @@ use crate::routes::private::sensor_calibrations;
 use crate::routes::private::sensor_calibrations::service::{InputCandidate, chosen_input};
 use crate::routes::private::sensor_deployments as deployments;
 use crate::routes::private::sensors;
+use crate::routes::private::sensors::models::ResolvedOwner;
 use crate::routes::private::site_parameters;
 use crate::routes::private::sites;
 use crate::routes::private::standard_curves;
@@ -226,6 +227,85 @@ pub fn batch_instrument(
     stream: Option<Uuid>,
 ) -> Option<Uuid> {
     row.or(slot).or(stream)
+}
+
+/// The site and parameter a batch row keyed by (site, parameter) is attributed to: the request's
+/// pair when a `site_parameters` slot backs it, and neither when the site was never assigned the
+/// parameter, since attribution comes from a slot and never from the request alone.
+#[must_use]
+pub fn slot_attribution(
+    site_id: Uuid,
+    parameter_id: Uuid,
+    slot: Option<Uuid>,
+) -> (Option<Uuid>, Option<Uuid>) {
+    match slot {
+        Some(_) => (Some(site_id), Some(parameter_id)),
+        None => (None, None),
+    }
+}
+
+/// Relative distance within which a submitted `calibrated_value` is taken to be the one its
+/// calibration produces.
+const CORRECTION_REL_TOL: f64 = 1e-9;
+
+/// The calibration a `/readings/batch` row is stored against and the value stored with it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BatchCorrection {
+    pub calibration_id: Option<Uuid>,
+    pub calibrated_value: Option<f64>,
+}
+
+/// A submitted `calibrated_value` that the row's calibration does not produce.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error(
+    "calibrated_value {submitted} is not what calibration {calibration_id} produces from the raw \
+     value ({computed}); omit calibrated_value to have it computed"
+)]
+pub struct CorrectionMismatch {
+    pub calibration_id: Uuid,
+    pub submitted: f64,
+    pub computed: f64,
+}
+
+/// What a `/readings/batch` row stores as its correction, so the stamped `calibration_id` is
+/// always a curve the stored value went through.
+///
+/// A standard curve composes on the base and its result is stored whatever was submitted. A row
+/// on a resolved base stores the value the base produces, and a submitted value that differs is
+/// refused. A row with no calibration keeps a submitted value as an unaccounted correction. A
+/// `calibration_id` that resolved to no curve is passed through for the insert to judge.
+pub fn batch_correction(
+    raw_value: f64,
+    submitted: Option<f64>,
+    calibration_id: Option<Uuid>,
+    base: Option<sensor_calibrations::service::Curve>,
+    standard: Option<sensor_calibrations::service::Curve>,
+) -> Result<BatchCorrection, CorrectionMismatch> {
+    let calibrated_value = match (standard, base, submitted) {
+        (Some(curve), _, _) => Some(sensor_calibrations::service::apply_curves(
+            raw_value,
+            base,
+            Some(curve),
+        )),
+        (None, Some(curve), submitted) => {
+            let computed = curve.apply(raw_value);
+            if let Some(value) = submitted
+                && (value - computed).abs() > CORRECTION_REL_TOL * computed.abs().max(1.0)
+            {
+                return Err(CorrectionMismatch {
+                    calibration_id: curve.id,
+                    submitted: value,
+                    computed,
+                });
+            }
+            Some(computed)
+        }
+        (None, None, submitted) => submitted,
+    };
+    Ok(BatchCorrection {
+        calibration_id,
+        calibrated_value,
+    })
 }
 
 /// The instrument an `/ingest` row is attributed to, in precedence order.
@@ -7605,8 +7685,8 @@ pub(super) fn ingest_outcome(
 
 /// The (site_id, parameter_id) a stream's pairing resolves to. Both are `None` when the stream is
 /// unpaired, ie. its readings land unattributed and stay out of the rollups until it is paired.
-pub(super) async fn resolve_stream_slot(
-    db: &sea_orm::DatabaseConnection,
+pub(super) async fn resolve_stream_slot<C: ConnectionTrait>(
+    db: &C,
     site_parameter_id: Option<Uuid>,
 ) -> AppResult<(Option<Uuid>, Option<Uuid>)> {
     let Some(sp_id) = site_parameter_id else {
@@ -7731,6 +7811,1032 @@ pub(super) async fn run_replicate_audit(
         }
     }
     Ok(())
+}
+
+// --- The ingest pass, one step at a time ---
+
+/// The first and last instant a pass covers.
+pub(super) type IngestSpan = (DateTime<Utc>, DateTime<Utc>);
+
+/// Standard curve claims stripped from a pass, by instant, each as the source made it.
+pub(super) type StrippedClaims = HashMap<DateTime<Utc>, Vec<serde_json::Value>>;
+
+/// The fields only a sync service may send, refused from any other caller, and a completeness
+/// window that does not open before it closes.
+pub(super) fn refuse_sync_only_claims(
+    payload: &IngestReadingsRequest,
+    is_sync_service: bool,
+) -> AppResult<()> {
+    let sync_only = [
+        (
+            payload.overwrite,
+            "overwrite is restricted to sync services",
+        ),
+        (
+            payload.collection,
+            "collection is restricted to sync services; grab entry goes through /grab_samples",
+        ),
+        (
+            payload.audit.is_some(),
+            "audit is restricted to sync services",
+        ),
+        (
+            payload.window.is_some(),
+            "window is restricted to sync services",
+        ),
+    ];
+    if !is_sync_service && let Some((_, refusal)) = sync_only.iter().find(|(sent, _)| *sent) {
+        return Err(AppError::Forbidden((*refusal).to_string()));
+    }
+    if let Some(window) = &payload.window
+        && window.from >= window.to
+    {
+        return Err(AppError::BadRequest(
+            "window.from must be before window.to".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A pass with no readings and no completeness claim has nothing to do. With a window, an empty
+/// payload is a claim the source holds nothing there, which the diff judges against the store.
+pub(super) fn is_nothing_to_ingest(payload: &IngestReadingsRequest) -> bool {
+    payload.readings.is_empty() && payload.window.is_none()
+}
+
+/// The stream a pass writes to, share-locked in the pass's own transaction until it commits: a
+/// pairing that commits first is what the pass attributes from, and one arriving later waits and
+/// then backfills what the pass wrote.
+pub(super) async fn lock_ingest_stream(
+    txn: &sea_orm::DatabaseTransaction,
+    stream_id: Uuid,
+) -> AppResult<data_streams::models::Model> {
+    data_streams::models::Entity::find_by_id(stream_id)
+        .lock_shared()
+        .one(txn)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))
+}
+
+/// A completeness window is accepted only on a stream declared spot. Withdrawal is confined to
+/// spot rows by a database CHECK and the rollups exclude spot, which is what keeps a retraction
+/// out of every rollup, so a window elsewhere is refused rather than half-honoured.
+pub(super) fn require_spot_window(
+    window: Option<&SourceWindow>,
+    stream_measurement_type: Option<&str>,
+) -> AppResult<()> {
+    if window.is_some() && stream_measurement_type != Some(SPOT) {
+        return Err(AppError::BadRequest(
+            "A completeness window is only accepted for streams declared measurement_type \
+             'spot'; continuous sources stay append-only"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// What admission refused from a pass: a tally by kind, since the per-reading messages carry the
+/// offending value and cannot group, and under a completeness window the keys refused, which the
+/// diff retains rather than reading as absent at source.
+///
+/// Admission is per reading, not per request: the caller replays from `last_data_time`, which only
+/// advances on success, so refusing a batch for one bad row would stall the stream.
+pub(super) struct IngestFunnel {
+    submitted: usize,
+    windowed: bool,
+    counts: Vec<(admission::RejectionKind, usize)>,
+    rejected_keys: HashSet<Key>,
+}
+
+impl IngestFunnel {
+    pub(super) fn new(readings: &[IngestReading], windowed: bool) -> Self {
+        Self {
+            submitted: readings.len(),
+            windowed,
+            counts: Vec::new(),
+            rejected_keys: HashSet::new(),
+        }
+    }
+
+    fn refuse(&mut self, r: &IngestReading, kind: admission::RejectionKind) {
+        record_rejection(&mut self.counts, kind);
+        if self.windowed {
+            self.rejected_keys.insert((r.time, r.replicate_index));
+        }
+    }
+
+    /// Drops every reading admission refuses at `now`.
+    pub(super) fn admit(&mut self, readings: &mut Vec<IngestReading>, now: DateTime<Utc>) {
+        readings.retain(|r| {
+            match admission::rejection_kind_at(
+                now,
+                r.time,
+                r.raw_value,
+                r.measurement_type.as_deref(),
+            ) {
+                None => true,
+                Some(kind) => {
+                    self.refuse(r, kind);
+                    false
+                }
+            }
+        });
+    }
+
+    /// Under a completeness window, two rows at one key would classify one submitted row twice.
+    /// The last occurrence wins (backends emit source-id order, so last is deterministic) and the
+    /// losers are counted, so the receipt arithmetic closes.
+    pub(super) fn keep_last_per_key(&mut self, readings: &mut Vec<IngestReading>) {
+        if !self.windowed {
+            return;
+        }
+        let mut seen = HashSet::new();
+        let mut keep = vec![false; readings.len()];
+        for (i, r) in readings.iter().enumerate().rev() {
+            keep[i] = seen.insert((r.time, r.replicate_index));
+        }
+        let mut keep = keep.into_iter();
+        readings.retain(|_| {
+            let kept = keep.next().unwrap_or(true);
+            if !kept {
+                record_rejection(&mut self.counts, admission::RejectionKind::DuplicateKey);
+            }
+            kept
+        });
+    }
+
+    /// Drops every reading naming a calibration that does not exist. A deleted calibration never
+    /// reappears, so refusing the request would stall the cursor for good.
+    pub(super) fn drop_unknown_calibrations(
+        &mut self,
+        readings: &mut Vec<IngestReading>,
+        declared: &HashMap<Uuid, sensor_calibrations::service::Curve>,
+    ) {
+        readings.retain(|r| match r.calibration_id {
+            Some(id) if !declared.contains_key(&id) => {
+                self.refuse(r, admission::RejectionKind::UnknownCalibration);
+                false
+            }
+            _ => true,
+        });
+    }
+
+    /// Drops every replicate whose resolved cadence is not spot. Only a spot instant has
+    /// replicates, and a row that is not one would sit at an index every continuous reader
+    /// filters out, ie. served nowhere.
+    pub(super) fn drop_replicates_off_spot(
+        &mut self,
+        readings: &mut Vec<IngestReading>,
+        attribution: &IngestAttribution,
+    ) {
+        readings.retain(|r| {
+            if r.replicate_index == 0 || attribution.measurement_type_of(r) == SPOT {
+                return true;
+            }
+            self.refuse(r, admission::RejectionKind::ReplicateIndexOnNonSpot);
+            false
+        });
+    }
+
+    pub(super) fn rejected_keys(&self) -> &HashSet<Key> {
+        &self.rejected_keys
+    }
+
+    pub(super) fn rejected_total(&self) -> usize {
+        self.counts.iter().map(|(_, n)| n).sum()
+    }
+
+    /// The tally as the receipt stores it, keyed by the rejection's description.
+    pub(super) fn rejected_by_kind(&self) -> serde_json::Value {
+        serde_json::Value::Object(
+            self.counts
+                .iter()
+                .map(|(kind, n)| (kind.as_str().to_string(), serde_json::json!(n)))
+                .collect(),
+        )
+    }
+
+    /// The response for a pass that stored `inserted` rows.
+    pub(super) fn outcome(&self, stream_id: Uuid, paired: bool, inserted: usize) -> IngestResponse {
+        ingest_outcome(stream_id, paired, self.submitted, inserted, &self.counts)
+    }
+}
+
+/// What a pass's readings are attributed to: the stream's pairing and its frozen instrument, the
+/// deployment windows covering each reading's own time, and the cadence each candidate instrument
+/// declares.
+pub(super) struct IngestAttribution {
+    pub(super) stream_sensor: Option<Uuid>,
+    pub(super) stream_measurement_type: Option<String>,
+    pub(super) site_id: Option<Uuid>,
+    pub(super) parameter_id: Option<Uuid>,
+    /// Calibration, deployment and site by reading time, from the stream instrument's windows.
+    pub(super) windows:
+        HashMap<DateTime<Utc>, crate::routes::private::sensors::models::ResolvedSlot>,
+    /// The slot's owner by reading time, for a stream that carries no instrument of its own.
+    pub(super) owners:
+        HashMap<DateTime<Utc>, crate::routes::private::sensors::models::ResolvedOwner>,
+    pub(super) sensor_types: HashMap<Uuid, &'static str>,
+}
+
+impl IngestAttribution {
+    /// Pairing is what attributes a reading to a site; an unpaired stream's readings are staged.
+    pub(super) fn paired(&self) -> bool {
+        self.site_id.is_some()
+    }
+
+    /// The instrument a reading resolves to: its own, the stream's, or the slot owner's.
+    pub(super) fn instrument_of(&self, r: &IngestReading) -> Option<Uuid> {
+        ingest_instrument(
+            r.sensor_id,
+            self.stream_sensor,
+            self.owners.get(&r.time).and_then(|o| o.sensor_id),
+        )
+    }
+
+    /// The cadence a reading is stored under: its own, the stream's, then its instrument's.
+    pub(super) fn measurement_type_of(&self, r: &IngestReading) -> String {
+        resolve_measurement_type(
+            r.measurement_type.as_deref(),
+            self.stream_measurement_type.as_deref(),
+            self.instrument_of(r),
+            &self.sensor_types,
+        )
+    }
+
+    /// Every instrument a reading could resolve to, sorted and once each.
+    pub(super) fn candidate_instruments(&self, readings: &[IngestReading]) -> Vec<Uuid> {
+        let mut ids: Vec<Uuid> = readings
+            .iter()
+            .filter_map(|r| r.sensor_id)
+            .chain(self.stream_sensor)
+            .chain(self.owners.values().filter_map(|o| o.sensor_id))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// One resolver request per reading that resolves to an instrument: that instrument's curve
+    /// on the stream's parameter at the reading's own time.
+    pub(super) fn calibration_requests(
+        &self,
+        readings: &[IngestReading],
+    ) -> Vec<(Uuid, Option<Uuid>, DateTime<Utc>)> {
+        readings
+            .iter()
+            .filter_map(|r| Some((self.instrument_of(r)?, self.parameter_id, r.time)))
+            .collect()
+    }
+
+    /// Reads the sensor-frequency default of every candidate instrument, applied when neither the
+    /// reading nor the stream declares a cadence.
+    pub(super) async fn read_cadences<C: ConnectionTrait>(
+        &mut self,
+        conn: &C,
+        readings: &[IngestReading],
+    ) -> AppResult<()> {
+        self.sensor_types =
+            measurement_types_for_sensors(conn, &self.candidate_instruments(readings)).await?;
+        Ok(())
+    }
+}
+
+/// A pass's attribution before any cadence is read: the deployment windows of the stream's frozen
+/// instrument by reading time, agreeing with the reprocess, or where the stream carries none, the
+/// slot's deployment timeline, so a reading still lands owned when a deployment covers it.
+pub(super) async fn resolve_ingest_attribution<C: ConnectionTrait>(
+    conn: &C,
+    stream: &data_streams::models::Model,
+    (site_id, parameter_id): (Option<Uuid>, Option<Uuid>),
+    readings: &[IngestReading],
+) -> AppResult<IngestAttribution> {
+    let times: Vec<DateTime<Utc>> = readings.iter().map(|r| r.time).collect();
+    let windows = match stream.sensor_id {
+        Some(sensor_id) => {
+            sensors::service::resolve_windows_for_times(conn, sensor_id, None, parameter_id, &times)
+                .await?
+        }
+        None => HashMap::new(),
+    };
+    let owners = match (stream.sensor_id, site_id, parameter_id) {
+        (None, Some(site_id), Some(parameter_id)) => {
+            sensors::service::resolve_slot_owner_for_times(conn, site_id, parameter_id, &times)
+                .await?
+        }
+        _ => HashMap::new(),
+    };
+    Ok(IngestAttribution {
+        stream_sensor: stream.sensor_id,
+        stream_measurement_type: stream.measurement_type.clone(),
+        site_id,
+        parameter_id,
+        windows,
+        owners,
+        sensor_types: HashMap::new(),
+    })
+}
+
+/// The curves a pass's readings may be stored against: the calibration covering each reading's own
+/// time, ranked by the resolver the reprocess uses, so a stored value and a later recompute agree;
+/// the calibrations callers named; and the standard curves whose claims were admitted.
+pub(super) struct IngestCurves {
+    pub(super) resolved:
+        HashMap<(Uuid, Option<Uuid>, DateTime<Utc>), sensor_calibrations::service::Curve>,
+    pub(super) declared: HashMap<Uuid, sensor_calibrations::service::Curve>,
+    pub(super) standard: HashMap<Uuid, sensor_calibrations::service::Curve>,
+}
+
+fn curves_by_id(
+    rows: impl IntoIterator<Item = (Uuid, f64, f64)>,
+) -> HashMap<Uuid, sensor_calibrations::service::Curve> {
+    rows.into_iter()
+        .map(|(id, slope, intercept)| {
+            (
+                id,
+                sensor_calibrations::service::Curve {
+                    id,
+                    slope,
+                    intercept,
+                },
+            )
+        })
+        .collect()
+}
+
+fn named_once(ids: impl Iterator<Item = Uuid>) -> Vec<Uuid> {
+    let mut ids: Vec<Uuid> = ids.collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// The calibrations callers named, by id. A caller is taken at its word about which curve applies,
+/// but the stored value is still computed from that curve's coefficients, so reference and value
+/// come from one curve.
+pub(super) async fn find_declared_calibrations<C: ConnectionTrait>(
+    conn: &C,
+    readings: &[IngestReading],
+) -> AppResult<HashMap<Uuid, sensor_calibrations::service::Curve>> {
+    let ids = named_once(readings.iter().filter_map(|r| r.calibration_id));
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sensor_calibrations::Entity::find()
+        .filter(sensor_calibrations::Column::Id.is_in(ids))
+        .all(conn)
+        .await?;
+    Ok(curves_by_id(
+        rows.into_iter().map(|c| (c.id, c.slope, c.intercept)),
+    ))
+}
+
+/// The standard curves a pass's readings claim, with the instrument each was fitted on.
+pub(super) struct ClaimedCurves {
+    pub(super) instruments: HashMap<Uuid, Uuid>,
+    pub(super) curves: HashMap<Uuid, sensor_calibrations::service::Curve>,
+}
+
+pub(super) async fn find_claimed_standard_curves<C: ConnectionTrait>(
+    conn: &C,
+    readings: &[IngestReading],
+) -> AppResult<ClaimedCurves> {
+    let ids = named_once(readings.iter().filter_map(|r| r.standard_curve_id));
+    if ids.is_empty() {
+        return Ok(ClaimedCurves {
+            instruments: HashMap::new(),
+            curves: HashMap::new(),
+        });
+    }
+    let rows = standard_curves::Entity::find()
+        .filter(standard_curves::Column::Id.is_in(ids))
+        .all(conn)
+        .await?;
+    Ok(ClaimedCurves {
+        instruments: rows.iter().map(|c| (c.id, c.sensor_id)).collect(),
+        curves: curves_by_id(rows.iter().map(|c| (c.id, c.slope, c.intercept))),
+    })
+}
+
+/// Holds each standard curve claim to the grab rules: fitted on the reading's instrument, on a spot
+/// reading. An inadmissible claim is stripped, never the reading, and returned for the review
+/// queue, so a mis-homed curve or a mis-declared stream instrument costs a correction, not data.
+pub(super) fn strip_inadmissible_curve_claims(
+    readings: &mut [IngestReading],
+    claimed: &ClaimedCurves,
+    attribution: &IngestAttribution,
+) -> StrippedClaims {
+    let mut stripped = StrippedClaims::new();
+    for r in readings.iter_mut() {
+        let Some(id) = r.standard_curve_id else {
+            continue;
+        };
+        let instrument = attribution.instrument_of(r);
+        let curve_instrument = claimed.instruments.get(&id).copied();
+        let reason = match curve_instrument {
+            None => "names no standard curve",
+            Some(fitted_on) if Some(fitted_on) != instrument => {
+                "fitted on a different instrument than the reading's"
+            }
+            Some(_) if attribution.measurement_type_of(r) != SPOT => {
+                "the reading is not a spot measurement"
+            }
+            Some(_) => continue,
+        };
+        r.standard_curve_id = None;
+        stripped.entry(r.time).or_default().push(serde_json::json!({
+            "replicate_index": r.replicate_index,
+            "standard_curve_id": id,
+            "curve_instrument_id": curve_instrument,
+            "reading_instrument_id": instrument,
+            "reason": reason,
+        }));
+    }
+    stripped
+}
+
+/// The row a reading is stored as.
+///
+/// On a paired stream every column is resolved: the site from the deployment covering the reading
+/// (a sensor can move while the stream keeps pointing at one slot), the instrument, the one curve
+/// both `calibration_id` and `calibrated_value` come from (the caller's if it named one, else
+/// whichever window covers the reading's own time), and a hand-picked standard curve composed on
+/// that result. No curve leaves `calibrated_value` NULL, which is what a reprocess over the same
+/// windows leaves too.
+///
+/// On an unpaired stream the reading is staged: what the caller declared is kept, because that is a
+/// claim somebody made, and nothing is derived until the pairing stamps site, parameter and
+/// instrument together (B223). The cadence still reads the channel's instrument, since which device
+/// a feed comes through is a fact about the channel.
+pub(super) fn reading_model(
+    stream_id: Uuid,
+    r: &IngestReading,
+    attribution: &IngestAttribution,
+    curves: &IngestCurves,
+) -> readings::ActiveModel {
+    let paired = attribution.paired();
+    let slot = attribution.windows.get(&r.time);
+    let owner = attribution.owners.get(&r.time);
+    let sensor_id = attribution.instrument_of(r);
+    let curve = r
+        .calibration_id
+        .and_then(|id| curves.declared.get(&id).copied())
+        .or_else(|| {
+            sensor_id.and_then(|s| {
+                curves
+                    .resolved
+                    .get(&(s, attribution.parameter_id, r.time))
+                    .copied()
+            })
+        });
+    let standard = r
+        .standard_curve_id
+        .and_then(|id| curves.standard.get(&id).copied());
+    readings::ActiveModel {
+        standard_curve_id: Set(standard.map(|c| c.id)),
+        provenance_kind: Set(Some("sync".to_string())),
+        site_id: Set(attribution
+            .site_id
+            .map(|paired_site| slot.and_then(|s| s.site_id).unwrap_or(paired_site))),
+        parameter_id: Set(attribution.parameter_id),
+        calibrated_value: Set(match (curve.filter(|_| paired), standard) {
+            (None, None) => None,
+            (base, standard) => Some(sensor_calibrations::service::apply_curves(
+                r.raw_value,
+                base,
+                standard,
+            )),
+        }),
+        sensor_id: Set(if paired { sensor_id } else { r.sensor_id }),
+        calibration_id: Set(if paired {
+            curve.map(|c| c.id)
+        } else {
+            r.calibration_id
+        }),
+        deployment_id: Set(if paired {
+            r.deployment_id
+                .or_else(|| slot.and_then(|s| s.deployment_id))
+                .or_else(|| owner.and_then(|o| o.deployment_id))
+        } else {
+            r.deployment_id
+        }),
+        measurement_type: Set(Some(attribution.measurement_type_of(r))),
+        ..readings::new(stream_id, r.time.into(), r.replicate_index, r.raw_value)
+    }
+}
+
+/// The rows a pass's readings are stored as, in payload order.
+pub(super) fn reading_models(
+    stream_id: Uuid,
+    readings: &[IngestReading],
+    attribution: &IngestAttribution,
+    curves: &IngestCurves,
+) -> Vec<readings::ActiveModel> {
+    readings
+        .iter()
+        .map(|r| reading_model(stream_id, r, attribution, curves))
+        .collect()
+}
+
+/// The span of a pass's spot rows on a paired stream, the window its sample groups and visits are
+/// rebuilt over: a (site, parameter, instant) group takes in rows already stored at the slot. An
+/// unpaired stream has none, since its pairing backfill materialises them.
+pub(super) fn spot_window(models: &[readings::ActiveModel], paired: bool) -> Option<IngestSpan> {
+    if !paired {
+        return None;
+    }
+    let spot_times = models
+        .iter()
+        .filter_map(|m| match (&m.measurement_type, &m.time) {
+            (ActiveValue::Set(Some(t)), ActiveValue::Set(time)) if t == SPOT => {
+                Some(time.with_timezone(&Utc))
+            }
+            _ => None,
+        });
+    spot_times.clone().min().zip(spot_times.max())
+}
+
+/// The rows a pass writes. Under a diff, only the keys it classified new: an unchanged row
+/// rewritten with identical values is WAL and an upsert count for nothing, and a changed one is a
+/// proposal (Q84). An overwrite writes every row, since it exists to rewrite attribution, which
+/// value equality cannot see.
+pub(super) fn rows_to_write<'a>(
+    models: &'a [readings::ActiveModel],
+    readings: &[IngestReading],
+    diff: Option<&DiffOutcome>,
+    overwrite: bool,
+) -> std::borrow::Cow<'a, [readings::ActiveModel]> {
+    match diff {
+        Some(d) if !overwrite => models
+            .iter()
+            .zip(readings)
+            .filter(|(_, r)| d.write_keys.contains(&(r.time, r.replicate_index)))
+            .map(|(m, _)| m.clone())
+            .collect::<Vec<_>>()
+            .into(),
+        _ => models.into(),
+    }
+}
+
+/// Whether a pass changed any group's content. One that wrote, withdrew or reinstated nothing left
+/// the sample statistics and visit attachments as they stood; an overwrite may have moved
+/// attribution, so it always counts.
+pub(super) fn pass_touched_groups(overwrite: bool, diff: Option<&DiffOutcome>) -> bool {
+    overwrite || diff.is_none_or(|d| d.new_rows + d.changed + d.withdrawn + d.reinstated > 0)
+}
+
+/// A pass's write: the windowed diff, the rows and the decisions they carry, the sample groups and
+/// visits they touch, the statistics audit, the stripped-claim holds and the receipt, all
+/// committing together.
+pub(super) struct IngestPass<'a> {
+    pub(super) payload: &'a IngestReadingsRequest,
+    pub(super) models: &'a [readings::ActiveModel],
+    pub(super) funnel: &'a IngestFunnel,
+    pub(super) stripped: &'a StrippedClaims,
+    pub(super) sample_window: Option<IngestSpan>,
+    pub(super) paired: bool,
+    pub(super) is_sync_service: bool,
+    pub(super) actor: &'a str,
+}
+
+/// What a pass's write left: the rows the upsert counted, the diff's classification, and the visits
+/// it touched.
+pub(super) struct IngestWritten {
+    pub(super) inserted: usize,
+    pub(super) diff: Option<DiffOutcome>,
+    pub(super) touched_events: Vec<TouchedEvent>,
+}
+
+impl IngestPass<'_> {
+    /// Writes the pass on `txn`. An overwrite, a window, a sample stamping reaching back-dated
+    /// groups or an audit can touch compressed chunks, so those run guarded, with the decompression
+    /// cap lifted; a plain append of new rows is a plain insert.
+    pub(super) async fn write(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+    ) -> AppResult<IngestWritten> {
+        if !self.is_guarded() {
+            let inserted = insert_reading_chunks(txn, self.models, Replace::Nothing).await?;
+            return Ok(IngestWritten {
+                inserted,
+                diff: None,
+                touched_events: Vec::new(),
+            });
+        }
+        bulk_write::guarded(txn, async |guarded| self.write_guarded(guarded).await).await
+    }
+
+    fn is_guarded(&self) -> bool {
+        self.payload.overwrite
+            || self.sample_window.is_some()
+            || self.payload.window.is_some()
+            || self.payload.audit.as_deref().is_some_and(|a| !a.is_empty())
+            || !self.stripped.is_empty()
+    }
+
+    async fn write_guarded(&self, txn: &sea_orm::DatabaseTransaction) -> AppResult<IngestWritten> {
+        let diff = self.diff_window(txn).await?;
+        let replace = if self.payload.overwrite {
+            Replace::ValuesAndAttribution
+        } else {
+            Replace::Nothing
+        };
+        let rows = rows_to_write(
+            self.models,
+            &self.payload.readings,
+            diff.as_ref(),
+            self.payload.overwrite,
+        );
+        self.record_corrections(txn, &rows, replace).await?;
+        let inserted = insert_reading_chunks(txn, &rows, replace).await?;
+        record_curve_claims(txn, &rows, self.actor, Origin::Sync).await?;
+        let touched_events = self.regroup_spot_rows(txn, diff.as_ref()).await?;
+        self.audit_replicates(txn, diff.as_ref()).await?;
+        self.hold_stripped_claims(txn).await?;
+        self.record_receipt(txn, diff.as_ref()).await?;
+        Ok(IngestWritten {
+            inserted,
+            diff,
+            touched_events,
+        })
+    }
+
+    /// The windowed diff of a completeness claim against the store; none without a claim.
+    async fn diff_window(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+    ) -> AppResult<Option<DiffOutcome>> {
+        let Some(window) = &self.payload.window else {
+            return Ok(None);
+        };
+        let admitted: Vec<AdmittedRow> = self
+            .payload
+            .readings
+            .iter()
+            .map(|r| {
+                (
+                    (r.time, r.replicate_index),
+                    r.raw_value,
+                    r.standard_curve_id,
+                )
+            })
+            .collect();
+        run_windowed_diff(
+            txn,
+            self.payload.stream_id,
+            window,
+            &admitted,
+            self.funnel.rejected_keys(),
+            self.actor,
+            self.paired,
+        )
+        .await
+        .map(Some)
+    }
+
+    /// A correction is a decision of sync origin (ADR 0008), recorded before the upsert so the
+    /// value it replaces is what the record holds.
+    async fn record_corrections(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        rows: &[readings::ActiveModel],
+        replace: Replace,
+    ) -> AppResult<()> {
+        if replace != Replace::Nothing {
+            record_value_corrections(txn, rows, self.actor, Origin::Sync).await?;
+        }
+        Ok(())
+    }
+
+    /// Rebuilds the sample groups and the visit attachments over the pass's spot window and names
+    /// the visits touched. Each source row maps onto one collection event (D7): a sync service
+    /// replaying a portal row writes a portal_sync event, any other writer is a person.
+    async fn regroup_spot_rows(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        diff: Option<&DiffOutcome>,
+    ) -> AppResult<Vec<TouchedEvent>> {
+        let Some((lo, hi)) = self
+            .sample_window
+            .filter(|_| pass_touched_groups(self.payload.overwrite, diff))
+        else {
+            return Ok(Vec::new());
+        };
+        let window = || {
+            Condition::all()
+                .add(flows::row(readings::Column::StreamId).eq(self.payload.stream_id))
+                .add(flows::row(readings::Column::Time).gte(DateTimeWithTimeZone::from(lo)))
+                .add(flows::row(readings::Column::Time).lte(DateTimeWithTimeZone::from(hi)))
+        };
+        let source = if self.is_sync_service {
+            collection_events::service::EventSource::PortalSync
+        } else {
+            collection_events::service::EventSource::Manual
+        };
+        materialise_samples(txn, window()).await?;
+        collection_events::service::attach_collection_events(txn, window(), source).await?;
+        flows::touched_events(txn, window()).await
+    }
+
+    /// The statistics audit judges what this transaction stored, so its holds commit or roll back
+    /// with the writes. A braked pass withheld the corrections the claim describes, so the stored
+    /// groups are not what the source asserted and the holds stand.
+    async fn audit_replicates(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        diff: Option<&DiffOutcome>,
+    ) -> AppResult<()> {
+        let Some(audits) = self.payload.audit.as_deref().filter(|a| !a.is_empty()) else {
+            return Ok(());
+        };
+        if diff.is_some_and(|d| d.braked) {
+            return Ok(());
+        }
+        run_replicate_audit(txn, self.payload.stream_id, audits, self.paired).await
+    }
+
+    /// One review-queue hold per instant whose curve claim was stripped. Raised after the
+    /// statistics audit on purpose: at one (stream, instant) key the later upsert wins, and a
+    /// stripped claim explains the disagreement the audit would otherwise report bare.
+    async fn hold_stripped_claims(&self, txn: &sea_orm::DatabaseTransaction) -> AppResult<()> {
+        if self.stripped.is_empty() {
+            return Ok(());
+        }
+        let status = audit::status_for(self.paired);
+        for (time, claims) in self.stripped {
+            upsert_curve_claim_hold(txn, self.payload.stream_id, *time, claims, status).await?;
+        }
+        tracing::warn!(
+            stream_id = %self.payload.stream_id,
+            instants = self.stripped.len(),
+            "Inadmissible standard curve claims stripped; readings stored uncorrected and held for review"
+        );
+        Ok(())
+    }
+
+    /// The receipt of a windowed pass, committed with it.
+    async fn record_receipt(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        diff: Option<&DiffOutcome>,
+    ) -> AppResult<()> {
+        let (Some(window), Some(d)) = (&self.payload.window, diff) else {
+            return Ok(());
+        };
+        write_receipt(
+            txn,
+            self.payload.stream_id,
+            window,
+            self.funnel.submitted,
+            d,
+            self.funnel.rejected_total(),
+            &self.funnel.rejected_by_kind(),
+        )
+        .await
+    }
+}
+
+/// What a committed pass did to served content, the gate every step after the commit reads.
+pub(super) struct IngestEffect {
+    pub(super) inserted: usize,
+    pub(super) withdrawn: usize,
+    pub(super) reinstated: usize,
+    /// An overwrite that wrote rows: history bounded queries may have cached, and values the
+    /// rollups have already materialised.
+    pub(super) corrected: bool,
+    /// Sample formation, a window, a withdrawal or a correction rewrote served history, which no
+    /// cache anywhere may be left to expire on TTL.
+    pub(super) rewrote_history: bool,
+    pub(super) span: Option<IngestSpan>,
+}
+
+impl IngestEffect {
+    pub(super) fn of(
+        payload: &IngestReadingsRequest,
+        sample_window: Option<IngestSpan>,
+        inserted: usize,
+        diff: Option<&DiffOutcome>,
+    ) -> Self {
+        let withdrawn = diff.map_or(0, |d| d.withdrawn);
+        let corrected = payload.overwrite && inserted > 0;
+        let times = || payload.readings.iter().map(|r| r.time);
+        Self {
+            inserted,
+            withdrawn,
+            reinstated: diff.map_or(0, |d| d.reinstated),
+            corrected,
+            rewrote_history: corrected
+                || sample_window.is_some()
+                || payload.window.is_some()
+                || withdrawn > 0,
+            span: times().min().zip(times().max()),
+        }
+    }
+
+    /// Rows whose served value moved: a withdrawal with nothing inserted still rewrote history. A
+    /// classified-changed key moved nothing; it is a proposal until somebody accepts it.
+    pub(super) fn moved(&self) -> u64 {
+        u64::try_from(self.inserted + self.withdrawn + self.reinstated).unwrap_or(u64::MAX)
+    }
+
+    pub(super) fn written(&self, slot: Slot, touched_events: Vec<TouchedEvent>) -> Written {
+        Written::new(self.moved())
+            .announced(u64::try_from(self.inserted).unwrap_or(u64::MAX))
+            .over(self.span)
+            .at(vec![slot])
+            .touching(touched_events)
+    }
+
+    /// The refresh is best-effort: the rows are committed and the cursor is about to advance past
+    /// them, so a refresh losing a lock to the janitor must not turn the write into a 500 that
+    /// replays it forever. Episodes are rebuilt inline, since a pass fires every sync cycle per
+    /// stream and one job each would be the noise.
+    pub(super) fn axes(&self) -> Axes {
+        Axes {
+            cache: if self.rewrote_history {
+                Cache::All
+            } else {
+                Cache::Sites
+            },
+            refresh: if self.corrected {
+                Refresh::Range { fatal: false }
+            } else {
+                Refresh::Skip
+            },
+            announce: true,
+            reconcile_alarms: true,
+            episodes: Episodes::Inline,
+            recompute_derived: false,
+            writer: flows::Writer::Person,
+        }
+    }
+}
+
+/// Recomposes a corrected span from whichever curves each row ends up carrying, before the rollups
+/// read it back: the upsert leaves a hand-picked curve standing and the correction resolved only a
+/// base. Best effort, since the rows are committed.
+pub(super) async fn recompose_corrected_span(
+    db: &DatabaseConnection,
+    stream_id: Uuid,
+    effect: &IngestEffect,
+) {
+    let Some((lo, hi)) = effect.span.filter(|_| effect.corrected) else {
+        return;
+    };
+    if let Err(e) = sensor_calibrations::service::recompose_from_own_curves_guarded(
+        db,
+        Expr::cust("TRUE"),
+        "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
+        vec![
+            stream_id.into(),
+            DateTimeWithTimeZone::from(lo).into(),
+            DateTimeWithTimeZone::from(hi).into(),
+        ],
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "recompose after overwrite failed");
+    }
+}
+
+/// Where the stream's cursor moves: the pass's newest instant, when it is past the stored one.
+/// Every group is admitted (an audit disagreement is a review record, not a gate), so the cursor
+/// always advances to the batch's newest.
+pub(super) fn advance_cursor(
+    readings: &[IngestReading],
+    last_data_time: Option<DateTimeWithTimeZone>,
+) -> Option<DateTime<Utc>> {
+    readings
+        .iter()
+        .map(|r| r.time)
+        .max()
+        .filter(|newest| last_data_time.is_none_or(|t| *newest > t.with_timezone(&Utc)))
+}
+
+/// The handshake digest a cleanly applied window leaves on its stream: no brake, no holds, no
+/// proposal awaiting, nothing rejected and no curve claim stripped. The sync client compares its
+/// next payload against it to skip re-sending unchanged content, so a pass that was not clean
+/// stores none and the window keeps re-asserting until a person rules.
+pub(super) fn clean_digest(
+    window: Option<&SourceWindow>,
+    rejected_total: usize,
+    claims_kept: bool,
+    diff: Option<&DiffOutcome>,
+) -> Option<String> {
+    let clean = rejected_total == 0
+        && claims_kept
+        && diff.is_some_and(|d| !d.braked && d.holds_raised == 0 && d.proposals_awaiting == 0);
+    window
+        .and_then(|w| w.content_digest.clone())
+        .filter(|_| clean)
+}
+
+/// Records what a pass leaves on its stream, the cursor and a changed digest. Written only while
+/// the stream's pairing is still the one the pass attributed under, and best effort: the rows are
+/// committed.
+pub(super) async fn record_stream_pass(
+    db: &DatabaseConnection,
+    stream: &data_streams::models::Model,
+    cursor: Option<DateTime<Utc>>,
+    digest: Option<String>,
+) {
+    let digest = digest.filter(|d| stream.last_window_digest.as_ref() != Some(d));
+    if cursor.is_none() && digest.is_none() {
+        return;
+    }
+    let recorded = data_streams::service::record_pass(
+        stream.id,
+        stream.site_parameter_id,
+        cursor.map(Into::into),
+        digest,
+    )
+    .exec(db)
+    .await;
+    match recorded {
+        Ok(r) if r.rows_affected == 0 => tracing::info!(
+            stream_id = %stream.id,
+            "Stream pairing changed after the pass read it; cursor and digest left to the next pass"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "Failed to update stream sync state"),
+    }
+}
+
+/// The instants whose derived values a pass may have moved, sorted and once each. A withdrawn key
+/// is absent from the payload by construction and a reinstated one likewise, so both are unioned
+/// in, or a derived value computed from a retracted input is never revisited.
+pub(super) fn derived_timestamps(
+    readings: &[IngestReading],
+    diff: Option<&DiffOutcome>,
+) -> Vec<DateTime<Utc>> {
+    let mut times: Vec<DateTime<Utc>> = readings.iter().map(|r| r.time).collect();
+    if let Some(d) = diff {
+        times.extend(d.withdrawn_keys.iter().map(|(t, _)| *t));
+        times.extend(d.reinstated_keys.iter().map(|(t, _)| *t));
+    }
+    times.sort();
+    times.dedup();
+    times
+}
+
+/// Enqueues the derived values a paired pass's instants feed, as a tracked `ingest_derived` job.
+/// Skipped where the site has no active derived parameter: that job would compute nothing, and was
+/// the dominant source of empty ones.
+pub(super) async fn enqueue_ingest_derived(
+    db: &DatabaseConnection,
+    stream_id: Uuid,
+    site_id: Option<Uuid>,
+    effect: &IngestEffect,
+    readings: &[IngestReading],
+    diff: Option<&DiffOutcome>,
+) -> AppResult<()> {
+    let Some(site_id) = site_id.filter(|_| effect.moved() > 0) else {
+        return Ok(());
+    };
+    let active =
+        crate::routes::private::derived_parameters::flows::site_has_active_derived(db, site_id)
+            .await
+            .unwrap_or(true);
+    if !active {
+        return Ok(());
+    }
+    crate::routes::private::reprocessing_jobs::service::enqueue(
+        db,
+        "ingest_derived",
+        None,
+        None,
+        &serde_json::json!({
+            "site_id": site_id,
+            "stream_id": stream_id,
+            "timestamps": derived_timestamps(readings, diff),
+        }),
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The response, with the diff's classification in place of the upsert's count under a window:
+/// the upsert counts updates too, and the classification is the accurate account.
+pub(super) fn classified_outcome(
+    mut outcome: IngestResponse,
+    diff: Option<&DiffOutcome>,
+    window: Option<&SourceWindow>,
+) -> IngestResponse {
+    if let Some(d) = diff {
+        outcome.inserted = d.new_rows;
+        outcome.changed = d.changed;
+        outcome.proposed = d.proposed;
+        outcome.withdrawn = d.withdrawn;
+        outcome.unchanged = d.unchanged;
+        outcome.retained = d.retained;
+        outcome.accepted_window = window.cloned();
+        if d.braked {
+            tracing::warn!(stream_id = %outcome.stream_id, changed = d.changed, withdrawn = d.withdrawn, "Windowed pass braked; corrections and withdrawals held for review");
+        }
+    }
+    tracing::debug!(inserted = outcome.inserted, skipped = outcome.skipped, changed = outcome.changed, withdrawn = outcome.withdrawn, reinstated = diff.map_or(0, |d| d.reinstated), stream_id = %outcome.stream_id, paired = outcome.paired, "Ingest complete");
+    outcome
 }
 
 /// Grabs are spot measurements by definition: a bottle, not a logger cadence.
@@ -9955,6 +11061,641 @@ pub(super) async fn compute_overlaps(
     })
 }
 
+/// A slot at one instant: the key a file's rows are deduplicated, owned and attributed by.
+pub(super) type SlotInstant = (Uuid, chrono::DateTime<chrono::Utc>);
+
+/// One stored cell of a file: parameter, instant, value as stored, and the file line it came from.
+pub(super) type ImportRow = (Uuid, chrono::DateTime<chrono::Utc>, f64, usize);
+
+/// The zone a file's naive timestamps are in, as declared by the caller.
+pub(super) fn declared_offset(hours: Option<f64>) -> chrono::Duration {
+    chrono::Duration::milliseconds((hours.unwrap_or(0.0) * 3_600_000.0) as i64)
+}
+
+/// `curves` fills a tool's curve slots, so a file naming no tool has none to fill.
+pub(super) fn require_tool_for_curves(req: &ImportCsvRequest) -> AppResult<()> {
+    if req.curves.is_some() && req.tool.is_none() {
+        return Err(AppError::BadRequest(
+            "curves fills a tool's curve slots; name the tool the file is entry for".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The problems a file's rows carry: the first `MAX_ERRORS` listed, every one counted.
+#[derive(Default)]
+pub(super) struct RowErrors {
+    pub(super) listed: Vec<RowError>,
+    pub(super) count: usize,
+}
+
+impl RowErrors {
+    pub(super) fn record(&mut self, row: usize, message: String) {
+        self.count += 1;
+        if self.listed.len() < MAX_ERRORS {
+            self.listed.push(RowError { row, message });
+        }
+    }
+}
+
+/// What a header can name at one site: the site's slot names and aliases first, then the catalog's
+/// codes and aliases. A calculation's output is recognised so it can be refused.
+#[derive(Default)]
+pub(super) struct ColumnResolver {
+    site_names: HashMap<String, (Uuid, String)>,
+    site_aliases: HashMap<String, (Uuid, String)>,
+    catalog: HashMap<String, Uuid>,
+    names: HashMap<Uuid, String>,
+    at_site: HashSet<Uuid>,
+    derived_outputs: HashSet<Uuid>,
+}
+
+impl ColumnResolver {
+    /// From the site's slot columns, the catalog as `(id, code, aliases)` and every calculation
+    /// output.
+    pub(super) fn new(
+        slots: Vec<SlotColumnRow>,
+        catalog: impl IntoIterator<Item = (Uuid, String, Vec<String>)>,
+        derived_outputs: HashSet<Uuid>,
+    ) -> Self {
+        let mut resolver = Self {
+            derived_outputs,
+            ..Self::default()
+        };
+        for row in slots {
+            let pid = row.parameter_id;
+            let sp_name = row.sp_name.unwrap_or_default();
+            let param_name = row.param_name.unwrap_or_default();
+            resolver
+                .site_names
+                .insert(sp_name.to_lowercase(), (pid, sp_name.clone()));
+            resolver
+                .site_names
+                .insert(param_name.to_lowercase(), (pid, sp_name.clone()));
+            resolver.names.insert(pid, sp_name.clone());
+            resolver.at_site.insert(pid);
+            for alias in row.aliases.unwrap_or_default() {
+                resolver
+                    .site_aliases
+                    .insert(alias.to_lowercase(), (pid, sp_name.clone()));
+            }
+        }
+        for (pid, code, aliases) in catalog {
+            resolver.catalog.insert(code.to_lowercase(), pid);
+            for alias in &aliases {
+                resolver.catalog.insert(alias.to_lowercase(), pid);
+            }
+            resolver.names.entry(pid).or_insert(code);
+        }
+        resolver
+    }
+
+    /// The parameter a header names, and the name it is reported under.
+    pub(super) fn resolve_header(&self, header: &str) -> Option<(Uuid, String)> {
+        let key = header.to_lowercase();
+        self.site_names
+            .get(&key)
+            .or_else(|| self.site_aliases.get(&key))
+            .cloned()
+            .or_else(|| self.catalog.get(&key).map(|&pid| (pid, self.name_of(pid))))
+    }
+
+    /// The parameter an explicit mapping names, by id or by any spelling a header may use.
+    pub(super) fn resolve_target(&self, target: &str) -> Option<(Uuid, String)> {
+        if let Ok(pid) = Uuid::parse_str(target) {
+            return self.names.get(&pid).map(|name| (pid, name.clone()));
+        }
+        self.resolve_header(target)
+    }
+
+    fn name_of(&self, pid: Uuid) -> String {
+        self.names.get(&pid).cloned().unwrap_or_default()
+    }
+}
+
+/// What a file's header does with each column.
+#[derive(Default)]
+pub(super) struct ColumnPlan {
+    pub(super) mappings: Vec<ColumnMapping>,
+    pub(super) mapped_columns: HashMap<String, String>,
+    pub(super) skipped_columns: Vec<String>,
+    pub(super) unmapped_columns: Vec<String>,
+    pub(super) warnings: Vec<String>,
+}
+
+/// Resolve every header but the timestamp: an explicit mapping first (`null` skips the column),
+/// then the resolver. A calculation's output is skipped, since it is computed and never ingested,
+/// and a parameter the site has no slot for is imported with a warning.
+pub(super) fn plan_columns(
+    headers: &[&str],
+    datetime_idx: usize,
+    mapping: Option<&HashMap<String, Option<String>>>,
+    resolver: &ColumnResolver,
+    site_name: &str,
+) -> ColumnPlan {
+    let mut plan = ColumnPlan::default();
+    for (idx, header) in headers.iter().enumerate() {
+        if idx == datetime_idx {
+            continue;
+        }
+        let resolved = match mapping.and_then(|m| m.get(*header)) {
+            Some(None) => {
+                plan.skipped_columns.push((*header).to_string());
+                continue;
+            }
+            Some(Some(target)) => {
+                let Some(resolved) = resolver.resolve_target(target) else {
+                    plan.unmapped_columns.push((*header).to_string());
+                    plan.warnings.push(format!(
+                        "Explicit mapping target '{target}' for column '{header}' is not a known parameter"
+                    ));
+                    continue;
+                };
+                Some(resolved)
+            }
+            None => resolver.resolve_header(header),
+        };
+        match resolved {
+            Some((pid, _)) if resolver.derived_outputs.contains(&pid) => {
+                plan.skipped_columns.push((*header).to_string());
+            }
+            Some((pid, resolved_name)) => {
+                plan.mapped_columns
+                    .insert((*header).to_string(), resolved_name);
+                if !resolver.at_site.contains(&pid) {
+                    plan.warnings.push(format!(
+                        "Column '{header}' maps to parameter '{}', which is not assigned to site '{site_name}'; it will be stored but not exposed until you add the site parameter",
+                        resolver.name_of(pid)
+                    ));
+                }
+                plan.mappings.push(ColumnMapping {
+                    idx,
+                    header: (*header).to_string(),
+                    parameter_id: pid,
+                    conversion_factor: 1.0,
+                    conversion_offset: 0.0,
+                });
+            }
+            None => plan.unmapped_columns.push((*header).to_string()),
+        }
+    }
+    plan
+}
+
+/// Refuse a file with no resolved column left to import.
+pub(super) fn require_columns(plan: &ColumnPlan) -> AppResult<()> {
+    if plan.mappings.is_empty() {
+        return Err(AppError::BadRequest(
+            "No CSV columns resolved to ingestible parameters for this site's project".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A reader over a wide CSV: headed, trimmed, and tolerant of short rows.
+pub(super) fn csv_reader(text: &str) -> csv::Reader<&[u8]> {
+    csv::ReaderBuilder::new()
+        .has_headers(true)
+        .trim(csv::Trim::All)
+        .flexible(true)
+        .from_reader(text.as_bytes())
+}
+
+/// The file's header row.
+pub(super) fn file_headers<R: std::io::Read>(
+    reader: &mut csv::Reader<R>,
+) -> AppResult<csv::StringRecord> {
+    reader
+        .headers()
+        .cloned()
+        .map_err(|e| AppError::BadRequest(format!("Failed to read CSV header: {e}")))
+}
+
+/// A file's rows as parsed: the cells to store, the span they cover and what could not be read.
+pub(super) struct ParsedFile {
+    pub(super) rows: Vec<ImportRow>,
+    pub(super) earliest: Option<chrono::DateTime<chrono::Utc>>,
+    pub(super) latest: Option<chrono::DateTime<chrono::Utc>>,
+    /// Rows whose timestamp was admitted, whatever their cells held.
+    pub(super) row_count: usize,
+    pub(super) errors: RowErrors,
+}
+
+/// Read every row after the header. A bad row or cell is recorded against its line and skipped,
+/// so a partly malformed file still imports its good rows. Every row is judged against the one
+/// `now`, so two rows carrying one timestamp cannot land on opposite sides of the lead bound.
+pub(super) fn parse_rows<R: std::io::Read>(
+    reader: &mut csv::Reader<R>,
+    datetime_idx: usize,
+    tz_offset: chrono::Duration,
+    mappings: &[ColumnMapping],
+    now: chrono::DateTime<chrono::Utc>,
+) -> ParsedFile {
+    let mut file = ParsedFile {
+        rows: Vec::new(),
+        earliest: None,
+        latest: None,
+        row_count: 0,
+        errors: RowErrors::default(),
+    };
+    // The header is line 1.
+    for (record, line) in reader.records().zip(2usize..) {
+        let record = match record {
+            Ok(r) => r,
+            Err(e) => {
+                file.errors.record(line, format!("CSV parse error: {e}"));
+                continue;
+            }
+        };
+        let dt_cell = record.get(datetime_idx).unwrap_or("");
+        let Some(time) = parse_datetime(dt_cell, tz_offset) else {
+            file.errors
+                .record(line, format!("Unparseable DateTime '{dt_cell}'"));
+            continue;
+        };
+        if let Some(reason) = admission::time_rejection_at(now, time) {
+            file.errors.record(line, reason);
+            continue;
+        }
+        file.row_count += 1;
+        file.earliest = Some(file.earliest.map_or(time, |e| Ord::min(e, time)));
+        file.latest = Some(file.latest.map_or(time, |l| Ord::max(l, time)));
+        for m in mappings {
+            match admission::classify_cell(record.get(m.idx).unwrap_or("")) {
+                admission::Cell::Missing => {}
+                admission::Cell::Invalid(reason) => {
+                    file.errors
+                        .record(line, format!("Column '{}': {reason}", m.header));
+                }
+                admission::Cell::Value(raw) => {
+                    let stored = (raw - m.conversion_offset) / m.conversion_factor;
+                    file.rows.push((m.parameter_id, time, stored, line));
+                }
+            }
+        }
+    }
+    file
+}
+
+/// The header each mapped parameter was read from, for naming it in a row error.
+pub(super) fn headers_by_parameter(mappings: &[ColumnMapping]) -> HashMap<Uuid, String> {
+    mappings
+        .iter()
+        .map(|m| (m.parameter_id, m.header.clone()))
+        .collect()
+}
+
+/// Each id once, in order.
+pub(super) fn distinct_ids(ids: impl IntoIterator<Item = Uuid>) -> Vec<Uuid> {
+    let mut ids: Vec<Uuid> = ids.into_iter().collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Refuse the rows landing on a slot a replicate-family stream serves. A reading's
+/// replicate_index is the source's column position there, so an import numbering from 0 would
+/// fabricate replicates, and a row beside the family would double-serve the instant. Returns
+/// whether any row was refused.
+pub(super) fn refuse_family_slots(
+    rows: &mut Vec<ImportRow>,
+    owning_stream: &HashMap<SlotInstant, Uuid>,
+    family_keys: &HashMap<Uuid, String>,
+    headers: &HashMap<Uuid, String>,
+    errors: &mut RowErrors,
+) -> bool {
+    let before = rows.len();
+    rows.retain(|(pid, time, _, line)| {
+        let Some(key) = owning_stream
+            .get(&(*pid, *time))
+            .and_then(|sid| family_keys.get(sid))
+        else {
+            return true;
+        };
+        errors.record(
+            *line,
+            format!(
+                "Column '{}': {} is served by replicate family stream '{key}'; its replicates \
+                 sync from the source and cannot be written by CSV import",
+                headers.get(pid).map_or("?", String::as_str),
+                time.to_rfc3339()
+            ),
+        );
+        false
+    });
+    rows.len() != before
+}
+
+/// The cadence a row will be written at, resolved as the write resolves it: the request's
+/// declaration, the stream that will carry the row, the deployed sensor's data_frequency, then
+/// continuous.
+pub(super) struct SlotCadence<'a> {
+    pub(super) declared: Option<&'a str>,
+    pub(super) owning_stream: &'a HashMap<SlotInstant, Uuid>,
+    pub(super) api_stream_of: HashMap<Uuid, Uuid>,
+    pub(super) stream_default: HashMap<Uuid, Option<String>>,
+    pub(super) owners: &'a HashMap<SlotInstant, ResolvedOwner>,
+    pub(super) sensor_types: HashMap<Uuid, &'static str>,
+}
+
+impl SlotCadence<'_> {
+    pub(super) fn of(&self, pid: Uuid, time: chrono::DateTime<chrono::Utc>) -> String {
+        let stream_id = self
+            .owning_stream
+            .get(&(pid, time))
+            .or_else(|| self.api_stream_of.get(&pid));
+        resolve_measurement_type(
+            self.declared,
+            stream_id
+                .and_then(|id| self.stream_default.get(id))
+                .and_then(Option::as_deref),
+            self.owners.get(&(pid, time)).and_then(|o| o.sensor_id),
+            &self.sensor_types,
+        )
+    }
+}
+
+/// Refuse a repeated (parameter, timestamp) on every cadence but spot. A repeat is a source defect
+/// there, and absorbing it as replicate 1 would hide it from the default read and every rollup
+/// while fabricating a grab sample around it; a spot file is a replicate plate, where the repeat is
+/// the point. Returns whether any row was refused.
+pub(super) fn refuse_repeated_slots(
+    rows: &mut Vec<ImportRow>,
+    cadence: impl Fn(Uuid, chrono::DateTime<chrono::Utc>) -> String,
+    headers: &HashMap<Uuid, String>,
+    errors: &mut RowErrors,
+) -> bool {
+    let mut seen: HashSet<SlotInstant> = HashSet::new();
+    let before = rows.len();
+    rows.retain(|(pid, time, _, line)| {
+        let resolved = cadence(*pid, *time);
+        if resolved == "spot" || seen.insert((*pid, *time)) {
+            return true;
+        }
+        errors.record(
+            *line,
+            format!(
+                "Column '{}': timestamp {} is repeated, and a '{resolved}' series holds one \
+                 reading per timestamp",
+                headers.get(pid).map_or("?", String::as_str),
+                time.to_rfc3339()
+            ),
+        );
+        false
+    });
+    rows.len() != before
+}
+
+/// The (parameter, timestamp) groups a spot file holds more than one value for.
+pub(super) fn replicate_groups(measurement_type: Option<&str>, rows: &[ImportRow]) -> usize {
+    if measurement_type != Some("spot") {
+        return 0;
+    }
+    let mut sizes: HashMap<SlotInstant, usize> = HashMap::new();
+    for (pid, t, _, _) in rows {
+        *sizes.entry((*pid, *t)).or_default() += 1;
+    }
+    sizes.values().filter(|n| **n > 1).count()
+}
+
+/// The cells a spot file's seasonal screen reads. A cell already stored with the same value is
+/// its own history, and importing it again changes nothing.
+pub(super) fn screened_cells(
+    rows: &[ImportRow],
+    identical_lines: &HashSet<usize>,
+) -> Vec<(usize, Uuid, chrono::DateTime<chrono::Utc>, f64)> {
+    rows.iter()
+        .filter(|(_, _, _, line)| !identical_lines.contains(line))
+        .map(|(pid, time, value, line)| (*line, *pid, *time, *value))
+        .collect()
+}
+
+/// The stream each row is written onto: the one already holding its slot, so an overwrite
+/// replaces the stored reading rather than adding a second one the rollups would double-count,
+/// else the importer's `api` stream for the parameter. A stream holding more than one of the
+/// file's parameters is not a target, since replicates are numbered per (stream, time).
+pub(super) struct WriteTargets<'a> {
+    owning_stream: &'a HashMap<SlotInstant, Uuid>,
+    api_streams: &'a HashMap<Uuid, Uuid>,
+    shared: HashSet<Uuid>,
+}
+
+impl<'a> WriteTargets<'a> {
+    pub(super) fn new(
+        owning_stream: &'a HashMap<SlotInstant, Uuid>,
+        api_streams: &'a HashMap<Uuid, Uuid>,
+    ) -> Self {
+        let mut params_per_stream: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
+        for ((parameter_id, _), stream_id) in owning_stream {
+            params_per_stream
+                .entry(*stream_id)
+                .or_default()
+                .insert(*parameter_id);
+        }
+        let shared = params_per_stream
+            .into_iter()
+            .filter(|(_, params)| params.len() > 1)
+            .map(|(stream_id, _)| stream_id)
+            .collect();
+        Self {
+            owning_stream,
+            api_streams,
+            shared,
+        }
+    }
+
+    pub(super) fn of(&self, pid: Uuid, time: chrono::DateTime<chrono::Utc>) -> Uuid {
+        self.owning_stream
+            .get(&(pid, time))
+            .filter(|stream_id| !self.shared.contains(*stream_id))
+            .copied()
+            .unwrap_or(self.api_streams[&pid])
+    }
+}
+
+/// The rows as staged for the worker. Sensor and deployment are physical facts about the slot at
+/// that time and are stamped either way, the channel's instrument standing in where no deployment
+/// names one; the calibration is a claim the value is uncorrected input, which only a raw file
+/// makes.
+pub(super) fn staged_rows(
+    site_id: Uuid,
+    rows: &[ImportRow],
+    owners: &HashMap<SlotInstant, ResolvedOwner>,
+    targets: &WriteTargets,
+    channel_instruments: &HashMap<Uuid, Uuid>,
+    values: CsvValueState,
+) -> Vec<StagedRow> {
+    rows.iter()
+        .map(|(parameter_id, time, value, _)| {
+            let owner = owners
+                .get(&(*parameter_id, *time))
+                .cloned()
+                .unwrap_or_default();
+            let stream_id = targets.of(*parameter_id, *time);
+            StagedRow {
+                stream_id,
+                site_id,
+                parameter_id: *parameter_id,
+                time: *time,
+                raw_value: *value,
+                sensor_id: owner
+                    .sensor_id
+                    .or_else(|| channel_instruments.get(&stream_id).copied()),
+                calibration_id: match values {
+                    CsvValueState::Raw => owner.calibration_id,
+                    CsvValueState::Corrected => None,
+                },
+                deployment_id: owner.deployment_id,
+            }
+        })
+        .collect()
+}
+
+/// What a commit does with the file's rows against what is stored.
+pub(super) struct ImportTally {
+    /// Anything to write: a new row, or a differing one an overwrite replaces.
+    pub(super) has_work: bool,
+    pub(super) overlapping: usize,
+    pub(super) inserted_total: usize,
+    pub(super) duplicates: usize,
+    pub(super) overwritten: usize,
+}
+
+/// How the file's rows split into new, unchanged and replaced under the conflict mode.
+pub(super) fn import_tally(
+    rows: usize,
+    identical: usize,
+    differing: usize,
+    conflict: ConflictMode,
+) -> ImportTally {
+    let overlapping = identical + differing;
+    let inserted_total = rows.saturating_sub(overlapping);
+    let (duplicates, overwritten) = match conflict {
+        ConflictMode::Skip => (overlapping, 0),
+        ConflictMode::Overwrite => (identical, differing),
+    };
+    ImportTally {
+        has_work: rows > overlapping || (differing > 0 && conflict == ConflictMode::Overwrite),
+        overlapping,
+        inserted_total,
+        duplicates,
+        overwritten,
+    }
+}
+
+/// How many distinct timestamps the rows cover, each one a derived recompute.
+pub(super) fn distinct_instants(rows: &[ImportRow]) -> usize {
+    rows.iter()
+        .map(|(_, t, _, _)| *t)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// Each mapped parameter paired with its importer stream, as the worker job reads them.
+pub(super) fn param_streams(
+    mappings: &[ColumnMapping],
+    api_streams: &HashMap<Uuid, Uuid>,
+) -> Vec<serde_json::Value> {
+    mappings
+        .iter()
+        .filter_map(|m| {
+            api_streams
+                .get(&m.parameter_id)
+                .map(|&sid| serde_json::json!([m.parameter_id, sid]))
+        })
+        .collect()
+}
+
+/// The `csv_import` job's params: where the staged rows are and what the worker applies them with.
+pub(super) fn import_job_params(
+    import_token: Uuid,
+    site_id: Uuid,
+    site_name: &str,
+    req: &ImportCsvRequest,
+    file: &ParsedFile,
+    overlapping: usize,
+    param_streams: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "import_token": import_token,
+        "site_id": site_id,
+        "site_name": site_name,
+        "conflict": match req.conflict {
+            ConflictMode::Skip => "skip",
+            ConflictMode::Overwrite => "overwrite",
+        },
+        "since": file.earliest.map(|t| t.to_rfc3339()),
+        "latest": file.latest.map(|t| t.to_rfc3339()),
+        "overlapping": overlapping,
+        "param_streams": param_streams,
+        "measurement_type": req.measurement_type.as_deref(),
+    })
+}
+
+/// One site's file as analysed, before anything is written.
+pub(super) struct SiteAnalysis {
+    pub(super) site_id: Uuid,
+    pub(super) site_name: String,
+    pub(super) session_id: Uuid,
+    pub(super) plan: ColumnPlan,
+    pub(super) parsed: ParsedFile,
+    pub(super) replicate_groups: usize,
+    pub(super) overlap: OverlapReport,
+    pub(super) check: Option<ImportCheck>,
+}
+
+/// What a commit wrote, beyond the analysis.
+pub(super) struct Committed {
+    pub(super) tally: ImportTally,
+    pub(super) derived_job_id: Option<Uuid>,
+    pub(super) derived_timestamps: usize,
+}
+
+impl SiteAnalysis {
+    /// The response for this site: a dry run's preview with no commit, else what the commit did.
+    pub(super) fn response(self, commit: Option<Committed>) -> ImportCsvResponse {
+        let dry_run = commit.is_none();
+        let (inserted_total, duplicates, overwritten, derived_job_id, derived_timestamps) = commit
+            .map_or((0, 0, 0, None, 0), |c| {
+                (
+                    c.tally.inserted_total,
+                    c.tally.duplicates,
+                    c.tally.overwritten,
+                    c.derived_job_id,
+                    c.derived_timestamps,
+                )
+            });
+        ImportCsvResponse {
+            site_id: self.site_id,
+            site_name: self.site_name,
+            dry_run,
+            session_id: Some(self.session_id),
+            mapped_columns: self.plan.mapped_columns,
+            skipped_columns: self.plan.skipped_columns,
+            unmapped_columns: self.plan.unmapped_columns,
+            warnings: self.plan.warnings,
+            row_count: self.parsed.row_count,
+            replicate_groups: self.replicate_groups,
+            inserted_total,
+            earliest: self.parsed.earliest,
+            latest: self.parsed.latest,
+            derived_job_id,
+            derived_timestamps,
+            duplicates,
+            overlaps_identical: self.overlap.identical,
+            overlaps_differing: self.overlap.differing,
+            overwritten,
+            overlap_sample: self.overlap.sample,
+            errors: self.parsed.errors.listed,
+            error_count: self.parsed.errors.count,
+            tool_runs_created: 0,
+            curves: Vec::new(),
+            check: self.check,
+            site_imports: Vec::new(),
+        }
+    }
+}
+
 /// Ceiling on tool-entry rows per request: each row is one runner execution plus one grab save,
 /// and a campaign result sheet is tens of rows, not thousands.
 pub(super) const TOOL_IMPORT_ROW_CAP: usize = 500;
@@ -10547,6 +12288,7 @@ pub(super) struct ReconciledRow {
     pub(super) touched: bool,
 }
 
+#[derive(Debug, Default)]
 pub struct DiffOutcome {
     pub new_rows: usize,
     pub changed: usize,
@@ -11102,8 +12844,16 @@ mod provenance;
 mod tail;
 
 #[cfg(test)]
+#[path = "tests/ingest.rs"]
+mod ingest;
+
+#[cfg(test)]
 #[path = "tests/batch.rs"]
 mod batch;
+
+#[cfg(test)]
+#[path = "tests/batch_correction.rs"]
+mod batch_correction_tests;
 
 // --- Statements the handlers and job bodies share ---
 

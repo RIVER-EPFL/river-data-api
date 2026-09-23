@@ -329,3 +329,94 @@ async fn a_named_base_calibration_is_applied_not_just_stamped() {
         "3.0 * 10.0 + 2.0: got {calibrated}"
     );
 }
+
+async fn stored_correction(db: &DatabaseConnection) -> Option<(Option<f64>, Option<Uuid>)> {
+    db.query_one_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "SELECT calibrated_value, calibration_id FROM readings \
+             WHERE parameter_id = '{GLOBAL_PARAM_TEMP_ID}' AND time = '{GRAB_TIME}'"
+        ),
+    ))
+    .await
+    .unwrap()
+    .map(|row| {
+        (
+            row.try_get("", "calibrated_value").unwrap(),
+            row.try_get("", "calibration_id").unwrap(),
+        )
+    })
+}
+
+/// A submitted value the row's calibration does not produce is refused, whether the row names the
+/// calibration or inherits it from the instrument deployed in the slot, since storing it would
+/// record a curve that did not make the number and the drift sweep would later rewrite it.
+#[tokio::test]
+#[serial]
+async fn a_submitted_value_its_calibration_does_not_produce_is_refused() {
+    let fx = setup().await;
+    let sensor = create_sensor(&fx.db, "Batch-Plate-04", GLOBAL_PARAM_TEMP_ID).await;
+    crate::common::sensor_lifecycle::deploy_sensor_for_parameter(
+        &fx.db,
+        sensor.id,
+        SITE1_ID,
+        GLOBAL_PARAM_TEMP_ID,
+        crate::common::sensor_lifecycle::dt("2025-01-01T00:00:00Z"),
+    )
+    .await;
+    let calibration = crate::common::sensor_lifecycle::add_calibration(
+        &fx.db,
+        sensor.id,
+        2.0,
+        0.0,
+        crate::common::sensor_lifecycle::dt("2025-01-01T00:00:00Z"),
+    )
+    .await;
+
+    let named = json!({
+        "site_id": SITE1_ID,
+        "parameter_id": GLOBAL_PARAM_TEMP_ID,
+        "time": GRAB_TIME,
+        "raw_value": 10.0,
+        "calibrated_value": 99.0,
+        "sensor_id": sensor.id,
+        "calibration_id": calibration,
+    });
+    let inherited = json!({
+        "site_id": SITE1_ID,
+        "parameter_id": GLOBAL_PARAM_TEMP_ID,
+        "time": GRAB_TIME,
+        "raw_value": 10.0,
+        "calibrated_value": 99.0,
+    });
+    for reading in [named, inherited] {
+        let (status, body) = post_batch(&fx, reading.clone()).await;
+        assert_eq!(status, 400, "{reading} ({status}): {body}");
+        assert!(
+            body.contains(&calibration.to_string()),
+            "the refusal names the calibration: {body}"
+        );
+        assert_eq!(stored_correction(&fx.db).await, None, "nothing is stored");
+    }
+
+    let (status, body) = post_batch(
+        &fx,
+        json!({
+            "site_id": SITE1_ID,
+            "parameter_id": GLOBAL_PARAM_TEMP_ID,
+            "time": GRAB_TIME,
+            "raw_value": 10.0,
+            "calibrated_value": 20.0,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a value the calibration produces ({status}): {body}"
+    );
+    assert_eq!(
+        stored_correction(&fx.db).await,
+        // 2.0 * 10.0 + 0.0
+        Some((Some(20.0), Some(calibration)))
+    );
+}

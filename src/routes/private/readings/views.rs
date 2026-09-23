@@ -6,7 +6,6 @@ use axum::Json;
 use axum::extract::Query;
 use axum::extract::State;
 use chrono::Utc;
-use sea_orm::ActiveModelTrait;
 use sea_orm::ColumnTrait;
 use sea_orm::EntityTrait;
 use sea_orm::QueryFilter;
@@ -34,7 +33,6 @@ use crate::common::middleware::require_write_data;
 use crate::common::middleware::scope_site_ids;
 use crate::error::AppError;
 use crate::error::AppResult;
-use crate::routes::private::collection_events::flows;
 use crate::routes::private::data_streams;
 use crate::routes::private::data_streams::service::get_or_create_api_stream;
 use crate::routes::private::parameters;
@@ -46,7 +44,6 @@ use crate::routes::private::readings::models::Origin;
 use crate::routes::private::readings::models::Owner;
 use crate::routes::private::readings::models::ProvenanceQuery;
 use crate::routes::private::readings::service::CurveClaim;
-use crate::routes::private::readings::service::Replace;
 use crate::routes::private::readings::service::admit_standard_curves;
 use crate::routes::private::readings::service::readings_on_conflict;
 use crate::routes::private::readings::service::rows_at;
@@ -54,14 +51,9 @@ use crate::routes::private::readings::service::run_id_of;
 use crate::routes::private::readings::status_events;
 use crate::routes::private::sensor_calibrations;
 use crate::routes::private::sensor_calibrations::resolver;
-use crate::routes::private::sensor_calibrations::service::Curve;
-use crate::routes::private::sensor_calibrations::service::apply_curves;
 use crate::routes::private::sensors::models::ResolvedOwner;
 use crate::routes::private::sensors::service::resolve_slot_owner_for_times;
-use crate::routes::private::sensors::service::resolve_windows_for_times;
-use crate::routes::private::standard_curves;
 use crate::routes::private::sync::models::GroupAudit;
-use crate::routes::private::sync::service as audit;
 use crate::routes::resolve_site_with_project;
 use crate::routes::service::ACTION_BODY_LIMIT;
 use crate::routes::service::DATA_BODY_LIMIT;
@@ -1132,14 +1124,15 @@ pub async fn unflag_range(
 }
 
 /// Batch insert readings keyed by (site_id, parameter_id). Auto-creates "api" streams when
-/// a (site, parameter) pair has none. 10MB body limit. Requires `write_data`.
+/// a (site, parameter) pair has none, and pairs one to the site's slot once the site carries it; a
+/// row is attributed from its stream's pairing. 10MB body limit. Requires `write_data`.
 #[utoipa::path(
     post,
     path = "/api/readings/batch",
     request_body = BatchReadingsRequest,
     responses(
         (status = 200, description = "Inserted count", body = BatchReadingsResponse),
-        (status = 400, description = "Timestamp outside the admissible window, or non-finite value"),
+        (status = 400, description = "Timestamp outside the admissible window, non-finite value, or a calibrated_value the row's calibration does not produce"),
         (status = 413, description = "Body exceeds 10MB limit"),
     ),
     tag = "ingestion"
@@ -1165,30 +1158,40 @@ pub async fn insert_batch_readings(
         }
     }
 
-    // Collect unique (site_id, parameter_id) pairs and resolve stream_ids
+    // Each (site_id, parameter_id) pair's api channel, paired to the site's slot once it exists,
+    // and the site and parameter that pairing attributes the pair's rows to.
     let mut stream_cache: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
-    // Whether each pair names a slot that exists. A reading is attributed by the pairing, never by
-    // the request alone: a caller naming a parameter the site has not been assigned would otherwise
-    // mint attribution no `site_parameters` row backs, which every later resolution reads as wrong.
-    let mut slot_exists: HashMap<(Uuid, Uuid), bool> = HashMap::new();
+    let mut attributions: HashMap<(Uuid, Uuid), (Option<Uuid>, Option<Uuid>)> = HashMap::new();
+    let mut touched_by_pairing = Vec::new();
 
     for r in &payload.readings {
         let key = (r.site_id, r.parameter_id);
         if let std::collections::hash_map::Entry::Vacant(entry) = stream_cache.entry(key) {
             let stream_id = get_or_create_api_stream(&state.db, r.site_id, r.parameter_id).await?;
-            entry.insert(stream_id);
-        }
-        if let std::collections::hash_map::Entry::Vacant(entry) = slot_exists.entry(key) {
-            let paired = crate::routes::private::data_streams::service::site_parameter_of(
+            let slot = crate::routes::private::data_streams::service::site_parameter_of(
                 &state.db,
                 r.site_id,
                 r.parameter_id,
             )
-            .await?
-            .is_some();
-            entry.insert(paired);
+            .await?;
+            let pairing = crate::routes::private::data_streams::flows::pair_entry_channel(
+                &state.db, stream_id, slot,
+            )
+            .await?;
+            touched_by_pairing.extend(pairing.touched_events);
+            attributions.insert(
+                key,
+                crate::routes::private::readings::service::resolve_stream_slot(
+                    &state.db,
+                    pairing.site_parameter_id,
+                )
+                .await?,
+            );
+            entry.insert(stream_id);
         }
     }
+    let attributed_sites: Vec<Uuid> = attributions.values().filter_map(|(s, _)| *s).collect();
+    enforce_project_scope_for_sites(&state.db, &scope, &attributed_sites).await?;
 
     // Collect unique (site_id, time) pairs for derived auto-compute
     let site_timestamps_for_derived: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = {
@@ -1318,16 +1321,13 @@ pub async fn insert_batch_readings(
         .collect();
     let standard_curve_models = admit_standard_curves(&state.db, &claims).await?;
 
-    // The base calibrations those rows sit on, so the stored value is the one the pair of recorded
-    // curves produces: instrument correction first, hand-picked curve on its result. Rows whose
-    // caller supplied no value need their base too: stamping the id while leaving the value
-    // uncorrected would claim a calibration the number never went through.
+    // The base calibration every row sits on, so the stored value is the one its recorded curves
+    // produce: instrument correction first, hand-picked curve on its result.
     let base_calibrations: HashMap<Uuid, sensor_calibrations::service::Curve> = {
         let mut ids: Vec<Uuid> = payload
             .readings
             .iter()
             .zip(&resolved)
-            .filter(|(r, _)| r.standard_curve_id.is_some() || r.calibrated_value.is_none())
             .filter_map(|(r, res)| r.calibration_id.or(res.owner.calibration_id))
             .collect();
         ids.sort_unstable();
@@ -1363,21 +1363,18 @@ pub async fn insert_batch_readings(
         )?;
     }
 
-    let models: Vec<readings::ActiveModel> = payload
+    let models = payload
         .readings
         .into_iter()
         .zip(resolved)
-        .map(|(r, res)| {
+        .map(|(r, res)| -> AppResult<readings::ActiveModel> {
             let Resolved {
                 stream_id,
                 owner,
                 measurement_type,
             } = res;
             let calibration_id = r.calibration_id.or(owner.calibration_id);
-            let attributed = slot_exists
-                .get(&(r.site_id, r.parameter_id))
-                .copied()
-                .unwrap_or(false);
+            let (site_id, parameter_id) = attributions[&(r.site_id, r.parameter_id)];
             let standard = r.standard_curve_id.map(|id| {
                 let c = &standard_curve_models[&id];
                 sensor_calibrations::service::Curve {
@@ -1387,30 +1384,26 @@ pub async fn insert_batch_readings(
                 }
             });
             let base = calibration_id.and_then(|id| base_calibrations.get(&id).copied());
-            // A curve claim is computed here; a caller-supplied value is kept as claimed; a row
-            // with neither gets its resolved base applied, so the stamped calibration_id is always
-            // a curve the stored value went through.
-            let calibrated_value = match (standard, r.calibrated_value) {
-                (Some(curve), _) => Some(sensor_calibrations::service::apply_curves(
-                    r.raw_value,
-                    base,
-                    Some(curve),
-                )),
-                (None, Some(value)) => Some(value),
-                (None, None) => base.map(|c| c.apply(r.raw_value)),
-            };
-            readings::ActiveModel {
+            let correction = crate::routes::private::readings::service::batch_correction(
+                r.raw_value,
+                r.calibrated_value,
+                calibration_id,
+                base,
+                standard,
+            )
+            .map_err(|e| AppError::BadRequest(e.to_string()))?;
+            Ok(readings::ActiveModel {
                 standard_curve_id: Set(r.standard_curve_id),
                 provenance_kind: Set(Some("batch".to_string())),
-                site_id: Set(attributed.then_some(r.site_id)),
-                parameter_id: Set(attributed.then_some(r.parameter_id)),
-                calibrated_value: Set(calibrated_value),
+                site_id: Set(site_id),
+                parameter_id: Set(parameter_id),
+                calibrated_value: Set(correction.calibrated_value),
                 sensor_id: Set(batch_instrument(
                     r.sensor_id,
                     owner.sensor_id,
                     stream_sensors.get(&stream_id).copied(),
                 )),
-                calibration_id: Set(calibration_id),
+                calibration_id: Set(correction.calibration_id),
                 deployment_id: Set(r.deployment_id.or(owner.deployment_id)),
                 measurement_type: Set(Some(measurement_type)),
                 sample_id: Set(r.sample_id),
@@ -1420,9 +1413,9 @@ pub async fn insert_batch_readings(
                     r.replicate_index.unwrap_or(0),
                     r.raw_value,
                 )
-            }
+            })
         })
-        .collect();
+        .collect::<AppResult<Vec<_>>>()?;
 
     let total = models.len();
     let inserted: usize;
@@ -1653,12 +1646,21 @@ pub async fn insert_batch_readings(
     .over(earliest.zip(latest))
     .at(stream_cache
         .iter()
-        .map(|((site_id, parameter_id), stream_id)| {
-            crate::routes::private::readings::service::Slot::paired(*site_id, *parameter_id)
-                .through(*stream_id)
+        .map(|(key, stream_id)| {
+            let (site_id, parameter_id) = attributions[key];
+            crate::routes::private::readings::service::Slot {
+                site_id,
+                parameter_id,
+                stream_id: Some(*stream_id),
+            }
         })
         .collect())
-    .touching(touched_events);
+    .touching(
+        touched_events
+            .into_iter()
+            .chain(touched_by_pairing)
+            .collect(),
+    );
     crate::routes::private::readings::service::run(
         &state,
         &written,
@@ -1708,865 +1710,102 @@ pub async fn ingest_readings(
     IsSyncService(is_sync_service): IsSyncService,
     Json(mut payload): Json<IngestReadingsRequest>,
 ) -> AppResult<Json<IngestResponse>> {
-    if payload.overwrite && !is_sync_service {
-        return Err(AppError::Forbidden(
-            "overwrite is restricted to sync services".to_string(),
-        ));
-    }
-    if payload.collection && !is_sync_service {
-        return Err(AppError::Forbidden(
-            "collection is restricted to sync services; grab entry goes through /grab_samples"
-                .to_string(),
-        ));
-    }
-    if payload.audit.is_some() && !is_sync_service {
-        return Err(AppError::Forbidden(
-            "audit is restricted to sync services".to_string(),
-        ));
-    }
-    if payload.window.is_some() && !is_sync_service {
-        return Err(AppError::Forbidden(
-            "window is restricted to sync services".to_string(),
-        ));
-    }
-    if let Some(window) = &payload.window
-        && window.from >= window.to
-    {
-        return Err(AppError::BadRequest(
-            "window.from must be before window.to".to_string(),
-        ));
+    refuse_sync_only_claims(&payload, is_sync_service)?;
+    if is_nothing_to_ingest(&payload) {
+        return Ok(Json(ingest_outcome(payload.stream_id, false, 0, 0, &[])));
     }
 
-    // An empty payload without a claim is nothing to do. With a window it is a claim the source
-    // holds nothing there, which the diff must judge against what is stored.
-    if payload.readings.is_empty() && payload.window.is_none() {
-        return Ok(Json(IngestResponse {
-            inserted: 0,
-            skipped: 0,
-            skipped_reasons: Vec::new(),
-            changed: 0,
-            proposed: 0,
-            withdrawn: 0,
-            unchanged: 0,
-            retained: 0,
-            accepted_window: None,
-            stream_id: payload.stream_id,
-            paired: false,
-        }));
-    }
-
-    let db = &state.db;
-
-    // Look up stream to get pairing info
-    let stream = data_streams::Entity::find_by_id(payload.stream_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
-
-    let (site_id, parameter_id) = resolve_stream_slot(db, stream.site_parameter_id).await?;
+    let txn = sea_orm::TransactionTrait::begin(&state.db).await?;
+    let stream = lock_ingest_stream(&txn, payload.stream_id).await?;
+    let (site_id, parameter_id) = resolve_stream_slot(&txn, stream.site_parameter_id).await?;
     let paired = site_id.is_some();
-
-    // Withdrawal is confined to spot rows by a database CHECK; the continuous aggregates exclude
-    // spot, which is what keeps a retraction structurally unreachable by a rollup. A window on a
-    // non-spot stream is therefore refused rather than half-honoured.
-    if payload.window.is_some() && stream.measurement_type.as_deref() != Some("spot") {
-        return Err(AppError::BadRequest(
-            "A completeness window is only accepted for streams declared measurement_type \
-             'spot'; continuous sources stay append-only"
-                .to_string(),
-        ));
-    }
-
-    // A project-scoped token may only ingest into a stream paired to a site within its project.
-    // An unpaired stream has no project, so a scoped token is rejected outright.
+    require_spot_window(payload.window.as_ref(), stream.measurement_type.as_deref())?;
     enforce_ingest_scope(&state.db, &scope, site_id).await?;
-
-    // Admission is per reading here, not per request: the caller replays from `last_data_time`,
-    // which only advances on success, so refusing a batch for one bad row stalls the stream.
-    // The cursor is taken from the survivors, so a future timestamp cannot latch it.
-    // Tallied by kind because the per-reading messages carry the offending value and cannot group.
-    let submitted = payload.readings.len();
-    let mut counts: Vec<(
-        crate::routes::private::readings::service::admission::RejectionKind,
-        usize,
-    )> = Vec::new();
-    // Keys the funnel refused, remembered so the diff classifies them `retained` rather than
-    // withdrawn: a key the request carried and the funnel refused is not absent at source.
-    let mut rejected_keys: std::collections::HashSet<(chrono::DateTime<Utc>, i16)> =
-        std::collections::HashSet::new();
-    let track_rejections = payload.window.is_some();
-    let now = Utc::now();
-    payload.readings.retain(|r| {
-        match crate::routes::private::readings::service::admission::rejection_kind_at(
-            now,
-            r.time,
-            r.raw_value,
-            r.measurement_type.as_deref(),
-        ) {
-            None => true,
-            Some(kind) => {
-                record_rejection(&mut counts, kind);
-                if track_rejections {
-                    rejected_keys.insert((r.time, r.replicate_index));
-                }
-                false
-            }
-        }
-    });
-
-    // Under a completeness claim, two payload rows at one key would classify one submitted row
-    // twice. The last occurrence wins (backends emit source-id order, so last is deterministic);
-    // the losers are counted so the receipt arithmetic closes.
-    if payload.window.is_some() {
-        let mut seen: std::collections::HashSet<(chrono::DateTime<Utc>, i16)> =
-            std::collections::HashSet::new();
-        let mut keep = vec![false; payload.readings.len()];
-        for (i, r) in payload.readings.iter().enumerate().rev() {
-            keep[i] = seen.insert((r.time, r.replicate_index));
-        }
-        if keep.iter().any(|k| !k) {
-            let mut i = 0;
-            payload.readings.retain(|_| {
-                let kept = keep[i];
-                i += 1;
-                if !kept {
-                    record_rejection(&mut counts, crate::routes::private::readings::service::admission::RejectionKind::DuplicateKey);
-                }
-                kept
-            });
-        }
+    let mut funnel = IngestFunnel::new(&payload.readings, payload.window.is_some());
+    funnel.admit(&mut payload.readings, Utc::now());
+    funnel.keep_last_per_key(&mut payload.readings);
+    if is_nothing_to_ingest(&payload) {
+        return Ok(Json(funnel.outcome(payload.stream_id, paired, 0)));
     }
-
-    // Everything downstream reads `payload.readings`, so a batch that is entirely inadmissible has
-    // no work left: return before the window-resolution queries rather than run them over nothing.
-    if payload.readings.is_empty() && payload.window.is_none() {
-        return Ok(Json(ingest_outcome(
-            payload.stream_id,
-            paired,
-            submitted,
-            0,
-            &counts,
-        )));
-    }
-
-    // Window-aware attribution: resolve calibration/deployment/site per reading TIME from the
-    // sensor's windows, agreeing with reprocess_sensor_readings. The stream's frozen sensor_id is the
-    // owner; cal/deployment/site come from whichever window covers each timestamp.
-    let resolved = if let Some(stream_sensor) = stream.sensor_id {
-        let times: Vec<chrono::DateTime<Utc>> = payload.readings.iter().map(|r| r.time).collect();
-        resolve_windows_for_times(db, stream_sensor, None, parameter_id, &times).await?
-    } else {
-        std::collections::HashMap::new()
-    };
-
-    // Fallback when the stream carries no frozen sensor: attribute by the (site, parameter)
-    // deployment timeline so readings still land owned when a deployment covers their time.
-    let slot_owner = match (stream.sensor_id, site_id, parameter_id) {
-        (None, Some(s), Some(p)) => {
-            let times: Vec<chrono::DateTime<Utc>> =
-                payload.readings.iter().map(|r| r.time).collect();
-            resolve_slot_owner_for_times(db, s, p, &times).await?
-        }
-        _ => std::collections::HashMap::new(),
-    };
-
-    // The curve covering each reading's own time, ranked by the one resolver the set-based
-    // reprocess UPDATEs use. A value stored here and the value a later reprocess recomputes are
-    // therefore the same number, so a reading is correct the moment it lands rather than only
-    // after the next reprocess.
-    let curves = {
-        let requests: Vec<(Uuid, Option<Uuid>, chrono::DateTime<Utc>)> = payload
-            .readings
-            .iter()
-            .filter_map(|r| {
-                let owner = slot_owner.get(&r.time);
-                let sensor = ingest_instrument(
-                    r.sensor_id,
-                    stream.sensor_id,
-                    owner.and_then(|o| o.sensor_id),
-                )?;
-                Some((sensor, parameter_id, r.time))
-            })
-            .collect();
-        resolver::resolve_many(db, &requests).await?
-    };
-
-    // A caller that names its own calibration is taken at its word about which curve applies, but
-    // the stored value is still computed from that curve's coefficients rather than trusted or left
-    // empty. Reference and value come from one curve on every reading, so nothing can store a
-    // correction its `calibration_id` did not produce.
-    let declared_curves: HashMap<Uuid, Curve> = {
-        let mut ids: Vec<Uuid> = payload
-            .readings
-            .iter()
-            .filter_map(|r| r.calibration_id)
-            .collect();
-        ids.sort_unstable();
-        ids.dedup();
-        if ids.is_empty() {
-            HashMap::new()
-        } else {
-            sensor_calibrations::Entity::find()
-                .filter(sensor_calibrations::Column::Id.is_in(ids))
-                .all(db)
-                .await?
-                .into_iter()
-                .map(|c| {
-                    (
-                        c.id,
-                        Curve {
-                            id: c.id,
-                            slope: c.slope,
-                            intercept: c.intercept,
-                        },
-                    )
-                })
-                .collect()
-        }
-    };
-
-    // A deleted calibration never reappears, so refusing the request here would stall the cursor
-    // permanently. Second pass because deciding it needs the calibration rows queried above.
-    payload.readings.retain(|r| match r.calibration_id {
-        Some(id) if !declared_curves.contains_key(&id) => {
-            record_rejection(&mut counts, crate::routes::private::readings::service::admission::RejectionKind::UnknownCalibration);
-            if track_rejections {
-                rejected_keys.insert((r.time, r.replicate_index));
-            }
-            false
-        }
-        _ => true,
-    });
-    if payload.readings.is_empty() && payload.window.is_none() {
-        return Ok(Json(ingest_outcome(
-            payload.stream_id,
-            paired,
-            submitted,
-            0,
-            &counts,
-        )));
-    }
-
-    // Sensor-frequency defaults for every sensor a reading could resolve to (explicit, stream, or
-    // slot owner), fetched in one query. Applied when neither the reading nor the stream declares
-    // a measurement_type.
-    let sensor_types = {
-        let mut candidate_sensors: Vec<Uuid> = payload
-            .readings
-            .iter()
-            .filter_map(|r| r.sensor_id)
-            .chain(stream.sensor_id)
-            .chain(slot_owner.values().filter_map(|o| o.sensor_id))
-            .collect();
-        candidate_sensors.sort_unstable();
-        candidate_sensors.dedup();
-        crate::routes::private::readings::service::measurement_types_for_sensors(
-            db,
-            &candidate_sensors,
-        )
-        .await?
-    };
-
-    // Replicates belong to a spot instant. The declared cadence is not the stored one, so this is
-    // judged against the resolved value; a row that fails it would be stored at an index every
-    // continuous reader filters out, ie. served nowhere.
-    payload.readings.retain(|r| {
-        if r.replicate_index == 0 {
-            return true;
-        }
-        let sensor_id = ingest_instrument(
-            r.sensor_id,
-            stream.sensor_id,
-            slot_owner.get(&r.time).and_then(|o| o.sensor_id),
-        );
-        let resolved = crate::routes::private::readings::service::resolve_measurement_type(
-            r.measurement_type.as_deref(),
-            stream.measurement_type.as_deref(),
-            sensor_id,
-            &sensor_types,
-        );
-        if resolved == crate::routes::private::readings::service::SPOT {
-            return true;
-        }
-        record_rejection(
-            &mut counts,
-            crate::routes::private::readings::service::admission::RejectionKind::ReplicateIndexOnNonSpot,
-        );
-        if track_rejections {
-            rejected_keys.insert((r.time, r.replicate_index));
-        }
-        false
-    });
-
-    // Standard curve claims, held to the grab rules (fitted on the reading's instrument, spot
-    // measurement). An inadmissible claim is stripped, never the reading: the value is stored
-    // uncorrected and the claim lands in the review queue as a `curve_claim_stripped` hold, so
-    // a mis-homed curve or a mis-declared stream instrument costs a correction, not data.
-    let mut stripped_claims: HashMap<chrono::DateTime<Utc>, Vec<serde_json::Value>> =
-        HashMap::new();
-    let standard_curves_by_id: HashMap<Uuid, Curve> = {
-        let mut ids: Vec<Uuid> = payload
-            .readings
-            .iter()
-            .filter_map(|r| r.standard_curve_id)
-            .collect();
-        ids.sort_unstable();
-        ids.dedup();
-        if ids.is_empty() {
-            HashMap::new()
-        } else {
-            let rows = standard_curves::Entity::find()
-                .filter(standard_curves::Column::Id.is_in(ids))
-                .all(db)
-                .await?;
-            let by_id: HashMap<Uuid, &standard_curves::Model> =
-                rows.iter().map(|c| (c.id, c)).collect();
-            for r in payload.readings.iter_mut() {
-                let Some(id) = r.standard_curve_id else {
-                    continue;
-                };
-                let sensor_id = ingest_instrument(
-                    r.sensor_id,
-                    stream.sensor_id,
-                    slot_owner.get(&r.time).and_then(|o| o.sensor_id),
-                );
-                let measurement_type =
-                    crate::routes::private::readings::service::resolve_measurement_type(
-                        r.measurement_type.as_deref(),
-                        stream.measurement_type.as_deref(),
-                        sensor_id,
-                        &sensor_types,
-                    );
-                let reason = match by_id.get(&id) {
-                    None => Some("names no standard curve"),
-                    Some(c) if Some(c.sensor_id) != sensor_id => {
-                        Some("fitted on a different instrument than the reading's")
-                    }
-                    Some(_)
-                        if measurement_type != crate::routes::private::readings::service::SPOT =>
-                    {
-                        Some("the reading is not a spot measurement")
-                    }
-                    Some(_) => None,
-                };
-                if let Some(reason) = reason {
-                    r.standard_curve_id = None;
-                    stripped_claims
-                        .entry(r.time)
-                        .or_default()
-                        .push(serde_json::json!({
-                            "replicate_index": r.replicate_index,
-                            "standard_curve_id": id,
-                            "curve_instrument_id": by_id.get(&id).map(|c| c.sensor_id),
-                            "reading_instrument_id": sensor_id,
-                            "reason": reason,
-                        }));
-                }
-            }
-            rows.into_iter()
-                .map(|c| {
-                    (
-                        c.id,
-                        Curve {
-                            id: c.id,
-                            slope: c.slope,
-                            intercept: c.intercept,
-                        },
-                    )
-                })
-                .collect()
-        }
-    };
-    if payload.readings.is_empty() && payload.window.is_none() {
-        return Ok(Json(ingest_outcome(
-            payload.stream_id,
-            paired,
-            submitted,
-            0,
-            &counts,
-        )));
-    }
-
-    // Build reading models
-    let models: Vec<readings::ActiveModel> = payload
-        .readings
-        .iter()
-        .map(|r| {
-            let slot = resolved.get(&r.time);
-            let owner = slot_owner.get(&r.time);
-            let sensor_id = ingest_instrument(
-                r.sensor_id,
-                stream.sensor_id,
-                owner.and_then(|o| o.sensor_id),
-            );
-            // A reading on an unpaired stream is staged: nothing has said which instrument
-            // measured it, and the channel's registration default is not that answer (B223). What
-            // the caller declared is kept, because that is a claim somebody made; what would be
-            // derived here waits for the pairing, which stamps site, parameter and instrument
-            // together. The cadence still reads the channel's instrument above: which device a
-            // feed comes through is a fact about the channel, not a claim about the measurement.
-            let stored_sensor_id = if paired { sensor_id } else { r.sensor_id };
-            // The one curve this reading is stored against: the caller's if it named one, else
-            // whichever window covers its own time. Both `calibration_id` and `calibrated_value`
-            // are derived from it, so a later reprocess re-resolving the same windows recomputes
-            // what is already stored instead of disagreeing with it. The deployment-derived slot
-            // and slot owner resolve calibrations by time alone, blind to the reading's parameter,
-            // so they are not consulted for a curve; they still answer for the deployment.
-            //
-            // No curve at all: `calibrated_value` stays NULL, which is what a reprocess over the
-            // same windows would leave too. Consumers read COALESCE(calibrated_value, raw_value),
-            // so the raw value is still what is served.
-            let curve = r
-                .calibration_id
-                .and_then(|id| declared_curves.get(&id).copied())
-                .or_else(|| {
-                    sensor_id.and_then(|s| curves.get(&(s, parameter_id, r.time)).copied())
-                });
-            // A hand-picked lab curve composes on top of whatever base calibration covers the
-            // reading, as on /readings/batch and /grab_samples: instrument correction first, the
-            // curve on its result. Reference and value still move together.
-            let standard = r
-                .standard_curve_id
-                .and_then(|id| standard_curves_by_id.get(&id).copied());
-            readings::ActiveModel {
-                standard_curve_id: Set(standard.map(|c| c.id)),
-                provenance_kind: Set(Some("sync".to_string())),
-                // Pairing is what attributes a reading to a site, so an unpaired stream stores its
-                // readings unattributed even when a deployment of its sensor covers their time.
-                // Within a paired stream the deployment decides which site, since a sensor can move
-                // between sites while the stream keeps pointing at one slot.
-                site_id: Set(site_id.map(|paired| slot.and_then(|s| s.site_id).unwrap_or(paired))),
-                parameter_id: Set(parameter_id),
-                calibrated_value: Set(match (curve.filter(|_| paired), standard) {
-                    (None, None) => None,
-                    (base, standard) => Some(apply_curves(r.raw_value, base, standard)),
-                }),
-                sensor_id: Set(stored_sensor_id),
-                calibration_id: Set(if paired {
-                    curve.map(|c| c.id)
-                } else {
-                    r.calibration_id
-                }),
-                deployment_id: Set(if paired {
-                    r.deployment_id
-                        .or_else(|| slot.and_then(|s| s.deployment_id))
-                        .or_else(|| owner.and_then(|o| o.deployment_id))
-                } else {
-                    r.deployment_id
-                }),
-                measurement_type: Set(Some(
-                    crate::routes::private::readings::service::resolve_measurement_type(
-                        r.measurement_type.as_deref(),
-                        stream.measurement_type.as_deref(),
-                        sensor_id,
-                        &sensor_types,
-                    ),
-                )),
-                ..readings::new(
-                    payload.stream_id,
-                    r.time.into(),
-                    r.replicate_index,
-                    r.raw_value,
-                )
-            }
-        })
-        .collect();
-
-    let total = models.len();
-
-    // Spot readings on a paired stream can form samples: replicate groups sharing an instant get
-    // a `samples` row (mean/stdev/n maintained by the readings triggers), which is what the
-    // serving paths and the UI whiskers read. A group needs no index-0 row: `replicate_index` is
-    // the source's column position and is never renumbered. Scoped to this batch's time window;
-    // identity of a collection event is (site, parameter, instant), so pre-existing rows at the
-    // slot join the group. Unpaired streams skip this (site_id is NULL, the pairing backfill
-    // materialises).
-    let sample_window = if paired {
-        let spot_times = models
-            .iter()
-            .filter_map(|m| match (&m.measurement_type, &m.time) {
-                (sea_orm::ActiveValue::Set(Some(t)), sea_orm::ActiveValue::Set(time))
-                    if t == crate::routes::private::readings::service::SPOT =>
-                {
-                    Some(time.with_timezone(&Utc))
-                }
-                _ => None,
-            });
-        spot_times.clone().min().zip(spot_times.max())
-    } else {
-        None
-    };
-
-    // Overwrite updates existing rows, the windowed diff corrects and withdraws, and the sample
-    // stamping UPDATE reaches back-dated groups; all can touch compressed chunks, so they run
-    // inside one transaction with the decompression cap lifted, like every other back-dated
-    // write path. The diff, the writes and the receipt commit together or not at all.
-    let mut diff_outcome: Option<crate::routes::private::readings::service::DiffOutcome> = None;
-    let mut touched_visits: Vec<crate::routes::private::collection_events::flows::TouchedEvent> =
-        Vec::new();
-    let audited =
-        payload.audit.as_deref().is_some_and(|a| !a.is_empty()) || !stripped_claims.is_empty();
-    let inserted = if payload.overwrite
-        || sample_window.is_some()
-        || payload.window.is_some()
-        || audited
-    {
-        let actor = crate::common::actor::label(&auth);
-        let (n, diff, touched_events) = crate::common::bulk_write::guarded(db, async |txn| {
-                let diff = match &payload.window {
-                    Some(window) => {
-                        let admitted: Vec<crate::routes::private::readings::service::AdmittedRow> = payload
-                            .readings
-                            .iter()
-                            .map(|r| {
-                                (
-                                    (r.time, r.replicate_index),
-                                    r.raw_value,
-                                    r.standard_curve_id,
-                                )
-                            })
-                            .collect();
-                        Some(
-                            crate::routes::private::readings::service::run_windowed_diff(
-                                txn,
-                                payload.stream_id,
-                                window,
-                                &admitted,
-                                &rejected_keys,
-                                &actor,
-                                paired,
-                            )
-                            .await?,
-                        )
-                    }
-                    None => None,
-                };
-                // A windowed pass writes only rows the store does not hold, so nothing it writes
-                // has a value to replace. An overwrite still replaces, which is what it is for.
-                let replace = if payload.overwrite {
-                    Replace::ValuesAndAttribution
-                } else {
-                    Replace::Nothing
-                };
-                // Under a diff only classified-new rows are written: an unchanged row re-written
-                // with identical values is a hypertable write, WAL and an upsert count that reads
-                // as effect, all for nothing, and a changed one is a proposal (Q84). An overwrite
-                // is exempt: it exists to rewrite attribution, which value equality cannot see.
-                let filtered: Vec<readings::ActiveModel>;
-                let to_write: &[readings::ActiveModel] = match &diff {
-                    Some(d) if !payload.overwrite => {
-                        filtered = models
-                            .iter()
-                            .zip(payload.readings.iter())
-                            .filter(|(_, r)| d.write_keys.contains(&(r.time, r.replicate_index)))
-                            .map(|(m, _)| m.clone())
-                            .collect();
-                        &filtered
-                    }
-                    _ => &models,
-                };
-                // A correction is a decision of sync origin (ADR 0008), recorded before the
-                // upsert so the value it replaces is what the record holds; a hand-picked curve
-                // the source names is a claim, recorded once.
-                if replace != Replace::Nothing {
-                    crate::routes::private::readings::service::record_value_corrections(
-                        txn,
-                        to_write,
-                        &actor,
-                        crate::routes::private::readings::models::Origin::Sync,
-                    )
-                    .await?;
-                }
-                let n = insert_reading_chunks(txn, to_write, replace).await?;
-                crate::routes::private::readings::service::record_curve_claims(
-                    txn,
-                    to_write,
-                    &actor,
-                    crate::routes::private::readings::models::Origin::Sync,
-                )
-                .await?;
-                // A pass that wrote, withdrew or reinstated nothing left every group's content
-                // as it stood; sample statistics and event attachment have nothing to recompute.
-                // Overwrites recompute regardless: they may have moved attribution.
-                let diff_touched = payload.overwrite
-                    || diff
-                        .as_ref()
-                        .is_none_or(|d| d.new_rows + d.changed + d.withdrawn + d.reinstated > 0);
-                let mut touched_events = Vec::new();
-                if diff_touched && let Some((lo, hi)) = sample_window {
-                    let window = || {
-                        use crate::routes::private::readings::models::Column;
-                        use sea_orm::ExprTrait as _;
-                        sea_orm::Condition::all()
-                            .add(flows::row(Column::StreamId).eq(payload.stream_id))
-                            .add(flows::row(Column::Time).gte(
-                                sea_orm::prelude::DateTimeWithTimeZone::from(lo),
-                            ))
-                            .add(flows::row(Column::Time).lte(
-                                sea_orm::prelude::DateTimeWithTimeZone::from(hi),
-                            ))
-                    };
-                    crate::routes::private::readings::service::materialise_samples(txn, window())
-                        .await?;
-                    // Each source row maps onto one collection event (D7). A sync service replaying
-                    // a portal row writes a portal_sync event; any other writer is a person.
-                    crate::routes::private::collection_events::service::attach_collection_events(
-                        txn,
-                        window(),
-                        if is_sync_service {
-                            crate::routes::private::collection_events::service::EventSource::PortalSync
-                        } else {
-                            crate::routes::private::collection_events::service::EventSource::Manual
-                        },
-                    )
-                    .await?;
-                    touched_events =
-                        crate::routes::private::collection_events::flows::touched_events(
-                            txn,
-                            window(),
-                        )
-                        .await?;
-                }
-                // The audit judges what this transaction stored, so its hold transitions commit or
-                // roll back with the writes. A braked pass withheld the corrections the claim
-                // describes, so the stored groups are not what the source asserted; the holds stand.
-                if let Some(audits) = payload.audit.as_deref().filter(|a| !a.is_empty())
-                    && diff.as_ref().is_none_or(|d| !d.braked)
-                {
-                    run_replicate_audit(
-                        txn,
-                        payload.stream_id,
-                        audits,
-                        paired,
-                    )
-                    .await?;
-                }
-                // After the statistics audit on purpose: at one (stream, instant) key the later
-                // upsert wins, and a stripped claim explains the disagreement the audit would
-                // otherwise report bare.
-                if !stripped_claims.is_empty() {
-                    let hold_status = audit::status_for(paired);
-                    for (time, claims) in &stripped_claims {
-                        upsert_curve_claim_hold(txn, payload.stream_id, *time, claims, hold_status)
-                            .await?;
-                    }
-                    tracing::warn!(
-                        stream_id = %payload.stream_id,
-                        instants = stripped_claims.len(),
-                        "Inadmissible standard curve claims stripped; readings stored uncorrected and held for review"
-                    );
-                }
-                if let (Some(window), Some(d)) = (&payload.window, &diff) {
-                    let rejected_total: usize = counts.iter().map(|(_, n)| n).sum();
-                    let rejected_json = serde_json::Value::Object(
-                        counts
-                            .iter()
-                            .map(|(k, n)| (k.as_str().to_string(), serde_json::json!(n)))
-                            .collect(),
-                    );
-                    crate::routes::private::readings::service::write_receipt(
-                        txn,
-                        payload.stream_id,
-                        window,
-                        submitted,
-                        d,
-                        rejected_total,
-                        &rejected_json,
-                    )
-                    .await?;
-                }
-                Ok((n, diff, touched_events))
-            })
+    let mut attribution =
+        resolve_ingest_attribution(&txn, &stream, (site_id, parameter_id), &payload.readings)
             .await?;
-        diff_outcome = diff;
-        touched_visits = touched_events;
-        n
-    } else {
-        insert_reading_chunks(db, &models, Replace::Nothing).await?
-    };
-
-    let diff_withdrawn = diff_outcome.as_ref().map_or(0, |d| d.withdrawn);
-    let diff_reinstated = diff_outcome.as_ref().map_or(0, |d| d.reinstated);
-    // What this pass did to served content, the gate every post-write side effect reads: a
-    // withdrawal with `inserted == 0` still rewrote history. A classified-changed key moved
-    // nothing here: it is a proposal until somebody accepts it, and the accept path does this
-    // work for the rows it writes.
-    let moved = u64::try_from(inserted + diff_withdrawn + diff_reinstated).unwrap_or(u64::MAX);
-    let effect = moved > 0;
-
-    let span = payload
-        .readings
-        .iter()
-        .map(|r| r.time)
-        .min()
-        .zip(payload.readings.iter().map(|r| r.time).max());
-
-    // A correction rewrites history that bounded queries may have cached and replaces values the
-    // rollups have already materialised. The upsert leaves a hand-picked curve standing and this
-    // correction resolved only a base, so the value is recomposed from whichever curves the row
-    // ends up carrying, before the rollups read it back.
-    let corrected = payload.overwrite && inserted > 0;
-    if corrected
-        && let Some((lo, hi)) = span
-        && let Err(e) = sensor_calibrations::service::recompose_from_own_curves_guarded(
-            &state.db,
-            sea_orm::sea_query::Expr::cust("TRUE"),
-            "r.stream_id = $1 AND r.time >= $2 AND r.time <= $3",
-            vec![
-                payload.stream_id.into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(lo).into(),
-                sea_orm::prelude::DateTimeWithTimeZone::from(hi).into(),
-            ],
-        )
-        .await
-    {
-        tracing::warn!(error = %e, "recompose after overwrite failed");
+    let requests = attribution.calibration_requests(&payload.readings);
+    let resolved = resolver::resolve_many(&txn, &requests).await?;
+    let declared = find_declared_calibrations(&txn, &payload.readings).await?;
+    funnel.drop_unknown_calibrations(&mut payload.readings, &declared);
+    if is_nothing_to_ingest(&payload) {
+        return Ok(Json(funnel.outcome(payload.stream_id, paired, 0)));
     }
+    attribution.read_cadences(&txn, &payload.readings).await?;
+    funnel.drop_replicates_off_spot(&mut payload.readings, &attribution);
+    let claimed = find_claimed_standard_curves(&txn, &payload.readings).await?;
+    let stripped = strip_inadmissible_curve_claims(&mut payload.readings, &claimed, &attribution);
+    if is_nothing_to_ingest(&payload) {
+        return Ok(Json(funnel.outcome(payload.stream_id, paired, 0)));
+    }
+    let curves = IngestCurves {
+        resolved,
+        declared,
+        standard: claimed.curves,
+    };
+    let models = reading_models(payload.stream_id, &payload.readings, &attribution, &curves);
+    let sample_window = spot_window(&models, paired);
+    let actor = label(&auth);
+    let pass = IngestPass {
+        payload: &payload,
+        models: &models,
+        funnel: &funnel,
+        stripped: &stripped,
+        sample_window,
+        paired,
+        is_sync_service,
+        actor: &actor,
+    };
+    let IngestWritten {
+        inserted,
+        diff,
+        touched_events,
+    } = pass.write(&txn).await?;
+    txn.commit().await?;
 
-    // Sample formation retroactively changes served historical points (the group's mean replaces
-    // the lone value), and a withdrawal, a reinstatement or a correction rewrites served history
-    // the same way, so those passes cannot be left to expire on TTL anywhere. A plain append is
-    // confined to its own site.
-    //
-    // The refresh is best-effort, like the alarm reconstruction: the rows are committed and the
-    // cursor is about to advance past them, so a refresh that loses a lock to the janitor must not
-    // turn a successful write into a 500 that replays the same batch forever. The rollups converge
-    // on the next scheduled refresh. Episodes are rebuilt inline rather than as a tracked job:
-    // single ingest fires every sync cycle per stream and would spam `reprocessing_jobs`.
-    let rewrote_history =
-        corrected || sample_window.is_some() || payload.window.is_some() || diff_withdrawn > 0;
-    let written = crate::routes::private::readings::service::Written::new(moved)
-        .announced(u64::try_from(inserted).unwrap_or(u64::MAX))
-        .over(span)
-        .at(vec![crate::routes::private::readings::service::Slot {
-            site_id,
-            parameter_id,
-            stream_id: Some(payload.stream_id),
-        }])
-        .touching(touched_visits);
-    crate::routes::private::readings::service::run(
+    let effect = IngestEffect::of(&payload, sample_window, inserted, diff.as_ref());
+    recompose_corrected_span(&state.db, payload.stream_id, &effect).await;
+    let written_at = Slot {
+        site_id,
+        parameter_id,
+        stream_id: Some(payload.stream_id),
+    };
+    super::service::run(
         &state,
-        &written,
-        &crate::routes::private::readings::service::Axes {
-            cache: if rewrote_history {
-                crate::routes::private::readings::service::Cache::All
-            } else {
-                crate::routes::private::readings::service::Cache::Sites
-            },
-            refresh: if corrected {
-                crate::routes::private::readings::service::Refresh::Range { fatal: false }
-            } else {
-                crate::routes::private::readings::service::Refresh::Skip
-            },
-            announce: true,
-            reconcile_alarms: true,
-            episodes: crate::routes::private::readings::service::Episodes::Inline,
-            recompute_derived: false,
-            writer: crate::routes::private::collection_events::flows::Writer::Person,
-        },
-        &crate::common::actor::label(&auth),
+        &effect.written(written_at, touched_events),
+        &effect.axes(),
+        &actor,
     )
     .await?;
-
-    // Update last_data_time on the stream. Every group is admitted (audit disagreements are
-    // review records, not gates), so the cursor always advances to the batch's newest instant.
-    // The same UPDATE persists the handshake digest of a cleanly applied windowed pass (no
-    // brake, no holds, no rejections, no stripped curve claims): the claim the sync client
-    // compares its next payload against to skip re-sending unchanged content. A braked or held
-    // pass stores none, so those windows keep re-asserting until a person rules.
-    let advance_cursor = payload
-        .readings
-        .iter()
-        .map(|r| r.time)
-        .max()
-        .filter(|max_time| {
-            stream
-                .last_data_time
-                .map(|t| *max_time > t.with_timezone(&Utc))
-                .unwrap_or(true)
-        });
-    let rejected_total: usize = counts.iter().map(|(_, n)| n).sum();
-    let clean_digest = payload
-        .window
-        .as_ref()
-        .and_then(|w| w.content_digest.clone())
-        .filter(|_| {
-            rejected_total == 0
-                && stripped_claims.is_empty()
-                && diff_outcome
-                    .as_ref()
-                    .is_some_and(|d| !d.braked && d.holds_raised == 0 && d.proposals_awaiting == 0)
-        });
-    let digest_changed = clean_digest.is_some() && stream.last_window_digest != clean_digest;
-    if advance_cursor.is_some() || digest_changed {
-        let mut active: data_streams::ActiveModel = stream.into();
-        if let Some(max_time) = advance_cursor {
-            active.last_data_time = Set(Some(max_time.into()));
-        }
-        if digest_changed {
-            active.last_window_digest = Set(clean_digest);
-        }
-        active.updated_at = Set(Utc::now().into());
-        if let Err(e) = active.update(db).await {
-            tracing::warn!(error = %e, "Failed to update stream sync state");
-        }
-    }
-
-    // Auto-compute derived parameters for newly ingested timestamps (batched), tracked as a job.
-    // Spawn-guard: skip entirely when the site has no active derived parameter, the job would
-    // compute nothing, and this is the dominant source of empty `ingest_derived` jobs.
-    if paired
-        && effect
-        && let Some(sid) = site_id
-        && crate::routes::private::derived_parameters::flows::site_has_active_derived(db, sid)
-            .await
-            .unwrap_or(true)
-    {
-        // A withdrawn key is absent from the payload by construction, so the retracted instants
-        // have to be unioned in or the derived output computed from a retracted input is never
-        // revisited. Reinstated keys are in the same position from the other direction.
-        let mut unique_timestamps: Vec<chrono::DateTime<Utc>> =
-            payload.readings.iter().map(|r| r.time).collect();
-        if let Some(d) = &diff_outcome {
-            unique_timestamps.extend(d.withdrawn_keys.iter().map(|(t, _)| *t));
-            unique_timestamps.extend(d.reinstated_keys.iter().map(|(t, _)| *t));
-        }
-        unique_timestamps.sort();
-        unique_timestamps.dedup();
-        let source_stream = payload.stream_id;
-
-        crate::routes::private::reprocessing_jobs::service::enqueue(
-            db,
-            "ingest_derived",
-            None,
-            None,
-            &serde_json::json!({
-                "site_id": sid,
-                "stream_id": source_stream,
-                "timestamps": unique_timestamps,
-            }),
-            None,
-        )
-        .await?;
-    }
-
-    let mut outcome = ingest_outcome(payload.stream_id, paired, submitted, inserted, &counts);
-    if let Some(d) = &diff_outcome {
-        // Under a diff, `inserted` from the upsert counts updates too; the classification is the
-        // accurate account.
-        outcome.inserted = d.new_rows;
-        outcome.changed = d.changed;
-        outcome.proposed = d.proposed;
-        outcome.withdrawn = d.withdrawn;
-        outcome.unchanged = d.unchanged;
-        outcome.retained = d.retained;
-        outcome.accepted_window = payload.window.clone();
-        if d.braked {
-            tracing::warn!(stream_id = %payload.stream_id, changed = d.changed, withdrawn = d.withdrawn, "Windowed pass braked; corrections and withdrawals held for review");
-        }
-    }
-    tracing::debug!(total, inserted = outcome.inserted, skipped = outcome.skipped, changed = outcome.changed, withdrawn = outcome.withdrawn, reinstated = diff_reinstated, stream_id = %payload.stream_id, paired, "Ingest complete");
-    Ok(Json(outcome))
+    let cursor = advance_cursor(&payload.readings, stream.last_data_time);
+    let digest = clean_digest(
+        payload.window.as_ref(),
+        funnel.rejected_total(),
+        stripped.is_empty(),
+        diff.as_ref(),
+    );
+    record_stream_pass(&state.db, &stream, cursor, digest).await;
+    enqueue_ingest_derived(
+        &state.db,
+        payload.stream_id,
+        site_id,
+        &effect,
+        &payload.readings,
+        diff.as_ref(),
+    )
+    .await?;
+    let outcome = funnel.outcome(payload.stream_id, paired, inserted);
+    Ok(Json(classified_outcome(
+        outcome,
+        diff.as_ref(),
+        payload.window.as_ref(),
+    )))
 }
 
 #[utoipa::path(
@@ -3235,27 +2474,13 @@ async fn import_one_site(
     scope: AccessScope,
     req: ImportCsvRequest,
 ) -> AppResult<Json<ImportCsvResponse>> {
-    crate::routes::private::readings::service::validate_measurement_type(
-        req.measurement_type.as_deref(),
-    )?;
-
+    let db = &state.db;
+    validate_measurement_type(req.measurement_type.as_deref())?;
     let (csv_text, session_id) = staged_csv(&state, &auth, &req).await?;
-
-    let tz_offset =
-        chrono::Duration::milliseconds((req.tz_offset_hours.unwrap_or(0.0) * 3_600_000.0) as i64);
-
-    let (site, _project) = resolve_site_with_project(&state.db, &req.site).await?;
-    let site_id = site.id;
-
-    // A project-scoped token may only import into a site within its project.
-    enforce_project_scope_for_sites(&state.db, &scope, &[site_id]).await?;
-
-    if req.curves.is_some() && req.tool.is_none() {
-        return Err(AppError::BadRequest(
-            "curves fills a tool's curve slots; name the tool the file is entry for".into(),
-        ));
-    }
-
+    let tz_offset = declared_offset(req.tz_offset_hours);
+    let (site, _project) = resolve_site_with_project(db, &req.site).await?;
+    enforce_project_scope_for_sites(db, &scope, &[site.id]).await?;
+    require_tool_for_curves(&req)?;
     // Tool entry: the file's columns are tool inputs, not catalog parameters. Same write path as
     // typing the rows into the tool (D15).
     if let Some(tool_name) = req.tool.as_deref() {
@@ -3266,641 +2491,322 @@ async fn import_one_site(
         return Ok(Json(response));
     }
 
-    // --- Resolution tables (site_parameter-first) ---------------------------------------------
-
-    // Site parameters for this site: lower(sp.name) -> (parameter_id, sp_name).
-    // Also build alias map from the site's parameters only.
-    let sp_rows =
-        crate::routes::private::readings::service::site_parameter_columns(&state.db, site_id)
-            .await?;
-
-    let mut site_param_map: HashMap<String, (Uuid, String)> = HashMap::new();
-    let mut site_alias_map: HashMap<String, (Uuid, String)> = HashMap::new();
-    let mut param_names: HashMap<Uuid, String> = HashMap::new();
-    let mut site_param_ids: HashSet<Uuid> = HashSet::new();
-
-    for row in sp_rows {
-        let (pid, sp_name, param_name, aliases) = (
-            row.parameter_id,
-            row.sp_name.unwrap_or_default(),
-            row.param_name.unwrap_or_default(),
-            row.aliases.unwrap_or_default(),
-        );
-
-        site_param_map.insert(sp_name.to_lowercase(), (pid, sp_name.clone()));
-        site_param_map.insert(param_name.to_lowercase(), (pid, sp_name.clone()));
-        param_names.insert(pid, sp_name.clone());
-        site_param_ids.insert(pid);
-
-        for alias in &aliases {
-            site_alias_map.insert(alias.to_lowercase(), (pid, sp_name.clone()));
-        }
-    }
-
-    // Derived-output parameters are computed, never ingested.
-    let derived_outputs =
-        crate::routes::private::readings::service::derived_output_parameter_ids(&state.db).await?;
-
-    // Global catalog fallback: lower(name) -> id, lower(alias) -> id.
-    let catalog_rows = parameters::Entity::find().all(&state.db).await?;
-    let mut catalog: HashMap<String, Uuid> = HashMap::new();
-    for row in catalog_rows {
-        let (pid, name, aliases) = (row.id, row.code, row.aliases);
-        catalog.insert(name.to_lowercase(), pid);
-        for alias in &aliases {
-            catalog.insert(alias.to_lowercase(), pid);
-        }
-        param_names.entry(pid).or_insert(name);
-    }
-
-    // Resolve an explicit-mapping target to a parameter id (site_param name, UUID, or catalog name).
-    let resolve_target = |target: &str| -> Option<(Uuid, String)> {
-        if let Ok(uuid) = Uuid::parse_str(target) {
-            return param_names.get(&uuid).map(|n| (uuid, n.clone()));
-        }
-        let key = target.to_lowercase();
-        site_param_map
-            .get(&key)
-            .cloned()
-            .or_else(|| site_alias_map.get(&key).cloned())
-            .or_else(|| {
-                catalog
-                    .get(&key)
-                    .map(|&pid| (pid, param_names.get(&pid).cloned().unwrap_or_default()))
-            })
+    let resolver = column_resolver(db, site.id).await?;
+    let mut reader = csv_reader(&csv_text);
+    let headers = file_headers(&mut reader)?;
+    let headers: Vec<&str> = headers.iter().collect();
+    let datetime_idx = timestamp_column(&headers).map_err(AppError::BadRequest)?;
+    let plan = plan_columns(
+        &headers,
+        datetime_idx,
+        req.mapping.as_ref(),
+        &resolver,
+        &site.name,
+    );
+    let mut parsed = parse_rows(
+        &mut reader,
+        datetime_idx,
+        tz_offset,
+        &plan.mappings,
+        Utc::now(),
+    );
+    let overlap =
+        compute_overlaps(db, site.id, &parsed.rows, parsed.earliest, parsed.latest).await?;
+    let overlap = refuse_family_rows(db, site.id, &plan.mappings, &mut parsed, overlap).await?;
+    let owners = slot_owners(db, site.id, &parsed.rows).await?;
+    let overlap = refuse_repeated_rows(
+        db,
+        site.id,
+        &req,
+        &plan.mappings,
+        &owners,
+        &mut parsed,
+        overlap,
+    )
+    .await?;
+    let check = screen_spot_file(&state, &auth, &req, site.id, &parsed.rows, &overlap).await?;
+    let analysis = SiteAnalysis {
+        site_id: site.id,
+        site_name: site.name,
+        session_id,
+        replicate_groups: replicate_groups(req.measurement_type.as_deref(), &parsed.rows),
+        plan,
+        parsed,
+        overlap,
+        check,
     };
-
-    // --- Parse header and classify columns ----------------------------------------------------
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(true)
-        .trim(csv::Trim::All)
-        .flexible(true)
-        .from_reader(csv_text.as_bytes());
-
-    let headers = reader
-        .headers()
-        .map_err(|e| AppError::BadRequest(format!("Failed to read CSV header: {e}")))?
-        .clone();
-
-    let columns: Vec<&str> = headers.iter().collect();
-    let datetime_idx = timestamp_column(&columns).map_err(AppError::BadRequest)?;
-
-    let mut mappings: Vec<ColumnMapping> = Vec::new();
-    let mut mapped_columns: HashMap<String, String> = HashMap::new();
-    let mut skipped_columns: Vec<String> = Vec::new();
-    let mut unmapped_columns: Vec<String> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
-
-    for (idx, header) in headers.iter().enumerate() {
-        if idx == datetime_idx {
-            continue;
-        }
-
-        // Candidate (parameter_id, display_name, factor, offset):
-        // Resolution: explicit mapping > site_param name > site aliases > exposure > catalog.
-        let candidate: Option<(Uuid, String, f64, f64)> = if let Some(entry) =
-            req.mapping.as_ref().and_then(|m| m.get(header))
-        {
-            match entry {
-                None => {
-                    skipped_columns.push(header.to_string());
-                    continue;
-                }
-                Some(target) => match resolve_target(target) {
-                    Some((pid, name)) => Some((pid, name, 1.0, 0.0)),
-                    None => {
-                        unmapped_columns.push(header.to_string());
-                        warnings.push(format!(
-                                "Explicit mapping target '{target}' for column '{header}' is not a known parameter"
-                            ));
-                        continue;
-                    }
-                },
-            }
-        } else {
-            let key = header.to_lowercase();
-            site_param_map
-                .get(&key)
-                .map(|(pid, name)| (*pid, name.clone(), 1.0, 0.0))
-                .or_else(|| {
-                    site_alias_map
-                        .get(&key)
-                        .map(|(pid, name)| (*pid, name.clone(), 1.0, 0.0))
-                })
-                .or_else(|| {
-                    catalog.get(&key).map(|pid| {
-                        (
-                            *pid,
-                            param_names.get(pid).cloned().unwrap_or_default(),
-                            1.0,
-                            0.0,
-                        )
-                    })
-                })
-        };
-
-        match candidate {
-            Some((pid, _, _, _)) if derived_outputs.contains(&pid) => {
-                skipped_columns.push(header.to_string());
-            }
-            Some((pid, resolved_name, factor, offset)) => {
-                mapped_columns.insert(header.to_string(), resolved_name);
-                if !site_param_ids.contains(&pid) {
-                    let name = param_names.get(&pid).cloned().unwrap_or_default();
-                    warnings.push(format!(
-                        "Column '{header}' maps to parameter '{name}', which is not assigned to site '{}'; it will be stored but not exposed until you add the site parameter",
-                        site.name
-                    ));
-                }
-                mappings.push(ColumnMapping {
-                    idx,
-                    header: header.to_string(),
-                    parameter_id: pid,
-                    conversion_factor: factor,
-                    conversion_offset: offset,
-                });
-            }
-            None => unmapped_columns.push(header.to_string()),
-        }
+    if req.dry_run {
+        return Ok(Json(analysis.response(None)));
     }
 
-    // --- Parse rows ---------------------------------------------------------------------------
-    // Bad rows/cells are skipped and recorded in `errors` (non-fatal), so a partially-malformed
-    // file still imports its good rows and the operator gets a list to fix and re-import.
-    let mut rows: Vec<(Uuid, chrono::DateTime<chrono::Utc>, f64, usize)> = Vec::new();
-    let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
-    let mut latest: Option<chrono::DateTime<chrono::Utc>> = None;
-    let mut row_count = 0usize;
-    let mut errors: Vec<RowError> = Vec::new();
-    let mut error_count = 0usize;
-    let mut line = 1usize; // header is line 1
-    // One clock read for the file: every row is judged against the same lead bound, so two rows
-    // carrying one timestamp cannot land on opposite sides of it.
-    let now = chrono::Utc::now();
-
-    let record_error =
-        |row: usize, message: String, errors: &mut Vec<RowError>, count: &mut usize| {
-            *count += 1;
-            if errors.len() < MAX_ERRORS {
-                errors.push(RowError { row, message });
-            }
-        };
-
-    for record in reader.records() {
-        line += 1;
-        let record = match record {
-            Ok(r) => r,
-            Err(e) => {
-                record_error(
-                    line,
-                    format!("CSV parse error: {e}"),
-                    &mut errors,
-                    &mut error_count,
-                );
-                continue;
-            }
-        };
-        let dt_cell = record.get(datetime_idx).unwrap_or("");
-        let Some(time) = parse_datetime(dt_cell, tz_offset) else {
-            record_error(
-                line,
-                format!("Unparseable DateTime '{dt_cell}'"),
-                &mut errors,
-                &mut error_count,
-            );
-            continue;
-        };
-        // The same bound /ingest and /readings/batch enforce, reported per row so the rest of the
-        // file still imports.
-        if let Some(reason) =
-            crate::routes::private::readings::service::admission::time_rejection_at(now, time)
-        {
-            record_error(line, reason, &mut errors, &mut error_count);
-            continue;
-        }
-        row_count += 1;
-        earliest = Some(earliest.map_or(time, |e| e.min(time)));
-        latest = Some(latest.map_or(time, |l| l.max(time)));
-        for m in &mappings {
-            let stored = match crate::routes::private::readings::service::admission::classify_cell(
-                record.get(m.idx).unwrap_or(""),
-            ) {
-                crate::routes::private::readings::service::admission::Cell::Missing => continue,
-                crate::routes::private::readings::service::admission::Cell::Invalid(reason) => {
-                    record_error(
-                        line,
-                        format!("Column '{}': {reason}", m.header),
-                        &mut errors,
-                        &mut error_count,
-                    );
-                    continue;
-                }
-                crate::routes::private::readings::service::admission::Cell::Value(raw) => {
-                    (raw - m.conversion_offset) / m.conversion_factor
-                }
-            };
-            rows.push((m.parameter_id, time, stored, line));
-        }
-    }
-
-    // Overlap diff: bucket incoming rows against what's already stored for this site, so the UI
-    // can preview what a re-import or overwrite would touch.
-    let mut overlap = compute_overlaps(&state.db, site_id, &rows, earliest, latest).await?;
-
-    // A slot instant owned by a replicate-family stream refuses CSV rows by name: a reading's
-    // replicate_index is the source's column position, so an import minting indexes from 0 onto
-    // the family would fabricate replicates, and routing beside it would double-serve the
-    // instant. The family's members sync from the source; corrections happen there.
-    {
-        let mut owning_ids: Vec<Uuid> = overlap.owning_stream.values().copied().collect();
-        owning_ids.sort_unstable();
-        owning_ids.dedup();
-        let family_keys = crate::routes::private::readings::service::replicate_family_keys(
-            &state.db,
-            &owning_ids,
-        )
-        .await?;
-        if !family_keys.is_empty() {
-            let header_of: HashMap<Uuid, String> = mappings
-                .iter()
-                .map(|m| (m.parameter_id, m.header.clone()))
-                .collect();
-            let before = rows.len();
-            rows.retain(|(pid, time, _, line)| {
-                let family = overlap
-                    .owning_stream
-                    .get(&(*pid, *time))
-                    .and_then(|sid| family_keys.get(sid));
-                let Some(key) = family else {
-                    return true;
-                };
-                record_error(
-                    *line,
-                    format!(
-                        "Column '{}': {} is served by replicate family stream '{key}'; its \
-                         replicates sync from the source and cannot be written by CSV import",
-                        header_of.get(pid).map_or("?", String::as_str),
-                        time.to_rfc3339()
-                    ),
-                    &mut errors,
-                    &mut error_count,
-                );
-                false
-            });
-            if rows.len() != before {
-                overlap = compute_overlaps(&state.db, site_id, &rows, earliest, latest).await?;
-            }
-        }
-    }
-    // Attribute each row to the sensor whose deployment window covers its time, so imported readings
-    // that fall inside an existing deployment land attributed instead of NULL (the historical-orphan
-    // source). Rows outside every deployment window resolve to all-None and need a later backdate.
-    let mut owner_map: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), ResolvedOwner> =
-        HashMap::new();
-    {
-        let mut times_by_param: HashMap<Uuid, Vec<chrono::DateTime<chrono::Utc>>> = HashMap::new();
-        for (pid, t, _, _) in &rows {
-            times_by_param.entry(*pid).or_default().push(*t);
-        }
-        for (pid, ts) in &times_by_param {
-            let resolved = resolve_slot_owner_for_times(&state.db, site_id, *pid, ts).await?;
-            for (t, owner) in resolved {
-                owner_map.insert((*pid, t), owner);
-            }
-        }
-    }
-
-    // One reading per (parameter, timestamp) on every cadence but spot: a repeat is a source
-    // defect, and absorbing it as replicate 1 hides the row from the default read and from every
-    // rollup while fabricating a grab sample around it. A spot file is a replicate plate, where
-    // the repeat is the point. The cadence is the one the write will resolve (request declaration
-    // → the stream that will carry the row → the deployed sensor's data_frequency → continuous),
-    // never the declaration alone, or a caller who declares nothing escapes the rule.
-    {
-        let mut api_stream_of: HashMap<Uuid, Uuid> = HashMap::new();
-        let mapped_params: Vec<Uuid> = mappings.iter().map(|m| m.parameter_id).collect();
-        for row in crate::routes::private::readings::service::api_streams_of_slots(
-            &state.db,
-            site_id,
-            &mapped_params,
+    require_columns(&analysis.plan)?;
+    let api_streams = importer_streams(db, analysis.site_id, &analysis.plan.mappings).await?;
+    let targets = WriteTargets::new(&analysis.overlap.owning_stream, &api_streams);
+    let instruments =
+        channel_instruments(db, &api_streams, &analysis.overlap.owning_stream).await?;
+    let staged = staged_rows(
+        analysis.site_id,
+        &analysis.parsed.rows,
+        &owners,
+        &targets,
+        &instruments,
+        req.values,
+    );
+    let tally = import_tally(
+        analysis.parsed.rows.len(),
+        analysis.overlap.identical,
+        analysis.overlap.differing,
+        req.conflict,
+    );
+    let derived_job_id = if tally.has_work {
+        stage_and_enqueue_import(
+            db,
+            &analysis,
+            &req,
+            &api_streams,
+            &staged,
+            tally.overlapping,
         )
         .await?
-        {
-            api_stream_of.insert(row.parameter_id, row.id);
-        }
-
-        let mut stream_ids: Vec<Uuid> = overlap
-            .owning_stream
-            .values()
-            .copied()
-            .chain(api_stream_of.values().copied())
-            .collect();
-        stream_ids.sort_unstable();
-        stream_ids.dedup();
-        let mut stream_default: HashMap<Uuid, Option<String>> = HashMap::new();
-        if !stream_ids.is_empty() {
-            for row in data_streams::Entity::find()
-                .filter(data_streams::Column::Id.is_in(stream_ids))
-                .all(&state.db)
-                .await?
-            {
-                stream_default.insert(row.id, row.measurement_type);
-            }
-        }
-
-        let mut sensor_ids: Vec<Uuid> = owner_map.values().filter_map(|o| o.sensor_id).collect();
-        sensor_ids.sort_unstable();
-        sensor_ids.dedup();
-        let sensor_types =
-            crate::routes::private::readings::service::measurement_types_for_sensors(
-                &state.db,
-                &sensor_ids,
-            )
-            .await?;
-
-        let header_of: HashMap<Uuid, String> = mappings
-            .iter()
-            .map(|m| (m.parameter_id, m.header.clone()))
-            .collect();
-        let mut seen_slots: HashSet<(Uuid, chrono::DateTime<chrono::Utc>)> = HashSet::new();
-        let before = rows.len();
-        rows.retain(|(pid, time, _, line)| {
-            let stream_id = overlap
-                .owning_stream
-                .get(&(*pid, *time))
-                .or_else(|| api_stream_of.get(pid));
-            let resolved = crate::routes::private::readings::service::resolve_measurement_type(
-                req.measurement_type.as_deref(),
-                stream_id
-                    .and_then(|id| stream_default.get(id))
-                    .and_then(Option::as_deref),
-                owner_map.get(&(*pid, *time)).and_then(|o| o.sensor_id),
-                &sensor_types,
-            );
-            if resolved == "spot" || seen_slots.insert((*pid, *time)) {
-                return true;
-            }
-            record_error(
-                *line,
-                format!(
-                    "Column '{}': timestamp {} is repeated, and a '{resolved}' series holds \
-                     one reading per timestamp",
-                    header_of.get(pid).map_or("?", String::as_str),
-                    time.to_rfc3339()
-                ),
-                &mut errors,
-                &mut error_count,
-            );
-            false
-        });
-        if rows.len() != before {
-            overlap = compute_overlaps(&state.db, site_id, &rows, earliest, latest).await?;
-        }
-    }
-
-    let overlap = overlap;
-
-    let replicate_groups = if req.measurement_type.as_deref() == Some("spot") {
-        let mut group_sizes: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), usize> = HashMap::new();
-        for (pid, t, _, _) in &rows {
-            *group_sizes.entry((*pid, *t)).or_default() += 1;
-        }
-        group_sizes.values().filter(|n| **n > 1).count()
-    } else {
-        0
-    };
-
-    // A spot file is screened against the site's seasonal history, cell by cell; a continuous
-    // file is not, the check's history being spot readings. A cell already stored with the same
-    // value is not screened: it is its own history, and importing it again changes nothing.
-    let check = if req.measurement_type.as_deref() == Some("spot") {
-        let cells: Vec<(usize, Uuid, chrono::DateTime<chrono::Utc>, f64)> = rows
-            .iter()
-            .filter(|(_, _, _, line)| !overlap.identical_lines.contains(line))
-            .map(|(pid, time, value, line)| (*line, *pid, *time, *value))
-            .collect();
-        Some(screen_import(&state, &auth, &req, site_id, &cells).await?)
     } else {
         None
     };
-
-    // Dry run: report the plan and overlap diff without writing.
-    if req.dry_run {
-        return Ok(Json(ImportCsvResponse {
-            site_id,
-            site_name: site.name,
-            dry_run: true,
-            session_id: Some(session_id),
-            mapped_columns,
-            skipped_columns,
-            unmapped_columns,
-            warnings,
-            row_count,
-            replicate_groups,
-            inserted_total: 0,
-            earliest,
-            latest,
-            derived_job_id: None,
-            derived_timestamps: 0,
-            duplicates: 0,
-            overlaps_identical: overlap.identical,
-            overlaps_differing: overlap.differing,
-            overwritten: 0,
-            overlap_sample: overlap.sample,
-            errors,
-            error_count,
-            tool_runs_created: 0,
-            curves: Vec::new(),
-            check,
-            site_imports: Vec::new(),
-        }));
-    }
-
-    if mappings.is_empty() {
-        return Err(AppError::BadRequest(
-            "No CSV columns resolved to ingestible parameters for this site's project".to_string(),
-        ));
-    }
-
-    // --- Prepare insert models (synchronous, fast) ---------------------------------------------
-    let mut stream_cache: HashMap<Uuid, Uuid> = HashMap::new();
-    for m in &mappings {
-        if let std::collections::hash_map::Entry::Vacant(e) = stream_cache.entry(m.parameter_id) {
-            let stream_id = get_or_create_api_stream(&state.db, site_id, m.parameter_id).await?;
-            e.insert(stream_id);
-        }
-    }
-
-    // Write onto the stream that already holds the slot, whatever it is, so an overwrite replaces
-    // the stored reading instead of adding a second one beside it on the importer's own stream.
-    // Both rows would otherwise satisfy the rollup predicate and double-count the slot's bucket.
-    // A slot nothing has written to yet lands on the importer's "api" stream.
-    //
-    // A stream that resolves for more than one of this file's parameters is not usable as a
-    // target: replicates are numbered per (stream, time), so two parameters sharing a stream at
-    // one timestamp would be numbered as each other's replicates.
-    let mut params_per_stream: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
-    for ((parameter_id, _), stream_id) in &overlap.owning_stream {
-        params_per_stream
-            .entry(*stream_id)
-            .or_default()
-            .insert(*parameter_id);
-    }
-    let write_target = |parameter_id: &Uuid, time: &chrono::DateTime<chrono::Utc>| -> Uuid {
-        overlap
-            .owning_stream
-            .get(&(*parameter_id, *time))
-            .filter(|stream_id| {
-                params_per_stream
-                    .get(*stream_id)
-                    .is_some_and(|params| params.len() == 1)
-            })
-            .copied()
-            .unwrap_or(stream_cache[parameter_id])
-    };
-
-    // The instrument each candidate target channel carries, for the rows the slot's deployment
-    // window does not attribute: an imported measurement names what produced it either way.
-    let stream_sensors: HashMap<Uuid, Uuid> = {
-        let mut ids: Vec<Uuid> = stream_cache.values().copied().collect();
-        ids.extend(overlap.owning_stream.values().copied());
-        ids.sort_unstable();
-        ids.dedup();
-        let mut map = HashMap::new();
-        for row in data_streams::Entity::find()
-            .filter(data_streams::Column::Id.is_in(ids))
-            .filter(data_streams::Column::SensorId.is_not_null())
-            .all(&state.db)
-            .await?
-        {
-            if let Some(sensor_id) = row.sensor_id {
-                map.insert(row.id, sensor_id);
-            }
-        }
-        map
-    };
-
-    let staged: Vec<StagedRow> = rows
-        .iter()
-        .map(|(parameter_id, time, value, _)| {
-            let owner = owner_map
-                .get(&(*parameter_id, *time))
-                .cloned()
-                .unwrap_or_default();
-            let stream_id = write_target(parameter_id, time);
-            StagedRow {
-                stream_id,
-                site_id,
-                parameter_id: *parameter_id,
-                time: *time,
-                raw_value: *value,
-                // Sensor and deployment are physical facts about the slot at that time and stay
-                // stamped either way; the calibration is a claim the row's value is uncorrected
-                // input, which only a declared-raw import may make.
-                sensor_id: owner
-                    .sensor_id
-                    .or_else(|| stream_sensors.get(&stream_id).copied()),
-                calibration_id: match req.values {
-                    CsvValueState::Raw => owner.calibration_id,
-                    CsvValueState::Corrected => None,
-                },
-                deployment_id: owner.deployment_id,
-            }
-        })
-        .collect();
-
-    let mut distinct_ts: Vec<chrono::DateTime<chrono::Utc>> =
-        rows.iter().map(|(_, t, _, _)| *t).collect();
-    distinct_ts.sort_unstable();
-    distinct_ts.dedup();
-    let derived_timestamps = distinct_ts.len();
-
-    let overlapping = overlap.identical + overlap.differing;
-    let overlap_differing = overlap.differing;
-    let has_work = rows.len() > overlapping
-        || (overlap_differing > 0 && req.conflict == ConflictMode::Overwrite);
-
-    // --- Stage the parsed readings and enqueue the worker job ---------------------------------
-    // The readings are externalised to `csv_import_staging` so any replica can run the import. The
-    // job reads them back by token, so the rows and the job commit together or not at all.
-    let derived_job_id = if has_work {
-        let import_token = Uuid::new_v4();
-        let txn = state.db.begin().await?;
-        stage_import_rows(&txn, import_token, &staged).await?;
-
-        let param_streams: Vec<serde_json::Value> = mappings
-            .iter()
-            .filter_map(|m| {
-                stream_cache
-                    .get(&m.parameter_id)
-                    .map(|&sid| serde_json::json!([m.parameter_id, sid]))
-            })
-            .collect();
-
-        let params = serde_json::json!({
-            "import_token": import_token,
-            "site_id": site_id,
-            "site_name": site.name,
-            "conflict": match req.conflict {
-                ConflictMode::Skip => "skip",
-                ConflictMode::Overwrite => "overwrite",
-            },
-            "since": earliest.map(|t| t.to_rfc3339()),
-            "latest": latest.map(|t| t.to_rfc3339()),
-            "overlapping": overlapping,
-            "param_streams": param_streams,
-            "measurement_type": req.measurement_type.as_deref(),
-        });
-
-        let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
-            &txn,
-            "csv_import",
-            None,
-            None,
-            &params,
-            None,
-        )
-        .await?;
-        txn.commit().await?;
-        job_id
-    } else {
-        None
-    };
-
-    let new_rows = rows.len().saturating_sub(overlapping);
-    let (inserted_total, duplicates, overwritten) = match req.conflict {
-        ConflictMode::Skip => (new_rows, overlapping, 0),
-        ConflictMode::Overwrite => (new_rows, overlap.identical, overlap.differing),
-    };
-
-    Ok(Json(ImportCsvResponse {
-        site_id,
-        site_name: site.name,
-        dry_run: false,
-        session_id: Some(session_id),
-        mapped_columns,
-        skipped_columns,
-        unmapped_columns,
-        warnings,
-        row_count,
-        replicate_groups,
-        inserted_total,
-        earliest,
-        latest,
+    let derived_timestamps = distinct_instants(&analysis.parsed.rows);
+    Ok(Json(analysis.response(Some(Committed {
+        tally,
         derived_job_id,
         derived_timestamps,
-        duplicates,
-        overlaps_identical: overlap.identical,
-        overlaps_differing: overlap.differing,
-        overwritten,
-        overlap_sample: overlap.sample,
-        errors,
-        error_count,
-        tool_runs_created: 0,
-        curves: Vec::new(),
-        check,
-        site_imports: Vec::new(),
-    }))
+    }))))
+}
+
+/// How a header resolves at this site: its slots, the catalog, and the calculations' outputs.
+async fn column_resolver(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+) -> AppResult<ColumnResolver> {
+    let slots = site_parameter_columns(db, site_id).await?;
+    let catalog = parameters::Entity::find().all(db).await?;
+    let derived_outputs = derived_output_parameter_ids(db).await?;
+    Ok(ColumnResolver::new(
+        slots,
+        catalog.into_iter().map(|p| (p.id, p.code, p.aliases)),
+        derived_outputs,
+    ))
+}
+
+/// Refuse the rows a replicate-family stream serves, and the overlap as the remaining rows stand.
+async fn refuse_family_rows(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    mappings: &[ColumnMapping],
+    parsed: &mut ParsedFile,
+    overlap: OverlapReport,
+) -> AppResult<OverlapReport> {
+    let owning_streams = distinct_ids(overlap.owning_stream.values().copied());
+    let family_keys = replicate_family_keys(db, &owning_streams).await?;
+    let refused = refuse_family_slots(
+        &mut parsed.rows,
+        &overlap.owning_stream,
+        &family_keys,
+        &headers_by_parameter(mappings),
+        &mut parsed.errors,
+    );
+    if !refused {
+        return Ok(overlap);
+    }
+    compute_overlaps(db, site_id, &parsed.rows, parsed.earliest, parsed.latest).await
+}
+
+/// The sensor, deployment and calibration whose windows cover each row's slot and time, so a row
+/// inside an existing deployment lands attributed. A row outside every window resolves to none.
+async fn slot_owners(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    rows: &[ImportRow],
+) -> AppResult<HashMap<SlotInstant, ResolvedOwner>> {
+    let mut times_by_parameter: HashMap<Uuid, Vec<chrono::DateTime<Utc>>> = HashMap::new();
+    for (pid, t, _, _) in rows {
+        times_by_parameter.entry(*pid).or_default().push(*t);
+    }
+    let mut owners = HashMap::new();
+    for (pid, times) in &times_by_parameter {
+        for (t, owner) in resolve_slot_owner_for_times(db, site_id, *pid, times).await? {
+            owners.insert((*pid, t), owner);
+        }
+    }
+    Ok(owners)
+}
+
+/// Refuse a repeated timestamp on every cadence but spot, and the overlap as the remaining rows
+/// stand.
+async fn refuse_repeated_rows(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    req: &ImportCsvRequest,
+    mappings: &[ColumnMapping],
+    owners: &HashMap<SlotInstant, ResolvedOwner>,
+    parsed: &mut ParsedFile,
+    overlap: OverlapReport,
+) -> AppResult<OverlapReport> {
+    let cadence = slot_cadence(
+        db,
+        site_id,
+        req.measurement_type.as_deref(),
+        mappings,
+        owners,
+        &overlap.owning_stream,
+    )
+    .await?;
+    let refused = refuse_repeated_slots(
+        &mut parsed.rows,
+        |pid, time| cadence.of(pid, time),
+        &headers_by_parameter(mappings),
+        &mut parsed.errors,
+    );
+    if !refused {
+        return Ok(overlap);
+    }
+    compute_overlaps(db, site_id, &parsed.rows, parsed.earliest, parsed.latest).await
+}
+
+/// What a row's cadence resolves from: the importer's streams at this site, the declared default
+/// of every stream a row may land on, and the frequency of every sensor that owns a row's slot.
+async fn slot_cadence<'a>(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    declared: Option<&'a str>,
+    mappings: &[ColumnMapping],
+    owners: &'a HashMap<SlotInstant, ResolvedOwner>,
+    owning_stream: &'a HashMap<SlotInstant, Uuid>,
+) -> AppResult<SlotCadence<'a>> {
+    let mapped: Vec<Uuid> = mappings.iter().map(|m| m.parameter_id).collect();
+    let api_stream_of: HashMap<Uuid, Uuid> = api_streams_of_slots(db, site_id, &mapped)
+        .await?
+        .into_iter()
+        .map(|row| (row.parameter_id, row.id))
+        .collect();
+    let streams = distinct_ids(
+        owning_stream
+            .values()
+            .chain(api_stream_of.values())
+            .copied(),
+    );
+    let stream_default = stream_cadences(db, streams).await?;
+    let sensors = distinct_ids(owners.values().filter_map(|o| o.sensor_id));
+    let sensor_types = measurement_types_for_sensors(db, &sensors).await?;
+    Ok(SlotCadence {
+        declared,
+        owning_stream,
+        api_stream_of,
+        stream_default,
+        owners,
+        sensor_types,
+    })
+}
+
+/// The measurement_type each stream declares, if any.
+async fn stream_cadences(
+    db: &sea_orm::DatabaseConnection,
+    stream_ids: Vec<Uuid>,
+) -> AppResult<HashMap<Uuid, Option<String>>> {
+    if stream_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    Ok(data_streams::Entity::find()
+        .filter(data_streams::Column::Id.is_in(stream_ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| (row.id, row.measurement_type))
+        .collect())
+}
+
+/// A spot file screened against the site's seasonal history; a continuous file is not, the
+/// check's history being spot readings.
+async fn screen_spot_file(
+    state: &AppState,
+    auth: &crate::common::middleware::AuthContext,
+    req: &ImportCsvRequest,
+    site_id: Uuid,
+    rows: &[ImportRow],
+    overlap: &OverlapReport,
+) -> AppResult<Option<ImportCheck>> {
+    if req.measurement_type.as_deref() != Some("spot") {
+        return Ok(None);
+    }
+    let cells = screened_cells(rows, &overlap.identical_lines);
+    Ok(Some(
+        screen_import(state, auth, req, site_id, &cells).await?,
+    ))
+}
+
+/// The importer's `api` stream for each mapped parameter at this site, created where missing.
+async fn importer_streams(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    mappings: &[ColumnMapping],
+) -> AppResult<HashMap<Uuid, Uuid>> {
+    let mut streams = HashMap::new();
+    for m in mappings {
+        if let std::collections::hash_map::Entry::Vacant(e) = streams.entry(m.parameter_id) {
+            e.insert(get_or_create_api_stream(db, site_id, m.parameter_id).await?);
+        }
+    }
+    Ok(streams)
+}
+
+/// The instrument each candidate target stream carries, for the rows no deployment window
+/// attributes: an imported measurement names what produced it either way.
+async fn channel_instruments(
+    db: &sea_orm::DatabaseConnection,
+    api_streams: &HashMap<Uuid, Uuid>,
+    owning_stream: &HashMap<SlotInstant, Uuid>,
+) -> AppResult<HashMap<Uuid, Uuid>> {
+    let ids = distinct_ids(api_streams.values().chain(owning_stream.values()).copied());
+    Ok(data_streams::Entity::find()
+        .filter(data_streams::Column::Id.is_in(ids))
+        .filter(data_streams::Column::SensorId.is_not_null())
+        .all(db)
+        .await?
+        .into_iter()
+        .filter_map(|row| row.sensor_id.map(|sensor_id| (row.id, sensor_id)))
+        .collect())
+}
+
+/// Stage the rows in `csv_import_staging` and enqueue the `csv_import` job that reads them back,
+/// in one transaction, so any replica can run the import and the rows and the job commit together
+/// or not at all.
+async fn stage_and_enqueue_import(
+    db: &sea_orm::DatabaseConnection,
+    analysis: &SiteAnalysis,
+    req: &ImportCsvRequest,
+    api_streams: &HashMap<Uuid, Uuid>,
+    staged: &[StagedRow],
+    overlapping: usize,
+) -> AppResult<Option<Uuid>> {
+    let import_token = Uuid::new_v4();
+    let params = import_job_params(
+        import_token,
+        analysis.site_id,
+        &analysis.site_name,
+        req,
+        &analysis.parsed,
+        overlapping,
+        param_streams(&analysis.plan.mappings, api_streams),
+    );
+    let txn = db.begin().await?;
+    stage_import_rows(&txn, import_token, staged).await?;
+    let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
+        &txn,
+        "csv_import",
+        None,
+        None,
+        &params,
+        None,
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(job_id)
 }
 
 // --- The `/readings` surface ---

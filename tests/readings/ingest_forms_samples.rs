@@ -1,8 +1,8 @@
 //! `/ingest` materialising `samples` for spot replicate groups on a paired stream: groups of two
-//! or more form on their own, a sync service declaring `collection` forms them from the first
-//! reading, unpaired streams defer to the pairing backfill, a group whose replicate indices start
-//! above zero keeps them and is still served, and an overwrite re-sync neither duplicates the
-//! sample nor detaches it.
+//! or more form whatever the writer declares, a lone reading forms none even under a declared
+//! `collection`, unpaired streams defer to the pairing backfill, a group whose replicate indices
+//! start above zero keeps them and is still served, and an overwrite re-sync neither duplicates
+//! the sample nor detaches it.
 //!
 //! Run: cargo test --test readings ingest_forms_samples -- --test-threads=1
 

@@ -8956,7 +8956,7 @@
             ]
           },
           "collection": {
-            "description": "The writer declaring these readings collection events: spot replicate groups sharing an\ninstant form a `samples` row from the first reading, like `/grab_samples`. Sync-service\ncallers only; without it a group still forms a sample once it carries two replicates.",
+            "description": "Ignored: a spot group sharing an instant forms a `samples` row once it carries two\nreplicates, whatever the writer declares. Accepted so sync services built on\nriver-data-core 0.14 and earlier are not refused. Sync-service callers only.",
             "type": "boolean"
           },
           "overwrite": {
@@ -17062,6 +17062,7 @@
         "additionalProperties": false,
         "properties": {
           "calibrated_value": {
+            "description": "The corrected value. Where a calibration covers the reading the server computes it from\nthat calibration, and a submitted value that differs is refused with 400. With no\ncalibration a submitted value is stored as given.",
             "format": "double",
             "type": [
               "number",
@@ -39211,13 +39212,13 @@
             "description": "Inserted count"
           },
           "400": {
-            "description": "Timestamp outside the admissible window, or non-finite value"
+            "description": "Timestamp outside the admissible window, non-finite value, or a calibrated_value the row's calibration does not produce"
           },
           "413": {
             "description": "Body exceeds 10MB limit"
           }
         },
-        "summary": "Batch insert readings keyed by (site_id, parameter_id). Auto-creates \"api\" streams when\na (site, parameter) pair has none. 10MB body limit. Requires `write_data`.",
+        "summary": "Batch insert readings keyed by (site_id, parameter_id). Auto-creates \"api\" streams when\na (site, parameter) pair has none, and pairs one to the site's slot once the site carries it; a\nrow is attributed from its stream's pairing. 10MB body limit. Requires `write_data`.",
         "tags": [
           "ingestion"
         ]
@@ -46650,7 +46651,7 @@
             "description": "Body exceeds 10MB limit"
           }
         },
-        "summary": "Batch insert non-numeric device status events (e.g. \"low_battery\", \"offline\").\nAuto-creates \"api\" streams as needed. 10MB body limit. Requires `write_data`.",
+        "summary": "Batch insert non-numeric device status events (e.g. \"low_battery\", \"offline\").\nAuto-creates \"api\" streams as needed. An event is attributed to its site and parameter only\nwhen the site carries that parameter; otherwise it is stored unattributed on its unpaired\nstream. 10MB body limit. Requires `write_data`.",
         "tags": [
           "ingestion"
         ]

@@ -203,6 +203,34 @@ fn the_cursor_advance_never_moves_the_cursor_back() {
     assert!(sql.contains(r#""id" ="#), "{sql}");
 }
 
+/// A pass's cursor and digest are written only under the pairing it attributed against.
+#[test]
+fn the_pass_state_is_written_only_under_the_pairing_the_pass_used() {
+    let paired = record_pass(
+        Uuid::nil(),
+        Some(Uuid::nil()),
+        Some(chrono::Utc::now().into()),
+        Some("d1".into()),
+    )
+    .build(sea_orm::DatabaseBackend::Postgres)
+    .to_string();
+    assert!(paired.contains(r#""site_parameter_id" ="#), "{paired}");
+    assert!(
+        paired.contains(r#""last_window_digest" = 'd1'"#),
+        "{paired}"
+    );
+    assert!(paired.contains("GREATEST(COALESCE("), "{paired}");
+
+    let unpaired = record_pass(Uuid::nil(), None, None, Some("d1".into()))
+        .build(sea_orm::DatabaseBackend::Postgres)
+        .to_string();
+    assert!(
+        unpaired.contains(r#""site_parameter_id" IS NULL"#),
+        "{unpaired}"
+    );
+    assert!(!unpaired.contains(r#""last_data_time""#), "{unpaired}");
+}
+
 #[test]
 fn test_declared_instrument_granularity_reads_both_shapes() {
     use river_data_core::models::InstrumentGranularity;

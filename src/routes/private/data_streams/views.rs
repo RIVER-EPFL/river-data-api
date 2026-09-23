@@ -609,8 +609,13 @@ pub async fn pair_stream(
             )
             .await?;
             let (backfilled, touched_events) = (done.readings, done.touched_events);
-            enqueue_window_reprocess(txn, stream_id, sp.site_id, sp.parameter_id, backfilled)
-                .await?;
+            super::flows::enqueue_slot_reprocess(
+                txn,
+                stream_id,
+                (sp.site_id, sp.parameter_id),
+                backfilled,
+            )
+            .await?;
 
             Ok((sp.site_id, sp.parameter_id, backfilled, touched_events))
         })
@@ -646,44 +651,6 @@ pub async fn pair_stream(
         stream: super::service::with_assignments(updated),
         backfilled,
     }))
-}
-
-/// Queue the window reprocess of the slot a stream was just paired to, on the pairing's own
-/// transaction. It re-attributes the backfilled readings to whichever sensor's deployment window
-/// covers each time, so pairing into a slot with a real deployment timeline is attributed by
-/// window, not by the single frozen sensor context; resolves each reading's calibration and
-/// corrected value from the window covering its own time; and refreshes continuous aggregates and
-/// cascades derived params.
-///
-/// Gated on the stream holding readings at all, not on the backfill having moved rows: a stream
-/// re-paired after an unpair, or one whose readings arrived already attributed, backfills nothing
-/// and still needs its window resolved against the slot it now feeds.
-async fn enqueue_window_reprocess<C: ConnectionTrait>(
-    txn: &C,
-    stream_id: Uuid,
-    site_id: Uuid,
-    parameter_id: Uuid,
-    backfilled: u64,
-) -> AppResult<()> {
-    let has_readings = crate::routes::private::readings::models::Entity::find()
-        .filter(crate::routes::private::readings::models::Column::StreamId.eq(stream_id))
-        .one(txn)
-        .await?
-        .is_some();
-    if backfilled == 0 && !has_readings {
-        return Ok(());
-    }
-    crate::routes::private::reprocessing_jobs::service::enqueue(
-        txn,
-        "pairing_backfill",
-        None,
-        Some(stream_id),
-        &serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
-        None,
-    )
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(())
 }
 
 /// Remove pairing from a stream. Clears `site_parameter_id`/`paired_at` on the stream and

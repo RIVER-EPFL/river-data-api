@@ -220,6 +220,109 @@ pub async fn backfill<C: ConnectionTrait>(
     })
 }
 
+/// The pairing an entry channel attributes its writes from, and the visits pairing it touched.
+pub struct ChannelPairing {
+    pub site_parameter_id: Option<Uuid>,
+    pub touched_events: Vec<TouchedEvent>,
+}
+
+/// Pair an unpaired entry channel to the slot it was opened for, now that the slot exists, with
+/// the backfill every pairing owes. A channel already paired keeps its pairing, and one whose slot
+/// does not exist stays unpaired.
+///
+/// No deployment is opened: an entry channel's instrument is not stationed at the site, which is
+/// how the channel is paired when it is created with its slot already in place.
+pub async fn pair_entry_channel(
+    db: &sea_orm::DatabaseConnection,
+    stream_id: Uuid,
+    slot: Option<Uuid>,
+) -> AppResult<ChannelPairing> {
+    let stream = data_streams::Entity::find_by_id(stream_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Stream not found".to_string()))?;
+    let (None, Some(site_parameter_id)) = (stream.site_parameter_id, slot) else {
+        return Ok(ChannelPairing {
+            site_parameter_id: stream.site_parameter_id,
+            touched_events: Vec::new(),
+        });
+    };
+    let sp = site_parameters::Entity::find_by_id(site_parameter_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Site parameter not found".to_string()))?;
+    let done = bulk_write::guarded(db, async |txn| {
+        let claimed =
+            super::service::claim_stream(stream_id, site_parameter_id, chrono::Utc::now().into())
+                .exec(txn)
+                .await?
+                .rows_affected;
+        if claimed == 0 {
+            return Ok(None);
+        }
+        let done = backfill(txn, HoldScope::Stream(stream_id), None).await?;
+        enqueue_slot_reprocess(txn, stream_id, (sp.site_id, sp.parameter_id), done.readings)
+            .await?;
+        Ok(Some(done))
+    })
+    .await?;
+    let Some(done) = done else {
+        return Ok(ChannelPairing {
+            site_parameter_id: paired_slot(db, stream_id).await?,
+            touched_events: Vec::new(),
+        });
+    };
+    Ok(ChannelPairing {
+        site_parameter_id: Some(site_parameter_id),
+        touched_events: done.touched_events,
+    })
+}
+
+/// The slot a stream is paired to, as committed.
+async fn paired_slot<C: ConnectionTrait>(db: &C, stream_id: Uuid) -> AppResult<Option<Uuid>> {
+    Ok(data_streams::Entity::find_by_id(stream_id)
+        .one(db)
+        .await?
+        .and_then(|s| s.site_parameter_id))
+}
+
+/// Queue the window reprocess a newly paired stream's slot owes, on the pairing's own transaction:
+/// each reading is re-attributed to the deployment covering its own time and corrected by the
+/// curve covering it, and the rollups and derived values follow.
+///
+/// Gated on the stream holding readings at all, not on the backfill having moved rows: a stream
+/// re-paired after an unpair, or one whose readings arrived already attributed, backfills nothing
+/// and still needs its window resolved against the slot it now feeds.
+pub async fn enqueue_slot_reprocess<C: ConnectionTrait>(
+    db: &C,
+    stream_id: Uuid,
+    (site_id, parameter_id): (Uuid, Uuid),
+    backfilled: u64,
+) -> AppResult<()> {
+    use sea_orm::{ColumnTrait, QueryFilter};
+
+    let has_readings = backfilled > 0
+        || readings::Entity::find()
+            .filter(readings::Column::StreamId.eq(stream_id))
+            .one(db)
+            .await?
+            .is_some();
+    if !has_readings {
+        return Ok(());
+    }
+    crate::routes::private::reprocessing_jobs::service::enqueue(
+        db,
+        "pairing_backfill",
+        None,
+        Some(stream_id),
+        &serde_json::json!({ "site_id": site_id, "parameter_id": parameter_id }),
+        None,
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(())
+}
+
 /// What a slot teardown moved and which visits lost an input.
 pub struct RetiredSlot {
     /// The reading span removed from the rollups.

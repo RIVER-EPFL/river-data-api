@@ -9,7 +9,8 @@ use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, enforce_project_scope_for_sites};
 use crate::error::AppResult;
 use crate::routes::private::data_streams;
-use crate::routes::private::data_streams::service::get_or_create_api_stream;
+use crate::routes::private::data_streams::service::{get_or_create_api_stream, site_parameter_of};
+use crate::routes::private::readings::service::slot_attribution;
 use crate::routes::private::readings::status_events;
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -32,7 +33,9 @@ pub struct BatchStatusEventsResponse {
 }
 
 /// Batch insert non-numeric device status events (e.g. "low_battery", "offline").
-/// Auto-creates "api" streams as needed. 10MB body limit. Requires `write_data`.
+/// Auto-creates "api" streams as needed. An event is attributed to its site and parameter only
+/// when the site carries that parameter; otherwise it is stored unattributed on its unpaired
+/// stream. 10MB body limit. Requires `write_data`.
 #[utoipa::path(
     post,
     path = "/api/status_events/batch",
@@ -52,12 +55,17 @@ pub async fn insert_batch_status_events(
     enforce_project_scope_for_sites(&state.db, &scope, &target_sites).await?;
 
     let mut stream_cache: HashMap<(Uuid, Uuid), Uuid> = HashMap::new();
+    let mut slots: HashMap<(Uuid, Uuid), Option<Uuid>> = HashMap::new();
 
     for e in &payload.events {
         let key = (e.site_id, e.parameter_id);
         if let std::collections::hash_map::Entry::Vacant(entry) = stream_cache.entry(key) {
             let stream_id = get_or_create_api_stream(&state.db, e.site_id, e.parameter_id).await?;
             entry.insert(stream_id);
+            slots.insert(
+                key,
+                site_parameter_of(&state.db, e.site_id, e.parameter_id).await?,
+            );
         }
     }
 
@@ -74,12 +82,14 @@ pub async fn insert_batch_status_events(
         .events
         .into_iter()
         .map(|e| {
-            let stream_id = stream_cache[&(e.site_id, e.parameter_id)];
+            let key = (e.site_id, e.parameter_id);
+            let stream_id = stream_cache[&key];
+            let (site_id, parameter_id) = slot_attribution(e.site_id, e.parameter_id, slots[&key]);
             status_events::ActiveModel {
                 stream_id: Set(stream_id),
                 time: Set(e.time.into()),
-                site_id: Set(Some(e.site_id)),
-                parameter_id: Set(Some(e.parameter_id)),
+                site_id: Set(site_id),
+                parameter_id: Set(parameter_id),
                 value: Set(e.value),
                 sensor_id: Set(e
                     .sensor_id
