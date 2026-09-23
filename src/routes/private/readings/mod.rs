@@ -2,6 +2,7 @@ pub mod consumed;
 pub mod decision_model;
 pub mod flows;
 pub mod models;
+pub mod portal_calculation;
 pub mod samples;
 pub mod service;
 pub mod status_events;

@@ -190,6 +190,20 @@ pub async fn project_of_sensor(db: &DatabaseConnection, sensor_id: Uuid) -> AppR
     .await
 }
 
+/// The project whose public API answers to `code`.
+pub async fn project_of_public_code(db: &DatabaseConnection, code: &str) -> AppResult<RowProject> {
+    use crate::routes::private::projects;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+    let id: Option<Uuid> = projects::Entity::find()
+        .select_only()
+        .column(projects::Column::Id)
+        .filter(projects::Column::PublicCode.eq(code))
+        .into_tuple()
+        .one(db)
+        .await?;
+    Ok(id.map_or(RowProject::Missing, |id| RowProject::In(vec![id])))
+}
+
 /// One row of a resolver query: whether the row targets nothing, and the project it reaches.
 #[derive(FromQueryResult)]
 struct ScopeRow {
@@ -270,6 +284,21 @@ pub fn confine_target(
         return Err(AppError::NotFound(format!("{what} not found")));
     }
     require_target_in_scope(scope, row, unowned, what)
+}
+
+/// Confine a row an instrument owns (a calibration, a curve) to the projects the instrument is
+/// deployed in. An instrument deployed nowhere is in no project, so any caller may name it.
+pub async fn require_instrument_in_scope(
+    db: &DatabaseConnection,
+    scope: &AccessScope,
+    sensor_id: Uuid,
+) -> AppResult<()> {
+    confine_target(
+        scope,
+        &project_of_sensor(db, sensor_id).await?,
+        Unowned::Allow,
+        "instrument",
+    )
 }
 
 /// Refuse an untargeted run to a restricted caller: with nothing named, the action reaches every

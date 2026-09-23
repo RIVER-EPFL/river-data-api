@@ -2090,6 +2090,31 @@ async fn withdraw_visit<C: sea_orm::ConnectionTrait>(conn: &C, visit_id: Uuid) -
     Ok(())
 }
 
+/// Close every measurement's hold at a visit with the visit's own ruling: once the field day is
+/// withdrawn, its entries have nothing left to rule on.
+async fn close_entry_holds_at<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+    at: sea_orm::prelude::DateTimeWithTimeZone,
+    status: &str,
+    by: &str,
+) -> AppResult<()> {
+    hold_model::Entity::update_many()
+        .col_expr(hold_model::Column::Status, Expr::val(status))
+        .col_expr(hold_model::Column::AcknowledgedBy, Expr::val(by))
+        .col_expr(
+            hold_model::Column::AcknowledgedAt,
+            Expr::current_timestamp(),
+        )
+        .filter(hold_model::Column::Kind.eq(HoldKind::UnverifiedEntry.as_str()))
+        .filter(hold_model::Column::Status.is_in(HoldStatus::OPEN.map(HoldStatus::as_str)))
+        .filter(hold_model::Column::SiteId.eq(site_id))
+        .filter(hold_model::Column::GroupTime.eq(at))
+        .exec(conn)
+        .await?;
+    Ok(())
+}
+
 /// Record the ruling on the hold, naming the visit it was about and how many readings moved with
 /// it.
 async fn decide_visit_hold<C: sea_orm::ConnectionTrait>(
@@ -2168,6 +2193,7 @@ pub(super) async fn rule_on_visit(
         } else {
             let rows = withdraw_visit_readings(txn, visit.id, by, &reason).await?;
             withdraw_visit(txn, visit.id).await?;
+            close_entry_holds_at(txn, site_id, hold.group_time, status, by).await?;
             rows
         };
         decide_visit_hold(txn, id, mode, status, by, visit.id, withdrawn).await?;
@@ -2822,9 +2848,9 @@ pub struct PlanInstrumentRef {
     /// `(source_system, source_key)` is an instrument's identity, so a later rename cannot break
     /// the mapping.
     pub source_key: String,
-    /// `stream` (already attributed), `curve_label` (suggested from the source's own curve
-    /// labels), `manual` (repointed in the review), `ambiguous_label` (the label matched more than
-    /// one, so nothing is suggested), or `placeholder` (nothing matched).
+    /// `stream` (already attributed), `source_key` (the source's own instrument under the key an
+    /// apply mints), `manual` (repointed in the review), or a proposal to confirm: `placeholder`
+    /// (a curve column's), `parameter` (a source parameter's) or `device` (a device feed's).
     pub resolved_by: String,
     pub create: bool,
     /// The instrument row was minted by stream registration rather than named by the source or an
@@ -2855,18 +2881,6 @@ pub struct PlanInstrumentRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub name_conflict: Option<InstrumentNameConflict>,
-    /// The instruments a curve label matched when it matched more than one. Which analyser the
-    /// source meant is not in the label, so the tie is named and nothing is suggested (Q195).
-    #[serde(default)]
-    #[schema(required)]
-    pub label_candidates: Vec<PlanLabelCandidate>,
-}
-
-/// One instrument a curve label matched, enough of it to choose by.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
-pub struct PlanLabelCandidate {
-    pub id: Uuid,
-    pub name: String,
 }
 
 /// The instrument a proposed name collides with, enough of it to choose by.
@@ -2900,8 +2914,6 @@ pub struct PlanReplicates {
 pub struct InstrumentCatalog {
     /// Instrument id -> (display name, source_key).
     by_id: HashMap<Uuid, (String, Option<String>)>,
-    /// The source's own instruments, as (normalised label, id), for curve-column matching.
-    labels: Vec<(String, Uuid)>,
     /// The source's own instruments by `source_key`, which is the identity an apply mints and
     /// dedupes on. Looked up before anything is proposed, so a plan built after an earlier one
     /// reports the instrument it already created rather than asking to create it again.
@@ -2917,8 +2929,7 @@ pub struct InstrumentCatalog {
     /// Instruments registration minted for a stream that named none, rather than ones a source or
     /// an operator attributed. They carry `metadata.minted_from_stream`
     /// (`sensors/identity.rs::resolve_or_mint_stream_instrument`). A default is what keeps a
-    /// reading from naming nothing; it is not evidence about which analyser produced a correction,
-    /// so it loses to a curve label that matches the stream's own curve column.
+    /// reading from naming nothing; it is not evidence about which analyser produced a correction.
     defaulted: std::collections::HashSet<Uuid>,
 }
 
@@ -2954,24 +2965,12 @@ pub fn proposal_conflict(
         .and_then(|s| catalog.holding_serial(s))
 }
 
-/// A curve column's stem, normalised for comparison against an instrument label:
+/// A curve column's stem, which names the instrument a placeholder proposes:
 /// `doc_std_curve_id` -> `doc`, `chla_acid_std_curve_id` -> `chla acid`.
 pub(super) fn curve_column_stem(column: &str) -> String {
     column
         .to_lowercase()
         .trim_end_matches("_std_curve_id")
-        .replace('_', " ")
-        .trim()
-        .to_string()
-}
-
-/// An instrument's label, normalised the same way. The source prefix is dropped because it is
-/// already the thing being matched within.
-pub(super) fn instrument_label(source_key: &str, source_system: &str) -> String {
-    source_key
-        .strip_prefix(&format!("{source_system}:"))
-        .unwrap_or(source_key)
-        .to_lowercase()
         .replace('_', " ")
         .trim()
         .to_string()
@@ -3044,7 +3043,6 @@ pub async fn load_instrument_catalog(
     }
 
     let mut by_id = HashMap::new();
-    let mut labels = Vec::new();
     let mut by_source_key = HashMap::new();
     for row in &rows {
         let name = row
@@ -3055,7 +3053,6 @@ pub async fn load_instrument_catalog(
         if row.source_system.as_deref() == Some(source_system)
             && let Some(key) = &row.source_key
         {
-            labels.push((instrument_label(key, source_system), row.id));
             by_source_key.insert(key.clone(), row.id);
         }
         by_id.insert(row.id, (name, row.source_key.clone()));
@@ -3091,7 +3088,6 @@ pub async fn load_instrument_catalog(
 
     Ok(InstrumentCatalog {
         by_id,
-        labels,
         by_source_key,
         by_name,
         by_serial,
@@ -3100,51 +3096,11 @@ pub async fn load_instrument_catalog(
     })
 }
 
-/// What a curve column's stem matched among this source's instrument labels.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum LabelMatch {
-    /// Nothing carries the stem.
-    None,
-    /// One instrument does. It is a suggestion, never a settled attribution: words matching is not
-    /// the source saying so.
-    One(Uuid),
-    /// Several do, and which analyser the source meant is not in the label. Reported rather than
-    /// dropped, because a tie is the review's question to answer.
-    Tie(Vec<Uuid>),
-}
-
-/// The instruments of this source whose label matches a curve column's stem.
-///
-/// A registration-minted default is not a candidate: its label is the parameter's own name, so
-/// `DOC` would tie with the analyser labelled `DOC corr` and make every stem ambiguous. The
-/// question a curve column asks is which instrument the source says produced the correction, and a
-/// default is the absence of that answer.
-pub(super) fn label_match(curve_column: &str, catalog: &InstrumentCatalog) -> LabelMatch {
-    let stem = curve_column_stem(curve_column);
-    let mut matches: Vec<Uuid> = catalog
-        .labels
-        .iter()
-        .filter(|(_, id)| !catalog.defaulted.contains(id))
-        .filter(|(label, _)| *label == stem || label.starts_with(&format!("{stem} ")))
-        .map(|(_, id)| *id)
-        .collect();
-    let mut seen = std::collections::HashSet::new();
-    matches.retain(|id| seen.insert(*id));
-    match matches.len() {
-        0 => LabelMatch::None,
-        1 => LabelMatch::One(matches[0]),
-        _ => LabelMatch::Tie(matches),
-    }
-}
-
 /// Which instrument a stream's curve references belong to, most specific first: the instrument the
-/// stream already names, then the source's own curve labels matched against the curve column, then
-/// a placeholder for an operator to confirm.
-///
-/// The label match is what lets a portal whose curve column is empty in the data still resolve: the
-/// curve catalog is replicated independently of the readings, so the instrument is knowable even
-/// when no row has yet named a curve. It is a heuristic, so it is reported as one, and an
-/// ambiguous stem resolves to nothing rather than to a guess.
+/// stream already names, then the source's own instrument under the key an apply mints, then a
+/// placeholder for an operator to confirm. A label that reads like the curve column is never
+/// matched: words agreeing is not the source naming the analyser, so the operator attaches each
+/// curve by hand (Q220).
 pub fn resolve_instrument(
     stream_sensor_id: Option<Uuid>,
     curve_column: Option<&str>,
@@ -3176,7 +3132,6 @@ pub fn resolve_instrument(
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
             proposed_name: None,
             name_conflict: None,
-            label_candidates: vec![],
         });
     }
 
@@ -3201,34 +3156,8 @@ pub fn resolve_instrument(
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
             proposed_name: None,
             name_conflict: None,
-            label_candidates: vec![],
         });
     }
-
-    // A label match is words agreeing, not the source naming an instrument, so it is carried as a
-    // suggestion the review confirms (Q195). A tie names its candidates and suggests none.
-    let tied = match label_match(&column, catalog) {
-        LabelMatch::One(id) => {
-            let (name, source_key) = catalog.by_id.get(&id).cloned().unwrap_or_default();
-            return Some(PlanInstrumentRef {
-                curve_column,
-                id: Some(id),
-                name,
-                source_key: source_key.unwrap_or_default(),
-                resolved_by: "curve_label".to_string(),
-                create: false,
-                defaulted: catalog.defaulted.contains(&id),
-                confirmed: false,
-                stamps_readings,
-                curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
-                proposed_name: None,
-                name_conflict: None,
-                label_candidates: vec![],
-            });
-        }
-        LabelMatch::Tie(ids) => label_candidates(&ids, catalog),
-        LabelMatch::None => vec![],
-    };
 
     // Unconfirmed, and the apply refuses until an operator says yes (Q123). The name is a stem
     // taken from a column heading, and a lab instrument is provenance: once readings name it,
@@ -3240,11 +3169,7 @@ pub fn resolve_instrument(
         id: None,
         name: name.clone(),
         source_key,
-        resolved_by: if tied.is_empty() {
-            "placeholder".to_string()
-        } else {
-            "ambiguous_label".to_string()
-        },
+        resolved_by: "placeholder".to_string(),
         create: true,
         defaulted: false,
         confirmed: false,
@@ -3252,25 +3177,7 @@ pub fn resolve_instrument(
         curves: vec![],
         proposed_name: Some(name),
         name_conflict: None,
-        label_candidates: tied,
     })
-}
-
-/// The tied instruments, named so the review can pick one instead of creating another.
-fn label_candidates(ids: &[Uuid], catalog: &InstrumentCatalog) -> Vec<PlanLabelCandidate> {
-    let mut candidates: Vec<PlanLabelCandidate> = ids
-        .iter()
-        .map(|id| PlanLabelCandidate {
-            id: *id,
-            name: catalog
-                .by_id
-                .get(id)
-                .map(|(name, _)| name.clone())
-                .unwrap_or_else(|| id.to_string()),
-        })
-        .collect();
-    candidates.sort_by(|a, b| a.name.cmp(&b.name));
-    candidates
 }
 
 /// The provenance key a stream's instrument is held under: the source's instrument for the raw
@@ -3316,7 +3223,6 @@ pub fn resolve_parameter_instrument(
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
             proposed_name: None,
             name_conflict: None,
-            label_candidates: vec![],
         };
     }
     // The lab's DOC analyser is one machine carried to every station, so it is called DOC. The
@@ -3337,7 +3243,6 @@ pub fn resolve_parameter_instrument(
         curves: vec![],
         proposed_name: Some(name),
         name_conflict: conflict,
-        label_candidates: vec![],
     }
 }
 
@@ -3366,7 +3271,6 @@ pub fn resolve_device_instrument(
             curves: catalog.curves.get(&id).cloned().unwrap_or_default(),
             proposed_name: None,
             name_conflict: None,
-            label_candidates: vec![],
         };
     }
     PlanInstrumentRef {
@@ -3382,7 +3286,6 @@ pub fn resolve_device_instrument(
         curves: vec![],
         proposed_name: Some(slot.to_string()),
         name_conflict: catalog.named(slot),
-        label_candidates: vec![],
     }
 }
 
@@ -4414,9 +4317,9 @@ pub(super) struct ApplyCounters {
     pub(super) curves_created: u32,
 }
 
-/// The streams whose instrument nobody has agreed to: a creation, an attachment the plan suggested
-/// from a curve label, or a lab row with nothing attached, which the apply would otherwise mint one
-/// for. A device feed drafted without one is its own channel instrument.
+/// The streams whose instrument nobody has agreed to: a creation, or a lab row with nothing
+/// attached, which the apply would otherwise mint one for. A device feed drafted without one is its
+/// own channel instrument.
 pub fn unconfirmed_instruments(entries: &[PlanEntry]) -> Vec<&str> {
     entries
         .iter()
@@ -7064,7 +6967,6 @@ pub(super) async fn apply_instrument_updates(
                             curves: Vec::new(),
                             proposed_name: Some(name),
                             name_conflict: None,
-                            label_candidates: vec![],
                         });
                 }
             }
@@ -7084,7 +6986,6 @@ pub(super) async fn apply_instrument_updates(
                 instrument.defaulted = is_minted_default(sensor);
                 instrument.confirmed = true;
                 instrument.curves = repointed_curves.clone();
-                instrument.label_candidates.clear();
             }
             // Naming an instrument proposes one; picking from the inventory attaches one. So a
             // name arriving at an entry that holds an existing instrument returns it to a
@@ -7108,28 +7009,9 @@ pub(super) async fn apply_instrument_updates(
                     instrument.defaulted = false;
                     instrument.confirmed = false;
                     instrument.curves = Vec::new();
-                    instrument.label_candidates.clear();
                 }
             }
 
-            // A tie is a choice, so it is not what an accept-everything button is for: the label
-            // matched two instruments and the plan suggested neither. Refused here rather than in
-            // the button, which a second client does not hold.
-            if update.instrument_confirmed == Some(true)
-                && instrument.resolved_by == "ambiguous_label"
-            {
-                return Err(AppError::BadRequest(format!(
-                    "the curve label of stream {} matches {}: pick one, or name the instrument to \
-                     create, before confirming",
-                    update.stream_id,
-                    instrument
-                        .label_candidates
-                        .iter()
-                        .map(|c| c.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" and ")
-                )));
-            }
             if let Some(confirmed) = update.instrument_confirmed {
                 instrument.confirmed = confirmed;
             }

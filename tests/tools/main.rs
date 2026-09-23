@@ -13,6 +13,7 @@ mod calculators;
 mod cnet_authoring;
 mod concurrent_version_saves;
 mod constants_parity;
+mod decommission;
 mod draft_run;
 mod formula_calculation;
 mod formula_draft_run;

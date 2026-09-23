@@ -193,6 +193,7 @@ pub async fn sample_preview(
     request_body = SeasonalCheckRequest,
     responses(
         (status = 200, description = "Per-value classification with the distribution payload and the method", body = SeasonalCheckResponse),
+        (status = 403, description = "Site outside the caller's projects"),
         (status = 404, description = "Site not found"),
     ),
     tag = "ingestion"
@@ -200,8 +201,10 @@ pub async fn sample_preview(
 pub async fn seasonal_check(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<crate::common::middleware::AuthContext>,
+    ProjectScope(scope): ProjectScope,
     Json(req): Json<SeasonalCheckRequest>,
 ) -> AppResult<Json<SeasonalCheckResponse>> {
+    crate::common::scope::require_sites_in_scope(&state.db, &scope, &[req.site_id]).await?;
     if req.values.is_empty() {
         return Err(AppError::BadRequest("No values to check".to_string()));
     }

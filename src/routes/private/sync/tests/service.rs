@@ -15,7 +15,6 @@ fn catalog(entries: &[(&str, Uuid)]) -> InstrumentCatalog {
             .iter()
             .map(|(key, id)| (*id, ((*key).to_string(), Some((*key).to_string()))))
             .collect(),
-        labels: vec![],
         by_source_key: entries
             .iter()
             .map(|(key, id)| ((*key).to_string(), *id))
@@ -27,14 +26,14 @@ fn catalog(entries: &[(&str, Uuid)]) -> InstrumentCatalog {
     }
 }
 
-/// Scenario: a stream names an instrument and the source's own curve catalog holds another
-/// whose label matches the stream's curve column.
-/// Expected behaviour: the instrument the stream names wins, bookkeeping row or not. Since
-/// M172 registration mints nothing, so an instrument on the stream is an attribution somebody
-/// made and there is no default to see through. The curve label answers only for a stream that
-/// names none.
+/// Scenario: a stream names an instrument, and the source holds another whose label reads like
+/// the stream's curve column.
+/// Expected behaviour: the instrument the stream names wins, bookkeeping row or not. Since M172
+/// registration mints nothing, so an instrument on the stream is an attribution somebody made. A
+/// stream naming none is never matched by its label: words agreeing is not the source naming the
+/// analyser, and the operator attaches each curve by hand (Q220).
 #[test]
-fn test_the_instrument_a_stream_names_wins_over_a_matching_curve_label() {
+fn test_the_instrument_a_stream_names_wins_and_a_label_suggests_nothing() {
     let bookkeeping = Uuid::new_v4();
     let analyser = Uuid::new_v4();
     let mut c = catalog(&[]);
@@ -44,7 +43,6 @@ fn test_the_instrument_a_stream_names_wins_over_a_matching_curve_label() {
         analyser,
         ("DOC corr".to_string(), Some("DOC corr".to_string())),
     );
-    c.labels.push(("doc".to_string(), analyser));
     c.defaulted.insert(bookkeeping);
 
     let named = super::resolve_instrument(Some(bookkeeping), Some("doc_std_curve_id"), "cnet", &c)
@@ -59,14 +57,11 @@ fn test_the_instrument_a_stream_names_wins_over_a_matching_curve_label() {
     assert_eq!(attributed.resolved_by, "stream", "{attributed:?}");
     assert_eq!(attributed.id, Some(analyser));
 
-    // A stream naming none is where the curve label is read. Words agreeing is a suggestion, not
-    // the source naming the analyser, so the apply waits for a person (Q195).
-    let by_label = super::resolve_instrument(None, Some("doc_std_curve_id"), "cnet", &c)
+    let unnamed = super::resolve_instrument(None, Some("doc_std_curve_id"), "cnet", &c)
         .expect("a curve column resolves");
-    assert_eq!(by_label.resolved_by, "curve_label", "{by_label:?}");
-    assert_eq!(by_label.id, Some(analyser));
-    assert!(!by_label.confirmed, "{by_label:?}");
-    assert!(by_label.label_candidates.is_empty(), "{by_label:?}");
+    assert_eq!(unnamed.resolved_by, "placeholder", "{unnamed:?}");
+    assert_eq!(unnamed.id, None, "nothing is pre-selected: {unnamed:?}");
+    assert!(unnamed.create && !unnamed.confirmed, "{unnamed:?}");
 
     // With nothing to match, the question stands unanswered and the plan proposes one.
     let alone = super::resolve_instrument(None, Some("tss_std_curve_id"), "cnet", &c)
@@ -421,6 +416,14 @@ fn test_plan_calculation_refuses_a_declaration_missing_either_half() {
         serde_json::json!({
             "parameter": { "source_calculation": { "function": "calcPCO2", "inputs": ["", " "] } }
         }),
+        serde_json::json!({ "parameter": { "source_calculation": "calcPCO2" } }),
+        serde_json::json!({
+            "parameter": { "source_calculation": { "function": "calcPCO2", "inputs": "lab_co2" } }
+        }),
+        serde_json::json!({
+            "parameter": { "source_calculation": { "function": 7, "inputs": ["a"] } }
+        }),
+        serde_json::json!(null),
     ];
     for metadata in cases {
         assert_eq!(plan_calculation(&metadata), None, "{metadata}");
@@ -836,67 +839,6 @@ fn test_a_plan_reads_its_slots_once_each_through_the_pairing() {
         sql.contains(r#""data_streams"."pairing_plan_id" ="#),
         "scoped to the plan: {sql}"
     );
-}
-
-/// Scenario: two of the source's instruments carry a label the same curve column stem matches,
-/// which is the CNET chla pair: `chla acid` and `chla noacid` both answer to `chla`.
-/// Expected behaviour: neither is suggested, both are named, and the row cannot be confirmed as
-/// it stands (Q195).
-#[test]
-fn test_a_curve_label_matching_two_instruments_names_both_and_suggests_neither() {
-    let acid = Uuid::new_v4();
-    let noacid = Uuid::new_v4();
-    let mut c = catalog(&[]);
-    c.by_id.insert(acid, ("Chla acid".to_string(), None));
-    c.by_id.insert(noacid, ("Chla noacid".to_string(), None));
-    c.labels.push(("chla acid".to_string(), acid));
-    c.labels.push(("chla noacid".to_string(), noacid));
-
-    assert_eq!(
-        super::label_match("chla_std_curve_id", &c),
-        super::LabelMatch::Tie(vec![acid, noacid])
-    );
-
-    let tied = super::resolve_instrument(None, Some("chla_std_curve_id"), "cnet", &c)
-        .expect("a curve column resolves");
-    assert_eq!(tied.resolved_by, "ambiguous_label", "{tied:?}");
-    assert_eq!(tied.id, None, "{tied:?}");
-    assert!(!tied.confirmed, "{tied:?}");
-    assert_eq!(
-        tied.label_candidates
-            .iter()
-            .map(|candidate| candidate.name.as_str())
-            .collect::<Vec<_>>(),
-        ["Chla acid", "Chla noacid"]
-    );
-
-    // The narrower column names one of them, and that one is a suggestion like any other.
-    assert_eq!(
-        super::label_match("chla_acid_std_curve_id", &c),
-        super::LabelMatch::One(acid)
-    );
-    assert_eq!(
-        super::label_match("tss_std_curve_id", &c),
-        super::LabelMatch::None
-    );
-}
-
-/// Expected behaviour: an unconfirmed suggestion holds the apply back just as an unconfirmed
-/// creation does. A label match attaches to an instrument that already exists, so the creation
-/// filter alone would have let it through.
-#[test]
-fn test_an_unconfirmed_label_suggestion_holds_the_apply() {
-    let analyser = Uuid::new_v4();
-    let mut c = catalog(&[]);
-    c.by_id.insert(analyser, ("DOC corr".to_string(), None));
-    c.labels.push(("doc corr".to_string(), analyser));
-    let suggestion = super::resolve_instrument(None, Some("doc_std_curve_id"), "cnet", &c)
-        .expect("a curve column resolves");
-    assert!(!suggestion.create, "{suggestion:?}");
-
-    let entry = with_instrument("DOC", Some(suggestion));
-    let source_key = entry.source_key.clone();
-    assert_eq!(super::unconfirmed_instruments(&[entry]), [source_key]);
 }
 
 /// Expected behaviour: a lab row with nothing attached holds the apply, which would otherwise mint

@@ -147,6 +147,15 @@ pub(super) async fn retired_at<C: ConnectionTrait>(
     Ok(curve.retired_at)
 }
 
+/// The instrument a curve belongs to.
+pub(super) async fn instrument_of<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<Uuid> {
+    Ok(Entity::find_by_id(id)
+        .one(conn)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Standard curve {id} not found")))?
+        .sensor_id)
+}
+
 pub(super) async fn readings_using<C: ConnectionTrait>(conn: &C, id: Uuid) -> AppResult<i64> {
     let count = readings::Entity::find()
         .filter(readings::Column::StandardCurveId.eq(id))

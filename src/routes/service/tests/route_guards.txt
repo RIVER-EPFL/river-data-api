@@ -150,6 +150,7 @@
 /tool_scripts/inspect => require_admin
 /tool_scripts/{id} => require_admin
 /tool_scripts/{id}/activations => require_admin
+/tool_scripts/{id}/decommission => require_admin
 /tool_scripts/{id}/formulas => deny_scoped_token+require_admin_or_token_write_metadata
 /tool_scripts/{id}/formulas/draft_run => require_admin
 /tool_scripts/{id}/version_ledger => require_read_data

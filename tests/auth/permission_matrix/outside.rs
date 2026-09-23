@@ -162,18 +162,7 @@ const UNPROBED: [&str; 5] = [
 
 /// Project-bound rows whose outside probe is known to reach the other project, each under the item
 /// that fixes it. The probe is issued and its answer printed, not asserted; the fix drops the entry.
-const KNOWN_LEAKS: [(&str, &str); 7] = [
-    (
-        "POST /api/actions/sensor_calibrations/{id}/recalculate",
-        "SB23",
-    ),
-    ("POST /api/sensor_calibrations/{id}/retire", "SB23"),
-    ("POST /api/sensor_calibrations/{id}/unretire", "SB23"),
-    ("POST /api/standard_curves/{id}/retire", "SB23"),
-    ("POST /api/standard_curves/{id}/unretire", "SB23"),
-    ("POST /api/readings/seasonal_check", "B514"),
-    ("POST /api/actions/invalidate_public_config/{code}", "B515"),
-];
+const KNOWN_LEAKS: [(&str, &str); 0] = [];
 
 /// How a confined caller is answered when a request names another project's row.
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -24,9 +24,10 @@ use super::models::{
     Column, Entity, LastUsedCurveQuery, LastUsedCurveResponse, RegisterStandardCurveRequest,
     RegisterStandardCurveResponse, RetireCurveRequest, RetireCurveResponse,
 };
-use super::service::{readings_using, retired_at};
+use super::service::{instrument_of, readings_using, retired_at};
 use crate::common::AppState;
-use crate::common::middleware::AuthContext;
+use crate::common::middleware::{AuthContext, ProjectScope};
+use crate::common::scope::require_instrument_in_scope;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::annotations::models as annotations;
 use crate::routes::private::parameters;
@@ -447,6 +448,7 @@ mod tests;
     request_body = RetireCurveRequest,
     responses(
         (status = 200, description = "Out of circulation", body = RetireCurveResponse),
+        (status = 403, description = "The curve's instrument is deployed outside the caller's projects"),
         (status = 404, description = "No such curve"),
         (status = 409, description = "Already retired"),
     ),
@@ -455,10 +457,12 @@ mod tests;
 pub async fn retire_standard_curve(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<AuthContext>,
+    ProjectScope(scope): ProjectScope,
     Path(id): Path<Uuid>,
     Json(req): Json<RetireCurveRequest>,
 ) -> AppResult<Json<RetireCurveResponse>> {
     let actor = crate::common::actor::label(&auth);
+    require_instrument_in_scope(&state.db, &scope, instrument_of(&state.db, id).await?).await?;
     if retired_at(&state.db, id).await?.is_some() {
         return Err(AppError::Conflict(format!(
             "Standard curve {id} is already retired"
@@ -485,6 +489,7 @@ pub async fn retire_standard_curve(
     params(("id" = Uuid, Path, description = "Standard curve UUID")),
     responses(
         (status = 200, description = "Offered again", body = RetireCurveResponse),
+        (status = 403, description = "The curve's instrument is deployed outside the caller's projects"),
         (status = 404, description = "No such curve"),
         (status = 409, description = "Not retired"),
     ),
@@ -492,8 +497,10 @@ pub async fn retire_standard_curve(
 )]
 pub async fn unretire_standard_curve(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<RetireCurveResponse>> {
+    require_instrument_in_scope(&state.db, &scope, instrument_of(&state.db, id).await?).await?;
     if retired_at(&state.db, id).await?.is_none() {
         return Err(AppError::Conflict(format!(
             "Standard curve {id} is not retired"

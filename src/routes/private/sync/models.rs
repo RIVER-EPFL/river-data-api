@@ -846,8 +846,7 @@ pub struct PlanInstrumentGroup {
     pub instrument_id: Option<Uuid>,
     pub name: String,
     pub source_key: String,
-    /// `stream` | `curve_label` (suggested from the label) | `manual` | `ambiguous_label` (the
-    /// label matched more than one, so nothing is suggested) | `placeholder`.
+    /// `stream` | `source_key` | `manual` | `placeholder` | `parameter` | `device`.
     pub resolved_by: String,
     pub create: bool,
     pub confirmed: bool,
@@ -871,11 +870,6 @@ pub struct PlanInstrumentGroup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub name_conflict: Option<crate::routes::private::sync::service::InstrumentNameConflict>,
-    /// The instruments the curve label matched when it matched more than one. The row is then a
-    /// choice between them rather than a suggestion.
-    #[serde(default)]
-    #[schema(required)]
-    pub label_candidates: Vec<crate::routes::private::sync::service::PlanLabelCandidate>,
 }
 
 /// The source parameters this plan pairs that no instrument covers, so an operator can attach one

@@ -1534,6 +1534,31 @@ pub struct OriginInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub receipt: Option<ReceiptSummary>,
+    /// The portal function that computed this column and the columns it read, as the source
+    /// declared on the stream. Absent for a column the source stores as entered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub portal_calculation: Option<PortalCalculation>,
+}
+
+/// The portal function a synced column was computed by, as the source declared it.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PortalCalculation {
+    /// The source's own function name, verbatim (`calcPCO2`).
+    pub function: String,
+    /// The columns it reads, in the order the source lists them.
+    pub inputs: Vec<PortalInput>,
+}
+
+/// One column a portal calculation reads.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PortalInput {
+    pub column: String,
+    /// The record it opens, where a stream of the same source at the same site holds it at the
+    /// same instant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub point: Option<SlotRef>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1737,6 +1762,18 @@ pub struct CalculationInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub active_version_no: Option<i32>,
+    /// The calculation's decommission, read as it stands now, absent while it is live.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub decommissioned: Option<Decommission>,
+}
+
+/// A calculation's decommission: when, by whom and why (Q272).
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct Decommission {
+    pub at: DateTime<Utc>,
+    pub by: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1762,6 +1799,11 @@ pub struct ComputationInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub run_source: Option<String>,
+    /// The decommission of the calculation the run executed, read as it stands now: the blob is
+    /// frozen at run time and cannot carry it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub decommissioned: Option<Decommission>,
     /// The group's statistics, the numbers the chart plotted and drew its bar from. Without these
     /// the record shows the replicates and never what was served.
     #[serde(skip_serializing_if = "Option::is_none")]

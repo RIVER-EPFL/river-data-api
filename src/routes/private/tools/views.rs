@@ -22,21 +22,22 @@ use super::models::version::ToolScriptVersion;
 use super::models::{
     ActivateRequest, ActivateResponse, ActivationRecord, ActiveTool, CalculationHealth,
     CalculationSites, ClosureQuery, ClosureResponse, CreateScriptRequest, CreateVersionRequest,
-    CreateVersionResponse, DraftRunFailure, DraftRunFailureKind, DraftRunRequest, DraftRunResponse,
-    DraftRunResults, Engine, FormulaDraftRunRequest, FormulaDraftRunResponse,
-    FormulaDraftRunResults, InspectScriptRequest, InspectScriptResponse, LintFinding,
-    MissingConstant, RunTrace, SaveFormulaSetRequest, SaveFormulaSetResponse, SavedFormula,
-    ToolCalculation, ToolDescriptor, ToolResult, UpdateScriptRequest, ValidateResponse,
-    VersionLedgerRow, VersionUsage, parse_manifest, reconcile_manifest,
+    CreateVersionResponse, DecommissionRequest, DraftRunFailure, DraftRunFailureKind,
+    DraftRunRequest, DraftRunResponse, DraftRunResults, Engine, FormulaDraftRunRequest,
+    FormulaDraftRunResponse, FormulaDraftRunResults, InspectScriptRequest, InspectScriptResponse,
+    LintFinding, MissingConstant, RunTrace, SaveFormulaSetRequest, SaveFormulaSetResponse,
+    SavedFormula, ToolCalculation, ToolDescriptor, ToolResult, UpdateScriptRequest,
+    ValidateResponse, VersionLedgerRow, VersionUsage, parse_manifest, reconcile_manifest,
 };
 use super::service::{
     FormulaWrite, LIST_LIMIT, audit_after_activation, calculation_health, calculation_slots,
     calculations_fed_by_subject, canonical_hash, check_engine, check_manifest_against_catalog,
     check_manifest_codes_resolve, closure_subject, codes_held_elsewhere, coverage_for,
-    find_active_tool, find_run_in_scope, formula_codes_held_elsewhere, insert_version, lint_script,
-    list_active_tools, load_parameter_catalog, load_script, load_version, manifest_finding,
-    manifest_json, mint_formula_version, normalise_name, normalised_json, plan_formula_set, render,
-    replicated_for, require_context_in_scope, run_stored_cases, run_tool_body, runner_runtime,
+    decommission_reason, find_active_tool, find_run_in_scope, formula_codes_held_elsewhere,
+    insert_version, lint_script, list_active_tools, load_parameter_catalog, load_script,
+    load_version, manifest_finding, manifest_json, mint_formula_version, normalise_name,
+    normalised_json, plan_formula_set, refuse_decommissioned, render, replicated_for,
+    require_context_in_scope, run_stored_cases, run_tool_body, runner_runtime, stamp_decommission,
     stored_version_content, take_back_steps,
 };
 use crate::common::AppState;
@@ -298,11 +299,14 @@ pub async fn create_script(
     Ok(Json(load_script(&state, created.id).await?))
 }
 
-/// Update a calculation's label, description or enabled switch (the code lives in versions).
-/// Requires Administrator.
+/// Update a calculation's label, description or enabled switch (the code lives in versions). A
+/// decommissioned calculation is not switched back on. Requires Administrator.
 #[utoipa::path(patch, path = "/api/tool_scripts/{id}", params(("id" = Uuid, Path)),
     request_body = UpdateScriptRequest,
-    responses((status = 200, body = ToolScript)), tag = "tool_scripts")]
+    responses(
+        (status = 200, body = ToolScript),
+        (status = 409, description = "Switching on a decommissioned calculation"),
+    ), tag = "tool_scripts")]
 pub async fn update_script(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -312,6 +316,9 @@ pub async fn update_script(
         .one(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("tool script {id} not found")))?;
+    if payload.enabled == Some(true) {
+        refuse_decommissioned(&existing.name, existing.decommissioned_at)?;
+    }
     let mut model: super::models::script::ActiveModel = existing.into();
     if let Some(label) = payload.label {
         model.label = Set(label);
@@ -324,6 +331,37 @@ pub async fn update_script(
     }
     model.updated_at = Set(chrono::Utc::now());
     model.update(&state.db).await?;
+    Ok(Json(load_script(&state, id).await?))
+}
+
+/// Decommission a calculation: it stops applying and firing at every site, and the decommission
+/// records who, when and why. Nothing it computed is withdrawn; its values keep their version and
+/// run. Requires Administrator.
+#[utoipa::path(post, path = "/api/tool_scripts/{id}/decommission", params(("id" = Uuid, Path)),
+    request_body = DecommissionRequest,
+    responses(
+        (status = 200, body = ToolScript),
+        (status = 400, description = "The reason is blank"),
+        (status = 404, description = "No such calculation"),
+        (status = 409, description = "Already decommissioned"),
+    ), tag = "tool_scripts")]
+pub async fn decommission_script(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<DecommissionRequest>,
+) -> AppResult<Json<ToolScript>> {
+    let reason = decommission_reason(&payload.reason)?;
+    let existing = super::models::script::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("tool script {id} not found")))?;
+    refuse_decommissioned(&existing.name, existing.decommissioned_at)?;
+    let by = crate::common::actor::label(&auth);
+    if !stamp_decommission(&state.db, id, &by, &reason).await? {
+        let now = load_script(&state, id).await?;
+        refuse_decommissioned(&now.name, now.decommissioned_at)?;
+    }
     Ok(Json(load_script(&state, id).await?))
 }
 
@@ -1061,6 +1099,7 @@ pub fn script_routes() -> Router<AppState> {
     Router::new()
         .route("/tool_scripts", get(list_scripts).post(create_script))
         .route("/tool_scripts/{id}", get(get_script).patch(update_script))
+        .route("/tool_scripts/{id}/decommission", post(decommission_script))
         .route("/tool_scripts/draft_run", post(draft_run))
         .route(
             "/tool_scripts/{id}/formulas/draft_run",

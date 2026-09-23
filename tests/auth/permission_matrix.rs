@@ -908,6 +908,7 @@ fn table() -> Table {
             ("POST", "/api/tool_scripts"),
             ("GET", "/api/tool_scripts/{id}"),
             ("PATCH", "/api/tool_scripts/{id}"),
+            ("POST", "/api/tool_scripts/{id}/decommission"),
             ("POST", "/api/tool_scripts/inspect"),
             ("POST", "/api/tool_scripts/{id}/versions"),
             ("GET", "/api/tool_scripts/{id}/versions/{version_id}"),

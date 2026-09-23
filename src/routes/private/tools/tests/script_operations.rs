@@ -91,6 +91,36 @@ fn a_switched_off_calculation_is_not_run_by_name() {
     }
 }
 
+#[test]
+fn a_decommission_records_a_trimmed_reason_and_refuses_a_blank_one() {
+    use super::decommission_reason;
+
+    assert_eq!(
+        decommission_reason("  replaced by pco2_v2 ").expect("a reason"),
+        "replaced by pco2_v2"
+    );
+    assert!(decommission_reason("").is_err());
+    assert!(decommission_reason("   ").is_err(), "whitespace is blank");
+}
+
+#[test]
+fn a_decommissioned_calculation_is_refused_naming_the_decommission() {
+    use super::refuse_decommissioned;
+    use crate::error::AppError;
+
+    assert!(refuse_decommissioned("pco2", None).is_ok());
+    let at = chrono::DateTime::parse_from_rfc3339("2026-09-23T10:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    match refuse_decommissioned("pco2", Some(at)) {
+        Err(AppError::Conflict(message)) => assert_eq!(
+            message,
+            "Calculation 'pco2' was decommissioned at 2026-09-23T10:00:00+00:00"
+        ),
+        other => panic!("a decommissioned calculation is refused: {other:?}"),
+    }
+}
+
 use super::{FormulaWrite, codes_held_elsewhere, plan_formula_set, steps_taken_back};
 
 fn id(n: u128) -> uuid::Uuid {

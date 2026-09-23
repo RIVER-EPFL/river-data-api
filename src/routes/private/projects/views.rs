@@ -11,6 +11,7 @@ use utoipa_axum::router::OpenApiRouter;
 use crate::common::AppState;
 use crate::common::authz::{Capability, TokenAccess, TokenBit};
 use crate::common::middleware::{ProjectScope, require_crud, require_read_metadata};
+use crate::common::scope::{self, Unowned};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::projects::Project;
 use crate::routes::private::sites;
@@ -95,7 +96,7 @@ pub struct InvalidatedConfigResponse {
 
 /// Invalidate the in-memory cache for a public project's API config. Use after editing
 /// public visibility settings to force a re-read on next public API request. Requires
-/// `write_metadata`.
+/// `write_metadata`, and the project among the caller's own.
 #[utoipa::path(
     post,
     path = "/api/actions/invalidate_public_config/{code}",
@@ -107,8 +108,11 @@ pub struct InvalidatedConfigResponse {
 )]
 pub async fn invalidate_public_config(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(code): Path<String>,
 ) -> AppResult<Json<InvalidatedConfigResponse>> {
+    let project = scope::project_of_public_code(&state.db, &code).await?;
+    scope::confine_target(&scope, &project, Unowned::Deny, "public project")?;
     invalidate_config(&state.public_config_cache, &code).await;
     Ok(Json(InvalidatedConfigResponse {
         status: "invalidated".to_string(),

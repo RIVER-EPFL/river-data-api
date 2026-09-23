@@ -110,13 +110,12 @@ fn is_unassigned(entry: &serde_json::Value) -> bool {
         && entry["is_device"] != json!(true)
 }
 
-/// An instrument the plan suggests, to create or to attach, that nobody has confirmed, no existing
-/// name collides with, and no curve label ties.
+/// An instrument the plan suggests, to create or to attach, that nobody has confirmed and no
+/// existing name collides with.
 fn is_suggestion(entry: &serde_json::Value) -> bool {
     let instrument = &entry["instrument"];
     !instrument.is_null()
         && instrument["confirmed"] != json!(true)
-        && instrument["resolved_by"] != json!("ambiguous_label")
         && instrument["name_conflict"].is_null()
 }
 

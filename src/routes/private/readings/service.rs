@@ -4855,7 +4855,22 @@ pub async fn assemble_records(
     let mut pins = load_pins(db, &stream_ids, time).await?;
     let value_arrivals = load_value_arrivals(db, &stream_ids, time).await?;
     let run_sources = fetch_run_sources(db, rows).await?;
-    let (calculations, formula_versions) = fetch_calculations(db, rows).await?;
+    let (mut calculations, formula_versions) = fetch_calculations(db, rows).await?;
+    let (retired_by_id, retired_by_name) = fetch_decommissions(
+        db,
+        &calculations
+            .values()
+            .map(|c| c.tool_script_id)
+            .collect::<Vec<_>>(),
+        &run_sources
+            .values()
+            .map(|(_, tool)| tool.clone())
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+    for calc in calculations.values_mut() {
+        calc.decommissioned = retired_by_id.get(&calc.tool_script_id).cloned();
+    }
     let links = fetch_formula_links(db, rows).await?;
     let served = fetch_served_values(db, rows, &links, time).await?;
     let mut consumed_sets =
@@ -4959,7 +4974,9 @@ pub async fn assemble_records(
         let blob = group.iter().find_map(|r| r.provenance.clone());
         let entered_by = group.iter().find_map(|r| r.created_by.clone());
         let computation = if blob.is_some() || entered_by.is_some() || sample.is_some() {
-            let run_source = run_id_of(blob.as_ref()).and_then(|id| run_sources.get(&id).cloned());
+            let run = run_id_of(blob.as_ref()).and_then(|id| run_sources.get(&id));
+            let run_source = run.map(|(source, _)| source.clone());
+            let decommissioned = run.and_then(|(_, tool)| retired_by_name.get(tool).cloned());
             Some(ComputationInfo {
                 sample_id: sample.map(|s| s.id),
                 created_by: entered_by,
@@ -4967,6 +4984,7 @@ pub async fn assemble_records(
                 notes: group.iter().find_map(|r| r.notes.clone()),
                 provenance: blob,
                 run_source,
+                decommissioned,
                 n: sample.map(|s| s.n),
                 mean: sample.and_then(|s| s.mean),
                 stdev: sample.and_then(|s| s.stdev),
@@ -5028,6 +5046,13 @@ pub async fn assemble_records(
                     })
                     .max(),
                 receipt,
+                portal_calculation: super::portal_calculation::of_stream(
+                    db,
+                    stream,
+                    group[0].site_id,
+                    time,
+                )
+                .await?,
             },
             readings: readings_out,
             chain: ChainInfo {
@@ -5528,11 +5553,11 @@ pub(super) async fn fetch_slot_holds(
     Ok(out)
 }
 
-/// The minting path of every tool run the rows' provenance blobs name.
+/// The minting path and calculation name of every tool run the rows' provenance blobs name.
 pub(super) async fn fetch_run_sources(
     db: &sea_orm::DatabaseConnection,
     rows: &[RawRow],
-) -> AppResult<HashMap<Uuid, String>> {
+) -> AppResult<HashMap<Uuid, (String, String)>> {
     let run_ids: Vec<Uuid> = rows
         .iter()
         .filter_map(|r| run_id_of(r.provenance.as_ref()))
@@ -5542,15 +5567,77 @@ pub(super) async fn fetch_run_sources(
     if run_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let found: Vec<(Uuid, String)> = tool_run::Entity::find()
+    let found: Vec<(Uuid, String, String)> = tool_run::Entity::find()
         .filter(tool_run::Column::Id.is_in(run_ids))
         .select_only()
         .column(tool_run::Column::Id)
         .column(tool_run::Column::Source)
+        .column(tool_run::Column::ToolName)
         .into_tuple()
         .all(db)
         .await?;
-    Ok(found.into_iter().collect())
+    Ok(found
+        .into_iter()
+        .map(|(id, source, tool)| (id, (source, tool)))
+        .collect())
+}
+
+/// The decommission a `tool_scripts` row records, when all three of its columns are set.
+pub(super) fn decommission_of(
+    at: Option<DateTime<Utc>>,
+    by: Option<String>,
+    reason: Option<String>,
+) -> Option<Decommission> {
+    Some(Decommission {
+        at: at?,
+        by: by?,
+        reason: reason?,
+    })
+}
+
+/// The decommissioned calculations among those named, keyed by id and by name: a formula value
+/// names its calculation by id, a run by the name it was executed under.
+pub(super) async fn fetch_decommissions(
+    db: &sea_orm::DatabaseConnection,
+    ids: &[Uuid],
+    names: &[String],
+) -> AppResult<(HashMap<Uuid, Decommission>, HashMap<String, Decommission>)> {
+    use crate::routes::private::tools::models::script as tool_script;
+    if ids.is_empty() && names.is_empty() {
+        return Ok((HashMap::new(), HashMap::new()));
+    }
+    type Row = (
+        Uuid,
+        String,
+        Option<DateTime<Utc>>,
+        Option<String>,
+        Option<String>,
+    );
+    let found: Vec<Row> = tool_script::Entity::find()
+        .filter(tool_script::Column::DecommissionedAt.is_not_null())
+        .filter(
+            Condition::any()
+                .add(tool_script::Column::Id.is_in(ids.iter().copied()))
+                .add(tool_script::Column::Name.is_in(names.iter().cloned())),
+        )
+        .select_only()
+        .column(tool_script::Column::Id)
+        .column(tool_script::Column::Name)
+        .column(tool_script::Column::DecommissionedAt)
+        .column(tool_script::Column::DecommissionedBy)
+        .column(tool_script::Column::DecommissionReason)
+        .into_tuple()
+        .all(db)
+        .await?;
+    let mut by_id = HashMap::new();
+    let mut by_name = HashMap::new();
+    for (id, name, at, by, reason) in found {
+        if let Some(decommission) = decommission_of(at, by, reason) {
+            by_id.insert(id, decommission.clone());
+            by_name.insert(name, decommission);
+        }
+    }
+    Ok((by_id, by_name))
 }
 
 /// A calculation formula as `(id, code, name, output_parameter_id, tool_script_id)`.
@@ -5608,6 +5695,7 @@ pub(super) async fn fetch_calculations(
                 formula: None,
                 content_hash: None,
                 active_version_no: None,
+                decommissioned: None,
             },
         );
     }

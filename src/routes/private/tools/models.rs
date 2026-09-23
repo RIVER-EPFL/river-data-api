@@ -104,6 +104,14 @@ pub mod script {
         /// `script` (R in the sandbox) or `formula` (the definitions attached to the calculation).
         #[crudcrate(filterable, sortable, on_create = "script".to_string())]
         pub engine: String,
+        /// When the calculation was decommissioned. Set, it is never enabled again (Q272).
+        #[crudcrate(exclude(create, update), filterable, sortable)]
+        pub decommissioned_at: Option<chrono::DateTime<chrono::Utc>>,
+        /// The administrator who decommissioned it, from the authenticated caller.
+        #[crudcrate(exclude(create, update))]
+        pub decommissioned_by: Option<String>,
+        #[crudcrate(exclude(create, update))]
+        pub decommission_reason: Option<String>,
         /// The version history, newest first, without the code: a history is read to choose a
         /// version, and the content is fetched for the one that was chosen. Detail only, since a list
         /// of calculations is not a list of their versions.
@@ -2042,6 +2050,12 @@ pub struct UpdateScriptRequest {
     /// activation and fires at no visit until it is switched back on.
     #[serde(default)]
     pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct DecommissionRequest {
+    /// Why the calculation is stopped at every site; recorded with who and when.
+    pub reason: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

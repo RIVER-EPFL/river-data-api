@@ -1203,6 +1203,24 @@ async fn hold_the_visit_open(db: &DatabaseConnection, event_id: &str, time: &str
     hold
 }
 
+/// File the hold an intern's measurement raises, pending a manager's ruling.
+async fn entry_hold(db: &DatabaseConnection, parameter_id: &str, time: &str) -> String {
+    let hold = Uuid::new_v4().to_string();
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO replicate_audit_holds \
+                 (id, stream_id, site_id, parameter_id, group_time, kind, expected, computed, \
+                  delta, status) \
+             VALUES ('{hold}', NULL, '{SITE1_ID}', '{parameter_id}', '{time}', \
+                     'unverified_entry', '{{\"state\": \"verified\"}}'::jsonb, \
+                     '{{\"state\": \"unverified\"}}'::jsonb, '{{}}'::jsonb, 'pending')"
+        ),
+    )
+    .await;
+    hold
+}
+
 async fn resolve_hold(app: &axum::Router, hold: &str, mode: &str, token: &str) -> (u16, String) {
     crate::common::post_json_with_token(
         app,
@@ -1270,19 +1288,7 @@ async fn verifying_a_measurement_is_refused_while_its_field_day_is_unruled() {
     let (event_id, _, _) = visit_state(&db, T1).await;
     let visit_hold = hold_the_visit_open(&db, &event_id, T1).await;
 
-    let entry_hold = Uuid::new_v4().to_string();
-    crate::common::exec(
-        &db,
-        &format!(
-            "INSERT INTO replicate_audit_holds \
-                 (id, stream_id, site_id, parameter_id, group_time, kind, expected, computed, \
-                  delta, status) \
-             VALUES ('{entry_hold}', NULL, '{SITE1_ID}', '{GLOBAL_PARAM_DO_ID}', '{T1}', \
-                     'unverified_entry', '{{\"state\": \"verified\"}}'::jsonb, \
-                     '{{\"state\": \"unverified\"}}'::jsonb, '{{}}'::jsonb, 'pending')"
-        ),
-    )
-    .await;
+    let entry_hold = entry_hold(&db, GLOBAL_PARAM_DO_ID, T1).await;
 
     let (status, body) = resolve_hold(&app, &entry_hold, "verify", &token).await;
     assert_eq!(status, 409, "the field day is ruled on first: {body}");
@@ -1335,9 +1341,43 @@ async fn rejecting_a_field_day_withdraws_it_with_its_readings() {
     assert_eq!(status, 200, "{body}");
     let (event_id, _, _) = visit_state(&db, T1).await;
     let hold = hold_the_visit_open(&db, &event_id, T1).await;
+    let elsewhere = "2025-06-02T08:00:00Z";
+    for (parameter, time) in [
+        (GLOBAL_PARAM_DO_ID, T1),
+        (GLOBAL_PARAM_TEMP_ID, T1),
+        (GLOBAL_PARAM_DO_ID, elsewhere),
+    ] {
+        entry_hold(&db, parameter, time).await;
+    }
 
     let (status, body) = resolve_hold(&app, &hold, "reject", &token).await;
     assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM replicate_audit_holds \
+                  WHERE kind = 'unverified_entry' AND status = 'remediated' \
+                    AND group_time = '{T1}'"
+            )
+        )
+        .await,
+        2,
+        "each measurement's hold closes with the field day it was entered at"
+    );
+    assert_eq!(
+        scalar_i64(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS n FROM replicate_audit_holds \
+                  WHERE kind = 'unverified_entry' AND status = 'pending' \
+                    AND group_time = '{elsewhere}'"
+            )
+        )
+        .await,
+        1,
+        "a measurement at another visit is still owed its ruling"
+    );
     let (_, unverified, withdrawn) = visit_state(&db, T1).await;
     assert!(withdrawn, "the visit carries the rejection");
     assert!(

@@ -52,6 +52,7 @@ use crate::common::scope::Unowned;
 use crate::common::scope::confine_target;
 use crate::common::scope::project_filter;
 use crate::common::scope::project_of_sensor;
+use crate::common::scope::require_instrument_in_scope;
 use crate::common::scope::require_named_target;
 use crate::error::AppError;
 use crate::error::AppResult;
@@ -196,6 +197,7 @@ async fn counts<C: ConnectionTrait>(
     request_body = RetireRequest,
     responses(
         (status = 200, description = "Retired, or reported for a dry run", body = RetireResponse),
+        (status = 403, description = "The calibration's instrument is deployed outside the caller's projects"),
         (status = 404, description = "No such calibration"),
         (status = 409, description = "Already retired"),
     ),
@@ -204,12 +206,14 @@ async fn counts<C: ConnectionTrait>(
 pub async fn retire_calibration(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<AuthContext>,
+    ProjectScope(scope): ProjectScope,
     Path(id): Path<Uuid>,
     Json(req): Json<RetireRequest>,
 ) -> AppResult<Json<RetireResponse>> {
     let actor = crate::common::actor::label(&auth);
     let origin = auth.origin();
     let (sensor_id, retired_at) = load(&state.db, id).await?;
+    require_instrument_in_scope(&state.db, &scope, sensor_id).await?;
     if retired_at.is_some() {
         return Err(AppError::Conflict(format!(
             "Calibration {id} is already retired"
@@ -330,6 +334,7 @@ pub struct UnretireResponse {
     params(("id" = Uuid, Path, description = "Calibration UUID")),
     responses(
         (status = 200, description = "Back in circulation", body = UnretireResponse),
+        (status = 403, description = "The calibration's instrument is deployed outside the caller's projects"),
         (status = 404, description = "No such calibration"),
         (status = 409, description = "Not retired"),
     ),
@@ -338,10 +343,12 @@ pub struct UnretireResponse {
 pub async fn unretire_calibration(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<AuthContext>,
+    ProjectScope(scope): ProjectScope,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<UnretireResponse>> {
     let actor = crate::common::actor::label(&auth);
     let (sensor_id, retired_at) = load(&state.db, id).await?;
+    require_instrument_in_scope(&state.db, &scope, sensor_id).await?;
     if retired_at.is_none() {
         return Err(AppError::Conflict(format!(
             "Calibration {id} is not retired"
@@ -1324,12 +1331,14 @@ pub struct RecalculateResponse {
     params(("id" = Uuid, Path, description = "Calibration UUID")),
     responses(
         (status = 200, description = "Reprocessing job spawned", body = RecalculateResponse),
+        (status = 403, description = "The calibration's instrument is deployed outside the caller's projects"),
         (status = 404, description = "Calibration not found"),
     ),
     tag = "actions"
 )]
 pub async fn recalculate_calibration(
     State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<RecalculateResponse>> {
     let row = crate::routes::private::sensor_calibrations::Entity::find_by_id(id)
@@ -1343,6 +1352,7 @@ pub async fn recalculate_calibration(
         )));
     };
     let sensor_id = row.sensor_id;
+    require_instrument_in_scope(&state.db, &scope, sensor_id).await?;
 
     let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
         &state.db,

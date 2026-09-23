@@ -154,11 +154,27 @@ async fn two_streams_on_one_slot_report_duplicate_slot() {
     let (db, app, token) = setup().await;
     let (sync_token, _service) = crate::common::seed_sync_session_token(&db).await;
 
-    for key in ["stn:a", "stn:b"] {
+    // The first column is one the portal computes, and says so on its descriptor; the second is
+    // stored as entered, and is one of the columns the first reads.
+    let computed = json!({
+        "parameter": {
+            "source_calculation": {
+                "function": "calcPCO2",
+                "inputs": ["lab_co2_co2ppm", "WTW_Temp_degC_1"],
+            },
+        },
+    });
+    let entered = json!({ "parameter": { "column_name": "lab_co2_co2ppm" } });
+    for (key, metadata) in [("stn:a", computed), ("stn:b", entered)] {
         let (status, stream) = crate::common::post_json_parse_with_token(
             &app,
             "/api/streams/register",
-            &json!({"source_system": "cnet", "source_key": key, "measurement_type": "spot"}),
+            &json!({
+                "source_system": "cnet",
+                "source_key": key,
+                "measurement_type": "spot",
+                "metadata": metadata,
+            }),
             &token,
         )
         .await;
@@ -191,6 +207,23 @@ async fn two_streams_on_one_slot_report_duplicate_slot() {
     assert_eq!(body["records"].as_array().unwrap().len(), 2);
     for rec in body["records"].as_array().unwrap() {
         assert_eq!(rec["origin"]["classification"], "sync");
+        let calculation = &rec["origin"]["portal_calculation"];
+        if rec["origin"]["source_key"] == "stn:a" {
+            assert_eq!(calculation["function"], "calcPCO2", "{rec}");
+            let inputs = calculation["inputs"].as_array().expect("inputs");
+            assert_eq!(inputs[0]["column"], "lab_co2_co2ppm");
+            assert_eq!(
+                inputs[0]["point"]["site_parameter_id"], PARAM_S1_DO_ID,
+                "a column the site holds at the instant opens its record: {rec}"
+            );
+            assert_eq!(inputs[1]["column"], "WTW_Temp_degC_1");
+            assert!(
+                inputs[1]["point"].is_null(),
+                "a column nothing holds opens nothing: {rec}"
+            );
+        } else {
+            assert!(calculation.is_null(), "an entered column names none: {rec}");
+        }
     }
 }
 

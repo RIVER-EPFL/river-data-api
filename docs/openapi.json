@@ -3037,6 +3037,10 @@
           "content_hash": {
             "type": "string"
           },
+          "decommissioned": {
+            "$ref": "#/components/schemas/Decommission",
+            "description": "The calculation's decommission, read as it stands now, absent while it is live."
+          },
           "definition_id": {
             "format": "uuid",
             "type": "string"
@@ -4118,6 +4122,10 @@
         "properties": {
           "created_by": {
             "type": "string"
+          },
+          "decommissioned": {
+            "$ref": "#/components/schemas/Decommission",
+            "description": "The decommission of the calculation the run executed, read as it stands now: the blob is\nfrozen at run time and cannot carry it."
           },
           "label": {
             "type": "string"
@@ -5754,6 +5762,39 @@
           "set_id",
           "job_id",
           "reversible"
+        ],
+        "type": "object"
+      },
+      "Decommission": {
+        "description": "A calculation's decommission: when, by whom and why (Q272).",
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "by": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "at",
+          "by",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "DecommissionRequest": {
+        "properties": {
+          "reason": {
+            "description": "Why the calculation is stopped at every site; recorded with who and when.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
         ],
         "type": "object"
       },
@@ -11831,6 +11872,10 @@
             "format": "date-time",
             "type": "string"
           },
+          "portal_calculation": {
+            "$ref": "#/components/schemas/PortalCalculation",
+            "description": "The portal function that computed this column and the columns it read, as the source\ndeclared on the stream. Absent for a column the source stores as entered."
+          },
           "receipt": {
             "$ref": "#/components/schemas/ReceiptSummary",
             "description": "The latest windowed-ingest pass whose claimed window covers the instant."
@@ -14768,13 +14813,6 @@
               "null"
             ]
           },
-          "label_candidates": {
-            "description": "The instruments the curve label matched when it matched more than one. The row is then a\nchoice between them rather than a suggestion.",
-            "items": {
-              "$ref": "#/components/schemas/PlanLabelCandidate"
-            },
-            "type": "array"
-          },
           "name": {
             "type": "string"
           },
@@ -14796,7 +14834,7 @@
             ]
           },
           "resolved_by": {
-            "description": "`stream` | `curve_label` (suggested from the label) | `manual` | `ambiguous_label` (the\nlabel matched more than one, so nothing is suggested) | `placeholder`.",
+            "description": "`stream` | `source_key` | `manual` | `placeholder` | `parameter` | `device`.",
             "type": "string"
           },
           "scope": {
@@ -14837,8 +14875,7 @@
           "site_count",
           "anchor_stream_id",
           "curves",
-          "proposed_name",
-          "label_candidates"
+          "proposed_name"
         ],
         "type": "object"
       },
@@ -14963,13 +15000,6 @@
               "null"
             ]
           },
-          "label_candidates": {
-            "description": "The instruments a curve label matched when it matched more than one. Which analyser the\nsource meant is not in the label, so the tie is named and nothing is suggested (Q195).",
-            "items": {
-              "$ref": "#/components/schemas/PlanLabelCandidate"
-            },
-            "type": "array"
-          },
           "name": {
             "type": "string"
           },
@@ -14985,7 +15015,7 @@
             ]
           },
           "resolved_by": {
-            "description": "`stream` (already attributed), `curve_label` (suggested from the source's own curve\nlabels), `manual` (repointed in the review), `ambiguous_label` (the label matched more than\none, so nothing is suggested), or `placeholder` (nothing matched).",
+            "description": "`stream` (already attributed), `source_key` (the source's own instrument under the key an\napply mints), `manual` (repointed in the review), or a proposal to confirm: `placeholder`\n(a curve column's), `parameter` (a source parameter's) or `device` (a device feed's).",
             "type": "string"
           },
           "source_key": {
@@ -15007,8 +15037,7 @@
           "defaulted",
           "confirmed",
           "stamps_readings",
-          "curves",
-          "label_candidates"
+          "curves"
         ],
         "type": "object"
       },
@@ -15072,23 +15101,6 @@
         "required": [
           "job_id",
           "status"
-        ],
-        "type": "object"
-      },
-      "PlanLabelCandidate": {
-        "description": "One instrument a curve label matched, enough of it to choose by.",
-        "properties": {
-          "id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "id",
-          "name"
         ],
         "type": "object"
       },
@@ -15655,6 +15667,43 @@
         "required": [
           "kind",
           "message"
+        ],
+        "type": "object"
+      },
+      "PortalCalculation": {
+        "description": "The portal function a synced column was computed by, as the source declared it.",
+        "properties": {
+          "function": {
+            "description": "The source's own function name, verbatim (`calcPCO2`).",
+            "type": "string"
+          },
+          "inputs": {
+            "description": "The columns it reads, in the order the source lists them.",
+            "items": {
+              "$ref": "#/components/schemas/PortalInput"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "function",
+          "inputs"
+        ],
+        "type": "object"
+      },
+      "PortalInput": {
+        "description": "One column a portal calculation reads.",
+        "properties": {
+          "column": {
+            "type": "string"
+          },
+          "point": {
+            "$ref": "#/components/schemas/SlotRef",
+            "description": "The record it opens, where a stream of the same source at the same site holds it at the\nsame instant."
+          }
+        },
+        "required": [
+          "column"
         ],
         "type": "object"
       },
@@ -26181,6 +26230,27 @@
               "null"
             ]
           },
+          "decommission_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decommissioned_at": {
+            "description": "When the calculation was decommissioned. Set, it is never enabled again (Q272).",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decommissioned_by": {
+            "description": "The administrator who decommissioned it, from the authenticated caller.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "description": {
             "type": [
               "string",
@@ -26232,6 +26302,9 @@
           "updated_at",
           "enabled",
           "engine",
+          "decommissioned_at",
+          "decommissioned_by",
+          "decommission_reason",
           "versions",
           "active_version_no",
           "version_count"
@@ -26261,6 +26334,27 @@
             "type": "string"
           },
           "created_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decommission_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decommissioned_at": {
+            "description": "When the calculation was decommissioned. Set, it is never enabled again (Q272).",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decommissioned_by": {
+            "description": "The administrator who decommissioned it, from the authenticated caller.",
             "type": [
               "string",
               "null"
@@ -26311,6 +26405,9 @@
           "updated_at",
           "enabled",
           "engine",
+          "decommissioned_at",
+          "decommissioned_by",
+          "decommission_reason",
           "active_version_no",
           "version_count"
         ],
@@ -27835,7 +27932,7 @@
             "description": "Cache invalidated"
           }
         },
-        "summary": "Invalidate the in-memory cache for a public project's API config. Use after editing\npublic visibility settings to force a re-read on next public API request. Requires\n`write_metadata`.",
+        "summary": "Invalidate the in-memory cache for a public project's API config. Use after editing\npublic visibility settings to force a re-read on next public API request. Requires\n`write_metadata`, and the project among the caller's own.",
         "tags": [
           "actions"
         ]
@@ -28134,6 +28231,9 @@
               }
             },
             "description": "Reprocessing job spawned"
+          },
+          "403": {
+            "description": "The calibration's instrument is deployed outside the caller's projects"
           },
           "404": {
             "description": "Calibration not found"
@@ -39970,6 +40070,9 @@
             },
             "description": "Per-value classification with the distribution payload and the method"
           },
+          "403": {
+            "description": "Site outside the caller's projects"
+          },
           "404": {
             "description": "Site not found"
           }
@@ -42039,6 +42142,9 @@
             },
             "description": "Retired, or reported for a dry run"
           },
+          "403": {
+            "description": "The calibration's instrument is deployed outside the caller's projects"
+          },
           "404": {
             "description": "No such calibration"
           },
@@ -42077,6 +42183,9 @@
               }
             },
             "description": "Back in circulation"
+          },
+          "403": {
+            "description": "The calibration's instrument is deployed outside the caller's projects"
           },
           "404": {
             "description": "No such calibration"
@@ -46480,6 +46589,9 @@
             },
             "description": "Out of circulation"
           },
+          "403": {
+            "description": "The curve's instrument is deployed outside the caller's projects"
+          },
           "404": {
             "description": "No such curve"
           },
@@ -46518,6 +46630,9 @@
               }
             },
             "description": "Offered again"
+          },
+          "403": {
+            "description": "The curve's instrument is deployed outside the caller's projects"
           },
           "404": {
             "description": "No such curve"
@@ -51598,9 +51713,12 @@
               }
             },
             "description": ""
+          },
+          "409": {
+            "description": "Switching on a decommissioned calculation"
           }
         },
-        "summary": "Update a calculation's label, description or enabled switch (the code lives in versions).\nRequires Administrator.",
+        "summary": "Update a calculation's label, description or enabled switch (the code lives in versions). A\ndecommissioned calculation is not switched back on. Requires Administrator.",
         "tags": [
           "tool_scripts"
         ]
@@ -51636,6 +51754,57 @@
           }
         },
         "summary": "The script's activation history, newest first. Requires Administrator.",
+        "tags": [
+          "tool_scripts"
+        ]
+      }
+    },
+    "/api/tool_scripts/{id}/decommission": {
+      "post": {
+        "operationId": "decommission_script",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecommissionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolScript"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "description": "The reason is blank"
+          },
+          "404": {
+            "description": "No such calculation"
+          },
+          "409": {
+            "description": "Already decommissioned"
+          }
+        },
+        "summary": "Decommission a calculation: it stops applying and firing at every site, and the decommission\nrecords who, when and why. Nothing it computed is withdrawn; its values keep their version and\nrun. Requires Administrator.",
         "tags": [
           "tool_scripts"
         ]

@@ -63,9 +63,9 @@ The path a measurement takes, generated from the migrated database:
 
 ![Core schema](docs/schema-core.svg)
 
-Every table is in [docs/schema.md](docs/schema.md), which GitHub renders as diagrams: an
-overview of all 51, then each subject area as an entity diagram with its columns listed
-underneath. That overview is also [docs/schema.svg](docs/schema.svg) on its own.
+Every table is in [docs/schema.svg](docs/schema.svg). `scripts/generate-schema-docs.py` also
+writes `docs/schema.md`, each subject area as an entity diagram with its columns listed
+underneath, which is generated locally and not committed.
 
 Tables are grouped and shaded by what they are for: **core** (blue) is the measurement and what
 identifies it, **catalog** (green) the definitions the core points at, **record** (amber) the
@@ -93,8 +93,8 @@ DataStreams (one incoming series from one source)
 
 A reading is keyed by `(stream_id, time, replicate_index)`. It carries the site and parameter
 it was attributed to, the instrument, deployment and curves behind its value, and the visit it
-belongs to. Readings are compressed after 30 days and rolled up into hourly, daily, weekly and
-monthly continuous aggregates.
+belongs to. Readings are compressed after 30 days and rolled up into hourly, six-hourly,
+twelve-hourly, daily, weekly and monthly continuous aggregates.
 
 ## How a reading arrives
 

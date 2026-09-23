@@ -3,8 +3,8 @@ use sea_orm::sea_query::PostgresQueryBuilder;
 use uuid::Uuid;
 
 use super::{
-    PROVENANCE_KINDS, classify_source, provenance_kind_for_run, provenance_kind_for_stream,
-    slot_holds_query, stream_holds_query,
+    PROVENANCE_KINDS, classify_source, decommission_of, provenance_kind_for_run,
+    provenance_kind_for_stream, slot_holds_query, stream_holds_query,
 };
 
 #[test]
@@ -156,4 +156,23 @@ mod bound_parameters {
     fn test_a_name_the_manifest_binds_to_nothing_keeps_the_requested_parameter() {
         assert!(check_bound_parameter("doc", "output", "suva", None, TEMP).is_ok());
     }
+}
+
+#[test]
+fn test_a_decommission_is_reported_only_when_the_calculation_records_one() {
+    let at = Utc.with_ymd_and_hms(2026, 9, 23, 10, 0, 0).unwrap();
+    let decommission = decommission_of(
+        Some(at),
+        Some("evan".to_string()),
+        Some("replaced by pco2_v2".to_string()),
+    )
+    .expect("a decommissioned calculation reports it");
+    assert_eq!(decommission.at, at);
+    assert_eq!(decommission.by, "evan");
+    assert_eq!(decommission.reason, "replaced by pco2_v2");
+    assert_eq!(
+        decommission_of(None, None, None),
+        None,
+        "a live calculation reports none"
+    );
 }

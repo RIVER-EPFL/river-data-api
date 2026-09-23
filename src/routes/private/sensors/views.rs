@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::common::AppState;
 use crate::common::middleware::{ProjectScope, sensor_in_scope};
 use crate::common::scope;
-use crate::common::scope::{Unowned, confine_target, project_of_sensor, require_named_target};
+use crate::common::scope::require_named_target;
 use crate::error::{AppError, AppResult};
 use crate::routes::private::readings::models as readings;
 use crate::routes::private::reprocessing_jobs::models::QueuedJobResponse;
@@ -1929,10 +1929,7 @@ pub async fn reprocess_sensor(
     Json(payload): Json<ReprocessSensorRequest>,
 ) -> AppResult<Json<QueuedJobResponse>> {
     let sensor_id = payload.sensor_id;
-    // A sensor that has never been deployed belongs to no project, and neither do its readings, so
-    // it stays reachable: an instrument sits in inventory before anyone decides where it goes.
-    let target = project_of_sensor(&app_state.db, sensor_id).await?;
-    confine_target(&scope, &target, Unowned::Allow, "sensor")?;
+    scope::require_instrument_in_scope(&app_state.db, &scope, sensor_id).await?;
 
     let job_id = crate::routes::private::reprocessing_jobs::service::enqueue(
         &app_state.db,

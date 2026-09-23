@@ -630,6 +630,54 @@ pub(super) fn admit_run(name: &str, enabled: bool) -> AppResult<()> {
     )))
 }
 
+/// The reason a decommission records, trimmed. A blank one is refused: the record is the reason.
+pub(super) fn decommission_reason(reason: &str) -> AppResult<String> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return Err(AppError::BadRequest(
+            "a decommission records its reason; reason is blank".to_string(),
+        ));
+    }
+    Ok(reason.to_string())
+}
+
+/// A decommissioned calculation is decommissioned once and never switched back on (Q272): the
+/// refusal names the decommission rather than leaving the constraint to answer.
+pub(super) fn refuse_decommissioned(
+    name: &str,
+    decommissioned_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> AppResult<()> {
+    let Some(at) = decommissioned_at else {
+        return Ok(());
+    };
+    Err(AppError::Conflict(format!(
+        "Calculation '{name}' was decommissioned at {}",
+        at.to_rfc3339()
+    )))
+}
+
+/// Stop a calculation at every site and record who, when and why, in one update. False when it was
+/// already decommissioned, so two decommissions racing record one.
+pub(super) async fn stamp_decommission(
+    db: &DatabaseConnection,
+    id: Uuid,
+    by: &str,
+    reason: &str,
+) -> AppResult<bool> {
+    let now = chrono::Utc::now();
+    let result = script::Entity::update_many()
+        .col_expr(script::Column::Enabled, Expr::value(false))
+        .col_expr(script::Column::DecommissionedAt, Expr::value(now))
+        .col_expr(script::Column::DecommissionedBy, Expr::value(by))
+        .col_expr(script::Column::DecommissionReason, Expr::value(reason))
+        .col_expr(script::Column::UpdatedAt, Expr::value(now))
+        .filter(script::Column::Id.eq(id))
+        .filter(script::Column::DecommissionedAt.is_null())
+        .exec(db)
+        .await?;
+    Ok(result.rows_affected == 1)
+}
+
 pub async fn find_active_tool(db: &DatabaseConnection, name: &str) -> AppResult<ActiveTool> {
     use sea_orm::sea_query::ExprTrait;
     let query = active_tool_query()
