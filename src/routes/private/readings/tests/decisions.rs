@@ -863,7 +863,7 @@ fn a_value_correction_is_per_row_only() {
 #[test]
 fn the_key_set_names_the_column_each_key_is_read_by() {
     let sql = super::key_set(
-        vec!["2025-06-01T00:00:00Z".to_string()],
+        vec![chrono::DateTime::UNIX_EPOCH],
         vec![0],
         vec!["{}".to_string()],
     )
@@ -872,6 +872,10 @@ fn the_key_set_names_the_column_each_key_is_read_by() {
         assert!(sql.contains(column), "{column} missing from {sql}");
     }
     assert_eq!(sql.matches("unnest").count(), 3, "{sql}");
+    assert!(
+        !sql.contains("text[]"),
+        "the times bind as timestamps, not text: {sql}"
+    );
 }
 
 #[test]

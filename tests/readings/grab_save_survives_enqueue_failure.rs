@@ -98,7 +98,6 @@ async fn a_grab_save_whose_recompute_cannot_be_queued_still_answers_the_write_it
         "/api/grab_samples",
         &json!({
             "site_id": SITE1_ID,
-            "created_by": "test-user",
             "readings": [
                 { "parameter_id": GLOBAL_PARAM_TEMP_ID, "value": 185.2, "time": AT },
                 { "parameter_id": GLOBAL_PARAM_TEMP_ID, "value": 198.7, "time": AT },

@@ -7684,12 +7684,6 @@
               "null"
             ]
           },
-          "created_by": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "dry_run": {
             "description": "Compute the preview and report existing groups without writing anything.",
             "type": "boolean"
@@ -15892,6 +15886,31 @@
         ],
         "type": "object"
       },
+      "PreviewUnstagedRequest": {
+        "additionalProperties": false,
+        "description": "A preview at a site and instant no visit stands at yet: the typed cells of a new row.",
+        "properties": {
+          "collected_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "site_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "staged": {
+            "items": {
+              "$ref": "#/components/schemas/StagedCell"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "site_id",
+          "collected_at"
+        ],
+        "type": "object"
+      },
       "PreviewedValue": {
         "description": "One value the chain would produce at a visit, were the staged cells saved. `value` is absent\nwhere the calculation cleared the slot, which a save records as a withdrawal.",
         "properties": {
@@ -17952,6 +17971,72 @@
           "source_system",
           "source_key",
           "metadata"
+        ],
+        "type": "object"
+      },
+      "RejectPreview": {
+        "description": "What rejecting an intern's entry would withdraw beside it (Q257).",
+        "properties": {
+          "entries": {
+            "description": "The entered readings the reject decides on.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "hold_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "withdrawn": {
+            "description": "The computed values that go with them, in the order the reject withdraws them.",
+            "items": {
+              "$ref": "#/components/schemas/RejectPreviewOutput"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "hold_id",
+          "entries",
+          "withdrawn"
+        ],
+        "type": "object"
+      },
+      "RejectPreviewOutput": {
+        "description": "One computed value a reject would withdraw.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "parameter_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "replicate_index": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "time": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "value": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "parameter_id",
+          "code",
+          "name",
+          "time",
+          "replicate_index",
+          "value"
         ],
         "type": "object"
       },
@@ -27018,6 +27103,13 @@
       },
       "VisitCell": {
         "properties": {
+          "curves": {
+            "description": "Each distinct standard curve the group's replicates were corrected through, in replicate\norder (Q97). Empty for a value no curve corrected.",
+            "items": {
+              "$ref": "#/components/schemas/VisitCellCurve"
+            },
+            "type": "array"
+          },
           "finding": {
             "description": "Kind of the oldest open finding on this cell, when one exists.",
             "type": "string"
@@ -27113,7 +27205,24 @@
           "n_withdrawn",
           "n_unverified",
           "replicates",
-          "has_provenance"
+          "has_provenance",
+          "curves"
+        ],
+        "type": "object"
+      },
+      "VisitCellCurve": {
+        "description": "A curve a listing's cell was corrected through: what the grid names it by.",
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
         ],
         "type": "object"
       },
@@ -30824,6 +30933,40 @@
         "summary": "Create many collection_events"
       }
     },
+    "/api/collection_events/preview": {
+      "post": {
+        "operationId": "preview_unstaged_visit",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewUnstagedRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventPreview"
+                }
+              }
+            },
+            "description": "What the chain would produce"
+          },
+          "400": {
+            "description": "A staged cell names a parameter the site does not carry"
+          }
+        },
+        "summary": "[`preview_collection_event`] at a site and instant no visit stands at yet: a row typed into the\ngrid's spare area, previewed before Save opens its visit. Opens nothing. Any member down to\nintern.",
+        "tags": [
+          "collection_events"
+        ]
+      }
+    },
     "/api/collection_events/stage": {
       "post": {
         "operationId": "stage_collection_event",
@@ -31094,7 +31237,7 @@
             "description": "Unknown collection event"
           }
         },
-        "summary": "What the calculation chain would produce at a visit, given the cells the operator has typed\nand not saved. The same walk the recompute runs, against the same inputs, storing nothing: no\nrun, no reading, no decision, no finding, no output slot and no job, so no value it returns can\nbe cited as provenance (Q212). Save is what executes and stores. Requires `write_data`.",
+        "summary": "What the calculation chain would produce at a visit, given the cells the operator has typed\nand not saved. The same walk the recompute runs, against the same inputs, storing nothing: no\nrun, no reading, no decision, no finding, no output slot and no job, so no value it returns can\nbe cited as provenance (Q212). Save is what executes and stores. Any member down to intern (Q240).",
         "tags": [
           "collection_events"
         ]
@@ -48159,6 +48302,41 @@
           }
         },
         "summary": "Dismiss a calculation finding: the audit reported a missing, stale or skipped output here and\na person rules that no recomputation is owed.",
+        "tags": [
+          "sync"
+        ]
+      }
+    },
+    "/api/sync/replicate_audit_holds/{id}/reject_preview": {
+      "get": {
+        "operationId": "reject_preview",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RejectPreview"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "description": "No pending unverified entry hold with this id"
+          }
+        },
+        "summary": "What rejecting an intern's entry would withdraw beside it: the values computed from it at its\nvisit, read by the same computation the reject acts on (Q257).",
         "tags": [
           "sync"
         ]

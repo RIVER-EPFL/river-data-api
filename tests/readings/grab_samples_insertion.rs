@@ -22,7 +22,6 @@ async fn test_insert_triplicate_grab_samples() {
         "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
-            "created_by": "test-user",
             "readings": [
                 { "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID, "value": 185.2, "time": time },
                 { "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID, "value": 198.7, "time": time },
@@ -529,7 +528,6 @@ async fn a_posted_value_is_stored_bit_for_bit() {
         "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
-            "created_by": "test-user",
             "readings": readings,
         }),
         &token,
@@ -746,4 +744,62 @@ async fn a_replace_from_a_stale_read_is_refused() {
         status, 200,
         "a save that read the whole group writes: {written}"
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_grab_save_author_is_the_caller() {
+    let (app, token, db) = setup().await;
+    let time = "2025-06-15T11:00:00Z";
+    let body = |extra: serde_json::Value| {
+        let mut b = serde_json::json!({
+            "site_id": crate::common::SITE1_ID,
+            "readings": [
+                { "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID, "value": 4.2, "time": time }
+            ]
+        });
+        b.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        b
+    };
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &body(serde_json::json!({ "created_by": "someone else" })),
+        &token,
+    )
+    .await;
+    assert!(
+        (400..500).contains(&status),
+        "a client-named author is refused ({status}): {text}"
+    );
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        "/api/grab_samples",
+        &body(serde_json::json!({})),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "insert should succeed: {text}");
+
+    let row = db
+        .query_one_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT r.created_by, 'token:' || t.id::text AS caller \
+                 FROM readings r, api_tokens t \
+                 WHERE r.site_id = '{}' AND r.parameter_id = '{}' AND r.time = '{time}'",
+                crate::common::SITE1_ID,
+                crate::common::GLOBAL_PARAM_TEMP_ID
+            ),
+        ))
+        .await
+        .unwrap()
+        .expect("the reading lands");
+    let author: Option<String> = row.try_get("", "created_by").unwrap();
+    let caller: String = row.try_get("", "caller").unwrap();
+    assert_eq!(author.as_deref(), Some(caller.as_str()));
 }

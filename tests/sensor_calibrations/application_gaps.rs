@@ -597,7 +597,6 @@ async fn grab_readings_receive_their_resolved_curve() {
         "/api/grab_samples",
         &json!({
             "site_id": f.site,
-            "created_by": "audit",
             "readings": [{
                 "parameter_id": f.parameter,
                 "sensor_id": f.sensor,

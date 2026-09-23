@@ -564,6 +564,28 @@ pub struct ResolveHoldRequest {
     pub reason: Option<String>,
 }
 
+/// What rejecting an intern's entry would withdraw beside it (Q257).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RejectPreview {
+    pub hold_id: Uuid,
+    /// The entered readings the reject decides on.
+    pub entries: usize,
+    /// The computed values that go with them, in the order the reject withdraws them.
+    pub withdrawn: Vec<RejectPreviewOutput>,
+}
+
+/// One computed value a reject would withdraw.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RejectPreviewOutput {
+    pub parameter_id: Uuid,
+    pub code: String,
+    pub name: String,
+    pub time: chrono::DateTime<chrono::Utc>,
+    pub replicate_index: i16,
+    #[schema(required)]
+    pub value: Option<f64>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResolveHoldResponse {
     /// The status the hold moved to: `acknowledged` | `remediated`.

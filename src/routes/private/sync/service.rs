@@ -2233,7 +2233,9 @@ pub(super) async fn rule_on_entry(
         )
     };
     let recorded = crate::common::bulk_write::guarded(&state.db, async |txn| {
-        let recorded = record_many(
+        let at = group_time.with_timezone(&chrono::Utc);
+        let ruled = pending_entry_keys(txn, site_id, parameter_id, at).await?;
+        let mut recorded = record_many(
             txn,
             kind,
             {
@@ -2257,6 +2259,9 @@ pub(super) async fn rule_on_entry(
             None,
         )
         .await?;
+        recorded.absorb(
+            outputs_follow_ruling(txn, site_id, at, &ruled, mode == "verify", status, by).await?,
+        );
         hold_model::Entity::update_many()
             .col_expr(hold_model::Column::Status, Expr::val(status))
             .col_expr(hold_model::Column::AcknowledgedBy, Expr::val(by))
@@ -2287,6 +2292,173 @@ pub(super) async fn rule_on_entry(
         status: status.to_string(),
         samples_affected: Some(i64::try_from(recorded.rows).unwrap_or(i64::MAX)),
     }))
+}
+
+/// The keys of the pending readings an entry ruling is about to decide on.
+async fn pending_entry_keys<C: ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+    parameter_id: Uuid,
+    at: chrono::DateTime<chrono::Utc>,
+) -> AppResult<Vec<crate::routes::private::readings::consumed::ReadingKey>> {
+    Ok(crate::routes::private::readings::Entity::find()
+        .filter(crate::routes::private::readings::Column::SiteId.eq(site_id))
+        .filter(crate::routes::private::readings::Column::ParameterId.eq(parameter_id))
+        .filter(crate::routes::private::readings::Column::Time.eq(at))
+        .filter(crate::routes::private::readings::Column::Unverified.eq(true))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|r| {
+            (
+                r.stream_id,
+                r.time.with_timezone(&chrono::Utc),
+                r.replicate_index,
+            )
+        })
+        .collect())
+}
+
+/// The computed readings a ruling on the entries `ruled` would carry with it (Q257), and the visit
+/// they were found at. The reject preview and the ruling both read this, so the notice a manager is
+/// shown and what the reject does are one computation.
+async fn ruling_follows<C: ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+    at: chrono::DateTime<chrono::Utc>,
+    ruled: &[crate::routes::private::readings::consumed::ReadingKey],
+    verify: bool,
+) -> AppResult<(
+    Vec<crate::routes::private::readings::consumed::ReadingKey>,
+    crate::routes::private::readings::consumed::VisitComputed,
+)> {
+    use crate::routes::private::readings::consumed::{computed_at, follow_ruling};
+    let computed = computed_at(conn, site_id, at).await?;
+    let followed = follow_ruling(&computed.outputs, &computed.pending, ruled, verify);
+    Ok((followed, computed))
+}
+
+/// What rejecting an intern's entry would withdraw beside it: every value computed from it, and
+/// from those, at the entry's visit.
+pub(super) async fn reject_takes(state: &AppState, id: Uuid) -> AppResult<RejectPreview> {
+    let hold = hold_model::Entity::find_by_id(id)
+        .filter(hold_model::Column::Kind.eq(HoldKind::UnverifiedEntry.as_str()))
+        .filter(hold_model::Column::Status.is_in(HoldStatus::OPEN.map(HoldStatus::as_str)))
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("no pending unverified entry hold {id}")))?;
+    let (Some(site_id), Some(parameter_id)) = (hold.site_id, hold.parameter_id) else {
+        return Err(AppError::BadRequest(format!(
+            "unverified entry hold {id} names no slot"
+        )));
+    };
+    let at = hold.group_time.with_timezone(&chrono::Utc);
+    let ruled = pending_entry_keys(&state.db, site_id, parameter_id, at).await?;
+    let (followed, computed) = ruling_follows(&state.db, site_id, at, &ruled, false).await?;
+    let parameter_ids: HashSet<Uuid> = followed
+        .iter()
+        .filter_map(|key| computed.parameters.get(key).copied())
+        .collect();
+    let names: HashMap<Uuid, (String, String)> = crate::routes::private::parameters::Entity::find()
+        .filter(crate::routes::private::parameters::Column::Id.is_in(parameter_ids))
+        .all(&state.db)
+        .await?
+        .into_iter()
+        .map(|p| (p.id, (p.code, p.name)))
+        .collect();
+    let withdrawn = followed
+        .iter()
+        .filter_map(|key| {
+            let parameter_id = *computed.parameters.get(key)?;
+            let (code, name) = names.get(&parameter_id).cloned()?;
+            Some(RejectPreviewOutput {
+                parameter_id,
+                code,
+                name,
+                time: key.1,
+                replicate_index: key.2,
+                value: computed.values.get(key).copied(),
+            })
+        })
+        .collect();
+    Ok(RejectPreview {
+        hold_id: id,
+        entries: ruled.len(),
+        withdrawn,
+    })
+}
+
+/// Carry an entry ruling to the values computed from it (Q257): a verify releases each output whose
+/// inputs are all verified now, a reject withdraws each output computed from what it withdrew. Each
+/// is a decision on the record, and each output's own review-queue row is closed with the ruling.
+async fn outputs_follow_ruling<C: ConnectionTrait>(
+    conn: &C,
+    site_id: Uuid,
+    at: chrono::DateTime<chrono::Utc>,
+    ruled: &[crate::routes::private::readings::consumed::ReadingKey],
+    verify: bool,
+    status: &str,
+    by: &str,
+) -> AppResult<crate::routes::private::readings::service::Recorded> {
+    use crate::routes::private::collection_events::flows::row;
+    use crate::routes::private::readings::models::{Column, Kind, Origin};
+    use crate::routes::private::readings::service::{NewValue, Recorded, record_many};
+
+    let (followed, computed) = ruling_follows(conn, site_id, at, ruled, verify).await?;
+    if followed.is_empty() {
+        return Ok(Recorded::default());
+    }
+    let keys = followed.iter().fold(
+        sea_orm::Condition::any(),
+        |any, (stream_id, time, index)| {
+            any.add(
+                sea_orm::Condition::all()
+                    .add(row(Column::StreamId).eq(*stream_id))
+                    .add(row(Column::Time).eq(*time))
+                    .add(row(Column::ReplicateIndex).eq(*index)),
+            )
+        },
+    );
+    let (kind, new, reason) = if verify {
+        (
+            Kind::Verify,
+            serde_json::json!({ "unverified": false }),
+            "every input it was computed from is verified",
+        )
+    } else {
+        (
+            Kind::Withdraw,
+            serde_json::json!({ "reason": "computed from a rejected entry" }),
+            "computed from a rejected entry",
+        )
+    };
+    let recorded = record_many(
+        conn,
+        kind,
+        keys,
+        NewValue::Literal(new),
+        by,
+        Some(reason),
+        Origin::Audit,
+        None,
+    )
+    .await?;
+    let parameters: HashSet<Uuid> = followed
+        .iter()
+        .filter_map(|key| computed.parameters.get(key).copied())
+        .collect();
+    hold_model::Entity::update_many()
+        .col_expr(hold_model::Column::Status, Expr::val(status))
+        .col_expr(hold_model::Column::AcknowledgedBy, Expr::val(by))
+        .col_expr(hold_model::Column::AcknowledgedAt, Expr::cust("NOW()"))
+        .filter(hold_model::Column::Kind.eq(HoldKind::UnverifiedEntry.as_str()))
+        .filter(hold_model::Column::Status.is_in(HoldStatus::OPEN.map(HoldStatus::as_str)))
+        .filter(hold_model::Column::SiteId.eq(site_id))
+        .filter(hold_model::Column::GroupTime.eq(at))
+        .filter(hold_model::Column::ParameterId.is_in(parameters))
+        .exec(conn)
+        .await?;
+    Ok(recorded)
 }
 
 /// How many plan entries an apply pairs between progress reports.

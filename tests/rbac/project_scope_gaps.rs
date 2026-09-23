@@ -1275,7 +1275,6 @@ async fn collection_event_writes_refuse_a_site_outside_the_callers_grants() {
         "/api/grab_samples",
         &json!({
             "site_id": scene.site_b.as_str(),
-            "created_by": "river1",
             "readings": [{
                 "parameter_id": scene.parameter.as_str(),
                 "value": 1.0,

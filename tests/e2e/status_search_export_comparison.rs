@@ -107,7 +107,7 @@ async fn grabs_are_tagged_alongside_continuous_readings() {
         &app,
         "/api/grab_samples",
         &serde_json::json!({
-            "site_id": site1, "created_by": "e2e",
+            "site_id": site1,
             "readings": [
                 { "parameter_id": dop, "value": 9.0, "time": grab_time },
                 { "parameter_id": dop, "value": 9.2, "time": grab_time },

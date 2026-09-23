@@ -34,7 +34,6 @@ fn grab_payload() -> serde_json::Value {
         .collect();
     serde_json::json!({
         "site_id": crate::common::SITE1_ID,
-        "created_by": "test",
         "readings": readings,
     })
 }

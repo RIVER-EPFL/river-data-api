@@ -1659,20 +1659,29 @@ pub async fn record_many<C: ConnectionTrait>(
 /// The three unnests share a select list, which Postgres steps in lockstep, and which is what
 /// names `t`, `ri` and `n` for the join and the mode filters that read them.
 fn key_set(
-    times: Vec<String>,
-    indices: Vec<i32>,
+    times: Vec<chrono::DateTime<chrono::Utc>>,
+    indices: Vec<i16>,
     news: Vec<String>,
 ) -> sea_orm::sea_query::SelectStatement {
-    let unnest = |array: Expr, of: &'static str| {
-        Expr::from(
-            sea_orm::sea_query::Func::cust(Alias::new("unnest")).arg(array.cast_as(Alias::new(of))),
-        )
-    };
-    Query::select()
-        .expr_as(unnest(Expr::val(times), "timestamptz[]"), Alias::new("t"))
-        .expr_as(unnest(Expr::val(indices), "smallint[]"), Alias::new("ri"))
-        .expr_as(unnest(Expr::val(news), "jsonb[]"), Alias::new("n"))
+    let news = Expr::val(news).cast_as(Alias::new("jsonb[]"));
+    key_pairs(times, indices)
+        .expr_as(unnest(news), Alias::new("n"))
         .to_owned()
+}
+
+/// The `(t, ri)` pairs of two parallel arrays, stepped in lockstep.
+fn key_pairs(
+    times: Vec<chrono::DateTime<chrono::Utc>>,
+    indices: Vec<i16>,
+) -> sea_orm::sea_query::SelectStatement {
+    Query::select()
+        .expr_as(unnest(Expr::val(times)), Alias::new("t"))
+        .expr_as(unnest(Expr::val(indices)), Alias::new("ri"))
+        .to_owned()
+}
+
+fn unnest(array: Expr) -> Expr {
+    Expr::from(sea_orm::sea_query::Func::cust(Alias::new("unnest")).arg(array))
 }
 
 /// The statement both recorders run: the rows in scope as `target`, the decision each one owes
@@ -1748,8 +1757,8 @@ pub async fn record_keyed<C: ConnectionTrait>(
         return Ok(Recorded::default());
     }
     refuse_historical(kind)?;
-    let times: Vec<String> = rows.iter().map(|(t, _, _)| t.to_rfc3339()).collect();
-    let indices: Vec<i32> = rows.iter().map(|(_, i, _)| i32::from(*i)).collect();
+    let times: Vec<chrono::DateTime<chrono::Utc>> = rows.iter().map(|(t, _, _)| *t).collect();
+    let indices: Vec<i16> = rows.iter().map(|(_, i, _)| *i).collect();
     let news: Vec<String> = rows.iter().map(|(_, _, n)| n.to_string()).collect();
     let cols: Vec<String> = kind
         .recorded_columns()
@@ -1885,11 +1894,13 @@ pub async fn record_keyed<C: ConnectionTrait>(
                     )
                     .eq(stream_id),
                 )
-                .add(Expr::cust_with_values(
-                    "(r.time, r.replicate_index) IN (SELECT t, ri FROM \
-                         unnest($1::text[]::timestamptz[], $2::int[]::smallint[]) AS k(t, ri))",
-                    [sea_orm::Value::from(times), sea_orm::Value::from(indices)],
-                )),
+                .add(
+                    Expr::tuple([
+                        Expr::col((Alias::new("r"), readings::Column::Time)),
+                        Expr::col((Alias::new("r"), readings::Column::ReplicateIndex)),
+                    ])
+                    .in_subquery(key_pairs(times, indices)),
+                ),
         )
         .await?;
     }
@@ -9120,7 +9131,6 @@ pub(super) async fn import_tool_csv(
                 expected_replicates: None,
                 pending_inputs: false,
                 site_id: site.id,
-                created_by: Some(actor.clone()),
                 label: None,
                 notes: None,
                 mode: (req.conflict == ConflictMode::Overwrite).then_some(GrabWriteMode::Replace),

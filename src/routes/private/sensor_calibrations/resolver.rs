@@ -120,9 +120,7 @@ pub async fn resolve_for_times<C: ConnectionTrait>(
         return Ok(out);
     }
 
-    // Timestamps travel as RFC3339 text and are cast server-side: sea-query's timestamptz array
-    // binding rejects chrono values here.
-    let mut wanted: Vec<String> = times.iter().map(DateTime::to_rfc3339).collect();
+    let mut wanted: Vec<DateTime<Utc>> = times.to_vec();
     wanted.sort_unstable();
     wanted.dedup();
 
@@ -141,10 +139,7 @@ pub async fn resolve_for_times<C: ConnectionTrait>(
         )
         .expr_as(Expr::col((q.clone(), q.clone())), Alias::new("time"))
         .from(TableRef::FunctionCall(
-            Func::cust(Alias::new("unnest")).arg(Expr::cust_with_values(
-                "$1::text[]::timestamptz[]",
-                [sea_orm::Value::from(wanted)],
-            )),
+            Func::cust(Alias::new("unnest")).arg(Expr::val(wanted)),
             q.into_iden(),
         ))
         .take();

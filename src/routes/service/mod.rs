@@ -413,10 +413,6 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
         .layer(RequestBodyLimitLayer::new(DATA_BODY_LIMIT))
         .layer(axum::extract::DefaultBodyLimit::max(IMPORT_BODY_LIMIT))
         .route(
-            "/collection_events/{id}/preview",
-            post(crate::routes::private::collection_events::views::preview_collection_event),
-        )
-        .route(
             "/collection_events/{id}/recompute",
             post(crate::routes::private::collection_events::views::recompute_collection_event),
         )
@@ -434,8 +430,17 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
     // Entering a field measurement, and opening the field day it is entered at. An intern reaches
     // these and nothing else that writes: the save lands unverified and is refused a replace
     // (Q21, M44), and a visit they open is itself unverified until a manager rules on it (Q177).
+    // The preview writes nothing: it is what the grid shows as they type (Q240).
     let field_entry_routes = Router::new()
         .route("/grab_samples", post(readings_views::insert_grab_samples))
+        .route(
+            "/collection_events/{id}/preview",
+            post(crate::routes::private::collection_events::views::preview_collection_event),
+        )
+        .route(
+            "/collection_events/preview",
+            post(crate::routes::private::collection_events::views::preview_unstaged_visit),
+        )
         .route(
             "/collection_events/stage",
             post(crate::routes::private::collection_events::views::stage_collection_event),

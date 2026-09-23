@@ -609,9 +609,33 @@ pub async fn preview_event(
     cells: &[StagedCell],
 ) -> AppResult<EventPreview> {
     let event = load_event(&state.db, event_id).await?;
+    preview_at(state, &event, cells).await
+}
+
+/// [`preview_event`] at a site and instant no visit stands at yet, as a row typed into the grid's
+/// spare area is. The walk finds no prior run there and writes nothing either way.
+pub async fn preview_unstaged(
+    state: &AppState,
+    site_id: Uuid,
+    collected_at: chrono::DateTime<chrono::Utc>,
+    cells: &[StagedCell],
+) -> AppResult<EventPreview> {
+    let event = EventContext {
+        id: Uuid::nil(),
+        site_id,
+        collected_at,
+    };
+    preview_at(state, &event, cells).await
+}
+
+async fn preview_at(
+    state: &AppState,
+    event: &EventContext,
+    cells: &[StagedCell],
+) -> AppResult<EventPreview> {
     let mut staged =
         StagedVisit::resolve(&state.db, event.site_id, event.collected_at, cells).await?;
-    let pass = walk_event(state, &event, &mut staged, &Pass::Preview).await?;
+    let pass = walk_event(state, event, &mut staged, &Pass::Preview).await?;
     Ok(EventPreview {
         site_id: event.site_id,
         collected_at: event.collected_at,
@@ -883,15 +907,13 @@ async fn walk_event(
             continue;
         }
 
-        // A value computed from a pending measurement is pending too (M62): whatever an intern
-        // entered at this visit carries into everything the chain derives from it.
-        let inputs_pending: bool = state
-            .db
-            .query_one_raw(pending_inputs_at(event.site_id, event.collected_at))
-            .await?
-            .map(|r| r.try_get("", "p"))
-            .transpose()?
-            .unwrap_or(false);
+        // A value computed from a pending measurement is pending too (M62), and only while one
+        // of the readings this run consumed is (Q257): an entry elsewhere at the visit is not its.
+        let inputs_pending = crate::routes::private::readings::consumed::any_pending(
+            &state.db,
+            &calculation.consumed,
+        )
+        .await?;
 
         // The site declared the inputs, so it gets the column the run publishes (Q193). The slot
         // is minted needing review, so a manager confirms it from the site's Parameters tab.
@@ -922,7 +944,6 @@ async fn walk_event(
             expected_replicates: None,
             site_id: event.site_id,
             pending_inputs: inputs_pending,
-            created_by: Some(actor.to_string()),
             label: None,
             notes: None,
             mode: Some(GrabWriteMode::Replace),
@@ -1761,24 +1782,6 @@ impl Job for EventRecompute {
         .await;
         Ok(i64::try_from(readings_written).unwrap_or(i64::MAX))
     }
-}
-
-/// Whether anything stored at this visit is still awaiting verification.
-fn pending_inputs_at(site_id: Uuid, collected_at: chrono::DateTime<chrono::Utc>) -> Statement {
-    use sea_orm::sea_query::ExprTrait;
-
-    let unverified = Query::select()
-        .expr(Expr::cust("1"))
-        .from(readings::Entity)
-        .and_where(Expr::col(readings::Column::SiteId).eq(site_id))
-        .and_where(Expr::col(readings::Column::Time).eq(collected_at))
-        .and_where(Expr::cust(r#""unverified" IS TRUE"#))
-        .to_owned();
-    build(
-        &Query::select()
-            .expr_as(Expr::exists(unverified), Alias::new("p"))
-            .to_owned(),
-    )
 }
 
 /// What one audit run covered, as its job report states it: each scope it was given, in the order

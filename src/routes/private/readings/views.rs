@@ -3297,7 +3297,7 @@ pub async fn insert_grab_samples(
             // What each row records about the measurement, request first and the rewritten group's
             // own prior values where the request is silent.
             let facts = GrabFacts {
-                created_by: payload.created_by.as_deref(),
+                created_by: Some(&actor),
                 label: payload.label.as_deref(),
                 notes: payload.notes.as_deref(),
                 provenance: provenance.as_ref(),

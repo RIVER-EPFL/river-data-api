@@ -1102,3 +1102,45 @@ async fn a_calculated_cell_names_its_run_in_the_listing() {
         .expect("the temperature cell is listed");
     assert_eq!(temp["tool_run_id"], run_id.to_string(), "{temp}");
 }
+
+/// Expected behaviour: a listed cell names each curve its replicates were corrected through, so
+/// the grid can say which curve a value was made with before the visit is opened (Q97).
+#[tokio::test]
+#[serial]
+async fn a_corrected_cell_names_its_curve_in_the_listing() {
+    let (db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+    let sensor =
+        crate::common::sensor_lifecycle::create_sensor_without_curve(&db, "analyser").await;
+    let curve = Uuid::new_v4();
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO standard_curves (id, sensor_id, slope, intercept, name) \
+             VALUES ('{curve}', '{sensor}', 2.0, 0.0, 'Curve 2026-03')"
+        ),
+    )
+    .await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "UPDATE readings SET standard_curve_id = '{curve}', calibrated_value = raw_value * 2 \
+             WHERE site_id = '{SITE1_ID}' AND parameter_id = '{GLOBAL_PARAM_DO_ID}' AND time = '{T1}'"
+        ),
+    )
+    .await;
+
+    let (status, body) =
+        crate::common::get_json_with_token(&app, &format!("/api/sites/{SITE1_ID}/visits"), &token)
+            .await;
+    assert_eq!(status, 200, "{body}");
+    let visits = body["visits"].as_array().unwrap();
+    let corrected = cell(&visits[1], GLOBAL_PARAM_DO_ID).expect("DO cell at T1");
+    assert_eq!(
+        corrected["curves"],
+        json!([{ "id": curve.to_string(), "name": "Curve 2026-03" }]),
+        "both repeats share one curve, named once: {corrected}"
+    );
+    let uncorrected = cell(&visits[1], GLOBAL_PARAM_TEMP_ID).expect("Temp cell at T1");
+    assert_eq!(uncorrected["curves"], json!([]), "{uncorrected}");
+}

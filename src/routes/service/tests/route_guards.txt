@@ -30,10 +30,11 @@
 /calculations/health => require_read_data
 /change_audit => require_read_metadata
 /change_proposals/decide => deny_scoped_token+require_manage_sensors
+/collection_events/preview => require_enter_field_data
 /collection_events/stage => require_enter_field_data
 /collection_events/stage_many => require_enter_field_data
 /collection_events/{id}/detail => require_read_data
-/collection_events/{id}/preview => require_write_data
+/collection_events/{id}/preview => require_enter_field_data
 /collection_events/{id}/recompute => require_write_data
 /commands/{id} => -
 /credentials => require_admin
@@ -100,6 +101,7 @@
 /replicate_audit_holds/{id}/accept_correction => deny_scoped_token+require_manage_sensors
 /replicate_audit_holds/{id}/accept_identity => deny_scoped_token+require_manage_sensors
 /replicate_audit_holds/{id}/dismiss_finding => deny_scoped_token+require_manage_sensors
+/replicate_audit_holds/{id}/reject_preview => deny_scoped_token+require_manage_sensors
 /replicate_audit_holds/{id}/release_brake => deny_scoped_token+require_manage_sensors
 /replicate_audit_holds/{id}/reopen => deny_scoped_token+require_manage_sensors
 /replicate_audit_holds/{id}/resolve => deny_scoped_token+require_manage_sensors

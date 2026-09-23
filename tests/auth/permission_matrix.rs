@@ -631,7 +631,6 @@ fn table() -> Table {
             ("POST", "/api/status_events/batch"),
             ("POST", "/api/readings/import_csv"),
             ("POST", "/api/readings/import_csv/chunk"),
-            ("POST", "/api/collection_events/{id}/preview"),
             ("POST", "/api/collection_events/{id}/recompute"),
             ("POST", "/api/readings/edits/preview"),
             ("POST", "/api/readings/edits"),
@@ -645,13 +644,16 @@ fn table() -> Table {
     );
 
     // Opening a field day is the same act as entering the values in it (Q177): an intern may stage
-    // a visit, and the visit they open is itself unverified until a manager rules on it.
+    // a visit, and the visit they open is itself unverified until a manager rules on it. The preview
+    // is what the grid shows them as they type (Q240).
     t.group(
         Capability::EnterFieldData,
         TokenAccess::Same,
         Scope::Open,
         &[
             ("POST", "/api/grab_samples"),
+            ("POST", "/api/collection_events/{id}/preview"),
+            ("POST", "/api/collection_events/preview"),
             ("POST", "/api/collection_events/stage"),
             ("POST", "/api/collection_events/stage_many"),
         ],
@@ -851,6 +853,7 @@ fn table() -> Table {
             ),
             ("POST", "/api/sync/replicate_audit_holds/{id}/resolve"),
             ("POST", "/api/sync/replicate_audit_holds/{id}/reopen"),
+            ("GET", "/api/sync/replicate_audit_holds/{id}/reject_preview"),
             ("POST", "/api/sync/change_proposals/decide"),
         ],
     );

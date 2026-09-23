@@ -90,6 +90,16 @@ pub struct PreviewEventRequest {
     pub staged: Vec<crate::routes::private::tools::staged::StagedCell>,
 }
 
+/// A preview at a site and instant no visit stands at yet: the typed cells of a new row.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewUnstagedRequest {
+    pub site_id: Uuid,
+    pub collected_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub staged: Vec<crate::routes::private::tools::staged::StagedCell>,
+}
+
 /// One visit of a field day: a site and the instant it was sampled.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -271,6 +281,18 @@ pub struct VisitCell {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub tool_run_id: Option<Uuid>,
+    /// Each distinct standard curve the group's replicates were corrected through, in replicate
+    /// order (Q97). Empty for a value no curve corrected.
+    pub curves: Vec<VisitCellCurve>,
+}
+
+/// A curve a listing's cell was corrected through: what the grid names it by.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct VisitCellCurve {
+    pub id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub name: Option<String>,
 }
 
 /// One replicate of a listing's cell: enough to draw the expanded column and to seed the edit

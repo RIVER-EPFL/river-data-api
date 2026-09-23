@@ -872,6 +872,59 @@ async fn served(db: &sea_orm::DatabaseConnection, parameter_id: &str) -> Option<
     ))
 }
 
+/// Scenario: a new visit is typed into the grid's spare row, so there is no visit to preview at yet.
+///
+/// Expected behaviour: the preview at the row's site and instant computes the output the chain
+/// would write, and opens no visit.
+#[tokio::test]
+#[serial]
+async fn a_preview_at_a_site_and_instant_computes_without_opening_a_visit() {
+    let group_id = "00000000-0000-4000-c000-000000000114";
+    let (db, app, token) = setup().await;
+    seed_calculation(&db, group_id).await;
+    let script_id = calculation_id(&db).await;
+    let (status, text) = add_formula(
+        &app,
+        &token,
+        &script_id,
+        "temp_ratio_out",
+        "DO_Temperature / Dissolved_O2",
+        1,
+    )
+    .await;
+    assert!((200..300).contains(&status), "create ({status}): {text}");
+    let output_id = minted_output(&db, "temp_ratio_out").await;
+    declare_slot(&db, &output_id).await;
+    let visits = "SELECT count(*) AS count FROM collection_events";
+    let before = count(&db, visits).await;
+
+    let (status, text) = crate::common::post_json_with_token(
+        &app,
+        "/api/collection_events/preview",
+        &json!({
+            "site_id": crate::common::SITE1_ID,
+            "collected_at": VISIT_TIME,
+            "staged": [
+                { "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID, "replicate_index": 0, "value": 8.0 },
+                { "parameter_id": crate::common::GLOBAL_PARAM_DO_ID, "replicate_index": 0, "value": 2.0 }
+            ]
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "preview ({status}): {text}");
+    let preview: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let output = preview["outputs"]
+        .as_array()
+        .and_then(|o| o.iter().find(|v| v["parameter_id"] == output_id.as_str()))
+        .unwrap_or_else(|| panic!("the output is previewed: {text}"));
+    assert!(
+        (output["value"].as_f64().expect("a value") - 4.0).abs() < 1e-12,
+        "8 / 2: {text}"
+    );
+    assert_eq!(count(&db, visits).await, before, "a preview opens no visit");
+}
+
 /// Scenario: a visit where the divisor was entered as 0, so the formula computes Inf.
 ///
 /// Expected behaviour: the output is refused (Q172). The value the slot already serves stands,

@@ -21,8 +21,9 @@ use uuid::Uuid;
 use super::models::{
     CellFinding, CellReplicate, CellSample, EnqueuedJobResponse, Entity, EventAuditRequest,
     EventCell, EventDetailResponse, EventRecomputeRequest, ExpectedParameter, PreviewEventRequest,
-    StageEventRequest, StageEventsRequest, StageVisitRow, StagedEvent, VisitCell, VisitListQuery,
-    VisitListRow, VisitReplicate, VisitRow, VisitsQuery, VisitsResponse,
+    PreviewUnstagedRequest, StageEventRequest, StageEventsRequest, StageVisitRow, StagedEvent,
+    VisitCell, VisitCellCurve, VisitListQuery, VisitListRow, VisitReplicate, VisitRow, VisitsQuery,
+    VisitsResponse,
 };
 use super::service::{
     self, limit_clause, paging, range_clause, visit_count_columns, visit_list_order,
@@ -38,6 +39,7 @@ use crate::routes::private::readings::models as readings;
 use crate::routes::private::readings::samples::models as samples;
 use crate::routes::private::sensors::models::{self as sensors, InstrumentKind};
 use crate::routes::private::site_parameters::models as site_parameters;
+use crate::routes::private::standard_curves::models as standard_curves;
 use crate::routes::private::sync::models::HoldStatus;
 use crate::routes::private::tools::models::EventPreview;
 use crate::routes::resolve_site;
@@ -162,7 +164,7 @@ pub async fn stage_collection_event(
 /// What the calculation chain would produce at a visit, given the cells the operator has typed
 /// and not saved. The same walk the recompute runs, against the same inputs, storing nothing: no
 /// run, no reading, no decision, no finding, no output slot and no job, so no value it returns can
-/// be cited as provenance (Q212). Save is what executes and stores. Requires `write_data`.
+/// be cited as provenance (Q212). Save is what executes and stores. Any member down to intern (Q240).
 #[utoipa::path(
     post,
     path = "/api/collection_events/{id}/preview",
@@ -188,6 +190,36 @@ pub async fn preview_collection_event(
     enforce_project_scope_for_sites(&state.db, &scope, &[event.site_id]).await?;
     Ok(Json(
         crate::routes::private::tools::flows::preview_event(&state, id, &req.staged).await?,
+    ))
+}
+
+/// [`preview_collection_event`] at a site and instant no visit stands at yet: a row typed into the
+/// grid's spare area, previewed before Save opens its visit. Opens nothing. Any member down to
+/// intern.
+#[utoipa::path(
+    post,
+    path = "/api/collection_events/preview",
+    request_body = PreviewUnstagedRequest,
+    responses(
+        (status = 200, description = "What the chain would produce", body = EventPreview),
+        (status = 400, description = "A staged cell names a parameter the site does not carry"),
+    ),
+    tag = "collection_events"
+)]
+pub async fn preview_unstaged_visit(
+    State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+    Json(req): Json<PreviewUnstagedRequest>,
+) -> AppResult<Json<EventPreview>> {
+    enforce_project_scope_for_sites(&state.db, &scope, &[req.site_id]).await?;
+    Ok(Json(
+        crate::routes::private::tools::flows::preview_unstaged(
+            &state,
+            req.site_id,
+            req.collected_at,
+            &req.staged,
+        )
+        .await?,
     ))
 }
 
@@ -718,6 +750,11 @@ pub async fn list_site_visits(
             agg("BOOL_OR(r.provenance IS NOT NULL)", "has_provenance"),
             agg("MAX(r.provenance ->> 'tool')", "tool"),
             agg("(MAX(r.provenance ->> 'run_id'))::uuid", "tool_run_id"),
+            agg(
+                "ARRAY_AGG(r.standard_curve_id ORDER BY r.replicate_index) \
+                 FILTER (WHERE r.standard_curve_id IS NOT NULL)",
+                "replicate_curves",
+            ),
         ] {
             cell_query.expr_as(expr, name);
         }
@@ -787,11 +824,19 @@ pub async fn list_site_visits(
                 .and_modify(|(_, n)| *n += 1)
                 .or_insert((f.kind, 1));
         }
+        let cell_rows = cell_rows
+            .iter()
+            .map(|c| CellRow::from_query_result(c, ""))
+            .collect::<Result<Vec<_>, _>>()?;
+        let curve_names = curve_names(&state.db, &cell_rows).await?;
         let mut by_event: std::collections::HashMap<Uuid, Vec<VisitCell>> =
             std::collections::HashMap::new();
-        for c in &cell_rows {
-            let c = CellRow::from_query_result(c, "")?;
+        for c in cell_rows {
             let replicates = replicates_of(&c);
+            let curves = cell_curves(
+                c.replicate_curves.as_deref().unwrap_or_default(),
+                &curve_names,
+            );
             by_event.entry(c.event_id).or_default().push(VisitCell {
                 parameter_id: c.parameter_id,
                 value: c.value,
@@ -812,6 +857,7 @@ pub async fn list_site_visits(
                 has_provenance: c.has_provenance.unwrap_or(false),
                 tool: c.tool,
                 tool_run_id: c.tool_run_id,
+                curves,
             });
         }
         for visit in &mut visits {
@@ -847,6 +893,7 @@ pub async fn list_site_visits(
                         has_provenance: false,
                         tool: None,
                         tool_run_id: None,
+                        curves: Vec::new(),
                     });
                 }
             }
@@ -1047,6 +1094,46 @@ struct CellRow {
     has_provenance: Option<bool>,
     tool: Option<String>,
     tool_run_id: Option<Uuid>,
+    replicate_curves: Option<Vec<Uuid>>,
+}
+
+/// The name of every curve the page's cells were corrected through, in one lookup.
+async fn curve_names(
+    db: &sea_orm::DatabaseConnection,
+    rows: &[CellRow],
+) -> AppResult<std::collections::HashMap<Uuid, Option<String>>> {
+    let ids: std::collections::BTreeSet<Uuid> = rows
+        .iter()
+        .flat_map(|r| r.replicate_curves.iter().flatten().copied())
+        .collect();
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    Ok(standard_curves::Entity::find()
+        .filter(standard_curves::Column::Id.is_in(ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|c| (c.id, c.name))
+        .collect())
+}
+
+/// A cell's curves: each distinct one its replicates name, in replicate order.
+fn cell_curves(
+    replicate_curves: &[Uuid],
+    names: &std::collections::HashMap<Uuid, Option<String>>,
+) -> Vec<VisitCellCurve> {
+    let mut curves: Vec<VisitCellCurve> = Vec::new();
+    for id in replicate_curves {
+        if curves.iter().any(|c| c.id == *id) {
+            continue;
+        }
+        curves.push(VisitCellCurve {
+            id: *id,
+            name: names.get(id).cloned().flatten(),
+        });
+    }
+    curves
 }
 
 /// The five parallel arrays one `ARRAY_AGG` group returns, read back as replicates. They come out

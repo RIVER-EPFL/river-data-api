@@ -36,6 +36,18 @@ async fn reading_facts(
     })
 }
 
+async fn caller(db: &DatabaseConnection) -> String {
+    db.query_one_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT 'token:' || id::text AS caller FROM api_tokens",
+    ))
+    .await
+    .unwrap()
+    .expect("the seeded token")
+    .try_get("", "caller")
+    .unwrap()
+}
+
 async fn sample_count(db: &DatabaseConnection) -> i64 {
     db.query_one_raw(Statement::from_string(
         sea_orm::DatabaseBackend::Postgres,
@@ -66,7 +78,6 @@ fn payload(values: &[f64], label: Option<&str>, notes: Option<&str>) -> serde_js
         .collect();
     serde_json::json!({
         "site_id": crate::common::SITE1_ID,
-        "created_by": "test",
         "label": label,
         "notes": notes,
         "readings": readings,
@@ -95,7 +106,7 @@ async fn label_and_notes_land_on_every_replicate() {
     let (label, notes, created_by, n) = reading_facts(&db).await.expect("the readings land");
     assert_eq!(label.as_deref(), Some("batch 7"));
     assert_eq!(notes.as_deref(), Some("filtered on site"));
-    assert_eq!(created_by.as_deref(), Some("test"));
+    assert_eq!(created_by, Some(caller(&db).await));
     assert_eq!(n, 2, "both replicates carry the record");
 
     let mut repost = payload(&[10.0, 12.0], None, Some("corrected note"));
@@ -139,7 +150,7 @@ async fn a_single_reading_keeps_its_note_without_a_sample() {
     let (label, notes, created_by, n) = reading_facts(&db).await.expect("the reading lands");
     assert_eq!(label, None);
     assert_eq!(notes.as_deref(), Some("lone value with context"));
-    assert_eq!(created_by.as_deref(), Some("test"));
+    assert_eq!(created_by, Some(caller(&db).await));
     assert_eq!(n, 1);
     assert_eq!(sample_count(&db).await, 0, "no statistics row is minted");
 }

@@ -318,3 +318,59 @@ mod resolve {
         assert_eq!(mark_of("stale"), UNKNOWN);
     }
 }
+
+mod ruling {
+    use std::collections::{HashMap, HashSet};
+
+    use chrono::{TimeZone, Utc};
+    use uuid::Uuid;
+
+    use super::super::{ReadingKey, follow_ruling};
+
+    fn key(n: u128) -> ReadingKey {
+        (
+            Uuid::from_u128(n),
+            Utc.with_ymd_and_hms(2025, 6, 15, 9, 0, 0).unwrap(),
+            0,
+        )
+    }
+
+    /// DIC (1) and temperature (2) are entered; pCO2 (10) reads both; CO2 flux (20) reads pCO2.
+    fn chain() -> HashMap<ReadingKey, Vec<ReadingKey>> {
+        HashMap::from([(key(10), vec![key(1), key(2)]), (key(20), vec![key(10)])])
+    }
+
+    #[test]
+    fn test_follow_ruling_holds_an_output_while_another_input_is_pending() {
+        let pending: HashSet<ReadingKey> = [key(1), key(2), key(10), key(20)].into();
+        assert!(follow_ruling(&chain(), &pending, &[key(1)], true).is_empty());
+    }
+
+    #[test]
+    fn test_follow_ruling_releases_through_the_chain_on_the_last_input() {
+        let pending: HashSet<ReadingKey> = [key(2), key(10), key(20)].into();
+        assert_eq!(
+            follow_ruling(&chain(), &pending, &[key(2)], true),
+            vec![key(10), key(20)]
+        );
+    }
+
+    #[test]
+    fn test_follow_ruling_releases_nothing_already_released_or_reading_nothing() {
+        let outputs = HashMap::from([(key(10), vec![key(1)]), (key(30), Vec::new())]);
+        let pending: HashSet<ReadingKey> = [key(1), key(30)].into();
+        // 10 was not pending, so there is nothing to release; 30 read nothing, so no ruling frees it.
+        assert!(follow_ruling(&outputs, &pending, &[key(1)], true).is_empty());
+    }
+
+    #[test]
+    fn test_follow_ruling_reject_takes_every_output_downstream() {
+        let pending: HashSet<ReadingKey> = [key(1), key(10), key(20)].into();
+        assert_eq!(
+            follow_ruling(&chain(), &pending, &[key(1)], false),
+            vec![key(10), key(20)]
+        );
+        // An input nothing consumed takes nothing with it.
+        assert!(follow_ruling(&chain(), &pending, &[key(3)], false).is_empty());
+    }
+}

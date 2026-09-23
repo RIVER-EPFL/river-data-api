@@ -2329,7 +2329,6 @@ pub(super) struct StoredReplicate {
 #[serde(deny_unknown_fields)]
 pub struct GrabSampleRequest {
     pub site_id: Uuid,
-    pub created_by: Option<String>,
     /// Stamped onto the samples rows this request creates or reuses.
     pub label: Option<String>,
     pub notes: Option<String>,

@@ -1185,6 +1185,26 @@ pub async fn resolve_hold(
     }
 }
 
+/// What rejecting an intern's entry would withdraw beside it: the values computed from it at its
+/// visit, read by the same computation the reject acts on (Q257).
+#[utoipa::path(
+    get,
+    path = "/api/sync/replicate_audit_holds/{id}/reject_preview",
+    responses(
+        (status = 200, body = RejectPreview),
+        (status = 404, description = "No pending unverified entry hold with this id"),
+    ),
+    tag = "sync"
+)]
+pub async fn reject_preview(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    ProjectScope(scope): ProjectScope,
+) -> AppResult<Json<RejectPreview>> {
+    enforce_hold_scope(&state.db, &scope, id).await?;
+    Ok(Json(reject_takes(&state, id).await?))
+}
+
 /// Revert a decision: a remediation's flags are removed (only the readings that resolution
 /// flagged, identified by the recorded reason) and the hold returns to review, `pending` or
 /// `deferred` per the stream's current pairing.
@@ -1370,6 +1390,10 @@ pub fn manage_routes() -> Router<AppState> {
         )
         .route("/replicate_audit_holds/{id}/resolve", post(resolve_hold))
         .route("/replicate_audit_holds/{id}/reopen", post(reopen_hold))
+        .route(
+            "/replicate_audit_holds/{id}/reject_preview",
+            get(reject_preview),
+        )
         .route(
             "/change_proposals/decide",
             post(crate::routes::private::readings::views::decide_proposals),

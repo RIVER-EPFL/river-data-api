@@ -68,7 +68,6 @@ async fn one_curve_stamps_its_own_rows_and_the_slot_declares_the_rest() {
         "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
-            "created_by": "lab",
             "readings": [
                 { "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID, "sensor_id": LAB_INSTRUMENT,
                   "standard_curve_id": CURVE, "value": 10.0, "time": TIME },
@@ -133,7 +132,6 @@ async fn a_curve_fitted_on_another_instrument_is_refused_against_the_declaration
         "/api/grab_samples",
         &serde_json::json!({
             "site_id": crate::common::SITE1_ID,
-            "created_by": "lab",
             "readings": [
                 { "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID,
                   "standard_curve_id": CURVE, "value": 10.0, "time": TIME }
@@ -299,7 +297,6 @@ async fn a_grab_cannot_name_a_bookkeeping_row_or_a_retired_instrument() {
             "/api/grab_samples",
             &serde_json::json!({
                 "site_id": crate::common::SITE1_ID,
-                "created_by": "lab",
                 "readings": [
                     { "parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID, "sensor_id": instrument,
                       "value": 10.0, "time": TIME }

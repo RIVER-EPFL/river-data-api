@@ -327,10 +327,10 @@ async fn an_output_computed_from_a_verified_measurement_is_served() {
 /// Scenario: a manager rejects the intern's entry an output was computed from.
 ///
 /// Expected behaviour: the ruling queues the visit's calculations as any curation decision does,
-/// and the audit reports the output it can no longer compute rather than passing over it.
+/// and the output went with its input (Q257), so the audit finds no stored value to report.
 #[tokio::test]
 #[serial]
-async fn rejecting_an_input_requeues_the_visit_and_the_audit_reports_its_output() {
+async fn rejecting_an_input_requeues_the_visit_and_leaves_the_audit_nothing_to_report() {
     use river_db::routes::private::tools::flows;
     use river_db::routes::private::tools::models::AuditCounts;
     use river_db::routes::private::tools::service;
@@ -394,7 +394,7 @@ async fn rejecting_an_input_requeues_the_visit_and_the_audit_reports_its_output(
     flows::audit_event(&state, &event, &tools, &catalog, &order, &mut counts)
         .await
         .expect("the audit runs");
-    assert_eq!(counts.skipped, 1, "the stored output is reported");
+    assert_eq!(counts.skipped, 0, "the output was withdrawn with its input");
     let findings: i64 = db
         .query_one_raw(Statement::from_string(
             DatabaseBackend::Postgres,
@@ -409,5 +409,169 @@ async fn rejecting_an_input_requeues_the_visit_and_the_audit_reports_its_output(
         .expect("a row")
         .try_get("", "c")
         .expect("count");
-    assert_eq!(findings, 1, "one finding at the output slot");
+    assert_eq!(
+        findings, 0,
+        "no finding stands at a slot whose value was withdrawn"
+    );
+}
+
+/// The intern's temperature entry as a review-queue row a manager can rule on.
+async fn input_hold(db: &DatabaseConnection) -> Uuid {
+    let hold = Uuid::new_v4();
+    crate::common::exec(
+        db,
+        &format!(
+            "INSERT INTO replicate_audit_holds (id, site_id, parameter_id, group_time, kind, \
+                 expected, computed, delta, status) \
+             VALUES ('{hold}', '{SITE1_ID}', '{GLOBAL_PARAM_TEMP_ID}', '{EVENT_TIME}', \
+                     'unverified_entry', '{{}}', '{{}}', '{{}}', 'pending')"
+        ),
+    )
+    .await;
+    hold
+}
+
+/// The output at the visit as (value, pending, withdrawn).
+async fn output_state(db: &DatabaseConnection, output_id: &str) -> Vec<(f64, bool, bool)> {
+    db.query_all_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "SELECT raw_value, unverified, withdrawn_at IS NOT NULL AS withdrawn FROM readings \
+             WHERE site_id = '{SITE1_ID}' AND parameter_id = '{output_id}' \
+               AND time = '{EVENT_TIME}' ORDER BY replicate_index"
+        ),
+    ))
+    .await
+    .expect("query")
+    .iter()
+    .map(|r| {
+        (
+            r.try_get("", "raw_value").expect("raw_value"),
+            r.try_get("", "unverified").expect("unverified"),
+            r.try_get("", "withdrawn").expect("withdrawn"),
+        )
+    })
+    .collect()
+}
+
+/// Scenario: a manager verifies the intern's entry an output was computed from, and it was the
+/// output's only pending input.
+///
+/// Expected behaviour: the output is released with it, on the record, and leaves the queue.
+#[tokio::test]
+#[serial]
+async fn verifying_the_last_pending_input_releases_the_output() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let (app, state) = crate::common::build_test_app_with_state(db.clone());
+    let (output_id, _) = install_calculation(&db, &app, &token, false).await;
+    let event_id = seed_pending_visit(&db).await;
+    river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
+        .await
+        .expect("the recompute runs");
+    assert_eq!(
+        output_state(&db, &output_id).await,
+        vec![(8.0, true, false)]
+    );
+    assert_eq!(pending_entry_holds(&db, &output_id).await, 1);
+
+    let hold = input_hold(&db).await;
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sync/replicate_audit_holds/{hold}/resolve"),
+        &json!({ "mode": "verify" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    assert_eq!(
+        output_state(&db, &output_id).await,
+        vec![(8.0, false, false)],
+        "the output follows its only input out of pending"
+    );
+    assert_eq!(
+        pending_entry_holds(&db, &output_id).await,
+        0,
+        "the released output leaves the review queue"
+    );
+    let verified: i64 = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT count(*) AS c FROM reading_decisions d \
+                   JOIN readings r ON r.stream_id = d.stream_id AND r.time = d.time \
+                  WHERE d.kind = 'verify' AND r.parameter_id = '{output_id}' \
+                    AND r.time = '{EVENT_TIME}'"
+            ),
+        ))
+        .await
+        .expect("query")
+        .expect("a row")
+        .try_get("", "c")
+        .expect("count");
+    assert_eq!(verified, 1, "the release is a decision on the record");
+}
+
+/// Scenario: a manager asks what rejecting the intern's entry would take, then rejects it.
+///
+/// Expected behaviour: the preview names the output computed from the entry, and the reject
+/// withdraws exactly that output and takes it out of the queue.
+#[tokio::test]
+#[serial]
+async fn rejecting_an_input_withdraws_the_output_computed_from_it() {
+    let db = crate::common::setup_test_db().await;
+    crate::common::cleanup_test_db(&db).await;
+    crate::common::seed_test_data(&db).await;
+    let token = crate::common::seed_token_full(&db).await;
+    let (app, state) = crate::common::build_test_app_with_state(db.clone());
+    let (output_id, _) = install_calculation(&db, &app, &token, false).await;
+    let event_id = seed_pending_visit(&db).await;
+    river_db::routes::private::tools::flows::recompute_event(&state, event_id, "test")
+        .await
+        .expect("the recompute runs");
+
+    let hold = input_hold(&db).await;
+    let (status, preview) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/sync/replicate_audit_holds/{hold}/reject_preview"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{preview}");
+    assert_eq!(preview["entries"], 1, "{preview}");
+    let named: Vec<(String, f64)> = preview["withdrawn"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|o| {
+            (
+                o["parameter_id"].as_str().unwrap().to_string(),
+                o["value"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(named, vec![(output_id.clone(), 8.0)], "{preview}");
+    let (status, body) = crate::common::post_json_with_token(
+        &app,
+        &format!("/api/sync/replicate_audit_holds/{hold}/resolve"),
+        &json!({ "mode": "reject" }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let state_after = output_state(&db, &output_id).await;
+    assert_eq!(state_after.len(), 1, "{state_after:?}");
+    assert!(
+        state_after[0].2,
+        "the output goes with its input: {state_after:?}"
+    );
+    assert_eq!(
+        pending_entry_holds(&db, &output_id).await,
+        0,
+        "the withdrawn output leaves the review queue"
+    );
 }

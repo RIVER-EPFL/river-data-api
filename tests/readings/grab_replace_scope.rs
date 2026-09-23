@@ -47,7 +47,7 @@ fn grab(values: &[f64], mode: Option<&str>) -> serde_json::Value {
         )
         .collect();
     let mut body =
-        json!({"site_id": crate::common::SITE1_ID, "created_by": "test", "readings": readings});
+        json!({"site_id": crate::common::SITE1_ID, "readings": readings});
     if let Some(m) = mode {
         body["mode"] = json!(m);
     }

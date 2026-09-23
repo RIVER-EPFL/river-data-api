@@ -9,7 +9,7 @@
 //! members' current values, because a number the calculation never saw and the store does not
 //! hold would read as the source's own.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::{Alias, Expr, Func, JoinType, Query};
@@ -74,7 +74,7 @@ struct CurrentReading {
 }
 
 /// The key of one consumed reading.
-type ReadingKey = (Uuid, DateTime<Utc>, i16);
+pub type ReadingKey = (Uuid, DateTime<Utc>, i16);
 
 #[derive(FromQueryResult)]
 struct CurrentRow {
@@ -402,6 +402,214 @@ async fn entity_values<C: ConnectionTrait>(
         }
     }
     Ok(out)
+}
+
+/// The computed readings a ruling on `ruled` carries with it (Q257), each an output mapped to the
+/// readings its run consumed. A verify releases every pending output none of whose inputs is still
+/// pending once the ruled readings are not; a release can free the output that read it, so the pass
+/// repeats until nothing moves. A reject takes every output that consumed a ruled reading or an
+/// output already taken.
+#[must_use]
+pub fn follow_ruling(
+    outputs: &HashMap<ReadingKey, Vec<ReadingKey>>,
+    pending: &HashSet<ReadingKey>,
+    ruled: &[ReadingKey],
+    verify: bool,
+) -> Vec<ReadingKey> {
+    let mut followed: Vec<ReadingKey> = Vec::new();
+    if verify {
+        let mut pending: HashSet<ReadingKey> = pending.clone();
+        for key in ruled {
+            pending.remove(key);
+        }
+        loop {
+            let released: Vec<ReadingKey> = outputs
+                .iter()
+                .filter(|(output, inputs)| {
+                    pending.contains(*output)
+                        && !inputs.is_empty()
+                        && inputs.iter().all(|input| !pending.contains(input))
+                })
+                .map(|(output, _)| *output)
+                .collect();
+            if released.is_empty() {
+                break;
+            }
+            for output in released {
+                pending.remove(&output);
+                followed.push(output);
+            }
+        }
+    } else {
+        let mut gone: HashSet<ReadingKey> = ruled.iter().copied().collect();
+        loop {
+            let taken: Vec<ReadingKey> = outputs
+                .iter()
+                .filter(|(output, inputs)| {
+                    !gone.contains(*output) && inputs.iter().any(|input| gone.contains(input))
+                })
+                .map(|(output, _)| *output)
+                .collect();
+            if taken.is_empty() {
+                break;
+            }
+            for output in taken {
+                gone.insert(output);
+                followed.push(output);
+            }
+        }
+    }
+    followed.sort();
+    followed
+}
+
+/// Whether any reading a run consumed is still awaiting verification.
+pub async fn any_pending<C: ConnectionTrait>(db: &C, inputs: &[ConsumedInput]) -> AppResult<bool> {
+    let keys: HashSet<ReadingKey> = inputs
+        .iter()
+        .flat_map(|input| {
+            input
+                .members
+                .iter()
+                .map(|m| (m.stream_id, m.time, m.replicate_index))
+        })
+        .collect();
+    if keys.is_empty() {
+        return Ok(false);
+    }
+    let streams: Vec<Uuid> = keys.iter().map(|(s, _, _)| *s).collect();
+    let times: Vec<DateTime<Utc>> = keys.iter().map(|(_, t, _)| *t).collect();
+    Ok(readings::Entity::find()
+        .filter(readings::Column::StreamId.is_in(streams))
+        .filter(readings::Column::Time.is_in(times))
+        .filter(readings::Column::Unverified.eq(true))
+        .all(db)
+        .await?
+        .iter()
+        .any(|r| keys.contains(&(r.stream_id, r.time.with_timezone(&Utc), r.replicate_index))))
+}
+
+/// The standing computed readings at one visit instant.
+#[derive(Debug, Default)]
+pub struct VisitComputed {
+    /// Each computed reading, with the readings its run consumed.
+    pub outputs: HashMap<ReadingKey, Vec<ReadingKey>>,
+    /// The pending readings among the computed ones and the ones they consumed.
+    pub pending: HashSet<ReadingKey>,
+    /// The parameter each computed reading is a value of.
+    pub parameters: HashMap<ReadingKey, Uuid>,
+    /// The value each computed reading serves.
+    pub values: HashMap<ReadingKey, f64>,
+}
+
+/// The computed readings standing at one visit instant, what each consumed, and which are pending.
+pub async fn computed_at<C: ConnectionTrait>(
+    db: &C,
+    site_id: Uuid,
+    time: DateTime<Utc>,
+) -> AppResult<VisitComputed> {
+    use crate::routes::private::tools::models::run as tool_run;
+    let rows = readings::Entity::find()
+        .filter(readings::Column::SiteId.eq(site_id))
+        .filter(readings::Column::Time.eq(time))
+        .filter(readings::Column::WithdrawnAt.is_null())
+        .all(db)
+        .await?;
+    let runs: HashMap<ReadingKey, Uuid> = rows
+        .iter()
+        .filter_map(|r| {
+            super::service::run_id_of(r.provenance.as_ref()).map(|run| {
+                (
+                    (r.stream_id, r.time.with_timezone(&Utc), r.replicate_index),
+                    run,
+                )
+            })
+        })
+        .collect();
+    let run_ids: HashSet<Uuid> = runs.values().copied().collect();
+    let consumed: HashMap<Uuid, Vec<ReadingKey>> = tool_run::Entity::find()
+        .filter(tool_run::Column::Id.is_in(run_ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|run| {
+            let inputs: Vec<ConsumedInput> = run
+                .context
+                .as_ref()
+                .and_then(|c| c.get("consumed"))
+                .cloned()
+                .and_then(|c| serde_json::from_value(c).ok())
+                .unwrap_or_default();
+            let keys = inputs
+                .iter()
+                .flat_map(|input| {
+                    input
+                        .members
+                        .iter()
+                        .map(|m| (m.stream_id, m.time, m.replicate_index))
+                })
+                .collect();
+            (run.id, keys)
+        })
+        .collect();
+    let outputs: HashMap<ReadingKey, Vec<ReadingKey>> = runs
+        .into_iter()
+        .filter_map(|(output, run)| consumed.get(&run).map(|inputs| (output, inputs.clone())))
+        .collect();
+
+    let mut pending: HashSet<ReadingKey> = rows
+        .iter()
+        .filter(|r| r.unverified)
+        .map(|r| (r.stream_id, r.time.with_timezone(&Utc), r.replicate_index))
+        .collect();
+    // An input held from an earlier visit is not among this instant's rows.
+    let elsewhere: Vec<ReadingKey> = outputs
+        .values()
+        .flatten()
+        .filter(|(_, at, _)| *at != time)
+        .copied()
+        .collect();
+    if !elsewhere.is_empty() {
+        let streams: Vec<Uuid> = elsewhere.iter().map(|(s, _, _)| *s).collect();
+        let times: Vec<DateTime<Utc>> = elsewhere.iter().map(|(_, t, _)| *t).collect();
+        for r in readings::Entity::find()
+            .filter(readings::Column::StreamId.is_in(streams))
+            .filter(readings::Column::Time.is_in(times))
+            .filter(readings::Column::Unverified.eq(true))
+            .all(db)
+            .await?
+        {
+            let key = (r.stream_id, r.time.with_timezone(&Utc), r.replicate_index);
+            if elsewhere.contains(&key) {
+                pending.insert(key);
+            }
+        }
+    }
+    let parameters = rows
+        .iter()
+        .filter_map(|r| {
+            let key = (r.stream_id, r.time.with_timezone(&Utc), r.replicate_index);
+            outputs
+                .contains_key(&key)
+                .then_some(r.parameter_id.map(|p| (key, p)))
+                .flatten()
+        })
+        .collect();
+    let values = rows
+        .iter()
+        .filter_map(|r| {
+            let key = (r.stream_id, r.time.with_timezone(&Utc), r.replicate_index);
+            outputs
+                .contains_key(&key)
+                .then_some((key, r.calibrated_value.unwrap_or(r.raw_value)))
+        })
+        .collect();
+    Ok(VisitComputed {
+        outputs,
+        pending,
+        parameters,
+        values,
+    })
 }
 
 #[cfg(test)]

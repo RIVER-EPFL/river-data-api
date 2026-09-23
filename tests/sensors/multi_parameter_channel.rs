@@ -424,7 +424,7 @@ async fn a_grab_on_the_second_channel_carries_that_channels_deployment() {
         &app,
         "/api/grab_samples",
         &serde_json::json!({
-            "site_id": crate::common::SITE1_ID, "created_by": "test",
+            "site_id": crate::common::SITE1_ID,
             "readings": [
                 {"parameter_id": crate::common::GLOBAL_PARAM_COND_ID, "sensor_id": sensor,
                  "value": 510.0, "time": "2025-06-02T05:00:00Z"},

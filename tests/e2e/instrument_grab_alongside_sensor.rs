@@ -78,7 +78,7 @@ async fn instrument_grabs_coexist_with_continuous_sensor_stream() {
         &app,
         "/api/grab_samples",
         &json!({
-            "site_id": site, "created_by": "e2e",
+            "site_id": site,
             "readings": [
                 { "parameter_id": param, "sensor_id": instrument_id,
                   "standard_curve_id": curve_id, "value": 100.0, "time": grab_time }
