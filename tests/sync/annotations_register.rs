@@ -388,3 +388,68 @@ async fn a_curve_less_annotation_takes_its_curve_on_the_first_pass_that_names_it
         (Some(curve), "curve 'A' (raw * 2 + 1)".into())
     );
 }
+
+async fn stored_digest(db: &DatabaseConnection, stream_id: &str) -> Option<String> {
+    db.query_one_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!("SELECT last_window_digest FROM data_streams WHERE id = '{stream_id}'"),
+    ))
+    .await
+    .unwrap()
+    .expect("the stream exists")
+    .try_get("", "last_window_digest")
+    .unwrap()
+}
+
+/// Scenario: a windowed pass on an unpaired stream is applied cleanly and its digest stored,
+/// while the annotation riding it is refused as `unpaired`.
+/// Expected behaviour: pairing drops the digest, so the next pass is not skipped as unchanged and
+/// the annotation lands on it rather than at the weekly full reassert.
+#[tokio::test]
+#[serial]
+async fn pairing_forgets_the_digest_of_a_pass_whose_annotations_were_refused() {
+    let fx = setup().await;
+    let (sync_token, _service) = crate::common::seed_sync_session_token(&fx.db).await;
+    let stream = register_stream(&fx, "FP3:DOC:reps", false).await;
+
+    let (status, body) = crate::common::post_json_parse_with_token(
+        &fx.app,
+        "/api/ingest",
+        &json!({
+            "stream_id": stream,
+            "collection": true,
+            "window": {
+                "from": "2025-01-01T00:00:00Z",
+                "to": "2026-01-01T00:00:00Z",
+                "source_rows_read": 1,
+                "content_digest": "d1"
+            },
+            "readings": [
+                {"time": T1, "raw_value": 10.0, "replicate_index": 0},
+                {"time": T1, "raw_value": 12.0, "replicate_index": 1}
+            ],
+        }),
+        &sync_token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(stored_digest(&fx.db, &stream).await.as_deref(), Some("d1"));
+    let refused = register(&fx, &stream, "FP3:doc_std_curve_id:x", "text").await;
+    assert_eq!(refused["status"], "unpaired", "{refused}");
+
+    let (status, body) = crate::common::post_json_with_token(
+        &fx.app,
+        &format!("/api/streams/{stream}/pair"),
+        &json!({"site_parameter_id": crate::common::PARAM_S1_TEMP_ID}),
+        &fx.token,
+    )
+    .await;
+    assert_eq!(status, 200, "pair ({status}): {body}");
+    assert_eq!(
+        stored_digest(&fx.db, &stream).await,
+        None,
+        "a digest stored before pairing would skip the pass that carries the annotation"
+    );
+    let landed = register(&fx, &stream, "FP3:doc_std_curve_id:x", "text").await;
+    assert_eq!(landed["status"], "created", "{landed}");
+}

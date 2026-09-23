@@ -515,6 +515,10 @@ pub fn api_router(state: &AppState) -> (Router<()>, utoipa::openapi::OpenApi) {
             get(crate::routes::private::tools::views::get_calculation_health),
         )
         .route(
+            "/calculations/sites",
+            get(crate::routes::private::tools::views::get_calculation_sites),
+        )
+        .route(
             "/tools/{tool_name}/calculate",
             post(tools::views::calculate_tool),
         )

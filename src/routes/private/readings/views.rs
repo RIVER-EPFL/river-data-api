@@ -3083,9 +3083,9 @@ pub async fn insert_grab_samples(
     let actor = crate::common::actor::label(&auth);
     let (inserted, replaced, kept_curated, withdrawn, created_sample_ids, touched_events) =
         crate::common::bulk_write::guarded(&state.db, async |txn| {
-            // A replace deletes the rows carrying the group's label, notes, authorship and blob,
-            // so they are captured first and restored onto the rewritten rows wherever the request
-            // does not carry its own.
+            // A replace rewrites the rows carrying the group's label, notes, authorship and blob,
+            // so they are captured first and kept on the rewritten rows wherever the request does
+            // not carry its own.
             let mut prior_facts: HashMap<(Uuid, chrono::DateTime<chrono::Utc>), StoredFacts> =
                 HashMap::new();
             let (replaced, kept_curated, withdrawn): (usize, usize, usize) =
@@ -3177,7 +3177,7 @@ pub async fn insert_grab_samples(
                             prior_facts.insert((*parameter_id, *time), row.into());
                         }
                     }
-                    // The delete is scoped to the grab stream: another source's rows at the same
+                    // The rewrite is scoped to the grab stream: another source's rows at the same
                     // instant are not this request's to rewrite. Curation wins, as in the windowed
                     // diff: a flagged, withdrawn or hand-curved row stays and the disagreement
                     // lands in the review queue.
@@ -3273,7 +3273,10 @@ pub async fn insert_grab_samples(
                         )
                         .await?;
                         withdrawn += usize::try_from(dropped.rows).unwrap_or(usize::MAX);
-                        let res = readings::Entity::delete_many()
+                        // The carried rows are rewritten in place by the insert's conflict
+                        // clause, under the same guard, so what no entry sets stays on them.
+                        use sea_orm::PaginatorTrait as _;
+                        removed += readings::Entity::find()
                             .filter(readings::Column::StreamId.eq(stream_id))
                             .filter(readings::Column::Time.eq(*time))
                             .filter(readings::Column::MeasurementType.eq("spot"))
@@ -3281,9 +3284,8 @@ pub async fn insert_grab_samples(
                             .filter(Expr::cust("is_flagged IS NOT TRUE"))
                             .filter(readings::Column::WithdrawnAt.is_null())
                             .filter(uncurved(Condition::all()))
-                            .exec(txn)
+                            .count(txn)
                             .await?;
-                        removed += res.rows_affected;
                     }
                     (
                         usize::try_from(removed).unwrap_or(usize::MAX),
@@ -3347,21 +3349,48 @@ pub async fn insert_grab_samples(
                 })
                 .collect();
 
-            let inserted = match readings::Entity::insert_many(models.clone())
-                .on_conflict(readings_upsert(Replace::Nothing))
-                .exec_without_returning(txn)
-                .await
-            {
-                Ok(rows) => rows as usize,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("None of the records") {
-                        0
-                    } else {
-                        return Err(AppError::Database(e));
-                    }
+            // A replace rewrites each carried row in place, guarded per group by whether the
+            // save names a curve; any other save keeps the stored row.
+            let curved_groups: HashSet<(Uuid, chrono::DateTime<chrono::Utc>)> = payload
+                .readings
+                .iter()
+                .zip(&preview)
+                .filter(|(_, p)| p.standard_curve.is_some())
+                .map(|(r, _)| (r.parameter_id, r.time))
+                .collect();
+            let mut inserted = 0usize;
+            for curved in [false, true] {
+                let batch: Vec<readings::ActiveModel> = payload
+                    .readings
+                    .iter()
+                    .zip(&models)
+                    .filter(|(r, _)| curved_groups.contains(&(r.parameter_id, r.time)) == curved)
+                    .map(|(_, m)| m.clone())
+                    .collect();
+                if batch.is_empty() {
+                    continue;
                 }
-            };
+                let replace = if payload.mode == Some(GrabWriteMode::Replace) {
+                    Replace::Entry { curved }
+                } else {
+                    Replace::Nothing
+                };
+                inserted += match readings::Entity::insert_many(batch)
+                    .on_conflict(readings_upsert(replace))
+                    .exec_without_returning(txn)
+                    .await
+                {
+                    Ok(rows) => rows as usize,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("None of the records") {
+                            0
+                        } else {
+                            return Err(AppError::Database(e));
+                        }
+                    }
+                };
+            }
             // A curve chosen with the entry is a claim, recorded once (ADR 0008).
             crate::routes::private::readings::service::record_curve_claims(
                 txn,

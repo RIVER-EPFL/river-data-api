@@ -151,6 +151,20 @@ fn attribute_status_events(scope: HoldScope) -> UpdateStatement {
         .to_owned()
 }
 
+/// Drop the newly paired streams' handshake digest. The stored digest claims the server already
+/// applied that content, which pairing makes untrue: annotations the source sent while the stream
+/// was unpaired were refused, so the next pass has to carry them again.
+fn forget_window_digests(scope: HoldScope) -> UpdateStatement {
+    Query::update()
+        .table(data_streams::Entity)
+        .value(
+            data_streams::Column::LastWindowDigest,
+            Expr::val(Option::<String>::None),
+        )
+        .and_where(scope_condition(scope))
+        .to_owned()
+}
+
 /// Attribute everything the newly paired streams already hold.
 ///
 /// Runs inside the caller's transaction: the readings must not be half attributed if a later step
@@ -189,6 +203,14 @@ pub async fn backfill<C: ConnectionTrait>(
     // Audit mismatches recorded while the streams were unpaired become reviewable now that the
     // data serves a slot.
     repoint_holds(conn, scope, true).await?;
+
+    let (sql, values) = forget_window_digests(scope).build(PostgresQueryBuilder);
+    conn.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+        values,
+    ))
+    .await?;
 
     Ok(Backfilled {
         readings,

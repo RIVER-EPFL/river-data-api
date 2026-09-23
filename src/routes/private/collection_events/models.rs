@@ -476,7 +476,7 @@ pub struct EventCell {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub record: Option<crate::routes::private::readings::models::ProvenanceRecord>,
-    /// The oldest open event-audit finding for this cell.
+    /// The oldest open finding for this cell, slot-keyed or placed through its stream's pairing.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub finding: Option<CellFinding>,

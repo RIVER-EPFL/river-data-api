@@ -66,3 +66,15 @@ fn test_attribute_status_events_writes_the_slot_and_the_instrument() {
         "{sql}"
     );
 }
+
+#[test]
+fn test_forget_window_digests_clears_only_the_scope() {
+    let sql = forget_window_digests(HoldScope::Plan(Uuid::nil())).to_string(PostgresQueryBuilder);
+
+    assert!(sql.starts_with(r#"UPDATE "data_streams""#), "{sql}");
+    assert!(sql.contains(r#""last_window_digest" = NULL"#), "{sql}");
+    assert!(
+        sql.contains(r#""data_streams"."pairing_plan_id" ="#),
+        "{sql}"
+    );
+}

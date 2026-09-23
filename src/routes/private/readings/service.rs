@@ -7006,6 +7006,11 @@ pub enum Replace {
     /// is never among them: it is chosen by hand per measurement and no query can recover it, so a
     /// re-send that names none leaves the stored one standing.
     ValuesAndAttribution,
+    /// A replacing grab save: everything the entry states, rewritten in place on a live,
+    /// unflagged row, and on a curved one only when the save names a curve of its own (`curved`).
+    /// A curated row is left as it stands. What no entry sets (the verification state, a flag, the
+    /// withdrawal) is carried.
+    Entry { curved: bool },
 }
 
 impl From<ConflictMode> for Replace {
@@ -7034,6 +7039,48 @@ pub(crate) fn readings_upsert(replace: Replace) -> sea_orm::sea_query::OnConflic
     match replace {
         Replace::Nothing => {
             clause.do_nothing();
+        }
+        Replace::Entry { curved } => {
+            clause.update_columns([
+                readings::Column::RawValue,
+                readings::Column::CalibratedValue,
+                readings::Column::MeasurementType,
+                readings::Column::SiteId,
+                readings::Column::ParameterId,
+                readings::Column::SensorId,
+                readings::Column::CalibrationId,
+                readings::Column::DeploymentId,
+                readings::Column::StandardCurveId,
+                readings::Column::Label,
+                readings::Column::Notes,
+                readings::Column::CreatedBy,
+                readings::Column::Provenance,
+                readings::Column::ProvenanceKind,
+            ]);
+            clause.value(
+                readings::Column::SampleId,
+                sea_orm::sea_query::Expr::cust(
+                    r#"COALESCE(EXCLUDED.sample_id, "readings"."sample_id")"#,
+                ),
+            );
+            clause.value(
+                readings::Column::IngestedAt,
+                sea_orm::sea_query::Expr::cust(
+                    r#"CASE WHEN "readings"."raw_value" IS DISTINCT FROM EXCLUDED.raw_value
+                        OR "readings"."calibrated_value" IS DISTINCT FROM EXCLUDED.calibrated_value
+                        THEN NOW() ELSE "readings"."ingested_at" END"#,
+                ),
+            );
+            let live = sea_orm::sea_query::Expr::cust(
+                r#""readings"."is_flagged" IS NOT TRUE AND "readings"."withdrawn_at" IS NULL"#,
+            );
+            clause.action_and_where(if curved {
+                live
+            } else {
+                live.and(sea_orm::sea_query::Expr::cust(
+                    r#""readings"."standard_curve_id" IS NULL"#,
+                ))
+            });
         }
         Replace::Values | Replace::ValuesAndAttribution => {
             clause.update_columns([

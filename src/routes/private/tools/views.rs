@@ -14,14 +14,14 @@ use sea_orm::{
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use super::flows::{execute_and_store_run, preview_run, replay_trace};
+use super::flows::{calculation_sites, execute_and_store_run, preview_run, replay_trace};
 use super::models::activation as activation_entity;
 use super::models::script as script_entity;
 use super::models::script::{ToolScript, ToolScriptList};
 use super::models::version::ToolScriptVersion;
 use super::models::{
     ActivateRequest, ActivateResponse, ActivationRecord, ActiveTool, CalculationHealth,
-    ClosureQuery, ClosureResponse, CreateScriptRequest, CreateVersionRequest,
+    CalculationSites, ClosureQuery, ClosureResponse, CreateScriptRequest, CreateVersionRequest,
     CreateVersionResponse, DraftRunFailure, DraftRunFailureKind, DraftRunRequest, DraftRunResponse,
     DraftRunResults, Engine, FormulaDraftRunRequest, FormulaDraftRunResponse,
     FormulaDraftRunResults, InspectScriptRequest, InspectScriptResponse, LintFinding,
@@ -40,7 +40,7 @@ use super::service::{
     take_back_steps,
 };
 use crate::common::AppState;
-use crate::common::middleware::AuthContext;
+use crate::common::middleware::{AuthContext, ProjectScope, scope_site_ids};
 use crate::error::{AppError, AppResult};
 use crate::routes::private::derived_parameters::models::definition as formula_entity;
 use crate::routes::private::derived_parameters::models::definition::{
@@ -196,6 +196,25 @@ pub async fn get_calculation_closure(
         stored,
     })
     .into_response())
+}
+
+/// Every enabled calculation and the sites it is active at, confined to the caller's projects.
+#[utoipa::path(
+    get,
+    path = "/api/calculations/sites",
+    responses(
+        (status = 200, description = "Where each calculation fires", body = [CalculationSites]),
+    ),
+    tag = "tools"
+)]
+pub async fn get_calculation_sites(
+    State(state): State<AppState>,
+    ProjectScope(scope): ProjectScope,
+) -> AppResult<Json<Vec<CalculationSites>>> {
+    let site_ids = scope_site_ids(&state.db, &scope).await?;
+    Ok(Json(
+        calculation_sites(&state.db, site_ids.as_deref()).await?,
+    ))
 }
 
 /// The open event-audit findings each calculation is carrying, and how many visits they sit on.

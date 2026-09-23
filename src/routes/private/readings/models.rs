@@ -2422,8 +2422,8 @@ pub struct GrabSampleResponse {
     pub created_sample_ids: Vec<Uuid>,
     /// True when nothing was written.
     pub dry_run: bool,
-    /// Rows removed by `mode: replace` before the insert. Only the grab stream's own rows at the
-    /// instant are candidates; rows another source wrote at the same slot and time are untouched.
+    /// Rows `mode: replace` rewrote in place. Only the grab stream's own rows at the instant are
+    /// candidates; rows another source wrote at the same slot and time are untouched.
     pub replaced: usize,
     /// Curated rows on the grab stream that `mode: replace` left in place: flagged, withdrawn, or
     /// carrying a standard curve the request did not supply. Each group with one raises a

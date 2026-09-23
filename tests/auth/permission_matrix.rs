@@ -726,6 +726,7 @@ fn table() -> Table {
             ("GET", "/api/tool_scripts/{id}/version_ledger"),
             ("GET", "/api/calculations/closure"),
             ("GET", "/api/calculations/health"),
+            ("GET", "/api/calculations/sites"),
             ("GET", "/api/derived_parameters/{id}/dependents"),
             ("POST", "/api/tools/{tool_name}/calculate"),
             ("POST", "/api/tools/{tool_name}/preview"),

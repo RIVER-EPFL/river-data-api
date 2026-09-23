@@ -117,3 +117,39 @@ mod ingest_response {
         assert!(!response.paired);
     }
 }
+
+/// A replacing grab save rewrites only a live, unflagged row, and a curved one only when the save
+/// names a curve; it carries the verification, the flag and the withdrawal as they stand.
+#[test]
+fn test_readings_upsert_entry_rewrites_only_what_the_delete_would_have_taken() {
+    let uncurved = on_conflict_sql(Replace::Entry { curved: false });
+    let curved = on_conflict_sql(Replace::Entry { curved: true });
+    for tail in [&uncurved, &curved] {
+        assert!(
+            tail.contains(r#""readings"."is_flagged" IS NOT TRUE"#),
+            "{tail}"
+        );
+        assert!(
+            tail.contains(r#""readings"."withdrawn_at" IS NULL"#),
+            "{tail}"
+        );
+        for carried in ["unverified", "is_flagged", "withdrawn_at", "flag_reason"] {
+            assert!(
+                !tail.contains(&format!(r#""{carried}" = "#)),
+                "{carried} is carried, not rewritten: {tail}"
+            );
+        }
+        assert!(
+            tail.contains(r#""raw_value" = "excluded"."raw_value""#),
+            "{tail}"
+        );
+    }
+    assert!(
+        uncurved.contains(r#""readings"."standard_curve_id" IS NULL"#),
+        "{uncurved}"
+    );
+    assert!(
+        !curved.contains(r#""readings"."standard_curve_id" IS NULL"#),
+        "{curved}"
+    );
+}

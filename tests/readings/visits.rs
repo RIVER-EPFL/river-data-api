@@ -382,6 +382,24 @@ async fn a_stream_keyed_hold_marks_the_visit_it_lands_at() {
         Some("replicate_stats"),
         "and it marks the slot's own cell: {row}"
     );
+
+    let (status, detail) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/collection_events/{}/detail", row["id"].as_str().unwrap()),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{detail}");
+    let do_cell = detail["cells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["parameter_id"] == GLOBAL_PARAM_DO_ID)
+        .expect("the detail carries the DO cell");
+    assert_eq!(
+        do_cell["finding"]["kind"], "replicate_stats",
+        "the opened visit names the same finding as its row: {do_cell}"
+    );
 }
 
 /// Scenario: two paired streams serve one slot at one spot instant, which is what reconciliation
@@ -1143,4 +1161,54 @@ async fn a_corrected_cell_names_its_curve_in_the_listing() {
     );
     let uncorrected = cell(&visits[1], GLOBAL_PARAM_TEMP_ID).expect("Temp cell at T1");
     assert_eq!(uncorrected["curves"], json!([]), "{uncorrected}");
+}
+
+/// Scenario: a visit waiting on a manager's ruling, whose review-queue hold is keyed on the visit
+/// and names no parameter.
+///
+/// Expected behaviour: the visit still opens, and no cell carries the visit's own hold.
+#[tokio::test]
+#[serial]
+async fn a_pending_visit_opens_with_its_visit_hold_on_no_cell() {
+    let (db, app, token) = setup().await;
+    save_two_visits(&app, &token).await;
+    crate::common::exec(
+        &db,
+        &format!(
+            "INSERT INTO replicate_audit_holds \
+                 (site_id, group_time, kind, expected, computed, delta, status) \
+             VALUES ('{SITE1_ID}', '{T1}', 'unverified_visit', '{{}}'::jsonb, '{{}}'::jsonb, \
+                     '{{}}'::jsonb, 'pending')"
+        ),
+    )
+    .await;
+    let event_id: String = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT id::text AS id FROM collection_events \
+                 WHERE site_id = '{SITE1_ID}' AND collected_at = '{T1}'"
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "id")
+        .unwrap();
+
+    let (status, body) = crate::common::get_json_with_token(
+        &app,
+        &format!("/api/collection_events/{event_id}/detail"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c.get("finding").is_none()),
+        "{body}"
+    );
 }

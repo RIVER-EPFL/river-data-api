@@ -1201,6 +1201,65 @@ struct FindingRow {
     status: String,
 }
 
+/// The open findings at one visit, oldest first. A hold is keyed on the slot (an event-audit
+/// finding) or on the stream that raised it (a statistics disagreement, a source modification, a
+/// brake); the stream's pairing places the second on its slot, as the visits listing does.
+async fn open_findings_at(
+    db: &sea_orm::DatabaseConnection,
+    site_id: Uuid,
+    collected_at: DateTime<Utc>,
+) -> Result<Vec<FindingRow>, sea_orm::DbErr> {
+    use crate::routes::private::sync::hold_model as holds;
+    let h = Alias::new("h");
+    let ds = Alias::new("ds");
+    let sp = Alias::new("sp");
+    let site = Expr::expr(sea_orm::sea_query::Func::coalesce([
+        Expr::col((h.clone(), holds::Column::SiteId)),
+        Expr::col((sp.clone(), site_parameters::Column::SiteId)),
+    ]));
+    let parameter = Expr::expr(sea_orm::sea_query::Func::coalesce([
+        Expr::col((h.clone(), holds::Column::ParameterId)),
+        Expr::col((sp.clone(), site_parameters::Column::ParameterId)),
+    ]));
+    let mut query = SeaQuery::select();
+    query
+        .column((h.clone(), holds::Column::Id))
+        .column((h.clone(), holds::Column::Kind))
+        .expr_as(parameter.clone(), Alias::new("parameter_id"))
+        .column((h.clone(), holds::Column::Tool))
+        .column((h.clone(), holds::Column::Status))
+        .from_as(holds::Entity, h.clone())
+        .join_as(
+            JoinType::LeftJoin,
+            data_streams::Entity,
+            ds.clone(),
+            Expr::col((ds.clone(), data_streams::Column::Id))
+                .equals((h.clone(), holds::Column::StreamId)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            site_parameters::Entity,
+            sp.clone(),
+            Expr::col((sp.clone(), site_parameters::Column::Id))
+                .equals((ds.clone(), data_streams::Column::SiteParameterId)),
+        )
+        .and_where(site.eq(site_id))
+        .and_where(Expr::col((h.clone(), holds::Column::GroupTime)).eq(collected_at))
+        .and_where(Expr::col((h.clone(), holds::Column::Status)).eq(HoldStatus::Pending.as_str()))
+        .and_where(parameter.is_not_null())
+        .order_by((h, holds::Column::CreatedAt), Order::Asc);
+    let (sql, values) = query.build(PostgresQueryBuilder);
+    db.query_all_raw(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+        values,
+    ))
+    .await?
+    .iter()
+    .map(|f| FindingRow::from_query_result(f, ""))
+    .collect()
+}
+
 /// One visit's grid row: every parameter measured at the event with its replicates, sample
 /// statistics, tool provenance presence, and any open finding — plus findings for parameters
 /// the audit says are missing entirely. Requires `read_data`.
@@ -1351,23 +1410,7 @@ pub async fn get_event_detail(
         .map(|r| DetailRow::from_query_result(r, ""))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let findings = state
-        .db
-        .query_all_raw(Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            format!(
-                "SELECT id, kind, parameter_id, tool, status FROM replicate_audit_holds \
-                 WHERE stream_id IS NULL AND site_id = $1 AND group_time = $2 \
-                   AND status = '{pending}' \
-                 ORDER BY created_at",
-                pending = HoldStatus::Pending.as_str()
-            ),
-            [event.site_id.into(), event.collected_at.into()],
-        ))
-        .await?
-        .iter()
-        .map(|f| FindingRow::from_query_result(f, ""))
-        .collect::<Result<Vec<_>, _>>()?;
+    let findings = open_findings_at(&state.db, event.site_id, event.collected_at).await?;
     let mut finding_by_param: std::collections::HashMap<Uuid, CellFinding> =
         std::collections::HashMap::new();
     for f in findings {

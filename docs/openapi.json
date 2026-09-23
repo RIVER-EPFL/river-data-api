@@ -1955,6 +1955,22 @@
         },
         "type": "object"
       },
+      "AppliedSite": {
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "type": "object"
+      },
       "AppliedSlot": {
         "properties": {
           "parameter_code": {
@@ -3164,6 +3180,32 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "CalculationSites": {
+        "description": "Where one enabled calculation is active: the sites that declare every parameter it reads, or\nalready hold one of its outputs. The same test the chain applies before it runs at a visit.",
+        "properties": {
+          "calculation": {
+            "description": "The calculation's name, as the chain and its findings record it.",
+            "type": "string"
+          },
+          "calculation_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "sites": {
+            "description": "By name.",
+            "items": {
+              "$ref": "#/components/schemas/AppliedSite"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "calculation_id",
+          "calculation",
+          "sites"
+        ],
         "type": "object"
       },
       "CalibrationBackfillCandidate": {
@@ -6688,7 +6730,7 @@
         "properties": {
           "finding": {
             "$ref": "#/components/schemas/CellFinding",
-            "description": "The oldest open event-audit finding for this cell."
+            "description": "The oldest open finding for this cell, slot-keyed or placed through its stream's pairing."
           },
           "has_provenance": {
             "description": "A server-built tool-run blob is stored on the measurement.",
@@ -7792,7 +7834,7 @@
             "type": "array"
           },
           "replaced": {
-            "description": "Rows removed by `mode: replace` before the insert. Only the grab stream's own rows at the\ninstant are candidates; rows another source wrote at the same slot and time are untouched.",
+            "description": "Rows `mode: replace` rewrote in place. Only the grab stream's own rows at the instant are\ncandidates; rows another source wrote at the same slot and time are untouched.",
             "minimum": 0,
             "type": "integer"
           },
@@ -30378,6 +30420,30 @@
           }
         },
         "summary": "The open event-audit findings each calculation is carrying, and how many visits they sit on.",
+        "tags": [
+          "tools"
+        ]
+      }
+    },
+    "/api/calculations/sites": {
+      "get": {
+        "operationId": "get_calculation_sites",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/CalculationSites"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Where each calculation fires"
+          }
+        },
+        "summary": "Every enabled calculation and the sites it is active at, confined to the caller's projects.",
         "tags": [
           "tools"
         ]

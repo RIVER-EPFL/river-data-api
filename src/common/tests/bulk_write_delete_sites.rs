@@ -1,11 +1,10 @@
 use std::path::{Path, PathBuf};
 
-/// Nothing deletes a reading except these statements, each a recorded decision: grab `replace`
-/// mode (uncurated spot rows at the instant being re-entered). A new delete of readings
-/// anywhere else fails this test until it is argued into the list. Tests are not scanned,
-/// neither the inline modules nor the sibling `tests/` directories they live in; only live
-/// code counts.
-const ALLOWED: &[(&str, usize)] = &[("src/routes/private/readings/views.rs", 1)];
+/// Nothing deletes a reading (CID10): retraction is a withdrawal stamp and a correction rewrites
+/// in place. A delete of readings anywhere fails this test until it is argued into the list.
+/// Tests are not scanned, neither the inline modules nor the sibling `tests/` directories they
+/// live in; only live code counts.
+const ALLOWED: &[(&str, usize)] = &[];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read src") {

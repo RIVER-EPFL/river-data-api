@@ -189,3 +189,54 @@ mod the_outputs_an_audit_compares {
         assert!(outputs_audited(Vec::new()).is_empty());
     }
 }
+
+/// Scenario: three sites, one declaring every parameter a calculation reads, one missing an
+/// input, and one missing an input but already holding an output.
+///
+/// Expected behaviour: the calculation is active at the first and the third, the same verdict
+/// `applies_at_site` gives the chain at each.
+mod the_sites_a_calculation_is_active_at {
+    use crate::routes::private::tools::flows::{applies_at_site, sites_applied};
+    use std::collections::{HashMap, HashSet};
+    use uuid::Uuid;
+
+    #[test]
+    fn a_site_is_counted_where_the_chain_would_fire() {
+        let (doc, a254, suva) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let (every_input, missing_one, holding_output) = (
+            Uuid::from_u128(10),
+            Uuid::from_u128(11),
+            Uuid::from_u128(12),
+        );
+        let inputs = vec![doc, a254];
+        let outputs = vec![("suva".to_string(), suva)];
+        let declared: HashMap<Uuid, HashSet<Uuid>> = [
+            (every_input, [doc, a254].into_iter().collect()),
+            (missing_one, [doc].into_iter().collect()),
+            (holding_output, [doc, suva].into_iter().collect()),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut active = sites_applied(&inputs, &outputs, &declared);
+        active.sort();
+        assert_eq!(active, vec![every_input, holding_output]);
+        for (site, parameters) in &declared {
+            assert_eq!(
+                active.contains(site),
+                applies_at_site(&inputs, &outputs, parameters)
+            );
+        }
+    }
+
+    /// The chain skips a calculation that publishes nothing before it asks where it applies.
+    #[test]
+    fn a_calculation_that_saves_nothing_is_active_nowhere() {
+        let doc = Uuid::from_u128(1);
+        let declared: HashMap<Uuid, HashSet<Uuid>> =
+            [(Uuid::from_u128(10), [doc].into_iter().collect())]
+                .into_iter()
+                .collect();
+        assert!(sites_applied(&[doc], &[], &declared).is_empty());
+    }
+}

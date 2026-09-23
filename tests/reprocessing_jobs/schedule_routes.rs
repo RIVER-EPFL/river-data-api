@@ -309,16 +309,35 @@ async fn list_reflects_running_for_in_flight_job() {
     insert_schedule(&db, JOB, 3600).await;
     insert_schedule(&db, "alarm_sweep", 60).await;
 
-    // A non-terminal job of JOB is in flight; alarm_sweep has none.
+    // A job of JOB is in flight under another worker's live lease; alarm_sweep has none. A
+    // running row with no lease is an orphan the reaper takes, so the lease is what keeps it.
     crate::common::exec(
         &db,
         &format!(
-            "INSERT INTO reprocessing_jobs (id, trigger_type, status, category) \
-             VALUES ('{}', '{JOB}', 'running', 'maintenance')",
+            "INSERT INTO reprocessing_jobs \
+                (id, trigger_type, status, category, owner, lease_epoch, lease_expires_at) \
+             VALUES ('{}', '{JOB}', 'running', 'maintenance', 'elsewhere', 1, \
+                     now() + interval '1 hour')",
             Uuid::new_v4()
         ),
     )
     .await;
+    let claimed = river_db::routes::private::reprocessing_jobs::service::run_one_with_policy(
+        &db,
+        &tokio::sync::broadcast::channel(16).0,
+        &river_db::routes::private::reprocessing_jobs::service::JobRegistry::new(),
+        "schedule_routes",
+        river_db::routes::private::reprocessing_jobs::service::RetryPolicy {
+            max_retries: 3,
+            backoff_base: std::time::Duration::from_secs(60),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !claimed,
+        "a leased in-flight job is not the reaper's to take"
+    );
 
     let (status, body) = crate::common::get_json_with_token(&app, "/api/schedules", &token).await;
     assert_eq!(status, 200);

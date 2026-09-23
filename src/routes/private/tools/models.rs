@@ -1932,6 +1932,23 @@ pub struct CalculationRepair {
     pub state: String,
 }
 
+/// Where one enabled calculation is active: the sites that declare every parameter it reads, or
+/// already hold one of its outputs. The same test the chain applies before it runs at a visit.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CalculationSites {
+    pub calculation_id: Uuid,
+    /// The calculation's name, as the chain and its findings record it.
+    pub calculation: String,
+    /// By name.
+    pub sites: Vec<AppliedSite>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AppliedSite {
+    pub id: Uuid,
+    pub name: String,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ClosureResponse {
     /// The calculations the named parameters feed, in the order the chain would run them.

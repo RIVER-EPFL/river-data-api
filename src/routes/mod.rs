@@ -293,6 +293,7 @@ pub fn validate_optional_time_range(
         private::sites::views::get_site_statistics,
         private::tools::views::get_calculation_closure,
         private::tools::views::get_calculation_health,
+        private::tools::views::get_calculation_sites,
         private::tools::views::list_tools,
         private::tools::views::calculate_tool,
         private::tools::views::preview_tool,

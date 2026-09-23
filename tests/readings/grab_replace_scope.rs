@@ -46,8 +46,7 @@ fn grab(values: &[f64], mode: Option<&str>) -> serde_json::Value {
             |v| json!({"parameter_id": crate::common::GLOBAL_PARAM_TEMP_ID, "value": v, "time": T}),
         )
         .collect();
-    let mut body =
-        json!({"site_id": crate::common::SITE1_ID, "readings": readings});
+    let mut body = json!({"site_id": crate::common::SITE1_ID, "readings": readings});
     if let Some(m) = mode {
         body["mode"] = json!(m);
     }
@@ -426,5 +425,68 @@ async fn replace_withdraws_the_replicates_the_save_does_not_carry() {
         .await,
         1,
         "the retraction is on the ledger, to roll back from"
+    );
+}
+
+/// Scenario: three replicates stand, one of them pending review, and a replace changes the middle
+/// value.
+///
+/// Expected behaviour: the carried rows are rewritten in place, never deleted, so all three keep
+/// their arrival stamp and the state no insert sets; the changed value is recorded on the ledger.
+#[tokio::test]
+#[serial]
+async fn a_replace_rewrites_carried_replicates_in_place() {
+    let fx = setup().await;
+    let (status, body) = save(&fx, &grab(&[1.0, 2.0, 3.0], None)).await;
+    assert_eq!(status, 200, "{body}");
+    crate::common::exec(
+        &fx.db,
+        &format!(
+            "UPDATE readings r SET unverified = true, ingested_at = '2025-01-01T00:00:00Z' \
+               FROM data_streams s WHERE s.id = r.stream_id AND s.source_system = 'grab_sample' \
+                AND r.site_id = '{}' AND r.parameter_id = '{}' AND r.time = '{T}'",
+            crate::common::SITE1_ID,
+            crate::common::GLOBAL_PARAM_TEMP_ID
+        ),
+    )
+    .await;
+
+    let (status, body) = save(&fx, &grab(&[1.0, 5.0, 3.0], Some("replace"))).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["replaced"], 3, "{body}");
+    assert_eq!(grab_rows(&fx).await, vec![(0, 1.0), (1, 5.0), (2, 3.0)]);
+    assert_eq!(
+        scalar_i64(
+            &fx.db,
+            &format!(
+                "SELECT count(*) AS n FROM {}",
+                grab_rows_where("AND r.unverified IS TRUE")
+            )
+        )
+        .await,
+        3,
+        "a rewrite in place keeps what no insert sets"
+    );
+    assert_eq!(
+        scalar_i64(
+            &fx.db,
+            &format!(
+                "SELECT count(*) AS n FROM {}",
+                grab_rows_where("AND r.ingested_at = '2025-01-01T00:00:00Z'")
+            )
+        )
+        .await,
+        3,
+        "no carried row is deleted and inserted again"
+    );
+    assert_eq!(
+        scalar_i64(
+            &fx.db,
+            "SELECT count(*) AS n FROM reading_decisions WHERE kind = 'value_correction' \
+              AND replicate_index = 1"
+        )
+        .await,
+        1,
+        "the changed value is on the record"
     );
 }

@@ -207,6 +207,60 @@ async fn coverage_says_where_a_calculation_s_data_lives() {
     );
 }
 
+/// The sites `closure_a` is active at, by id, as reported to this token.
+async fn sites_of_closure_a(app: &axum::Router, token: &str) -> Vec<String> {
+    let (status, body) =
+        crate::common::get_json_with_token(app, "/api/calculations/sites", token).await;
+    assert_eq!(status, 200, "{body}");
+    body.as_array()
+        .expect("one entry per calculation")
+        .iter()
+        .find(|c| c["calculation"] == "closure_a")
+        .expect("every enabled calculation is listed")["sites"]
+        .as_array()
+        .expect("sites")
+        .iter()
+        .filter_map(|s| s["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Scenario: a site in a second project declares the temperature `closure_a` reads.
+///
+/// Expected behaviour: both sites are named as where `closure_a` is active, and a token scoped to
+/// the first project is told only of its own.
+#[tokio::test]
+#[serial]
+async fn the_sites_a_calculation_is_active_at_are_named() {
+    const PROJECT_B_ID: &str = "00000000-0000-4000-e000-000000000001";
+    const SITE_B_ID: &str = "00000000-0000-4000-e000-000000000010";
+    let (db, app, token) = setup().await;
+    for sql in [
+        format!("INSERT INTO projects (id, name) VALUES ('{PROJECT_B_ID}', 'Closure B')"),
+        format!(
+            "INSERT INTO sites (id, name, project_id) VALUES ('{SITE_B_ID}', 'Closure site B', '{PROJECT_B_ID}')"
+        ),
+        format!(
+            "INSERT INTO site_parameters (site_id, parameter_id, name) VALUES ('{SITE_B_ID}', '{GLOBAL_PARAM_TEMP_ID}', 'Temp B')"
+        ),
+    ] {
+        crate::common::db::exec(&db, &sql).await;
+    }
+
+    let every = sites_of_closure_a(&app, &token).await;
+    assert!(every.contains(&SITE1_ID.to_string()), "{every:?}");
+    assert!(every.contains(&SITE_B_ID.to_string()), "{every:?}");
+
+    let scoped = crate::common::seed_api_token(
+        &db,
+        crate::common::full_permissions(),
+        Some(crate::common::PROJECT_ID),
+    )
+    .await;
+    let confined = sites_of_closure_a(&app, &scoped).await;
+    assert!(confined.contains(&SITE1_ID.to_string()), "{confined:?}");
+    assert!(!confined.contains(&SITE_B_ID.to_string()), "{confined:?}");
+}
+
 /// Expected behaviour: the grid marks each cell with the calculations that read it and the one
 /// that writes it, so the role is visible while a value is being typed.
 #[tokio::test]

@@ -7,13 +7,13 @@ use sea_orm::{
     ActiveModelTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, Set,
     Statement,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use super::models::{
-    ActiveTool, AuditCounts, Engine, EventAudit, EventContext, EventPreview, EventRecompute,
-    MissingConstant, PreviewedValue, RecomputeOutcome, RecomputeScope, RunOutcome, RunTrace,
-    ToolCalculation, ToolResult, parse_manifest, run,
+    ActiveTool, AppliedSite, AuditCounts, CalculationSites, Engine, EventAudit, EventContext,
+    EventPreview, EventRecompute, MissingConstant, PreviewedValue, RecomputeOutcome,
+    RecomputeScope, RunOutcome, RunTrace, ToolCalculation, ToolResult, parse_manifest, run,
 };
 use super::service::{
     ParameterCatalog, ResolvedRun, VisitContext, build, evaluate_with_trace, execute_resolved,
@@ -206,6 +206,76 @@ pub async fn declared_parameters(
         .collect())
 }
 
+/// [`declared_parameters`] for every site at once, or for the sites named.
+pub async fn declared_parameters_by_site(
+    db: &DatabaseConnection,
+    site_ids: Option<&[Uuid]>,
+) -> AppResult<HashMap<Uuid, HashSet<Uuid>>> {
+    use crate::routes::private::site_parameters::models as site_parameters;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+    let mut query = site_parameters::Entity::find()
+        .select_only()
+        .column(site_parameters::Column::SiteId)
+        .column(site_parameters::Column::ParameterId);
+    if let Some(ids) = site_ids {
+        query = query.filter(site_parameters::Column::SiteId.is_in(ids.iter().copied()));
+    }
+    let mut declared: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
+    for (site_id, parameter_id) in query.into_tuple::<(Uuid, Uuid)>().all(db).await? {
+        declared.entry(site_id).or_default().insert(parameter_id);
+    }
+    Ok(declared)
+}
+
+/// Every enabled calculation with the sites it is active at, named, read the way the chain reads
+/// them. `site_ids` confines the sites considered; `None` is every site.
+pub async fn calculation_sites(
+    db: &DatabaseConnection,
+    site_ids: Option<&[Uuid]>,
+) -> AppResult<Vec<CalculationSites>> {
+    use crate::routes::private::sites::models as sites;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+    let tools = list_active_tools(db).await?;
+    let catalog = load_parameter_catalog(db, tools.iter().map(|t| &t.manifest)).await?;
+    let declared = declared_parameters_by_site(db, site_ids).await?;
+    let names: Vec<(Uuid, String)> = sites::Entity::find()
+        .select_only()
+        .column(sites::Column::Id)
+        .column(sites::Column::Name)
+        .filter(sites::Column::Id.is_in(declared.keys().copied()))
+        .order_by_asc(sites::Column::Name)
+        .into_tuple()
+        .all(db)
+        .await?;
+    Ok(tools
+        .iter()
+        .map(|tool| {
+            let saved_outputs: Vec<(String, Uuid)> = tool
+                .manifest
+                .outputs
+                .iter()
+                .filter_map(|o| catalog.resolve(o).map(|p| (o.key.clone(), p.id)))
+                .collect();
+            let active: HashSet<Uuid> =
+                sites_applied(&read_inputs(tool, &catalog), &saved_outputs, &declared)
+                    .into_iter()
+                    .collect();
+            CalculationSites {
+                calculation_id: tool.script_id,
+                calculation: tool.name.clone(),
+                sites: names
+                    .iter()
+                    .filter(|(id, _)| active.contains(id))
+                    .map(|(id, name)| AppliedSite {
+                        id: *id,
+                        name: name.clone(),
+                    })
+                    .collect(),
+            }
+        })
+        .collect())
+}
+
 /// Whether a calculation applies at a site (Q193): the site declares every parameter the
 /// calculation reads, so declaring the inputs declares the outputs and the run mints the output
 /// slot it needs. Q98's test stands beside it rather than being dropped: a site that already
@@ -221,6 +291,24 @@ pub fn applies_at_site(
         return true;
     }
     saved_outputs.iter().any(|(_, id)| declared.contains(id))
+}
+
+/// The sites a calculation is active at: [`applies_at_site`] over each site's declaration. A
+/// calculation that publishes nothing is active nowhere, as the chain skips it before asking.
+#[must_use]
+pub fn sites_applied(
+    read_inputs: &[Uuid],
+    saved_outputs: &[(String, Uuid)],
+    declared: &HashMap<Uuid, HashSet<Uuid>>,
+) -> Vec<Uuid> {
+    if saved_outputs.is_empty() {
+        return Vec::new();
+    }
+    declared
+        .iter()
+        .filter(|(_, parameters)| applies_at_site(read_inputs, saved_outputs, parameters))
+        .map(|(site_id, _)| *site_id)
+        .collect()
 }
 
 /// Why the chain leaves one of a run's outputs alone at a visit, or `None` when it writes it.
